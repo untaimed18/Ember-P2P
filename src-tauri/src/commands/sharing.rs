@@ -494,7 +494,7 @@ pub(crate) async fn refresh_file_cache(
                 .map(|file| {
                     (
                         crate::search::index::normalize_path_key(&file.path),
-                        (file.shared_kad, file.shared_ed2k),
+                        (file.shared_kad, file.shared_ed2k, file.shared_ember),
                     )
                 })
                 .collect::<std::collections::HashMap<_, _>>()
@@ -502,9 +502,10 @@ pub(crate) async fn refresh_file_cache(
     let mut snap = snap_raw;
     for file in &mut snap {
         let key = crate::search::index::normalize_path_key(&file.path);
-        if let Some((shared_kad, shared_ed2k)) = previous_flags.get(&key) {
+        if let Some((shared_kad, shared_ed2k, shared_ember)) = previous_flags.get(&key) {
             file.shared_kad = file.shared && !file.hash.is_empty() && *shared_kad;
             file.shared_ed2k = file.shared && !file.hash.is_empty() && *shared_ed2k;
+            file.shared_ember = file.shared && !file.hash.is_empty() && *shared_ember;
         }
     }
     *cache.write().await = snap;
@@ -3453,6 +3454,7 @@ mod tests {
             friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
+            shared_ember: false,
         }
     }
 

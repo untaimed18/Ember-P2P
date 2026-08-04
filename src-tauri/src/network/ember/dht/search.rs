@@ -294,8 +294,13 @@ impl IterativeSearch {
     }
 
     /// Mark a node's request as failed (timeout, error).
-    pub fn mark_failed(&mut self, request_id: u32) {
-        if let Some(node_id) = self.pending_requests.remove(&request_id) {
+    ///
+    /// Returns which node it was, so the caller can also hold the failure
+    /// against the routing table. Without that, a dead gossip lead stayed a
+    /// lookup seed until the liveness sweep happened to reach it.
+    pub fn mark_failed(&mut self, request_id: u32) -> Option<EmberNodeId> {
+        let failed = self.pending_requests.remove(&request_id);
+        if let Some(node_id) = failed {
             for entry in &mut self.shortlist {
                 if entry.contact.node_id == node_id {
                     entry.state = NodeState::Failed;
@@ -304,6 +309,7 @@ impl IterativeSearch {
             }
         }
         self.check_complete();
+        failed
     }
 
     /// Re-evaluate and return the completion state. Unlike the internal
@@ -378,7 +384,7 @@ impl SearchManager {
         target: EmberNodeId,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
-        let initial = routing_table.find_closest(&target, K_BUCKET_SIZE);
+        let initial = routing_table.find_closest_prefer_verified(&target, K_BUCKET_SIZE);
         let id = self.alloc_id()?;
         let search = IterativeSearch::new(id, SearchType::FindNode, target, vec![], initial);
         trace!("Starting FIND_NODE search {} for target {}", id, target);
@@ -394,7 +400,7 @@ impl SearchManager {
         keyword_hashes: Vec<[u8; 16]>,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
-        let initial = routing_table.find_closest(&primary_key, K_BUCKET_SIZE);
+        let initial = routing_table.find_closest_prefer_verified(&primary_key, K_BUCKET_SIZE);
         let id = self.alloc_id()?;
         let search = IterativeSearch::new(
             id,

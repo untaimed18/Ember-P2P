@@ -647,14 +647,75 @@ impl RoutingTable {
             .count()
     }
 
+    /// Return the `count` closest contacts to `target`, verified ones first
+    /// and unverified leads only in slots that would otherwise be empty.
+    ///
+    /// For work we do ourselves — publish targets and lookup frontiers — as
+    /// opposed to the contact lists we hand to other peers.
+    /// [`Self::find_closest`] drops every lead the moment a single contact has
+    /// answered us, which is right for gossip we propagate onward and for
+    /// judging store responsibility, but on a young network it makes that one
+    /// verified peer the *only* target for every key: records replicate to one
+    /// node instead of k, and a lookup that starts from one contact can barely
+    /// verify any more, so the table stays stuck where it is. Trying a lead
+    /// costs a round trip; refusing to costs the join.
+    ///
+    /// The result is deliberately *not* globally distance-ordered — verified
+    /// contacts lead regardless of distance — which is why the proximity gate
+    /// and outbound contact lists keep using [`Self::find_closest`]. A table
+    /// with `count` verified contacts behaves identically either way.
+    pub fn find_closest_prefer_verified(
+        &self,
+        target: &EmberNodeId,
+        count: usize,
+    ) -> Vec<EmberContact> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut verified: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        let mut leads: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        for bucket in &self.buckets {
+            for contact in &bucket.contacts {
+                let entry = (target.distance(&contact.node_id), contact);
+                if contact.is_verified() {
+                    verified.push(entry);
+                } else {
+                    leads.push(entry);
+                }
+            }
+        }
+
+        verified.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut out: Vec<EmberContact> = verified
+            .into_iter()
+            .take(count)
+            .map(|(_, c)| c.clone())
+            .collect();
+        if out.len() < count {
+            leads.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+            out.extend(
+                leads
+                    .into_iter()
+                    .take(count - out.len())
+                    .map(|(_, c)| c.clone()),
+            );
+        }
+        out
+    }
+
     /// Return the `count` closest contacts to `target`.
     ///
     /// Once we know any contact that has actually answered us, only those are
-    /// returned. Lookups and the contact lists we hand to other peers are both
-    /// built from this, and seeding either with addresses we have merely been
-    /// told about wastes round-trips and propagates unverified gossip as if it
-    /// were real. Before anything has answered we have no choice but to use
-    /// the leads we have, which is the cold-start case.
+    /// returned. This is what we hand to other peers and what decides which
+    /// keys we are responsible for storing: seeding a reply with addresses we
+    /// have merely been told about propagates unverified gossip as if it were
+    /// real, and letting gossip into the proximity comparison would let an
+    /// attacker inject fake near-contacts to make us refuse legitimate stores.
+    /// Before anything has answered we have no choice but to use the leads we
+    /// have, which is the cold-start case.
+    ///
+    /// Callers picking targets for our *own* publishes and lookups want
+    /// [`Self::find_closest_prefer_verified`] instead.
     pub fn find_closest(&self, target: &EmberNodeId, count: usize) -> Vec<EmberContact> {
         let verified_only = self.verified_len() > 0;
         let mut all: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
@@ -1165,6 +1226,49 @@ mod tests {
         let closest = rt.find_closest(&make_id(0x10), 10);
         assert_eq!(closest.len(), 1, "the unproven lead drops out");
         assert_eq!(closest[0].node_id, make_id(0x20));
+    }
+
+    /// Excluding leads outright is right for what we hand other peers, but it
+    /// left our own publishes and lookups with a single target on a young
+    /// network: one proven contact meant every record replicated to one node
+    /// instead of k, and a lookup starting from one contact could not verify
+    /// enough peers to escape.
+    #[test]
+    fn our_own_targets_top_up_with_leads_behind_the_proven_ones() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        rt.add_contact(make_contact(0x20, 4672));
+        for lead in [0x10u8, 0x11, 0x12] {
+            rt.add_contact(gossip_contact(lead));
+        }
+        assert_eq!(rt.verified_len(), 1);
+
+        // The gossip-excluding path still returns exactly the one proven peer.
+        assert_eq!(rt.find_closest(&make_id(0x10), 10).len(), 1);
+
+        // Ours uses the leads for the slots that would otherwise sit empty,
+        // and still puts the proven contact first however far away it is.
+        let targets = rt.find_closest_prefer_verified(&make_id(0x10), 10);
+        assert_eq!(targets.len(), 4, "the three leads fill the empty slots");
+        assert_eq!(
+            targets[0].node_id,
+            make_id(0x20),
+            "the proven contact leads regardless of distance"
+        );
+
+        // A table with enough proven contacts is unaffected by the change.
+        for id in [0x21u8, 0x22] {
+            rt.add_contact(make_contact(id, 4672));
+        }
+        let targets = rt.find_closest_prefer_verified(&make_id(0x10), 3);
+        assert!(
+            targets.iter().all(|c| c.is_verified()),
+            "leads must not displace proven contacts inside the requested count"
+        );
+
+        // And a zero request stays empty rather than returning the whole table.
+        assert!(rt.find_closest_prefer_verified(&make_id(0x10), 0).is_empty());
     }
 
     /// Unproven entries must not hold slots against contacts that have

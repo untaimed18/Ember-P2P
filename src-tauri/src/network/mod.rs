@@ -5330,6 +5330,7 @@ mod tests {
                 friends_only: false,
                 shared_kad: false,
                 shared_ed2k: false,
+                shared_ember: false,
             },
             peer_id: String::new(),
             peer_name: String::new(),
@@ -5741,7 +5742,8 @@ mod tests {
         );
     }
 
-    /// An unanswered batch must not linger in the in-flight map.
+    /// An unanswered batch must not linger in the in-flight map, and must
+    /// surrender its records so the backoff can be charged against them.
     #[test]
     fn unacked_batches_expire() {
         let mut pub_ = EmberBatchPublisher::default();
@@ -5753,13 +5755,301 @@ mod tests {
                 sent_at: std::time::Instant::now() - EMBER_BATCH_ACK_TIMEOUT * 2,
             },
         );
-        pub_.expire(std::time::Instant::now());
+        let abandoned = pub_.expire(std::time::Instant::now());
         assert!(pub_.in_flight.is_empty());
+        assert_eq!(abandoned, vec![record_ref(0, 0)]);
+    }
+
+    /// The four maps `EmberPublishSchedule` borrows, owned so a test can drive
+    /// the state machine without a whole `NetworkState`.
+    #[derive(Default)]
+    struct TestSchedule {
+        unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+        attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
+        source_at: HashMap<[u8; 16], std::time::Instant>,
+        keyword_at: HashMap<[u8; 16], std::time::Instant>,
+    }
+
+    impl TestSchedule {
+        fn borrow(&mut self) -> EmberPublishSchedule<'_> {
+            EmberPublishSchedule {
+                unplaced: &mut self.unplaced,
+                attempts: &mut self.attempts,
+                source_at: &mut self.source_at,
+                keyword_at: &mut self.keyword_at,
+            }
+        }
+
+        fn rounds_failed(&self, reference: EmberRecordRef) -> u32 {
+            self.attempts
+                .get(&(reference.file_hash, reference.kind))
+                .map(|a| a.rounds_failed)
+                .unwrap_or(0)
+        }
+    }
+
+    /// Records the flush gave up on never reached a peer, so they must not count
+    /// against the file. Charging at selection meant three ticks of discarded
+    /// records parked a file for a full republish interval with nothing having
+    /// left the host — and because the clock was stamped, it looked published.
+    #[test]
+    fn dropped_records_cost_a_file_nothing() {
+        let mut sched = TestSchedule::default();
+        let one = record_ref(1, 10);
+        let two = record_ref(1, 11);
+        let slot = (one.file_hash, one.kind);
+
+        track_ember_record_pending(sched.borrow(), one);
+        track_ember_record_pending(sched.borrow(), two);
+        assert_eq!(sched.unplaced[&slot].len(), 2);
+
+        // The flush could not send either of them.
+        untrack_ember_record_pending(sched.borrow(), one);
+        untrack_ember_record_pending(sched.borrow(), two);
+
+        assert_eq!(sched.rounds_failed(one), 0, "a dropped round is not a failure");
+        assert!(
+            !sched.unplaced.contains_key(&slot),
+            "the file must leave the pending set or selection never offers it again"
+        );
+        assert!(
+            !sched.keyword_at.contains_key(&one.file_hash),
+            "nothing was placed, so the republish clock must not have advanced"
+        );
+
+        // And it is due again straight away rather than waiting out an interval.
+        assert_eq!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                one.file_hash,
+                one.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                std::time::Instant::now(),
+            ),
+            Some(u64::MAX)
+        );
+    }
+
+    /// Only records that reached the wire and went unacked count, and one round
+    /// counts once however many of its `K_EMBER_REPLICAS` batches time out.
+    #[test]
+    fn a_failed_round_is_charged_once_and_parks_the_file_after_three() {
+        let mut sched = TestSchedule::default();
+        let reference = record_ref(2, 20);
+        let slot = (reference.file_hash, reference.kind);
+        let start = std::time::Instant::now();
+
+        track_ember_record_pending(sched.borrow(), reference);
+
+        // A round's replica batches all time out together; that is one round.
+        for _ in 0..5 {
+            charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, start);
+        }
+        assert_eq!(sched.rounds_failed(reference), 1);
+
+        // Later rounds are a publish tick apart, well outside the collapse
+        // window, so they count separately.
+        let mut at = start;
+        for expected in 2..=EMBER_PUBLISH_MAX_ATTEMPTS {
+            at += EMBER_BATCH_ACK_TIMEOUT * 2;
+            charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+            assert_eq!(sched.rounds_failed(reference), expected);
+        }
+
+        // One more parks it: the clock is stamped so the staleness ranking stops
+        // putting it first, and the pending marker is released.
+        at += EMBER_BATCH_ACK_TIMEOUT * 2;
+        charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+        assert!(!sched.unplaced.contains_key(&slot));
+        assert!(sched.keyword_at.contains_key(&reference.file_hash));
+        assert_eq!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                reference.file_hash,
+                reference.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                at,
+            ),
+            None,
+            "a parked file waits out its interval"
+        );
+
+        // A straggling timeout after the round resolved must not re-charge it.
+        at += EMBER_BATCH_ACK_TIMEOUT * 2;
+        charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+        assert_eq!(sched.rounds_failed(reference), 0);
+    }
+
+    /// Selection ranks on the republish clock, which says nothing about whether
+    /// the previous round is still in flight. Without the pending check a file
+    /// was picked again every tick and put a second copy of every record on the
+    /// wire — and carry-over means a backlog legitimately spans several ticks.
+    #[test]
+    fn a_file_awaiting_placement_is_not_selected_again() {
+        let mut sched = TestSchedule::default();
+        let reference = record_ref(3, 30);
+        let now = std::time::Instant::now();
+
+        // Never published: maximally stale, so certain to be picked.
+        assert_eq!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                reference.file_hash,
+                reference.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                now,
+            ),
+            Some(u64::MAX)
+        );
+
+        // Queued for a peer: still maximally stale by the clock, but off-limits.
+        track_ember_record_pending(sched.borrow(), reference);
+        assert_eq!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                reference.file_hash,
+                reference.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                now,
+            ),
+            None
+        );
+
+        // Confirmed placement releases it, and then the interval holds it back.
+        untrack_ember_record_pending(sched.borrow(), reference);
+        sched.borrow().stamp(reference.file_hash, reference.kind, now);
+        assert_eq!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                reference.file_hash,
+                reference.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                now,
+            ),
+            None
+        );
+        assert!(
+            ember_publish_staleness(
+                &sched.unplaced,
+                &sched.keyword_at,
+                reference.file_hash,
+                reference.kind,
+                EMBER_KEYWORD_REPUBLISH,
+                now + EMBER_KEYWORD_REPUBLISH,
+            )
+            .is_some(),
+            "once the interval has passed it is due again"
+        );
+    }
+
+    /// A ping is the only way a lead becomes usable, so the ping budget is also
+    /// the join rate. The steady-state trickle made a cold join take many
+    /// minutes, during which publishes had one target and lookups one seed.
+    #[test]
+    fn a_starved_table_gets_a_wider_ping_budget() {
+        assert_eq!(ember_maint_ping_budget(0), EMBER_MAINT_MAX_PINGS_STARVED);
+        assert_eq!(
+            ember_maint_ping_budget(EMBER_PING_STARVED_BELOW - 1),
+            EMBER_MAINT_MAX_PINGS_STARVED
+        );
+        // Once joined it drops back to the steady-state trickle.
+        assert_eq!(
+            ember_maint_ping_budget(EMBER_PING_STARVED_BELOW),
+            EMBER_MAINT_MAX_PINGS
+        );
+        assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
+    }
+
+    fn queued_record(seed: u8) -> EmberQueuedRecord {
+        EmberQueuedRecord {
+            reference: record_ref(1, seed),
+            record: ember::dht::messages::BatchedRecord {
+                key: [seed; 16],
+                record: vec![seed, seed, seed],
+                record_signature: [0u8; 64],
+            },
+        }
+    }
+
+    /// The flush's frame budget used to discard whatever it could not send,
+    /// while the file had already been charged an attempt at selection — three
+    /// ticks of that parked a file for a whole republish interval with none of
+    /// its records ever having left the host.
+    #[test]
+    fn a_flush_holds_over_what_it_could_not_send() {
+        let mut pub_ = EmberBatchPublisher::default();
+        let node = ember::dht::EmberNodeId([7u8; 16]);
+        let contact = ember::dht::EmberContact {
+            node_id: node,
+            addr: SocketAddr::from(([80, 7, 1, 1], 4672)),
+            noise_pub: [7u8; 32],
+            ed25519_pub: [7u8; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        };
+
+        let tail: Vec<EmberQueuedRecord> = (0..5u8).map(queued_record).collect();
+        let dropped = pub_.carry_over(node, &contact, tail);
+        assert!(dropped.is_empty(), "there was room for all of it");
+        assert_eq!(pub_.queued_count, 5);
+        assert_eq!(pub_.queued[&node].1.len(), 5);
+
+        // Held-over work stays ahead of anything queued afterwards, so the
+        // oldest records are still the first ones tried.
+        pub_.enqueue(
+            std::slice::from_ref(&contact),
+            record_ref(2, 99),
+            queued_record(99).record,
+        );
+        let order: Vec<[u8; 16]> = pub_.queued[&node]
+            .1
+            .iter()
+            .map(|q| q.reference.key)
+            .collect();
+        assert_eq!(order.last(), Some(&record_ref(2, 99).key));
+        assert_eq!(order.len(), 6);
+    }
+
+    /// Carry-over must not become an unbounded spool: one peer that never
+    /// drains would fill the global queue cap and starve every other
+    /// destination's publishes.
+    #[test]
+    fn carry_over_is_bounded_per_peer() {
+        let mut pub_ = EmberBatchPublisher::default();
+        let node = ember::dht::EmberNodeId([8u8; 16]);
+        let contact = ember::dht::EmberContact {
+            node_id: node,
+            addr: SocketAddr::from(([80, 8, 1, 1], 4672)),
+            noise_pub: [8u8; 32],
+            ed25519_pub: [8u8; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        };
+
+        let over = EMBER_MAX_CARRY_OVER_PER_PEER + 40;
+        let tail: Vec<EmberQueuedRecord> = (0..over).map(|i| queued_record(i as u8)).collect();
+        let dropped = pub_.carry_over(node, &contact, tail);
+        assert_eq!(dropped.len(), 40, "the excess is reported, not silently lost");
+        assert_eq!(pub_.queued_count, EMBER_MAX_CARRY_OVER_PER_PEER);
+        assert_eq!(
+            pub_.queued[&node].1.len(),
+            EMBER_MAX_CARRY_OVER_PER_PEER,
+            "the peer holds its limit and no more"
+        );
     }
 
     /// A fixed per-tick budget silently stopped republishing everything past
     /// a few thousand files, because the cycle no longer fit inside the
     /// record TTL.
+    /// A table big enough that the deliverable bound is not what binds, so
+    /// these cases exercise the TTL arithmetic rather than the flush budget.
+    const ROOMY_TABLE: usize = K_EMBER_REPLICAS * 64;
+
     #[test]
     fn keyword_publish_budget_covers_the_library_within_its_ttl() {
         let ticks_per_cycle =
@@ -5767,18 +6057,18 @@ mod tests {
 
         // A small library still gets the floor rather than zero.
         assert_eq!(
-            ember_keyword_files_per_tick(0),
+            ember_keyword_files_per_tick(0, ROOMY_TABLE),
             EMBER_KEYWORD_PUBLISH_MIN_PER_TICK
         );
         assert_eq!(
-            ember_keyword_files_per_tick(1),
+            ember_keyword_files_per_tick(1, ROOMY_TABLE),
             EMBER_KEYWORD_PUBLISH_MIN_PER_TICK
         );
 
         // Libraries up to the point where the ceiling binds must complete a
         // full pass inside one republish interval.
         for library in [1_000usize, 10_000, 50_000] {
-            let per_tick = ember_keyword_files_per_tick(library);
+            let per_tick = ember_keyword_files_per_tick(library, ROOMY_TABLE);
             let covered = per_tick * ticks_per_cycle;
             if per_tick < EMBER_KEYWORD_PUBLISH_MAX_PER_TICK {
                 assert!(
@@ -5791,8 +6081,108 @@ mod tests {
 
         // And the ceiling still bounds a single tick's burst.
         assert_eq!(
-            ember_keyword_files_per_tick(usize::MAX / 2),
+            ember_keyword_files_per_tick(usize::MAX / 2, ROOMY_TABLE),
             EMBER_KEYWORD_PUBLISH_MAX_PER_TICK
+        );
+    }
+
+    /// The keyword budget used to ignore what the flush could carry. On a small
+    /// table every key resolves to the same handful of peers, so 96 files of
+    /// several records each was hundreds of records aimed at a destination that
+    /// could take a few dozen — and the rest was discarded while each file was
+    /// charged a publish attempt.
+    #[test]
+    fn publish_budgets_stay_within_what_the_flush_can_deliver() {
+        // A one-contact table: every record goes to that one peer, so the
+        // deliverable total is one peer's minute of allowance.
+        assert_eq!(
+            ember_deliverable_records_per_tick(1),
+            EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize
+        );
+        assert_eq!(
+            ember_deliverable_records_per_tick(K_EMBER_REPLICAS),
+            EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize
+        );
+        // Past k the target sets diverge and the total scales with the table.
+        assert!(
+            ember_deliverable_records_per_tick(K_EMBER_REPLICAS * 4)
+                > ember_deliverable_records_per_tick(K_EMBER_REPLICAS)
+        );
+
+        // A huge library on a tiny table must be held to the deliverable count,
+        // counting each file as several keyword records.
+        let tiny = ember_keyword_files_per_tick(50_000, 1);
+        assert!(
+            tiny * EMBER_KEYWORDS_PER_FILE_ESTIMATE <= ember_deliverable_records_per_tick(1),
+            "{tiny} files of ~{EMBER_KEYWORDS_PER_FILE_ESTIMATE} records each exceeds \
+             what one peer will accept"
+        );
+        assert!(tiny < EMBER_KEYWORD_PUBLISH_MAX_PER_TICK);
+
+        // Sources are one record per file, so they get the whole allowance.
+        let tiny_src = ember_source_files_per_tick(50_000, 50_000, 1);
+        assert!(tiny_src <= ember_deliverable_records_per_tick(1));
+        assert!(tiny_src > tiny, "a source file is cheaper than a keyword file");
+
+        // And a roomy table is not what binds: the same library gets more per
+        // tick than it would on a table of one, because the records spread.
+        assert!(
+            ember_keyword_files_per_tick(50_000, ROOMY_TABLE) > tiny,
+            "a roomy table should not be held to the one-contact deliverable bound"
+        );
+        assert_eq!(
+            ember_keyword_files_per_tick(usize::MAX / 2, ROOMY_TABLE),
+            EMBER_KEYWORD_PUBLISH_MAX_PER_TICK,
+            "the hard ceiling still bounds the extreme"
+        );
+    }
+
+    /// Source records had the fixed budget the keyword path was already fixed
+    /// for: five per tick covers 600 files in the two-hour interval, so a
+    /// larger library never completed a pass and the remainder was never
+    /// published. A cold start also crawled — a 160-file library took half an
+    /// hour before its last file was findable.
+    #[test]
+    fn source_publish_budget_covers_the_library_and_drains_a_backlog() {
+        let ticks_per_cycle =
+            (EMBER_SOURCE_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs()) as usize;
+
+        // Nothing to do still yields the floor, not zero.
+        assert_eq!(
+            ember_source_files_per_tick(0, 0, ROOMY_TABLE),
+            EMBER_SOURCE_PUBLISH_MIN_PER_TICK
+        );
+
+        // Steady state: one full pass must fit the republish interval for
+        // every library the ceiling can still cover.
+        let coverable = EMBER_SOURCE_PUBLISH_MAX_PER_TICK * ticks_per_cycle;
+        for library in [600usize, 1_000, coverable] {
+            // Worst case for coverage is a spread-out schedule, where only an
+            // interval's share is due on any one tick.
+            let due = library.div_ceil(ticks_per_cycle);
+            let per_tick = ember_source_files_per_tick(library, due, ROOMY_TABLE);
+            assert!(
+                per_tick * ticks_per_cycle >= library,
+                "a {library}-file library publishes {per_tick}/tick, covering only \
+                 {} within the republish interval",
+                per_tick * ticks_per_cycle
+            );
+        }
+
+        // Cold start: a whole library due at once drains in about
+        // `EMBER_SOURCE_BACKLOG_DRAIN_TICKS`, not a whole pass. The old fixed
+        // five would have needed 32 ticks for this library.
+        let per_tick = ember_source_files_per_tick(159, 159, ROOMY_TABLE);
+        assert!(
+            per_tick >= 159 / EMBER_SOURCE_BACKLOG_DRAIN_TICKS,
+            "a 159-file backlog only publishes {per_tick}/tick"
+        );
+        assert!(per_tick > EMBER_SOURCE_PUBLISH_MIN_PER_TICK);
+
+        // And a tick's burst stays bounded however big the backlog gets.
+        assert_eq!(
+            ember_source_files_per_tick(usize::MAX / 2, usize::MAX / 2, ROOMY_TABLE),
+            EMBER_SOURCE_PUBLISH_MAX_PER_TICK
         );
     }
 
@@ -8343,7 +8733,10 @@ struct NetworkState {
     ember_publish_unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     /// Consecutive publish rounds each file has left unconfirmed, driving the
     /// [`EMBER_PUBLISH_MAX_ATTEMPTS`] backoff.
-    ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), u32>,
+    ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
+    /// Bookkeeping for the publish heartbeat, accumulated by the selection and
+    /// flush paths and reset each time it logs.
+    ember_publish_pass: EmberPublishPassStats,
     /// Batched publish queue: groups a tick's records by destination so a
     /// large library's republish fits the link and the peer rate limits.
     ember_batch_publish: EmberBatchPublisher,
@@ -8590,6 +8983,16 @@ struct NetworkState {
     /// tick republishes a file's keywords only after
     /// `EMBER_KEYWORD_REPUBLISH` has elapsed.
     ember_keyword_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// Shared files whose Ember DHT source record has been acknowledged by
+    /// at least one storer, keyed by 16-byte eD2K hash. Drives the Library
+    /// "Ember" badge, the same way `PublishManager`'s source timestamps
+    /// drive the KAD badge.
+    ///
+    /// Deliberately *not* derived from `ember_source_publish_at`: that map
+    /// is a scheduling clock and `charge_ember_publish_failure` stamps it
+    /// for rounds that were never confirmed, so a file nobody stored would
+    /// otherwise light up the badge.
+    ember_published_sources: HashSet<[u8; 16]>,
     /// In-flight Ember DHT *keyword* searches started for a user search
     /// (slice 10), keyed by `search_id` -> the originating search context.
     /// Distinct from the dev value-lookup waiters
@@ -8632,8 +9035,13 @@ struct EmberSearchRequest {
     /// The per-search request id `next_to_query` handed out (the
     /// correlation token `process_response` / `mark_failed` expect).
     per_search_req_id: u32,
-    /// When the query went out, for the staleness sweep.
-    sent_at: std::time::Instant,
+    /// When the staleness sweep should give up on this query.
+    ///
+    /// A deadline rather than a send time because the budget is not the same
+    /// for every query: one queued behind a Noise handshake has not reached the
+    /// peer yet, and charging it the ordinary budget expired it before it had
+    /// been asked anything — which on a cold table is every first contact.
+    deadline: std::time::Instant,
 }
 
 /// Feed records we already hold for `key` into a lookup that has just started.
@@ -8661,17 +9069,117 @@ fn seed_ember_local_records(
     debug!("Ember DHT: seeded {seeded} local record(s) into search {search_id}");
 }
 
+/// The per-file publish schedule, borrowed as a unit.
+///
+/// The four maps only mean anything together: a file is due when `*_at` says so
+/// *and* `unplaced` says its last round finished, and `attempts` decides when a
+/// file that keeps failing is parked. Passing them as a bundle is also what lets
+/// the state machine be exercised without standing up a whole [`NetworkState`],
+/// which is where the bugs were — an attempt charged before the record reached
+/// the wire, and a pending marker that outlived the records it tracked.
+struct EmberPublishSchedule<'a> {
+    unplaced: &'a mut HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    attempts: &'a mut HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
+    source_at: &'a mut HashMap<[u8; 16], std::time::Instant>,
+    keyword_at: &'a mut HashMap<[u8; 16], std::time::Instant>,
+}
+
+impl EmberPublishSchedule<'_> {
+    /// Advance the republish clock for `kind`, so selection stops offering the
+    /// file until its interval has passed again.
+    fn stamp(&mut self, file_hash: [u8; 16], kind: EmberPublishKind, at: std::time::Instant) {
+        match kind {
+            EmberPublishKind::Keyword => {
+                self.keyword_at.insert(file_hash, at);
+            }
+            EmberPublishKind::Source => {
+                self.source_at.insert(file_hash, at);
+            }
+            // Replication carries someone else's record; there is no local
+            // schedule for it.
+            EmberPublishKind::Replication => {}
+        }
+    }
+}
+
+impl NetworkState {
+    fn publish_schedule(&mut self) -> EmberPublishSchedule<'_> {
+        EmberPublishSchedule {
+            unplaced: &mut self.ember_publish_unplaced,
+            attempts: &mut self.ember_publish_attempts,
+            source_at: &mut self.ember_source_publish_at,
+            keyword_at: &mut self.ember_keyword_publish_at,
+        }
+    }
+}
+
+/// How stale a file's records of `kind` are, or `None` when it must not be
+/// selected this tick.
+///
+/// The `unplaced` check is the load-bearing part: a file whose previous round is
+/// still queued or awaiting an ack must not be picked again, because
+/// re-enqueueing puts a second copy of every record on the wire, and the flush's
+/// carry-over means a backlog can legitimately span several ticks.
+fn ember_publish_staleness(
+    unplaced: &HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    published_at: &HashMap<[u8; 16], std::time::Instant>,
+    file_hash: [u8; 16],
+    kind: EmberPublishKind,
+    interval: std::time::Duration,
+    now: std::time::Instant,
+) -> Option<u64> {
+    if unplaced.contains_key(&(file_hash, kind)) {
+        return None;
+    }
+    match published_at.get(&file_hash) {
+        // Never published ranks above anything with a timestamp.
+        None => Some(u64::MAX),
+        Some(at) => {
+            let elapsed = now.duration_since(*at);
+            if elapsed < interval {
+                None
+            } else {
+                Some(elapsed.as_secs())
+            }
+        }
+    }
+}
+
 /// Note that `reference`'s record has been queued for publishing, so the file
 /// is not considered published until it lands somewhere.
-fn track_ember_record_pending(state: &mut NetworkState, reference: EmberRecordRef) {
+fn track_ember_record_pending(schedule: EmberPublishSchedule<'_>, reference: EmberRecordRef) {
     if reference.kind == EmberPublishKind::Replication {
         return;
     }
-    state
-        .ember_publish_unplaced
+    schedule
+        .unplaced
         .entry((reference.file_hash, reference.kind))
         .or_default()
         .insert(reference.key);
+}
+
+/// Forget a queued record we have given up on sending, without treating it as
+/// published.
+///
+/// The counterpart to [`track_ember_record_pending`] for the give-up paths. A
+/// file that stays marked pending is skipped by selection, so a record dropped
+/// by the flush would otherwise take its file out of the rotation permanently.
+/// Deliberately does not stamp the republish clock: nothing was placed, and the
+/// file should come back around as due.
+fn untrack_ember_record_pending(schedule: EmberPublishSchedule<'_>, reference: EmberRecordRef) {
+    if reference.kind == EmberPublishKind::Replication {
+        return;
+    }
+    let slot = (reference.file_hash, reference.kind);
+    if let Some(unplaced) = schedule.unplaced.get_mut(&slot) {
+        unplaced.remove(&reference.key);
+        if unplaced.is_empty() {
+            schedule.unplaced.remove(&slot);
+            // The round is over without having placed anything, so the failure
+            // count that belonged to it goes too.
+            schedule.attempts.remove(&slot);
+        }
+    }
 }
 
 /// Apply a storer's confirmation that `reference`'s record landed, advancing
@@ -8690,22 +9198,23 @@ fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordR
     if !finished {
         return;
     }
-    state.ember_publish_unplaced.remove(&slot);
-    state.ember_publish_attempts.remove(&slot);
     let now = std::time::Instant::now();
+    let mut schedule = state.publish_schedule();
+    schedule.unplaced.remove(&slot);
+    schedule.attempts.remove(&slot);
+    schedule.stamp(reference.file_hash, reference.kind, now);
     // Counted here rather than at enqueue: this is the point at which the
     // file is genuinely published, so the figure means what its label says
     // instead of counting attempts that may have been dropped or refused.
     match reference.kind {
         EmberPublishKind::Keyword => {
-            state.ember_keyword_publish_at.insert(reference.file_hash, now);
             state.ember_diagnostics.ember_dht_keywords_published = state
                 .ember_diagnostics
                 .ember_dht_keywords_published
                 .saturating_add(1);
         }
         EmberPublishKind::Source => {
-            state.ember_source_publish_at.insert(reference.file_hash, now);
+            state.ember_published_sources.insert(reference.file_hash);
             state.ember_diagnostics.ember_dht_sources_published = state
                 .ember_diagnostics
                 .ember_dht_sources_published
@@ -8717,41 +9226,62 @@ fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordR
     }
 }
 
-/// Count one publish round against a file and, once it has gone unconfirmed
-/// too many times, defer it so it stops holding a slot every tick.
+/// Charge one failed publish round against a file and, once it has gone
+/// unconfirmed too many times, defer it a full republish interval so it stops
+/// holding a selection slot every tick.
 ///
-/// Returns whether the file should be skipped this round.
-fn ember_publish_backoff_exhausted(
-    state: &mut NetworkState,
+/// Only ever called for records that reached the wire and were not acked. It
+/// used to be called at *selection*, before the record was even queued, which
+/// meant a file whose records the flush discarded — the common case on a small
+/// table, where every key resolves to the same few peers — burned all three of
+/// its attempts and was parked for hours without a single record having left
+/// the host.
+///
+/// A round sends the same record to `K_EMBER_REPLICAS` peers in separate
+/// batches, and they all time out within a moment of each other, so charges are
+/// collapsed inside one [`EMBER_BATCH_ACK_TIMEOUT`] window. Rounds are a
+/// publish tick apart, comfortably wider, so consecutive rounds still count
+/// separately.
+fn charge_ember_publish_failure(
+    mut schedule: EmberPublishSchedule<'_>,
     file_hash: [u8; 16],
     kind: EmberPublishKind,
-) -> bool {
+    now: std::time::Instant,
+) {
     // Replication is not scheduled per file, so there is nothing to back off.
     if kind == EmberPublishKind::Replication {
-        return false;
+        return;
     }
     let slot = (file_hash, kind);
-    let attempts = state.ember_publish_attempts.entry(slot).or_insert(0);
-    *attempts += 1;
-    if *attempts <= EMBER_PUBLISH_MAX_ATTEMPTS {
-        return false;
+    // No pending set means the round already resolved — confirmed by another
+    // storer, or given up on — and a straggling timeout must not charge it.
+    if !schedule.unplaced.contains_key(&slot) {
+        return;
+    }
+    let attempts = schedule
+        .attempts
+        .entry(slot)
+        .or_insert(EmberPublishAttempts {
+            rounds_failed: 0,
+            last_charged: now
+                .checked_sub(EMBER_BATCH_ACK_TIMEOUT)
+                .unwrap_or(now),
+        });
+    if now.duration_since(attempts.last_charged) < EMBER_BATCH_ACK_TIMEOUT {
+        return;
+    }
+    attempts.rounds_failed += 1;
+    attempts.last_charged = now;
+    if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
+        return;
     }
     // Treat it as done for scheduling purposes so the staleness ranking stops
     // putting it first. It gets one more try after a full interval.
-    *attempts = 0;
-    state.ember_publish_unplaced.remove(&slot);
-    let now = std::time::Instant::now();
-    match kind {
-        EmberPublishKind::Keyword => {
-            state.ember_keyword_publish_at.insert(file_hash, now);
-        }
-        EmberPublishKind::Source => {
-            state.ember_source_publish_at.insert(file_hash, now);
-        }
-        EmberPublishKind::Replication => return false,
-    }
+    schedule.attempts.remove(&slot);
+    schedule.unplaced.remove(&slot);
+    schedule.stamp(file_hash, kind, now);
     debug!(
-        "Ember publish: {} records for {} went unconfirmed; deferring a full interval",
+        "Ember publish: {} records for {} went unconfirmed {EMBER_PUBLISH_MAX_ATTEMPTS} rounds; deferring a full interval",
         match kind {
             EmberPublishKind::Keyword => "keyword",
             EmberPublishKind::Source => "source",
@@ -8759,7 +9289,6 @@ fn ember_publish_backoff_exhausted(
         },
         hex::encode(file_hash)
     );
-    true
 }
 
 /// Clear the rendezvous "published" mark if `removed` was its publish search.
@@ -8805,10 +9334,47 @@ struct EmberRecordRef {
     key: [u8; 16],
 }
 
+/// Backoff state for one file's records of a given kind.
+///
+/// `last_charged` exists so that the `K_EMBER_REPLICAS` batches carrying one
+/// round all count as the single round they are. See
+/// [`charge_ember_publish_failure`].
+struct EmberPublishAttempts {
+    rounds_failed: u32,
+    last_charged: std::time::Instant,
+}
+
 /// A record waiting to be sent to one destination.
 struct EmberQueuedRecord {
     reference: EmberRecordRef,
     record: ember::dht::messages::BatchedRecord,
+}
+
+/// What one publish pass picked up and what its flush achieved.
+///
+/// Reported by the publish heartbeat so `due` versus `selected` shows whether
+/// the budget or the library is the limit, and `flush` shows whether the
+/// selected work actually left the host.
+#[derive(Default, Debug, Clone, Copy)]
+struct EmberPublishPassStats {
+    /// Files past their republish interval and not already awaiting placement.
+    due: usize,
+    /// How many of those the per-tick budget took.
+    selected: usize,
+    flush: EmberFlushStats,
+}
+
+/// What one `flush_ember_batch_publish` pass actually managed to do.
+///
+/// Reported by the publish heartbeat: without it there is no way to tell a
+/// tick that delivered everything from one that dropped most of it, and the
+/// terminal's only publish lines come from KAD.
+#[derive(Default, Debug, Clone, Copy)]
+struct EmberFlushStats {
+    frames_sent: usize,
+    records_sent: usize,
+    records_carried: usize,
+    records_dropped: usize,
 }
 
 /// One `STORE_BATCH` awaiting its ack, in the order its records were packed
@@ -8838,6 +9404,10 @@ struct EmberBatchPublisher {
     /// cannot afford to re-sum every destination on each call.
     queued_count: usize,
     in_flight: HashMap<u32, EmberBatchInFlight>,
+    /// Records sent to each peer in the current minute, so the flush can run
+    /// often without exceeding what a storer will accept. See
+    /// [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`].
+    sent_window: HashMap<ember::dht::EmberNodeId, (u32, std::time::Instant)>,
 }
 
 /// Records the queue may hold before it starts refusing work, so a tick that
@@ -8854,19 +9424,52 @@ const EMBER_BATCH_QUEUE_MAX: usize = 8192;
 /// per-tick budget, nothing else in the library is ever published again.
 const EMBER_PUBLISH_MAX_ATTEMPTS: u32 = 3;
 
-/// `STORE_BATCH` frames we will send one peer in a single publish tick.
+/// `STORE_BATCH` frames we will send one peer in a single flush.
 ///
 /// A receiver drops everything past `MAX_MSGS_PER_WINDOW` frames per second,
 /// so a burst larger than that is simply thrown away — and discarded frames
 /// are never acked, so the files they carried are republished from scratch on
 /// the next tick, forever. This sits well under that allowance to leave room
-/// for the searches, pings and gossip that share it. Whatever does not fit
-/// waits for the next tick.
+/// for the searches, pings and gossip that share it. Whatever does not fit is
+/// held over by [`flush_ember_batch_publish`] for the next flush.
 ///
 /// The case that makes this matter is a *small* table: `find_closest` returns
 /// every peer it knows for every key, so each destination's queue holds the
 /// entire tick's output rather than a twentieth of it.
 const EMBER_MAX_BATCH_FRAMES_PER_PEER: usize = 12;
+
+/// Records we will send one peer per minute.
+///
+/// The binding limit is the *receiver's*, not ours:
+/// [`scale::NetworkScale::max_stores_per_minute`] charges a storer's budget per
+/// record and refuses the rest, and a refused record is never acked, so
+/// overshooting means republishing it forever. A storer with a healthy table
+/// enforces the strictest tier and we cannot see which tier a given peer is in,
+/// so pace to that rather than to the more generous bootstrap figure.
+const EMBER_STORE_RECORDS_PER_PEER_PER_MIN: u32 = 120;
+
+/// How often the queued records are drained.
+///
+/// Publishing used to flush only on the 60-second publish tick, so whatever a
+/// destination's frame budget could not carry waited a whole minute even on an
+/// idle link — and before carry-over existed it was simply discarded. Draining
+/// on a short cadence clears a backlog in minutes instead of tens of minutes,
+/// while [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`] still holds the average to
+/// what a storer will accept and [`EMBER_MAX_BATCH_FRAMES_PER_PEER`] keeps any
+/// single flush well under the receiver's per-second frame limit.
+const EMBER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Records one destination may hold over to later flushes.
+///
+/// Carry-over exists so that work already selected is not silently lost, not
+/// as an unbounded spool. Without a per-peer bound, one peer that never drains
+/// would fill [`EMBER_BATCH_QUEUE_MAX`] on its own and `enqueue` would then
+/// refuse work for every other destination too. Past this the excess is
+/// dropped and its files are returned to the due pool, which is the honest
+/// outcome: it is the selection budget that should come down, and
+/// [`ember_keyword_files_per_tick`] and [`ember_source_files_per_tick`] size
+/// themselves so this is not reached in the steady state.
+const EMBER_MAX_CARRY_OVER_PER_PEER: usize = 256;
 /// How many nodes each record is replicated to. Kademlia's k, and the same
 /// value `PublishManager` uses for the single-record path.
 const K_EMBER_REPLICAS: usize = ember::dht::K_BUCKET_SIZE;
@@ -8930,24 +9533,90 @@ impl EmberBatchPublisher {
             .collect()
     }
 
-    /// Drop batches whose ack never came, returning how many records they
-    /// carried so the failure is visible rather than silent.
-    fn expire(&mut self, now: std::time::Instant) -> usize {
-        let mut abandoned = 0usize;
+    /// Drop batches whose ack never came, returning the records they carried.
+    ///
+    /// The references are returned rather than merely counted because these are
+    /// the only publishes known to have reached the wire and failed, which is
+    /// what [`charge_ember_publish_failure`] is allowed to hold against a file.
+    fn expire(&mut self, now: std::time::Instant) -> Vec<EmberRecordRef> {
+        let mut abandoned = Vec::new();
         self.in_flight.retain(|_, b| {
             let live = now.duration_since(b.sent_at) < EMBER_BATCH_ACK_TIMEOUT;
             if !live {
-                abandoned += b.records.len();
+                abandoned.extend_from_slice(&b.records);
             }
             live
         });
         abandoned
     }
 
+    /// Put records the flush could not send back under their destination,
+    /// newest work behind them, returning how many had to be dropped because
+    /// the destination is already holding its limit.
+    fn carry_over(
+        &mut self,
+        node_id: ember::dht::EmberNodeId,
+        contact: &ember::dht::EmberContact,
+        mut tail: Vec<EmberQueuedRecord>,
+    ) -> Vec<EmberRecordRef> {
+        let entry = self
+            .queued
+            .entry(node_id)
+            .or_insert_with(|| (contact.clone(), Vec::new()));
+        let room = EMBER_MAX_CARRY_OVER_PER_PEER.saturating_sub(entry.1.len());
+        let dropped: Vec<EmberRecordRef> = tail
+            .split_off(tail.len().min(room))
+            .into_iter()
+            .map(|q| q.reference)
+            .collect();
+        self.queued_count += tail.len();
+        // Ahead of anything queued since, so the oldest work still goes first.
+        let held = std::mem::replace(&mut entry.1, tail);
+        entry.1.extend(held);
+        if entry.1.is_empty() {
+            self.queued.remove(&node_id);
+        }
+        dropped
+    }
+
+    /// Records this peer may still be sent this minute.
+    fn record_allowance(&mut self, node_id: ember::dht::EmberNodeId, now: std::time::Instant) -> usize {
+        match self.sent_window.get(&node_id) {
+            Some((used, since)) if now.duration_since(*since) < std::time::Duration::from_secs(60) => {
+                EMBER_STORE_RECORDS_PER_PEER_PER_MIN.saturating_sub(*used) as usize
+            }
+            _ => EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize,
+        }
+    }
+
+    fn note_records_sent(
+        &mut self,
+        node_id: ember::dht::EmberNodeId,
+        now: std::time::Instant,
+        records: usize,
+    ) {
+        if records == 0 {
+            return;
+        }
+        let entry = self.sent_window.entry(node_id).or_insert((0, now));
+        if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(records as u32);
+    }
+
+    /// Forget pacing state for peers we have not sent to in a while, so a long
+    /// session's churn cannot grow the map without bound.
+    fn prune_sent_window(&mut self, now: std::time::Instant) {
+        self.sent_window
+            .retain(|_, (_, since)| now.duration_since(*since) < std::time::Duration::from_secs(300));
+    }
+
     fn clear(&mut self) {
         self.queued.clear();
         self.queued_count = 0;
         self.in_flight.clear();
+        self.sent_window.clear();
     }
 }
 
@@ -8965,6 +9634,30 @@ fn fault_ember_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNode
         let addr = contact.addr;
         state.ember_transport.remove_session(&addr);
     }
+    evict_ember_contact_if_dead(state, node_id, why);
+}
+
+/// Count a failed *lookup* query against a contact, without tearing down its
+/// Noise session.
+///
+/// Weaker evidence than an unanswered liveness ping: a lookup query can time
+/// out because the peer is busy or because our own 5-second budget is tight, so
+/// dropping the session — and paying a handshake to rebuild it — would be
+/// premature. Counting it still matters. Before this, search timeouts touched
+/// only the search's own shortlist, so a dead gossip lead kept being chosen as
+/// a seed for every later lookup until the liveness sweep happened to reach it,
+/// which at eight pings a minute can be many minutes of five-second stalls.
+fn fault_ember_search_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNodeId) {
+    evict_ember_contact_if_dead(state, node_id, "unresponsive in lookup");
+}
+
+/// Charge one failure against a contact and evict it once it has missed
+/// `MAX_FAILED_QUERIES` in a row, promoting a replacement if one is waiting.
+fn evict_ember_contact_if_dead(
+    state: &mut NetworkState,
+    node_id: &ember::dht::EmberNodeId,
+    why: &str,
+) {
     if !state.ember_dht.mark_failed_contact(node_id) {
         return;
     }
@@ -9045,6 +9738,18 @@ const MAX_EMBER_PENDING_PINGS: usize = 1024;
 /// a lookup, long enough to tolerate a Noise handshake round trip.
 const EMBER_SEARCH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The same budget for a query still sitting behind a Noise handshake.
+///
+/// The transport reports such a frame as queued and rides it out once the
+/// handshake completes, so the peer has not been asked anything yet when the
+/// clock starts. Charging it the ordinary budget failed the contact before it
+/// could possibly answer — and on a cold table every contact is a first
+/// contact, so a fresh node's lookups failed almost everything they touched.
+/// Covers a Noise_XX 2-RTT setup plus the query round trip, and stays well
+/// inside the 60-second whole-search cap.
+const EMBER_SEARCH_QUEUED_QUERY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(12);
+
 // ── DHT maintenance (slice 6) ──
 
 /// How often the maintenance loop runs (bucket refresh, liveness pings,
@@ -9072,6 +9777,31 @@ const EMBER_RECORD_REPUBLISH_SECS: u64 = 3600;
 /// network with refreshes, pings, or republishes.
 const EMBER_MAINT_MAX_REFRESH: usize = 3;
 const EMBER_MAINT_MAX_PINGS: usize = 8;
+
+/// The liveness-ping budget while the table has too few proven contacts to
+/// work with.
+///
+/// A ping is the only way an unverified lead becomes usable, so this budget is
+/// also the rate at which a node joins. Eight a minute is a sensible steady-state
+/// trickle and a poor join: a table holding dozens of leads and one proven peer
+/// needs many minutes to find out which of them are real, and until it does,
+/// publishes replicate to that single peer and lookups walk a frontier of one.
+/// Verification is cheap — one small frame each — so the starved case gets a
+/// wider budget.
+const EMBER_MAINT_MAX_PINGS_STARVED: usize = 32;
+
+/// Verified contacts below which the starved ping budget applies. One
+/// k-bucket, the same bar the bridge and rendezvous lookup use for "joined".
+const EMBER_PING_STARVED_BELOW: usize = ember::dht::K_BUCKET_SIZE;
+
+/// Liveness pings this cycle, given how many contacts have actually answered.
+fn ember_maint_ping_budget(verified: usize) -> usize {
+    if verified < EMBER_PING_STARVED_BELOW {
+        EMBER_MAINT_MAX_PINGS_STARVED
+    } else {
+        EMBER_MAINT_MAX_PINGS
+    }
+}
 /// Records a storer replicates onward per maintenance cycle.
 ///
 /// At five per minute this capped storer-side replication at 300 records an
@@ -9084,10 +9814,18 @@ const EMBER_MAINT_MAX_REPUBLISH: usize = 200;
 const EMBER_MAINT_MAX_ANNOUNCE: usize = 2;
 
 /// KAD-bridge bootstrap (slice 13). While the Ember DHT routing table holds
-/// fewer than this many contacts, the maintenance loop folds in Ember peers
-/// learned from the live KAD network by DHT-pinging them; once the table
-/// reaches this size it's self-sustaining and the bridge goes quiet. One
+/// fewer than this many *verified* contacts, the maintenance loop folds in
+/// Ember peers learned from the live KAD network by DHT-pinging them; once the
+/// table reaches this size it's self-sustaining and the bridge goes quiet. One
 /// k-bucket's worth is plenty to seed iterative lookups + ongoing refresh.
+///
+/// Counted against contacts that have answered us, not `contact_count()`.
+/// Against the total, a node that had been handed twenty unverified gossip
+/// leads switched off both the bridge and the rendezvous lookup while holding
+/// exactly one peer it could actually reach — and unverified leads are
+/// precisely what the bridge exists to convert. That state is self-sustaining
+/// in the wrong direction: one usable contact is too thin a frontier for a
+/// lookup to discover anyone new.
 const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
 
 /// How often we re-advertise ourselves under the Ember rendezvous key.
@@ -9149,9 +9887,88 @@ const EMBER_CONTACT_STALE_SECS: i64 = 2 * 3600;
 /// inside the 24 h record TTL.
 const EMBER_SOURCE_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
 
-/// Max shared-file source records to (re)publish per `publish_timer` tick,
-/// so a large library can't fan out an unbounded burst of STOREs at once.
-const EMBER_SOURCE_PUBLISH_MAX_PER_TICK: usize = 5;
+/// Floor on shared-file source records (re)published per `publish_timer`
+/// tick, so a nearly-idle library still makes progress every minute.
+const EMBER_SOURCE_PUBLISH_MIN_PER_TICK: usize = 5;
+
+/// Hard ceiling on the same, so one tick's selection cannot become an
+/// arbitrarily long queue however large the library or the table.
+///
+/// The binding limit in practice is [`ember_deliverable_records_per_tick`]; this
+/// only bounds the extreme.
+const EMBER_SOURCE_PUBLISH_MAX_PER_TICK: usize = 256;
+
+/// Records a publish tick may queue and still expect the flush to deliver.
+///
+/// A record goes to `min(contacts, K_EMBER_REPLICAS)` peers, so with a table at
+/// or below k every peer receives every record and the deliverable total is one
+/// peer's minute of allowance. Above k the target sets diverge and the total
+/// scales with the table.
+///
+/// Queueing past this is not free. The overflow is held over by
+/// `flush_ember_batch_publish`, and past [`EMBER_MAX_CARRY_OVER_PER_PEER`] it is
+/// dropped and its files return to the due pool having achieved nothing — so a
+/// budget the flush cannot drain converts directly into wasted signing, wasted
+/// cloning, and files that never publish. The keyword path had exactly that
+/// shape: up to 96 files a tick, several records each, all landing on the same
+/// few peers on a small table.
+fn ember_deliverable_records_per_tick(contacts: usize) -> usize {
+    let per_peer = EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize;
+    if contacts <= K_EMBER_REPLICAS {
+        per_peer
+    } else {
+        per_peer.saturating_mul(contacts) / K_EMBER_REPLICAS.max(1)
+    }
+}
+
+/// Keyword records a filename is assumed to yield, for budgeting only.
+///
+/// `extract_keywords` splits on separators so the real count varies per name;
+/// budgeting on an estimate keeps selection O(1) per file rather than tokenising
+/// the library every tick. Erring high is the safe direction: underestimating
+/// produces a queue the flush cannot drain.
+const EMBER_KEYWORDS_PER_FILE_ESTIMATE: usize = 4;
+
+/// How many ticks a backlog of due source records should take to drain.
+///
+/// Only shapes a cold start — a first run, a re-enable (which clears the
+/// schedule), or a return from a long outage. In the steady state the backlog
+/// is one interval's worth of files and the floor covers it.
+const EMBER_SOURCE_BACKLOG_DRAIN_TICKS: usize = 10;
+
+/// Files whose source records go out this tick, for a library of
+/// `publishable` files with `due` of them currently past their interval.
+///
+/// Two things have to hold. A full pass must fit inside
+/// [`EMBER_SOURCE_REPUBLISH`], or the files past the cut are never published
+/// at all — a fixed five per tick covered only 600 files, the same silent
+/// cliff [`ember_keyword_files_per_tick`] exists to avoid. And a cold start
+/// should not take a whole pass to become findable: at five per tick a
+/// 160-file library needed half an hour before its last file existed on the
+/// network. The steady-state term guarantees the first, the backlog term the
+/// second, and the ceiling keeps either from outrunning the flush.
+///
+/// `contacts` is the routing-table size, which decides how much the flush can
+/// actually deliver — see [`ember_deliverable_records_per_tick`]. A source file
+/// is one record, so files and records are the same currency here.
+fn ember_source_files_per_tick(publishable: usize, due: usize, contacts: usize) -> usize {
+    let ticks_per_cycle = (EMBER_SOURCE_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs())
+        .max(1) as usize;
+    // Round up, then add ~25% headroom for ticks lost to an empty routing
+    // table or a failed flush.
+    let steady = publishable.div_ceil(ticks_per_cycle);
+    let steady = steady + steady.div_ceil(4);
+    let drain = due.div_ceil(EMBER_SOURCE_BACKLOG_DRAIN_TICKS);
+    let deliverable = ember_deliverable_records_per_tick(contacts)
+        .max(EMBER_SOURCE_PUBLISH_MIN_PER_TICK);
+    steady
+        .max(drain)
+        .clamp(
+            EMBER_SOURCE_PUBLISH_MIN_PER_TICK,
+            EMBER_SOURCE_PUBLISH_MAX_PER_TICK,
+        )
+        .min(deliverable)
+}
 
 // ── DHT keyword publishing (slice 8) ──
 
@@ -9183,16 +10000,28 @@ const EMBER_KEYWORD_PUBLISH_MAX_PER_TICK: usize = 96;
 /// everything beyond that silently never gets republished. The budget
 /// therefore follows library size: one full pass per interval, plus a little
 /// headroom for ticks lost to an empty routing table or a failed flush.
-fn ember_keyword_files_per_tick(publishable: usize) -> usize {
+///
+/// Then bounded by what the flush can deliver. Unlike a source file, a keyword
+/// file is *several* records — one per keyword, each to its own target set — so
+/// the file budget has to be divided by
+/// [`EMBER_KEYWORDS_PER_FILE_ESTIMATE`] before comparing against
+/// [`ember_deliverable_records_per_tick`]. Without that division a small table
+/// was asked for several hundred records a tick and could carry a few dozen.
+fn ember_keyword_files_per_tick(publishable: usize, contacts: usize) -> usize {
     let ticks_per_cycle = (EMBER_KEYWORD_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs())
         .max(1) as usize;
     // Round up, then add ~25% headroom.
     let per_tick = publishable.div_ceil(ticks_per_cycle);
     let with_headroom = per_tick + per_tick.div_ceil(4);
-    with_headroom.clamp(
-        EMBER_KEYWORD_PUBLISH_MIN_PER_TICK,
-        EMBER_KEYWORD_PUBLISH_MAX_PER_TICK,
-    )
+    let deliverable_files = (ember_deliverable_records_per_tick(contacts)
+        / EMBER_KEYWORDS_PER_FILE_ESTIMATE.max(1))
+    .max(EMBER_KEYWORD_PUBLISH_MIN_PER_TICK);
+    with_headroom
+        .clamp(
+            EMBER_KEYWORD_PUBLISH_MIN_PER_TICK,
+            EMBER_KEYWORD_PUBLISH_MAX_PER_TICK,
+        )
+        .min(deliverable_files)
 }
 
 /// How often a download re-queries the Ember DHT for sources, indexed by
@@ -9336,25 +10165,48 @@ fn parse_ember_file_hash(hash_hex: &str) -> [u8; 32] {
     out
 }
 
-/// Set Library KAD / eD2K badges from real publish/offer state, not mere connectivity.
+/// Set the Library KAD / eD2K / Ember badges from real publish/offer state,
+/// not mere connectivity.
 fn apply_publish_badges(
     files: &mut [FileInfo],
     kad_connected: bool,
     server_connected: bool,
+    ember_enabled: bool,
     kad_published: &HashSet<[u8; 16]>,
     ed2k_offered: &HashSet<[u8; 16]>,
+    ember_published: &HashSet<[u8; 16]>,
 ) {
     for f in files {
         let hash = parse_ed2k_hash16(&f.hash);
         // A friends-only file is never published or offered, so its badges
-        // must stay dark even while both networks are connected.
+        // must stay dark even while every network is connected.
         let listable = f.is_public_listable();
         f.shared_kad =
             listable && kad_connected && hash.map(|h| kad_published.contains(&h)).unwrap_or(false);
         f.shared_ed2k = listable
             && server_connected
             && hash.map(|h| ed2k_offered.contains(&h)).unwrap_or(false);
+        f.shared_ember = listable
+            && ember_enabled
+            && hash.map(|h| ember_published.contains(&h)).unwrap_or(false);
     }
+}
+
+/// How many files currently carry each publish badge.
+///
+/// Used to decide whether a cache refresh is worth telling the Library about.
+/// Counting rather than diffing pairwise keeps this allocation-free and
+/// independent of index ordering; the rare case where one file gains a badge
+/// in the same tick another loses it is covered by the next refresh, and an
+/// unshare emits its own event anyway.
+fn badge_counts(files: &[FileInfo]) -> (usize, usize, usize) {
+    files.iter().fold((0, 0, 0), |(kad, ed2k, ember), f| {
+        (
+            kad + f.shared_kad as usize,
+            ed2k + f.shared_ed2k as usize,
+            ember + f.shared_ember as usize,
+        )
+    })
 }
 
 fn record_offered_ed2k_hashes(state: &mut NetworkState, files: &[ed2k::server::OfferFile]) {
@@ -11356,12 +12208,16 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
     state.ember_keyword_publish_at.clear();
+    // Library badges must go dark with the feature: the records we placed
+    // will age out of the network and we are no longer republishing them.
+    state.ember_published_sources.clear();
     state.ember_search = ember::dht::search::SearchManager::new();
     state.ember_publish = ember::dht::publish::PublishManager::new();
     state.ember_batch_publish.clear();
     state.ember_announced_at.clear();
     state.ember_publish_unplaced.clear();
     state.ember_publish_attempts.clear();
+    state.ember_publish_pass = EmberPublishPassStats::default();
 
     // KAD-bridge discovery caches: only meaningful while the transport is
     // live, and the attempted-set in particular would otherwise grow
@@ -12094,6 +12950,7 @@ pub async fn start_network(
         ember_announced_at: HashMap::new(),
         ember_publish_unplaced: HashMap::new(),
         ember_publish_attempts: HashMap::new(),
+        ember_publish_pass: EmberPublishPassStats::default(),
         ember_batch_publish: EmberBatchPublisher::default(),
         ember_started_at: chrono::Utc::now().timestamp(),
         ember_self_lookup_done: false,
@@ -12172,6 +13029,7 @@ pub async fn start_network(
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
+        ember_published_sources: HashSet::new(),
         ember_keyword_searches: HashMap::new(),
         ember_pending_keyword_results: Vec::new(),
         ember_download_source_searches: HashMap::new(),
@@ -12862,6 +13720,13 @@ pub async fn start_network(
     // (combined with EMBER_SEARCH_QUERY_TIMEOUT) without busy-spinning.
     let mut ember_search_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     ember_search_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Drain queued STORE records. Separate from the 60-second publish tick
+    // that fills the queue: a tick's worth routinely exceeds one peer's frame
+    // budget, and holding the overflow until the next tick wasted most of a
+    // minute per batch.
+    let mut ember_flush_timer = tokio::time::interval(EMBER_FLUSH_INTERVAL);
+    ember_flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Periodic DHT maintenance: bucket refresh, contact liveness pings,
     // and record republish. Each task is internally gated on a much longer
@@ -14616,6 +15481,7 @@ pub async fn start_network(
                                     friends_only: completed_friends_only,
                                     shared_kad: false,
                                     shared_ed2k: false,
+                                    shared_ember: false,
                                 };
                                 let shared_file = {
                                     let mut index = local_index.write().await;
@@ -14658,8 +15524,10 @@ pub async fn start_network(
                                         &mut snap,
                                         kad_connected,
                                         state.server_connected,
+                                        settings.ember_native_enabled,
                                         &kad_published,
                                         &state.offered_ed2k_hashes,
+                                        &state.ember_published_sources,
                                     );
                                     *shared_files.write().await = snap;
                                 }
@@ -20191,6 +21059,36 @@ pub async fn start_network(
                 )
                 .await;
 
+                // Ember's own publish heartbeat. Every other publish line in
+                // the log comes from KAD, so without this there was no way to
+                // tell a tick that delivered its records from one that dropped
+                // them — which for a long time was most of them.
+                if settings.ember_native_enabled {
+                    let contacts = state.ember_dht.contact_count();
+                    let verified = state.ember_dht.routing().verified_len();
+                    let queued = state.ember_batch_publish.queued_count;
+                    let in_flight = state.ember_batch_publish.in_flight.len();
+                    let unplaced = state.ember_publish_unplaced.len();
+                    let pass = state.ember_publish_pass;
+                    if contacts > 0 || queued > 0 || pass.due > 0 {
+                        info!(
+                            "Ember publish cycle: contacts={contacts} ({verified} verified), \
+                             due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \
+                             in-flight={in_flight}, sent={} in {} frame(s), held over={}, \
+                             dropped={}, acked={}, failed={}",
+                            pass.due,
+                            pass.selected,
+                            pass.flush.records_sent,
+                            pass.flush.frames_sent,
+                            pass.flush.records_carried,
+                            pass.flush.records_dropped,
+                            state.ember_diagnostics.ember_dht_stores_acked,
+                            state.ember_diagnostics.ember_dht_stores_failed,
+                        );
+                    }
+                    state.ember_publish_pass = EmberPublishPassStats::default();
+                }
+
                 if state.stats.status == NetworkStatus::Disconnected { return; }
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
@@ -24488,6 +25386,7 @@ pub async fn start_network(
                                                 friends_only: false,
                                                 shared_kad: false,
                                                 shared_ed2k: false,
+                                                shared_ember: false,
                                             },
                                         peer_id: String::new(),
                                         peer_name: String::new(),
@@ -25959,6 +26858,7 @@ pub async fn start_network(
                                             friends_only: false,
                                             shared_kad: false,
                                             shared_ed2k: false,
+                                            shared_ember: false,
                                         },
                                         peer_id: format!("{}:{}", sr.client_id, sr.client_port),
                                         peer_name: String::new(),
@@ -28409,6 +29309,18 @@ pub async fn start_network(
                 }
             }
 
+            _ = ember_flush_timer.tick() => {
+                let __panic_result = std::panic::AssertUnwindSafe(async {
+                if state.ember_batch_publish.queued.is_empty() {
+                    return;
+                }
+                flush_ember_batch_publish(&udp_socket, &mut state).await;
+                }).catch_unwind().await;
+                if let Err(__p) = __panic_result {
+                    error!("Network loop arm 'ember_flush_timer' panicked: {}", describe_panic(&*__p));
+                }
+            }
+
             _ = ember_search_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 // Cheap when idle: the maps are empty unless an iterative
@@ -28432,15 +29344,21 @@ pub async fn start_network(
                 let stale: Vec<u32> = state
                     .ember_dht_search_requests
                     .iter()
-                    .filter(|(_, r)| now.duration_since(r.sent_at) > EMBER_SEARCH_QUERY_TIMEOUT)
+                    .filter(|(_, r)| now >= r.deadline)
                     .map(|(wire_id, _)| *wire_id)
                     .collect();
 
                 let mut touched: HashSet<u32> = HashSet::new();
                 for wire_id in stale {
                     if let Some(req) = state.ember_dht_search_requests.remove(&wire_id) {
-                        if let Some(search) = state.ember_search.get_mut(req.search_id) {
-                            search.mark_failed(req.per_search_req_id);
+                        let failed = state
+                            .ember_search
+                            .get_mut(req.search_id)
+                            .and_then(|search| search.mark_failed(req.per_search_req_id));
+                        // Also hold it against the table, or the same dead lead
+                        // seeds the next lookup and stalls that one too.
+                        if let Some(node_id) = failed {
+                            fault_ember_search_contact(&mut state, &node_id);
                         }
                         touched.insert(req.search_id);
                     }
@@ -28541,12 +29459,25 @@ pub async fn start_network(
                 // published, so the next tick retries them — but count the
                 // records, or the acked/failed pair on the diagnostics page
                 // would show acks with no matching failures.
+                //
+                // This is also the only place a publish is *known* to have
+                // reached the wire and failed, so it is where the backoff is
+                // charged. Charging at selection instead penalised files whose
+                // records the flush had discarded before sending.
                 let abandoned = state.ember_batch_publish.expire(now);
-                if abandoned > 0 {
+                if !abandoned.is_empty() {
                     state.ember_diagnostics.ember_dht_stores_failed = state
                         .ember_diagnostics
                         .ember_dht_stores_failed
-                        .saturating_add(abandoned as u32);
+                        .saturating_add(abandoned.len() as u32);
+                    for reference in abandoned {
+                        charge_ember_publish_failure(
+                            state.publish_schedule(),
+                            reference.file_hash,
+                            reference.kind,
+                            now,
+                        );
+                    }
                 }
 
                 // 6) Inject sources discovered by completed download source
@@ -28725,7 +29656,7 @@ pub async fn start_network(
                 // and gossip takes over.
                 let rendezvous_now = chrono::Utc::now().timestamp();
                 if settings.ember_native_enabled
-                    && state.ember_dht.contact_count() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+                    && state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
                     && state.ember_rendezvous_search.is_none()
                     && rendezvous_now.saturating_sub(state.ember_rendezvous_looked_up_at)
                         > EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS
@@ -28841,8 +29772,10 @@ pub async fn start_network(
                 let changed_count = updates.len();
                 let kad_connected = state.stats.status == NetworkStatus::Connected;
                 let srv_connected = state.server_connected;
+                let ember_enabled = settings.ember_native_enabled;
                 let kad_published = state.publish_manager.source_published_md4_hashes();
                 let ed2k_offered = state.offered_ed2k_hashes.clone();
+                let ember_published = state.ember_published_sources.clone();
                 tokio::spawn(async move {
                     let file_snap = {
                         let index = li_ref.read().await;
@@ -28851,8 +29784,10 @@ pub async fn start_network(
                             &mut snap,
                             kad_connected,
                             srv_connected,
+                            ember_enabled,
                             &kad_published,
                             &ed2k_offered,
+                            &ember_published,
                         );
                         snap
                     };
@@ -29429,10 +30364,13 @@ pub async fn start_network(
                 let s_files = shared_files.clone();
                 let db_ref = db.clone();
                 let li_ref = local_index.clone();
+                let app_for_cache = app_handle.clone();
                 let kad_connected = state.stats.status == NetworkStatus::Connected;
                 let srv_connected = state.server_connected;
+                let ember_enabled = settings.ember_native_enabled;
                 let kad_published = state.publish_manager.source_published_md4_hashes();
                 let ed2k_offered = state.offered_ed2k_hashes.clone();
+                let ember_published = state.ember_published_sources.clone();
                 last_cache_refresh_started_at = chrono::Utc::now().timestamp();
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
@@ -29450,8 +30388,10 @@ pub async fn start_network(
                             &mut snap,
                             kad_connected,
                             srv_connected,
+                            ember_enabled,
                             &kad_published,
                             &ed2k_offered,
+                            &ember_published,
                         );
                         snap
                     };
@@ -29510,7 +30450,29 @@ pub async fn start_network(
                     // preparation step. The watchdog never aborts this task, so
                     // a refresh cannot leave only the leading subset of this
                     // cache bundle updated.
-                    *s_files.write().await = file_snap;
+                    //
+                    // This is also the only place the KAD / eD2K / Ember publish
+                    // badges are computed, and a file that has just finished
+                    // publishing gives the Library no other reason to re-read the
+                    // list — it reloads on `shared-files-changed` alone. Emit when
+                    // a badge actually flips, so the flags land in the UI without
+                    // waiting on unrelated activity and without reloading the
+                    // whole list on a five-second clock.
+                    let badges_changed = {
+                        let mut cache = s_files.write().await;
+                        let changed = badge_counts(&file_snap) != badge_counts(&cache);
+                        *cache = file_snap;
+                        changed
+                    };
+                    if badges_changed {
+                        let _ = app_for_cache.emit(
+                            "shared-files-changed",
+                            serde_json::json!({
+                                "phase": "publish-badges",
+                                "count": 0,
+                            }),
+                        );
+                    }
                 }));
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -31065,6 +32027,10 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             }
         };
 
+        // Tracked separately from `send_ok`: a query still sitting behind a
+        // handshake has not reached the peer yet, so the ordinary query budget
+        // would expire it before it was ever asked anything.
+        let mut behind_handshake = false;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -31084,8 +32050,12 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 }
             }
             // A handshake to this peer is already in flight; the frame is
-            // queued and will ride out when it completes — treat as sent.
-            ember::transport::OutgoingResult::Queued => true,
+            // queued and will ride out when it completes — treat as sent, but
+            // give it the longer budget below.
+            ember::transport::OutgoingResult::Queued => {
+                behind_handshake = true;
+                true
+            }
             ember::transport::OutgoingResult::Error(e) => {
                 debug!(
                     "Ember DHT search {search_id}: transport error for {}: {e}",
@@ -31097,9 +32067,14 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
 
         if !send_ok {
             // Couldn't get the query out — fail this shortlist entry so
-            // the search doesn't wait on a node we never reached.
-            if let Some(s) = state.ember_search.get_mut(search_id) {
-                s.mark_failed(per_search_req_id);
+            // the search doesn't wait on a node we never reached, and treat a
+            // contact we cannot even transmit to the same way maintenance does.
+            let failed = state
+                .ember_search
+                .get_mut(search_id)
+                .and_then(|s| s.mark_failed(per_search_req_id));
+            if let Some(node_id) = failed {
+                fault_ember_contact(state, &node_id, "unreachable");
             }
             continue;
         }
@@ -31116,12 +32091,17 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 .saturating_add(1);
         }
         batch_sent = batch_sent.saturating_add(1);
+        let budget = if behind_handshake {
+            EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
+        } else {
+            EMBER_SEARCH_QUERY_TIMEOUT
+        };
         state.ember_dht_search_requests.insert(
             wire_req_id,
             EmberSearchRequest {
                 search_id,
                 per_search_req_id,
-                sent_at: std::time::Instant::now(),
+                deadline: std::time::Instant::now() + budget,
             },
         );
     }
@@ -31416,6 +32396,7 @@ fn build_ember_keyword_results(
                         friends_only: false,
                         shared_kad: false,
                         shared_ed2k: false,
+                        shared_ember: false,
                     },
                     peer_id: String::new(),
                     peer_name: String::new(),
@@ -31456,16 +32437,31 @@ fn majority_ember_digest_hex(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) ->
 /// Send everything the batch publisher has queued, one or more `STORE_BATCH`
 /// datagrams per destination.
 ///
-/// A destination whose send fails simply keeps its records unsent; the files
-/// stay due and the next tick retries them.
+/// Whatever a destination's frame budget could not carry is held over for the
+/// next flush rather than discarded. Dropping it looked harmless because the
+/// file stayed due, but the file had already been charged a publish attempt at
+/// selection: three ticks of that parked it for a full republish interval
+/// without one of its records ever having left the host.
+/// Totals accumulate into `state.ember_publish_pass.flush` rather than being
+/// returned, because the drain runs both from the publish tick and from its own
+/// timer and the heartbeat wants the sum of both.
 async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState) {
+    let mut stats = EmberFlushStats::default();
+    let flush_at = std::time::Instant::now();
+    state.ember_batch_publish.prune_sent_window(flush_at);
     let destinations: Vec<ember::dht::EmberNodeId> =
         state.ember_batch_publish.queued.keys().copied().collect();
 
     for node_id in destinations {
-        let Some((contact, queued)) = state.ember_batch_publish.queued.remove(&node_id) else {
+        let Some((contact, mut queued)) = state.ember_batch_publish.queued.remove(&node_id) else {
             continue;
         };
+        // What this peer will still accept this minute. Sending past it wastes
+        // the records outright: the storer's rate limiter refuses them and
+        // never acks, so they would be republished from scratch forever.
+        let allowance = state
+            .ember_batch_publish
+            .record_allowance(node_id, flush_at);
         state.ember_batch_publish.queued_count = state
             .ember_batch_publish
             .queued_count
@@ -31477,8 +32473,14 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
             queued.iter().map(|q| q.record.clone()).collect();
         let mut offset = 0usize;
         let mut frames_sent = 0usize;
+        let mut records_sent = 0usize;
+        // Records that can never be sent, as opposed to ones merely held over.
+        let mut unsendable: Vec<EmberRecordRef> = Vec::new();
 
-        while offset < wire.len() && frames_sent < EMBER_MAX_BATCH_FRAMES_PER_PEER {
+        while offset < wire.len()
+            && frames_sent < EMBER_MAX_BATCH_FRAMES_PER_PEER
+            && records_sent < allowance
+        {
             // A record too large for any batch would otherwise stall this
             // destination forever and take every record behind it with it.
             // Skip just that one and carry on.
@@ -31487,11 +32489,15 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                     "Ember batch publish: skipping a {}-byte record that cannot fit a datagram",
                     wire[offset].record.len()
                 );
+                unsendable.push(queued[offset].reference);
                 offset += 1;
                 continue;
             }
+            // Offer the packer only as many records as the peer's remaining
+            // allowance covers, so a full datagram cannot overshoot it.
+            let window = (offset + (allowance - records_sent)).min(wire.len());
             let Some((wire_req_id, frame, taken)) =
-                state.ember_dht.build_store_batch(&wire[offset..])
+                state.ember_dht.build_store_batch(&wire[offset..window])
             else {
                 break;
             };
@@ -31525,12 +32531,17 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                 .iter()
                 .map(|q| q.reference)
                 .collect();
-            offset += taken;
-            frames_sent += 1;
 
             if !sent {
+                // Leave `offset` alone so this frame's records are held over
+                // with the rest of the tail rather than counted as delivered.
                 break;
             }
+            offset += taken;
+            frames_sent += 1;
+            records_sent += taken;
+            stats.frames_sent += 1;
+            stats.records_sent += taken;
             state.ember_batch_publish.in_flight.insert(
                 wire_req_id,
                 EmberBatchInFlight {
@@ -31540,7 +32551,38 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                 },
             );
         }
+
+        state
+            .ember_batch_publish
+            .note_records_sent(node_id, flush_at, records_sent);
+
+        if offset < queued.len() {
+            let tail = queued.split_off(offset);
+            let held = tail.len();
+            let dropped = state
+                .ember_batch_publish
+                .carry_over(node_id, &contact, tail);
+            stats.records_carried += held - dropped.len();
+            stats.records_dropped += dropped.len();
+            // A record we gave up on must stop counting against its file, or
+            // the file sits marked as pending a placement that will never come
+            // and `skip-pending` selection never offers it again.
+            for reference in dropped {
+                untrack_ember_record_pending(state.publish_schedule(), reference);
+            }
+        }
+        stats.records_dropped += unsendable.len();
+        for reference in unsendable {
+            untrack_ember_record_pending(state.publish_schedule(), reference);
+        }
     }
+
+    let window = &mut state.ember_publish_pass.flush;
+    window.frames_sent += stats.frames_sent;
+    window.records_sent += stats.records_sent;
+    window.records_dropped += stats.records_dropped;
+    // Not cumulative: this is the depth still waiting, not a rate.
+    window.records_carried = stats.records_carried;
 }
 
 /// Push a publish forward: pull the targets not yet stored on, send each
@@ -31669,6 +32711,18 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
         .retain(|_, r| r.publish_id != publish_id);
 }
 
+/// Whether the batch queue still holds more than a tick's deliverable work.
+///
+/// Backpressure for the selection paths. The flush holds over what it cannot
+/// send, so a tick that selects while the queue is already deep only pushes the
+/// backlog closer to [`EMBER_MAX_CARRY_OVER_PER_PEER`], where it is dropped and
+/// the files return to the due pool having cost a signature and a clone each.
+/// Waiting a tick for the drain to catch up is strictly better.
+fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
+    state.ember_batch_publish.queued_count
+        >= ember_deliverable_records_per_tick(state.ember_dht.contact_count())
+}
+
 /// Whether a library file may be advertised on the Ember DHT.
 ///
 /// Scope is decided by `is_public_listable`, never by `shared` alone: a
@@ -31711,6 +32765,7 @@ mod ember_publish_scope_tests {
             friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
+            shared_ember: false,
         }
     }
 
@@ -31811,6 +32866,11 @@ async fn maybe_publish_ember_sources(
         state.ember_diagnostics.ember_dht_firewalled_publishing = true;
     }
 
+    // Gauges above are wanted every tick, so this comes after them.
+    if ember_publish_queue_is_backed_up(state) {
+        return;
+    }
+
     // Select shared files whose source record is missing or past its
     // republish interval, bounded per tick. Snapshot under a short read lock
     // so it isn't held across the publish awaits below.
@@ -31825,6 +32885,7 @@ async fn maybe_publish_ember_sources(
         let idx = local_index.read().await;
         let files = idx.all_files();
         let mut ranked: Vec<(u64, usize)> = Vec::new();
+        let mut publishable = 0usize;
         for (i, f) in files.iter().enumerate() {
             if !is_ember_publishable(f) {
                 continue;
@@ -31835,20 +32896,27 @@ async fn maybe_publish_ember_sources(
             else {
                 continue;
             };
-            let staleness = match state.ember_source_publish_at.get(&hash) {
-                None => u64::MAX,
-                Some(t) => {
-                    let elapsed = now.duration_since(*t);
-                    if elapsed < EMBER_SOURCE_REPUBLISH {
-                        continue;
-                    }
-                    elapsed.as_secs()
-                }
+            publishable += 1;
+            let Some(staleness) = ember_publish_staleness(
+                &state.ember_publish_unplaced,
+                &state.ember_source_publish_at,
+                hash,
+                EmberPublishKind::Source,
+                EMBER_SOURCE_REPUBLISH,
+                now,
+            ) else {
+                continue;
             };
             ranked.push((staleness, i));
         }
         ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        ranked.truncate(EMBER_SOURCE_PUBLISH_MAX_PER_TICK);
+        state.ember_publish_pass.due += ranked.len();
+        ranked.truncate(ember_source_files_per_tick(
+            publishable,
+            ranked.len(),
+            state.ember_dht.contact_count(),
+        ));
+        state.ember_publish_pass.selected += ranked.len();
         ranked
             .into_iter()
             .filter_map(|(_, i)| {
@@ -31912,13 +32980,10 @@ async fn maybe_publish_ember_sources(
         // peer acks, so a publish that reached nobody is retried next tick
         // instead of locking the file out for the full republish interval —
         // which is what happened when the timestamp was written at dispatch.
-        if ember_publish_backoff_exhausted(state, file_hash, EmberPublishKind::Source) {
-            continue;
-        }
-        let targets = state
-            .ember_dht
-            .routing()
-            .find_closest(&ember::dht::EmberNodeId(record.keyword_hash), K_EMBER_REPLICAS);
+        let targets = state.ember_dht.routing().find_closest_prefer_verified(
+            &ember::dht::EmberNodeId(record.keyword_hash),
+            K_EMBER_REPLICAS,
+        );
         let reference = EmberRecordRef {
             file_hash,
             kind: EmberPublishKind::Source,
@@ -31933,7 +32998,7 @@ async fn maybe_publish_ember_sources(
                 record_signature: record.signature,
             },
         ) {
-            track_ember_record_pending(state, reference);
+            track_ember_record_pending(state.publish_schedule(), reference);
         }
 
         // Buddy path: also ask HighID contacts to STORE on our behalf when
@@ -32000,6 +33065,9 @@ async fn maybe_publish_ember_keywords(
     if !settings.ember_native_enabled || state.ember_dht.contact_count() == 0 {
         return;
     }
+    if ember_publish_queue_is_backed_up(state) {
+        return;
+    }
 
     let now = std::time::Instant::now();
     let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
@@ -32016,15 +33084,15 @@ async fn maybe_publish_ember_keywords(
             else {
                 continue;
             };
-            let staleness = match state.ember_keyword_publish_at.get(&hash) {
-                None => u64::MAX,
-                Some(t) => {
-                    let elapsed = now.duration_since(*t);
-                    if elapsed < EMBER_KEYWORD_REPUBLISH {
-                        continue;
-                    }
-                    elapsed.as_secs()
-                }
+            let Some(staleness) = ember_publish_staleness(
+                &state.ember_publish_unplaced,
+                &state.ember_keyword_publish_at,
+                hash,
+                EmberPublishKind::Keyword,
+                EMBER_KEYWORD_REPUBLISH,
+                now,
+            ) else {
+                continue;
             };
             ranked.push((staleness, i));
         }
@@ -32033,7 +33101,12 @@ async fn maybe_publish_ember_keywords(
         // republishing everything past the first few thousand files.
         let publishable = files.iter().filter(|f| is_ember_publishable(f)).count();
         ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        ranked.truncate(ember_keyword_files_per_tick(publishable));
+        state.ember_publish_pass.due += ranked.len();
+        ranked.truncate(ember_keyword_files_per_tick(
+            publishable,
+            state.ember_dht.contact_count(),
+        ));
+        state.ember_publish_pass.selected += ranked.len();
         ranked
             .into_iter()
             .filter_map(|(_, i)| {
@@ -32066,9 +33139,6 @@ async fn maybe_publish_ember_keywords(
             files_with_no_keywords.push(file_hash);
             continue;
         }
-        if ember_publish_backoff_exhausted(state, file_hash, EmberPublishKind::Keyword) {
-            continue;
-        }
         for keyword in keywords {
             let record = state.ember_dht.build_keyword_record(
                 &keyword,
@@ -32084,10 +33154,10 @@ async fn maybe_publish_ember_keywords(
             // Queue rather than send: records bound for the same peer travel
             // together, which is what makes a large library's republish cycle
             // fit inside the record TTL.
-            let targets = state
-                .ember_dht
-                .routing()
-                .find_closest(&ember::dht::EmberNodeId(record.keyword_hash), K_EMBER_REPLICAS);
+            let targets = state.ember_dht.routing().find_closest_prefer_verified(
+                &ember::dht::EmberNodeId(record.keyword_hash),
+                K_EMBER_REPLICAS,
+            );
             let reference = EmberRecordRef {
                 file_hash,
                 kind: EmberPublishKind::Keyword,
@@ -32103,7 +33173,7 @@ async fn maybe_publish_ember_keywords(
                 },
             );
             if queued {
-                track_ember_record_pending(state, reference);
+                track_ember_record_pending(state.publish_schedule(), reference);
             }
         }
     }
@@ -32172,7 +33242,7 @@ async fn run_ember_maintenance(
     //    table is bootstrapped, so steady-state KAD traffic doesn't spray
     //    DHT pings. `force` (the dev-panel button) bypasses the size gate so
     //    the bridge can be exercised on demand.
-    if force || state.ember_dht.contact_count() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+    if force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
         let candidates = kad_bridge_candidates(
             &state.ember_noise_keys,
             &state.ember_kad_bridge_attempted,
@@ -32380,12 +33450,11 @@ async fn run_ember_maintenance(
     //    A PONG refreshes the contact; silence past EMBER_MAINT_PING_TIMEOUT
     //    faults it (and eventually evicts it) in the 1-second sweep.
     let now = chrono::Utc::now().timestamp();
-    let due = state.ember_dht.contacts_due_for_ping(
-        now,
-        EMBER_CONTACT_PING_SECS,
-        EMBER_MAINT_MAX_PINGS,
-        force,
-    );
+    let ping_budget = ember_maint_ping_budget(state.ember_dht.routing().verified_len());
+    let due =
+        state
+            .ember_dht
+            .contacts_due_for_ping(now, EMBER_CONTACT_PING_SECS, ping_budget, force);
     for contact in due {
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let send_ok = match state.ember_transport.prepare_outgoing(
@@ -32457,10 +33526,10 @@ async fn run_ember_maintenance(
             Some(r) => r,
             None => continue, // already verified when stored; skip if somehow malformed
         };
-        let targets = state
-            .ember_dht
-            .routing()
-            .find_closest(&ember::dht::EmberNodeId(record.keyword_hash), K_EMBER_REPLICAS);
+        let targets = state.ember_dht.routing().find_closest_prefer_verified(
+            &ember::dht::EmberNodeId(record.keyword_hash),
+            K_EMBER_REPLICAS,
+        );
         // Replication carries someone else's record, so there is no local
         // file schedule to advance; the reference is only used to line the
         // ack bitmap up.
@@ -37585,6 +38654,7 @@ async fn handle_command_inner(
             diag.local_ed25519_public_key = hex::encode(state.ember_dht.ed25519_public_key());
             diag.ember_dht_contacts = state.ember_dht.contact_count() as u32;
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
+            diag.ember_dht_published_files = state.ember_published_sources.len() as u32;
             let (store_keys, store_records) = state.ember_dht.store_stats();
             diag.ember_dht_stored_keys = store_keys as u32;
             diag.ember_dht_stored_records = store_records as u32;
@@ -40027,6 +41097,17 @@ async fn handle_command_inner(
             state
                 .source_publish_acks
                 .retain(|hash, _| desired.contains(hash));
+            // Same eviction for the Ember badge set. Ember publishes only
+            // complete, publicly listable files (no partials), so unsharing
+            // one must darken its badge exactly as it does for KAD.
+            let ember_keep: HashSet<[u8; 16]> = all_index_files
+                .iter()
+                .filter(|f| f.is_public_listable())
+                .filter_map(|f| parse_ed2k_hash16(&f.hash))
+                .collect();
+            state
+                .ember_published_sources
+                .retain(|hash| ember_keep.contains(hash));
             info!("Re-populated publish manager with {shared_count} shared + {partial_count} partial downloads after change");
 
             // eMule: re-send OP_OFFERFILES to the server when shared files change
@@ -42461,6 +43542,7 @@ fn convert_search_results(
                         friends_only: false,
                         shared_kad: false,
                         shared_ed2k: false,
+                        shared_ember: false,
                     },
                     peer_id: p.source_addr,
                     peer_name: String::new(),
@@ -42594,6 +43676,7 @@ fn convert_note_search_results(
                     friends_only: false,
                     shared_kad: false,
                     shared_ed2k: false,
+                    shared_ember: false,
                 },
                 peer_id: publisher_hex,
                 peer_name,

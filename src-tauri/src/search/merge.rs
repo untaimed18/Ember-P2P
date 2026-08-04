@@ -297,6 +297,7 @@ mod tests {
                 friends_only: false,
                 shared_kad: false,
                 shared_ed2k: false,
+                shared_ember: false,
             },
             peer_id: String::new(),
             peer_name: String::new(),

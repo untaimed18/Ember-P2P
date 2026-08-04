@@ -308,6 +308,7 @@ impl FileIndexer {
             friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
+            shared_ember: false,
         })
     }
 

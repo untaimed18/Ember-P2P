@@ -1,98 +1,161 @@
 # Ember DHT — remaining work and future improvements
 
-Status: **protocol slices complete** behind `ember_native_enabled`
-(default **off**). Keyword/source publish, search, bootstrap (rendezvous
-`/bootstrap` + KAD bridge), buddy `PROXY_STORE`, peer announce, BLAKE3
-integrity digests, rate limits, and diagnostics are live on `develop`.
-
-This replaces the old survival / slice plan docs. For multi-node local
-setup see [`ember-network-harness.md`](./ember-network-harness.md).
+Status: **protocol slices complete** and the overlay is **on by default**
+(`ember_native_enabled`, with a one-shot migration for profiles created
+before the default flipped). Keyword/source publish, iterative search,
+join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
+BLAKE3 integrity digests, network-size-adaptive abuse limits, and
+diagnostics are live on `develop`.
 
 Code: [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/).
 
 ---
 
-## What's left (before shipping to main)
+## How a node joins
 
-These are release gates, not missing protocol slices. Private testing is
-enough; a public beta is optional.
+There is no central bootstrap and no shipped address list. A cold node
+gets in through, in rough order of who arrives first:
 
-1. **Private multi-node smoke** — cold join (rendezvous, ideally without
-   KAD) → contacts grow → share a file → Ember search finds it → download
-   with BLAKE3 verify when a digest is known. Exercise LowID /
-   `PROXY_STORE` if you can.
-2. **Production rendezvous** — `/register` + signed `/bootstrap` healthy
-   with at least a few always-on DHT-on nodes in the pool so fresh clients
-   get first contact.
-3. **Version + notes for main** — `develop` is `1.5.0-a`, `main` is
-   `1.2.0`. Bump to a release version (drop `-a`), merge, and note that
-   Ember DHT is opt-in under Settings → Network and stays off by default.
-4. **Keep the flag off by default** — ship the code; only users who enable
-   Ember join the DHT. Transfers remain eD2K after source discovery.
+1. **The KAD rendezvous key.** Ember nodes advertise themselves under one
+   fixed KAD key as an ordinary source record carrying their Noise pubkey
+   tag; a node with a near-empty table runs a plain source lookup there.
+   Re-advertised every 5 hours (`EMBER_RENDEZVOUS_REPUBLISH_SECS`, matching
+   KAD's source TTL) and only while the node is reachable and already
+   publishing something, so a leecher never generates publish traffic
+   purely to list itself. Lookups are spaced 10 minutes apart and stop
+   once the table reaches one k-bucket.
+2. **The KAD bridge.** Ember peers noticed in ordinary KAD traffic get
+   DHT-pinged so their signed `PONG` folds them into the routing table.
+   Capped at `EMBER_KAD_BRIDGE_MAX_PINGS` per maintenance cycle and quiet
+   above `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`.
+3. **eD2K client-to-client sessions.** Peers that advertise the Ember
+   capability bit over a normal eD2K transfer are cached with their UDP
+   port and bridged too, via Noise_XX when no static key is known. This is
+   the path for a client running with no KAD at all.
+4. **DHT gossip** (`FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`) and
+   **`nodes_ember.dat`** (up to `EMBER_PERSIST_MAX_CONTACTS` = 200) once
+   the node has been online before.
+
+The rendezvous server is still used for *friend* NAT traversal and relay.
+It has no role in DHT bootstrap: that pool, its endpoint, and the pinned
+key it verified were deleted, because the server and client never agreed
+on the envelope format and restoring it would have handed the operator an
+identity-to-IP map of every participant.
+
+---
+
+## What's left
+
+### 1. Ember-native transfers are dormant
+
+[`network/ember/transfer.rs`](../src-tauri/src/network/ember/transfer.rs)
+holds the 256 KiB chunk protocol and the BLAKE3 hash tree, but nothing
+imports it — there is no reference to `ember::transfer::` anywhere in the
+tree. Ember discovers the source; the bytes still move over eD2K
+client-to-client. Wiring it up is the largest remaining piece if the goal
+is a network that does not need the eMule wire at all.
+
+### 2. Wire versioning has no story
+
+`EMBER_DHT_VERSION` is 1 and there is no negotiation. The last wire change
+touched five places (control version, batched store and its ack,
+contact-list trimming, payload limits) and old peers simply cannot talk to
+new ones. That was fine while the overlay shipped off by default; it now
+ships **on**, so the next format change reaches users who will not all
+update at once. Decide on graceful reject plus an upgrade prompt — or real
+negotiation — before the first release with a user population on it.
+
+### 3. Cold join when eMule is not available
+
+Every path in the list above except `nodes_ember.dat` presupposes either a
+live KAD connection or an eD2K transfer with an Ember-capable peer. A
+first-run user with KAD off and no servers has no way in, and seed lists
+are deliberately not planned. Either accept and document that Ember rides
+eMule's bootstrap, or add a path that does not.
+
+### 4. Validation past the happy path
+
+Search → download over a live network is confirmed working. Still
+unexercised end to end:
+
+- LowID / firewalled publishing through buddy `PROXY_STORE`.
+- A cold join from an empty contact file with no KAD.
+- Republish behaviour across a full record TTL on a large library.
+
+For a local two-node test where neither side can reach KAD, the dev
+*commands* remain even though the dev page is gone —
+`add_ember_dht_contact` is the only way to introduce two nodes directly,
+alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
+`ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
+`ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
 ---
 
 ## Known limits (document for users / release notes)
 
 - Multi-keyword search uses sparse DHT intersection (missing secondary
-  keys are skipped) plus filename AND at emit time — not a strict
+  keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
-- Gossip contacts from `ANNOUNCE_PEER` / `PEER_LIST` / `FOUND_NODE` are
-  unverified until the node hears from them directly (same as Kademlia).
-- Download content transfer is still eD2K c2c; the Ember-native chunk
-  transfer module is dormant.
-- BLAKE3 verify runs when an expected digest is available (search hit,
-  DHT source record, known.met / library). Deep links without a digest
-  still complete and hash for future share.
+- Gossip contacts are unverified until the node hears from them directly
+  (same as Kademlia). Admission is bounded by the diversity caps in
+  [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), but there is
+  no reputation scoring on gossip itself.
+- Download content transfer is still eD2K c2c (see item 1 above).
+- BLAKE3 verify runs when an expected digest is available (search hit, DHT
+  source record, known.met / library). Deep links without a digest still
+  complete and hash for future share.
 
 ---
 
 ## Future improvements
 
-Ordered roughly by leverage. None block a main merge if the gates above
-pass.
+Ordered roughly by leverage. None block a release if the items above are
+settled.
 
 ### Bootstrap and network health
 
-- Long-lived seed / always-on operators and monitoring for empty
-  `/bootstrap` pools.
-- Stronger observed-IP / STUN interplay under weird NATs (soak data).
-- Table quality: prefer verified contacts over long-lived gossip; tune
-  announce vs bucket-refresh balance under load.
+- Monitoring for rendezvous-key health: how many nodes are listed, how
+  often a cold lookup returns nothing.
+- Stronger observed-IP / STUN interplay under awkward NATs (needs soak
+  data).
+- Shard the rendezvous key space. The derivation is already versioned for
+  this; it matters once one KAD bucket's 1000-entry cap is in sight.
+- Table quality: tune announce versus bucket-refresh balance under load.
 
 ### Search and publish
 
-- Richer keyword indexing (stemming / more than space-split tokens) if
-  recall lags KAD for real libraries.
-- Clearer search UI when Ember is joining (empty table) vs enabled-but-
-  quiet.
-- Publish/replication telemetry dashboards beyond `/ember` counters.
+- Richer keyword indexing (stemming, more than space-split tokens) if
+  recall lags KAD on real libraries.
+- Clearer search UI when Ember is joining (empty table) versus
+  enabled-but-quiet.
+- Storer-side replication telemetry. The publish side now logs an
+  `Ember publish cycle` heartbeat each minute — due, selected, awaiting
+  placement, queued, in flight, sent, held over, dropped, acked, failed — which
+  is what says whether selected work is reaching the wire. There is no
+  equivalent view of what this node is republishing on others' behalf.
 
 ### Integrity and downloads
 
-- Surface BLAKE3 verify pass/fail clearly in the transfer UI.
+- Surface BLAKE3 verify pass/fail in the transfer UI.
 - Seed `emberFileHash` from more UI entry points when the digest is
   already known.
-- Optional: finish Ember-native chunk transfer (`transfer.rs`) so
-  Ember-to-Ember downloads need no eD2K wire.
 
 ### Hardening and ops
 
-- Longer fuzz / property tests in CI; soak jobs overnight.
-- Cap or score gossip to limit table poisoning under Sybil pressure.
-- Version negotiation story when wire formats evolve past v1.
+- Longer fuzz / property tests in CI; overnight soak jobs.
+- Score gossip to limit table poisoning under Sybil pressure, beyond the
+  per-IP and per-subnet admission caps.
 
 ### Product / UX
 
-- Ember Network page polish for non-dev users (less `/dev/ember`-only
-  language).
-- Clear "Ember DHT on / off / joining / ready" status in the shell.
-- Migration guidance when turning DHT on alongside existing KAD/eD2K.
+- Migration guidance when turning the DHT on alongside existing KAD/eD2K.
 
 ### Explicitly not planned
 
-- Hardcoded `seeds.txt` or DNS SRV seed lists — join stays rendezvous +
-  KAD bridge.
+- Hardcoded `seeds.txt` or DNS SRV seed lists — join stays the KAD
+  rendezvous key, the bridges, gossip, and the persisted contact file.
+- A rendezvous-hosted bootstrap pool. It leaks an identity-to-IP roster of
+  every participant to whoever runs the server.
 
 ---
 
@@ -102,7 +165,13 @@ pass.
 | --- | --- |
 | DHT engine / wire | `src-tauri/src/network/ember/dht/` |
 | Network loop / publish / search drivers | `src-tauri/src/network/mod.rs` |
-| Settings toggle | Settings → Network (`ember_native_enabled`) |
-| User diagnostics | `/ember` |
-| Dev harness panel | `/dev/ember` |
-| Local multi-node | [`ember-network-harness.md`](./ember-network-harness.md) |
+| Adaptive abuse limits | `src-tauri/src/network/ember/dht/scale.rs` |
+| Dormant native transfer | `src-tauri/src/network/ember/transfer.rs` |
+| Settings toggle | Settings → Network (`ember_native_enabled`, on by default) |
+| User-facing status | `/ember` (Ember Network page) |
+| Library publish badges | `shared_ember` on `FileInfo` → Library "Shared" column |
+
+Protocol constants live in
+[`dht/mod.rs`](../src-tauri/src/network/ember/dht/mod.rs): 128-bit node IDs
+(BLAKE3 of the Ed25519 public key), k = 20, α = 5, 20 contacts per
+response.

@@ -1,11 +1,17 @@
 <script lang="ts">
   /*
-   * User-facing "Ember Network" page: a single power switch for the
-   * Ember-native overlay plus an at-a-glance status read-out (routing
-   * contacts, in-flight searches, local store). The toggle persists through
-   * `update_settings` and the backend applies it live, though a node that
-   * starts with an empty routing table only fills it once the maintenance
-   * tick runs the KAD bridge — there is no central pool to fetch from.
+   * User-facing "Ember Network" page. The default view answers only the
+   * questions a user actually has — is it on, am I connected, can people
+   * reach me, are my shared files findable — in plain language. Every
+   * protocol-level counter and table lives behind the "Technical
+   * details" disclosure, which is also the only thing that polls the
+   * contact / search / store snapshots, so the common case costs one
+   * command per tick instead of four.
+   *
+   * The toggle persists through `update_settings` and the backend applies
+   * it live, though a node that starts with an empty routing table only
+   * fills it once the maintenance tick runs the KAD bridge — there is no
+   * central pool to fetch from.
    */
   import { onMount, untrack } from 'svelte';
   import { getSettings, updateSettings } from '$lib/api/settings';
@@ -34,6 +40,7 @@
   let contactFilter = $state('');
   let loadError = $state<string | null>(null);
   let toggleError = $state<string | null>(null);
+  let detailsOpen = $state(false);
 
   // `enabled` is the toggle's bound value; `lastAppliedEnabled` is the
   // last value we successfully persisted. The `$effect` below applies a
@@ -47,12 +54,13 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unmounted = false;
   let inFlightDiag = false;
+  let inFlightLists = false;
 
   // Diagnostics-health + join-progress state. `diagStale` raises a banner
   // once polling has failed several times in a row (the service is down,
   // not just a transient blip), so the numbers below aren't silently
   // mistaken for live ones. The join timer flips `joinTimedOut` so the
-  // "joining…" spinner can't spin forever when no peers are reachable.
+  // "connecting…" state can't linger forever when no peers are reachable.
   let diagStale = $state(false);
   let joinTimedOut = $state(false);
   let diagFailures = 0;
@@ -72,22 +80,6 @@
     inFlightDiag = true;
     try {
       diag = await getEmberDiagnostics();
-      if (diag.ember_native_enabled) {
-        const [c, s, st] = await Promise.all([
-          getEmberDhtContacts().catch(() => contacts),
-          getEmberDhtSearches().catch(() => searches),
-          getEmberDhtStore().catch(() => storeEntries),
-        ]);
-        if (!unmounted) {
-          contacts = c;
-          searches = s;
-          storeEntries = st;
-        }
-      } else if (!unmounted) {
-        contacts = [];
-        searches = [];
-        storeEntries = [];
-      }
       diagFailures = 0;
       diagStale = false;
       reconcileToggle();
@@ -101,6 +93,44 @@
     } finally {
       inFlightDiag = false;
     }
+    await refreshLists();
+  }
+
+  // The contact / search / store snapshots are three extra commands per
+  // tick and only render inside "Technical details", so they are fetched
+  // only while that section is open. Guarded separately from the
+  // diagnostics poll so opening the section can fill the tables at once
+  // instead of being swallowed by an in-flight poll and waiting out a tick.
+  async function refreshLists() {
+    if (unmounted || inFlightLists) return;
+    if (!detailsOpen || !diag?.ember_native_enabled) {
+      contacts = [];
+      searches = [];
+      storeEntries = [];
+      return;
+    }
+    inFlightLists = true;
+    try {
+      const [c, s, st] = await Promise.all([
+        getEmberDhtContacts().catch(() => contacts),
+        getEmberDhtSearches().catch(() => searches),
+        getEmberDhtStore().catch(() => storeEntries),
+      ]);
+      // Re-check: the user can close the section while these are in flight,
+      // and the close path has already cleared the lists.
+      if (!unmounted && detailsOpen) {
+        contacts = c;
+        searches = s;
+        storeEntries = st;
+      }
+    } finally {
+      inFlightLists = false;
+    }
+  }
+
+  function onDetailsToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
+    detailsOpen = e.currentTarget.open;
+    void refreshLists();
   }
 
   let filteredContacts = $derived.by(() => {
@@ -198,7 +228,95 @@
   }
 
   let isActive = $derived(!!diag?.ember_native_enabled);
-  let joining = $derived(isActive && (diag?.ember_dht_contacts ?? 0) === 0 && !joinTimedOut);
+  let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
+  let joining = $derived(isActive && peerCount === 0 && !joinTimedOut);
+  let isConnected = $derived(isActive && peerCount > 0);
+
+  // Until the first diagnostics land we genuinely don't know the state, and
+  // an enabled node would otherwise be announced as "Off" with a "turn it
+  // on" hint for a round trip.
+  let statusLabel = $derived(
+    diag === null
+      ? m.common_loading()
+      : !isActive
+        ? m.ember_status_disabled()
+        : isConnected
+          ? m.ember_status_connected()
+          : joining
+            ? m.ember_status_connecting()
+            : m.ember_status_no_peers(),
+  );
+
+  let statusHint = $derived(
+    diag === null
+      ? ''
+      : !isActive
+        ? m.ember_disabled_explainer()
+        : isConnected
+          ? m.ember_status_connected_hint()
+          : joining
+            ? m.ember_joining_hint()
+            : m.ember_no_contacts_hint(),
+  );
+
+  // "Checking" outranks "relayed": without a known external address the
+  // firewall verdict isn't settled yet, so claiming a relay is in use
+  // would be guessing.
+  type Reachability = 'direct' | 'relayed' | 'checking';
+  let reachability: Reachability = $derived(
+    diag?.ember_dht_udp_unreachable
+      ? 'checking'
+      : diag?.ember_dht_firewalled_publishing
+        ? 'relayed'
+        : 'direct',
+  );
+
+  let reachabilityLabel = $derived(
+    reachability === 'direct'
+      ? m.ember_health_direct()
+      : reachability === 'relayed'
+        ? m.ember_health_relayed()
+        : m.kad_checking(),
+  );
+
+  let reachabilityHint = $derived(
+    reachability === 'direct'
+      ? m.ember_health_direct_hint()
+      : reachability === 'relayed'
+        ? m.ember_dht_firewalled_publishing_hint()
+        : m.ember_dht_udp_unreachable_hint(),
+  );
+
+  // Deliberately the live count of files with a placed source record, not the
+  // session `*_published` counters: those only ever climb, so they would keep
+  // claiming "Published" after the user unshared everything, and a keyword ack
+  // alone would flip the pill before the source record that actually makes the
+  // file fetchable. This is the same set behind the Library's Ember badge.
+  let sharingPublished = $derived((diag?.ember_dht_published_files ?? 0) > 0);
+
+  // `id` exists so the `{#each}` below is keyed on something stable. Keying
+  // on the label would put a translator in a position to crash the page:
+  // two of these strings colliding in one locale is a duplicate-key error.
+  let metrics = $derived([
+    { id: 'contacts', k: m.ember_stat_contacts(), v: String(peerCount) },
+    { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
+    { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
+    { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },
+    { id: 'published-files', k: m.ember_stat_published_files(), v: String(diag?.ember_dht_published_files ?? 0) },
+    { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: String(diag?.ember_dht_stored_keys ?? 0) },
+    { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
+    { id: 'searches', k: m.ember_stat_active_searches(), v: String(diag?.ember_dht_active_searches ?? 0) },
+    { id: 'search-hits', k: m.ember_stat_search_hit_miss(), v: `${diag?.ember_dht_search_hits ?? 0}/${diag?.ember_dht_search_misses ?? 0}` },
+    { id: 'store-acks', k: m.ember_stat_store_ack_fail(), v: `${diag?.ember_dht_stores_acked ?? 0}/${diag?.ember_dht_stores_failed ?? 0}` },
+    { id: 'replication', k: m.ember_stat_avg_replication(), v: String(diag?.ember_dht_avg_replication ?? 0) },
+    { id: 'search-rounds', k: m.ember_stat_search_rounds(), v: String(diag?.ember_dht_search_rounds ?? 0) },
+    { id: 'find-values', k: m.ember_stat_find_values_sent(), v: String(diag?.ember_dht_find_values_sent ?? 0) },
+    { id: 'serve-hits', k: m.ember_stat_serve_hit_miss(), v: `${diag?.ember_dht_find_value_hits ?? 0}/${diag?.ember_dht_find_value_misses ?? 0}` },
+    { id: 'buddy', k: m.ember_stat_buddy_pub_fwd(), v: `${diag?.ember_dht_buddy_publishes ?? 0}/${diag?.ember_dht_buddy_forwards ?? 0}` },
+    { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
+    { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
+    { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
+  ]);
 
   onMount(() => {
     getSettings()
@@ -240,12 +358,13 @@
   <!-- Status + power switch -->
   <section class="card hero">
     <div class="hero-main">
-      <span class="status-dot" class:on={isActive}></span>
+      <span class="status-dot" class:on={isConnected} class:pending={isActive && !isConnected}></span>
       <div class="hero-text">
         <div class="status-label">
-          {isActive ? m.ember_status_active() : m.ember_status_disabled()}
+          {statusLabel}
+          {#if joining}<span class="spinner" aria-hidden="true"></span>{/if}
         </div>
-        <p class="hint">{m.ember_enable_hint()}</p>
+        {#if statusHint}<p class="hint">{statusHint}</p>{/if}
       </div>
     </div>
     <div class="hero-toggle">
@@ -265,234 +384,212 @@
     <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
   {/if}
 
-  {#if !isActive}
-    <div class="banner banner-muted" role="status">{m.ember_disabled_explainer()}</div>
-  {:else if joining}
-    <div class="banner banner-info" role="status">
-      <span class="spinner" aria-hidden="true"></span>
-      {m.ember_joining_hint()}
-    </div>
-  {:else if (diag?.ember_dht_contacts ?? 0) === 0}
-    <div class="banner banner-muted" role="status">{m.ember_no_contacts_hint()}</div>
-  {/if}
-
-  {#if isActive && diag?.ember_dht_udp_unreachable}
-    <div class="banner banner-info" role="status">{m.ember_dht_udp_unreachable_hint()}</div>
-  {:else if isActive && diag?.ember_dht_firewalled_publishing}
-    <div class="banner banner-muted" role="status">{m.ember_dht_firewalled_publishing_hint()}</div>
-  {/if}
-
-  <!-- Live stats -->
-  <section class="stat-grid" class:dimmed={!isActive}>
-    <div class="stat">
-      <div class="stat-value">{diag?.ember_dht_contacts ?? 0}</div>
-      <div class="stat-label">{m.ember_stat_contacts()}</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">{diag?.ember_sessions ?? 0}</div>
-      <div class="stat-label">{m.ember_stat_sessions()}</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">{diag?.ember_peers_known ?? 0}</div>
-      <div class="stat-label">{m.ember_stat_peers()}</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">{diag?.ember_dht_stored_records ?? 0}</div>
-      <div class="stat-label">{m.ember_stat_records()}</div>
-    </div>
-  </section>
-
   {#if isActive}
-    <section class="stat-grid secondary" class:dimmed={!isActive}>
+    <section class="stat-grid">
       <div class="stat">
-        <div class="stat-value">{diag?.ember_dht_search_hits ?? 0}/{diag?.ember_dht_search_misses ?? 0}</div>
-        <div class="stat-label">{m.ember_stat_search_hit_miss()}</div>
+        <div class="stat-value">{peerCount}</div>
+        <div class="stat-label">{m.ember_overview_peers()}</div>
       </div>
       <div class="stat">
-        <div class="stat-value">{diag?.ember_dht_stores_acked ?? 0}/{diag?.ember_dht_stores_failed ?? 0}</div>
-        <div class="stat-label">{m.ember_stat_store_ack_fail()}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">{diag?.ember_dht_avg_replication ?? 0}</div>
-        <div class="stat-label">{m.ember_stat_avg_replication()}</div>
+        <div class="stat-value">{diag?.ember_sessions ?? 0}</div>
+        <div class="stat-label">{m.ember_overview_connections()}</div>
       </div>
       <div class="stat">
         <div class="stat-value">{diag?.ember_dht_active_searches ?? 0}</div>
-        <div class="stat-label">{m.ember_stat_active_searches()}</div>
-      </div>
-    </section>
-
-    <div class="dht-layout">
-      <section class="card dht-panel">
-        <div class="panel-head">
-          <h2>{m.ember_dht_contacts_title()}</h2>
-          <input
-            class="filter-input"
-            type="search"
-            bind:value={contactFilter}
-            placeholder={m.ember_dht_contacts_filter()}
-            aria-label={m.ember_dht_contacts_filter()}
-          />
-        </div>
-        <div class="table-wrap">
-          <table class="dht-table">
-            <thead>
-              <tr>
-                <th>{m.ember_dht_col_node_id()}</th>
-                <th>{m.ember_dht_col_addr()}</th>
-                <th>{m.ember_dht_col_distance()}</th>
-                <th>{m.ember_dht_col_fails()}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each filteredContacts as c (c.node_id + c.addr)}
-                <tr>
-                  <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
-                  <td><code>{c.addr}</code></td>
-                  <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
-                  <td>{c.failed_queries}</td>
-                </tr>
-              {:else}
-                <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="card dht-panel">
-        <h2>{m.ember_dht_status_title()}</h2>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_stored_keys()}</div>
-          <div class="v">{diag?.ember_dht_stored_keys ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_active_publishes()}</div>
-          <div class="v">{diag?.ember_dht_active_publishes ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_search_rounds()}</div>
-          <div class="v">{diag?.ember_dht_search_rounds ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_find_values_sent()}</div>
-          <div class="v">{diag?.ember_dht_find_values_sent ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_serve_hit_miss()}</div>
-          <div class="v">{diag?.ember_dht_find_value_hits ?? 0}/{diag?.ember_dht_find_value_misses ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_buddy_pub_fwd()}</div>
-          <div class="v">{diag?.ember_dht_buddy_publishes ?? 0}/{diag?.ember_dht_buddy_forwards ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_malformed()}</div>
-          <div class="v">{diag?.ember_dht_malformed ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_observed_votes()}</div>
-          <div class="v">{diag?.ember_dht_observed_votes ?? 0}</div>
-        </div>
-        <div class="kv compact">
-          <div class="k">{m.ember_stat_observed_addr()}</div>
-          <div class="v"><code>{diag?.ember_dht_observed_addr || '—'}</code></div>
-        </div>
-      </section>
-    </div>
-
-    <section class="card">
-      <h2>{m.ember_dht_searches_title()}</h2>
-      <div class="table-wrap">
-        <table class="dht-table">
-          <thead>
-            <tr>
-              <th>{m.ember_dht_search_col_id()}</th>
-              <th>{m.ember_dht_search_col_type()}</th>
-              <th>{m.ember_dht_search_col_target()}</th>
-              <th>{m.ember_dht_search_col_results()}</th>
-              <th>{m.ember_dht_search_col_progress()}</th>
-              <th>{m.ember_dht_search_col_age()}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each searches as s (s.id)}
-              <tr>
-                <td>{s.id}</td>
-                <td>{s.type}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
-                <td title={s.target}><code>{shortHex(s.target)}</code></td>
-                <td>{s.results}</td>
-                <td>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
-                <td>{s.age_secs}s</td>
-              </tr>
-            {:else}
-              <tr><td colspan="6" class="empty">{m.ember_dht_searches_empty()}</td></tr>
-            {/each}
-          </tbody>
-        </table>
+        <div class="stat-label">{m.ember_overview_searches()}</div>
       </div>
     </section>
 
     <section class="card">
-      <h2>{m.ember_dht_store_title()}</h2>
-      <p class="hint">{m.ember_dht_store_hint()}</p>
-      <div class="table-wrap">
-        <table class="dht-table">
-          <thead>
-            <tr>
-              <th>{m.ember_dht_store_col_key()}</th>
-              <th>{m.ember_dht_store_col_records()}</th>
-              <th>{m.ember_dht_store_col_keyword()}</th>
-              <th>{m.ember_dht_store_col_source()}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each storeEntries as e (e.key)}
-              <tr>
-                <td title={e.key}><code>{shortHex(e.key)}</code></td>
-                <td>{e.record_count}</td>
-                <td>{e.keyword_records}</td>
-                <td>{e.source_records}</td>
-              </tr>
-            {:else}
-              <tr><td colspan="4" class="empty">{m.ember_dht_store_empty()}</td></tr>
-            {/each}
-          </tbody>
-        </table>
+      <h2>{m.ember_health_title()}</h2>
+      <div class="health-row">
+        <div class="health-head">
+          <span class="health-label">{m.ember_health_reachability()}</span>
+          <span
+            class="pill"
+            class:ok={reachability === 'direct'}
+            class:warn={reachability === 'relayed'}
+            class:muted={reachability === 'checking'}
+          >{reachabilityLabel}</span>
+        </div>
+        <p class="hint">{reachabilityHint}</p>
+      </div>
+      <div class="health-row">
+        <div class="health-head">
+          <span class="health-label">{m.ember_health_sharing()}</span>
+          <span
+            class="pill"
+            class:ok={sharingPublished}
+            class:muted={!sharingPublished}
+          >{sharingPublished ? m.ember_health_sharing_published() : m.ember_health_sharing_waiting()}</span>
+        </div>
+        <p class="hint">{sharingPublished ? m.ember_health_sharing_published_hint() : m.ember_health_sharing_waiting_hint()}</p>
       </div>
     </section>
   {/if}
-
-  <!-- Local identity -->
-  <section class="card">
-    <h2>{m.ember_identity_title()}</h2>
-    <p class="hint">{m.ember_identity_hint()}</p>
-    {#each [
-      { key: 'node', label: m.ember_node_id_label(), value: diag?.ember_dht_node_id ?? '' },
-      { key: 'noise', label: m.ember_noise_key_label(), value: diag?.local_noise_public_key ?? '' },
-      { key: 'ed', label: m.ember_ed25519_key_label(), value: diag?.local_ed25519_public_key ?? '' },
-    ] as row (row.key)}
-      <div class="kv">
-        <div class="k">{row.label}</div>
-        <div class="v pubkey-row">
-          <code class="pubkey">{row.value || '—'}</code>
-          {#if row.value}
-            <button type="button" class="copy-btn" onclick={() => copyText(row.value, row.key)} title={m.ember_copy()}>
-              {#if copiedKey === row.key}{m.ember_copied()}
-              {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
-              {:else}{m.ember_copy()}{/if}
-            </button>
-          {/if}
-        </div>
-      </div>
-    {/each}
-  </section>
 
   <!-- About -->
   <section class="card">
     <h2>{m.ember_about_title()}</h2>
     <p class="about-text">{m.ember_about_text()}</p>
   </section>
+
+  <!--
+    Everything below is protocol-level diagnostics. Collapsed by default,
+    and `onDetailsToggle` is what starts/stops polling the three snapshot
+    commands that feed the tables.
+  -->
+  <details class="card advanced" ontoggle={onDetailsToggle}>
+    <summary>
+      <span class="chevron" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
+          <polyline points="6,3 11,8 6,13" />
+        </svg>
+      </span>
+      <span class="summary-text">
+        <span class="summary-title">{m.ember_details_summary()}</span>
+        <span class="summary-hint">{m.ember_details_hint()}</span>
+      </span>
+    </summary>
+
+    <div class="advanced-body">
+      <section class="sub-card">
+        <h3>{m.ember_identity_title()}</h3>
+        <p class="hint">{m.ember_identity_hint()}</p>
+        {#each [
+          { key: 'node', label: m.ember_node_id_label(), value: diag?.ember_dht_node_id ?? '' },
+          { key: 'noise', label: m.ember_noise_key_label(), value: diag?.local_noise_public_key ?? '' },
+          { key: 'ed', label: m.ember_ed25519_key_label(), value: diag?.local_ed25519_public_key ?? '' },
+        ] as row (row.key)}
+          <div class="kv">
+            <div class="k">{row.label}</div>
+            <div class="v pubkey-row">
+              <code class="pubkey">{row.value || '—'}</code>
+              {#if row.value}
+                <button type="button" class="copy-btn" onclick={() => copyText(row.value, row.key)} title={m.ember_copy()}>
+                  {#if copiedKey === row.key}{m.ember_copied()}
+                  {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
+                  {:else}{m.ember_copy()}{/if}
+                </button>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </section>
+
+      {#if isActive}
+        <section class="sub-card">
+          <h3>{m.ember_dht_status_title()}</h3>
+          <div class="metric-grid">
+            {#each metrics as metric (metric.id)}
+              <div class="metric">
+                <span class="metric-k">{metric.k}</span>
+                <span class="metric-v">{metric.v}</span>
+              </div>
+            {/each}
+          </div>
+        </section>
+
+        <section class="sub-card">
+          <div class="panel-head">
+            <h3>{m.ember_dht_contacts_title()}</h3>
+            <input
+              class="filter-input"
+              type="search"
+              bind:value={contactFilter}
+              placeholder={m.ember_dht_contacts_filter()}
+              aria-label={m.ember_dht_contacts_filter()}
+            />
+          </div>
+          <div class="table-wrap">
+            <table class="dht-table">
+              <thead>
+                <tr>
+                  <th>{m.ember_dht_col_node_id()}</th>
+                  <th>{m.ember_dht_col_addr()}</th>
+                  <th>{m.ember_dht_col_distance()}</th>
+                  <th>{m.ember_dht_col_fails()}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each filteredContacts as c (c.node_id + c.addr)}
+                  <tr>
+                    <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
+                    <td><code>{c.addr}</code></td>
+                    <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
+                    <td>{c.failed_queries}</td>
+                  </tr>
+                {:else}
+                  <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="sub-card">
+          <h3>{m.ember_dht_searches_title()}</h3>
+          <div class="table-wrap">
+            <table class="dht-table">
+              <thead>
+                <tr>
+                  <th>{m.ember_dht_search_col_id()}</th>
+                  <th>{m.ember_dht_search_col_type()}</th>
+                  <th>{m.ember_dht_search_col_target()}</th>
+                  <th>{m.ember_dht_search_col_results()}</th>
+                  <th>{m.ember_dht_search_col_progress()}</th>
+                  <th>{m.ember_dht_search_col_age()}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each searches as s (s.id)}
+                  <tr>
+                    <td>{s.id}</td>
+                    <td>{s.type}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
+                    <td title={s.target}><code>{shortHex(s.target)}</code></td>
+                    <td>{s.results}</td>
+                    <td>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
+                    <td>{s.age_secs}s</td>
+                  </tr>
+                {:else}
+                  <tr><td colspan="6" class="empty">{m.ember_dht_searches_empty()}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="sub-card">
+          <h3>{m.ember_dht_store_title()}</h3>
+          <p class="hint">{m.ember_dht_store_hint()}</p>
+          <div class="table-wrap">
+            <table class="dht-table">
+              <thead>
+                <tr>
+                  <th>{m.ember_dht_store_col_key()}</th>
+                  <th>{m.ember_dht_store_col_records()}</th>
+                  <th>{m.ember_dht_store_col_keyword()}</th>
+                  <th>{m.ember_dht_store_col_source()}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each storeEntries as e (e.key)}
+                  <tr>
+                    <td title={e.key}><code>{shortHex(e.key)}</code></td>
+                    <td>{e.record_count}</td>
+                    <td>{e.keyword_records}</td>
+                    <td>{e.source_records}</td>
+                  </tr>
+                {:else}
+                  <tr><td colspan="4" class="empty">{m.ember_dht_store_empty()}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      {/if}
+    </div>
+  </details>
   </div>
 </div>
 
@@ -504,7 +601,7 @@
    */
   .ember-inner {
     padding: 24px;
-    max-width: 1100px;
+    max-width: 900px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
@@ -579,6 +676,10 @@
     transition: background 0.2s ease, box-shadow 0.2s ease;
   }
 
+  .status-dot.pending {
+    background: var(--warning, #d9a441);
+  }
+
   .status-dot.on {
     background: #3ccf6d;
     box-shadow:
@@ -590,10 +691,14 @@
     font-size: 17px;
     font-weight: 700;
     color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .hero-text .hint {
     margin: 2px 0 0;
+    max-width: 62ch;
   }
 
   .hint {
@@ -604,13 +709,8 @@
 
   .stat-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 12px;
-    transition: opacity 0.2s ease;
-  }
-
-  .stat-grid.dimmed {
-    opacity: 0.5;
   }
 
   .stat {
@@ -635,21 +735,179 @@
     color: var(--text-muted);
   }
 
-  .stat-grid.secondary .stat-value {
-    font-size: 18px;
+  /* --- Connection health --- */
+
+  .health-row {
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
   }
 
-  .dht-layout {
-    display: grid;
-    grid-template-columns: 1.6fr 1fr;
-    gap: 16px;
+  .health-row:first-of-type {
+    border-top: none;
+    padding-top: 8px;
   }
 
-  .dht-panel {
-    min-width: 0;
+  .health-row:last-of-type {
+    padding-bottom: 0;
+  }
+
+  .health-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .health-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .health-row .hint {
+    margin: 4px 0 0;
+    max-width: 70ch;
+  }
+
+  .pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+
+  .pill.ok {
+    color: var(--badge-success-text, #3ccf6d);
+    background: color-mix(in srgb, var(--success, #3ccf6d) 15%, transparent);
+    border-color: color-mix(in srgb, var(--success, #3ccf6d) 30%, transparent);
+  }
+
+  .pill.warn {
+    color: var(--badge-warning-text, #d9a441);
+    background: color-mix(in srgb, var(--warning, #d9a441) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
+  }
+
+  .pill.muted {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-muted) 15%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 28%, transparent);
+  }
+
+  /* --- Technical details disclosure --- */
+
+  .advanced {
+    padding: 0;
+  }
+
+  .advanced summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 20px;
+    cursor: pointer;
+    list-style: none;
+    border-radius: var(--radius-lg, 10px);
+  }
+
+  .advanced summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .advanced summary:hover .summary-title {
+    color: var(--accent);
+  }
+
+  .advanced summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .chevron {
+    display: inline-flex;
+    color: var(--text-muted);
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .advanced[open] .chevron {
+    transform: rotate(90deg);
+  }
+
+  .summary-text {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .summary-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .summary-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .advanced-body {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: 4px 20px 20px;
+    border-top: 1px solid var(--border);
+    margin-top: -1px;
+  }
+
+  .advanced-body .sub-card:first-child {
+    padding-top: 14px;
+  }
+
+  .sub-card h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 4px;
+  }
+
+  .sub-card .hint {
+    margin: 0 0 8px;
+  }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 24px;
+    margin-top: 6px;
+  }
+
+  .metric {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+    min-width: 0;
+  }
+
+  .metric-k {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .metric-v {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .panel-head {
@@ -658,9 +916,10 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
+    margin-bottom: 8px;
   }
 
-  .panel-head h2 {
+  .panel-head h3 {
     margin: 0;
   }
 
@@ -716,11 +975,6 @@
     color: var(--text-muted);
     text-align: center;
     padding: 16px;
-  }
-
-  .kv.compact {
-    margin: 0;
-    padding: 4px 0;
   }
 
   .kv {
@@ -797,18 +1051,6 @@
     color: var(--error, #e06a5f);
   }
 
-  .banner-info {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    color: var(--text-secondary);
-  }
-
-  .banner-muted {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-  }
-
   .spinner {
     width: 13px;
     height: 13px;
@@ -825,13 +1067,14 @@
 
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation: none; }
+    .chevron { transition: none; }
   }
 
   @media (max-width: 640px) {
     .stat-grid {
-      grid-template-columns: repeat(2, 1fr);
+      grid-template-columns: 1fr;
     }
-    .dht-layout {
+    .metric-grid {
       grid-template-columns: 1fr;
     }
     .kv {

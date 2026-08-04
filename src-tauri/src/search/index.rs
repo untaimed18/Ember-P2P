@@ -855,6 +855,7 @@ fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
     file.shared = existing.shared;
     file.shared_kad = existing.shared_kad;
     file.shared_ed2k = existing.shared_ed2k;
+    file.shared_ember = existing.shared_ember;
     // Carried for the same reason as `shared`, and more urgently: a rediscovered
     // row is built with `friends_only: false`, so dropping it here silently
     // republishes a restricted file to the open network — the watcher firing or
@@ -973,6 +974,7 @@ mod local_index_tests {
             friends_only: false,
             shared_kad: false,
             shared_ed2k: false,
+            shared_ember: false,
         }
     }
 

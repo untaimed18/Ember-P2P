@@ -34,11 +34,15 @@
   /* Nominal category colors — distinct hues (not tied to the success/
      warning/danger/accent semantics above) so independent badges shown
      side-by-side stay visually distinguishable. Used by the Library's
-     KAD/eD2K/AICH share-status badges and its non-semantic priority
+     KAD/eD2K/Ember/AICH share-status badges and its non-semantic priority
      levels (verylow/low/auto — "high"/"release" reuse --warning/--danger
-     directly since they already map to those meanings). */
+     directly since they already map to those meanings).
+     Ember is rose rather than the obvious ember-orange: the friends-only
+     badge in the same row is --warning orange, and two warm pills side by
+     side stop reading as separate states. */
   --kad-color: #3498db;
   --ed2k-color: #9b59b6;
+  --ember-color: #c2185b;
   --aich-color: #27ae60;
   --priority-verylow: #888888;
   --priority-low: #5599bb;
@@ -156,6 +160,7 @@
      danger so they stay legible against the dark canvas. */
   --kad-color: #6bb1e6;
   --ed2k-color: #c08cd9;
+  --ember-color: #ea87ac;
   --aich-color: #5ecb87;
   --priority-verylow: #9a9fa8;
   --priority-low: #7fb6d9;

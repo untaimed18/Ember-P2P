@@ -1017,6 +1017,7 @@ pub fn run() {
                             friends_only: record.friends_only,
                             shared_kad: false,
                             shared_ed2k: false,
+                            shared_ember: false,
                         });
                     }
                 }

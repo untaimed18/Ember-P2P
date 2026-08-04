@@ -3210,6 +3210,7 @@
                 <span class="meta-badges">
                   {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
                   {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                  {#if selectedFile.shared && selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
               {/if}
@@ -4628,6 +4629,11 @@
     background: color-mix(in srgb, var(--ed2k-color) 15%, transparent);
     border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
     color: var(--ed2k-color);
+  }
+  .meta-badge.meta-badge-ember {
+    background: color-mix(in srgb, var(--ember-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ember-color) 30%, transparent);
+    color: var(--ember-color);
   }
   .meta-badge.meta-badge-aich {
     background: color-mix(in srgb, var(--aich-color) 15%, transparent);

@@ -26,6 +26,12 @@ export interface FileInfo {
   friends_only: boolean;
   shared_kad: boolean;
   shared_ed2k: boolean;
+  /**
+   * A source record for this file is live on the Ember DHT. Set only once
+   * storing peers have acknowledged the publish, so it means other Ember
+   * users can find the file rather than that a publish was attempted.
+   */
+  shared_ember: boolean;
 }
 
 export interface PeerInfo {
@@ -345,6 +351,13 @@ export interface EmberDiagnostics {
   ember_dht_observed_votes: number;
   /** Slice 19: confirmed observed external address (`ip:port`), if any. */
   ember_dht_observed_addr?: string;
+  /**
+   * Shared files with a confirmed Ember DHT source record right now. Falls
+   * again when a file is unshared or the overlay is switched off, unlike the
+   * session counters above, and is the same set that lights the Library's
+   * Ember badge.
+   */
+  ember_dht_published_files: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set

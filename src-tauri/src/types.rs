@@ -61,6 +61,12 @@ pub struct FileInfo {
     /// Whether this file is currently offered to an ed2k server (runtime status)
     #[serde(default)]
     pub shared_ed2k: bool,
+    /// Whether a source record for this file is live on the Ember DHT
+    /// (runtime status). Set only once storers have acknowledged the
+    /// publish, so it means "other Ember users can find this", not
+    /// "we tried".
+    #[serde(default)]
+    pub shared_ember: bool,
 }
 
 impl FileInfo {
@@ -705,6 +711,13 @@ pub struct EmberDiagnostics {
     /// Slice 19: confirmed observed external address (`ip:port`), if any.
     #[serde(default)]
     pub ember_dht_observed_addr: String,
+    /// Shared files that have a confirmed Ember DHT *source* record right
+    /// now. Unlike the session counters above this falls again when a file is
+    /// unshared or the overlay is switched off, so it is what the UI should
+    /// use to answer "can other people find my files". It is also the exact
+    /// set behind the Library's Ember badge, so the two cannot disagree.
+    #[serde(default)]
+    pub ember_dht_published_files: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

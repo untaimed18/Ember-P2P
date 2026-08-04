@@ -417,7 +417,7 @@ impl PublishManager {
         }
 
         let dht_key = EmberNodeId(record.keyword_hash);
-        let targets = routing_table.find_closest(&dht_key, K_BUCKET_SIZE);
+        let targets = routing_table.find_closest_prefer_verified(&dht_key, K_BUCKET_SIZE);
 
         if targets.len() < MIN_STORE_NODES {
             debug!(

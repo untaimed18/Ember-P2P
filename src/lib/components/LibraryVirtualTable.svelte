@@ -26,6 +26,10 @@
     sortField?: SortField;
   };
 
+  // `shared` is sized for the badge row rather than its header: a file can
+  // carry the share tick plus KAD / eD2K / Ember pills at once. Its
+  // `minWidth` doubles as the migration for anyone whose saved width predates
+  // the Ember badge, because `loadColumnState` clamps restored widths up to it.
   const ALL_COLUMNS: LibraryColumn[] = [
     { key: 'name',        label: () => m.library_col_filename(),    width: 280, minWidth: 140, sortField: 'name' },
     { key: 'size',        label: () => m.library_col_size(),        width: 75,  minWidth: 56,  sortField: 'size' },
@@ -33,7 +37,7 @@
     { key: 'priority',    label: () => m.library_col_priority(),    width: 72,  minWidth: 60,  sortField: 'priority' },
     { key: 'transferred', label: () => m.library_col_transferred(), width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
     { key: 'sources',     label: () => m.library_col_peers(),       width: 60,  minWidth: 50,  sortField: 'complete_sources' },
-    { key: 'shared',      label: () => m.library_col_shared(),      width: 80,  minWidth: 60 },
+    { key: 'shared',      label: () => m.library_col_shared(),      width: 132, minWidth: 96 },
     { key: 'hash',        label: () => m.library_col_file_id(),     width: 120, minWidth: 80,  sortField: 'hash' },
     { key: 'requests',    label: () => m.library_col_requests(),    width: 70,  minWidth: 50,  sortField: 'requests' },
     { key: 'accepted',    label: () => m.library_col_accepted(),    width: 70,  minWidth: 50,  sortField: 'accepted' },
@@ -657,11 +661,12 @@
                     <span class="hashing-label">{m.common_pending()}</span>
                   {:else if file.shared}
                     <span class="shared-icon shared-yes" title={m.library_shared()}>&#x2713;</span>
-                    {#if file.friends_only || file.shared_kad || file.shared_ed2k || file.aich_hash}
+                    {#if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember || file.aich_hash}
                       <span class="shared-badges">
                         {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
                         {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
                         {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                        {#if file.shared_ember}<span class="shared-badge ember" title={m.library_published_ember()}>Ember</span>{/if}
                         {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
                       </span>
                     {/if}
@@ -939,6 +944,11 @@
     background: color-mix(in srgb, var(--ed2k-color) 15%, transparent);
     border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
     color: var(--ed2k-color);
+  }
+  .shared-badge.ember {
+    background: color-mix(in srgb, var(--ember-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ember-color) 30%, transparent);
+    color: var(--ember-color);
   }
   .shared-badge.aich {
     background: color-mix(in srgb, var(--aich-color) 15%, transparent);
