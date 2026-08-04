@@ -1299,6 +1299,64 @@ fn prune_stale_ember_noise_keys_at(
     map.retain(|_, (_, ts)| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
+/// Expected-digest entries tolerated before `prune_ember_content_hashes` starts
+/// discarding the ones nothing is waiting on.
+///
+/// Every distinct file hash a keyword search returns lands in the map, and a
+/// search can carry three hundred records, so a session spent searching grows it
+/// without limit. Generous enough that the prune is rare, small enough to bound
+/// the map at a few megabytes.
+const MAX_EMBER_CONTENT_HASHES: usize = 20_000;
+
+/// Bound the expected-BLAKE3 map to digests something could still verify against.
+///
+/// Deliberately not a TTL or an LRU. The map's whole purpose is to hold the
+/// digest a transfer checks at *completion*, which can be hours after the search
+/// hit that taught it to us, so evicting by age or by insertion order is exactly
+/// the wrong rule — it would drop the entry for the longest download. Instead
+/// this keeps every digest referenced by a live transfer or by the library and
+/// discards the rest, which are search results nothing acted on.
+async fn prune_ember_content_hashes(
+    state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
+) {
+    if state.ember_content_hashes.len() <= MAX_EMBER_CONTENT_HASHES {
+        return;
+    }
+    let mut keep: HashSet<[u8; 16]> = HashSet::new();
+    {
+        let mgr = transfer_manager.read().await;
+        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+            if let Some(hash) = parse_ed2k_hash16(&transfer.file_hash) {
+                keep.insert(hash);
+            }
+        }
+    }
+    for hash in state.pending_downloads.values() {
+        if let Some(parsed) = parse_ed2k_hash16(&hash.file_hash) {
+            keep.insert(parsed);
+        }
+    }
+    {
+        let idx = local_index.read().await;
+        for file in idx.all_files() {
+            if let Some(hash) = parse_ed2k_hash16(&file.hash) {
+                keep.insert(hash);
+            }
+        }
+    }
+    let before = state.ember_content_hashes.len();
+    state
+        .ember_content_hashes
+        .retain(|hash, _| keep.contains(hash));
+    debug!(
+        "Ember content digests: pruned {} unreferenced entr(ies) (now {})",
+        before - state.ember_content_hashes.len(),
+        state.ember_content_hashes.len()
+    );
+}
+
 /// Minimum spacing between relay offers accepted from one friend. Comfortably
 /// under the 30s send cadence, so an honest peer is never throttled, while an
 /// abusive one cannot spend our CPU on signature checks faster than this.
@@ -9486,7 +9544,12 @@ impl EmberBatchPublisher {
         reference: EmberRecordRef,
         record: ember::dht::messages::BatchedRecord,
     ) -> bool {
-        if self.queued_count >= EMBER_BATCH_QUEUE_MAX || targets.is_empty() {
+        // Counted against the whole fan-out, not just the first replica: the
+        // check used to run once and the loop then added one entry per target,
+        // so the documented ceiling could be overshot by `K_EMBER_REPLICAS - 1`.
+        if targets.is_empty()
+            || self.queued_count.saturating_add(targets.len()) > EMBER_BATCH_QUEUE_MAX
+        {
             return false;
         }
         for contact in targets {
@@ -12226,6 +12289,24 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_kad_bridge_attempted.clear();
     state.known_ember_peers.clear();
     state.ember_keyless_peers.clear();
+    // `ember_content_hashes` deliberately survives: it holds the expected BLAKE3
+    // for downloads in flight, seeded from deep links as well as DHT hits, and
+    // clearing it here would drop the digest a running transfer verifies against.
+    // It is bounded by `prune_ember_content_hashes` instead.
+
+    // Stop claiming to be an Ember node on KAD.
+    //
+    // The advert under `ember_rendezvous_key` says "DHT-ping me to join"; with
+    // the overlay off we drop every Ember-magic packet those peers send. Leaving
+    // the timestamp alone meant we neither withdrew the claim nor re-advertised,
+    // so for up to a full republish interval other nodes spent their bridge ping
+    // budget — eight a minute — on a peer that would never answer. Zeroing it
+    // means a re-enable re-advertises on the next publish tick instead of
+    // waiting the interval out, and an in-flight lookup is dropped rather than
+    // resolving into a table we are no longer maintaining.
+    state.ember_rendezvous_published_at = 0;
+    state.ember_rendezvous_looked_up_at = 0;
+    state.ember_rendezvous_search = None;
 
     // A re-enable is a fresh join: redo the self-lookup and restart the
     // disconnect clock rather than carrying over the old session's state.
@@ -29250,6 +29331,7 @@ pub async fn start_network(
                     state.ember_noise_keys.contains_key(key)
                         || state.ember_keyless_peers.contains_key(key)
                 });
+                prune_ember_content_hashes(&mut state, &transfer_manager, &local_index).await;
                 let pruned_after = state.known_ember_peers.len();
                 if pruned_after != pruned_before {
                     state.stats.ember_peers = pruned_after as u32;

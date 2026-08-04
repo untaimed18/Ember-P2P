@@ -323,9 +323,21 @@ impl EmberDht {
                 attributed_ip,
             )
         {
-            if self.store_sig_seen.len() < MAX_STORE_SIG_CACHE {
-                self.store_sig_seen.insert(sig_key, now_inst);
+            // At capacity, make room rather than stopping: silently declining to
+            // record a signature turns off replay collapse for exactly the
+            // publishers arriving during a flood, which is when it earns its
+            // keep. The oldest entry is the one closest to ageing out anyway.
+            if self.store_sig_seen.len() >= MAX_STORE_SIG_CACHE {
+                if let Some(oldest) = self
+                    .store_sig_seen
+                    .iter()
+                    .min_by_key(|(_, seen)| **seen)
+                    .map(|(k, _)| *k)
+                {
+                    self.store_sig_seen.remove(&oldest);
+                }
             }
+            self.store_sig_seen.insert(sig_key, now_inst);
             StoreOutcome::Stored
         } else {
             StoreOutcome::Rejected

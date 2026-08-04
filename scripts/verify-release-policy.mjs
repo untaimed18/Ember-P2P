@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -125,6 +126,70 @@ export function verifyVersions({
     throw new Error(`Release version policy failed:\n- ${errors.join("\n- ")}`);
   }
   return version;
+}
+
+/** Split `1.2.3` into comparable numbers. */
+function parseVersion(version) {
+  return version.split(".").map((part) => Number(part));
+}
+
+/** -1, 0 or 1 comparing two `major.minor.patch` strings. */
+function compareVersions(a, b) {
+  const left = parseVersion(a);
+  const right = parseVersion(b);
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** The highest `vX.Y.Z` tag in the repository, or `null` if there are none. */
+function latestReleaseTag(root) {
+  let output;
+  try {
+    output = execFileSync("git", ["tag", "--list", "v*.*.*"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    // No git, no repository, or no tags: nothing to compare against. Callers
+    // treat that as "cannot check" rather than as a failure, so a source
+    // tarball build is not blocked by the absence of history.
+    return null;
+  }
+  const versions = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^v\d+\.\d+\.\d+$/.test(line))
+    .map((line) => line.slice(1));
+  if (versions.length === 0) return null;
+  return versions.reduce((best, next) =>
+    compareVersions(next, best) > 0 ? next : best,
+  );
+}
+
+/**
+ * The declared version must be higher than the newest release tag.
+ *
+ * `verifyVersions` only proves the five manifests agree with each other, which
+ * they also do when nothing was bumped at all. Ten commits of work once sat on
+ * develop still declaring the released version: two builds reported the same
+ * number while differing in their DHT wire format and in whether the overlay was
+ * on by default, so the updater could not tell them apart and neither could a
+ * bug report.
+ */
+export function verifyVersionAdvanced({ root = scriptRoot } = {}) {
+  const version = JSON.parse(read(root, "package.json")).version;
+  const latest = latestReleaseTag(root);
+  if (!latest) return { version, latestTag: null };
+  if (compareVersions(version, latest) <= 0) {
+    throw new Error(
+      `Release version policy failed:\n- package.json version ${version} is not ahead of the ` +
+        `latest release tag v${latest}; run \`npm run bump-version <next>\``,
+    );
+  }
+  return { version, latestTag: latest };
 }
 
 export function verifyWorkflow({ root = scriptRoot } = {}) {
@@ -259,9 +324,10 @@ export function verifySecurityEpoch({ root = scriptRoot } = {}) {
 
 export function verifyReleasePolicy(options = {}) {
   const version = verifyVersions(options);
+  const { latestTag } = verifyVersionAdvanced(options);
   const actions = verifyWorkflow(options);
   const securityEpoch = verifySecurityEpoch(options);
-  return { version, actions, securityEpoch };
+  return { version, latestTag, actions, securityEpoch };
 }
 
 function parseArgs(argv) {
@@ -286,8 +352,11 @@ if (
 ) {
   try {
     const result = verifyReleasePolicy(parseArgs(process.argv.slice(2)));
+    const against = result.latestTag
+      ? `ahead of v${result.latestTag}`
+      : "no release tags to compare against";
     console.log(
-      `release policy verified: version ${result.version}, security epoch ${result.securityEpoch}, ${result.actions} SHA-pinned action uses`,
+      `release policy verified: version ${result.version} (${against}), security epoch ${result.securityEpoch}, ${result.actions} SHA-pinned action uses`,
     );
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

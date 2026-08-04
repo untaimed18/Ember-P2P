@@ -13,7 +13,23 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-pub const EMBER_DHT_VERSION: u8 = 1;
+/// Wire version this build speaks.
+///
+/// Bumped to 2 because the v1 layout is not compatible: the batched store and
+/// its ack, contact-list trimming, and the payload limits all changed shape
+/// while the byte still read 1, so two peers announced the same version and
+/// then misparsed each other. The byte exists to make that a clean refusal, and
+/// leaving it alone turned a version mismatch into malformed-frame counters that
+/// look like packet loss.
+pub const EMBER_DHT_VERSION: u8 = 2;
+
+/// Oldest wire version this build can still parse.
+///
+/// Equal to [`EMBER_DHT_VERSION`] while no released version is compatible with
+/// another. A future change that only *adds* to the format can lower this
+/// instead of raising both, which is the whole point of keeping them separate:
+/// the decoder then accepts the range rather than a single value.
+pub const EMBER_DHT_MIN_VERSION: u8 = 2;
 pub const K_BUCKET_SIZE: usize = 20;
 pub const ALPHA: usize = 5;
 pub const ID_BITS: usize = 128;

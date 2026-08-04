@@ -3,7 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use super::{EmberContact, EmberNodeId, EMBER_DHT_VERSION, MAX_CONTACTS_PER_RESPONSE};
+use super::{
+    EmberContact, EmberNodeId, EMBER_DHT_MIN_VERSION, EMBER_DHT_VERSION, MAX_CONTACTS_PER_RESPONSE,
+};
 use crate::network::ember::crypto;
 
 // ── Message types ──
@@ -276,8 +278,16 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
     if version == 0 {
         anyhow::bail!("Invalid DHT version 0");
     }
-    if version > EMBER_DHT_VERSION {
-        anyhow::bail!("Unsupported DHT version {version}");
+    // Both ends of the range, not just the upper one. Refusing only *newer*
+    // versions meant an older peer's frames were accepted and then misparsed,
+    // because the version byte was never raised when the layout changed. A peer
+    // we cannot parse has to be refused here, where it reads as a version
+    // mismatch, rather than deeper in as a malformed payload.
+    if version < EMBER_DHT_MIN_VERSION || version > EMBER_DHT_VERSION {
+        anyhow::bail!(
+            "Unsupported DHT version {version} (this build speaks \
+             {EMBER_DHT_MIN_VERSION}..={EMBER_DHT_VERSION})"
+        );
     }
     let msg_type = cursor.read_u8()?;
     let request_id = cursor.read_u32::<LittleEndian>()?;
@@ -572,7 +582,16 @@ pub fn batched_record_wire_len(record_len: usize) -> usize {
 pub fn peek_store_batch_count(frame: &[u8]) -> Option<u32> {
     // version(1) + msg_type(1) + request_id(4) + sender_id(16) + pubkey(32)
     // + payload_len(2), then the payload's own leading count byte.
-    let offset = HEADER_MIN_SIZE + 32 + 2;
+    let len_at = HEADER_MIN_SIZE + 32;
+    let offset = len_at + 2;
+    // The declared payload length has to be read first. Indexing straight to the
+    // count byte meant that on a frame claiming an empty payload the byte at that
+    // offset is the first byte of the *signature*, so the store budget was
+    // charged from signature material instead of a record count.
+    let payload_len = u16::from_le_bytes([*frame.get(len_at)?, *frame.get(len_at + 1)?]);
+    if payload_len == 0 {
+        return None;
+    }
     frame
         .get(offset)
         .map(|count| (*count as u32).min(MAX_STORE_BATCH_RECORDS as u32))
@@ -1126,6 +1145,33 @@ mod tests {
             }
             _ => panic!("expected Pong"),
         }
+    }
+
+    /// A version we cannot parse has to be refused as a version mismatch. The
+    /// check used to reject only *newer* versions, so when the v1 layout changed
+    /// without the byte being raised, two peers announced the same version and
+    /// then misparsed each other into malformed-frame counters that looked like
+    /// packet loss.
+    #[test]
+    fn decode_refuses_versions_outside_the_supported_range() {
+        let (sk, id) = test_keypair();
+        let encoded = encode_message(&build_ping(id, 1), &sk, true);
+
+        // The version byte leads the frame, so the range check runs before the
+        // signature is even looked at.
+        for bogus in [0u8, EMBER_DHT_MIN_VERSION - 1, EMBER_DHT_VERSION + 1, 0xFF] {
+            let mut framed = encoded.clone();
+            framed[0] = bogus;
+            assert!(
+                decode_message(&framed, true).is_err(),
+                "version {bogus} must be refused"
+            );
+        }
+
+        // Our own frames still decode, and the range is coherent.
+        assert!(decode_message(&encoded, true).is_ok());
+        assert!(EMBER_DHT_MIN_VERSION >= 1);
+        assert!(EMBER_DHT_MIN_VERSION <= EMBER_DHT_VERSION);
     }
 
     #[test]

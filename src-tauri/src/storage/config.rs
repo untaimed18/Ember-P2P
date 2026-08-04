@@ -82,12 +82,20 @@ fn paths_likely_equal(a: &Path, b: &Path) -> bool {
 ///
 /// Skipped entirely on a fresh install, where the default already applies.
 /// Returns whether the config needs saving.
-fn migrate_ember_default_on(settings: &mut AppSettings, config_existed: bool) -> bool {
+/// Returns `(config_needs_saving, told_the_user_we_turned_it_on)`. The second
+/// flag drives a startup notice: joining the overlay publishes source records
+/// carrying this node's address and keyword records for its shared files, and we
+/// cannot distinguish "false because that was the default" from "false because
+/// the user chose it", so the one case where we override a possible choice is not
+/// something to leave in a log line nobody reads.
+fn migrate_ember_default_on(settings: &mut AppSettings, config_existed: bool) -> (bool, bool) {
     if !config_existed || settings.ember_default_on_migrated {
-        return false;
+        return (false, false);
     }
+    let mut turned_on = false;
     if !settings.ember_native_enabled {
         settings.ember_native_enabled = true;
+        turned_on = true;
         info!(
             "Joining the Ember Network for this profile: it is on by default from this \
              version and the stored value predates that default. It can be turned off \
@@ -95,7 +103,7 @@ fn migrate_ember_default_on(settings: &mut AppSettings, config_existed: bool) ->
         );
     }
     settings.ember_default_on_migrated = true;
-    true
+    (true, turned_on)
 }
 
 pub struct AppConfig {
@@ -105,6 +113,11 @@ pub struct AppConfig {
     /// the app fell back to defaults. Lets startup surface a non-silent notice
     /// to the user (their settings were reset; the original is recoverable).
     pub corrupt_backup: Option<PathBuf>,
+    /// Set when the one-shot migration turned the Ember overlay on for a profile
+    /// that had it off. Startup surfaces a notice, for the same reason the
+    /// corrupt-config recovery does: it is a change the user did not ask for, and
+    /// this one puts them on a network.
+    pub ember_default_on_applied: bool,
 }
 
 impl AppConfig {
@@ -195,7 +208,9 @@ impl AppConfig {
             config_changed = true;
         }
 
-        config_changed |= migrate_ember_default_on(&mut settings, config_existed);
+        let (ember_migrated, ember_default_on_applied) =
+            migrate_ember_default_on(&mut settings, config_existed);
+        config_changed |= ember_migrated;
 
         // Migrate: old configs pointed download_folder directly at the user's
         // Downloads dir.  It should be a Ember subfolder so we don't pollute it.
@@ -262,6 +277,7 @@ impl AppConfig {
             settings,
             config_path,
             corrupt_backup,
+            ember_default_on_applied,
         })
     }
 
@@ -308,9 +324,28 @@ mod ember_default_on_tests {
             ember_default_on_migrated: false,
             ..AppSettings::default()
         };
-        assert!(migrate_ember_default_on(&mut settings, true));
+        let (changed, notify) = migrate_ember_default_on(&mut settings, true);
+        assert!(changed);
         assert!(settings.ember_native_enabled);
         assert!(settings.ember_default_on_migrated);
+        assert!(
+            notify,
+            "the user has to be told we put them on a network they had switched off"
+        );
+    }
+
+    /// An upgraded profile that already had it on is not something to announce:
+    /// nothing changed for that user, so a notice would only be noise.
+    #[test]
+    fn an_upgrade_that_changes_nothing_is_not_announced() {
+        let mut settings = AppSettings {
+            ember_native_enabled: true,
+            ember_default_on_migrated: false,
+            ..AppSettings::default()
+        };
+        let (changed, notify) = migrate_ember_default_on(&mut settings, true);
+        assert!(changed, "the marker still has to be persisted");
+        assert!(!notify);
     }
 
     /// The whole point of the marker: the flip happens once, so switching the
@@ -323,7 +358,9 @@ mod ember_default_on_tests {
             ember_default_on_migrated: true,
             ..AppSettings::default()
         };
-        assert!(!migrate_ember_default_on(&mut settings, true));
+        let (changed, notify) = migrate_ember_default_on(&mut settings, true);
+        assert!(!changed);
+        assert!(!notify);
         assert!(!settings.ember_native_enabled);
     }
 
@@ -332,7 +369,9 @@ mod ember_default_on_tests {
     #[test]
     fn a_fresh_install_is_left_alone() {
         let mut settings = AppSettings::default();
-        assert!(!migrate_ember_default_on(&mut settings, false));
+        let (changed, notify) = migrate_ember_default_on(&mut settings, false);
+        assert!(!changed);
+        assert!(!notify);
         assert!(settings.ember_native_enabled);
     }
 }

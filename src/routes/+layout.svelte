@@ -187,6 +187,7 @@
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
+    let unlistenEmberDefaultOn: UnlistenFn | null = null;
 
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
@@ -229,6 +230,16 @@
     })
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
+
+    // The upgrade turned the Ember overlay on for a profile that had it off.
+    // There is no stored difference between "off because that was the default"
+    // and "off because the user chose it", so say so rather than assume.
+    listen('ember-default-on-applied', () => {
+      if (!mounted) return;
+      toastWarning(m.layout_ember_default_on());
+    })
+      .then((fn) => { if (mounted) unlistenEmberDefaultOn = fn; else fn(); })
+      .catch((e) => console.error('Failed to register ember-default-on listener:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',
@@ -392,6 +403,7 @@
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
       if (unlistenPolicyReset) unlistenPolicyReset();
+      if (unlistenEmberDefaultOn) unlistenEmberDefaultOn();
     };
   });
 </script>

@@ -422,6 +422,7 @@ pub fn run() {
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
+            let ember_default_on_applied = config.ember_default_on_applied;
             let db_corrupt_backup = db.corrupt_backup.clone();
             let mut policy_failures = Vec::new();
             let mut policy_scope = security::policy::PolicyResetScope::default();
@@ -648,6 +649,16 @@ pub fn run() {
                         "db-corrupt-recovered",
                         serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
                     );
+                });
+            }
+            // Same delayed-emit reasoning as the recovery notices above: the
+            // overlay was turned on for this profile without being asked, and
+            // that belongs on screen rather than only in the log.
+            if ember_default_on_applied {
+                let emit_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let _ = emit_handle.emit("ember-default-on-applied", serde_json::json!({}));
                 });
             }
             if !security_policy.is_loaded() {

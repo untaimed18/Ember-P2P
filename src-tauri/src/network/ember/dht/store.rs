@@ -494,11 +494,14 @@ impl DhtStore {
         // and inbound stores, expiry and budget eviction mutate it constantly
         // between ticks, so a saved index would point somewhere arbitrary.
         let (start, mut skip_records) = match self.republish_cursor {
-            Some((key, idx)) => (
-                ordered.iter().position(|k| *k == key).unwrap_or(0),
-                // The key may have shrunk or vanished since we noted it.
-                idx,
-            ),
+            // The key may have shrunk or vanished since we noted it. If it is
+            // gone — expiry or budget eviction between ticks — the record index
+            // belongs to nothing, and carrying it over made the pass skip that
+            // many records of whichever key now happens to sort first.
+            Some((key, idx)) => match ordered.iter().position(|k| *k == key) {
+                Some(at) => (at, idx),
+                None => (0, 0),
+            },
             None => (0, 0),
         };
 

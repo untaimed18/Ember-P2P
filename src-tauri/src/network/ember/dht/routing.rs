@@ -826,7 +826,9 @@ impl RoutingTable {
     // ── Internal helpers ──
 
     fn add_to_cache(&mut self, bucket_idx: usize, contact: EmberContact) {
-        let max_subnet_global = self.scale().max_contacts_per_subnet_global();
+        let scale = self.scale();
+        let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_per_ip = scale.max_contacts_per_ip();
 
         // Don't add duplicates to cache
         if self.buckets[bucket_idx]
@@ -843,11 +845,22 @@ impl RoutingTable {
             // fill the cache with entries that `evict_and_replace` would
             // skip, leaving a bucket with no usable replacement when a slot
             // finally opened.
+            //
+            // The per-IP limit has to be part of that test, not just the subnet
+            // ones: `evict_and_replace` checks all three before promoting, so an
+            // IP-saturated entry is exactly as unpromotable as a subnet-saturated
+            // one and was being treated as worth keeping.
             let bucket = &self.buckets[bucket_idx];
             let ineligible = bucket.replacement_cache.iter().position(|c| {
                 let s = c.subnet_key();
                 bucket.subnet_count(s) >= MAX_PER_SUBNET_PER_BUCKET
                     || self.global_subnet_count.get(&s).copied().unwrap_or(0) >= max_subnet_global
+                    || self
+                        .global_ip_count
+                        .get(&c.addr.ip())
+                        .copied()
+                        .unwrap_or(0)
+                        >= max_per_ip
             });
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
