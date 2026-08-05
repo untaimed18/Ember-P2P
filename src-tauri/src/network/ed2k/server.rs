@@ -9,7 +9,16 @@ use tracing::{debug, info, warn};
 use super::messages::*;
 
 const SERVER_POLL_READABLE_TIMEOUT_MS: u64 = 5;
+/// Deadline for the first byte of a polled packet. Safe to abandon: nothing
+/// has been consumed, so the stream is still on a packet boundary.
 const SERVER_POLL_PACKET_TIMEOUT_SECS: u64 = 1;
+/// Deadline for the remainder of a packet once its first byte is consumed.
+///
+/// Long, because there is no safe way to abandon this read — expiry is
+/// treated as a corrupt stream and drops the session. It therefore has to be
+/// generous enough that a large `OP_SEARCHRESULT` or `OP_SERVERLIST` arriving
+/// over a slow link never trips it; only a genuinely dead connection should.
+const SERVER_PACKET_BODY_TIMEOUT_SECS: u64 = 60;
 /// Bound on any single write to the server socket. Every write here runs
 /// inline in the network task's `tokio::select!` loop (not spawned), so an
 /// unbounded `write_all`/`flush` against a server that stops draining its
@@ -520,9 +529,32 @@ impl Ed2kServerConnection {
                         _ => return PollReadPacketResult::Idle,
                     }
                 }
-                match tokio::time::timeout(
+                // Deadline the protocol byte on its own. `readable()` only
+                // promises the *first* byte, so entering the old single
+                // timeout around the whole packet could — and on a slow link
+                // receiving a large OP_SEARCHRESULT or OP_SERVERLIST routinely
+                // did — abandon a read that had already consumed part of the
+                // payload. With `has_buffered == false` that was then reported
+                // as `Idle`, and the next poll parsed payload bytes as a
+                // header. Expiry here provably consumed nothing.
+                let protocol = match tokio::time::timeout(
                     std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
-                    read_server_packet(reader),
+                    reader.read_u8(),
+                )
+                .await
+                {
+                    Ok(Ok(protocol)) => protocol,
+                    Ok(Err(e)) => {
+                        return classify_packet_read_result(Err(e), false);
+                    }
+                    Err(_) => return PollReadPacketResult::Idle,
+                };
+                // Past the first byte there is no safe way to walk away, so
+                // give the remainder a budget long enough that expiry means
+                // the connection is genuinely dead, and treat it as corrupt.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(SERVER_PACKET_BODY_TIMEOUT_SECS),
+                    read_server_packet_after_protocol(reader, protocol),
                 )
                 .await
                 {
@@ -537,18 +569,7 @@ impl Ed2kServerConnection {
                         }
                         other => other,
                     },
-                    Err(_) => {
-                        if has_buffered {
-                            // BufReader had data and we started reading a packet;
-                            // timing out mid-read means the stream is corrupted.
-                            packet_poll_timeout_result(false)
-                        } else {
-                            // Entered because tcp.readable() indicated readiness, but
-                            // no data arrived within the timeout. This is a spurious
-                            // wakeup (common on Windows), not corruption.
-                            PollReadPacketResult::Idle
-                        }
-                    }
+                    Err(_) => packet_poll_timeout_result(false),
                 }
             }
             ServerTransport::Encrypted(stream) => {
@@ -565,9 +586,24 @@ impl Ed2kServerConnection {
                         _ => return PollReadPacketResult::Idle,
                     }
                 }
-                match tokio::time::timeout(
+                // Same split as the plain path above: only the first byte is
+                // safely abandonable, and on this transport an abandoned read
+                // desynchronizes the RC4 keystream as well as the framing.
+                let first = match tokio::time::timeout(
                     std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
-                    stream.read_packet(),
+                    stream.read_packet_first_byte(),
+                )
+                .await
+                {
+                    Ok(Ok(first)) => first,
+                    Ok(Err(e)) => {
+                        return classify_packet_read_result(Err(e), true);
+                    }
+                    Err(_) => return PollReadPacketResult::Idle,
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(SERVER_PACKET_BODY_TIMEOUT_SECS),
+                    stream.read_packet_after_first_byte(first),
                 )
                 .await
                 {
@@ -582,13 +618,7 @@ impl Ed2kServerConnection {
                         }
                         other => other,
                     },
-                    Err(_) => {
-                        if has_buffered {
-                            packet_poll_timeout_result(true)
-                        } else {
-                            PollReadPacketResult::Idle
-                        }
-                    }
+                    Err(_) => packet_poll_timeout_result(true),
                 }
             }
         }
@@ -2221,6 +2251,20 @@ const MAX_UNCOMPRESSED_SERVER_PACKET: usize = 300_000;
 
 async fn read_server_packet<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
     let protocol = reader.read_u8().await?;
+    read_server_packet_after_protocol(reader, protocol).await
+}
+
+/// The rest of a server packet, once its protocol byte has been consumed.
+///
+/// Split out so the poll loop can put a short deadline on the *first* byte
+/// only — where expiry provably consumed nothing — and read the remainder
+/// under a long, fatal budget. `read_exact` is not cancel-safe, so a deadline
+/// that fires anywhere after the first byte leaves the reader parked
+/// mid-payload with no way to resynchronize.
+async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    protocol: u8,
+) -> io::Result<(u8, Vec<u8>)> {
     if protocol != OP_EDONKEYHEADER && protocol != OP_PACKEDPROT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -2917,12 +2917,28 @@ impl MultiSourceDownload {
                 }));
             }
 
-            let all_sources: Vec<DownloadSource> = self
-                .sources
-                .iter()
-                .chain(injected_sources.iter())
-                .cloned()
-                .collect();
+            // Deduplicate on the dial key. `injected_sources` is appended to
+            // on every re-injection with no existing-entry check, so over a
+            // long download one peer accumulated several rows and appeared as
+            // several independent candidate indices. The cooldown filter is
+            // keyed on `(ip, port)` and evaluated once per round, and
+            // `source_dial_history` is only stamped *after* assignment, so
+            // every copy passed and each could be handed a different part and
+            // spawned concurrently — several simultaneous TCP connections to
+            // the same peer, which is exactly the pattern the surrounding
+            // cooldown and dial pacing exist to avoid and which anti-leecher
+            // mods penalise. `claim_live_peer` only catches it after connect,
+            // Hello and EmuleInfo have already completed.
+            let all_sources: Vec<DownloadSource> = {
+                let mut seen: std::collections::HashSet<(String, u16)> =
+                    std::collections::HashSet::new();
+                self.sources
+                    .iter()
+                    .chain(injected_sources.iter())
+                    .filter(|s| seen.insert((s.peer_ip.clone(), s.peer_port)))
+                    .cloned()
+                    .collect()
+            };
 
             // Promote any peers that reached queue state during the
             // previous round (populated by `download_parts_from_source`

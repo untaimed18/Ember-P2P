@@ -893,6 +893,14 @@ const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
 const SESSIONMAXTIME_SECS: u64 = 3600;
+/// Most bytes a single `OP_REQUESTPARTS` may commit us to serving.
+///
+/// The block loop that serves a request runs to completion before any
+/// rotation control is evaluated, so this is what bounds how long one peer can
+/// hold a slot uninterrupted. Set to the session quantum: an eMule-family peer
+/// asks for three `EMBLOCKSIZE` blocks per request, so nothing legitimate
+/// comes close.
+const MAX_REQUESTPARTS_BYTES: u64 = SESSIONMAXTRANS;
 /// eMule MIN_UP_CLIENTS_ALLOWED: minimum upload slots regardless of bandwidth
 const MIN_UP_CLIENTS_ALLOWED: usize = 2;
 /// eMule MAX_UP_CLIENTS_ALLOWED: maximum upload slots
@@ -7536,6 +7544,38 @@ impl UploadHandler {
                             }
                         }
                         offsets = split;
+                    }
+
+                    // Cap what one request can commit us to serving. Every
+                    // rotation control — SESSIONMAXTRANS, SESSIONMAXTIME, the
+                    // score-based preemption check and the outer idle gate —
+                    // lives *after* the block loop below, so a single range
+                    // covering the whole file (nothing rejected it: it is
+                    // within EOF and correctly ordered) held one of the user's
+                    // upload slots for the entire transfer while everyone else
+                    // waited, and stopped responding to preemption for that
+                    // whole period. eMule-family peers ask for three
+                    // EMBLOCKSIZE blocks at a time, so a session-quantum cap
+                    // is far above anything legitimate; the remainder is simply
+                    // dropped and the peer re-requests it on its next turn.
+                    {
+                        let mut budget = MAX_REQUESTPARTS_BYTES;
+                        let before = offsets.len();
+                        offsets.retain(|&(s, e)| {
+                            let len = e.saturating_sub(s);
+                            if len > budget {
+                                false
+                            } else {
+                                budget -= len;
+                                true
+                            }
+                        });
+                        if offsets.len() != before {
+                            debug!(
+                                "Trimmed OP_REQUESTPARTS from {peer_addr}: {before} block(s) exceeded \
+                                 the {MAX_REQUESTPARTS_BYTES}-byte per-request cap"
+                            );
+                        }
                     }
 
                     // Diagnostic: summarise the batch shape for this REQUESTPARTS

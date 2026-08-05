@@ -32,7 +32,17 @@ use crate::app_state::AppState;
 pub struct SharedFoldersWatcher {
     watched: Mutex<HashSet<PathBuf>>,
     debouncer: Mutex<Option<Debouncer<RecommendedWatcher>>>,
+    /// The last full set of folders we were asked to watch, including any that
+    /// were offline at the time. `watched` holds only those actually
+    /// registered, so this is what lets the retry loop tell "not requested"
+    /// apart from "requested but unavailable".
+    desired: Mutex<Vec<String>>,
 }
+
+/// How often to retry shared folders that could not be watched — an external
+/// or network drive that was disconnected at launch, or a directory that
+/// disappeared mid-session and took its OS watch with it.
+const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 impl SharedFoldersWatcher {
     /// Create and start the watcher. Returns `None` if the OS-level watcher
@@ -178,15 +188,61 @@ impl SharedFoldersWatcher {
         let watcher = Arc::new(Self {
             watched: Mutex::new(HashSet::new()),
             debouncer: Mutex::new(Some(debouncer)),
+            desired: Mutex::new(Vec::new()),
         });
         watcher.sync_paths(&initial_paths);
+
+        // Retry folders we could not watch. `sync_paths` runs only at startup
+        // and on folder add/remove, so a shared folder on an external or
+        // network drive that was disconnected at launch was skipped and never
+        // reconsidered: live change tracking stayed off for that folder for
+        // the rest of the session even after the drive came back, and files
+        // added there went unindexed until a manual reload. The same applies
+        // to a watched directory that disappears mid-session, which kills its
+        // OS watch with nothing to re-establish it.
+        let retry_watcher = Arc::downgrade(&watcher);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_RETRY_INTERVAL).await;
+                let Some(watcher) = retry_watcher.upgrade() else {
+                    return;
+                };
+                watcher.resync_unwatched();
+            }
+        });
         Some(watcher)
+    }
+
+    /// Re-watch any desired folder that is not currently being watched, and
+    /// forget watches whose directory has gone away so they are re-established
+    /// if it returns.
+    fn resync_unwatched(&self) {
+        let desired = self.desired.lock().clone();
+        if desired.is_empty() {
+            return;
+        }
+        {
+            let mut current = self.watched.lock();
+            current.retain(|path| path.exists());
+        }
+        let missing = {
+            let current = self.watched.lock();
+            desired
+                .iter()
+                .any(|p| !current.contains(&PathBuf::from(p)) && PathBuf::from(p).exists())
+        };
+        if missing {
+            self.sync_paths(&desired);
+        }
     }
 
     /// Make the watched set exactly match `desired`. Paths that don't exist
     /// on disk are skipped (logged once). Errors from the underlying
     /// watcher are logged but non-fatal.
     pub fn sync_paths(&self, desired: &[String]) {
+        // Remember the full request, including paths that are offline right
+        // now, so `resync_unwatched` can pick them up when they reappear.
+        *self.desired.lock() = desired.to_vec();
         let desired_set: HashSet<PathBuf> = desired
             .iter()
             .filter_map(|p| {
@@ -194,7 +250,10 @@ impl SharedFoldersWatcher {
                 if pb.exists() {
                     Some(pb)
                 } else {
-                    warn!("FS watcher: skipping non-existent path {}", pb.display());
+                    debug!(
+                        "FS watcher: {} is not available yet; will retry",
+                        pb.display()
+                    );
                     None
                 }
             })

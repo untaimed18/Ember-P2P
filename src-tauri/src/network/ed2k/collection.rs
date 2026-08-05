@@ -3,8 +3,6 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
-use tracing::info;
-
 const COLLECTION_FILE_VERSION1: u32 = 0x01;
 const COLLECTION_FILE_VERSION2_LARGE: u32 = 0x02;
 
@@ -216,7 +214,13 @@ impl Collection {
         })
     }
 
-    pub fn save_binary(&self, path: &Path) -> anyhow::Result<()> {
+    /// Serialized `.emulecollection` bytes.
+    ///
+    /// Callers write these themselves rather than handing this type a path:
+    /// a scoped export has to create its file through a pinned parent handle,
+    /// because a pathname can be redirected between the containment check and
+    /// the write.
+    pub fn to_binary_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.write_u32::<LittleEndian>(COLLECTION_FILE_VERSION2_LARGE)?;
 
@@ -268,20 +272,11 @@ impl Collection {
             buf.write_all(&file_buf)?;
         }
 
-        // Use atomic_write so a crash mid-save can't truncate the
-        // collection file. Previously we did write+rename without
-        // fsync — on Windows the rename can land before the data
-        // pages flush, leaving a zero-length file at the final path.
-        crate::security::atomic_write(path, &buf, false)?;
-        info!(
-            "Saved collection '{}' with {} files",
-            self.name,
-            self.files.len()
-        );
-        Ok(())
+        Ok(buf)
     }
 
-    pub fn save_text(&self, path: &Path) -> anyhow::Result<()> {
+    /// Serialized ed2k-link text. See [`Collection::to_binary_bytes`].
+    pub fn to_text_bytes(&self) -> String {
         let mut content = String::new();
         for file in &self.files {
             let aich = if file.aich_hash.is_empty() {
@@ -298,9 +293,7 @@ impl Collection {
             ));
             content.push('\n');
         }
-        // Same crash-safety reasoning as `save` above.
-        crate::security::atomic_write(path, content.as_bytes(), false)?;
-        Ok(())
+        content
     }
 }
 
@@ -599,7 +592,8 @@ mod tests {
                 .unwrap_or_default(),
         ));
 
-        collection.save_binary(&path).expect("save collection");
+        let bytes = collection.to_binary_bytes().expect("serialize collection");
+        std::fs::write(&path, &bytes).expect("save collection");
         let loaded = Collection::load(&path).expect("load collection");
         let _ = std::fs::remove_file(&path);
 

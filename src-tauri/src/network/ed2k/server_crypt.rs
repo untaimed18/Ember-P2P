@@ -80,9 +80,35 @@ impl ObfuscatedServerStream {
     }
 
     /// Read and decrypt a server packet. Returns (opcode, payload).
+    /// Consume just the first ciphertext byte of a packet header.
+    ///
+    /// The poll loop deadlines this alone so an expiry provably leaves the
+    /// stream on a packet boundary; everything after it is read under a long
+    /// fatal budget, because RC4 is a stream cipher and an abandoned read
+    /// desynchronizes the keystream as well as the framing.
+    pub async fn read_packet_first_byte(&mut self) -> io::Result<u8> {
+        let mut first = [0u8; 1];
+        self.reader.read_exact(&mut first).await?;
+        Ok(first[0])
+    }
+
     pub async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        let first = self.read_packet_first_byte().await?;
+        self.read_packet_after_first_byte(first).await
+    }
+
+    /// The rest of a packet, given its already-consumed first ciphertext byte.
+    ///
+    /// The byte is re-joined with the remaining five before decryption, so the
+    /// RC4 keystream advances over exactly the same six bytes as a single
+    /// read would have.
+    pub async fn read_packet_after_first_byte(
+        &mut self,
+        first: u8,
+    ) -> io::Result<(u8, Vec<u8>)> {
         let mut enc_header = [0u8; 6];
-        self.reader.read_exact(&mut enc_header).await?;
+        enc_header[0] = first;
+        self.reader.read_exact(&mut enc_header[1..]).await?;
         let mut dec_header = [0u8; 6];
         self.recv_key.process(&enc_header, &mut dec_header);
 

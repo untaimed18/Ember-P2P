@@ -12455,6 +12455,11 @@ fn apply_network_settings(
         new_settings.allow_shared_files_browse,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // Same value, second consumer: the Hello builder has no settings handle,
+    // and until it was told, bit 2 of CT_EMULE_MISCOPTIONS1 was hardcoded to
+    // "no view shared files" — so enabling the setting never reached the wire
+    // and eMule peers never offered "View Files", let alone asked.
+    ed2k::messages::set_share_browsing_allowed(new_settings.allow_shared_files_browse);
     state.uss_enabled_flag.store(
         new_settings.uss_enabled,
         std::sync::atomic::Ordering::Relaxed,
@@ -13106,9 +13111,13 @@ pub async fn start_network(
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
-        share_browsing_shared: Arc::new(std::sync::atomic::AtomicBool::new(
-            settings.allow_shared_files_browse,
-        )),
+        share_browsing_shared: {
+            // Seed the Hello builder's mirror from the same value.
+            ed2k::messages::set_share_browsing_allowed(settings.allow_shared_files_browse);
+            Arc::new(std::sync::atomic::AtomicBool::new(
+                settings.allow_shared_files_browse,
+            ))
+        },
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),

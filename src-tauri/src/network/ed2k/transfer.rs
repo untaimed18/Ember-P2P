@@ -3318,6 +3318,26 @@ impl Ed2kDownload {
         tracker.set_file_name(&self.file_name);
         if !part_hashes.is_empty() {
             tracker.set_part_hashes(part_hashes.clone());
+        } else {
+            // Seed live verification from the resumed `.part.met`, exactly as
+            // the multi-source worker does. Without this the single-source
+            // path ran with per-part MD4 verification disabled whenever the
+            // peer never answered `OP_HASHSETREQ` (a LowID callback peer that
+            // does not serve hashsets, say) — even though the tracker had just
+            // loaded a verified hashset from disk. Nothing was ever marked
+            // verified, the AICH narrowing block became unreachable, the
+            // download advertised zero serveable parts for its whole life, and
+            // a single corrupt block went unnoticed until the whole-file hash
+            // at 100%, which then reset every part for re-download.
+            let resumed = tracker.part_hashes().to_vec();
+            if !resumed.is_empty() {
+                debug!(
+                    "Seeding {} part hash(es) from resumed .part.met for {}",
+                    resumed.len(),
+                    self.file_name
+                );
+                part_hashes = resumed;
+            }
         }
 
         // Publish initial preview-readiness onto the shared transfer control so

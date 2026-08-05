@@ -387,6 +387,28 @@ impl HelloOptions {
     }
 }
 
+/// Process-wide mirror of `AppSettings::allow_shared_files_browse`.
+///
+/// Every Hello we send has to give the same answer — the responder handshake
+/// from the upload listener, and the dialer handshakes from the download,
+/// friend and buddy paths — but only the upload listener has a settings
+/// handle in scope. One atomic keeps them consistent without threading a
+/// snapshot through five signatures and their call sites, and the value is a
+/// single user setting, so there is genuinely nothing per-connection about it.
+/// Kept current by the network task; see `set_share_browsing_allowed`.
+static SHARE_BROWSING_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mirror the current `allow_shared_files_browse` setting for Hello building.
+pub fn set_share_browsing_allowed(allowed: bool) {
+    SHARE_BROWSING_ALLOWED.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether peers are currently told they may browse our shared files.
+pub fn share_browsing_allowed() -> bool {
+    SHARE_BROWSING_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Peer capability flags parsed from Hello/EmuleInfo exchanges.
 #[derive(Debug, Clone, Default)]
 pub struct PeerCapabilities {
@@ -493,7 +515,17 @@ pub fn build_hello_answer_with_buddy_opts(
 // ignore, so we look byte-identical to eMule on the public handshake.
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
+///
+/// Bit 2 is "no view shared files", so it is the *inverse* of the user's
+/// setting. It used to be hardcoded to 1, which meant that enabling "Allow
+/// shared files browse" changed nothing on the wire: every peer was still told
+/// on the handshake that our shares were private, eMule stored that as
+/// `m_bNoViewSharedFiles` and suppressed its "View Files" action, so
+/// `OP_ASKSHAREDFILES` never arrived and the whole responder path — including
+/// the polite `OP_ASKSHAREDDENIEDANS` refusal — was unreachable for the
+/// clients it was written for.
 pub fn build_misc_options1() -> u32 {
+    let no_view_shared_files = !share_browsing_allowed() as u32;
     (1u32 << 29)   // AICH ver 1
     | (1u32 << 28)   // Unicode
     | (4u32 << 24)   // UDP ver 4
@@ -503,7 +535,7 @@ pub fn build_misc_options1() -> u32 {
     | (2u32 << 8)    // Extended requests ver 2
     | (1u32 << 4)    // Comments ver 1
     | (0u32 << 3)    // No peer cache
-    | (1u32 << 2)    // No view shared files
+    | (no_view_shared_files << 2)
     | (1u32 << 1)    // Multi-packet support
     | (0u32 << 0) // Preview support
 }

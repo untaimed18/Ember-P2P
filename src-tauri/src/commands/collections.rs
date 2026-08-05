@@ -247,6 +247,7 @@ async fn create_collection_internal(
         ));
     }
 
+    let mut scoped_dirs: Option<Vec<String>> = None;
     if enforce_output_scope {
         let config = state.config.read().await;
         let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
@@ -274,6 +275,7 @@ async fn create_collection_internal(
                 )
             },
         )?;
+        scoped_dirs = Some(allowed_dirs);
     }
 
     let ext = canonical
@@ -288,14 +290,55 @@ async fn create_collection_internal(
     }
     let write_path = canonical.clone();
     tokio::task::spawn_blocking(move || {
-        if binary {
+        let bytes = if binary {
             collection
-                .save_binary(&write_path)
-                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+                .to_binary_bytes()
+                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?
         } else {
-            collection
-                .save_text(&write_path)
-                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+            collection.to_text_bytes().into_bytes()
+        };
+        match scoped_dirs {
+            // Scoped export: create the file through a pinned parent-directory
+            // handle rather than by pathname. `verify_output_path` above only
+            // proves the location was inside an approved root *at check time*,
+            // and both the write and `atomic_write`'s own temp file resolve
+            // the parent by name afterwards — so a directory swapped in
+            // between could redirect the export out of the approved tree.
+            // `archive_recovery` and the download-completion path already
+            // write through this helper for the same reason.
+            Some(allowed_dirs) => {
+                use std::io::Write;
+                // `create_new` refuses an existing file, so make room first —
+                // through the identity-checked removal, not `fs::remove_file`.
+                if write_path.exists() {
+                    crate::security::filesystem::remove_approved_file(&write_path, &allowed_dirs)
+                        .map_err(|e| {
+                            coded_ctx(
+                                "collections_save_failed",
+                                "Could not replace the existing collection file",
+                                e,
+                            )
+                        })?;
+                }
+                let (_, mut file) = crate::security::filesystem::create_new_verified_output(
+                    &write_path,
+                    &allowed_dirs,
+                )
+                .map_err(|e| {
+                    coded_ctx(
+                        "collections_output_outside_allowed_dirs",
+                        "Output path must be inside an unchanged approved root",
+                        e,
+                    )
+                })?;
+                file.write_all(&bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+            }
+            // Unscoped export (the user picked the destination themselves):
+            // no approved root applies, so keep the crash-safe atomic write.
+            None => crate::security::atomic_write(&write_path, &bytes, false)
+                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?,
         }
         Ok::<_, String>(())
     })
