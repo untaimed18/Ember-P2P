@@ -566,8 +566,9 @@ impl KnownFileList {
     /// Decide whether the on-disk known-file record matches what we just
     /// discovered for this file, or whether we need to refresh the
     /// record. Returns `true` if any of `file_path`, `modified_at`,
-    /// `file_size`, `file_name`, or `aich_hash` (when the discovery
-    /// supplies one) has drifted from the stored value.
+    /// `file_size`, `file_name`, `aich_hash`, or `ember_file_hash` (the
+    /// last two only when the discovery supplies one) has drifted from
+    /// the stored value.
     ///
     /// Used by the `SharedFilesChanged` handler to break the
     /// "permanent rehash loop" that fires whenever any external
@@ -585,6 +586,7 @@ impl KnownFileList {
         discovered_mtime: i64,
         _discovered_name: &str,
         discovered_aich: &str,
+        discovered_ember: &str,
     ) -> bool {
         if let Some(entry) = self.path_index.get(&normalize_path_key(discovered_path)) {
             return entry.hash != *hash
@@ -594,7 +596,17 @@ impl KnownFileList {
                     && self
                         .files
                         .get(hash)
-                        .is_none_or(|record| record.aich_hash != discovered_aich));
+                        .is_none_or(|record| record.aich_hash != discovered_aich))
+                // Same rule for the Ember digest. Omitting it meant the
+                // startup migration recomputed BLAKE3 for the whole library,
+                // found every other field unchanged, skipped the write, and
+                // rehashed the identical files again on the next launch —
+                // forever.
+                || (!discovered_ember.is_empty()
+                    && self
+                        .files
+                        .get(hash)
+                        .is_none_or(|record| record.ember_file_hash != discovered_ember));
         }
         match self.files.get(hash) {
             None => true,
@@ -1321,6 +1333,7 @@ mod tests {
             1_700_000_000,
             "movie.mkv",
             "",
+            "",
         ));
     }
 
@@ -1331,6 +1344,7 @@ mod tests {
         let hash = r.file_hash;
         let path = r.file_path.clone();
         let aich = r.aich_hash.clone();
+        let ember = r.ember_file_hash.clone();
         kf.add_or_update(r);
         assert!(!kf.record_needs_refresh(
             &hash,
@@ -1339,6 +1353,7 @@ mod tests {
             1_700_000_000,
             "movie.mkv",
             &aich,
+            &ember,
         ));
     }
 
@@ -1355,6 +1370,7 @@ mod tests {
         let hash = r.file_hash;
         let path = r.file_path.clone();
         let aich = r.aich_hash.clone();
+        let ember = r.ember_file_hash.clone();
         kf.add_or_update(r);
         assert!(
             kf.record_needs_refresh(
@@ -1364,6 +1380,7 @@ mod tests {
                 1_700_000_500, // <-- drifted
                 "movie.mkv",
                 &aich,
+                &ember,
             ),
             "mtime drift must trigger a refresh — otherwise the next \
              discovery's find_by_path_and_meta will reject the stale \
@@ -1378,6 +1395,7 @@ mod tests {
         let r = sample_record();
         let hash = r.file_hash;
         let aich = r.aich_hash.clone();
+        let ember = r.ember_file_hash.clone();
         kf.add_or_update(r);
         // Same hash, different path — file was moved/renamed.
         assert!(kf.record_needs_refresh(
@@ -1387,6 +1405,7 @@ mod tests {
             1_700_000_000,
             "movie.mkv",
             &aich,
+            &ember,
         ));
     }
 
@@ -1415,6 +1434,7 @@ mod tests {
             1024 * 1024,
             1_700_000_123,
             "renamed-copy.mkv",
+            "",
             "",
         ));
     }
@@ -1469,6 +1489,7 @@ mod tests {
         let r = sample_record();
         let hash = r.file_hash;
         let path = r.file_path.clone();
+        let ember = r.ember_file_hash.clone();
         kf.add_or_update(r);
         assert!(!kf.record_needs_refresh(
             &hash,
@@ -1477,6 +1498,59 @@ mod tests {
             1_700_000_000,
             "movie.mkv",
             "", // <-- discovery hasn't computed AICH yet
+            &ember,
+        ));
+    }
+
+    /// Regression for the Ember rehash loop: a record written before the
+    /// BLAKE3 digest existed has an empty `ember_file_hash`, so startup
+    /// queues the file for a migration re-hash. When that pass supplies the
+    /// digest, this must report a refresh — otherwise the reconcile skips
+    /// the write (every other field is unchanged), the digest never reaches
+    /// known.met, and the whole library re-hashes on every single launch.
+    #[test]
+    fn record_needs_refresh_when_ember_digest_is_new() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.ember_file_hash = String::new();
+        let hash = r.file_hash;
+        let path = r.file_path.clone();
+        let aich = r.aich_hash.clone();
+        kf.add_or_update(r);
+        assert!(
+            kf.record_needs_refresh(
+                &hash,
+                &path,
+                1024 * 1024,
+                1_700_000_000,
+                "movie.mkv",
+                &aich,
+                &"ab".repeat(32), // <-- migration pass just computed it
+            ),
+            "a freshly computed Ember digest must be persisted, or the \
+             migration re-hashes the same files on every launch forever",
+        );
+    }
+
+    /// Mirror of the AICH rule: discovery that hasn't computed the Ember
+    /// digest yet must not flag a refresh, which would wipe a known digest
+    /// every time the watcher fires ahead of the hash pass.
+    #[test]
+    fn record_needs_refresh_ignores_empty_ember_in_discovery() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        let path = r.file_path.clone();
+        let aich = r.aich_hash.clone();
+        kf.add_or_update(r);
+        assert!(!kf.record_needs_refresh(
+            &hash,
+            &path,
+            1024 * 1024,
+            1_700_000_000,
+            "movie.mkv",
+            &aich,
+            "", // <-- discovery hasn't computed BLAKE3 yet
         ));
     }
 

@@ -30851,17 +30851,18 @@ pub async fn start_network(
         }
     }
 
-    // Final AICH-root checkpoint before the shutdown save: fold any freshly
-    // recomputed roots from the live index into known.met so a hash pass
-    // interrupted by this shutdown (e.g. the one-time AICH migration re-hash)
-    // resumes next launch instead of restarting. This mirrors the aich_hash
-    // arm of the SharedFilesChanged reconcile, minus the publish-set rebuild
-    // that's pointless during shutdown, and preserves every other field.
+    // Final digest checkpoint before the shutdown save: fold any freshly
+    // recomputed AICH roots and Ember BLAKE3 digests from the live index into
+    // known.met so a hash pass interrupted by this shutdown (either one-time
+    // migration re-hash) resumes next launch instead of restarting. This
+    // mirrors the digest arms of the SharedFilesChanged reconcile, minus the
+    // publish-set rebuild that's pointless during shutdown, and preserves
+    // every other field.
     {
         let idx = local_index.read().await;
         let mut any_updated = false;
         for f in idx.all_files() {
-            if f.aich_hash.is_empty() || f.hash.is_empty() {
+            if f.hash.is_empty() || (f.aich_hash.is_empty() && f.ember_file_hash.is_empty()) {
                 continue;
             }
             if let Ok(hb) = hex::decode(&f.hash) {
@@ -30869,8 +30870,14 @@ pub async fn start_network(
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&hb);
                     if let Some(record) = known_files.find_by_hash_mut(&fh) {
-                        if record.aich_hash != f.aich_hash {
+                        if !f.aich_hash.is_empty() && record.aich_hash != f.aich_hash {
                             record.aich_hash = f.aich_hash.clone();
+                            any_updated = true;
+                        }
+                        if !f.ember_file_hash.is_empty()
+                            && record.ember_file_hash != f.ember_file_hash
+                        {
+                            record.ember_file_hash = f.ember_file_hash.clone();
                             any_updated = true;
                         }
                     }
@@ -40953,6 +40960,7 @@ async fn handle_command_inner(
                             f.modified_at,
                             &f.name,
                             &f.aich_hash,
+                            &f.ember_file_hash,
                         ) {
                             use crate::storage::known_files::KnownFileRecord;
                             // Preserve cumulative counters from the
