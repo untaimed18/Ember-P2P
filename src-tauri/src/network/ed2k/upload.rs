@@ -1579,6 +1579,9 @@ struct UploadHandler {
     abuse_tracker: Arc<tokio::sync::Mutex<AbuseTracker>>,
     /// In-memory AICH hash cache: file_hash_hex -> (AICHRecoveryHashSet, last_access)
     aich_cache: Arc<tokio::sync::Mutex<AichCache>>,
+    /// In-memory MD4 part-hash cache for `OP_HASHSETREQ`: file_hash_hex ->
+    /// (part hashes, last_access). See [`PartHashCache`].
+    part_hash_cache: Arc<tokio::sync::Mutex<PartHashCache>>,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     ember_hash: [u8; 16],
     /// Our Ed25519 public key, advertised in `OP_EMBER_HELLO` so peers can
@@ -1635,6 +1638,49 @@ struct UploadHandler {
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
+const MAX_PART_HASH_CACHE_ENTRIES: usize = 50;
+
+/// MD4 part hashes for complete shared files, keyed by ed2k hash hex.
+///
+/// `OP_HASHSETREQ` / `OP_HASHSETREQUEST2` answer a ~22-byte request by reading
+/// the whole file. Uncached, that meant every new downloader of a share cost a
+/// full re-read — a popular 20 GB file re-hashed per downloader — and a peer
+/// looping the request could pin a CPU core and the disk for as long as it
+/// liked, because the handler needs no upload slot, no queue position and no
+/// identity, and the abuse tracker only counts connections rather than
+/// packets. The AICH computation one opcode away was already memoized exactly
+/// like this.
+struct PartHashCache {
+    entries: HashMap<String, (Vec<[u8; 16]>, std::time::Instant)>,
+}
+
+impl PartHashCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Vec<[u8; 16]>> {
+        let entry = self.entries.get_mut(key)?;
+        entry.1 = std::time::Instant::now();
+        Some(entry.0.clone())
+    }
+
+    fn insert(&mut self, key: String, value: Vec<[u8; 16]>) {
+        if self.entries.len() >= MAX_PART_HASH_CACHE_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, std::time::Instant::now()));
+    }
+}
 
 struct AichCache {
     entries: HashMap<
@@ -2400,6 +2446,7 @@ pub async fn start_upload_server(
         udp_fw_check_tx,
         abuse_tracker: Arc::new(tokio::sync::Mutex::new(AbuseTracker::new())),
         aich_cache: Arc::new(tokio::sync::Mutex::new(AichCache::new())),
+        part_hash_cache: Arc::new(tokio::sync::Mutex::new(PartHashCache::new())),
         ember_hash,
         ed25519_public_key,
         ed25519_secret_key,
@@ -6335,8 +6382,16 @@ impl UploadHandler {
                     let key_len = payload[0] as usize;
                     if key_len > 0 && payload.len() > key_len {
                         let mut cm = self.credit_manager.write().await;
-                        cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
-                        cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
+                        // Only move the identity forward if the key was
+                        // actually bound. A refused key must not reset a
+                        // verified peer's state to `Needed` — that alone
+                        // would let a stranger knock an established identity
+                        // out of `Verified` on demand.
+                        let key_bound = cm
+                            .set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
+                        if key_bound {
+                            cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
+                        }
                         drop(cm);
 
                         // Replay any SECIDENTSTATE the peer sent us before
@@ -8340,6 +8395,18 @@ impl UploadHandler {
 
                         slot_guard.deactivate();
                         session_start = None;
+                        // Reset the session byte counters, exactly as the
+                        // cancel / end-of-download teardown below does. Left
+                        // set, the outer idle gate (`slot_guard.is_active() ||
+                        // uploaded > 0`) tripped 60 seconds later and closed
+                        // the connection on a peer that was correctly waiting
+                        // its next turn. That trigger exists to unpin a stale
+                        // UI row, and `transfer_id` was just cleared, so there
+                        // was no row left to unpin — it only cost the
+                        // connection, and a firewalled peer could not be
+                        // re-promoted until it dialled back in.
+                        uploaded = 0;
+                        served_bytes_per_part.clear();
                         self.slot_rates.lock().remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
 
@@ -8636,19 +8703,43 @@ impl UploadHandler {
                         let file_size = file.size;
                         let is_partial = file.is_partial;
                         let mut opened = file.opened;
-                        let hashset_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<[u8; 16]>>> {
-                            if is_partial && file_size > 0 {
-                                let tracker = super::part_tracker::PartTracker::new(file_size, &path);
-                                let cached = tracker.part_hashes();
-                                if !cached.is_empty() {
-                                    tracing::debug!("Using {} cached part hashes from tracker", cached.len());
-                                    return Ok(Some(cached.to_vec()));
+                        // Complete files answer from the memo when we have it:
+                        // this handler is otherwise a whole-file read for the
+                        // price of a 22-byte packet, and every downloader of a
+                        // share sends one.
+                        let cache_key = hex::encode(req_hash);
+                        let memoized = if is_partial {
+                            None
+                        } else {
+                            self.part_hash_cache.lock().await.get(&cache_key)
+                        };
+                        let hashset_result = match memoized {
+                            Some(hashes) => Ok(Some(hashes)),
+                            None => {
+                                let computed = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<[u8; 16]>>> {
+                                    if is_partial && file_size > 0 {
+                                        let tracker = super::part_tracker::PartTracker::new(file_size, &path);
+                                        let cached = tracker.part_hashes();
+                                        if !cached.is_empty() {
+                                            tracing::debug!("Using {} cached part hashes from tracker", cached.len());
+                                            return Ok(Some(cached.to_vec()));
+                                        }
+                                        return Ok(None);
+                                    }
+                                    Ok(Some(compute_part_hashes(&mut opened)?))
+                                })
+                                .await?;
+                                if let Ok(Some(ref hashes)) = computed {
+                                    if !is_partial {
+                                        self.part_hash_cache
+                                            .lock()
+                                            .await
+                                            .insert(cache_key.clone(), hashes.clone());
+                                    }
                                 }
-                                return Ok(None);
+                                computed
                             }
-                            Ok(Some(compute_part_hashes(&mut opened)?))
-                        })
-                        .await?;
+                        };
 
                         match hashset_result {
                             Ok(Some(hashes)) => {
@@ -8709,8 +8800,17 @@ impl UploadHandler {
                                 let aich_root = local_ident.aich_hash;
                                 let is_partial = file.is_partial;
                                 let mut opened = file.opened;
-                                let (md4_hashes, aich_hashes) = tokio::task::spawn_blocking(move || {
-                                    let md4 = if request_md4 {
+                                // Same memo as `OP_HASHSETREQ` above: without
+                                // it this re-reads the whole file per request.
+                                let cache_key = hex::encode(file_ident.md4_hash);
+                                let memoized_md4 = if is_partial || !request_md4 {
+                                    None
+                                } else {
+                                    self.part_hash_cache.lock().await.get(&cache_key)
+                                };
+                                let compute_md4 = request_md4 && memoized_md4.is_none();
+                                let (computed_md4, aich_hashes) = tokio::task::spawn_blocking(move || {
+                                    let md4 = if compute_md4 {
                                         if is_partial {
                                             let tracker = super::part_tracker::PartTracker::new(file_size, &path);
                                             let cached = tracker.part_hashes();
@@ -8736,6 +8836,15 @@ impl UploadHandler {
                                     };
                                     Ok::<_, anyhow::Error>((md4, aich))
                                 }).await??;
+                                if let Some(ref hashes) = computed_md4 {
+                                    if !is_partial {
+                                        self.part_hash_cache
+                                            .lock()
+                                            .await
+                                            .insert(cache_key.clone(), hashes.clone());
+                                    }
+                                }
+                                let md4_hashes = memoized_md4.or(computed_md4);
 
                                 let md4_section = md4_hashes
                                     .as_ref()

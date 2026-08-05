@@ -1718,6 +1718,31 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Launch `path` in the user's default application.
+///
+/// On Windows the extended-length `\\?\` prefix has to come off first. Every
+/// path here comes from `canonicalize`, which always produces that form, and
+/// the Shell APIs behind `opener` reject it — so "Open" failed for every file
+/// while the neighbouring "Show in folder" worked, because
+/// `reveal_in_file_manager` already strips it. A path that genuinely needs
+/// the prefix to exceed MAX_PATH cannot be launched by the shell either way.
+#[cfg(target_os = "windows")]
+pub fn open_with_default_app(path: &Path) -> io::Result<()> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+    let clean = match value.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => value.strip_prefix(r"\\?\").unwrap_or(value).to_string(),
+    };
+    opener::open(clean).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_with_default_app(path: &Path) -> io::Result<()> {
+    opener::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
 #[cfg(target_os = "macos")]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     std::process::Command::new("open")

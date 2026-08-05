@@ -864,6 +864,17 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             // ember_file_hash must be rehashed once so DHT publish and
             // download verify see a real BLAKE3 (zeros skip verify).
             if file.ember_file_hash.is_empty() {
+                // Restore the path-unique pending id for the duration of the
+                // re-hash. `file.id` was just set to the content hash above,
+                // which is identical for every duplicate of the same content,
+                // and both `finalize_pending_hash` and `remove_file_by_id`
+                // resolve by first match — so a hash failure on one copy (a
+                // file locked by an antivirus scan, the ordinary Windows case
+                // during this pass) removed a different, perfectly healthy
+                // copy from the Library instead. `discover_file` uses this
+                // same `pending:` scheme for exactly that reason. The hash
+                // itself stays on `file.hash`, so nothing else regresses.
+                file.id = format!("pending:{}", file.path);
                 needs_hashing.push(file.clone());
             }
         } else {
@@ -2057,16 +2068,24 @@ pub async fn get_file_media_metadata(
         // delete_shared_file) rather than a string-prefix match. A path that
         // normalizes under a shared folder but resolves via symlink/junction to
         // an arbitrary location must not be probable through this IPC surface.
+        // `verify_existing_path`, not a bare containment check. This was the
+        // last path command still using `is_path_within_dirs`, which only
+        // canonicalizes and compares prefixes — it does not require the root
+        // to still hold the volume-serial + file-id identity it was approved
+        // with. A retargeted junction (exactly what the approved-root
+        // registry exists to catch, and what
+        // `junction_retarget_invalidates_approved_root` pins) therefore let
+        // this command read media tags from outside the shared tree and act
+        // as an existence oracle for arbitrary paths under the swapped root.
         let path = std::path::Path::new(&file_path);
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
-        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err(coded(
-                "sharing_file_not_shared",
-                "File is not in a shared folder",
-            ));
-        }
+        let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
+            .map_err(|e| {
+                coded_ctx(
+                    "sharing_file_not_shared",
+                    "File is not in a shared folder",
+                    e,
+                )
+            })?;
         let cstr = canonical.to_string_lossy();
         Ok(extract_media_metadata(&cstr))
     })
@@ -3335,7 +3354,7 @@ pub async fn open_shared_file(
             ));
         }
         if crate::security::filesystem::passive_type_agrees(&declared_name, &canonical) {
-            opener::open(&canonical)
+            crate::security::filesystem::open_with_default_app(&canonical)
                 .map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
         } else {
             crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {

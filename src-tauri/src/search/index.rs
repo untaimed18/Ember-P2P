@@ -56,8 +56,9 @@ impl LocalIndex {
     }
 
     pub fn add_files(&mut self, files: Vec<FileInfo>) {
+        let mut lookup = self.path_lookup();
         for file in files {
-            self.upsert_file(file);
+            self.upsert_file_with_lookup(file, &mut lookup);
         }
         self.rebuild_indices();
     }
@@ -102,8 +103,9 @@ impl LocalIndex {
                     || discovered_keys.contains(&normalize_path_key(&file.path))
             });
         }
+        let mut lookup = self.path_lookup();
         for file in discovered {
-            self.upsert_file(file);
+            self.upsert_file_with_lookup(file, &mut lookup);
         }
         self.rebuild_indices();
     }
@@ -579,6 +581,25 @@ impl LocalIndex {
         changed
     }
 
+    /// Record a freshly computed Ember BLAKE3 digest against every copy of
+    /// this content. Returns whether anything changed.
+    ///
+    /// Keyed by content hash rather than path because the digest describes
+    /// the bytes, so all duplicates of the same file share it.
+    pub fn set_ember_file_hash_by_hash(&mut self, hash: &str, ember_file_hash: &str) -> bool {
+        if hash.is_empty() || ember_file_hash.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for file in &mut self.files {
+            if file.hash == hash && file.ember_file_hash != ember_file_hash {
+                file.ember_file_hash = ember_file_hash.to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> ShareMutation {
         let key = normalize_path_key(path);
         let Some(selected) = self
@@ -805,22 +826,49 @@ impl LocalIndex {
         }
     }
 
-    fn upsert_file(&mut self, mut file: FileInfo) {
+    /// Snapshot `normalize_path_key -> position` for the current `files`.
+    ///
+    /// Batch inserts keep this alive across the whole loop and patch it as
+    /// they go. `path_map` cannot be used directly because it is only
+    /// reconciled by `rebuild_indices` after the loop finishes.
+    fn path_lookup(&self) -> HashMap<String, usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| (normalize_path_key(&file.path), idx))
+            .collect()
+    }
+
+    /// `upsert_file` against a caller-maintained lookup, so a batch insert is
+    /// linear rather than quadratic.
+    ///
+    /// The scan this replaces recomputed `normalize_path_key` (two heap
+    /// allocations: a separator rewrite and a lowercase) for every stored row
+    /// on every insert. A full-library load or reload therefore cost O(n²)
+    /// allocations while holding the index write lock — minutes of apparent
+    /// hang on a large share, with every reader (upload hash resolution, the
+    /// UI's shared-file queries) blocked behind it.
+    fn upsert_file_with_lookup(&mut self, mut file: FileInfo, lookup: &mut HashMap<String, usize>) {
         // Match by the same case-normalized key used for `path_map` (lowercased
         // on Windows). Comparing raw path strings let the same file re-appear
         // under different casing (e.g. C:\Foo vs c:\foo), which pushed a
         // duplicate entry while the index silently collapsed them onto one key.
         let key = normalize_path_key(&file.path);
-        if let Some(pos) = self
-            .files
-            .iter()
-            .position(|f| normalize_path_key(&f.path) == key)
-        {
-            preserve_runtime_state(&self.files[pos], &mut file);
-            self.files[pos] = file;
-        } else {
-            self.files.push(file);
+        match lookup.get(&key) {
+            Some(&pos) => {
+                preserve_runtime_state(&self.files[pos], &mut file);
+                self.files[pos] = file;
+            }
+            None => {
+                lookup.insert(key, self.files.len());
+                self.files.push(file);
+            }
         }
+    }
+
+    fn upsert_file(&mut self, file: FileInfo) {
+        let mut lookup = self.path_lookup();
+        self.upsert_file_with_lookup(file, &mut lookup);
     }
 
     fn rebuild_indices(&mut self) {

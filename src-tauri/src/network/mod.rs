@@ -4427,12 +4427,20 @@ async fn try_connect_server(
     // whenever it's enabled: use the dedicated obfuscation port if we learned
     // one, otherwise the standard port. Fall back to plain if the DH handshake
     // fails (e.g. a server that doesn't actually support obfuscation).
-    let enc_port = if obf_port != 0 {
-        Some(obf_port)
-    } else if obfuscation_enabled {
-        Some(port)
-    } else {
+    // Gated on the setting first. Reading `obf_port` before it meant that once
+    // a server's obfuscation port had been learned — which happens
+    // automatically from any extended UDP status reply, so for most
+    // obfuscation-capable servers — turning obfuscation off in Settings did
+    // nothing. That is not cosmetic: `login()` sets
+    // `SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT` on an encrypted transport,
+    // and the server relays those bits to peers as instructions for how to
+    // connect back to us.
+    let enc_port = if !obfuscation_enabled {
         None
+    } else if obf_port != 0 {
+        Some(obf_port)
+    } else {
+        Some(port)
     };
     if !force_plain {
         if let Some(enc_port) = enc_port {
@@ -5906,11 +5914,23 @@ mod tests {
         }
         assert_eq!(sched.rounds_failed(reference), 1);
 
+        // A charge short of the cap releases the placement hold, which is what
+        // lets the next tick select the file and produce another round. Left
+        // held, the file was never re-selected, never produced another batch,
+        // and so never reached `expire()` for a second charge — `rounds_failed`
+        // froze at 1 and the file sat out the rest of the session.
+        assert!(
+            !sched.unplaced.contains_key(&slot),
+            "a failed round must release the file for re-selection"
+        );
+
         // Later rounds are a publish tick apart, well outside the collapse
-        // window, so they count separately.
+        // window, so they count separately. Each begins by re-selecting the
+        // file, exactly as `maybe_publish_ember_*` would.
         let mut at = start;
         for expected in 2..=EMBER_PUBLISH_MAX_ATTEMPTS {
             at += EMBER_BATCH_ACK_TIMEOUT * 2;
+            track_ember_record_pending(sched.borrow(), reference);
             charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
             assert_eq!(sched.rounds_failed(reference), expected);
         }
@@ -5918,6 +5938,7 @@ mod tests {
         // One more parks it: the clock is stamped so the staleness ranking stops
         // putting it first, and the pending marker is released.
         at += EMBER_BATCH_ACK_TIMEOUT * 2;
+        track_ember_record_pending(sched.borrow(), reference);
         charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
         assert!(!sched.unplaced.contains_key(&slot));
         assert!(sched.keyword_at.contains_key(&reference.file_hash));
@@ -9331,6 +9352,15 @@ fn charge_ember_publish_failure(
     attempts.rounds_failed += 1;
     attempts.last_charged = now;
     if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
+        // Release the placement hold so the next tick can pick the file up
+        // again. `ember_publish_staleness` returns `None` for anything still
+        // in `unplaced`, so leaving it there after a round expired meant the
+        // file was never re-selected, never produced another batch, and so
+        // never reached `expire()` for a second charge — `rounds_failed`
+        // froze at 1 and the file sat out the rest of the session, which is
+        // the normal outcome on a cold or lossy DHT. The attempt count stays,
+        // so the cap below still applies across rounds.
+        schedule.unplaced.remove(&slot);
         return;
     }
     // Treat it as done for scheduling purposes so the staleness ranking stops
@@ -11264,6 +11294,64 @@ fn spawn_save_server_met(
             });
         }
         Err(e) => warn!("Failed to serialize server.met: {e}"),
+    }
+}
+
+/// Persist the live range list to `ipfilter.dat` after a manual edit.
+///
+/// Adding or removing a range used to touch memory only, so a range the user
+/// blocked was gone after the next launch and one they deliberately unblocked
+/// came back — a security control silently reverting while the Security page
+/// reported success. Serialization happens here on the network task (cheap,
+/// no I/O) and the write goes to the blocking pool.
+fn spawn_save_ipfilter_dat(ip_filter: &IpFilter, path: PathBuf) {
+    // Never serialize a list that was never read. Startup skips the file
+    // entirely while the filter is disabled, so writing the live (empty)
+    // list would replace the user's whole downloaded blacklist with the one
+    // range they just added. `ensure_ipfilter_loaded` normally makes this
+    // unreachable; it stays as a hard stop against data loss.
+    if !ip_filter.has_loaded_ranges() {
+        warn!("Not writing ipfilter.dat: the persisted list was never loaded this session");
+        return;
+    }
+    let bytes = ip_filter.canonical_dat_bytes();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::security::atomic_write(&path, &bytes, false) {
+            warn!("Failed to persist ipfilter.dat after a manual range change: {e}");
+        }
+    });
+}
+
+/// Read `ipfilter.dat` into the live filter if it has not been read yet, so a
+/// manual add/remove rewrites the full list rather than replacing it.
+///
+/// Loading while the filter is disabled is inert: every `is_blocked*` path
+/// checks `enabled` before it consults the ranges.
+async fn ensure_ipfilter_loaded(state: &mut NetworkState) {
+    if state.ip_filter.has_loaded_ranges() {
+        return;
+    }
+    let path = state.data_dir.join("ipfilter.dat");
+    if !path.exists() {
+        // Nothing on disk to preserve, so the live list is authoritative.
+        state.ip_filter.mark_loaded_from_disk();
+        return;
+    }
+    let enabled = state.ip_filter.is_enabled();
+    let block_private = state.ip_filter.blocks_private();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let mut fresh = IpFilter::new(enabled, block_private);
+        fresh.load_from_file(&path).map(|_| fresh)
+    })
+    .await
+    .ok()
+    .flatten();
+    match loaded {
+        Some(fresh) => {
+            state.ip_filter.merge_ranges_from(&fresh);
+            state.ip_filter.mark_loaded_from_disk();
+        }
+        None => warn!("Could not read ipfilter.dat before a manual range change"),
     }
 }
 
@@ -13838,6 +13926,10 @@ pub async fn start_network(
         mpsc::unbounded_channel::<String>();
     let (nat_probe_result_tx, mut nat_probe_result_rx) =
         mpsc::unbounded_channel::<NatProbeResult>();
+    // Completed-download BLAKE3 digests, computed off the event loop.
+    // `(ed2k hash, digest)`.
+    let (ember_digest_result_tx, mut ember_digest_result_rx) =
+        mpsc::unbounded_channel::<([u8; 16], [u8; 32])>();
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
     let (udp_map_ka_result_tx, mut udp_map_ka_result_rx) =
         mpsc::unbounded_channel::<UdpMappingKeepaliveResult>();
@@ -14736,13 +14828,11 @@ pub async fn start_network(
                         });
                     }
                 }
-                if !offer_files.is_empty() {
-                    // Fresh offer drain replaces the offered-hash set so
-                    // removed shares do not keep a stale "offered" badge.
-                    state.offered_ed2k_hashes.clear();
-                    pending_offer_signature = Some(offer_files_signature(&offer_files));
-                    pending_offer_files = Some(offer_files);
-                }
+                // Fresh offer drain replaces the offered-hash set so
+                // removed shares do not keep a stale "offered" badge.
+                state.offered_ed2k_hashes.clear();
+                pending_offer_signature = Some(offer_files_signature(&offer_files));
+                pending_offer_files = Some(offer_files);
             }
         }
         if let Some(files) = pending_offer_files.as_mut() {
@@ -14778,7 +14868,28 @@ pub async fn start_network(
                             }
                         }
                     } else if files.is_empty() {
-                        pending_offer_files = None;
+                        // An empty offer is a real message — it tells the
+                        // server we no longer share anything, and
+                        // `offer_files_chunk` deliberately supports the
+                        // count=0 form. Dropping it here meant a user who
+                        // unshared their library (or removed their last
+                        // shared folder, or marked everything friends-only)
+                        // stayed listed as a source for all of it until they
+                        // disconnected, with peers still being handed their
+                        // address. It also left `last_offer_files_signature`
+                        // stale, so every later reconcile re-armed this same
+                        // no-op.
+                        match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
+                            Ok(()) => {
+                                pending_offer_files = None;
+                                if let Some(sig) = pending_offer_signature.take() {
+                                    state.last_offer_files_signature = Some(sig);
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to send the clearing OP_OFFERFILES: {e}");
+                            }
+                        }
                     }
                 }
             } else {
@@ -15407,7 +15518,7 @@ pub async fn start_network(
                                         // then compute BLAKE3 of the completed
                                         // file so deep-link / paste downloads
                                         // still get content integrity for share.
-                                        let mut ember_hex = state
+                                        let ember_hex = state
                                             .ember_content_hashes
                                             .get(&fh)
                                             .filter(|d| **d != [0u8; 32])
@@ -15423,18 +15534,28 @@ pub async fn start_network(
                                             })
                                             .unwrap_or_default();
                                         if ember_hex.is_empty() {
+                                            // Compute it off the loop and fold
+                                            // it in when it lands. Awaiting the
+                                            // hash here suspended the whole
+                                            // `select!` for as long as it took
+                                            // to read the file end to end — no
+                                            // UDP receive, no timers, no
+                                            // command handling, on every plain
+                                            // eD2K completion (the fallback is
+                                            // the common case: only an Ember
+                                            // DHT hit or a prior known.met
+                                            // record fills the field above).
                                             let hash_path = completed_path.clone();
-                                            if let Ok(Ok(digest)) =
-                                                tokio::task::spawn_blocking(move || {
+                                            let digest_tx = ember_digest_result_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                if let Ok(digest) =
                                                     crate::network::ember::crypto::blake3_hash_file_path(
                                                         &hash_path,
                                                     )
-                                                })
-                                                .await
-                                            {
-                                                ember_hex = hex::encode(digest);
-                                                state.ember_content_hashes.insert(fh, digest);
-                                            }
+                                                {
+                                                    let _ = digest_tx.send((fh, digest));
+                                                }
+                                            });
                                         }
                                         ember_hex
                                     },
@@ -20198,7 +20319,16 @@ pub async fn start_network(
             // Periodic bootstrap (eMule BigTimer style)
             _ = bootstrap_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
+                // Only the KAD bootstrap below depends on KAD being up. The
+                // friend-presence and friend-search work after this block must
+                // not: `stats.status` is only ever advanced by KAD code paths,
+                // so an eD2K-only session (the default, `auto_connect_kad` is
+                // off) sits at `Disconnected` forever. Returning here left the
+                // connection broker unbuilt, no QUIC listener, and the node
+                // never registered with rendezvous — friends could not find it
+                // at all, with no event emitted to say so.
+                'kad_bootstrap: {
+                if state.stats.status == NetworkStatus::Disconnected { break 'kad_bootstrap; }
                 let table_size = state.routing_table.len();
 
                 if table_size == 0 {
@@ -20710,6 +20840,9 @@ pub async fn start_network(
                             info!("Started {kad_started} KAD searches initially; remaining {} will search on next retry cycle", pending_count - kad_started);
                         }
                 }
+                state.stats.connected_peers = count;
+                } // 'kad_bootstrap
+
                 // Register with the rendezvous server as soon as we have a
                 // confirmed external IP so other Ember clients can find us.
                 if !state.friend_presence_initial_done
@@ -20935,7 +21068,6 @@ pub async fn start_network(
                     }
                 }
 
-                state.stats.connected_peers = count;
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'bootstrap_timer' panicked: {}", describe_panic(&*__p));
@@ -21182,9 +21314,16 @@ pub async fn start_network(
                     state.ember_publish_pass = EmberPublishPassStats::default();
                 }
 
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-                if state.routing_table.is_empty() {
-                    debug!("Skipping publish cycle: routing table is empty");
+                // Folded into the routing-table guard rather than returning:
+                // everything below the guard is rendezvous/friend-presence
+                // work, and an early return here defeated the whole point of
+                // the comment that follows. An eD2K-only session never leaves
+                // `Disconnected`, so the presence heartbeat never ran and the
+                // node quietly dropped off the rendezvous server.
+                if state.stats.status == NetworkStatus::Disconnected
+                    || state.routing_table.is_empty()
+                {
+                    debug!("Skipping publish cycle: KAD is not connected or its routing table is empty");
                 } else {
                 let total_files = state.publish_manager.file_count();
                 let needing_source = state.publish_manager.files_needing_source_publish().len();
@@ -22077,7 +22216,12 @@ pub async fn start_network(
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
             _ = cleanup_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
+                // Deliberately not gated on KAD status. This sweep is the only
+                // bound on `pending_udp_reasks` and `server_udp_source_reask_at`,
+                // both of which are filled by server-driven source discovery
+                // that needs no KAD at all — so in an eD2K-only session (which
+                // never leaves `Disconnected`) they grew for the whole session.
+                // Every step below is a no-op on empty KAD state.
                 let (removed_sids, released_in_use) = state.search_manager.cleanup(120);
                 finalize_removed_searches(&mut state, &app_handle, &removed_sids, &released_in_use);
                 state.dht_store.cleanup_expired();
@@ -22470,8 +22614,10 @@ pub async fn start_network(
             // hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
             _ = broker_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-
+                // Not gated on KAD status: the broker serves friend connections
+                // over rendezvous, which has nothing to do with Kademlia, and
+                // an eD2K-only session never leaves `Disconnected`. Both halves
+                // below are already no-ops when no broker exists.
                 if let Some(ref mut broker) = state.connection_broker {
                     broker.tick().await;
                 }
@@ -28812,6 +28958,29 @@ pub async fn start_network(
             // Statistics rate recording (every second)
             _ = stats_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Fold in any completed-download BLAKE3 digests finished on the
+                // blocking pool since the last tick, so the file can be
+                // published to the Ember DHT and verified on later transfers.
+                // Drained here rather than in its own `select!` arm because
+                // this loop is already at tokio's 64-branch ceiling.
+                while let Ok((digest_hash, digest)) = ember_digest_result_rx.try_recv() {
+                    state.ember_content_hashes.insert(digest_hash, digest);
+                    let digest_hex = hex::encode(digest);
+                    if let Some(record) = known_files.find_by_hash_mut(&digest_hash) {
+                        if record.ember_file_hash != digest_hex {
+                            record.ember_file_hash = digest_hex.clone();
+                            known_files.mark_dirty();
+                        }
+                    }
+                    let hash_hex = hex::encode(digest_hash);
+                    let changed = {
+                        let mut index = local_index.write().await;
+                        index.set_ember_file_hash_by_hash(&hash_hex, &digest_hex)
+                    };
+                    if changed {
+                        debug!("Ember digest for {hash_hex} computed after completion");
+                    }
+                }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
                 // Fold peer-to-peer SX bytes (OP_REQUESTSOURCES /
@@ -29427,6 +29596,15 @@ pub async fn start_network(
                     && state.ember_dht_maint_pings.is_empty()
                     && state.ember_pending_source_injections.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
+                    // The batch publisher is on an entirely separate path from
+                    // the maps above — `flush_ember_batch_publish` only ever
+                    // writes `in_flight` — and `expire()` below is its only
+                    // reaper. Leaving it out of the guard meant that whenever
+                    // unacked batches were the only outstanding work (an idle
+                    // window with a warm table), abandoned batches piled up
+                    // with no ceiling and `ember_dht_stores_failed` never
+                    // moved, so acks and failures permanently disagreed.
+                    && state.ember_batch_publish.in_flight.is_empty()
                 {
                     return;
                 }
@@ -30927,6 +31105,41 @@ pub async fn start_network(
         );
     }
     if !state.aich_hash_sets.is_empty() {
+        // Wait out a periodic writer still in flight. Every sibling shutdown
+        // save drains its in-flight flag or takes its lock; this one did
+        // neither, so a 120-second periodic save that happened to be running
+        // could rename its older snapshot over the one written here. The
+        // writes are atomic, so the file could not be corrupted — but the
+        // shutdown snapshot is strictly newer (it drains `aich_set_rx` just
+        // above), and losing it discards the AICH recovery sets computed
+        // since that save began.
+        if known2_save_in_flight {
+            let waited_from = tokio::time::Instant::now();
+            while known2_save_in_flight
+                && waited_from.elapsed() < std::time::Duration::from_secs(5)
+            {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    periodic_save_result_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(result)) => {
+                        if matches!(result.job, PeriodicSaveJob::Known2) {
+                            known2_save_in_flight = false;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            if known2_save_in_flight {
+                warn!(
+                    "Periodic known2_64.met save still in flight 5s into shutdown; \
+                     writing the final snapshot anyway"
+                );
+            }
+        }
         let known2_path = state.data_dir.join("known2_64.met");
         if let Err(e) = ed2k::aich::save_known2_met(&known2_path, &state.aich_hash_sets) {
             error!("Failed to save known2_64.met on shutdown: {e}");
@@ -31370,7 +31583,24 @@ async fn send_kad_search_results(
     let mut batch_est_size: usize = HEADER_OVERHEAD;
 
     for entry in results {
-        let entry_est = 16 + entry.tags.len() * 24 + 8;
+        // Size each tag by what it actually serializes to. The old flat
+        // 24-bytes-per-tag figure ignored string payloads, and a stored
+        // keyword entry's filename may run to `MAX_STORED_FILENAME_BYTES`
+        // (4 KiB) — so a "1420-byte" batch of long-named hits was really
+        // several KB, `encode_packet` could not compress it under the
+        // fragment ceiling, and the error was discarded along with every
+        // result in the batch. A publisher could plant long filenames under
+        // a keyword we store for and blind our answers for it.
+        let entry_est: usize = 16
+            + 8
+            + entry
+                .tags
+                .iter()
+                .map(|tag| match &tag.value {
+                    kad::types::TagValue::String(s) => s.len() + 6,
+                    _ => 12,
+                })
+                .sum::<usize>();
         if batch_est_size + entry_est > MAX_BATCH && !batch.is_empty() {
             let msg = KadMessage::SearchRes {
                 sender_id,
@@ -33653,6 +33883,13 @@ async fn run_ember_maintenance(
                 .ember_diagnostics
                 .ember_dht_records_republished
                 .saturating_add(1);
+        } else {
+            // The batch already stamped this record as republished, so
+            // without re-arming it the drop would cost a full republish
+            // interval of silence for a record we still hold.
+            state
+                .ember_dht
+                .mark_republish_due(&record.keyword_hash, &record.signature);
         }
     }
     flush_ember_batch_publish(socket, state).await;
@@ -34058,21 +34295,46 @@ async fn handle_ember_dht_message(
                 .map(|c| ember_dht_contact_info(c, local_id))
                 .collect();
             let _ = tx.send(infos);
-        } else if let Some(req) = state.ember_dht_search_requests.remove(&rid) {
+        } else if let Some((search_id, per_search_req_id)) = state
+            .ember_dht_search_requests
+            .get(&rid)
+            .map(|req| (req.search_id, req.per_search_req_id))
+        {
             // `process_response` gates on `(per_search_req_id, from_id)`,
             // so a forged or misrouted answer can't advance the search.
-            if let Some(from_id) = inbound.sender_id {
-                if let Some(search) = state.ember_search.get_mut(req.search_id) {
-                    search.process_response(req.per_search_req_id, &from_id, contacts, Vec::new());
+            //
+            // Only drop the wire-id entry once the answer is accepted.
+            // Removing first meant a wrong-sender reply — request ids come
+            // from one guessable counter — permanently unhooked the query:
+            // `process_response` re-inserted its own pending entry and
+            // returned false, but the deadline sweep could no longer expire
+            // anything, the shortlist slot stayed `InFlight` against ALPHA,
+            // and the real peer's later answer matched nothing. Any peer
+            // with a session could stall lookups this way.
+            let consumed = if let Some(from_id) = inbound.sender_id {
+                match state.ember_search.get_mut(search_id) {
+                    Some(search) => {
+                        search.process_response(per_search_req_id, &from_id, contacts, Vec::new())
+                    }
+                    // Search is gone; nothing will ever match this id again.
+                    None => true,
                 }
-                drive_ember_search(socket, state, req.search_id).await;
             } else {
                 // No verified sender id (should not happen post-decode) —
                 // treat as a failed query so the search can move on.
-                if let Some(search) = state.ember_search.get_mut(req.search_id) {
-                    search.mark_failed(req.per_search_req_id);
+                if let Some(search) = state.ember_search.get_mut(search_id) {
+                    search.mark_failed(per_search_req_id);
                 }
-                drive_ember_search(socket, state, req.search_id).await;
+                true
+            };
+            if consumed {
+                state.ember_dht_search_requests.remove(&rid);
+                drive_ember_search(socket, state, search_id).await;
+            } else {
+                debug!(
+                    "Ember DHT: FOUND_NODE {rid} from {from} did not come from the queried node; \
+                     leaving the query outstanding"
+                );
             }
         } else {
             debug!("Ember DHT: FOUND_NODE request_id {rid} from {from} matched no pending find or search");
@@ -34127,15 +34389,36 @@ async fn handle_ember_dht_message(
     // the next round. A value search can also receive FOUND_NODE answers
     // (handled above) when a peer has no record.
     if let Some((rid, records)) = inbound.found_value {
-        if let Some(req) = state.ember_dht_search_requests.remove(&rid) {
-            if let Some(from_id) = inbound.sender_id {
-                if let Some(search) = state.ember_search.get_mut(req.search_id) {
-                    search.process_response(req.per_search_req_id, &from_id, Vec::new(), records);
+        if let Some((search_id, per_search_req_id)) = state
+            .ember_dht_search_requests
+            .get(&rid)
+            .map(|req| (req.search_id, req.per_search_req_id))
+        {
+            // Same rule as FOUND_NODE above: keep the correlation entry until
+            // the answer is accepted, so a wrong-sender reply cannot orphan
+            // the query past the reach of the deadline sweep.
+            let consumed = if let Some(from_id) = inbound.sender_id {
+                match state.ember_search.get_mut(search_id) {
+                    Some(search) => {
+                        search.process_response(per_search_req_id, &from_id, Vec::new(), records)
+                    }
+                    None => true,
                 }
-            } else if let Some(search) = state.ember_search.get_mut(req.search_id) {
-                search.mark_failed(req.per_search_req_id);
+            } else {
+                if let Some(search) = state.ember_search.get_mut(search_id) {
+                    search.mark_failed(per_search_req_id);
+                }
+                true
+            };
+            if consumed {
+                state.ember_dht_search_requests.remove(&rid);
+                drive_ember_search(socket, state, search_id).await;
+            } else {
+                debug!(
+                    "Ember DHT: FOUND_VALUE {rid} from {from} did not come from the queried node; \
+                     leaving the query outstanding"
+                );
             }
-            drive_ember_search(socket, state, req.search_id).await;
         } else {
             debug!("Ember DHT: FOUND_VALUE request_id {rid} from {from} matched no pending search");
         }
@@ -37408,6 +37691,31 @@ async fn handle_command_inner(
             // Remove from pending_downloads so no new searches are started
             let removed_pending = state.pending_downloads.remove(&transfer_id);
 
+            // Resolve the file hash up front, before the teardown below drops
+            // the state that carries it. Every caller removes the transfer
+            // from `TransferManager` *before* sending this command, and a
+            // started download is no longer in `pending_downloads`, so by the
+            // time the old lookup ran (after `per_file_sources.remove`) both
+            // sources were empty and the unpublish below was dead code for
+            // every download that had actually run: we kept advertising as a
+            // source for a file we had just deleted, and leaked its publish,
+            // ack, blackbox and AICH-recovery entries for the session.
+            let cancel_hash = removed_pending
+                .as_ref()
+                .map(|p| p.file_hash.clone())
+                .or_else(|| {
+                    transfer_manager
+                        .try_read()
+                        .ok()
+                        .and_then(|mgr| mgr.get_transfer(&transfer_id).map(|t| t.file_hash.clone()))
+                })
+                .or_else(|| {
+                    state
+                        .per_file_sources
+                        .get(&transfer_id)
+                        .map(|sources| hex::encode(sources.file_hash))
+                });
+
             // Cancel control first so detached per-source tasks bail before
             // we ACK cleanup / delete .part files (N1).
             {
@@ -37461,18 +37769,8 @@ async fn handle_command_inner(
                 state.tracker_registry.lock().remove(&transfer_id);
             }
 
-            // Remove partial download from KAD source publish
-            let cancel_hash = removed_pending
-                .as_ref()
-                .map(|p| p.file_hash.clone())
-                .or_else(|| {
-                    // Not in pending — check transfer_manager for file hash
-                    // (use try_read to avoid blocking the event loop)
-                    transfer_manager
-                        .try_read()
-                        .ok()
-                        .and_then(|mgr| mgr.get_transfer(&transfer_id).map(|t| t.file_hash.clone()))
-                });
+            // Remove partial download from KAD source publish. `cancel_hash`
+            // was resolved at the top of this handler, before teardown.
             if let Some(fh) = cancel_hash {
                 if let Ok(hb) = hex::decode(&fh) {
                     if hb.len() >= 16 {
@@ -39730,12 +40028,14 @@ async fn handle_command_inner(
         } => {
             if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>())
             {
+                ensure_ipfilter_loaded(state).await;
                 state.ip_filter.add_range(start, end, description);
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
                 state.routing_table.evict_filtered_contacts();
                 state.ember_dht.evict_filtered_contacts();
+                spawn_save_ipfilter_dat(&state.ip_filter, state.data_dir.join("ipfilter.dat"));
                 info!(
                     "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
                     state.ip_filter.range_count()
@@ -39748,11 +40048,13 @@ async fn handle_command_inner(
             end_ip,
             tx,
         } => {
+            ensure_ipfilter_loaded(state).await;
             let removed = state.ip_filter.remove_range(&start_ip, &end_ip);
             if removed {
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
+                spawn_save_ipfilter_dat(&state.ip_filter, state.data_dir.join("ipfilter.dat"));
                 info!(
                     "Removed IP filter range {start_ip} - {end_ip}, total ranges: {}",
                     state.ip_filter.range_count()
@@ -39776,8 +40078,12 @@ async fn handle_command_inner(
             //
             // Keep the live filter in place during the await so UDP/TCP
             // arms don't see an empty placeholder if the load task panics.
+            // Keyed on "have we read the file", not "is the list empty". A
+            // single manual range added while the filter was off used to make
+            // the count non-zero and skip this load entirely, so enabling the
+            // filter armed it with essentially nothing.
             let mut load_ready = true;
-            if enabled && state.ip_filter.range_count() == 0 {
+            if enabled && !state.ip_filter.has_loaded_ranges() {
                 let default_path = state.data_dir.join("ipfilter.dat");
                 if default_path.exists() {
                     let block_private = state.ip_filter.blocks_private();

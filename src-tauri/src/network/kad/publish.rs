@@ -11,6 +11,67 @@ const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
 const MAX_FILES_PER_KEYWORD_PUBLISH: usize = 150;
 const MAX_FILES_PER_KEYWORD_PACKET: usize = 50;
 
+/// Byte budget for one `PublishKeyReq` body.
+///
+/// `encode_packet` compresses any payload over 1419 bytes and hard-fails when
+/// the compressed form still exceeds 1418. Staying under the compression
+/// threshold means a keyword packet always encodes, whatever its filenames
+/// look like. The remaining headroom covers the 16-byte target, the entry
+/// count, and the protocol/opcode bytes.
+const MAX_KEYWORD_PACKET_BODY_BYTES: usize = 1300;
+
+/// Conservative encoded size of one keyword entry.
+///
+/// A 16-byte file id and a tag count, then a fixed allowance per tag plus any
+/// string payload. Filenames dominate and are exactly what made a fixed
+/// 50-entry packet unencodable.
+fn keyword_entry_wire_size(entry: &PublishEntry) -> usize {
+    let values: usize = entry
+        .tags
+        .iter()
+        .map(|tag| match &tag.value {
+            TagValue::String(s) => s.len() + 2,
+            // Every other value this builder emits is at most 8 bytes.
+            _ => 8,
+        })
+        .sum();
+    16 + 2 + entry.tags.len() * 4 + values
+}
+
+/// Split keyword entries into packets small enough to actually encode.
+///
+/// A keyword entry is mostly incompressible — a 16-byte MD4 plus a filename —
+/// so chunking purely by count produced roughly 6 KB bodies for a popular
+/// keyword, which zlib could not squeeze under the fragment ceiling.
+/// `encode_packet` returned an error that both send sites discarded with
+/// `if let Ok(packet)`, so the publish silently vanished: the keyword was
+/// never marked published, `next_keyword_candidate` re-offered it on every
+/// tick, and a fresh DHT search was started each time. Any keyword appearing
+/// in more than roughly fifteen filenames never reached the network at all.
+///
+/// A single entry larger than the budget still gets its own packet — better
+/// to attempt an oversized one than to drop the file silently.
+fn chunk_keyword_entries(entries: Vec<PublishEntry>) -> Vec<Vec<PublishEntry>> {
+    let mut chunks: Vec<Vec<PublishEntry>> = Vec::new();
+    let mut current: Vec<PublishEntry> = Vec::new();
+    let mut current_bytes = 0usize;
+    for entry in entries {
+        let size = keyword_entry_wire_size(&entry);
+        let full = current.len() >= MAX_FILES_PER_KEYWORD_PACKET
+            || (!current.is_empty() && current_bytes + size > MAX_KEYWORD_PACKET_BODY_BYTES);
+        if full {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// K15's load-based backoff (see [`PublishManager::record_keyword_publish_load`])
 /// doubles the keyword republish interval each time a storing peer reports
 /// a near-full bucket, up to `1 << 4` = 16x. Left uncapped, that reaches
@@ -410,11 +471,11 @@ impl PublishManager {
             return None;
         }
 
-        let messages = entries
-            .chunks(MAX_FILES_PER_KEYWORD_PACKET)
+        let messages = chunk_keyword_entries(entries)
+            .into_iter()
             .map(|chunk| KadMessage::PublishKeyReq {
                 target: keyword_hash,
-                entries: chunk.to_vec(),
+                entries: chunk,
             })
             .collect();
 

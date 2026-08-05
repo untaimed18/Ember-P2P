@@ -411,6 +411,17 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
         GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     loop {
+        // Register the waiter before the capacity check below. `Notified`
+        // only enrolls when it is first polled, and every release site uses
+        // `notify_waiters()`, which wakes whoever is enrolled *now* and
+        // stores no permit — so a slot freed between the check and the await
+        // was missed outright and the task slept on capacity that already
+        // existed, while still holding one of the download's per-file
+        // connection slots.
+        let notified = l.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         let desired = l.desired_max.load(Ordering::Acquire);
         let active = l.in_use.load(Ordering::Acquire);
         if active < desired {
@@ -439,7 +450,7 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
             }
             continue;
         }
-        l.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -6024,20 +6035,26 @@ async fn download_parts_from_source(
     // Skip if this source already had pre-populated available_parts (counted
     // in the initial update_frequencies call) to avoid double-counting.
     // Sources counted here are decremented when the task exits (see below).
-    let wire_counted_avail: Option<Vec<bool>> = if !had_preexisting_availability {
-        if let Some(ref pfs) = peer_file_status {
-            if let Some(cs) = &chunk_sel {
-                let mut cs = cs.write().await;
-                for (i, &has) in pfs.iter().enumerate() {
-                    if i < cs.part_frequency.len() && has {
-                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+    // Held for the rest of the function so the contribution is undone however
+    // this source ends, not only on the clean return at the bottom.
+    let _wire_avail_guard: Option<WireAvailabilityGuard> = if !had_preexisting_availability {
+        match (&peer_file_status, &chunk_sel) {
+            (Some(pfs), Some(cs)) => {
+                {
+                    let mut cs = cs.write().await;
+                    for (i, &has) in pfs.iter().enumerate() {
+                        if i < cs.part_frequency.len() && has {
+                            cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+                        }
                     }
+                    cs.total_sources = cs.total_sources.saturating_add(1);
                 }
-                cs.total_sources = cs.total_sources.saturating_add(1);
+                Some(WireAvailabilityGuard {
+                    chunk_sel: Some(cs.clone()),
+                    avail: Some(pfs.clone()),
+                })
             }
-            Some(pfs.clone())
-        } else {
-            None
+            _ => None,
         }
     } else {
         None
@@ -6607,9 +6624,24 @@ async fn download_parts_from_source(
                     .chunks(MAX_BLOCKS_PER_REQUEST)
                     .map(|c| c.to_vec())
                     .collect();
-                let needs_i64 = peer_supports_large_files
-                    && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                (all_blocks, batches, 0, needs_i64)
+                let needs_large_offsets =
+                    all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                if needs_large_offsets && !peer_supports_large_files {
+                    // Gating `needs_i64` on the peer's capability alone sent
+                    // the 32-bit request anyway, and `build_request_parts`
+                    // clamps with `min(u32::MAX)` behind a `debug_assert`
+                    // that does nothing in release — so both ends of a
+                    // past-4 GiB range collapsed to 0xFFFFFFFF and the peer
+                    // was asked for zero bytes. It sends nothing, we burn the
+                    // whole initial-data budget plus the re-assert rounds
+                    // holding a connection slot, and the source stays in the
+                    // pool to be re-dialled after its cooldown. Refuse it up
+                    // front: it genuinely cannot serve this range.
+                    anyhow::bail!(
+                        "source does not support large files but part {part_idx} lies past 4 GiB"
+                    );
+                }
+                (all_blocks, batches, 0, needs_large_offsets)
             };
 
             // Mark in_progress (idempotent — pipelined state already did this,
@@ -8370,14 +8402,31 @@ async fn download_parts_from_source(
                                         debug!("Failed to send OP_AICHREQUEST: {e}");
                                     } else {
                                         debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
-                                        recovery_bytes = wait_for_aich_recovery_answer_ms(
+                                        match wait_for_aich_recovery_answer_ms(
                                             &mut *reader,
                                             file_hash,
                                             part_idx,
                                             master_hash,
                                             &mut auth_deferred,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            AichAnswerOutcome::Recovered(data) => {
+                                                recovery_bytes = Some(data);
+                                            }
+                                            AichAnswerOutcome::NotAvailable => {}
+                                            // The reader may be parked
+                                            // mid-packet, so anything we read
+                                            // next would be payload bytes
+                                            // parsed as a header. End the
+                                            // source instead of corrupting the
+                                            // rest of the session with it.
+                                            AichAnswerOutcome::StreamDesynced => {
+                                                anyhow::bail!(
+                                                    "AICH recovery wait left the stream desynchronized"
+                                                );
+                                            }
+                                        }
                                     }
                                 } else {
                                     debug!("Skipping OP_AICHREQUEST for part {part_idx}: source already tried or retries exhausted");
@@ -8874,15 +8923,9 @@ async fn download_parts_from_source(
 
     emit_source!("completed", None, measured_speed);
 
-    // Decrement wire-learned availability now that this source is done.
-    // Sources with pre-existing availability are decremented by the spawning
-    // closure instead.
-    if let Some(ref avail) = wire_counted_avail {
-        if let Some(cs) = &chunk_sel {
-            let mut cs = cs.write().await;
-            cs.remove_source(avail);
-        }
-    }
+    // Wire-learned availability is released by `_wire_avail_guard` on the way
+    // out, whichever exit this source takes. Sources with pre-existing
+    // availability are decremented by the spawning closure instead.
 
     info!(
         "DIAG: source {} ({}) download_parts_from_source returning Ok(()): src_transferred={}, per_part_credit_remaining={:?}",
@@ -8896,6 +8939,38 @@ async fn download_parts_from_source(
 /// download. After fixing the queue-misalignment bug the caller now
 /// only consumes `part_idx` and recomputes the rest via
 /// `compute_part_blocks_ms`, but the other fields stay populated so a
+/// Releases a source's wire-learned availability contribution when the source
+/// task ends, by any route.
+///
+/// The matching `remove_source` used to sit at the bottom of
+/// `download_parts_from_source`, reachable only on the clean `Ok(())` return.
+/// Every ordinary ending — peer queue full, upload-slot timeout, queue
+/// detach, connection lost while queued, any `?` in the transfer loop —
+/// skipped it, so `part_frequency` and `total_sources` grew monotonically.
+/// `select_part` scores parts as `zone * 1000 + active_bonus +
+/// completion_score + freq`, so once the leaked frequencies exceeded a few
+/// hundred they swamped the 50-point active bonus and the 0-100 completion
+/// score: the download stopped preferring nearly-finished parts, kept opening
+/// new ones, and few ever verified — which also keeps partial-file sharing
+/// near zero, since only verified parts are advertised.
+struct WireAvailabilityGuard {
+    chunk_sel: Option<Arc<RwLock<ChunkSelector>>>,
+    avail: Option<Vec<bool>>,
+}
+
+impl Drop for WireAvailabilityGuard {
+    fn drop(&mut self) {
+        let (Some(chunk_sel), Some(avail)) = (self.chunk_sel.take(), self.avail.take()) else {
+            return;
+        };
+        // `Drop` cannot await, so hand the release to the runtime. This runs
+        // inside the source task, so a handle is always available.
+        tokio::spawn(async move {
+            chunk_sel.write().await.remove_source(&avail);
+        });
+    }
+}
+
 /// future caller can reuse the work without a second pass.
 #[allow(dead_code)]
 struct PipelineCandidate {
@@ -8995,8 +9070,14 @@ async fn pre_pipeline_next_part_ms(
     if batches.is_empty() {
         return None;
     }
-    let needs_i64 =
-        peer_supports_large_files && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+    let needs_large_offsets = all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+    if needs_large_offsets && !peer_supports_large_files {
+        // Don't pre-pipeline a part this peer cannot address. The 32-bit
+        // builder would clamp the range to a zero-length request; the main
+        // request path refuses such a source outright for the same reason.
+        return None;
+    }
+    let needs_i64 = needs_large_offsets;
     let _ = file_size;
 
     Some(PipelineCandidate {
@@ -9141,47 +9222,84 @@ fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64,
     Ok((hash, start, end, &payload[24..]))
 }
 
+/// Outcome of waiting for an `OP_AICHANSWER`.
+enum AichAnswerOutcome {
+    /// Recovery data for the requested part.
+    Recovered(Vec<u8>),
+    /// The peer answered, but not with usable recovery data. The stream is
+    /// still positioned on a packet boundary.
+    NotAvailable,
+    /// A read was abandoned part-way through a packet, so the next read would
+    /// start mid-payload. The caller must drop the connection.
+    StreamDesynced,
+}
+
 /// Wait for `OP_AICHANSWER` matching file, part, and trusted AICH master hash (up to ~8s).
+///
+/// `read_packet_async_ms` consumes the stream incrementally — one protocol
+/// byte, four length bytes, an opcode, then the payload in 64 KiB steps — so a
+/// dropped read future leaves the reader mid-packet with no way to resynchronize.
+/// This used to slice the wait into 2-second `timeout`s around a *fresh* read
+/// future each time, which meant that whenever the peer was still streaming the
+/// pipelined block sent just before verification began (the normal case), the
+/// timer fired mid-payload and the following read parsed file bytes as a packet
+/// header. AICH block-level recovery therefore usually failed and the connection
+/// then died with a spurious "invalid packet length". The main receive loop
+/// already pins its read future across stall ticks for exactly this reason.
+///
+/// One deadline now covers the whole wait, and if it fires the caller is told
+/// the stream is unusable rather than being left to read garbage from it.
 async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     file_hash: &[u8; 16],
     part_idx: usize,
     expected_master: [u8; 20],
     deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
-) -> Option<Vec<u8>> {
+) -> AichAnswerOutcome {
     use super::messages::{OP_AICHANSWER, OP_EMULEPROT};
 
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
-    let deadline = tokio::time::Instant::now() + MAX_WAIT;
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let chunk = remaining.min(std::time::Duration::from_secs(2));
-        match tokio::time::timeout(chunk, read_packet_async_ms(reader)).await {
-            Ok(Ok((proto, opcode, payload))) => {
-                if proto == OP_EMULEPROT
-                    && opcode == OP_AICHANSWER
-                    && (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
-                        .contains(&payload.len())
-                {
-                    let mut ans_hash = [0u8; 16];
-                    ans_hash.copy_from_slice(&payload[..16]);
-                    let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
-                    let mut root = [0u8; 20];
-                    root.copy_from_slice(&payload[18..38]);
-                    if ans_hash == *file_hash && ans_part == part_idx && root == expected_master {
-                        return Some(payload[38..].to_vec());
-                    }
+
+    let scan = async {
+        loop {
+            let (proto, opcode, payload) = match read_packet_async_ms(reader).await {
+                Ok(packet) => packet,
+                // A read error already means the connection is finished; the
+                // caller drops it either way.
+                Err(_) => return AichAnswerOutcome::StreamDesynced,
+            };
+            if proto == OP_EMULEPROT
+                && opcode == OP_AICHANSWER
+                && (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                    .contains(&payload.len())
+            {
+                let mut ans_hash = [0u8; 16];
+                ans_hash.copy_from_slice(&payload[..16]);
+                let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+                let mut root = [0u8; 20];
+                root.copy_from_slice(&payload[18..38]);
+                if ans_hash == *file_hash && ans_part == part_idx && root == expected_master {
+                    return AichAnswerOutcome::Recovered(payload[38..].to_vec());
                 }
-                if deferred_packets.len() >= 64 {
-                    return None;
-                }
-                deferred_packets.push_back((proto, opcode, payload));
             }
-            Ok(Err(_)) => return None,
-            Err(_) => {}
+            if deferred_packets.len() >= 64 {
+                // Every packet read so far was whole, so the stream is still
+                // aligned — we just refuse to buffer more.
+                return AichAnswerOutcome::NotAvailable;
+            }
+            deferred_packets.push_back((proto, opcode, payload));
+        }
+    };
+
+    match tokio::time::timeout(MAX_WAIT, scan).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            debug!(
+                "AICH recovery wait for part {part_idx} timed out mid-stream; dropping the source"
+            );
+            AichAnswerOutcome::StreamDesynced
         }
     }
-    None
 }
 
 /// Read a single packet during the handshake/setup phase, bounded by

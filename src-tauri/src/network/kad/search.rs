@@ -809,7 +809,16 @@ impl SearchState {
         // eMule: PrepareToStop fires at the lifetime mark, then a 15s grace
         // period allows late results to arrive. The overall cap is therefore
         // search-lifetime + FETCH_TIMEOUT_SECS.
-        now - self.started_at >= lifetime + FETCH_TIMEOUT_SECS
+        //
+        // A negative delta means the wall clock stepped backwards (an NTP
+        // correction after resume, or the user fixing a wrong clock). Treat
+        // that as expired rather than "not yet": otherwise the search sat
+        // below every threshold until real time caught up, and because
+        // `MAX_ACTIVE_SEARCHES` counts non-completed searches, twenty stuck
+        // ones took keyword search, source lookup and publishing offline for
+        // the size of the jump. `expire_pending` already guards this way.
+        let elapsed = now - self.started_at;
+        elapsed < 0 || elapsed >= lifetime + FETCH_TIMEOUT_SECS
     }
 
     fn lifetime_secs(&self) -> i64 {
@@ -1538,7 +1547,12 @@ impl SearchManager {
         let to_remove: Vec<SearchId> = self
             .active
             .iter()
-            .filter(|(_, s)| s.completed_at.is_some_and(|t| now - t >= grace_secs))
+            // `now - t < 0` means the wall clock stepped backwards; reap
+            // rather than hold the row until real time catches up.
+            .filter(|(_, s)| {
+                s.completed_at
+                    .is_some_and(|t| now - t < 0 || now - t >= grace_secs)
+            })
             .map(|(id, _)| *id)
             .collect();
         let mut released_ids = Vec::new();

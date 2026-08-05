@@ -257,7 +257,9 @@
     // and the numbers vanished again every time the user navigated
     // away from /transfers and back.
     refreshUploadQueue();
-    refreshKnownClients();
+    // Priming the tab counts only needs the list, not a badge sweep — this
+    // runs on every visit to /transfers whether or not the tab is opened.
+    refreshKnownClients(false);
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
@@ -757,6 +759,10 @@
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
   const KNOWN_POLL_INTERVAL_MS = 8000;
+  // Upper bound on Trust badges force-refreshed per poll. Each one is a
+  // backend command, not a local read, so this cannot scale with the
+  // 1,000-row display limit.
+  const KNOWN_REPUTATION_REFRESH_MAX = 100;
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
@@ -794,7 +800,7 @@
       }
     }
   }
-  async function refreshKnownClients() {
+  async function refreshKnownClients(refreshBadges = true) {
     const gen = ++knownClientsGen;
     try {
       const data = await getKnownClients();
@@ -802,14 +808,23 @@
       knownClients = data;
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
-      // Force-refresh Trust badges each poll so manual bans / score
-      // changes appear without leaving the tab. Only the displayed slice is
-      // fetched — the badge is rendered per rendered row, and the full ledger
-      // can hold tens of thousands of records.
-      void refreshReputations(
-        displayedKnownClients.map((k) => k.user_hash),
-        true,
-      );
+      // Force-refresh Trust badges so manual bans / score changes appear
+      // without leaving the tab — but only for a bounded slice.
+      //
+      // `getPeerReputation` is not a local read: each call is pushed onto the
+      // bounded network command channel and fails with `network_busy` when it
+      // is full. Forcing all 1,000 displayed rows every 8 seconds put ~1,000
+      // commands per cycle through the same channel that serves transfers,
+      // search and server operations, so unrelated actions intermittently
+      // failed with "Network busy". Chunking bounds concurrency, not volume.
+      if (refreshBadges) {
+        void refreshReputations(
+          displayedKnownClients
+            .slice(0, KNOWN_REPUTATION_REFRESH_MAX)
+            .map((k) => k.user_hash),
+          true,
+        );
+      }
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
       if (!mounted || gen !== knownClientsGen) return;
@@ -998,6 +1013,12 @@
       void refreshFriendHashes();
       if (knownPollHandle === null) {
         knownPollHandle = setInterval(() => {
+          // Every other poll in the app skips work while the window is
+          // hidden; this one did not, so a minimized client kept sweeping
+          // reputations forever.
+          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+            return;
+          }
           refreshKnownClients();
           void refreshFriendHashes();
         }, KNOWN_POLL_INTERVAL_MS);

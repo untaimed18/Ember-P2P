@@ -564,13 +564,22 @@ impl CreditManager {
         }
     }
 
-    /// eMule IS_IDBADGUY: record the IP only when identity is first verified
-    /// (ident_ip == 0). Subsequent calls leave ident_ip unchanged so that
-    /// `get_current_ident_state` can detect IP changes dynamically without
-    /// permanently mutating stored state.
+    /// eMule IS_IDBADGUY: pin the address a verified identity was last proven
+    /// from, so `get_current_ident_state` can flag a replay from somewhere
+    /// else without mutating the stored state.
+    ///
+    /// The pin is refreshed on every successful verification, not only the
+    /// first. Its sole caller runs immediately after `verify_signature`
+    /// succeeds, so the peer has just proved possession of the key bound to
+    /// this hash from `current_ip` — there is nothing left to be suspicious
+    /// of. Writing only when `ident_ip == 0` meant a peer on a dynamic
+    /// address was re-challenged (`secident_request_state` deliberately
+    /// re-asks when the IP moved), passed, and then had the result thrown
+    /// away: the stale pin kept it `BadGuy` forever, which zeroes its queue
+    /// score and can refuse it a slot outright once the queue is busy.
     pub fn check_identity_ip(&mut self, user_hash: [u8; 16], current_ip: u32) {
         let record = self.get_or_create(user_hash);
-        if record.ident_state == IdentState::Verified && record.ident_ip == 0 {
+        if record.ident_state == IdentState::Verified {
             record.ident_ip = current_ip;
         }
     }
@@ -760,17 +769,50 @@ impl CreditManager {
         )
     }
 
-    pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) {
+    /// Bind a peer's RSA public key to their user hash. Returns whether the
+    /// key is bound to this hash once the call returns.
+    ///
+    /// Trust on first use: the first key seen for a hash owns that identity,
+    /// and a *different* key arriving later is refused rather than silently
+    /// replacing it. Overwriting was a credit-theft primitive — a user hash
+    /// travels in the clear in every Hello, so anyone who had seen a peer
+    /// could connect claiming that hash, push their own key, and inherit the
+    /// balances bound to it. Recovery was impossible: `secident_request_state`
+    /// only asks for a key when none is stored, so the genuine peer was never
+    /// asked again, its signatures no longer matched, and it was pinned at
+    /// `IdentState::Failed` with credit refused from then on.
+    ///
+    /// The residual limitation is inherent to eD2K: a hash nobody has bound
+    /// yet can be claimed by whoever gets there first, and a peer that
+    /// genuinely rotates its keypair stays unverified until its record ages
+    /// out of `cleanup_stale`. Both are strictly better than handing an
+    /// attacker an established identity.
+    pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) -> bool {
+        if key.is_empty() {
+            return false;
+        }
         if key.len() > 4096 {
             tracing::warn!(
                 "Rejecting oversized public key ({} bytes) from {}",
                 key.len(),
                 crate::security::short_hash(&user_hash)
             );
-            return;
+            return false;
         }
         let record = self.get_or_create(user_hash);
-        record.public_key = key;
+        if record.public_key.is_empty() {
+            record.public_key = key;
+            return true;
+        }
+        if record.public_key == key {
+            return true;
+        }
+        tracing::warn!(
+            "Refusing a public key that differs from the one already bound to {}; \
+             keeping the established identity",
+            crate::security::short_hash(&user_hash)
+        );
+        false
     }
 
     /// Remember the Ember identity bound to an eD2K `user_hash` after a
@@ -1370,6 +1412,61 @@ fn verify_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user hash is public — it goes out in the clear in every Hello — so
+    /// "whoever sends a key last owns the identity" let anyone claim a peer's
+    /// hash, inherit its credit, and lock the real peer out of verifying for
+    /// good. First key seen wins.
+    #[test]
+    fn a_second_differing_public_key_cannot_displace_the_first() {
+        let mut cm = CreditManager::new();
+        let victim = [0x11u8; 16];
+        let honest = vec![0xAAu8; 64];
+        let attacker = vec![0xBBu8; 64];
+
+        assert!(cm.set_public_key(victim, honest.clone()));
+        assert!(
+            !cm.set_public_key(victim, attacker),
+            "a different key for a bound hash must be refused",
+        );
+        assert_eq!(
+            cm.get_record(&victim).unwrap().public_key,
+            honest,
+            "the originally bound key must survive",
+        );
+        assert!(
+            cm.set_public_key(victim, honest),
+            "re-sending the same key stays a no-op success",
+        );
+    }
+
+    /// Regression: a verified peer that moves to a new address is
+    /// re-challenged and passes, so the pin must follow it. Leaving the old
+    /// pin in place reported `BadGuy` forever, which zeroes the queue score.
+    #[test]
+    fn reverifying_from_a_new_address_clears_the_badguy_state() {
+        let mut cm = CreditManager::new();
+        let peer = [0x22u8; 16];
+        let first_ip = 0x0A00_0001u32;
+        let second_ip = 0x0A00_0002u32;
+
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.check_identity_ip(peer, first_ip);
+        assert_eq!(
+            cm.get_current_ident_state(&peer, second_ip),
+            IdentState::BadGuy,
+            "an unverified move must still look like a replay",
+        );
+
+        // The peer answered a fresh challenge from its new address.
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.check_identity_ip(peer, second_ip);
+        assert_eq!(
+            cm.get_current_ident_state(&peer, second_ip),
+            IdentState::Verified,
+            "a peer that re-proved its identity must not stay BadGuy",
+        );
+    }
 
     /// Monotonic-ish suffix for temp filenames so concurrent test runs don't
     /// collide on a shared temp path.

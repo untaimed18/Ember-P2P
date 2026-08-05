@@ -302,8 +302,17 @@ impl ServerUdpSocket {
         // Dedup keyed by the canonical (plain) addr — so toggling
         // obfuscation on/off for a server doesn't bypass the
         // cooldown by switching to a "different" key.
+        // eMule's UDPSERVSTATREASKTIME. The caller ticks every 200 ms so a
+        // queued `OP_GLOBGETSOURCES` is never left sitting in the socket
+        // buffer, and relies on this per-server gate for the actual cadence —
+        // so the gate has to be the real one. Using `MIN_PING_INTERVAL_SECS`
+        // (a 5-second floor meant for on-demand pings) made that fast tick
+        // the cadence instead, hammering every server in the list every few
+        // seconds forever. Public servers rate-limit and blacklist for that,
+        // which silently kills UDP source discovery — the thing the pings
+        // exist to support.
         if let Some(&last) = self.last_ping_times.get(&plain_addr) {
-            if now - last < MIN_PING_INTERVAL_SECS {
+            if now - last < STAT_REASK_INTERVAL_SECS.max(MIN_PING_INTERVAL_SECS) {
                 return Ok(0);
             }
         }

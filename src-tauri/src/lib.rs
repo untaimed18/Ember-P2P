@@ -893,6 +893,15 @@ pub fn run() {
                             && file.size > crate::network::ed2k::hash::PARTSIZE;
                         let needs_ember = file.ember_file_hash.is_empty();
                         if needs_aich || needs_ember {
+                            // Path-unique pending id while this copy is queued
+                            // for re-hashing. `file.id` is the content hash,
+                            // which every duplicate of the same content
+                            // shares, and `finalize_pending_hash` /
+                            // `remove_file_by_id` both take the first match —
+                            // so a hash failure on one copy dropped a
+                            // different, healthy copy from the Library. Same
+                            // reasoning as `discover_file`'s `pending:` ids.
+                            file.id = format!("pending:{}", file.path);
                             files_to_hash.push(file.clone());
                         }
                     } else {

@@ -657,6 +657,14 @@ impl KnownFileList {
             if !record.aich_hash.is_empty() {
                 existing.aich_hash = record.aich_hash;
             }
+            // Same "newly available" rule as the AICH root above. Without this
+            // the startup BLAKE3 migration recomputed the digest, handed it to
+            // the reconcile, and had it dropped here — so the digest only ever
+            // reached disk via the shutdown checkpoint, and any crash or
+            // force-quit re-hashed the whole library on the next launch.
+            if !record.ember_file_hash.is_empty() {
+                existing.ember_file_hash = record.ember_file_hash;
+            }
             existing.upload_priority = record.upload_priority;
             existing.is_shared = record.is_shared;
             existing.friends_only = record.friends_only;
@@ -1530,6 +1538,59 @@ mod tests {
             "a freshly computed Ember digest must be persisted, or the \
              migration re-hashes the same files on every launch forever",
         );
+    }
+
+    /// Detecting the drift is only half of it — `add_or_update` has to
+    /// actually store the digest on the existing record. It previously did
+    /// not, so `record_needs_refresh` reported the same drift forever, the
+    /// reconcile rewrote the record on every pass without ever resolving it,
+    /// and the digest reached disk only via the shutdown checkpoint.
+    #[test]
+    fn add_or_update_applies_a_newly_computed_ember_digest() {
+        let mut kf = KnownFileList::new();
+        let mut original = sample_record();
+        original.ember_file_hash = String::new();
+        let hash = original.file_hash;
+        kf.add_or_update(original);
+
+        let mut refreshed = sample_record();
+        refreshed.ember_file_hash = "ab".repeat(32);
+        kf.add_or_update(refreshed);
+
+        assert_eq!(
+            kf.find_by_hash(&hash).unwrap().ember_file_hash,
+            "ab".repeat(32),
+            "the digest the migration just computed must land on the record",
+        );
+        assert!(
+            !kf.record_needs_refresh(
+                &hash,
+                "C:/Library/movie.mkv",
+                1024 * 1024,
+                1_700_000_000,
+                "movie.mkv",
+                &"aich".repeat(10),
+                &"ab".repeat(32),
+            ),
+            "once applied, the same discovery must stop reporting drift",
+        );
+    }
+
+    /// An existing digest must not be cleared by a later reconcile whose
+    /// discovery had not computed one, mirroring the AICH rule.
+    #[test]
+    fn add_or_update_keeps_an_existing_ember_digest_when_the_update_has_none() {
+        let mut kf = KnownFileList::new();
+        let original = sample_record();
+        let hash = original.file_hash;
+        let ember = original.ember_file_hash.clone();
+        kf.add_or_update(original);
+
+        let mut bare = sample_record();
+        bare.ember_file_hash = String::new();
+        kf.add_or_update(bare);
+
+        assert_eq!(kf.find_by_hash(&hash).unwrap().ember_file_hash, ember);
     }
 
     /// Mirror of the AICH rule: discovery that hasn't computed the Ember

@@ -682,6 +682,18 @@ pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
 }
 
 fn normalize_match_path(path: &str) -> String {
+    // Strip Windows' extended-length prefix first. Folders chosen through the
+    // picker are stored `canonicalize`d and so always carry it, while the keys
+    // these paths are matched against come from `normalize_path_key`, which
+    // strips it — so `\\?\C:\Media` normalized to `?/c:/media` and matched
+    // nothing at all. Per-file share and priority intents for any
+    // picker-added folder therefore survived that folder's removal, and were
+    // silently re-applied if it was ever added back: most visibly, a file the
+    // user had since re-shared got unshared again.
+    let path = match path.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    };
     let replaced = path.replace('\\', "/");
     let parts: Vec<&str> = replaced.split('/').filter(|s| !s.is_empty()).collect();
     let mut resolved = Vec::new();

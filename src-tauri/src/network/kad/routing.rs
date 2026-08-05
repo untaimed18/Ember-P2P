@@ -888,35 +888,38 @@ enum AddResult {
 fn apply_existing_contact_update(
     bin: &mut RoutingBin,
     contact: KadContact,
-    // Host-order external IP (`RoutingTable::external_ip`).
-    external_ip: Option<u32>,
+    // Host-order external IP (`RoutingTable::external_ip`). Retained for the
+    // caller's signature; the UDP-key check below is keyed on the peer's
+    // address, not ours.
+    _external_ip: Option<u32>,
     global_ip_count: &HashMap<Ipv4Addr, u32>,
     global_subnet_count: &HashMap<u32, u32>,
 ) -> Option<(Ipv4Addr, Ipv4Addr)> {
     let Some(existing) = bin.get_contact_mut(&contact.id) else {
         return None;
     };
-    // eMule UDPKey sender verification: if the existing contact has a
-    // valid UDP key for our IP, the incoming contact must present the
-    // same key. Prevents contact hijacking.
-    if let Some(our_ip) = external_ip {
-        let existing_key_val = existing
-            .udp_key
-            .map(|k| k.get_key_value(our_ip))
-            .unwrap_or(0);
-        if existing_key_val != 0 {
-            let incoming_key_val = contact
-                .udp_key
-                .map(|k| k.get_key_value(our_ip))
-                .unwrap_or(0);
-            if existing_key_val != incoming_key_val {
-                tracing::debug!(
-                    "RT reject update for {}: UDPKey mismatch (sender key empty: {})",
-                    existing.id,
-                    incoming_key_val == 0,
-                );
-                return None;
-            }
+    // eMule UDPKey sender verification: once a contact has a valid UDP key,
+    // an update claiming its KadID must present the same key. Prevents
+    // contact hijacking.
+    //
+    // Compare the raw key values. This used to ask `get_key_value(our_ip)`
+    // on both sides, but in this codebase a UDP key is tagged with the *peer*
+    // address it was derived for (`KadUDPKey::generate(our_udp_key,
+    // their_ip)`, and both send paths read it back with the destination's
+    // IP) — so querying with our own address always returned 0, the guard
+    // body never executed, and any peer that had learned our verify key
+    // could retarget an arbitrary routing-table entry to itself. Because the
+    // key is a function of the peer's address, a claimant at a different
+    // address cannot produce it.
+    if let Some(existing_key) = existing.udp_key.filter(|k| k.is_valid()) {
+        let incoming_key_val = contact.udp_key.map(|k| k.key).unwrap_or(0);
+        if incoming_key_val != existing_key.key {
+            tracing::debug!(
+                "RT reject update for {}: UDPKey mismatch (sender key empty: {})",
+                existing.id,
+                incoming_key_val == 0,
+            );
+            return None;
         }
     }
 

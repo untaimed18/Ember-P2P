@@ -172,9 +172,20 @@ const BACKUP_FILES: &[BackupFile] = &[
     plain("antileech.dat"),
     plain("reputation.json"),
     plain("search_spam.json"),
-    // Per-file share decisions and the filesystem allow-list.
+    // Per-file share decisions.
     plain("share_intent.json"),
-    plain("approved_roots.json"),
+    // `approved_roots.json` is deliberately absent. Each record binds a folder
+    // to a volume serial and file id, so it is meaningful only on the machine
+    // that wrote it. Restoring one carried the source machine's records over,
+    // which made `initialize_approved_roots` skip the first-run migration
+    // (state file present) and then revoke the download folder on identity
+    // mismatch — or leave it with no record at all when startup had just
+    // created it fresh. Either way every download failed with "target is
+    // outside the approved roots" and, unlike a shared folder, there was no
+    // in-app way to re-approve it. Leaving the file out means a restored
+    // profile re-runs the migration and approves the configured roots on
+    // *this* machine. An older archive that still contains the entry is
+    // ignored: `read_archive` only accepts names in this list.
 ];
 
 fn backup_file(name: &str) -> Option<&'static BackupFile> {

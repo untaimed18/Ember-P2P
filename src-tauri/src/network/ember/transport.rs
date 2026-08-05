@@ -806,6 +806,26 @@ impl EmberTransport {
     }
 
     fn handle_ik_init(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
+        // Same rule `handle_xx_msg1` applies: never let an inbound init
+        // destroy a handshake *we* started to the same address.
+        //
+        // Without it, two peers that dialled each other inside one RTT each
+        // completed as responder to the other's msg1 and dropped their own
+        // initiator state — so each side's msg2 then arrived to "no pending
+        // handshake" and was refused, leaving both ends holding a live
+        // session from a *different* handshake. Every transport packet
+        // between them failed AEAD after that, and nothing recovered it:
+        // decrypt failures deliberately do not tear a session down,
+        // `prepare_outgoing` keeps refreshing `last_activity` so the idle
+        // timeout never fires, and the collision itself marked the contact
+        // fresh enough to skip liveness pings for ten minutes.
+        if matches!(
+            self.pending.get(&from),
+            Some(PendingHandshake::IkInitiator { .. } | PendingHandshake::XxInitiatorMsg1 { .. })
+        ) {
+            debug!("Ignoring IK init from {from}: an initiator handshake is in flight");
+            return IncomingResult::Rejected;
+        }
         // Do no crypto, re-emit no embedded payload, and replace no live
         // session for a repeat. Answering with the response we already
         // computed serves a peer whose copy was lost without giving a

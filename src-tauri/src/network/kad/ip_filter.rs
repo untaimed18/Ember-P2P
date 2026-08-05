@@ -193,6 +193,14 @@ pub struct IpFilter {
     block_private: bool,
     /// See [`IpFilterSnapshot::ranges_ready`].
     ranges_ready: bool,
+    /// Whether a filter file has actually been read into this instance.
+    ///
+    /// Distinct from `ranges_ready`, which is "safe to apply" and is true for
+    /// a *disabled* filter that has read nothing. Startup only reads
+    /// `ipfilter.dat` when the filter is enabled, so this is what tells a
+    /// manual edit whether serializing the live list back over that file
+    /// would preserve it or destroy it.
+    loaded_from_disk: bool,
     /// Total range-based filter hits (atomic so readonly checks can also count)
     total_range_hits: AtomicU64,
     /// Hits from blocking private/reserved/special IPs (not in any range)
@@ -208,6 +216,7 @@ impl IpFilter {
             // Disabled ⇒ nothing to load. Enabled ⇒ fail closed until the
             // first load pass finishes (or confirms there is no file).
             ranges_ready: !enabled,
+            loaded_from_disk: false,
             total_range_hits: AtomicU64::new(0),
             total_special_hits: AtomicU64::new(0),
         }
@@ -263,7 +272,20 @@ impl IpFilter {
         // A successful commit means the range list is intentional — clear the
         // fail-closed gate (also covers empty files that parse cleanly).
         self.ranges_ready = true;
+        self.loaded_from_disk = true;
         self.blocked_ranges.len()
+    }
+
+    /// Whether a filter file has been read into this instance, so the live
+    /// range list may safely be written back over `ipfilter.dat`.
+    pub fn has_loaded_ranges(&self) -> bool {
+        self.loaded_from_disk
+    }
+
+    /// Record that the persisted file has been folded in by some other route
+    /// (used when a manual edit loads it on demand before rewriting it).
+    pub fn mark_loaded_from_disk(&mut self) {
+        self.loaded_from_disk = true;
     }
 
     /// (Re)load the filter from `path`, dispatching on extension: `.p2b` ->
@@ -508,8 +530,20 @@ impl IpFilter {
         for range in &self.blocked_ranges {
             let start = Ipv4Addr::from(range.start);
             let end = Ipv4Addr::from(range.end);
+            // Carry the real description through. This is now also the
+            // save path for manual add/remove, and stamping every row
+            // "Ember imported range" would erase the labels of a
+            // downloaded list the moment the user blocks one address.
+            // Newlines would split one row into two unparseable ones.
+            let description = range.description.replace(['\r', '\n'], " ");
+            let description = description.trim();
+            let description = if description.is_empty() {
+                "Ember imported range"
+            } else {
+                description
+            };
             bytes.extend_from_slice(
-                format!("{start} - {end} , 000 , Ember imported range\n").as_bytes(),
+                format!("{start} - {end} , 000 , {description}\n").as_bytes(),
             );
         }
         bytes

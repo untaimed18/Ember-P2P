@@ -50,11 +50,18 @@ impl SharedFoldersWatcher {
         // reuses reload_shared_files so the heavy lifting (discover, hash,
         // publish) is shared with the manual-reload path.
         let app_for_handler = app.clone();
+        // Lets the driver re-arm itself when a reload is rejected because one
+        // is already in flight.
+        let reload_tx_for_retry = reload_tx.clone();
         // NOTE: must use `tauri::async_runtime::spawn` (not `tokio::spawn`)
         // because `SharedFoldersWatcher::start` is called from Tauri's
         // synchronous `setup` hook, which is not itself running inside a
         // Tokio reactor context.
         tauri::async_runtime::spawn(async move {
+            /// How long to wait before retrying a rescan that collided with a
+            /// scan already in progress. Long enough not to spin, short enough
+            /// that files land in the Library promptly once the scan ends.
+            const RELOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
             // Upper bound on total time we'll defer a rescan while new events
             // keep arriving. Without this, a long-running bulk copy that emits
             // a steady trickle of events could starve the reload indefinitely.
@@ -113,7 +120,23 @@ impl SharedFoldersWatcher {
                 )
                 .await
                 {
-                    warn!("FS watcher: reload_shared_files failed: {e}");
+                    // A reload already running rejects this one outright, and
+                    // the coalescing loop above has already drained every
+                    // queued ping — so without a re-arm the notification was
+                    // simply lost. That is the common case, not a rare one:
+                    // the first files copied into a shared folder start the
+                    // scan, and everything copied while it runs raises exactly
+                    // this rejection and never gets indexed.
+                    if e.contains("sharing_reload_in_flight") {
+                        let retry_tx = reload_tx_for_retry.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(RELOAD_RETRY_DELAY).await;
+                            let _ = retry_tx.send(()).await;
+                        });
+                        debug!("FS watcher: a scan is already running; re-arming the rescan");
+                    } else {
+                        warn!("FS watcher: reload_shared_files failed: {e}");
+                    }
                 }
             }
         });

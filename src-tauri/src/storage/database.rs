@@ -1145,9 +1145,16 @@ impl Database {
                 peer.banned as i32,
             ],
         )?;
+        // Banned rows are exempt. A ban is a user decision with no natural
+        // refresh — nothing contacts the peer again, so `last_seen` freezes
+        // and the row drifts to the bottom of this ordering (a ban placed on
+        // a hash we had never met starts at 0 and is evicted immediately).
+        // The ban list is rebuilt from `banned = 1` at startup, so eviction
+        // silently un-banned peers within days on an active node.
         conn.execute(
             "DELETE FROM peers WHERE id IN (
                 SELECT id FROM peers
+                WHERE banned = 0
                 ORDER BY last_seen DESC
                 LIMIT -1 OFFSET ?1
             )",

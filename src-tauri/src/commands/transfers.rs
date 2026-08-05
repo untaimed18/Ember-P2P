@@ -902,12 +902,18 @@ pub async fn pause_transfers_batch(
         }
     }
     for transfer_id in &transfer_ids {
-        let _ = state
-            .network_tx
-            .send(NetworkCommand::PauseDownload {
+        // `bounded_send`, like the single-row sibling. A raw `send().await` on
+        // a full channel with a wedged consumer never returns, so selecting
+        // many rows and clicking Pause left the UI spinning with no error
+        // where one row would have surfaced `network_timeout` after ten
+        // seconds.
+        let _ = bounded_send(
+            &state.network_tx,
+            NetworkCommand::PauseDownload {
                 transfer_id: transfer_id.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
@@ -982,13 +988,16 @@ pub async fn stop_transfers_batch(
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
         persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
-        let _ = state
-            .network_tx
-            .send(NetworkCommand::CancelDownload {
+        // Bounded, matching `stop_transfer` — see the note in
+        // `pause_transfers_batch`.
+        let _ = bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
                 transfer_id: transfer_id.clone(),
                 cleanup_ack: None,
-            })
-            .await;
+            },
+        )
+        .await;
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
@@ -1275,7 +1284,7 @@ pub async fn open_file(
                 )
             })?;
         if crate::security::filesystem::passive_type_agrees(&transfer.file_name, &canonical) {
-            opener::open(&canonical)
+            crate::security::filesystem::open_with_default_app(&canonical)
                 .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
         } else {
             crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {

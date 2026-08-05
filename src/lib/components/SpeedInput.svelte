@@ -26,7 +26,16 @@
   // makes `value === 0`) would yank the input out from under the user and
   // replace it with the unlimited placeholder mid-keystroke.
   let showUnlimited = $derived(value === 0 && !focused);
-  let internalUpdate = false;
+  // `lastSyncedValue` alone decides whether a `value` change came from this
+  // component or from outside. A separate "internal update" flag used to do
+  // it, but `handleInput` set the flag before writing `value`, and several
+  // ordinary keystrokes leave the computed number identical — typing the
+  // decimal point in "50.5", adding a trailing zero, typing "0" into an
+  // already-zero field. Writing the same primitive to a `$bindable` prop
+  // invalidates nothing, so the effect never ran to clear the flag, and the
+  // next *external* write (Discard in Settings, "Run speed test" in the setup
+  // wizard) was swallowed — leaving the box showing an abandoned value that
+  // no longer matched the setting underneath it.
   let lastSyncedValue = -1;
   const inputId = $derived(
     `speed-input-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'limit'}`,
@@ -55,10 +64,6 @@
     // set and the effect would never run again — leaving the field frozen
     // against external writes (speed-test "Apply recommended", Discard).
     const next = value;
-    if (internalUpdate) {
-      internalUpdate = false;
-      return;
-    }
     if (next !== lastSyncedValue) {
       lastSyncedValue = next;
       syncFromBytes(next);
@@ -69,13 +74,11 @@
     const target = e.target as HTMLInputElement;
     const raw = target.value;
     const num = parseFloat(raw);
-    internalUpdate = true;
     if (num < 0) {
       // `min="0"` only constrains the spinner; a typed "-50" still arrives here.
       // A negative rate is not a request to remove the cap, so hold the previous
       // value — blur re-renders the canonical display.
       displayValue = raw;
-      internalUpdate = false;
       return;
     }
     if (isNaN(num) || num === 0) {

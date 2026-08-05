@@ -161,6 +161,29 @@ fn decompress_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `read_exact` under the same deadline the rest of this handshake uses.
+///
+/// Each step of the DH exchange needs its own bound: the handshake sits in
+/// the single `pending_server_connect` slot, and that slot gating eD2K
+/// auto-reconnect means one unbounded read takes the whole server subsystem
+/// down until the user reconnects by hand.
+async fn read_exact_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    what: &str,
+) -> io::Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(DH_STEP_TIMEOUT_SECS),
+        reader.read_exact(buf),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out")))??;
+    Ok(())
+}
+
+/// Per-step deadline for the obfuscated server handshake.
+const DH_STEP_TIMEOUT_SECS: u64 = 10;
+
 /// Perform the full DH handshake with a server's obfuscation port.
 pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServerStream> {
     info!("Connecting to server obfuscation port {addr}");
@@ -249,8 +272,15 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     info!("Server DH: shared secret computed, RC4 keys derived");
 
     // Step 4: Read + decrypt: magic(4) + methods(1) + preferred(1) + padLen(1) + padding
+    //
+    // Every read from here on is bounded. Without a timeout, a server that
+    // accepted the connection and sent its 96-byte g^b and then went quiet
+    // parked this future forever — and because it runs inside the
+    // `pending_server_connect` task, whose slot must be empty for eD2K
+    // auto-reconnect to fire again, the whole server subsystem stayed wedged
+    // on "Connecting…" for the rest of the session with nothing to recover it.
     let mut enc_magic = [0u8; 4];
-    reader.read_exact(&mut enc_magic).await?;
+    read_exact_bounded(&mut reader, &mut enc_magic, "server DH sync magic").await?;
     let mut dec_magic = [0u8; 4];
     recv_key.process(&enc_magic, &mut dec_magic);
     let magic = u32::from_le_bytes(dec_magic);
@@ -264,7 +294,7 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     info!("Server DH: magic verified OK");
 
     let mut enc_tags = [0u8; 3];
-    reader.read_exact(&mut enc_tags).await?;
+    read_exact_bounded(&mut reader, &mut enc_tags, "server DH method tags").await?;
     let mut dec_tags = [0u8; 3];
     recv_key.process(&enc_tags, &mut dec_tags);
     let _methods_supported = dec_tags[0];
@@ -273,7 +303,7 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
 
     if server_pad_len > 0 {
         let mut enc_pad = vec![0u8; server_pad_len];
-        reader.read_exact(&mut enc_pad).await?;
+        read_exact_bounded(&mut reader, &mut enc_pad, "server DH padding").await?;
         let mut dec_pad = vec![0u8; server_pad_len];
         recv_key.process(&enc_pad, &mut dec_pad);
     }

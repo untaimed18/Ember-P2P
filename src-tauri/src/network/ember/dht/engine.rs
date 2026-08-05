@@ -732,6 +732,12 @@ impl EmberDht {
         self.store.take_republish_batch(interval, max, force)
     }
 
+    /// Re-arm a record whose republish was never queued (see
+    /// [`DhtStore::mark_republish_due`]).
+    pub fn mark_republish_due(&mut self, key: &[u8; 16], signature: &[u8; 64]) {
+        self.store.mark_republish_due(key, signature);
+    }
+
     /// Handle one decrypted inbound DHT frame from `from` over a Noise
     /// session whose peer static key is `remote_noise_pub`. `now` is a
     /// unix timestamp used for contact freshness.

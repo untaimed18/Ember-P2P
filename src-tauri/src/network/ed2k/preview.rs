@@ -197,7 +197,7 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
     if !crate::security::filesystem::passive_type_agrees(declared, file_path) {
         anyhow::bail!("preview type is not on the passive launch allowlist");
     }
-    opener::open(file_path)?;
+    crate::security::filesystem::open_with_default_app(file_path)?;
     Ok(())
 }
 

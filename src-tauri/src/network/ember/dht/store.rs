@@ -547,6 +547,30 @@ impl DhtStore {
         out
     }
 
+    /// Make a record due for republish again after its re-store was dropped
+    /// before it reached the wire.
+    ///
+    /// `take_republish_batch` stamps every record it hands out, but the caller
+    /// can still fail to queue one: `EmberBatchPublisher::enqueue` refuses
+    /// when the target list is momentarily empty (an ipfilter reload, a
+    /// staleness purge, a cold start) or when the queue cap would be
+    /// overshot. Left stamped, the record sat unreplicated for a full hour
+    /// against a 24-hour TTL — drifting out of the k-closest set during churn
+    /// while the diagnostics counted a republish that never happened.
+    pub fn mark_republish_due(&mut self, key: &[u8; 16], signature: &[u8; 64]) {
+        let Some(records) = self.entries.get_mut(key) else {
+            return;
+        };
+        let Some(record) = records.iter_mut().find(|r| r.signature == *signature) else {
+            return;
+        };
+        // Any sufficiently old stamp makes it due on the next pass; the exact
+        // value does not matter because `due` is a threshold test.
+        record.last_republished = Instant::now()
+            .checked_sub(Duration::from_secs(86_400))
+            .unwrap_or_else(Instant::now);
+    }
+
     /// Total number of records across all keys.
     pub fn total_records(&self) -> usize {
         self.entries.values().map(|v| v.len()).sum()

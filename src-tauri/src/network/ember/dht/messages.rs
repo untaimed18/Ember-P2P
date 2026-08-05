@@ -85,7 +85,15 @@ pub const MAX_UNFRAGMENTED_PAYLOAD: usize =
 
 /// Byte budget for the record blobs in a `FOUND_VALUE`, after its 16-byte key
 /// and 2-byte record count. Each blob also costs a 2-byte length prefix.
-pub const MAX_FOUND_VALUE_RECORD_BYTES: usize = MAX_DELIVERABLE_PAYLOAD - 16 - 2;
+///
+/// Budgeted against the unfragmented limit like every other response whose
+/// size we choose (FOUND_NODE, PEER_LIST, STORE_BATCH). Using the 4 KB decode
+/// cap here produced ~4 KB datagrams that fragment on any normal MTU — and
+/// the node holding the most records for a popular keyword is exactly the one
+/// whose answers were then most likely to be dropped in transit. The searcher
+/// read that as a timeout and charged the responder a failure, so after three
+/// of them a healthy, well-stocked storer was evicted from the routing table.
+pub const MAX_FOUND_VALUE_RECORD_BYTES: usize = MAX_UNFRAGMENTED_PAYLOAD - 16 - 2;
 /// Maximum STORE / PROXY_STORE record body size. Bounded by what can actually
 /// be delivered rather than a round number larger than the datagram cap.
 pub const MAX_STORE_RECORD_BYTES: usize = MAX_DELIVERABLE_PAYLOAD - 18;
