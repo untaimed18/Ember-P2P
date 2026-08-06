@@ -170,7 +170,8 @@ function latestReleaseTag(root) {
 }
 
 /**
- * The declared version must be higher than the newest release tag.
+ * Between releases the declared version must be higher than the newest release
+ * tag.
  *
  * `verifyVersions` only proves the five manifests agree with each other, which
  * they also do when nothing was bumped at all. Ten commits of work once sat on
@@ -178,18 +179,34 @@ function latestReleaseTag(root) {
  * number while differing in their DHT wire format and in whether the overlay was
  * on by default, so the updater could not tell them apart and neither could a
  * bug report.
+ *
+ * On a tagged release (`--require-tag` / `GITHUB_REF_NAME=vX.Y.Z`) this check
+ * is skipped: the version must *equal* the tag being cut (enforced by
+ * `verifyVersions`), and being ahead of that same tag is impossible.
  */
-export function verifyVersionAdvanced({ root = scriptRoot } = {}) {
+export function verifyVersionAdvanced({
+  root = scriptRoot,
+  tag = null,
+  requireTag = false,
+} = {}) {
   const version = JSON.parse(read(root, "package.json")).version;
   const latest = latestReleaseTag(root);
-  if (!latest) return { version, latestTag: null };
+  if (!latest) return { version, latestTag: null, checked: false };
+
+  const effectiveTag = tag ?? process.env.GITHUB_REF_NAME ?? null;
+  const cuttingRelease =
+    requireTag || (effectiveTag != null && effectiveTag === `v${version}`);
+  if (cuttingRelease) {
+    return { version, latestTag: latest, checked: false };
+  }
+
   if (compareVersions(version, latest) <= 0) {
     throw new Error(
       `Release version policy failed:\n- package.json version ${version} is not ahead of the ` +
         `latest release tag v${latest}; run \`npm run bump-version <next>\``,
     );
   }
-  return { version, latestTag: latest };
+  return { version, latestTag: latest, checked: true };
 }
 
 export function verifyWorkflow({ root = scriptRoot } = {}) {
@@ -324,10 +341,10 @@ export function verifySecurityEpoch({ root = scriptRoot } = {}) {
 
 export function verifyReleasePolicy(options = {}) {
   const version = verifyVersions(options);
-  const { latestTag } = verifyVersionAdvanced(options);
+  const { latestTag, checked: versionAdvanced } = verifyVersionAdvanced(options);
   const actions = verifyWorkflow(options);
   const securityEpoch = verifySecurityEpoch(options);
-  return { version, latestTag, actions, securityEpoch };
+  return { version, latestTag, versionAdvanced, actions, securityEpoch };
 }
 
 function parseArgs(argv) {
@@ -352,9 +369,11 @@ if (
 ) {
   try {
     const result = verifyReleasePolicy(parseArgs(process.argv.slice(2)));
-    const against = result.latestTag
-      ? `ahead of v${result.latestTag}`
-      : "no release tags to compare against";
+    const against = !result.latestTag
+      ? "no release tags to compare against"
+      : result.versionAdvanced
+        ? `ahead of v${result.latestTag}`
+        : `release tag matches v${result.version}`;
     console.log(
       `release policy verified: version ${result.version} (${against}), security epoch ${result.securityEpoch}, ${result.actions} SHA-pinned action uses`,
     );

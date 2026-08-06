@@ -74,6 +74,7 @@ test("repository release versions and workflow policy agree", () => {
     requireTag: true,
   });
   assert.equal(result.version, packageVersion);
+  assert.equal(result.versionAdvanced, false);
   assert.equal(result.securityEpoch, 1);
   assert.ok(result.actions > 0);
 });
