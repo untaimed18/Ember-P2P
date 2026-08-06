@@ -229,32 +229,46 @@
 
   let isActive = $derived(!!diag?.ember_native_enabled);
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
+  let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
   let joining = $derived(isActive && peerCount === 0 && !joinTimedOut);
   let isConnected = $derived(isActive && peerCount > 0);
+
+  type HeroState = 'loading' | 'off' | 'connecting' | 'connected' | 'no_peers';
+  let heroState: HeroState = $derived(
+    diag === null
+      ? 'loading'
+      : !isActive
+        ? 'off'
+        : isConnected
+          ? 'connected'
+          : joining
+            ? 'connecting'
+            : 'no_peers',
+  );
 
   // Until the first diagnostics land we genuinely don't know the state, and
   // an enabled node would otherwise be announced as "Off" with a "turn it
   // on" hint for a round trip.
   let statusLabel = $derived(
-    diag === null
+    heroState === 'loading'
       ? m.common_loading()
-      : !isActive
+      : heroState === 'off'
         ? m.ember_status_disabled()
-        : isConnected
+        : heroState === 'connected'
           ? m.ember_status_connected()
-          : joining
+          : heroState === 'connecting'
             ? m.ember_status_connecting()
             : m.ember_status_no_peers(),
   );
 
   let statusHint = $derived(
-    diag === null
+    heroState === 'loading'
       ? ''
-      : !isActive
+      : heroState === 'off'
         ? m.ember_disabled_explainer()
-        : isConnected
+        : heroState === 'connected'
           ? m.ember_status_connected_hint()
-          : joining
+          : heroState === 'connecting'
             ? m.ember_joining_hint()
             : m.ember_no_contacts_hint(),
   );
@@ -292,7 +306,43 @@
   // claiming "Published" after the user unshared everything, and a keyword ack
   // alone would flip the pill before the source record that actually makes the
   // file fetchable. This is the same set behind the Library's Ember badge.
-  let sharingPublished = $derived((diag?.ember_dht_published_files ?? 0) > 0);
+  let sharingPublished = $derived(publishedCount > 0);
+
+  type PillTone = 'ok' | 'warn' | 'muted' | 'pending';
+
+  let networkPillLabel = $derived(
+    isConnected
+      ? m.ember_status_connected()
+      : joining
+        ? m.ember_status_connecting()
+        : m.ember_status_no_peers(),
+  );
+  let networkPillTone: PillTone = $derived(
+    isConnected ? 'ok' : joining ? 'pending' : 'warn',
+  );
+  let networkHint = $derived(
+    isConnected
+      ? m.ember_status_connected_hint()
+      : joining
+        ? m.ember_joining_hint()
+        : m.ember_no_contacts_hint(),
+  );
+
+  let reachabilityTone: PillTone = $derived(
+    reachability === 'direct' ? 'ok' : reachability === 'relayed' ? 'warn' : 'muted',
+  );
+
+  let sharingPillLabel = $derived(
+    sharingPublished
+      ? m.ember_health_sharing_published_count({ count: publishedCount })
+      : m.ember_health_sharing_waiting(),
+  );
+  let sharingTone: PillTone = $derived(sharingPublished ? 'ok' : 'muted');
+  let sharingHint = $derived(
+    sharingPublished
+      ? m.ember_health_sharing_published_hint()
+      : m.ember_health_sharing_waiting_hint(),
+  );
 
   // `id` exists so the `{#each}` below is keyed on something stable. Keying
   // on the label would put a translator in a position to crash the page:
@@ -359,7 +409,7 @@
   <div>
     <h1>
       {m.nav_ember_network()}
-      <span class="badge-experimental">{m.ember_experimental()}</span>
+      <span class="badge-beta">{m.ember_experimental()}</span>
     </h1>
     <p class="subtitle">{m.ember_page_subtitle()}</p>
   </div>
@@ -372,9 +422,15 @@
   {/if}
 
   <!-- Status + power switch -->
-  <section class="card hero">
+  <section class="hero" class:state-off={heroState === 'off' || heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
+    <div class="hero-glow" aria-hidden="true"></div>
     <div class="hero-main">
-      <span class="status-dot" class:on={isConnected} class:pending={isActive && !isConnected}></span>
+      <span
+        class="status-dot"
+        class:on={heroState === 'connected'}
+        class:pending={heroState === 'connecting'}
+        class:warn={heroState === 'no_peers'}
+      ></span>
       <div class="hero-text">
         <div class="status-label">
           {statusLabel}
@@ -384,6 +440,7 @@
       </div>
     </div>
     <div class="hero-toggle">
+      <span class="toggle-caption">{m.ember_enable_label()}</span>
       <ToggleSwitch
         bind:checked={enabled}
         disabled={applying || settings === null}
@@ -401,54 +458,78 @@
   {/if}
 
   {#if isActive}
-    <section class="stat-grid">
+    <section class="stat-grid" aria-label={m.ember_health_title()}>
       <div class="stat">
         <div class="stat-value">{peerCount}</div>
         <div class="stat-label">{m.ember_overview_peers()}</div>
       </div>
       <div class="stat">
-        <div class="stat-value">{diag?.ember_sessions ?? 0}</div>
-        <div class="stat-label">{m.ember_overview_connections()}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">{diag?.ember_dht_active_searches ?? 0}</div>
-        <div class="stat-label">{m.ember_overview_searches()}</div>
+        <div class="stat-value">{publishedCount}</div>
+        <div class="stat-label">{m.ember_overview_published()}</div>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card checklist">
       <h2>{m.ember_health_title()}</h2>
-      <div class="health-row">
-        <div class="health-head">
-          <span class="health-label">{m.ember_health_reachability()}</span>
-          <span
-            class="pill"
-            class:ok={reachability === 'direct'}
-            class:warn={reachability === 'relayed'}
-            class:muted={reachability === 'checking'}
-          >{reachabilityLabel}</span>
+
+      <div class="check-row">
+        <div class="check-indicator" class:ok={networkPillTone === 'ok'} class:warn={networkPillTone === 'warn'} class:pending={networkPillTone === 'pending'} aria-hidden="true">
+          {#if networkPillTone === 'ok'}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
+          {:else if networkPillTone === 'pending'}
+            <span class="check-spinner"></span>
+          {:else}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M8 5.5v3.5M8 11h.01" /></svg>
+          {/if}
         </div>
-        <p class="hint">{reachabilityHint}</p>
+        <div class="check-body">
+          <div class="check-head">
+            <span class="check-label">{m.ember_health_network()}</span>
+            <span class="pill" class:ok={networkPillTone === 'ok'} class:warn={networkPillTone === 'warn'} class:pending={networkPillTone === 'pending'}>{networkPillLabel}</span>
+          </div>
+          <p class="hint">{networkHint}</p>
+        </div>
       </div>
-      <div class="health-row">
-        <div class="health-head">
-          <span class="health-label">{m.ember_health_sharing()}</span>
-          <span
-            class="pill"
-            class:ok={sharingPublished}
-            class:muted={!sharingPublished}
-          >{sharingPublished ? m.ember_health_sharing_published() : m.ember_health_sharing_waiting()}</span>
+
+      <div class="check-row">
+        <div class="check-indicator" class:ok={reachabilityTone === 'ok'} class:warn={reachabilityTone === 'warn'} class:muted={reachabilityTone === 'muted'} aria-hidden="true">
+          {#if reachabilityTone === 'ok'}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
+          {:else if reachabilityTone === 'warn'}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3l6 10H2L8 3z" /><path d="M8 7v3M8 11.5h.01" /></svg>
+          {:else}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M5.5 8h5" /></svg>
+          {/if}
         </div>
-        <p class="hint">{sharingPublished ? m.ember_health_sharing_published_hint() : m.ember_health_sharing_waiting_hint()}</p>
+        <div class="check-body">
+          <div class="check-head">
+            <span class="check-label">{m.ember_health_reachability()}</span>
+            <span class="pill" class:ok={reachabilityTone === 'ok'} class:warn={reachabilityTone === 'warn'} class:muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+          </div>
+          <p class="hint">{reachabilityHint}</p>
+        </div>
+      </div>
+
+      <div class="check-row">
+        <div class="check-indicator" class:ok={sharingTone === 'ok'} class:muted={sharingTone === 'muted'} aria-hidden="true">
+          {#if sharingTone === 'ok'}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
+          {:else}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M5.5 8h5" /></svg>
+          {/if}
+        </div>
+        <div class="check-body">
+          <div class="check-head">
+            <span class="check-label">{m.ember_health_sharing()}</span>
+            <span class="pill" class:ok={sharingTone === 'ok'} class:muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+          </div>
+          <p class="hint">{sharingHint}</p>
+        </div>
       </div>
     </section>
   {/if}
 
-  <!-- About -->
-  <section class="card">
-    <h2>{m.ember_about_title()}</h2>
-    <p class="about-text">{m.ember_about_text()}</p>
-  </section>
+  <p class="about-text">{m.ember_about_text()}</p>
 
   <!--
     Everything below is protocol-level diagnostics. Collapsed by default,
@@ -642,12 +723,12 @@
     max-width: 70ch;
   }
 
-  .badge-experimental {
+  .badge-beta {
     display: inline-block;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.3px;
+    letter-spacing: 0.4px;
     padding: 2px 8px;
     border-radius: 8px;
     color: var(--accent);
@@ -666,21 +747,79 @@
     font-size: 14px;
     font-weight: 600;
     color: var(--text-primary);
-    margin: 0 0 4px;
+    margin: 0 0 12px;
   }
 
+  /* --- Status hero --- */
+
   .hero {
+    position: relative;
+    overflow: hidden;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
+    gap: 20px;
+    padding: 22px 24px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg, 10px);
+    transition:
+      background 0.35s ease,
+      border-color 0.35s ease,
+      box-shadow 0.35s ease;
+  }
+
+  .hero-glow {
+    position: absolute;
+    inset: -40% -20% auto auto;
+    width: 55%;
+    height: 140%;
+    pointer-events: none;
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in srgb, var(--ember-color, #c2185b) 18%, transparent) 0%,
+      transparent 70%
+    );
+    opacity: 0;
+    transition: opacity 0.4s ease;
+  }
+
+  .hero.state-connected {
+    border-color: color-mix(in srgb, var(--ember-color, #c2185b) 28%, var(--border));
+    background:
+      linear-gradient(
+        135deg,
+        color-mix(in srgb, var(--ember-color, #c2185b) 7%, var(--bg-secondary)) 0%,
+        var(--bg-secondary) 55%
+      );
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--ember-color, #c2185b) 12%, transparent);
+  }
+
+  .hero.state-connected .hero-glow {
+    opacity: 1;
+  }
+
+  .hero.state-connecting {
+    border-color: color-mix(in srgb, var(--warning) 32%, var(--border));
+    background:
+      linear-gradient(
+        135deg,
+        color-mix(in srgb, var(--warning) 8%, var(--bg-secondary)) 0%,
+        var(--bg-secondary) 60%
+      );
+  }
+
+  .hero.state-no-peers {
+    border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
   }
 
   .hero-main {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 16px;
     min-width: 0;
+    flex: 1;
   }
 
   .status-dot {
@@ -689,32 +828,55 @@
     border-radius: 50%;
     flex-shrink: 0;
     background: var(--text-muted);
-    transition: background 0.2s ease, box-shadow 0.2s ease;
+    transition: background 0.25s ease, box-shadow 0.25s ease;
   }
 
   .status-dot.pending {
-    background: var(--warning, #d9a441);
+    background: var(--warning);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 18%, transparent);
+  }
+
+  .status-dot.warn {
+    background: var(--warning);
   }
 
   .status-dot.on {
-    background: #3ccf6d;
+    background: var(--success);
     box-shadow:
-      0 0 0 3px color-mix(in srgb, #3ccf6d 20%, transparent),
-      0 0 12px color-mix(in srgb, #3ccf6d 55%, transparent);
+      0 0 0 3px color-mix(in srgb, var(--success) 20%, transparent),
+      0 0 14px color-mix(in srgb, var(--ember-color, #c2185b) 35%, transparent);
   }
 
   .status-label {
-    font-size: 17px;
+    font-size: 22px;
     font-weight: 700;
+    letter-spacing: -0.02em;
     color: var(--text-primary);
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
+    line-height: 1.2;
   }
 
   .hero-text .hint {
-    margin: 2px 0 0;
-    max-width: 62ch;
+    margin: 6px 0 0;
+    max-width: 56ch;
+  }
+
+  .hero-toggle {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .toggle-caption {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
   }
 
   .hint {
@@ -723,9 +885,11 @@
     line-height: 1.5;
   }
 
+  /* --- Glance metrics --- */
+
   .stat-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 12px;
   }
 
@@ -733,54 +897,107 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg, 10px);
-    padding: 16px;
+    padding: 18px 16px;
     text-align: center;
+    transition: border-color 0.2s ease;
+  }
+
+  .stat:hover {
+    border-color: color-mix(in srgb, var(--ember-color, #c2185b) 22%, var(--border));
   }
 
   .stat-value {
-    font-size: 26px;
+    font-size: 28px;
     font-weight: 700;
-    color: var(--accent);
+    color: var(--ember-color, #c2185b);
     line-height: 1.1;
     font-variant-numeric: tabular-nums;
   }
 
   .stat-label {
-    margin-top: 4px;
+    margin-top: 6px;
     font-size: 12px;
+    font-weight: 500;
     color: var(--text-muted);
   }
 
-  /* --- Connection health --- */
+  /* --- Health checklist --- */
 
-  .health-row {
-    padding: 10px 0;
-    border-top: 1px solid var(--border);
+  .checklist {
+    padding-top: 16px;
+    padding-bottom: 8px;
   }
 
-  .health-row:first-of-type {
+  .check-row {
+    display: flex;
+    gap: 14px;
+    padding: 14px 0;
+    border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  }
+
+  .check-row:first-of-type {
     border-top: none;
-    padding-top: 8px;
+    padding-top: 2px;
   }
 
-  .health-row:last-of-type {
-    padding-bottom: 0;
+  .check-indicator {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--text-muted) 22%, transparent);
   }
 
-  .health-head {
+  .check-indicator.ok {
+    color: var(--badge-success-text, var(--success));
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    border-color: color-mix(in srgb, var(--success) 28%, transparent);
+  }
+
+  .check-indicator.warn {
+    color: var(--badge-warning-text, var(--warning));
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+  }
+
+  .check-indicator.pending {
+    color: var(--badge-warning-text, var(--warning));
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+  }
+
+  .check-indicator.muted {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 22%, transparent);
+  }
+
+  .check-body {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .check-head {
     display: flex;
     align-items: center;
     gap: 10px;
+    flex-wrap: wrap;
   }
 
-  .health-label {
+  .check-label {
     font-size: 13px;
     font-weight: 600;
     color: var(--text-primary);
   }
 
-  .health-row .hint {
-    margin: 4px 0 0;
+  .check-row .hint {
+    margin: 5px 0 0;
     max-width: 70ch;
   }
 
@@ -805,10 +1022,25 @@
     border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
   }
 
+  .pill.pending {
+    color: var(--badge-warning-text, #d9a441);
+    background: color-mix(in srgb, var(--warning, #d9a441) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
+  }
+
   .pill.muted {
     color: var(--text-secondary);
     background: color-mix(in srgb, var(--text-muted) 15%, transparent);
     border-color: color-mix(in srgb, var(--text-muted) 28%, transparent);
+  }
+
+  .check-spinner {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--warning) 30%, transparent);
+    border-top-color: var(--warning);
+    animation: spin 0.8s linear infinite;
   }
 
   /* --- Technical details disclosure --- */
@@ -1045,10 +1277,11 @@
   }
 
   .about-text {
-    margin: 0;
-    color: var(--text-secondary);
+    margin: 4px 0 0;
+    color: var(--text-muted);
     font-size: 13px;
     line-height: 1.6;
+    max-width: 72ch;
   }
 
   .banner {
@@ -1082,13 +1315,29 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .spinner { animation: none; }
-    .chevron { transition: none; }
+    .spinner,
+    .check-spinner { animation: none; }
+    .chevron,
+    .hero,
+    .hero-glow,
+    .status-dot,
+    .stat { transition: none; }
   }
 
   @media (max-width: 640px) {
+    .hero {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 16px;
+    }
+    .hero-toggle {
+      align-items: flex-start;
+      flex-direction: row;
+      justify-content: space-between;
+      width: 100%;
+    }
     .stat-grid {
-      grid-template-columns: 1fr;
+      grid-template-columns: 1fr 1fr;
     }
     .metric-grid {
       grid-template-columns: 1fr;
@@ -1096,6 +1345,9 @@
     .kv {
       grid-template-columns: 1fr;
       gap: 4px;
+    }
+    .status-label {
+      font-size: 20px;
     }
   }
 </style>

@@ -57,8 +57,8 @@
   "nav_statistics": "统计",
   "nav_settings": "设置",
   "nav_ember_network": "Ember Network",
-  "ember_page_subtitle": "通过端到端加密连接，直接与其他 Ember 用户查找和分享文件，中间没有任何服务器。",
-  "ember_experimental": "实验性",
+  "ember_page_subtitle": "端到端加密的点对点文件分享 — 中间没有服务器。",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "已关闭",
   "ember_status_connected": "已连接",
   "ember_status_connecting": "正在连接…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "节点",
   "ember_overview_connections": "连接",
   "ember_overview_searches": "搜索",
-  "ember_health_title": "连接状况",
+  "ember_health_title": "状态",
   "ember_health_reachability": "可达性",
   "ember_health_direct": "直连",
   "ember_health_direct_hint": "其他 Ember 用户可以直接连接到你。",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "无法加载已保存的安全策略。",
   "layout_policy_reset_acknowledge": "确认并重置策略",
   "layout_policy_reset_working": "正在重置策略…",
-  "layout_policy_reset_failed": "无法重置安全策略。"
+  "layout_policy_reset_failed": "无法重置安全策略。",
+  "ember_overview_published": "已发布文件",
+  "ember_health_network": "网络",
+  "ember_health_sharing_published_count": "已发布 · {count}"
 }

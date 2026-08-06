@@ -57,8 +57,8 @@
   "nav_statistics": "統計",
   "nav_settings": "設定",
   "nav_ember_network": "Ember Network",
-  "ember_page_subtitle": "透過端到端加密連線，直接與其他 Ember 使用者尋找並分享檔案，中間沒有任何伺服器。",
-  "ember_experimental": "實驗性",
+  "ember_page_subtitle": "端對端加密的點對點檔案分享 — 中間沒有伺服器。",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "已關閉",
   "ember_status_connected": "已連線",
   "ember_status_connecting": "正在連線…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "節點",
   "ember_overview_connections": "連線",
   "ember_overview_searches": "搜尋",
-  "ember_health_title": "連線狀況",
+  "ember_health_title": "狀態",
   "ember_health_reachability": "可連線性",
   "ember_health_direct": "直連",
   "ember_health_direct_hint": "其他 Ember 使用者可以直接連線到你。",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "無法載入已儲存的安全策略。",
   "layout_policy_reset_acknowledge": "確認並重置策略",
   "layout_policy_reset_working": "正在重置策略…",
-  "layout_policy_reset_failed": "無法重置安全策略。"
+  "layout_policy_reset_failed": "無法重置安全策略。",
+  "ember_overview_published": "已發布檔案",
+  "ember_health_network": "網路",
+  "ember_health_sharing_published_count": "已發布 · {count}"
 }

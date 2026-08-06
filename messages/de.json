@@ -57,8 +57,8 @@
   "nav_statistics": "Statistiken",
   "nav_settings": "Einstellungen",
   "nav_ember_network": "Ember-Netzwerk",
-  "ember_page_subtitle": "Finden und teilen Sie Dateien direkt mit anderen Ember-Nutzern über Ende-zu-Ende-verschlüsselte Verbindungen — ganz ohne Server dazwischen.",
-  "ember_experimental": "Experimentell",
+  "ember_page_subtitle": "Verschlüsselter Peer-to-Peer-Dateiaustausch — ohne Server dazwischen.",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "Aus",
   "ember_status_connected": "Verbunden",
   "ember_status_connecting": "Verbinden…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "Peers",
   "ember_overview_connections": "Verbindungen",
   "ember_overview_searches": "Suchen",
-  "ember_health_title": "Verbindungszustand",
+  "ember_health_title": "Status",
   "ember_health_reachability": "Erreichbarkeit",
   "ember_health_direct": "Direkt",
   "ember_health_direct_hint": "Andere Ember-Nutzer können sich direkt mit Ihnen verbinden.",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "Die gespeicherte Sicherheitsrichtlinie konnte nicht geladen werden.",
   "layout_policy_reset_acknowledge": "Bestätigen und Richtlinie zurücksetzen",
   "layout_policy_reset_working": "Richtlinie wird zurückgesetzt…",
-  "layout_policy_reset_failed": "Die Sicherheitsrichtlinie konnte nicht zurückgesetzt werden."
+  "layout_policy_reset_failed": "Die Sicherheitsrichtlinie konnte nicht zurückgesetzt werden.",
+  "ember_overview_published": "Veröffentlichte Dateien",
+  "ember_health_network": "Netzwerk",
+  "ember_health_sharing_published_count": "Veröffentlicht · {count}"
 }

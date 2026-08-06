@@ -57,8 +57,8 @@
   "nav_statistics": "Estadísticas",
   "nav_settings": "Ajustes",
   "nav_ember_network": "Red Ember",
-  "ember_page_subtitle": "Encuentra y comparte archivos directamente con otros usuarios de Ember mediante conexiones cifradas de extremo a extremo, sin servidores de por medio.",
-  "ember_experimental": "Experimental",
+  "ember_page_subtitle": "Compartir archivos cifrado entre pares — sin servidores de por medio.",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "Desactivada",
   "ember_status_connected": "Conectada",
   "ember_status_connecting": "Conectando…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "Pares",
   "ember_overview_connections": "Conexiones",
   "ember_overview_searches": "Búsquedas",
-  "ember_health_title": "Estado de la conexión",
+  "ember_health_title": "Estado",
   "ember_health_reachability": "Accesibilidad",
   "ember_health_direct": "Directa",
   "ember_health_direct_hint": "Otros usuarios de Ember pueden conectarse contigo directamente.",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "No se pudo cargar la política de seguridad guardada.",
   "layout_policy_reset_acknowledge": "Confirmar y restablecer la política",
   "layout_policy_reset_working": "Restableciendo la política…",
-  "layout_policy_reset_failed": "No se pudo restablecer la política de seguridad."
+  "layout_policy_reset_failed": "No se pudo restablecer la política de seguridad.",
+  "ember_overview_published": "Archivos publicados",
+  "ember_health_network": "Red",
+  "ember_health_sharing_published_count": "Publicados · {count}"
 }

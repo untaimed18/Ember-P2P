@@ -57,8 +57,8 @@
   "nav_statistics": "Статистика",
   "nav_settings": "Настройки",
   "nav_ember_network": "Ember Network",
-  "ember_page_subtitle": "Находите файлы и делитесь ими напрямую с другими пользователями Ember по сквозным зашифрованным соединениям — без серверов-посредников.",
-  "ember_experimental": "Экспериментально",
+  "ember_page_subtitle": "Зашифрованный обмен файлами напрямую — без серверов-посредников.",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "Выключено",
   "ember_status_connected": "Подключено",
   "ember_status_connecting": "Подключение…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "Пиры",
   "ember_overview_connections": "Соединения",
   "ember_overview_searches": "Поиски",
-  "ember_health_title": "Состояние подключения",
+  "ember_health_title": "Состояние",
   "ember_health_reachability": "Доступность",
   "ember_health_direct": "Прямая",
   "ember_health_direct_hint": "Другие пользователи Ember могут подключаться к вам напрямую.",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "Не удалось загрузить сохранённую политику безопасности.",
   "layout_policy_reset_acknowledge": "Подтвердить и сбросить политику",
   "layout_policy_reset_working": "Сброс политики…",
-  "layout_policy_reset_failed": "Не удалось сбросить политику безопасности."
+  "layout_policy_reset_failed": "Не удалось сбросить политику безопасности.",
+  "ember_overview_published": "Опубликованные файлы",
+  "ember_health_network": "Сеть",
+  "ember_health_sharing_published_count": "Опубликованы · {count}"
 }

@@ -57,8 +57,8 @@
   "nav_statistics": "Statistiche",
   "nav_settings": "Impostazioni",
   "nav_ember_network": "Ember Network",
-  "ember_page_subtitle": "Trova e condividi file direttamente con altri utenti Ember tramite connessioni cifrate end-to-end, senza server di mezzo.",
-  "ember_experimental": "Sperimentale",
+  "ember_page_subtitle": "Condivisione file peer-to-peer crittografata — senza server di mezzo.",
+  "ember_experimental": "BETA",
   "ember_status_disabled": "Disattivato",
   "ember_status_connected": "Connesso",
   "ember_status_connecting": "Connessione…",
@@ -70,7 +70,7 @@
   "ember_overview_peers": "Peer",
   "ember_overview_connections": "Connessioni",
   "ember_overview_searches": "Ricerche",
-  "ember_health_title": "Stato della connessione",
+  "ember_health_title": "Stato",
   "ember_health_reachability": "Raggiungibilità",
   "ember_health_direct": "Diretta",
   "ember_health_direct_hint": "Gli altri utenti Ember possono connettersi a te direttamente.",
@@ -2324,5 +2324,8 @@
   "layout_policy_reset_unknown_reason": "Impossibile caricare la policy di sicurezza salvata.",
   "layout_policy_reset_acknowledge": "Conferma e reimposta policy",
   "layout_policy_reset_working": "Reimpostazione policy…",
-  "layout_policy_reset_failed": "Impossibile reimpostare la policy di sicurezza."
+  "layout_policy_reset_failed": "Impossibile reimpostare la policy di sicurezza.",
+  "ember_overview_published": "File pubblicati",
+  "ember_health_network": "Rete",
+  "ember_health_sharing_published_count": "Pubblicati · {count}"
 }
