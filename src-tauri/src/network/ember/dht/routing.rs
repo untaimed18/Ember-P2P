@@ -421,6 +421,13 @@ impl RoutingTable {
         if contact.is_verified() {
             if let Some(pos) = bucket.contacts.iter().position(|c| !c.is_verified()) {
                 let evicted = bucket.contacts.remove(pos).unwrap();
+                // Same reason as the not-full path above: a contact can be
+                // sitting in the cache and then enter the bucket directly, and
+                // the leftover entry holds one of only twenty cache slots for
+                // a peer that is already resident.
+                bucket
+                    .replacement_cache
+                    .retain(|c| c.node_id != contact.node_id);
                 bucket.contacts.push_back(contact);
                 bucket.last_activity = chrono::Utc::now().timestamp();
                 self.release_subnet(evicted.subnet_key());

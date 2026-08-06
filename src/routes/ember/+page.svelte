@@ -327,9 +327,25 @@
       })
       .catch((e) => { loadError = m.ember_load_failed({ error: translateError(e) }); });
     refreshDiag();
-    pollTimer = setInterval(refreshDiag, 2500);
+    // Skip the poll while the window is hidden, like every other poll in the
+    // app, and catch up on the way back so a restored window is not showing
+    // diagnostics from whenever it was minimized.
+    const visible = () =>
+      typeof document === 'undefined' || document.visibilityState === 'visible';
+    pollTimer = setInterval(() => {
+      if (visible()) refreshDiag();
+    }, 2500);
+    const onVisibility = () => {
+      if (visible()) refreshDiag();
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibility);
+    }
     return () => {
       unmounted = true;
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibility);
+      }
       if (pollTimer) clearInterval(pollTimer);
       if (copyTimer) clearTimeout(copyTimer);
       if (joinTimer) clearTimeout(joinTimer);

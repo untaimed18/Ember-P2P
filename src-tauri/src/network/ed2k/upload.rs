@@ -7520,6 +7520,56 @@ impl UploadHandler {
                         offsets = merged;
                     }
 
+                    // Cap what one request can commit us to serving, *before*
+                    // the per-block split below. Every rotation control —
+                    // SESSIONMAXTRANS, SESSIONMAXTIME, the score-based
+                    // preemption check and the outer idle gate — lives after
+                    // the block loop, so a single range covering the whole
+                    // file (nothing rejected it: it is within EOF and
+                    // correctly ordered) held one of the user's upload slots
+                    // for the entire transfer while everyone else waited.
+                    //
+                    // Trimming after the split was too late to stop the other
+                    // half of the problem: the split expands a range into one
+                    // tuple per EMBLOCKSIZE first, so a 22-byte request naming
+                    // one whole-file range on a 50 GB share allocated roughly
+                    // 290k tuples — several megabytes — before anything looked
+                    // at the budget, and the peer could repeat that at line
+                    // rate. Capping the merged ranges bounds the split's output
+                    // to `MAX_REQUESTPARTS_BYTES / EMBLOCKSIZE` pieces.
+                    //
+                    // Ranges are truncated rather than dropped so an oversized
+                    // request still gets served up to the cap; the remainder is
+                    // re-requested on the peer's next turn. eMule-family peers
+                    // ask for three EMBLOCKSIZE blocks at a time, so nothing
+                    // legitimate reaches this.
+                    {
+                        let before = offsets.len();
+                        let mut budget = MAX_REQUESTPARTS_BYTES;
+                        let mut capped: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
+                        for (s, e) in offsets {
+                            if budget == 0 {
+                                break;
+                            }
+                            let take = e.saturating_sub(s).min(budget);
+                            if take == 0 {
+                                continue;
+                            }
+                            capped.push((s, s + take));
+                            budget -= take;
+                        }
+                        let trimmed = capped.len() != before
+                            || capped.iter().map(|&(s, e)| e - s).sum::<u64>()
+                                == MAX_REQUESTPARTS_BYTES;
+                        if trimmed {
+                            debug!(
+                                "Trimmed OP_REQUESTPARTS from {peer_addr}: {before} range(s) \
+                                 exceeded the {MAX_REQUESTPARTS_BYTES}-byte per-request cap"
+                            );
+                        }
+                        offsets = capped;
+                    }
+
                     // Belt-and-suspenders: split any range larger than
                     // EMBLOCKSIZE back into per-block pieces before we
                     // serve it. Under normal peer behaviour the merge
@@ -7544,38 +7594,6 @@ impl UploadHandler {
                             }
                         }
                         offsets = split;
-                    }
-
-                    // Cap what one request can commit us to serving. Every
-                    // rotation control — SESSIONMAXTRANS, SESSIONMAXTIME, the
-                    // score-based preemption check and the outer idle gate —
-                    // lives *after* the block loop below, so a single range
-                    // covering the whole file (nothing rejected it: it is
-                    // within EOF and correctly ordered) held one of the user's
-                    // upload slots for the entire transfer while everyone else
-                    // waited, and stopped responding to preemption for that
-                    // whole period. eMule-family peers ask for three
-                    // EMBLOCKSIZE blocks at a time, so a session-quantum cap
-                    // is far above anything legitimate; the remainder is simply
-                    // dropped and the peer re-requests it on its next turn.
-                    {
-                        let mut budget = MAX_REQUESTPARTS_BYTES;
-                        let before = offsets.len();
-                        offsets.retain(|&(s, e)| {
-                            let len = e.saturating_sub(s);
-                            if len > budget {
-                                false
-                            } else {
-                                budget -= len;
-                                true
-                            }
-                        });
-                        if offsets.len() != before {
-                            debug!(
-                                "Trimmed OP_REQUESTPARTS from {peer_addr}: {before} block(s) exceeded \
-                                 the {MAX_REQUESTPARTS_BYTES}-byte per-request cap"
-                            );
-                        }
                     }
 
                     // Diagnostic: summarise the batch shape for this REQUESTPARTS

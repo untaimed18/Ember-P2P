@@ -37,6 +37,10 @@ pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
 /// caps a real batch at roughly twenty minimum-size records, so do not size
 /// anything against 64 expecting it to be reachable.
 pub const MAX_STORE_BATCH_RECORDS: usize = 64;
+// The ack is a `u64` bitmap indexed by record position, so `1u64 << i` for the
+// last record has to be representable. Raising the constant without widening
+// the bitmap would turn an attacker-controlled count into a shift overflow.
+const _: () = assert!(MAX_STORE_BATCH_RECORDS <= u64::BITS as usize);
 
 /// Maximum keys in a FIND_VALUE request.
 pub const MAX_FIND_VALUE_KEYS: usize = 8;
@@ -336,24 +340,29 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&data[sig_offset..sig_offset + 64]);
 
-    // Verify signature if we have the public key
-    if let Some(ref pk_bytes) = sender_pub_key {
-        if let Some(pk) = crypto::verifying_key_from_bytes(pk_bytes) {
-            let signed_data = &data[..sig_offset];
-            if !crypto::verify(&pk, signed_data, &signature) {
-                anyhow::bail!("DHT message signature verification failed");
-            }
-            // Bind sender_id to the public key. The signature only proves the
-            // sender holds *some* key; without this check a peer could sign with
-            // their own key while claiming a victim's sender_id (routing-table
-            // poisoning / impersonation in FOUND_NODE, STORE_RECORD, etc.).
-            // `node_id == BLAKE3(pubkey)[..16]` everywhere else in Ember.
-            if !crypto::verify_ember_hash_binding(pk_bytes, &sender_id.0) {
-                anyhow::bail!("DHT message sender_id does not match its public key");
-            }
-        } else {
-            anyhow::bail!("Invalid Ed25519 public key in DHT message");
-        }
+    // Verify the signature and the identity binding. Both live behind the
+    // public key being present, so a `has_pub_key = false` call would return a
+    // fully-formed but entirely unauthenticated `DhtMessage`. Every encoder in
+    // the tree sets `include_pub_key: true` and the only production caller
+    // decodes with `true`, so refusing the other case costs nothing and stops
+    // a future caller from silently opting out of authentication.
+    let Some(ref pk_bytes) = sender_pub_key else {
+        anyhow::bail!("DHT message carries no public key, so it cannot be authenticated");
+    };
+    let Some(pk) = crypto::verifying_key_from_bytes(pk_bytes) else {
+        anyhow::bail!("Invalid Ed25519 public key in DHT message");
+    };
+    let signed_data = &data[..sig_offset];
+    if !crypto::verify(&pk, signed_data, &signature) {
+        anyhow::bail!("DHT message signature verification failed");
+    }
+    // Bind sender_id to the public key. The signature only proves the
+    // sender holds *some* key; without this check a peer could sign with
+    // their own key while claiming a victim's sender_id (routing-table
+    // poisoning / impersonation in FOUND_NODE, STORE_RECORD, etc.).
+    // `node_id == BLAKE3(pubkey)[..16]` everywhere else in Ember.
+    if !crypto::verify_ember_hash_binding(pk_bytes, &sender_id.0) {
+        anyhow::bail!("DHT message sender_id does not match its public key");
     }
 
     let payload = decode_payload(msg_type, payload_data)?;
@@ -1142,17 +1151,32 @@ mod tests {
         assert!(matches!(decoded.payload, DhtPayload::Ping));
 
         let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
-        let encoded = encode_message(&pong, &sk, false);
-        let decoded = decode_message(&encoded, false).unwrap();
+        let encoded = encode_message(&pong, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
         match decoded.payload {
             DhtPayload::Pong { observed } => {
-                assert_eq!(
-                    observed,
-                    Some("203.0.113.50:4672".parse().unwrap())
-                );
+                assert_eq!(observed, Some("203.0.113.50:4672".parse().unwrap()));
             }
             _ => panic!("expected Pong"),
         }
+    }
+
+    /// Signature verification and the `sender_id == BLAKE3(pubkey)[..16]`
+    /// binding both live behind the public key being present, so decoding
+    /// without one yielded a fully-formed but entirely unauthenticated
+    /// message. Nothing in the tree encodes that way and the only production
+    /// caller passes `true`, so the shape is refused rather than left as a
+    /// trap for a future caller.
+    #[test]
+    fn a_frame_without_a_public_key_cannot_be_authenticated_and_is_refused() {
+        let (sk, id) = test_keypair();
+        let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
+        let encoded = encode_message(&pong, &sk, false);
+        let err = decode_message(&encoded, false).expect_err("must not decode unauthenticated");
+        assert!(
+            err.to_string().contains("cannot be authenticated"),
+            "unexpected reason: {err}"
+        );
     }
 
     /// A version we cannot parse has to be refused as a version mismatch. The
@@ -1282,8 +1306,10 @@ mod tests {
     fn decode_message_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xE19E_19E1);
-        // Longer soak than the original 200×512 smoke: covers truncated
-        // headers, oversized contact lists, and random trailing junk.
+        // Header-level soak: truncated frames, bad versions, random trailing
+        // junk. Deliberately does *not* reach `decode_payload` — random bytes
+        // cannot pass an Ed25519 check — which is what
+        // `decode_payload_fuzz_never_panics` below exists to cover.
         for _ in 0..2_000 {
             let len = rng.gen_range(0..=2_048);
             let mut buf = vec![0u8; len];
@@ -1291,6 +1317,75 @@ mod tests {
             let _ = decode_message(&buf, true);
             let _ = decode_message(&buf, false);
         }
+    }
+
+    /// Fuzz the payload decoders, which is where every length prefix, slice
+    /// and capacity hint actually lives.
+    ///
+    /// Random bytes never get there: a buffer has to carry the right version,
+    /// an exactly-consistent payload length *and* a valid signature over
+    /// itself, so the header-level soak above rejects essentially every
+    /// iteration at the signature and the decoders were never executed once.
+    /// Signing a well-formed frame around a randomised body puts the fuzz
+    /// where the parsing is.
+    #[test]
+    fn decode_payload_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let (sk, id) = test_keypair();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0EC0_DEC0);
+        let types = [
+            MSG_PING,
+            MSG_PONG,
+            MSG_FIND_NODE,
+            MSG_FOUND_NODE,
+            MSG_STORE_RECORD,
+            MSG_STORE_ACK,
+            MSG_FIND_VALUE,
+            MSG_FOUND_VALUE,
+            MSG_ANNOUNCE_PEER,
+            MSG_PEER_LIST,
+            MSG_PROXY_STORE,
+            MSG_PROXY_STORE_ACK,
+            MSG_STORE_BATCH,
+            MSG_STORE_BATCH_ACK,
+            0x00,
+            0xFF,
+        ];
+
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            // One deterministic well-formed frame so a future change that
+            // stops the fuzz reaching the decoders fails loudly instead of
+            // passing vacuously again.
+            let (msg_type, payload) = if i == 0 {
+                (MSG_PING, Vec::new())
+            } else {
+                let msg_type = types[rng.gen_range(0..types.len())];
+                let len = rng.gen_range(0..=600usize);
+                let mut payload = vec![0u8; len];
+                rng.fill(&mut payload[..]);
+                (msg_type, payload)
+            };
+
+            let mut buf = Vec::with_capacity(payload.len() + 120);
+            buf.push(EMBER_DHT_VERSION);
+            buf.push(msg_type);
+            buf.extend_from_slice(&rng.gen::<u32>().to_le_bytes());
+            buf.extend_from_slice(&id.0);
+            buf.extend_from_slice(&sk.verifying_key().to_bytes());
+            buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&payload);
+            let sig = crypto::sign(&sk, &buf);
+            buf.extend_from_slice(&sig);
+
+            if decode_message(&buf, true).is_ok() {
+                decoded_ok += 1;
+            }
+        }
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a frame that reached the payload decoders"
+        );
     }
 
     #[test]

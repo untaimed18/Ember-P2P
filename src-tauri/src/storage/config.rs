@@ -81,7 +81,7 @@ fn paths_likely_equal(a: &Path, b: &Path) -> bool {
 /// across restarts.
 ///
 /// Skipped entirely on a fresh install, where the default already applies.
-/// Returns whether the config needs saving.
+///
 /// Returns `(config_needs_saving, told_the_user_we_turned_it_on)`. The second
 /// flag drives a startup notice: joining the overlay publishes source records
 /// carrying this node's address and keyword records for its shared files, and we

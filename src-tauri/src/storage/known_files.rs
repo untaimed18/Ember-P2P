@@ -566,9 +566,16 @@ impl KnownFileList {
     /// Decide whether the on-disk known-file record matches what we just
     /// discovered for this file, or whether we need to refresh the
     /// record. Returns `true` if any of `file_path`, `modified_at`,
-    /// `file_size`, `file_name`, `aich_hash`, or `ember_file_hash` (the
-    /// last two only when the discovery supplies one) has drifted from
-    /// the stored value.
+    /// `file_size`, `aich_hash`, or `ember_file_hash` (the last two only
+    /// when the discovery supplies one) has drifted from the stored value.
+    ///
+    /// The discovered name is deliberately *not* compared, which the parameter
+    /// name records. On a case-insensitive filesystem a rename that changes
+    /// only capitalisation leaves the path key, size and mtime identical, so
+    /// `known.met` keeps the old spelling until something else forces a
+    /// refresh. Adding the comparison would mean re-persisting every record
+    /// whose stored name merely differs in case from the one the scan
+    /// produced, which is not obviously the better trade.
     ///
     /// Used by the `SharedFilesChanged` handler to break the
     /// "permanent rehash loop" that fires whenever any external

@@ -12,13 +12,40 @@ const SERVER_POLL_READABLE_TIMEOUT_MS: u64 = 5;
 /// Deadline for the first byte of a polled packet. Safe to abandon: nothing
 /// has been consumed, so the stream is still on a packet boundary.
 const SERVER_POLL_PACKET_TIMEOUT_SECS: u64 = 1;
-/// Deadline for the remainder of a packet once its first byte is consumed.
+/// Longest silence tolerated at any single point inside a packet body.
 ///
-/// Long, because there is no safe way to abandon this read — expiry is
-/// treated as a corrupt stream and drops the session. It therefore has to be
-/// generous enough that a large `OP_SEARCHRESULT` or `OP_SERVERLIST` arriving
-/// over a slow link never trips it; only a genuinely dead connection should.
-const SERVER_PACKET_BODY_TIMEOUT_SECS: u64 = 60;
+/// This, rather than the total below, is what detects a dead connection. A
+/// large `OP_SEARCHRESULT` or `OP_SERVERLIST` over a slow link keeps delivering
+/// bytes, so it never trips an idle deadline however long it takes overall,
+/// while a server that stops mid-packet is caught in seconds instead of
+/// holding the caller for the whole total budget.
+const SERVER_PACKET_IDLE_TIMEOUT_SECS: u64 = 10;
+
+/// Hard cap on one packet body once its first byte is consumed.
+///
+/// There is no safe way to abandon this read — expiry is treated as a corrupt
+/// stream and drops the session — and it runs *inline* in the network task's
+/// `tokio::select!` loop, so whatever it is, it is also how long KAD, uploads,
+/// timers and UI events can stop. The idle deadline above covers honest
+/// slowness; this only bounds a server that trickles just fast enough to keep
+/// resetting it. Matches the write side's `SERVER_WRITE_TIMEOUT_SECS` because
+/// it is the same tradeoff on the same thread.
+///
+/// The real fix is to stop awaiting socket I/O on the event loop at all —
+/// a reader task feeding `poll_messages` over a channel — at which point both
+/// budgets can be as generous as the protocol wants.
+const SERVER_PACKET_BODY_TIMEOUT_SECS: u64 = 30;
+
+/// Longest one `poll_messages` call spends draining before it returns what it
+/// has and lets the next tick continue.
+///
+/// The drain loop reads packets until the socket goes idle, so bounding a
+/// single packet bounds nothing on its own: a server that stalls just short of
+/// the per-packet deadline, completes, and repeats holds the event loop for as
+/// many packets as it cares to send. Checked between whole packets, where the
+/// stream is aligned and stopping is free — exactly the property the existing
+/// `Idle` return already depends on.
+const SERVER_POLL_DRAIN_BUDGET_SECS: u64 = 15;
 /// Bound on any single write to the server socket. Every write here runs
 /// inline in the network task's `tokio::select!` loop (not spawned), so an
 /// unbounded `write_all`/`flush` against a server that stops draining its
@@ -909,6 +936,7 @@ impl Ed2kServerConnection {
 
     pub async fn poll_messages(&mut self) -> io::Result<Vec<ServerEvent>> {
         let mut events = Vec::new();
+        let started = std::time::Instant::now();
         loop {
             match self.poll_read_packet().await {
                 PollReadPacketResult::Packet((opcode, payload)) => {
@@ -917,6 +945,20 @@ impl Ed2kServerConnection {
                         payload.len()
                     );
                     events.extend(parse_server_event(opcode, &payload));
+                    // Between packets the stream is on a boundary, so handing
+                    // the event loop back costs nothing but a tick of latency.
+                    // Draining unconditionally let one busy (or deliberately
+                    // chatty) server hold the loop for as long as it kept
+                    // sending.
+                    if started.elapsed()
+                        >= std::time::Duration::from_secs(SERVER_POLL_DRAIN_BUDGET_SECS)
+                    {
+                        debug!(
+                            "Server poll yielding after {} event(s); more may be waiting",
+                            events.len()
+                        );
+                        break;
+                    }
                 }
                 PollReadPacketResult::Idle => break,
                 PollReadPacketResult::Disconnected(err) => return Err(err),
@@ -2261,6 +2303,27 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Resu
 /// under a long, fatal budget. `read_exact` is not cancel-safe, so a deadline
 /// that fires anywhere after the first byte leaves the reader parked
 /// mid-payload with no way to resynchronize.
+/// Await `read`, failing with `TimedOut` if it delivers nothing for
+/// [`SERVER_PACKET_IDLE_TIMEOUT_SECS`].
+///
+/// Applied per step rather than once around the whole body so that progress
+/// resets the clock: a slow but live transfer is never cut off, while a server
+/// that goes quiet mid-packet is detected without waiting out the total budget.
+async fn read_step<T>(read: impl std::future::Future<Output = io::Result<T>>) -> io::Result<T> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SERVER_PACKET_IDLE_TIMEOUT_SECS),
+        read,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server stopped sending mid-packet",
+        )),
+    }
+}
+
 async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     protocol: u8,
@@ -2271,14 +2334,14 @@ async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
             format!("unexpected server protocol byte: 0x{protocol:02X}"),
         ));
     }
-    let length = reader.read_u32_le().await? as usize;
+    let length = read_step(reader.read_u32_le()).await? as usize;
     if length == 0 || length > 5 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid server packet length",
         ));
     }
-    let opcode = reader.read_u8().await?;
+    let opcode = read_step(reader.read_u8()).await?;
     let payload_len = length - 1;
     let mut payload = Vec::new();
     if payload_len > 0 {
@@ -2291,7 +2354,7 @@ async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
         let mut chunk = [0u8; 32 * 1024];
         while remaining > 0 {
             let want = remaining.min(chunk.len());
-            reader.read_exact(&mut chunk[..want]).await?;
+            read_step(reader.read_exact(&mut chunk[..want])).await?;
             payload.extend_from_slice(&chunk[..want]);
             remaining -= want;
         }

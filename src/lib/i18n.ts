@@ -90,11 +90,16 @@ export function systemLocale(): Locale {
   const prefix = compiled.find((l) => l.toLowerCase() === lang);
   if (prefix) return prefix;
   if (lang === 'zh') {
-    const hant =
-      nav.includes('hant') ||
-      nav.includes('tw') ||
-      nav.includes('hk') ||
-      nav.includes('mo');
+    // Match whole subtags, not substrings. An explicit script wins over the
+    // region, so `zh-Hans-HK` is Simplified even though its region normally
+    // implies Traditional — a substring test read the `hk` and got it
+    // backwards.
+    const parts = nav.split(/[-_]/);
+    const hant = parts.includes('hant')
+      ? true
+      : parts.includes('hans')
+        ? false
+        : parts.some((part) => part === 'tw' || part === 'hk' || part === 'mo');
     const want = hant ? 'zh-tw' : 'zh-cn';
     const preferred = compiled.find((l) => l.toLowerCase() === want);
     if (preferred) return preferred;

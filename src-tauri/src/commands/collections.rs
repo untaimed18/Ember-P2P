@@ -308,20 +308,19 @@ async fn create_collection_internal(
             // write through this helper for the same reason.
             Some(allowed_dirs) => {
                 use std::io::Write;
-                // `create_new` refuses an existing file, so make room first —
-                // through the identity-checked removal, not `fs::remove_file`.
-                if write_path.exists() {
-                    crate::security::filesystem::remove_approved_file(&write_path, &allowed_dirs)
-                        .map_err(|e| {
-                            coded_ctx(
-                                "collections_save_failed",
-                                "Could not replace the existing collection file",
-                                e,
-                            )
-                        })?;
-                }
+                // Write a sibling temp through the pinned parent handle and
+                // rename it over the target, so the export keeps the
+                // crash-safety the unscoped branch has.
+                //
+                // Deleting the old file first and then creating the new one —
+                // which is what `create_new` seemed to require — meant any
+                // failure after the delete (disk full, permissions changed, a
+                // crash) left the user with no collection file at all. The
+                // rename is the only step that resolves by pathname, and it is
+                // the same step `atomic_write` relies on.
+                let tmp_path = crate::security::unique_tmp_path(&write_path);
                 let (_, mut file) = crate::security::filesystem::create_new_verified_output(
-                    &write_path,
+                    &tmp_path,
                     &allowed_dirs,
                 )
                 .map_err(|e| {
@@ -331,9 +330,19 @@ async fn create_collection_internal(
                         e,
                     )
                 })?;
-                file.write_all(&bytes)
-                    .and_then(|()| file.sync_all())
-                    .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
+                let mut written = file.write_all(&bytes).and_then(|()| file.sync_all());
+                // Close before renaming: Windows will not replace a file that
+                // still has an open handle on the source.
+                drop(file);
+                if written.is_ok() {
+                    written = std::fs::rename(&tmp_path, &write_path);
+                }
+                if let Err(e) = written {
+                    // Never leave the scratch file behind next to the user's
+                    // collections; the original is still intact either way.
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(coded_ctx("collections_save_failed", "Failed to save", e));
+                }
             }
             // Unscoped export (the user picked the destination themselves):
             // no approved root applies, so keep the crash-safe atomic write.

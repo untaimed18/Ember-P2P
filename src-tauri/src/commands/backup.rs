@@ -174,22 +174,37 @@ const BACKUP_FILES: &[BackupFile] = &[
     plain("search_spam.json"),
     // Per-file share decisions.
     plain("share_intent.json"),
-    // `approved_roots.json` is deliberately absent. Each record binds a folder
-    // to a volume serial and file id, so it is meaningful only on the machine
-    // that wrote it. Restoring one carried the source machine's records over,
-    // which made `initialize_approved_roots` skip the first-run migration
-    // (state file present) and then revoke the download folder on identity
-    // mismatch — or leave it with no record at all when startup had just
-    // created it fresh. Either way every download failed with "target is
-    // outside the approved roots" and, unlike a shared folder, there was no
-    // in-app way to re-approve it. Leaving the file out means a restored
-    // profile re-runs the migration and approves the configured roots on
-    // *this* machine. An older archive that still contains the entry is
-    // ignored: `read_archive` only accepts names in this list.
+    // `approved_roots.json` is deliberately absent; see [`LEGACY_IGNORED_FILES`].
 ];
+
+/// Names that older archives legitimately carry and this build discards.
+///
+/// Distinct from simply dropping a name out of [`BACKUP_FILES`]: `read_archive`
+/// refuses an archive whose manifest names anything outside the allow-list, so
+/// a bare removal made every backup written by an earlier version unrestorable
+/// with "The backup contains an unexpected file" — the one moment a user cannot
+/// work around it. Entries listed here are skipped instead: not read, not
+/// checksummed, not staged.
+///
+/// `approved_roots.json` earned its place because each record binds a folder to
+/// a volume serial and file id, so it is meaningful only on the machine that
+/// wrote it. Restoring one carried the source machine's records over, which
+/// made `initialize_approved_roots` skip the first-run migration (state file
+/// present) and then revoke the download folder on identity mismatch — or leave
+/// it with no record at all when startup had just created it fresh. Either way
+/// every download failed with "target is outside the approved roots" and,
+/// unlike a shared folder, there was no in-app way to re-approve it. Skipping it
+/// means a restored profile re-runs the migration and approves the configured
+/// roots on *this* machine.
+const LEGACY_IGNORED_FILES: &[&str] = &["approved_roots.json"];
 
 fn backup_file(name: &str) -> Option<&'static BackupFile> {
     BACKUP_FILES.iter().find(|f| f.name == name)
+}
+
+/// Whether `name` is a file an older version backed up that this one drops.
+fn is_legacy_ignored(name: &str) -> bool {
+    LEGACY_IGNORED_FILES.contains(&name)
 }
 
 /// Outer, unencrypted framing. Everything here is needed *before* a key
@@ -893,6 +908,13 @@ fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8
     let mut total = 0u64;
     let mut out = Vec::new();
     for entry in &manifest.files {
+        // A file this version no longer restores. Skipped before the
+        // allow-list test and never read, so an archive from a version that
+        // still backed it up restores cleanly rather than being rejected
+        // wholesale. Nothing downstream sees it, so it cannot name a path.
+        if is_legacy_ignored(&entry.name) {
+            continue;
+        }
         // The allow-list is what keeps a crafted archive from naming
         // `..\..\something` or any path outside the data directory.
         if backup_file(&entry.name).is_none() {
@@ -1050,12 +1072,16 @@ pub async fn preview_backup(
             let zip_path = scratch.join("payload.zip");
             decrypt_stream(&source, &zip_path, &passphrase)?;
             let manifest = read_manifest(&mut open_archive(&zip_path)?)?;
-            let total_bytes = manifest.files.iter().map(|f| f.size).sum();
+            // Report what a restore would actually apply. Listing an entry this
+            // version discards would promise the user something the restore
+            // then silently skips.
+            let restorable = || manifest.files.iter().filter(|f| !is_legacy_ignored(&f.name));
+            let total_bytes = restorable().map(|f| f.size).sum();
             Ok(BackupPreview {
                 app_version: manifest.app_version.clone(),
                 created_at: manifest.created_at,
                 schema_version: manifest.schema_version,
-                files: manifest.files.iter().map(|f| f.name.clone()).collect(),
+                files: restorable().map(|f| f.name.clone()).collect(),
                 total_bytes,
                 includes_identity: manifest.files.iter().any(|f| f.name == "identity.json"),
                 schema_too_new: manifest.schema_version
@@ -1821,6 +1847,31 @@ mod tests {
         // rejection would pass a looser check while leaving the allow-list
         // itself unexercised.
         assert!(err.contains("unexpected file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping a name out of `BACKUP_FILES` is not the same as never having
+    /// backed it up. Every archive an earlier version wrote still names
+    /// `approved_roots.json`, and the allow-list refuses the *whole* archive on
+    /// an unknown entry — so a bare removal made those backups unrestorable at
+    /// exactly the moment their owner needed them.
+    #[test]
+    fn an_archive_from_a_version_that_backed_up_approved_roots_still_restores() {
+        let dir = scratch("archive-legacy");
+        let entries: &[(&str, &[u8])] = &[
+            ("config.json", b"{}"),
+            ("approved_roots.json", b"[{\"path\":\"D:/Shared\"}]"),
+            ("nodes.dat", b"contacts"),
+        ];
+        let zip_path = write_archive(&dir, entries, &manifest_for(entries));
+
+        let (_, read) = read_archive(&zip_path).expect("a 1.3.5 archive must still restore");
+        let names: Vec<&str> = read.iter().map(|(e, _)| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["config.json", "nodes.dat"],
+            "the dropped file is skipped, not restored, and does not fail the archive"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

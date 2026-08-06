@@ -337,10 +337,28 @@ impl ServerUdpSocket {
         self.pending_challenges.insert(plain_addr, challenge);
 
         if self.last_ping_times.len() > MAX_TRACKED_SERVERS {
-            let cutoff = now - STAT_REASK_INTERVAL_SECS;
-            self.last_ping_times.retain(|_, &mut ts| ts > cutoff);
-            self.pending_challenges
-                .retain(|a, _| self.last_ping_times.contains_key(a));
+            // Evict oldest-first rather than by age. The ping gate above only
+            // sends when the previous ping is older than `STAT_REASK_INTERVAL`
+            // and stamps `now` on success, so every surviving entry is younger
+            // than that cutoff by construction — an age-based `retain` could
+            // never remove anything and `MAX_TRACKED_SERVERS` bounded nothing
+            // for a server list over 500 entries.
+            let excess = self.last_ping_times.len() - MAX_TRACKED_SERVERS;
+            let mut by_age: Vec<(SocketAddr, i64)> = self
+                .last_ping_times
+                .iter()
+                .map(|(addr, ts)| (*addr, *ts))
+                .collect();
+            by_age.sort_unstable_by_key(|(_, ts)| *ts);
+            for (addr, _) in by_age.into_iter().take(excess) {
+                // Never drop the entry we just made; it is the newest, so this
+                // only matters if the cap is somehow at zero.
+                if addr == plain_addr {
+                    continue;
+                }
+                self.last_ping_times.remove(&addr);
+                self.pending_challenges.remove(&addr);
+            }
         }
         debug!(
             "Sent status ping to {}:{} (challenge=0x{challenge:08X})",

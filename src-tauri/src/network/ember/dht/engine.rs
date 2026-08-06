@@ -132,6 +132,9 @@ pub struct EmberDht {
     /// Recently-seen STORE signatures (`blake3(publisher||sig)` → time)
     /// for slice-14 replay collapse.
     store_sig_seen: HashMap<[u8; 32], Instant>,
+    /// When `store_sig_seen` was last swept, so the scan runs on a schedule
+    /// rather than once per record of every oversized batch.
+    store_sig_swept_at: Option<Instant>,
 }
 
 impl EmberDht {
@@ -155,6 +158,7 @@ impl EmberDht {
             local_id,
             next_request_id: 1,
             store_sig_seen: HashMap::new(),
+            store_sig_swept_at: None,
         }
     }
 
@@ -286,9 +290,17 @@ impl EmberDht {
         hasher.update(&record_signature);
         let sig_key = *hasher.finalize().as_bytes();
         let now_inst = Instant::now();
-        if self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
+        // Sweep at most once per TTL. `accept_record` runs once per record, so
+        // an unconditional size check meant a single 64-record `STORE_BATCH`
+        // could walk a 25,000-entry map 64 times — and nothing expires inside
+        // one batch, so 63 of those scans could not free anything.
+        let sweep_due = self
+            .store_sig_swept_at
+            .is_none_or(|at| now_inst.duration_since(at) >= STORE_SIG_REPLAY_TTL);
+        if sweep_due && self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
             self.store_sig_seen
                 .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
+            self.store_sig_swept_at = Some(now_inst);
         }
         let is_replay = self
             .store_sig_seen
@@ -952,9 +964,11 @@ impl EmberDht {
                         .first()
                         .map(|k| EmberNodeId(*k))
                         .unwrap_or(self.local_id);
-                    let closest = self
-                        .routing
-                        .find_closest(&target, MAX_CONTACTS_PER_RESPONSE);
+                    // Exclude the asker, like the FIND_NODE and ANNOUNCE_PEER
+                    // paths. `handle_message` adds the sender to the table
+                    // before we get here, so a bare `find_closest` could spend
+                    // one of only twenty slots telling a peer about itself.
+                    let closest = self.closest_excluding(&target, msg.sender_id);
                     let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                     out.responses
                         .push(messages::encode_message(&found, &self.signing_key, true));

@@ -34316,14 +34316,20 @@ async fn handle_ember_dht_message(
             // Removing first meant a wrong-sender reply — request ids come
             // from one guessable counter — permanently unhooked the query:
             // `process_response` re-inserted its own pending entry and
-            // returned false, but the deadline sweep could no longer expire
+            // refused it, but the deadline sweep could no longer expire
             // anything, the shortlist slot stayed `InFlight` against ALPHA,
             // and the real peer's later answer matched nothing. Any peer
             // with a session could stall lookups this way.
+            //
+            // `accepted`, not `new_closer`: a converged hop returns nothing
+            // closer and is still a perfectly good answer. Gating on progress
+            // held every such query open until its deadline expired.
             let consumed = if let Some(from_id) = inbound.sender_id {
                 match state.ember_search.get_mut(search_id) {
                     Some(search) => {
-                        search.process_response(per_search_req_id, &from_id, contacts, Vec::new())
+                        search
+                            .process_response(per_search_req_id, &from_id, contacts, Vec::new())
+                            .accepted
                     }
                     // Search is gone; nothing will ever match this id again.
                     None => true,
@@ -34406,10 +34412,16 @@ async fn handle_ember_dht_message(
             // Same rule as FOUND_NODE above: keep the correlation entry until
             // the answer is accepted, so a wrong-sender reply cannot orphan
             // the query past the reach of the deadline sweep.
+            // `accepted`, not `new_closer`: this path carries no contacts at
+            // all, so progress is false for every single value hit. Reading it
+            // as acceptance meant a search that had just been handed exactly
+            // what it asked for still sat out its whole query timeout.
             let consumed = if let Some(from_id) = inbound.sender_id {
                 match state.ember_search.get_mut(search_id) {
                     Some(search) => {
-                        search.process_response(per_search_req_id, &from_id, Vec::new(), records)
+                        search
+                            .process_response(per_search_req_id, &from_id, Vec::new(), records)
+                            .accepted
                     }
                     None => true,
                 }
@@ -41511,9 +41523,15 @@ async fn handle_command_inner(
             // source and keyword publish timestamps, so already-published
             // work is not needlessly repeated.
             state.publish_manager.retain_files(&desired);
+            // The rendezvous advert is deliberately not a library file, so it
+            // is never in `desired`. Dropping its counter mid-publish made the
+            // completion handler read zero acks, conclude the advert had not
+            // been stored, and re-advertise on the next tick — every time a
+            // library change happened to overlap a rendezvous publish.
+            let rendezvous_key = kad::publish::ember_rendezvous_key();
             state
                 .source_publish_acks
-                .retain(|hash, _| desired.contains(hash));
+                .retain(|hash, _| desired.contains(hash) || *hash == rendezvous_key);
             // Same eviction for the Ember badge set. Ember publishes only
             // complete, publicly listable files (no partials), so unsharing
             // one must darken its badge exactly as it does for KAD.

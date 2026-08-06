@@ -70,6 +70,16 @@ export async function takePendingCloseRequest(): Promise<boolean> {
   return invoke('take_pending_close_request');
 }
 
+/**
+ * Consume the one-shot notice that startup turned the Ember overlay on for a
+ * profile that had it off. A latch rather than an event because the migration
+ * behind it is already persisted and never repeats, so a notice dropped
+ * because the webview was still starting would never be shown at all.
+ */
+export async function takePendingEmberDefaultOnNotice(): Promise<boolean> {
+  return invoke('take_pending_ember_default_on_notice');
+}
+
 /** Open the official Ember website in the default browser. */
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');

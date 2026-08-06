@@ -503,9 +503,16 @@ pub(crate) async fn refresh_file_cache(
     for file in &mut snap {
         let key = crate::search::index::normalize_path_key(&file.path);
         if let Some((shared_kad, shared_ed2k, shared_ember)) = previous_flags.get(&key) {
-            file.shared_kad = file.shared && !file.hash.is_empty() && *shared_kad;
-            file.shared_ed2k = file.shared && !file.hash.is_empty() && *shared_ed2k;
-            file.shared_ember = file.shared && !file.hash.is_empty() && *shared_ember;
+            // `is_public_listable`, not `shared` alone — the same predicate
+            // `apply_publish_badges` uses on the network side. Gating on
+            // `shared` left a stale badge lit after a file was restricted to
+            // friends, right up until the next network-side refresh, which is
+            // the one case where the badge is saying something untrue about
+            // who can see the file.
+            let listable = file.is_public_listable() && !file.hash.is_empty();
+            file.shared_kad = listable && *shared_kad;
+            file.shared_ed2k = listable && *shared_ed2k;
+            file.shared_ember = listable && *shared_ember;
         }
     }
     *cache.write().await = snap;
@@ -864,17 +871,20 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
             // ember_file_hash must be rehashed once so DHT publish and
             // download verify see a real BLAKE3 (zeros skip verify).
             if file.ember_file_hash.is_empty() {
-                // Restore the path-unique pending id for the duration of the
+                // Give this copy a path-unique id for the duration of the
                 // re-hash. `file.id` was just set to the content hash above,
                 // which is identical for every duplicate of the same content,
                 // and both `finalize_pending_hash` and `remove_file_by_id`
                 // resolve by first match — so a hash failure on one copy (a
                 // file locked by an antivirus scan, the ordinary Windows case
                 // during this pass) removed a different, perfectly healthy
-                // copy from the Library instead. `discover_file` uses this
-                // same `pending:` scheme for exactly that reason. The hash
-                // itself stays on `file.hash`, so nothing else regresses.
-                file.id = format!("pending:{}", file.path);
+                // copy from the Library instead. The hash itself stays on
+                // `file.hash`, so nothing else regresses.
+                //
+                // `rehash:`, not `pending:`: this row is already complete and
+                // servable, so cancellation must leave it alone. See
+                // [`crate::search::index::REHASH_ID_PREFIX`].
+                file.id = crate::search::index::rehash_id(&file.path);
                 needs_hashing.push(file.clone());
             }
         } else {
@@ -1557,6 +1567,11 @@ pub async fn add_shared_folder(
                             index
                                 .finalize_pending_hash(&file_temp_id, updated_file.clone())
                                 .is_some()
+                        } else if still_shared {
+                            // Cancelled. A re-hash row is already servable and
+                            // keeps its place; only an unhashed row is dropped.
+                            index.abandon_hash_placeholder(&file_temp_id);
+                            false
                         } else {
                             index.remove_file_by_id(&file_temp_id);
                             false
@@ -1586,19 +1601,19 @@ pub async fn add_shared_folder(
                         info!("Hashing cancelled mid-file for {path}");
                         was_cancelled = true;
                         let mut index = local_index.write().await;
-                        index.remove_file_by_id(&file_temp_id);
+                        index.abandon_hash_placeholder(&file_temp_id);
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    index.abandon_hash_placeholder(&file_temp_id);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    index.abandon_hash_placeholder(&file_temp_id);
                 }
                 Err(_) => {
                     // One slow file must not end the scan. Cancelling the whole
@@ -2735,6 +2750,11 @@ pub async fn reload_shared_files(
                             index
                                 .finalize_pending_hash(&file_temp_id, updated_file.clone())
                                 .is_some()
+                        } else if still_shared {
+                            // Cancelled. A re-hash row is already servable and
+                            // keeps its place; only an unhashed row is dropped.
+                            index.abandon_hash_placeholder(&file_temp_id);
+                            false
                         } else {
                             index.remove_file_by_id(&file_temp_id);
                             false
@@ -2764,19 +2784,19 @@ pub async fn reload_shared_files(
                         info!("Reload hashing cancelled mid-file");
                         was_cancelled = true;
                         let mut index = local_index.write().await;
-                        index.remove_file_by_id(&file_temp_id);
+                        index.abandon_hash_placeholder(&file_temp_id);
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    index.abandon_hash_placeholder(&file_temp_id);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
-                    index.remove_file_by_id(&file_temp_id);
+                    index.abandon_hash_placeholder(&file_temp_id);
                 }
                 Err(_) => {
                     // One slow file must not end the reload. Cancelling the whole

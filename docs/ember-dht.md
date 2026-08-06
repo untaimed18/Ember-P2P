@@ -55,15 +55,20 @@ tree. Ember discovers the source; the bytes still move over eD2K
 client-to-client. Wiring it up is the largest remaining piece if the goal
 is a network that does not need the eMule wire at all.
 
-### 2. Wire versioning has no story
+### 2. Wire versioning rejects cleanly but cannot negotiate
 
-`EMBER_DHT_VERSION` is 1 and there is no negotiation. The last wire change
-touched five places (control version, batched store and its ack,
-contact-list trimming, payload limits) and old peers simply cannot talk to
-new ones. That was fine while the overlay shipped off by default; it now
-ships **on**, so the next format change reaches users who will not all
-update at once. Decide on graceful reject plus an upgrade prompt — or real
-negotiation — before the first release with a user population on it.
+The last wire change touched five places (control version, batched store and
+its ack, contact-list trimming, payload limits), so `EMBER_DHT_VERSION` is now
+**2** and `EMBER_DHT_MIN_VERSION` is 2 alongside it: the decoder accepts a
+*range*, and a frame outside it is refused at the version byte instead of
+becoming a malformed-frame counter that reads like packet loss. A change that
+only adds to the format can lower the minimum rather than raising both.
+
+What is still missing is the part that needs a decision. Two peers on
+incompatible versions now fail cleanly, but neither is told why and there is no
+upgrade prompt — they simply never fold each other into a routing table. That
+was tolerable while the overlay shipped off by default; it now ships **on**, so
+the next breaking change reaches users who will not all update at once.
 
 ### 3. Cold join when eMule is not available
 

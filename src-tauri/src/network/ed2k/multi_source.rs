@@ -2083,7 +2083,7 @@ impl MultiSourceDownload {
                                 cs.total_sources = cs.total_sources.saturating_add(1);
                             }
                             info!("Injecting new source {}:{} (idx {src_idx}) into active download", source.peer_ip, source.peer_port);
-                            injected_sources.push(source.clone());
+                            remember_injected_source(&mut injected_sources, source.clone());
                             let src = source.clone();
                             let trk = tracker.clone();
                             let pp = part_path.clone();
@@ -2324,7 +2324,7 @@ impl MultiSourceDownload {
                                 "Injecting pre-established source {}:{} (idx {src_idx}) into active download",
                                 source.peer_ip, source.peer_port,
                             );
-                            injected_sources.push(source.clone());
+                            remember_injected_source(&mut injected_sources, source.clone());
                             let src = source.clone();
                             let trk = tracker.clone();
                             let pp = part_path.clone();
@@ -2689,7 +2689,7 @@ impl MultiSourceDownload {
                                 source.peer_ip,
                                 source.peer_port
                             );
-                            injected_sources.push(source);
+                            remember_injected_source(&mut injected_sources, source);
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -3154,7 +3154,7 @@ impl MultiSourceDownload {
                                             source.peer_ip,
                                             source.peer_port,
                                         );
-                                        injected_sources.push(source);
+                                        remember_injected_source(&mut injected_sources, source);
                                     }
                                     None => {
                                         post_phase_new_source_rx = None;
@@ -4617,7 +4617,11 @@ async fn download_parts_from_source(
                 if payload.len() > key_len && key_len > 0 {
                     if let Some(cm) = &credit_mgr {
                         let mut cm = cm.write().await;
-                        cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
+                        if !cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec()) {
+                            debug!(
+                                "Ignoring OP_PUBLICKEY from {addr}: a different key is already bound to this user hash"
+                            );
+                        }
                     }
                     // Replay a challenge we parked earlier because we
                     // didn't yet have the peer's key — now we can sign
@@ -5340,7 +5344,11 @@ async fn download_parts_from_source(
             };
             if let Some(cm) = &credit_mgr {
                 let mut cm = cm.write().await;
-                cm.set_public_key(peer_user_hash, key);
+                if !cm.set_public_key(peer_user_hash, key) {
+                    debug!(
+                        "Ignoring OP_PUBLICKEY from {addr}: a different key is already bound to this user hash"
+                    );
+                }
             }
             // Replay any parked challenge now that we have the peer's key
             // (same deferred-sign path as the pre-file-control handler
@@ -8987,7 +8995,30 @@ impl Drop for WireAvailabilityGuard {
     }
 }
 
-/// future caller can reuse the work without a second pass.
+/// Remember a freshly discovered source unless the list already holds one for
+/// the same endpoint.
+///
+/// Deduping on the way in, not only when a round rebuilds `all_sources`: the
+/// same peer is re-announced by KAD, the ed2k server and peer exchange over and
+/// over during a long download, and every arrival used to append another row.
+/// The round's `HashSet` pass then hid the duplicates from the download while
+/// the vector — and the per-round scan over it — kept growing with the session.
+fn remember_injected_source(
+    injected: &mut Vec<DownloadSource>,
+    source: DownloadSource,
+) -> bool {
+    if injected
+        .iter()
+        .any(|s| s.peer_ip == source.peer_ip && s.peer_port == source.peer_port)
+    {
+        return false;
+    }
+    injected.push(source);
+    true
+}
+
+/// One part chosen for pre-pipelining, with its block layout already computed
+/// so a future caller can reuse the work without a second pass.
 #[allow(dead_code)]
 struct PipelineCandidate {
     part_idx: usize,
@@ -9265,6 +9296,11 @@ enum AichAnswerOutcome {
 ///
 /// One deadline now covers the whole wait, and if it fires the caller is told
 /// the stream is unusable rather than being left to read garbage from it.
+///
+/// Because that outcome costs the connection, a peer that answers *negatively*
+/// has to be recognised as an answer. Most peers hold no recovery data for a
+/// given part, so buffering their reply and waiting out the deadline turned the
+/// common case into a dropped source after an 8-second stall.
 async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     file_hash: &[u8; 16],
@@ -9284,18 +9320,33 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
                 // caller drops it either way.
                 Err(_) => return AichAnswerOutcome::StreamDesynced,
             };
-            if proto == OP_EMULEPROT
-                && opcode == OP_AICHANSWER
-                && (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+            if proto == OP_EMULEPROT && opcode == OP_AICHANSWER {
+                if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
                     .contains(&payload.len())
-            {
-                let mut ans_hash = [0u8; 16];
-                ans_hash.copy_from_slice(&payload[..16]);
-                let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
-                let mut root = [0u8; 20];
-                root.copy_from_slice(&payload[18..38]);
-                if ans_hash == *file_hash && ans_part == part_idx && root == expected_master {
-                    return AichAnswerOutcome::Recovered(payload[38..].to_vec());
+                {
+                    let mut ans_hash = [0u8; 16];
+                    ans_hash.copy_from_slice(&payload[..16]);
+                    let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+                    let mut root = [0u8; 20];
+                    root.copy_from_slice(&payload[18..38]);
+                    if ans_hash == *file_hash && ans_part == part_idx {
+                        if root == expected_master {
+                            return AichAnswerOutcome::Recovered(payload[38..].to_vec());
+                        }
+                        // Our request, answered with a root we do not trust.
+                        // Nothing further is coming, and the stream is still
+                        // on a packet boundary, so stop here.
+                        return AichAnswerOutcome::NotAvailable;
+                    }
+                } else {
+                    // eMule answers "I have no recovery data for that part"
+                    // with a frame too short to carry a hash block. Treating
+                    // that as just another packet to buffer meant the peer —
+                    // having already replied — went quiet, the deadline fired,
+                    // and the caller dropped a source that had done nothing
+                    // wrong. Only one AICH request is outstanding per
+                    // connection, so any answer here is the answer to it.
+                    return AichAnswerOutcome::NotAvailable;
                 }
             }
             if deferred_packets.len() >= 64 {

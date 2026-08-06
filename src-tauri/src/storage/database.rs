@@ -1165,10 +1165,18 @@ impl Database {
 
     pub fn get_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
         let conn = self.conn.lock();
+        // Banned rows first, then by recency. Exempting them from eviction
+        // only kept them in the table; every consumer reads them through
+        // here, and a ban's `last_seen` is frozen at the moment it was placed
+        // (nothing contacts the peer again), so on an active node they sorted
+        // below `MAX_PEERS_ROWS` fresher rows and fell outside this window.
+        // The enforcement sets rebuilt at startup and by the periodic resync
+        // are both built from this result, so the ban stopped being applied
+        // while the row sat in the database looking correct.
         let mut stmt = conn.prepare(
             "SELECT id, addresses, nickname, last_seen, files_shared, banned
              FROM peers
-             ORDER BY last_seen DESC
+             ORDER BY banned DESC, last_seen DESC
              LIMIT ?1",
         )?;
 

@@ -32,6 +32,35 @@ pub struct SearchSnapshot {
     pub started_at_secs: u64,
 }
 
+/// What a response did for the search that received it.
+///
+/// The two answers are genuinely independent and collapsing them into one
+/// boolean was a real bug. The caller needs `accepted` to decide whether to
+/// retire the wire-request correlation entry and drive the next round; it used
+/// to read `new_closer` for that, which is false for *every* `FOUND_VALUE`
+/// (that path carries no contacts at all) and for any `FOUND_NODE` on a
+/// converged hop. Correct answers were therefore treated as unaccepted, so the
+/// lookup could not advance until the query deadline expired — a full timeout
+/// per hop, against a whole-search cap only a few timeouts wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseOutcome {
+    /// The response correlated with an outstanding query and was applied.
+    /// False means it was refused — unknown request id, or a sender other than
+    /// the node we asked — and that query is still legitimately outstanding.
+    pub accepted: bool,
+    /// The response contributed a node strictly closer than the best already
+    /// on the shortlist, so the search has somewhere new to go.
+    pub new_closer: bool,
+}
+
+impl ResponseOutcome {
+    /// A response that did not correlate with any outstanding query.
+    pub const REFUSED: Self = Self {
+        accepted: false,
+        new_closer: false,
+    };
+}
+
 /// State of a node in the search shortlist.
 #[derive(Debug, Clone, PartialEq)]
 enum NodeState {
@@ -168,14 +197,16 @@ impl IterativeSearch {
     }
 
     /// Process a FOUND_NODE / FOUND_VALUE response from a peer.
-    /// Returns true if new closer nodes were discovered (search should continue).
+    ///
+    /// See [`ResponseOutcome`] for why acceptance and progress are reported
+    /// separately rather than as one boolean.
     pub fn process_response(
         &mut self,
         request_id: u32,
         from_id: &EmberNodeId,
         closer_nodes: Vec<EmberContact>,
         value_records: Vec<Vec<u8>>,
-    ) -> bool {
+    ) -> ResponseOutcome {
         // Reject responses we didn't ask for: an attacker (or a buggy
         // peer) sending arbitrary `(request_id, from_id)` pairs must
         // not be able to flip a node to `Responded`, merge `closer_nodes`,
@@ -195,7 +226,7 @@ impl IterativeSearch {
             if let Some(real) = expected {
                 self.pending_requests.insert(request_id, real);
             }
-            return false;
+            return ResponseOutcome::REFUSED;
         }
 
         for entry in &mut self.shortlist {
@@ -290,7 +321,10 @@ impl IterativeSearch {
         // Check convergence
         self.check_complete();
 
-        new_closer
+        ResponseOutcome {
+            accepted: true,
+            new_closer,
+        }
     }
 
     /// Mark a node's request as failed (timeout, error).
@@ -739,6 +773,43 @@ mod tests {
         assert!(search.complete);
     }
 
+    /// The driver retires a query's wire-correlation entry and dispatches the
+    /// next round only when a response is *accepted*. Reporting acceptance as
+    /// "found something closer" made a value hit — which carries no contacts
+    /// at all — and a converged final hop both look like refusals, so the
+    /// lookup stalled for a full query timeout at every hop that mattered.
+    #[test]
+    fn a_correct_answer_is_accepted_even_when_it_brings_nothing_closer() {
+        let local = make_id(0x00);
+        let mut rt = RoutingTable::new(local, false);
+        rt.add_contact(make_contact(0x80));
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, req_id) = search.next_to_query().into_iter().next().unwrap();
+
+        let outcome = search.process_response(req_id, &make_id(0x80), vec![], vec![]);
+        assert!(
+            outcome.accepted,
+            "a peer that knows nobody closer still answered the question"
+        );
+        assert!(!outcome.new_closer);
+
+        // And a reply from someone we did not ask is still refused, so the
+        // query stays outstanding for the peer that owes us one.
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, req_id) = search.next_to_query().into_iter().next().unwrap();
+        let outcome = search.process_response(req_id, &make_id(0x7F), vec![], vec![]);
+        assert_eq!(outcome, ResponseOutcome::REFUSED);
+        assert!(
+            search.pending_requests.contains_key(&req_id),
+            "the real responder's slot must survive an impostor's answer"
+        );
+    }
+
     #[test]
     fn search_discovers_closer_node_multi_hop() {
         // We only know B at the start; B points us at a much closer C;
@@ -760,8 +831,9 @@ mod tests {
 
         // B answers with a closer node C (dist 0x02 < B's 0x81).
         let c = make_contact(0x03);
-        let progressed = search.process_response(b_req, &make_id(0x80), vec![c], vec![]);
-        assert!(progressed, "C is closer than B → search continues");
+        let outcome = search.process_response(b_req, &make_id(0x80), vec![c], vec![]);
+        assert!(outcome.accepted);
+        assert!(outcome.new_closer, "C is closer than B → search continues");
         assert!(!search.complete, "C is still pending");
 
         // Round 2: hop to C.

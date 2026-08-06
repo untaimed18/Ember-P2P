@@ -621,6 +621,9 @@ pub fn run() {
                 background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 quit_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pending_close_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_ember_default_on_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+                    ember_default_on_applied,
+                )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
@@ -651,16 +654,13 @@ pub fn run() {
                     );
                 });
             }
-            // Same delayed-emit reasoning as the recovery notices above: the
-            // overlay was turned on for this profile without being asked, and
-            // that belongs on screen rather than only in the log.
-            if ember_default_on_applied {
-                let emit_handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _ = emit_handle.emit("ember-default-on-applied", serde_json::json!({}));
-                });
-            }
+            // No delayed emit for this one: it is latched in `AppState` above
+            // and the layout drains it once its listeners are up. The recovery
+            // notices beside it still race a slow cold start — an event fired
+            // three seconds in is simply dropped if the webview has not
+            // resolved `listen()` yet — but they can be re-derived from the
+            // `.bak` files on disk, whereas this migration is one-shot and
+            // already persisted, so a lost notice is lost for good.
             if !security_policy.is_loaded() {
                 let emit_handle = app_handle.clone();
                 let status = security_policy.status();
@@ -893,15 +893,19 @@ pub fn run() {
                             && file.size > crate::network::ed2k::hash::PARTSIZE;
                         let needs_ember = file.ember_file_hash.is_empty();
                         if needs_aich || needs_ember {
-                            // Path-unique pending id while this copy is queued
-                            // for re-hashing. `file.id` is the content hash,
+                            // Path-unique id while this copy is queued for
+                            // re-hashing. `file.id` is the content hash,
                             // which every duplicate of the same content
                             // shares, and `finalize_pending_hash` /
                             // `remove_file_by_id` both take the first match —
                             // so a hash failure on one copy dropped a
-                            // different, healthy copy from the Library. Same
-                            // reasoning as `discover_file`'s `pending:` ids.
-                            file.id = format!("pending:{}", file.path);
+                            // different, healthy copy from the Library.
+                            //
+                            // `rehash:`, not `pending:`: the row is already
+                            // hashed and servable and only wants an optional
+                            // digest, so a cancelled pass must not discard it.
+                            // See [`crate::search::index::REHASH_ID_PREFIX`].
+                            file.id = crate::search::index::rehash_id(&file.path);
                             files_to_hash.push(file.clone());
                         }
                     } else {
@@ -1190,7 +1194,15 @@ pub fn run() {
                                     // removed pending row must not return just
                                     // because its hash computation finished.
                                     idx.finalize_pending_hash(&file_temp_id, updated.clone()).is_some()
+                                } else if still_shared {
+                                    // Cancelled. A re-hash row is already
+                                    // servable and keeps its place; only an
+                                    // unhashed row is discarded.
+                                    idx.abandon_hash_placeholder(&file_temp_id);
+                                    false
                                 } else {
+                                    // No longer under a shared folder, so the
+                                    // row goes whatever kind it is.
                                     idx.remove_file_by_id(&file_temp_id);
                                     false
                                 }
@@ -1237,19 +1249,19 @@ pub fn run() {
                                 info!("Startup hashing cancelled mid-file");
                                 was_cancelled = true;
                                 let mut idx = index_clone.write().await;
-                                idx.remove_file_by_id(&file_temp_id);
+                                idx.abandon_hash_placeholder(&file_temp_id);
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
-                            idx.remove_file_by_id(&file_temp_id);
+                            idx.abandon_hash_placeholder(&file_temp_id);
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
                             page_complete = false;
                             let mut idx = index_clone.write().await;
-                            idx.remove_file_by_id(&file_temp_id);
+                            idx.abandon_hash_placeholder(&file_temp_id);
                         }
                         Err(_) => {
                             // One slow file must not end the scan. Cancelling the
@@ -1551,6 +1563,7 @@ pub fn run() {
             commands::settings::quit_app,
             commands::settings::set_close_behavior,
             commands::settings::take_pending_close_request,
+            commands::settings::take_pending_ember_default_on_notice,
             commands::settings::open_ember_website,
             commands::security::get_security_policy_state,
             commands::security::acknowledge_security_policy_reset,

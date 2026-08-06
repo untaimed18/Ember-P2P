@@ -787,6 +787,8 @@ impl CreditManager {
     /// genuinely rotates its keypair stays unverified until its record ages
     /// out of `cleanup_stale`. Both are strictly better than handing an
     /// attacker an established identity.
+    #[must_use = "a refused key means this peer is not the identity it claims; \
+                  callers that go on to trust it are the bug this return exists to catch"]
     pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) -> bool {
         if key.is_empty() {
             return false;
@@ -1589,7 +1591,7 @@ mod tests {
             let r = cm.get_or_create(user);
             r.last_seen = stale_ts;
         }
-        cm.set_public_key(user, vec![0xAB; 64]);
+        assert!(cm.set_public_key(user, vec![0xAB; 64]));
         assert!(
             cm.get_record(&user).unwrap().last_seen >= now_floor,
             "set_public_key must bump last_seen",

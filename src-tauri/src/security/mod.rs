@@ -210,7 +210,7 @@ pub fn try_begin_single_flight(flag: &AtomicBool) -> Option<SingleFlightGuard<'_
         .map(|_| SingleFlightGuard(flag))
 }
 
-fn unique_tmp_path(final_path: &Path) -> PathBuf {
+pub(crate) fn unique_tmp_path(final_path: &Path) -> PathBuf {
     use rand::RngCore;
     let mut random = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut random);

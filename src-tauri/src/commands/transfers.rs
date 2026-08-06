@@ -901,23 +901,36 @@ pub async fn pause_transfers_batch(
             persist_transfer_status(&state, transfer_id, &status).await;
         }
     }
+    let mut send_error = None;
     for transfer_id in &transfer_ids {
         // `bounded_send`, like the single-row sibling. A raw `send().await` on
         // a full channel with a wedged consumer never returns, so selecting
         // many rows and clicking Pause left the UI spinning with no error
         // where one row would have surfaced `network_timeout` after ten
         // seconds.
-        let _ = bounded_send(
+        //
+        // Stop at the first failure rather than discarding it and carrying on.
+        // Every send costs the full `CMD_SEND_TIMEOUT` against a wedged task,
+        // so a full batch of `MAX_BATCH_TRANSFER_IDS` spent well over an hour
+        // timing out one row at a time and then reported success.
+        if let Err(e) = bounded_send(
             &state.network_tx,
             NetworkCommand::PauseDownload {
                 transfer_id: transfer_id.clone(),
             },
         )
-        .await;
+        .await
+        {
+            send_error = Some(e);
+            break;
+        }
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
-    Ok(())
+    match send_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
@@ -976,6 +989,7 @@ pub async fn stop_transfers_batch(
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
+    let mut send_error = None;
     for transfer_id in transfer_ids {
         let promoted = {
             let mut manager = state.transfer_manager.write().await;
@@ -988,20 +1002,27 @@ pub async fn stop_transfers_batch(
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
         persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
-        // Bounded, matching `stop_transfer` — see the note in
-        // `pause_transfers_batch`.
-        let _ = bounded_send(
+        // Bounded, and the first failure ends the batch — see the note in
+        // `pause_transfers_batch` for why carrying on is worse than stopping.
+        if let Err(e) = bounded_send(
             &state.network_tx,
             NetworkCommand::CancelDownload {
                 transfer_id: transfer_id.clone(),
                 cleanup_ack: None,
             },
         )
-        .await;
+        .await
+        {
+            send_error = Some(e);
+            break;
+        }
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
-    Ok(())
+    match send_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]

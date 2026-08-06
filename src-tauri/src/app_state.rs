@@ -136,6 +136,16 @@ pub struct AppState {
     /// the startup race where the event arrives before the webview can hear
     /// it and would otherwise leave a prevented native close with no dialog.
     pub pending_close_request: Arc<AtomicBool>,
+    /// Set when startup turned the Ember overlay on for a profile that had it
+    /// off, and consumed by the layout after its listeners are registered.
+    ///
+    /// A latch rather than a fire-and-forget event, for the same reason as
+    /// `pending_close_request`: Tauri does not buffer events, so a notice
+    /// emitted before the webview has resolved `listen()` is simply lost. The
+    /// migration has already been written to disk by then and is one-shot, so
+    /// the user would never be told their node had joined a network that
+    /// publishes their address and their shared-file keywords.
+    pub pending_ember_default_on_notice: Arc<AtomicBool>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio

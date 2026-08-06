@@ -22,6 +22,19 @@ const MAX_KEYS: usize = 50_000;
 /// rather than refusing the newcomer, so a full store still tracks the keys
 /// we are most responsible for.
 const MAX_STORE_BYTES: usize = 48 * 1024 * 1024;
+
+/// What one resident record costs the budget.
+///
+/// Counting only `data.len()` understated the real figure badly: a `DhtRecord`
+/// carries a 64-byte signature, a 32-byte publisher key, three `Instant`s and
+/// the rest of its fields alongside the blob, so at the minimum record size the
+/// struct outweighs its own payload and a "48 MB" store was holding closer to
+/// 120 MB. Charging the fixed overhead as well makes the ceiling mean roughly
+/// what it says. The `Vec`/`HashMap` allocation headers are still uncounted,
+/// which is a rounding error next to this.
+fn record_cost(data_len: usize) -> usize {
+    data_len + std::mem::size_of::<DhtRecord>()
+}
 /// Default record TTL.
 const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// How far a record's signed creation timestamp may sit in the future before
@@ -69,6 +82,15 @@ pub struct DhtRecord {
     /// survive node churn. Initialised to the store time so a freshly
     /// stored record isn't immediately republished.
     pub last_republished: Instant,
+    /// Set when a republish was handed out but never made it onto the wire,
+    /// so the next pass picks the record up regardless of the clock.
+    ///
+    /// A flag rather than an old `last_republished`: `Instant` counts from
+    /// boot, so `Instant::now() - 24h` is not representable on a machine that
+    /// has been up for less than a day and the saturating fallback stamped the
+    /// record as *just* republished — the exact opposite of due, and silently,
+    /// on what is the common desktop case.
+    pub republish_due: bool,
 }
 
 /// Local DHT key-value store for Ember DHT.
@@ -200,7 +222,7 @@ impl DhtStore {
                     break;
                 };
                 let victim = records.remove(soonest);
-                self.bytes = self.bytes.saturating_sub(victim.data.len());
+                self.bytes = self.bytes.saturating_sub(record_cost(victim.data.len()));
                 dropped += 1;
             }
             if records.is_empty() {
@@ -307,6 +329,7 @@ impl DhtStore {
             attributed_ip,
             expires_at,
             last_republished: now,
+            republish_due: false,
         };
 
         let records = self.entries.entry(key).or_insert_with(Vec::new);
@@ -349,8 +372,8 @@ impl DhtStore {
                 records[pos].last_republished = now;
                 return true;
             }
-            let old_len = records[pos].data.len();
-            let new_len = record.data.len();
+            let old_len = record_cost(records[pos].data.len());
+            let new_len = record_cost(record.data.len());
             records[pos] = record;
             debug_assert!(
                 self.bytes >= old_len,
@@ -408,7 +431,7 @@ impl DhtStore {
             return false;
         }
 
-        self.bytes += record.data.len();
+        self.bytes += record_cost(record.data.len());
         records.push(record);
         self.enforce_byte_budget(&key);
         true
@@ -448,7 +471,7 @@ impl DhtStore {
             records.retain(|r| {
                 let live = r.expires_at > now;
                 if !live {
-                    freed += r.data.len();
+                    freed += record_cost(r.data.len());
                 }
                 live
             });
@@ -534,9 +557,11 @@ impl DhtStore {
                 if r.data.first() == Some(&RECORD_TYPE_SOURCE) {
                     continue;
                 }
-                let due = force || now.duration_since(r.last_republished) >= interval;
+                let due =
+                    force || r.republish_due || now.duration_since(r.last_republished) >= interval;
                 if due {
                     r.last_republished = now;
+                    r.republish_due = false;
                     out.push((r.data.clone(), r.signature));
                 }
             }
@@ -564,11 +589,7 @@ impl DhtStore {
         let Some(record) = records.iter_mut().find(|r| r.signature == *signature) else {
             return;
         };
-        // Any sufficiently old stamp makes it due on the next pass; the exact
-        // value does not matter because `due` is a threshold test.
-        record.last_republished = Instant::now()
-            .checked_sub(Duration::from_secs(86_400))
-            .unwrap_or_else(Instant::now);
+        record.republish_due = true;
     }
 
     /// Total number of records across all keys.
@@ -1105,6 +1126,44 @@ mod tests {
         assert_eq!(all_due.len(), 1, "max bounds the batch to 1");
     }
 
+    /// A republish that never reached the wire has to come back around. This
+    /// used to be expressed as "stamp it 24 hours ago", which `Instant` cannot
+    /// represent on a machine booted more recently than that — so the
+    /// saturating fallback marked the record as freshly republished and it sat
+    /// out the whole interval instead.
+    #[test]
+    fn a_dropped_republish_is_due_again_on_the_next_pass() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let key = [3u8; 16];
+        let d = vec![0x01u8, 9, 9];
+        let sig = sign(&sk, &d);
+        assert!(store.store(key, d.clone(), sig, pk, now_ts()));
+
+        // Handed out once, which stamps it as republished.
+        let batch = store.take_republish_batch(Duration::from_secs(3600), 10, true);
+        assert_eq!(batch.len(), 1);
+        assert!(
+            store
+                .take_republish_batch(Duration::from_secs(3600), 10, false)
+                .is_empty(),
+            "still inside the interval"
+        );
+
+        // The caller could not queue it, so it must be offered again — with
+        // the interval unchanged and no reliance on how long the host has
+        // been up.
+        store.mark_republish_due(&key, &sig);
+        let again = store.take_republish_batch(Duration::from_secs(3600), 10, false);
+        assert_eq!(again.len(), 1, "a dropped republish must be retried");
+        assert_eq!(again[0].0, d);
+
+        // And it is a one-shot: the retry consumed the flag.
+        assert!(store
+            .take_republish_batch(Duration::from_secs(3600), 10, false)
+            .is_empty());
+    }
+
     #[test]
     fn source_records_are_not_republished() {
         let mut store = DhtStore::new();
@@ -1213,6 +1272,7 @@ mod tests {
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
             last_republished: Instant::now(),
+            republish_due: false,
         };
         store.entries.entry(key).or_default().push(record);
 

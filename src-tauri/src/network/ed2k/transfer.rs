@@ -1533,7 +1533,12 @@ impl Ed2kDownload {
                     };
                     if let Some(cm) = &self.credit_manager {
                         let mut cm = cm.write().await;
-                        cm.set_public_key(peer_user_hash, key);
+                        if !cm.set_public_key(peer_user_hash, key) {
+                            debug!(
+                                "Ignoring OP_PUBLICKEY from {}: a different key is already bound to this user hash",
+                                self.source_addr
+                            );
+                        }
                     }
                     if let Some((challenge, state)) = pending_peer_challenge.take() {
                         respond_to_secident_challenge(
@@ -2291,7 +2296,12 @@ impl Ed2kDownload {
                     };
                     if let Some(cm) = &self.credit_manager {
                         let mut cm = cm.write().await;
-                        cm.set_public_key(peer_user_hash, key);
+                        if !cm.set_public_key(peer_user_hash, key) {
+                            debug!(
+                                "Ignoring OP_PUBLICKEY from {}: a different key is already bound to this user hash",
+                                self.source_addr
+                            );
+                        }
                     }
                     if pending_secident_challenge.is_none() {
                         pending_secident_challenge = maybe_send_secident_challenge(
@@ -4042,7 +4052,12 @@ impl Ed2kDownload {
                                 };
                             if let Some(cm) = &self.credit_manager {
                                 let mut cm = cm.write().await;
-                                cm.set_public_key(peer_user_hash, key);
+                                if !cm.set_public_key(peer_user_hash, key) {
+                                    debug!(
+                                        "Ignoring OP_PUBLICKEY from {}: a different key is already bound to this user hash",
+                                        self.source_addr
+                                    );
+                                }
                             }
                             if pending_secident_challenge.is_none() {
                                 pending_secident_challenge = maybe_send_secident_challenge(
@@ -4481,14 +4496,31 @@ impl Ed2kDownload {
                                         debug!("Failed to send OP_AICHREQUEST: {e}");
                                     } else {
                                         debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
-                                        recovery_bytes = wait_for_aich_recovery_answer(
+                                        match wait_for_aich_recovery_answer(
                                             &mut reader,
                                             &self.file_hash,
                                             part_idx,
                                             master_hash,
                                             &mut auth_deferred,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            AichAnswerOutcome::Recovered(data) => {
+                                                recovery_bytes = Some(data);
+                                            }
+                                            AichAnswerOutcome::NotAvailable => {}
+                                            // The reader may be parked
+                                            // mid-packet, so anything read next
+                                            // would be payload bytes parsed as
+                                            // a header. End the source rather
+                                            // than corrupt the rest of the
+                                            // session with it.
+                                            AichAnswerOutcome::StreamDesynced => {
+                                                anyhow::bail!(
+                                                    "AICH recovery wait left the stream desynchronized"
+                                                );
+                                            }
+                                        }
                                     }
                                 } else {
                                     debug!("Skipping OP_AICHREQUEST for part {part_idx}: source already tried or retries exhausted");
@@ -5484,50 +5516,88 @@ pub(crate) async fn handle_secident_signature(
     }
 }
 
+/// What a wait for `OP_AICHANSWER` ended in. Mirrors the multi-source path's
+/// outcome so both react to a half-read packet the same way.
+enum AichAnswerOutcome {
+    Recovered(Vec<u8>),
+    /// The peer answered, but has nothing we can use. The stream is still on a
+    /// packet boundary, so the connection is fine to keep.
+    NotAvailable,
+    /// The read was abandoned partway through a packet. Nothing can be parsed
+    /// from this connection afterwards.
+    StreamDesynced,
+}
+
 /// Wait for `OP_AICHANSWER` matching file, part, and trusted AICH master hash (up to ~8s).
+///
+/// `read_packet_async` consumes the stream incrementally, so a dropped read
+/// future leaves the reader mid-packet with no way to resynchronize. Slicing
+/// the wait into short timeouts around a *fresh* read future — which is what
+/// this did — meant that whenever the peer was still streaming the block sent
+/// just before verification began (the normal case), the timer fired mid-payload
+/// and the next read parsed file bytes as a packet header. One deadline covers
+/// the whole wait instead, and if it fires the caller is told the stream is
+/// unusable rather than left to read garbage from it. The multi-source path
+/// carries the identical fix.
 async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     file_hash: &[u8; 16],
     part_idx: usize,
     expected_master: [u8; 20],
     deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
-) -> Option<Vec<u8>> {
+) -> AichAnswerOutcome {
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
-    let deadline = tokio::time::Instant::now() + MAX_WAIT;
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let chunk = remaining.min(std::time::Duration::from_secs(2));
-        match tokio::time::timeout(chunk, read_packet_async(reader)).await {
-            Ok(Ok((proto, opcode, payload))) => {
-                if proto == OP_EMULEPROT
-                    && opcode == OP_AICHANSWER
-                    && (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
-                        .contains(&payload.len())
+
+    let scan = async {
+        loop {
+            let (proto, opcode, payload) = match read_packet_async(reader).await {
+                Ok(packet) => packet,
+                Err(_) => return AichAnswerOutcome::StreamDesynced,
+            };
+            if proto == OP_EMULEPROT && opcode == OP_AICHANSWER {
+                if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                    .contains(&payload.len())
                 {
                     let mut ans_hash = [0u8; 16];
                     ans_hash.copy_from_slice(&payload[..16]);
                     let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
                     let mut root = [0u8; 20];
                     root.copy_from_slice(&payload[18..38]);
-                    if ans_hash == *file_hash && ans_part == part_idx && root == expected_master {
-                        return Some(payload[38..].to_vec());
+                    if ans_hash == *file_hash && ans_part == part_idx {
+                        if root == expected_master {
+                            return AichAnswerOutcome::Recovered(payload[38..].to_vec());
+                        }
+                        debug!(
+                            "AICH recovery: part {part_idx} answered with an untrusted root {}",
+                            hex::encode(root)
+                        );
+                        return AichAnswerOutcome::NotAvailable;
                     }
-                    debug!(
-                        "AICH recovery: ignoring non-matching OP_AICHANSWER (expected part {part_idx} hash {}, got part {ans_part} hash {})",
-                        hex::encode(file_hash),
-                        hex::encode(ans_hash)
-                    );
+                } else {
+                    // eMule's "no recovery data for that part" reply is too
+                    // short to carry a hash block. Only one request is
+                    // outstanding, so this is the answer to it — and treating
+                    // it as an unrelated packet meant waiting out the deadline
+                    // and then dropping a source that had done nothing wrong.
+                    return AichAnswerOutcome::NotAvailable;
                 }
-                if deferred_packets.len() >= 64 {
-                    return None;
-                }
-                deferred_packets.push_back((proto, opcode, payload));
             }
-            Ok(Err(_)) => return None,
-            Err(_) => {}
+            if deferred_packets.len() >= 64 {
+                // Everything read so far was a whole packet, so the stream is
+                // still aligned; we just refuse to buffer more.
+                return AichAnswerOutcome::NotAvailable;
+            }
+            deferred_packets.push_back((proto, opcode, payload));
+        }
+    };
+
+    match tokio::time::timeout(MAX_WAIT, scan).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            debug!("AICH recovery wait for part {part_idx} timed out mid-stream");
+            AichAnswerOutcome::StreamDesynced
         }
     }
-    None
 }
 
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(

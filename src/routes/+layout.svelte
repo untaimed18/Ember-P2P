@@ -24,13 +24,14 @@
     quitApp,
     setCloseBehavior,
     takePendingCloseRequest,
+    takePendingEmberDefaultOnNotice,
   } from '$lib/api/settings';
   import { checkForUpdates, isUpdateCheckDue } from '$lib/stores/updater';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
-  import { clearAllToasts, toastError, toastWarning } from '$lib/stores/toast';
+  import { addToast, clearAllToasts, toastError, toastWarning } from '$lib/stores/toast';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
@@ -187,7 +188,6 @@
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
-    let unlistenEmberDefaultOn: UnlistenFn | null = null;
 
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
@@ -234,12 +234,17 @@
     // The upgrade turned the Ember overlay on for a profile that had it off.
     // There is no stored difference between "off because that was the default"
     // and "off because the user chose it", so say so rather than assume.
-    listen('ember-default-on-applied', () => {
-      if (!mounted) return;
-      toastWarning(m.layout_ember_default_on());
-    })
-      .then((fn) => { if (mounted) unlistenEmberDefaultOn = fn; else fn(); })
-      .catch((e) => console.error('Failed to register ember-default-on listener:', e));
+    //
+    // Pulled from a backend latch rather than pushed as an event: the
+    // migration is written to disk during setup and never runs again, so an
+    // event fired before this webview finished starting would take the only
+    // notice with it. Sticky, because it is a consent notice about joining a
+    // network — the default six seconds is not long enough to read it.
+    takePendingEmberDefaultOnNotice()
+      .then((pending) => {
+        if (mounted && pending) addToast('warning', m.layout_ember_default_on(), 0);
+      })
+      .catch((e) => console.error('Failed to consume the ember-default-on latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',
@@ -403,7 +408,6 @@
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
       if (unlistenPolicyReset) unlistenPolicyReset();
-      if (unlistenEmberDefaultOn) unlistenEmberDefaultOn();
     };
   });
 </script>

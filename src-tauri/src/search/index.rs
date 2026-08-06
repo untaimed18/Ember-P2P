@@ -12,6 +12,31 @@ pub struct LocalIndex {
     name_tokens: HashMap<String, Vec<usize>>,
 }
 
+/// Temporary id for a row that has never been hashed, so the index has nothing
+/// else to identify it by. Cancelling the scan discards these: without a hash
+/// they cannot be served, searched or published.
+pub const PENDING_ID_PREFIX: &str = "pending:";
+
+/// Temporary id for an *already hashed* row queued for a one-time digest
+/// top-up (the AICH or Ember BLAKE3 migration passes).
+///
+/// A separate prefix because the two have opposite cancellation semantics and
+/// sharing one wiped the Library. On the first launch after the digest
+/// migration landed, every record in an older `known.met` needs a top-up, so
+/// every row carried a temp id — and `remove_pending_files`, whose contract is
+/// "drop the unhashed rows", then deleted the entire library the moment the
+/// user pressed Stop. Those rows have a valid eD2K hash and full metadata and
+/// lack only an optional digest, so they must survive.
+pub const REHASH_ID_PREFIX: &str = "rehash:";
+
+/// Path-unique temp id for a row awaiting a digest top-up. Path-unique rather
+/// than content-keyed because `finalize_pending_hash` and `remove_file_by_id`
+/// both take the first match, so a shared content hash let one copy's outcome
+/// land on a different, healthy copy.
+pub fn rehash_id(path: &str) -> String {
+    format!("{REHASH_ID_PREFIX}{path}")
+}
+
 /// Result of applying a hash-wide share-state change. `hashes` contains each
 /// complete file identity once for `known.met` persistence; `changed_paths`
 /// also counts pending rows, which have no hash to persist yet.
@@ -286,12 +311,37 @@ impl LocalIndex {
     }
 
     /// Remove all files that still have a "pending:..." temp id (unhashed).
+    ///
+    /// Deliberately does not touch [`REHASH_ID_PREFIX`] rows. Those are already
+    /// hashed and fully described by `known.met`; they are only queued for an
+    /// optional digest top-up, so discarding them on cancellation would empty
+    /// the Library of files that are perfectly servable.
     pub fn remove_pending_files(&mut self) {
         let before = self.files.len();
-        self.files.retain(|f| !f.id.starts_with("pending:"));
+        self.files.retain(|f| !f.id.starts_with(PENDING_ID_PREFIX));
         if self.files.len() != before {
             self.rebuild_indices();
         }
+    }
+
+    /// Give up on a placeholder row whose hash pass ended without a result,
+    /// returning the row only if it was actually removed.
+    ///
+    /// The two placeholder kinds part company here. An unhashed row goes: with
+    /// no hash it cannot be served, searched or published, so keeping it would
+    /// only show the user a file that does not work. A re-hash row stays and is
+    /// merely put back under its content-hash id — it was already complete, and
+    /// what it missed was an optional digest top-up, so dropping it would
+    /// unshare a healthy file because an antivirus scanner held it for a moment.
+    ///
+    /// Only `id` changes on the kept path, and no index is keyed on `id`.
+    pub fn abandon_hash_placeholder(&mut self, temp_id: &str) -> Option<FileInfo> {
+        let pos = self.files.iter().position(|f| f.id == temp_id)?;
+        if temp_id.starts_with(REHASH_ID_PREFIX) && !self.files[pos].hash.is_empty() {
+            self.files[pos].id = self.files[pos].hash.clone();
+            return None;
+        }
+        Some(self.swap_remove_indexed(pos))
     }
 
     /// Remove only the pending (unhashed) entries that fall under one of
@@ -305,7 +355,7 @@ impl LocalIndex {
         }
         let before = self.files.len();
         self.files.retain(|f| {
-            !(f.id.starts_with("pending:")
+            !(f.id.starts_with(PENDING_ID_PREFIX)
                 && prefixes
                     .iter()
                     .any(|p| crate::security::path_matches_dir(&f.path, p)))
@@ -993,7 +1043,7 @@ mod tests {
 
 #[cfg(test)]
 mod local_index_tests {
-    use super::LocalIndex;
+    use super::{rehash_id, LocalIndex};
     use crate::types::FileInfo;
 
     fn file(path: &str, hash: &str, shared: bool, priority: &str) -> FileInfo {
@@ -1160,6 +1210,79 @@ mod local_index_tests {
         assert_eq!(mutation.changed_paths, 1);
         assert!(mutation.hashes.is_empty());
         assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
+    }
+
+    /// The one-time digest migration queues *every* already-hashed row for a
+    /// top-up, so sharing the `pending:` prefix with genuinely unhashed rows
+    /// meant the first press of "Stop hashing" after upgrading emptied the
+    /// whole Library — files with valid hashes, metadata and counters, gone
+    /// until the next restart, and unservable in the meantime.
+    #[test]
+    fn cancelling_a_scan_keeps_rows_that_only_wanted_a_digest() {
+        let mut index = LocalIndex::new();
+        let mut unhashed = file("A/new.bin", "", true, "normal");
+        unhashed.id = "pending:A/new.bin".to_string();
+        let mut rehashing = file(
+            "A/known.bin",
+            "dddddddddddddddddddddddddddddddd",
+            true,
+            "normal",
+        );
+        rehashing.id = rehash_id("A/known.bin");
+        index.add_files(vec![unhashed, rehashing]);
+
+        index.remove_pending_files();
+
+        assert!(
+            index.get_by_path("A/new.bin").is_none(),
+            "an unhashed row has no hash and cannot be served, so it goes"
+        );
+        assert_eq!(
+            index
+                .get_by_path("A/known.bin")
+                .expect("an already-hashed row must survive cancellation")
+                .hash,
+            "dddddddddddddddddddddddddddddddd"
+        );
+    }
+
+    /// A digest pass that fails — an antivirus lock, a sleeping drive — must
+    /// not unshare a file that was already complete. The row goes back to its
+    /// content-hash id instead of being dropped.
+    #[test]
+    fn abandoning_a_digest_pass_restores_the_content_hash_id() {
+        let mut index = LocalIndex::new();
+        let mut rehashing = file(
+            "A/known.bin",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            true,
+            "normal",
+        );
+        rehashing.id = rehash_id("A/known.bin");
+        index.add_file(rehashing);
+
+        assert!(
+            index
+                .abandon_hash_placeholder(&rehash_id("A/known.bin"))
+                .is_none(),
+            "the row is kept, so nothing is handed back to the caller"
+        );
+        assert_eq!(
+            index.get_by_path("A/known.bin").unwrap().id,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+
+        // An unhashed row has nothing to fall back on and is still removed.
+        let mut unhashed = file("A/new.bin", "", true, "normal");
+        unhashed.id = "pending:A/new.bin".to_string();
+        index.add_file(unhashed);
+        assert!(
+            index
+                .abandon_hash_placeholder("pending:A/new.bin")
+                .is_some(),
+            "an unhashed row is removed and returned"
+        );
+        assert!(index.get_by_path("A/new.bin").is_none());
     }
 
     #[test]

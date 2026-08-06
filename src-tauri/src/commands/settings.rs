@@ -1419,6 +1419,19 @@ pub async fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Re
         .swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
+/// Consume the "we turned the Ember overlay on for you" notice, if startup
+/// raised one. One-shot, like the close-request latch: the config migration
+/// behind it has already been written and never runs again, so the notice has
+/// exactly one chance to reach the user.
+#[tauri::command]
+pub async fn take_pending_ember_default_on_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state
+        .pending_ember_default_on_notice
+        .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
 #[tauri::command]
 pub async fn set_close_behavior(
     state: tauri::State<'_, AppState>,

@@ -757,12 +757,20 @@
   let knownClientsLoaded = $state(false);
   let queuePollHandle: ReturnType<typeof setInterval> | null = null;
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
+  let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
   const KNOWN_POLL_INTERVAL_MS = 8000;
   // Upper bound on Trust badges force-refreshed per poll. Each one is a
   // backend command, not a local read, so this cannot scale with the
   // 1,000-row display limit.
   const KNOWN_REPUTATION_REFRESH_MAX = 100;
+  // Where the next poll's window starts. The budget above has to rotate
+  // rather than sit on the first hundred rows: this sweep is the only thing
+  // that ever populates `reputationMap` for the table, so a fixed window left
+  // every row past it showing "—" with a "Fetching…" tooltip forever, however
+  // long the tab stayed open. Rotating covers a full 1,000-row ledger in
+  // about eighty seconds while keeping each poll's cost flat.
+  let knownReputationCursor = 0;
   // Monotonic sequence guards: an overlapping/slow poll response must not apply
   // out of order on top of a newer one (last-started wins, regardless of which
   // request's promise resolves first).
@@ -818,12 +826,19 @@
       // search and server operations, so unrelated actions intermittently
       // failed with "Network busy". Chunking bounds concurrency, not volume.
       if (refreshBadges) {
-        void refreshReputations(
-          displayedKnownClients
-            .slice(0, KNOWN_REPUTATION_REFRESH_MAX)
-            .map((k) => k.user_hash),
-          true,
-        );
+        const hashes = displayedKnownClients.map((k) => k.user_hash);
+        if (hashes.length > 0) {
+          const start = knownReputationCursor % hashes.length;
+          const window =
+            hashes.length <= KNOWN_REPUTATION_REFRESH_MAX
+              ? hashes
+              : [...hashes.slice(start), ...hashes.slice(0, start)].slice(
+                  0,
+                  KNOWN_REPUTATION_REFRESH_MAX,
+                );
+          knownReputationCursor = (start + window.length) % hashes.length;
+          void refreshReputations(window, true);
+        }
       }
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
@@ -1023,6 +1038,20 @@
           void refreshFriendHashes();
         }, KNOWN_POLL_INTERVAL_MS);
       }
+      // Skipping ticks while hidden means the first thing the user sees on
+      // restoring the window is up to a full interval out of date, so pump
+      // once on the way back — the same catch-up the network and transfer
+      // stores do around their own visibility gates.
+      if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
+        knownVisibilityHandler = () => {
+          if (document.visibilityState !== 'visible' || bottomView !== 'known_clients') {
+            return;
+          }
+          refreshKnownClients();
+          void refreshFriendHashes();
+        };
+        document.addEventListener('visibilitychange', knownVisibilityHandler);
+      }
     } else if (knownPollHandle !== null) {
       clearInterval(knownPollHandle);
       knownPollHandle = null;
@@ -1031,6 +1060,10 @@
       if (knownPollHandle !== null) {
         clearInterval(knownPollHandle);
         knownPollHandle = null;
+      }
+      if (typeof document !== 'undefined' && knownVisibilityHandler !== null) {
+        document.removeEventListener('visibilitychange', knownVisibilityHandler);
+        knownVisibilityHandler = null;
       }
     };
   });

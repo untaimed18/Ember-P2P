@@ -207,7 +207,13 @@ impl SharedFoldersWatcher {
                 let Some(watcher) = retry_watcher.upgrade() else {
                     return;
                 };
-                watcher.resync_unwatched();
+                // `Path::exists` is a blocking syscall, and on the very case
+                // this retry exists for — an unreachable network share — it
+                // can sit for tens of seconds. Running it on a runtime worker
+                // stalled that worker, and doing it under the `watched` lock
+                // stalled a second one whenever an add/remove command tried to
+                // take the same lock.
+                let _ = tokio::task::spawn_blocking(move || watcher.resync_unwatched()).await;
             }
         });
         Some(watcher)
@@ -221,17 +227,45 @@ impl SharedFoldersWatcher {
         if desired.is_empty() {
             return;
         }
-        {
+        // Probe the filesystem first and take the lock afterwards. Every
+        // `exists()` here can block for as long as the OS takes to give up on
+        // an unreachable share, and holding `watched` across that blocks
+        // `sync_paths` — which the add/remove folder commands call — for the
+        // same stretch.
+        let watched_now: Vec<PathBuf> = self.watched.lock().iter().cloned().collect();
+        let vanished: Vec<PathBuf> = watched_now
+            .into_iter()
+            .filter(|path| !path.exists())
+            .collect();
+        let reappeared = desired
+            .iter()
+            .map(PathBuf::from)
+            .any(|path| !self.watched.lock().contains(&path) && path.exists());
+
+        if !vanished.is_empty() {
+            // Release the OS watch before forgetting the path. Dropping it
+            // from `watched` alone left the registration in place — nothing
+            // else ever unwatches it, because `sync_paths` derives its removal
+            // set from `watched` — so a directory that flickered accumulated a
+            // fresh watch (and handle) on the backend every time it came back.
             let mut current = self.watched.lock();
-            current.retain(|path| path.exists());
+            let mut debouncer_guard = self.debouncer.lock();
+            if let Some(debouncer) = debouncer_guard.as_mut() {
+                for path in &vanished {
+                    if let Err(e) = debouncer.watcher().unwatch(path) {
+                        debug!(
+                            "FS watcher: could not unwatch the vanished {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            for path in &vanished {
+                current.remove(path);
+            }
         }
-        let missing = {
-            let current = self.watched.lock();
-            desired
-                .iter()
-                .any(|p| !current.contains(&PathBuf::from(p)) && PathBuf::from(p).exists())
-        };
-        if missing {
+
+        if reappeared {
             self.sync_paths(&desired);
         }
     }
