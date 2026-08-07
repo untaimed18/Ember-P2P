@@ -119,10 +119,34 @@ pub struct DhtStore {
     /// Resident-byte ceiling. A field rather than a constant so tests can
     /// exercise eviction without signing tens of thousands of records.
     byte_budget: usize,
-    /// Records refused because [`MAX_KEYS`] distinct keys are already held.
-    /// Unlike the byte budget this cap has no eviction path, so it is the one
-    /// store limit that can turn away a key we are genuinely closest to.
+    /// Distinct-key ceiling. A field for the same reason as `byte_budget`:
+    /// filling 50,000 keys for real would mean 50,000 signature verifications.
+    key_budget: usize,
+    /// Records refused for want of a free key slot, after eviction was tried.
     key_cap_rejections: u64,
+    /// Upper bound on the XOR distance of the furthest key currently held,
+    /// or `None` when unknown.
+    ///
+    /// Exists to keep the *refusal* path O(1) once the key map is full. Without
+    /// it, every record of a flood aimed at random distant keys would drive a
+    /// full scan looking for a victim — turning a cap meant to bound memory
+    /// into a way to burn CPU.
+    ///
+    /// Only ever an over-estimate: it is set from a real scan, removals
+    /// elsewhere can only bring the true furthest closer, and inserting a new
+    /// key clears it rather than risking a value that is too small. Over-
+    /// estimating costs an extra scan; under-estimating would refuse a key we
+    /// should have taken, so the direction matters.
+    furthest_key_distance: Option<[u8; 16]>,
+}
+
+/// XOR distance between two 128-bit ids.
+fn xor_distance(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+    let mut d = [0u8; 16];
+    for i in 0..16 {
+        d[i] = a[i] ^ b[i];
+    }
+    d
 }
 
 impl DhtStore {
@@ -134,7 +158,9 @@ impl DhtStore {
             bytes: 0,
             local_id: None,
             byte_budget: MAX_STORE_BYTES,
+            key_budget: MAX_KEYS,
             key_cap_rejections: 0,
+            furthest_key_distance: None,
         }
     }
 
@@ -169,6 +195,113 @@ impl DhtStore {
         self.byte_budget = budget;
     }
 
+    /// Shrink the distinct-key ceiling so the cap and its eviction can be
+    /// exercised without filling 50,000 keys.
+    #[cfg(test)]
+    fn set_key_budget_for_test(&mut self, budget: usize) {
+        self.key_budget = budget;
+    }
+
+    /// Drop a key and everything under it, keeping the byte total in step.
+    fn drop_key(&mut self, key: &[u8; 16]) {
+        if let Some(records) = self.entries.remove(key) {
+            for record in records {
+                self.bytes = self.bytes.saturating_sub(record_cost(record.data.len()));
+            }
+        }
+    }
+
+    /// Make room for a key we do not yet hold. Returns whether there is space.
+    ///
+    /// The byte budget evicts; this cap used to refuse outright, so once
+    /// [`MAX_KEYS`] distinct keys were held every new key was turned away —
+    /// including ones this node is the closest in the network to. A publisher
+    /// spreading records over random keys could therefore fill the map and
+    /// deny service for the keys that actually belong here.
+    ///
+    /// Expired keys go first, being free. Otherwise the furthest key from us
+    /// is given up, and only when the incoming key is closer than it. That
+    /// ordering is what makes the eviction safe rather than a new lever: a
+    /// flood of distant keys finds nothing it is allowed to displace, while a
+    /// key we are genuinely responsible for always finds room.
+    fn make_room_for_key(&mut self, incoming: &[u8; 16]) -> bool {
+        if self.entries.len() < self.key_budget {
+            return true;
+        }
+        // Without our own id there is no notion of responsibility, so there is
+        // no principled victim to choose.
+        let Some(local) = self.local_id else {
+            return false;
+        };
+        let incoming_distance = xor_distance(&local.0, incoming);
+
+        // The O(1) refusal that keeps a flood cheap. Safe because the bound
+        // over-estimates: anything it rejects, a full scan would reject too.
+        if let Some(bound) = self.furthest_key_distance {
+            if incoming_distance >= bound {
+                return false;
+            }
+        }
+
+        let now = Instant::now();
+        let expired: Vec<[u8; 16]> = self
+            .entries
+            .iter()
+            .filter(|(_, records)| records.iter().all(|r| r.expires_at <= now))
+            .map(|(key, _)| *key)
+            .collect();
+        if !expired.is_empty() {
+            for key in expired {
+                self.drop_key(&key);
+            }
+            self.furthest_key_distance = None;
+            if self.entries.len() < self.key_budget {
+                return true;
+            }
+        }
+
+        // Furthest key to evict, and the next-furthest to seed the bound with
+        // once it is gone — both from a single pass.
+        let mut furthest: Option<([u8; 16], [u8; 16])> = None;
+        let mut runner_up: Option<[u8; 16]> = None;
+        for key in self.entries.keys() {
+            let distance = xor_distance(&local.0, key);
+            match furthest {
+                Some((_, current)) if distance > current => {
+                    runner_up = Some(current);
+                    furthest = Some((*key, distance));
+                }
+                Some(_) => {
+                    if runner_up.is_none_or(|r| distance > r) {
+                        runner_up = Some(distance);
+                    }
+                }
+                None => furthest = Some((*key, distance)),
+            }
+        }
+
+        let Some((furthest_key, furthest_distance)) = furthest else {
+            return false;
+        };
+        if incoming_distance >= furthest_distance {
+            self.furthest_key_distance = Some(furthest_distance);
+            return false;
+        }
+
+        self.drop_key(&furthest_key);
+        debug!(
+            "DHT store at the {}-key cap: gave up {} for a key closer to us",
+            self.key_budget,
+            hex::encode(furthest_key)
+        );
+        // The caller inserts `incoming` next, so the bound has to cover it.
+        self.furthest_key_distance = Some(match runner_up {
+            Some(r) if r >= incoming_distance => r,
+            _ => incoming_distance,
+        });
+        true
+    }
+
     /// Free space by dropping the records we are least responsible for.
     ///
     /// Ranking is by XOR distance from our own ID first — a record far from
@@ -199,13 +332,7 @@ impl DhtStore {
             .filter(|key| *key != spare)
             .map(|key| {
                 let distance = match local {
-                    Some(id) => {
-                        let mut d = [0u8; 16];
-                        for i in 0..16 {
-                            d[i] = id.0[i] ^ key[i];
-                        }
-                        d
-                    }
+                    Some(id) => xor_distance(&id.0, key),
                     None => [0u8; 16],
                 };
                 (*key, distance)
@@ -321,10 +448,21 @@ impl DhtStore {
             return false;
         }
 
-        if self.entries.len() >= MAX_KEYS && !self.entries.contains_key(&key) {
-            self.key_cap_rejections = self.key_cap_rejections.saturating_add(1);
-            debug!("DHT store full ({MAX_KEYS} keys), rejecting new key");
-            return false;
+        if !self.entries.contains_key(&key) {
+            if !self.make_room_for_key(&key) {
+                self.key_cap_rejections = self.key_cap_rejections.saturating_add(1);
+                debug!(
+                    "DHT store full ({} keys) and holds nothing further away than {}; rejecting",
+                    self.key_budget,
+                    hex::encode(key)
+                );
+                return false;
+            }
+            // A new key can sit further out than the cached bound, and the
+            // bound is only safe while it over-estimates. Clearing it costs one
+            // scan later; during a flood at capacity nothing is inserted, so it
+            // survives exactly when it is doing work.
+            self.furthest_key_distance = None;
         }
 
         let now = Instant::now();
@@ -732,6 +870,122 @@ mod tests {
     /// records.
     fn now_ts() -> i64 {
         chrono::Utc::now().timestamp()
+    }
+
+    /// A store filled to its key cap with keys at a fixed XOR distance from a
+    /// local id of all-zeroes, so "closer" and "further" are just the leading
+    /// byte. Returns the store, ready at capacity.
+    fn store_at_key_cap(first_byte: u8, keys: usize) -> DhtStore {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        store.set_key_budget_for_test(keys);
+        for i in 0..keys {
+            let mut key = [0u8; 16];
+            key[0] = first_byte;
+            key[1] = (i >> 8) as u8;
+            key[2] = (i & 0xFF) as u8;
+            let (sk, pk) = keypair();
+            let data = vec![i as u8];
+            let sig = sign(&sk, &data);
+            assert!(store.store(key, data, sig, pk, now_ts()));
+        }
+        assert_eq!(store.key_count(), keys);
+        store
+    }
+
+    /// The cap used to refuse outright, so a publisher spreading records over
+    /// random keys could fill the map and lock out the keys this node is the
+    /// closest in the network to — the ones it exists to serve.
+    #[test]
+    fn a_closer_key_displaces_the_furthest_when_the_map_is_full() {
+        let mut store = store_at_key_cap(0xF0, 8);
+
+        let near = [0x01u8; 16];
+        let (sk, pk) = keypair();
+        let data = vec![0xAAu8];
+        let sig = sign(&sk, &data);
+        assert!(
+            store.store(near, data, sig, pk, now_ts()),
+            "a key we are responsible for must find room"
+        );
+
+        assert_eq!(store.key_count(), 8, "the cap still holds");
+        assert!(store.get(&near).is_some(), "and the close key is present");
+        assert_eq!(
+            store.key_cap_rejections(),
+            0,
+            "displacing is not a rejection"
+        );
+    }
+
+    /// The other half of the policy, and what keeps eviction from being a new
+    /// lever: a distant key finds nothing it is allowed to push out.
+    #[test]
+    fn a_distant_key_cannot_displace_a_closer_one() {
+        let mut store = store_at_key_cap(0x01, 8);
+
+        let far = [0xFFu8; 16];
+        let (sk, pk) = keypair();
+        let data = vec![0xBBu8];
+        let sig = sign(&sk, &data);
+        assert!(
+            !store.store(far, data, sig, pk, now_ts()),
+            "a key further out than everything held must be refused"
+        );
+
+        assert_eq!(store.key_count(), 8);
+        assert!(store.get(&far).is_none());
+        assert_eq!(store.key_cap_rejections(), 1);
+    }
+
+    /// The refusal above has to stay cheap. A flood aimed at distant keys is
+    /// answered from the cached bound rather than a scan per record, so the
+    /// cap cannot be turned from a memory bound into a CPU cost.
+    #[test]
+    fn repeated_distant_keys_are_refused_without_rescanning() {
+        let mut store = store_at_key_cap(0x01, 8);
+
+        for i in 0..64u8 {
+            let mut far = [0xFFu8; 16];
+            far[15] = i;
+            let (sk, pk) = keypair();
+            let data = vec![i];
+            let sig = sign(&sk, &data);
+            assert!(!store.store(far, data, sig, pk, now_ts()));
+        }
+
+        assert_eq!(store.key_count(), 8, "nothing was displaced");
+        assert_eq!(store.key_cap_rejections(), 64);
+        assert!(
+            store.furthest_key_distance.is_some(),
+            "the bound must be cached, or every refusal costs a full scan"
+        );
+    }
+
+    /// Inserting a new key can put one further out than the cached bound, so
+    /// the bound must be dropped rather than left too small — a bound that
+    /// under-estimates refuses keys the store should have taken.
+    #[test]
+    fn a_new_key_clears_the_cached_bound() {
+        let mut store = store_at_key_cap(0x01, 8);
+
+        // Provoke a refusal so the bound is populated.
+        let far = [0xFFu8; 16];
+        let (sk, pk) = keypair();
+        let data = vec![1u8];
+        assert!(!store.store(far, data.clone(), sign(&sk, &data), pk, now_ts()));
+        assert!(store.furthest_key_distance.is_some());
+
+        // Room again, then a genuinely new key.
+        store.set_key_budget_for_test(16);
+        let fresh = [0x02u8; 16];
+        let (sk2, pk2) = keypair();
+        let d2 = vec![2u8];
+        assert!(store.store(fresh, d2.clone(), sign(&sk2, &d2), pk2, now_ts()));
+        assert!(
+            store.furthest_key_distance.is_none(),
+            "a new key invalidates the bound"
+        );
     }
 
     #[test]

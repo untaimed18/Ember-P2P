@@ -15,6 +15,15 @@ const SEARCH_TIMEOUT_SECS: u64 = 60;
 /// Maximum results returned from a single search.
 const MAX_SEARCH_RESULTS: usize = 300;
 
+/// How many times one node may be queried within a single search.
+///
+/// A timeout is not proof a node is gone — it may have been mid-handshake,
+/// briefly saturated, or the datagram may simply have been lost. Marking it
+/// failed forever on the first miss threw away real peers on lossy paths. Two
+/// is the smallest value that tolerates a single loss, and it bounds the extra
+/// work at one repeat query per node so a search still converges.
+const MAX_QUERY_ATTEMPTS: u8 = 2;
+
 /// Diagnostic row for one in-flight Ember DHT search (slice 16).
 #[derive(Debug, Clone)]
 pub struct SearchSnapshot {
@@ -111,8 +120,20 @@ pub struct IterativeSearch {
     shortlist: Vec<ShortlistEntry>,
     /// Collected value results (for FIND_VALUE searches).
     pub results: Vec<SearchResultRecord>,
-    /// Nodes we've already queried (to avoid duplicates).
+    /// BLAKE3 of every blob already in `results`.
+    ///
+    /// A popular record is held by many nodes, and a Kademlia walk asks twenty
+    /// of them, so without this the same signed blob took a slot per peer that
+    /// returned it. On a well-replicated keyword that filled
+    /// [`MAX_SEARCH_RESULTS`] with copies of a handful of files and completed
+    /// the search, hiding everything the later hops would have found.
+    seen_results: HashSet<[u8; 32]>,
+    /// Nodes with a query currently outstanding or permanently given up on.
+    /// A node that failed but has attempts left is removed, which is what
+    /// makes it eligible to be picked again.
     queried: HashSet<EmberNodeId>,
+    /// Queries sent per node this search, against [`MAX_QUERY_ATTEMPTS`].
+    attempts: HashMap<EmberNodeId, u8>,
     /// When this search started.
     pub started_at: Instant,
     /// True when the search has converged or found enough results.
@@ -157,7 +178,9 @@ impl IterativeSearch {
             keyword_hashes,
             shortlist,
             results: Vec::new(),
+            seen_results: HashSet::new(),
             queried: HashSet::new(),
+            attempts: HashMap::new(),
             started_at: Instant::now(),
             complete: false,
             pending_requests: HashMap::new(),
@@ -187,6 +210,7 @@ impl IterativeSearch {
             if entry.state == NodeState::Pending && !self.queried.contains(&entry.contact.node_id) {
                 entry.state = NodeState::InFlight;
                 self.queried.insert(entry.contact.node_id);
+                *self.attempts.entry(entry.contact.node_id).or_insert(0) += 1;
                 let req_id = self.next_request_id;
                 self.next_request_id = self.next_request_id.wrapping_add(1);
                 self.pending_requests.insert(req_id, entry.contact.node_id);
@@ -254,6 +278,12 @@ impl IterativeSearch {
                     );
                     continue;
                 }
+            }
+            // Dedup before the cap, not after: counting copies against
+            // `MAX_SEARCH_RESULTS` is what let a well-replicated record end
+            // the search before the closer hops were reached.
+            if !self.seen_results.insert(*blake3::hash(&data).as_bytes()) {
+                continue;
             }
             if self.results.len() < MAX_SEARCH_RESULTS {
                 self.results.push(SearchResultRecord {
@@ -332,14 +362,29 @@ impl IterativeSearch {
     /// Returns which node it was, so the caller can also hold the failure
     /// against the routing table. Without that, a dead gossip lead stayed a
     /// lookup seed until the liveness sweep happened to reach it.
+    ///
+    /// A node with attempts left goes back to `Pending` rather than `Failed`,
+    /// so one lost datagram does not permanently remove it from this search.
+    /// See [`MAX_QUERY_ATTEMPTS`].
     pub fn mark_failed(&mut self, request_id: u32) -> Option<EmberNodeId> {
         let failed = self.pending_requests.remove(&request_id);
         if let Some(node_id) = failed {
+            let spent = self.attempts.get(&node_id).copied().unwrap_or(MAX_QUERY_ATTEMPTS);
+            let retryable = spent < MAX_QUERY_ATTEMPTS;
             for entry in &mut self.shortlist {
                 if entry.contact.node_id == node_id {
-                    entry.state = NodeState::Failed;
+                    entry.state = if retryable {
+                        NodeState::Pending
+                    } else {
+                        NodeState::Failed
+                    };
                     break;
                 }
+            }
+            if retryable {
+                // Eligible for `next_to_query` again. The attempt count is
+                // kept, so this can only happen `MAX_QUERY_ATTEMPTS` times.
+                self.queried.remove(&node_id);
             }
         }
         self.check_complete();
@@ -663,6 +708,120 @@ mod tests {
         }
     }
 
+    /// A FOUND_VALUE blob shaped the way `process_response` validates it:
+    /// record type, the queried keyword hash at [1..17], a body, then the
+    /// 64-byte publisher signature.
+    fn value_blob(target: EmberNodeId, filler: u8) -> Vec<u8> {
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&target.0);
+        blob.extend_from_slice(&[filler; 16]);
+        blob.extend_from_slice(&[filler; 64]);
+        blob
+    }
+
+    /// Two peers holding the same record is the normal case for anything
+    /// worth finding, and a walk asks twenty of them. Counting each copy
+    /// against the result cap let one popular record end the search.
+    #[test]
+    fn the_same_record_from_two_peers_is_kept_once() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let a = make_contact(0xF0);
+        let b = make_contact(0xE0);
+        rt.add_contact(a.clone());
+        rt.add_contact(b.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+
+        let shared = value_blob(target, 0x11);
+        let only_b = value_blob(target, 0x22);
+        for (contact, req_id) in batch {
+            let records = if contact.node_id == b.node_id {
+                vec![shared.clone(), only_b.clone()]
+            } else {
+                vec![shared.clone()]
+            };
+            search.process_response(req_id, &contact.node_id, vec![], records);
+        }
+
+        assert_eq!(
+            search.results.len(),
+            2,
+            "the duplicate must not take a second slot"
+        );
+        assert!(search.results.iter().any(|r| r.data == shared));
+        assert!(search.results.iter().any(|r| r.data == only_b));
+    }
+
+    /// Dedup has to be by content, not by responder: a peer returning the
+    /// same blob twice in one response must not get two slots either.
+    #[test]
+    fn one_peer_repeating_itself_gains_nothing() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, req_id) = search.next_to_query().remove(0);
+
+        let blob = value_blob(target, 0x33);
+        search.process_response(req_id, &peer.node_id, vec![], vec![blob.clone(); 50]);
+
+        assert_eq!(search.results.len(), 1);
+    }
+
+    /// A timeout is not proof a node is gone. Giving up on the first miss
+    /// removed reachable peers from the walk on any lossy path.
+    #[test]
+    fn a_node_that_times_out_once_is_asked_again() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let (_, first) = search.next_to_query().remove(0);
+        assert_eq!(search.mark_failed(first), Some(peer.node_id));
+        assert!(!search.complete, "one miss must not end a one-peer search");
+
+        let retry = search.next_to_query();
+        assert_eq!(retry.len(), 1, "the node is eligible again");
+        assert_eq!(retry[0].0.node_id, peer.node_id);
+    }
+
+    /// Retry has to be bounded, or a dead node keeps a search alive forever.
+    #[test]
+    fn retries_are_capped_so_a_dead_node_ends_the_search() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        rt.add_contact(make_contact(0xF0));
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        for attempt in 1..=MAX_QUERY_ATTEMPTS {
+            let batch = search.next_to_query();
+            assert_eq!(batch.len(), 1, "attempt {attempt} should go out");
+            search.mark_failed(batch[0].1);
+        }
+
+        assert!(
+            search.next_to_query().is_empty(),
+            "the node is spent after {MAX_QUERY_ATTEMPTS} attempts"
+        );
+        assert!(search.poll_complete(), "and the search converges");
+    }
+
     #[test]
     fn keyword_hash_deterministic() {
         let h1 = keyword_hash("test");
@@ -890,6 +1049,12 @@ mod tests {
         // Blobs are `record_data || 64-byte sig` with keyword_hash at [1..17].
         let mut matching = vec![0u8; 17 + 64];
         matching[1..17].copy_from_slice(&target.0);
+        // A second, genuinely different record under the same key — two
+        // publishers, or one publisher with two files. Distinct content
+        // matters: identical blobs are deduplicated, so repeating one here
+        // would test the dedup rather than the keyword binding this covers.
+        let mut other_matching = matching.clone();
+        other_matching[17] = 0xAB;
         let mut mismatched = matching.clone();
         mismatched[1] ^= 0xFF;
 
@@ -897,9 +1062,13 @@ mod tests {
             *req_id,
             &make_id(0x80),
             vec![],
-            vec![matching.clone(), mismatched, matching],
+            vec![matching, mismatched, other_matching],
         );
 
-        assert_eq!(search.results.len(), 2);
+        assert_eq!(
+            search.results.len(),
+            2,
+            "both distinct records kept, the wrong-key one dropped"
+        );
     }
 }

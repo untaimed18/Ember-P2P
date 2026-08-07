@@ -1304,6 +1304,9 @@ pub enum UploadEventKind {
         aich_roots: Vec<([u8; 16], [u8; 20])>,
         ember_peers: Vec<(std::net::Ipv4Addr, u16)>,
         relay_attestations: Vec<crate::network::ember::RelayAttestation>,
+        /// Ember identity of the peer that sent this exchange, when its HELLO
+        /// bound one. See the matching field on `DownloadEvent::EmberSources`.
+        from_ember_hash: Option<[u8; 16]>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
     ///
@@ -9556,7 +9559,7 @@ impl UploadHandler {
                                 let ember_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
                                 let _ = self.upload_event_tx.send(UploadEvent {
                                     transfer_id: transfer_id.clone().unwrap_or_default(),
-                                    kind: UploadEventKind::EmberSources { entries: epx_entries, aich_roots, ember_peers, relay_attestations },
+                                    kind: UploadEventKind::EmberSources { entries: epx_entries, aich_roots, ember_peers, relay_attestations, from_ember_hash: peer_ember_hash },
                                 }).await;
                             }
                             Ok(_) => {}

@@ -64,7 +64,9 @@ for Ember mesh building. v2 and v3 payloads are still accepted.
 | Max relay attestations (ERAT trailer) | 16 |
 | Relay attestation max TTL | 30 minutes |
 
-Private/reserved IPs and zero-port entries are silently dropped. These caps prevent abuse from poisoned or malicious payloads.
+Private/reserved IPs and zero-port entries are silently dropped, as is our own address when a peer hands it back. These caps prevent abuse from poisoned or malicious payloads.
+
+The 64 KB ceiling applies to the TCP path, which streams. UDP EPX has to fit one Noise datagram, so it is packed to a separate, much smaller budget derived from the transport's frame size — the same files and sources in the same wire format, just fewer of them.
 
 TCP EPX ingest and send require the Ember HELLO handshake plus a verified BLAKE3 binding between the peer's advertised Ed25519 public key and its Ember hash. That binding is an offline consistency check rather than proof the peer holds the matching private key — an attacker who observed the pair on the wire can replay it — so it is deliberately a lower bar than the proof-of-possession required for chat, browse and other friend privileges. EPX carries source data only, bounded by the caps above, and never grants those privileges. UDP EPX (`ExchangeData`) requires an authenticated Noise_IK session. The per-source `relay-capable` flag is advisory only — relay candidates are admitted solely from verified ERAT trailers.
 

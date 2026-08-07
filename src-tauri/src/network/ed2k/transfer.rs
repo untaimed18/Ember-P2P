@@ -417,6 +417,12 @@ pub enum DownloadEvent {
         aich_roots: Vec<([u8; 16], [u8; 20])>,
         ember_peers: Vec<(std::net::Ipv4Addr, u16)>,
         relay_attestations: Vec<crate::network::ember::RelayAttestation>,
+        /// Ember identity of the peer that sent this exchange, when its HELLO
+        /// bound one. Carried so the connection broker can charge any relay
+        /// attestations in the trailer to whoever introduced them — the
+        /// per-introducer cap is what stops one peer filling the relay pool
+        /// with self-signed entries, and it needs a name to charge.
+        from_ember_hash: Option<[u8; 16]>,
     },
     /// An Ember peer was detected (for peer discovery mesh bootstrap).
     ///
@@ -1709,6 +1715,7 @@ impl Ed2kDownload {
                                     aich_roots,
                                     ember_peers: epx_peers,
                                     relay_attestations,
+                                    from_ember_hash: peer_ember_hash,
                                 })
                                 .await;
                         }
@@ -2424,6 +2431,7 @@ impl Ed2kDownload {
                                         aich_roots,
                                         ember_peers,
                                         relay_attestations,
+                                        from_ember_hash: peer_ember_hash,
                                     })
                                     .await;
                             }
@@ -4202,6 +4210,7 @@ impl Ed2kDownload {
                                                 aich_roots,
                                                 ember_peers,
                                                 relay_attestations,
+                                                from_ember_hash: peer_ember_hash,
                                             })
                                             .await;
                                     }

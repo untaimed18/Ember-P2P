@@ -4760,6 +4760,7 @@ async fn download_parts_from_source(
                                     aich_roots,
                                     ember_peers: epx_peers,
                                     relay_attestations,
+                                    from_ember_hash: peer_ember_hash,
                                 })
                                 .await;
                         }
@@ -5485,6 +5486,7 @@ async fn download_parts_from_source(
                                 aich_roots,
                                 ember_peers: epx_peers,
                                 relay_attestations,
+                                from_ember_hash: peer_ember_hash,
                             })
                             .await;
                     }
@@ -7896,6 +7898,7 @@ async fn download_parts_from_source(
                                                 aich_roots,
                                                 ember_peers,
                                                 relay_attestations,
+                                                from_ember_hash: peer_ember_hash,
                                             })
                                             .await;
                                     }

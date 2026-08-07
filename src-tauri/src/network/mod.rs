@@ -1503,6 +1503,9 @@ async fn handle_epx_sources(
     aich_roots: &[([u8; 16], [u8; 20])],
     ember_peers: &[(Ipv4Addr, u16)],
     relay_attestations: &[ember::RelayAttestation],
+    // Ember identity of the peer this exchange came from, when one is bound.
+    // Only used to charge relay attestations to an introducer.
+    from_ember_hash: Option<[u8; 16]>,
     label: &str,
 ) -> usize {
     state.ember_diagnostics.epx_events_received = state
@@ -1520,11 +1523,21 @@ async fn handle_epx_sources(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // `None`: this layer has no Ember identity for the exchanging peer, and
-    // unlike a friend's forward, reaching this path at all requires sharing a
-    // swarm with us. The per-introducer cap targets gossip, which removed that
-    // barrier; EPX candidates stay bounded by the global cap as before.
-    admit_relay_attestations(state, relay_attestations, now_unix, None, label);
+    // Charged to the peer that sent them, exactly as a friend's forwarded
+    // offer is. Passing `None` here left EPX outside the per-introducer cap on
+    // the grounds that reaching this path requires sharing a swarm with us —
+    // but the global pool is small and evicts oldest-first, so one bound peer
+    // could fill it with self-signed attestations and displace every relay
+    // learned elsewhere. Sharing a swarm bounds who can try, not how much one
+    // of them gets. A peer whose HELLO bound no identity stays uncharged and
+    // is still held by the global cap alone.
+    admit_relay_attestations(
+        state,
+        relay_attestations,
+        now_unix,
+        from_ember_hash,
+        label,
+    );
 
     for (file_hash, sources) in entries {
         total_sources_offered += sources.len();
@@ -1556,6 +1569,15 @@ async fn handle_epx_sources(
                 && (state.firewalled || state.low_id)
                 && flags & ember::SOURCE_FLAG_RELAY_CAPABLE == 0
             {
+                total_sources_filtered += 1;
+                continue;
+            }
+            // Our own address, handed back to us. EPX has no provenance, so
+            // sources we advertise reach peers that then advertise them on,
+            // and one of those hops eventually points at us — leaving a
+            // download dialling itself. The DHT source path already drops
+            // self this way (`parse_ember_source_records`); EPX did not.
+            if Some(ip) == state.external_ip {
                 total_sources_filtered += 1;
                 continue;
             }
@@ -16182,8 +16204,8 @@ pub async fn start_network(
                     }
                 }
                 // Inject Ember Peer Exchange sources into matching active downloads
-                if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, &format!("download {transfer_id}")).await;
+                if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event {
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}")).await;
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port, udp_port } = event {
@@ -17064,8 +17086,8 @@ pub async fn start_network(
                 }
 
                 // Inject Ember Peer Exchange sources from upload-side peers
-                if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations } = event.kind {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, "upload").await;
+                if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event.kind {
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload").await;
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port, udp_port } = event.kind {
@@ -29849,6 +29871,8 @@ pub async fn start_network(
                         &[],
                         &[],
                         &[],
+                        // Our own DHT lookup results, not a peer's forward.
+                        None,
                         "ember-dht",
                     )
                     .await;
@@ -32336,6 +32360,16 @@ async fn handle_ember_native_udp_inner(
                     let (entries, aich_roots) = ed2k::transfer::epx_result_to_entries(&result);
                     let ember_peers: Vec<(Ipv4Addr, u16)> =
                         result.peers.iter().map(|p| (p.ip, p.tcp_port)).collect();
+                    // The Noise session proves who we are talking to but
+                    // carries no Ember identity, so any relay attestations are
+                    // charged against the routing table's binding for this
+                    // address. A peer we hold no contact for stays uncharged,
+                    // bounded by the global relay-pool cap alone.
+                    let from_ember_hash = state
+                        .ember_dht
+                        .routing()
+                        .contact_at(from)
+                        .map(|c| c.node_id.0);
                     let injected = handle_epx_sources(
                         state,
                         transfer_manager,
@@ -32345,6 +32379,7 @@ async fn handle_ember_native_udp_inner(
                         &aich_roots,
                         &ember_peers,
                         &result.relay_attestations,
+                        from_ember_hash,
                         "ember-udp",
                     )
                     .await;
