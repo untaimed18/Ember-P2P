@@ -859,7 +859,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.4.0</h3>
+      <h3>Get Ember 1.4.1</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1367,6 +1367,49 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-4-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.4.1" target="_blank" rel="noopener">Ember v1.4.1</a></h3>
+        <time class="release-date" datetime="2026-08-07">August 7, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.4.1" target="_blank" rel="noopener"><code>v1.4.1</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <p>A follow-up to the Ember Network beta, from an audit of the EPX and Ember DHT code. Most of what it fixes was invisible: a source exchange that quietly never answered, a routing table that spent its whole budget on peers it had never heard from, and paths that failed without leaving a trace anyone could see.</p>
+
+        <h5>Source exchange (EPX)</h5>
+        <ul>
+          <li><strong>UDP exchanges are answered again</strong> &mdash; The payload sent over UDP was built for the TCP path, where size is not limited. On any client with a real download list it was too big for a single packet and was dropped before sending, so an active peer never answered a UDP source exchange. It is now built to fit, sending fewer files rather than nothing</li>
+          <li><strong>Your own address is no longer accepted back</strong> &mdash; Sources travel peer to peer, so one eventually came back pointing at you, leaving a download trying to connect to itself</li>
+          <li><strong>Relay offers are charged to whoever sent them</strong> &mdash; A single peer could fill the relay list with entries it made up and push out the relays learned elsewhere. Each peer now has a share, as forwarded friend offers already did</li>
+        </ul>
+
+        <h5>Ember Network</h5>
+        <ul>
+          <li><strong>Searches find more</strong> &mdash; A popular file is held by many peers, and every copy it returned used one of the 300 result slots. Copies are now counted once, so a common file no longer crowds out everything else in the results</li>
+          <li><strong>A missed reply is not the end</strong> &mdash; A peer that failed to answer once was dropped from that search for good, even though a single lost packet is enough to cause it. It gets a second chance</li>
+          <li><strong>Known-good peers stay known-good</strong> &mdash; Peers that had answered were being pushed aside by ones merely heard about, so the connections actually in use went stale and were dropped. They are now kept up to date, while new leads still get checked</li>
+          <li><strong>Harder to crowd out</strong> &mdash; Being told about a flood of peers no longer tightens the limits that decide who is let in, which had made it harder to accept real ones. Storage similarly makes room for files it is genuinely responsible for instead of turning them away once full</li>
+        </ul>
+
+        <h5>Diagnostics</h5>
+        <ul>
+          <li>The Ember Network page gains counters for source exchanges, how many offered sources are used versus filtered, replies too large for UDP, and storage rejections &mdash; each covering a path that previously failed silently</li>
+        </ul>
+
+        <h5>Documentation</h5>
+        <ul>
+          <li>The EPX section described a stronger identity check than the code performs. Source exchange requires the Ember handshake and a key that matches the advertised identity; chat, browsing and other friend features continue to require full proof of key ownership</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.4.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.4.1</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-4-0">
       <div class="release-header">
