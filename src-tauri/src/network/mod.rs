@@ -1561,43 +1561,27 @@ async fn handle_epx_sources(
                     "EPX source {ip}:{port} advertised relay-capable; not treating flag as relay admission (attestation trailer required)"
                 );
             }
-            // Skip LowID↔LowID for plain firewalled sources (no Ember relay
-            // path). When `SOURCE_FLAG_RELAY_CAPABLE` is set (Ember DHT / EPX
-            // slice 15), keep the source so it stays eligible for the
-            // KAD-callback broker path instead of being dropped outright.
-            if flags & ember::SOURCE_FLAG_FIREWALLED != 0
-                && (state.firewalled || state.low_id)
-                && flags & ember::SOURCE_FLAG_RELAY_CAPABLE == 0
-            {
+            // Whether this source is worth having is decided in
+            // `ember::ingest`, which takes only the facts it depends on and so
+            // can be exercised without a `NetworkState`. Scoped: it borrows
+            // three fields mutably, and the injection below needs the state
+            // back.
+            let verdict = {
+                let mut admission = ember::ingest::SourceAdmission {
+                    we_are_unreachable: state.firewalled || state.low_id,
+                    external_ip: state.external_ip,
+                    dead_sources: &mut state.dead_sources,
+                    ip_filter: &mut state.ip_filter,
+                    banned_ips: &state.banned_ips,
+                };
+                admission.check(file_hash, ip, port, flags)
+            };
+            if let Err(reason) = verdict {
                 total_sources_filtered += 1;
-                continue;
-            }
-            // Our own address, handed back to us. EPX has no provenance, so
-            // sources we advertise reach peers that then advertise them on,
-            // and one of those hops eventually points at us — leaving a
-            // download dialling itself. The DHT source path already drops
-            // self this way (`parse_ember_source_records`); EPX did not.
-            if Some(ip) == state.external_ip {
-                total_sources_filtered += 1;
-                continue;
-            }
-            if state
-                .dead_sources
-                .is_dead_source_for_file(file_hash, u32::from(ip), port)
-            {
-                total_sources_filtered += 1;
-                continue;
-            }
-            // Same IP policy as `inject_source_into_active_transfers`:
-            // `IpFilter::is_blocked` (bogus / optional private / ranges)
-            // plus the live banlist. Do not use unconditional
-            // `is_special_use_v4` — that ignores `block_private_ips`.
-            if state.ip_filter.is_blocked(ip) {
-                total_sources_filtered += 1;
-                continue;
-            }
-            if state.banned_ips.contains(&ip) {
-                total_sources_filtered += 1;
+                debug!(
+                    "EPX source {ip}:{port} dropped ({}) from {label}",
+                    reason.as_str()
+                );
                 continue;
             }
             // Only reuse connect_options / user_hash already known from
@@ -6453,6 +6437,104 @@ mod tests {
         let ip = Ipv4Addr::new(1, 2, 3, 4);
         assert!(record_known_ember_peer(&mut map, ip, 4662));
         assert_eq!(map.len(), 1);
+    }
+
+    fn udp_peer(last: u8) -> SocketAddr {
+        SocketAddr::from(([80, 2, 2, last], 4672))
+    }
+
+    /// The budget a peer gets before its UDP exchanges are refused. Answering
+    /// one costs a payload build and a send, so an unmetered peer could make
+    /// us do that work as fast as it can ask.
+    #[test]
+    fn udp_epx_allows_a_peers_budget_then_refuses() {
+        let mut map = HashMap::new();
+        let addr = udp_peer(1);
+
+        for attempt in 1..=ember::MAX_EPX_PACKETS_PER_CONNECTION {
+            assert!(
+                check_and_record_udp_epx_rate(&mut map, addr),
+                "request {attempt} is within budget"
+            );
+        }
+        assert!(
+            !check_and_record_udp_epx_rate(&mut map, addr),
+            "one past the budget must be refused"
+        );
+    }
+
+    /// Budgets are per address, so a noisy peer cannot mute a quiet one.
+    #[test]
+    fn udp_epx_budgets_are_not_shared_between_peers() {
+        let mut map = HashMap::new();
+        let noisy = udp_peer(2);
+        for _ in 0..=ember::MAX_EPX_PACKETS_PER_CONNECTION {
+            check_and_record_udp_epx_rate(&mut map, noisy);
+        }
+        assert!(!check_and_record_udp_epx_rate(&mut map, noisy));
+
+        assert!(
+            check_and_record_udp_epx_rate(&mut map, udp_peer(3)),
+            "a different peer starts with its own budget"
+        );
+    }
+
+    /// The window rolls: a peer that waited out its window is served again,
+    /// which is what keeps the limit from permanently muting a legitimate
+    /// peer whose re-send cadence happens to line up with it.
+    #[test]
+    fn udp_epx_budget_refills_after_the_window() {
+        let mut map = HashMap::new();
+        let addr = udp_peer(4);
+        for _ in 0..ember::MAX_EPX_PACKETS_PER_CONNECTION {
+            assert!(check_and_record_udp_epx_rate(&mut map, addr));
+        }
+        assert!(!check_and_record_udp_epx_rate(&mut map, addr));
+
+        // Back-date the window rather than sleeping through five minutes.
+        let stale = std::time::Instant::now()
+            .checked_sub(EPX_UDP_RATE_WINDOW)
+            .expect("clock far enough from boot to back-date");
+        map.get_mut(&addr).unwrap().1 = stale;
+
+        assert!(
+            check_and_record_udp_epx_rate(&mut map, addr),
+            "the window has rolled, so the peer is served again"
+        );
+        assert_eq!(
+            map.get(&addr).unwrap().0,
+            1,
+            "and its budget starts over rather than resuming mid-window"
+        );
+    }
+
+    /// The map is capped so a flood of distinct addresses cannot grow it
+    /// without bound. The cost, worth stating explicitly: eviction is by age,
+    /// so a large enough flood can push out a real peer's counter and hand it
+    /// a fresh budget. Memory is the bound being defended here, not fairness.
+    #[test]
+    fn udp_epx_rate_map_is_bounded_by_evicting_the_oldest() {
+        let mut map = HashMap::new();
+        let first = SocketAddr::from(([10, 0, 0, 1], 4672));
+        assert!(check_and_record_udp_epx_rate(&mut map, first));
+
+        for i in 0..MAX_EMBER_UDP_EPX_RATE_ENTRIES {
+            let i = i as u32;
+            let addr = SocketAddr::from((
+                [11, (i >> 16) as u8, (i >> 8) as u8, (i & 0xFF) as u8],
+                4672,
+            ));
+            check_and_record_udp_epx_rate(&mut map, addr);
+        }
+
+        assert!(
+            map.len() <= MAX_EMBER_UDP_EPX_RATE_ENTRIES,
+            "the map must stay within its cap"
+        );
+        assert!(
+            !map.contains_key(&first),
+            "the oldest entry is the one given up"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod broker;
 pub mod crypto;
+pub mod ingest;
 pub mod mapping_keepalive;
 pub mod nat;
 pub mod quic;
