@@ -718,6 +718,33 @@ pub struct EmberDiagnostics {
     /// set behind the Library's Ember badge, so the two cannot disagree.
     #[serde(default)]
     pub ember_dht_published_files: u32,
+    /// Every source listed in an EPX payload we accepted, before any
+    /// filtering. The denominator for EPX yield: compare against
+    /// `NetworkStats::epx_sources_received`, which counts only the sources
+    /// that reached a live download. A large gap means we are spending
+    /// bandwidth on exchanges that tell us nothing.
+    #[serde(default)]
+    pub epx_sources_offered: u32,
+    /// EPX sources for a file we *are* downloading that were still dropped —
+    /// IP-filtered, banned, known-dead, or an unreachable LowID peer. Distinct
+    /// from the much larger set we skip because the file is not ours: this
+    /// counts sources a peer thought were worth sending and we judged unusable,
+    /// so a peer feeding us junk shows up here rather than silently.
+    #[serde(default)]
+    pub epx_sources_filtered: u32,
+    /// UDP EPX replies dropped before sending because the payload could not
+    /// fit one Ember datagram. The TCP builder has no per-datagram ceiling and
+    /// there is no fragmentation here, so on a node with a busy download list
+    /// this can be *every* reply — a silent no-op that otherwise looks
+    /// identical to having no peers ask.
+    #[serde(default)]
+    pub epx_udp_oversized_skipped: u32,
+    /// Inbound DHT records refused because the store is holding its maximum
+    /// number of distinct keys. Unlike the byte budget there is no eviction
+    /// here, so a sustained count means new keys — including ones this node is
+    /// genuinely closest to — are being turned away.
+    #[serde(default)]
+    pub ember_dht_store_key_cap_rejections: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

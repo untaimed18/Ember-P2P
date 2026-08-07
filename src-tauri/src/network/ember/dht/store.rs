@@ -119,6 +119,10 @@ pub struct DhtStore {
     /// Resident-byte ceiling. A field rather than a constant so tests can
     /// exercise eviction without signing tens of thousands of records.
     byte_budget: usize,
+    /// Records refused because [`MAX_KEYS`] distinct keys are already held.
+    /// Unlike the byte budget this cap has no eviction path, so it is the one
+    /// store limit that can turn away a key we are genuinely closest to.
+    key_cap_rejections: u64,
 }
 
 impl DhtStore {
@@ -130,7 +134,13 @@ impl DhtStore {
             bytes: 0,
             local_id: None,
             byte_budget: MAX_STORE_BYTES,
+            key_cap_rejections: 0,
         }
+    }
+
+    /// Cumulative count of records refused for want of a free key slot.
+    pub fn key_cap_rejections(&self) -> u64 {
+        self.key_cap_rejections
     }
 
     /// Track how permissive the abuse limits should currently be.
@@ -312,6 +322,7 @@ impl DhtStore {
         }
 
         if self.entries.len() >= MAX_KEYS && !self.entries.contains_key(&key) {
+            self.key_cap_rejections = self.key_cap_rejections.saturating_add(1);
             debug!("DHT store full ({MAX_KEYS} keys), rejecting new key");
             return false;
         }

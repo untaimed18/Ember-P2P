@@ -1512,6 +1512,8 @@ async fn handle_epx_sources(
 
     let mut total_injected = 0usize;
     let mut total_sources_this_event = 0usize;
+    let mut total_sources_offered = 0usize;
+    let mut total_sources_filtered = 0usize;
     let mut per_hash_persisted: HashMap<String, u32> = HashMap::new();
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1525,6 +1527,7 @@ async fn handle_epx_sources(
     admit_relay_attestations(state, relay_attestations, now_unix, None, label);
 
     for (file_hash, sources) in entries {
+        total_sources_offered += sources.len();
         let matching_ids = {
             let mgr = transfer_manager.read().await;
             let hash_hex = hex::encode(file_hash);
@@ -1553,12 +1556,14 @@ async fn handle_epx_sources(
                 && (state.firewalled || state.low_id)
                 && flags & ember::SOURCE_FLAG_RELAY_CAPABLE == 0
             {
+                total_sources_filtered += 1;
                 continue;
             }
             if state
                 .dead_sources
                 .is_dead_source_for_file(file_hash, u32::from(ip), port)
             {
+                total_sources_filtered += 1;
                 continue;
             }
             // Same IP policy as `inject_source_into_active_transfers`:
@@ -1566,9 +1571,11 @@ async fn handle_epx_sources(
             // plus the live banlist. Do not use unconditional
             // `is_special_use_v4` — that ignores `block_private_ips`.
             if state.ip_filter.is_blocked(ip) {
+                total_sources_filtered += 1;
                 continue;
             }
             if state.banned_ips.contains(&ip) {
+                total_sources_filtered += 1;
                 continue;
             }
             // Only reuse connect_options / user_hash already known from
@@ -1716,6 +1723,18 @@ async fn handle_epx_sources(
         state.stats.ember_peers = state.known_ember_peers.len() as u32;
         state.ember_payload_dirty = true;
     }
+
+    // Recorded whether or not anything was injected: an exchange that offered
+    // hundreds of sources and yielded none is the case worth seeing, and it is
+    // indistinguishable from a quiet network without these.
+    state.ember_diagnostics.epx_sources_offered = state
+        .ember_diagnostics
+        .epx_sources_offered
+        .saturating_add(total_sources_offered as u32);
+    state.ember_diagnostics.epx_sources_filtered = state
+        .ember_diagnostics
+        .epx_sources_filtered
+        .saturating_add(total_sources_filtered as u32);
 
     if total_injected > 0 {
         state.stats.epx_sources_received = state
@@ -32242,6 +32261,10 @@ async fn handle_ember_native_udp_inner(
             let epx_udp_budget =
                 ember::transport::MAX_EMBER_DATAGRAM_BYTES.saturating_sub(EPX_UDP_OVERHEAD_BUDGET);
             if payload_arc.len() > epx_udp_budget {
+                state.ember_diagnostics.epx_udp_oversized_skipped = state
+                    .ember_diagnostics
+                    .epx_udp_oversized_skipped
+                    .saturating_add(1);
                 debug!(
                     "ember-udp: EPX payload too large for a single UDP datagram ({} bytes > {epx_udp_budget} budget); skipping ExchangeData reply to {from}",
                     payload_arc.len(),
@@ -34047,6 +34070,10 @@ async fn handle_ember_dht_message(
             .ember_dht_store_replays
             .saturating_add(1);
     }
+
+    // Cumulative on the store itself, so this mirrors rather than accumulates.
+    state.ember_diagnostics.ember_dht_store_key_cap_rejections =
+        state.ember_dht.store_key_cap_rejections() as u32;
 
     if let Some(err) = inbound.error {
         state.ember_diagnostics.ember_dht_malformed = state

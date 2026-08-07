@@ -34,6 +34,12 @@ use crate::network::ember::SOURCE_FLAG_FIREWALLED;
 const STORE_SIG_REPLAY_TTL: Duration = Duration::from_secs(60);
 const MAX_STORE_SIG_CACHE: usize = 50_000;
 
+/// Share of the liveness-ping budget held for unverified leads when there are
+/// enough verified contacts due to spend the whole thing. One in four: enough
+/// that gossip keeps being promoted once the table is healthy, small enough
+/// that the contacts we actually route through stay refreshed.
+const LEAD_PING_RESERVE_DIVISOR: usize = 4;
+
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
 pub struct DhtInbound {
@@ -646,6 +652,12 @@ impl EmberDht {
         (self.store.key_count(), self.store.total_records())
     }
 
+    /// Cumulative records the local store refused because it is already
+    /// holding its maximum number of distinct keys.
+    pub fn store_key_cap_rejections(&self) -> u64 {
+        self.store.key_cap_rejections()
+    }
+
     /// Snapshot of live store keys for the diagnostic UI (capped).
     pub fn store_entries(&self, max: usize) -> Vec<DhtStoreEntry> {
         self.store.snapshot(max)
@@ -702,8 +714,19 @@ impl EmberDht {
     }
 
     /// Contacts to liveness-ping this cycle: those not heard from in more
-    /// than `threshold_secs` (or all, oldest first, when `force`), capped
-    /// at `max`.
+    /// than `threshold_secs` (or all, when `force`), capped at `max`.
+    ///
+    /// Verified contacts and unverified leads draw on separate shares of the
+    /// budget. Leads arrive with `last_seen == 0`, so ranking the two together
+    /// by staleness placed every lead ahead of every proven contact and left
+    /// nothing to refresh the table with: a node that had finished joining
+    /// spent its whole budget re-probing gossip while the contacts it actually
+    /// routes through aged past the timeout and were evicted.
+    ///
+    /// Leads keep a reserved minority share and take everything the verified
+    /// side does not claim, so a starved table — few verified contacts, many
+    /// leads — still spends nearly the whole (deliberately wider) budget
+    /// finding out which leads are real.
     pub fn contacts_due_for_ping(
         &self,
         now: i64,
@@ -711,14 +734,28 @@ impl EmberDht {
         max: usize,
         force: bool,
     ) -> Vec<EmberContact> {
-        let mut due: Vec<EmberContact> = self
+        if max == 0 {
+            return Vec::new();
+        }
+        let (mut leads, mut verified): (Vec<EmberContact>, Vec<EmberContact>) = self
             .routing
             .all_contacts()
             .into_iter()
-            .filter(|c| force || (now - c.last_seen) > threshold_secs)
+            .filter(|c| force || !c.is_verified() || (now - c.last_seen) > threshold_secs)
+            .partition(|c| !c.is_verified());
+
+        verified.sort_by_key(|c| c.last_seen); // stalest first
+        // Leads have no staleness to rank by, so prefer those we have not
+        // already failed against: a wall of dead gossip would otherwise hold
+        // the reserve until it faults out, keeping fresh leads unprobed.
+        leads.sort_by_key(|c| c.failed_queries);
+
+        let lead_reserve = max.div_ceil(LEAD_PING_RESERVE_DIVISOR).min(leads.len());
+        let mut due: Vec<EmberContact> = verified
+            .into_iter()
+            .take(max - lead_reserve)
             .collect();
-        due.sort_by_key(|c| c.last_seen); // stalest first
-        due.truncate(max);
+        due.extend(leads.into_iter().take(max - due.len()));
         due
     }
 
@@ -1118,6 +1155,118 @@ mod tests {
 
     fn addr(last: u8, port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, last], port))
+    }
+
+    /// A contact that lands in bucket `bucket` — one bit of XOR distance from
+    /// us — in its own /24. Both matter: a k-bucket holds only
+    /// [`K_BUCKET_SIZE`] contacts, and subnet diversity refuses crowding, so
+    /// contacts minted from a running counter would mostly never be admitted.
+    fn contact_in_bucket(local: EmberNodeId, bucket: usize, last_seen: i64) -> EmberContact {
+        let mut id = local.0;
+        id[15 - bucket / 8] ^= 1 << (bucket % 8);
+        let b = bucket as u8;
+        EmberContact {
+            node_id: EmberNodeId(id),
+            addr: SocketAddr::from(([80, 1, b.wrapping_add(1), 1], 4672)),
+            noise_pub: [b; 32],
+            ed25519_pub: [b; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    }
+
+    /// Gossip and on-disk contacts arrive with `last_seen == 0`. Ranking them
+    /// against proven contacts by staleness put every one of them first, so a
+    /// joined node spent its entire ping budget re-probing leads while the
+    /// contacts it routes through aged out.
+    #[test]
+    fn leads_cannot_crowd_verified_contacts_out_of_the_ping_budget() {
+        let mut d = dht(11);
+        let local = d.local_id();
+        let now = 100_000i64;
+        // Stale enough to be due, and far more leads than the budget.
+        for bucket in 0..6 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, now - 5_000)));
+        }
+        for bucket in 10..51 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, 0)));
+        }
+
+        let due = d.contacts_due_for_ping(now, 600, 8, false);
+        assert_eq!(due.len(), 8, "the whole budget should be spent");
+
+        let verified = due.iter().filter(|c| c.is_verified()).count();
+        assert_eq!(
+            verified, 6,
+            "every due verified contact must be pinged before leads take the rest"
+        );
+        assert_eq!(due.len() - verified, 2, "leads keep only their reserve");
+    }
+
+    /// The reserve is a floor for leads, not a ceiling: while the table is
+    /// starved there are few verified contacts to spend the (deliberately
+    /// wider) budget on, and it should go to finding out which leads are real.
+    #[test]
+    fn a_starved_table_still_spends_its_budget_on_leads() {
+        let mut d = dht(12);
+        let local = d.local_id();
+        let now = 100_000i64;
+        assert!(d.add_contact(contact_in_bucket(local, 0, now - 5_000)));
+        for bucket in 10..51 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, 0)));
+        }
+
+        let due = d.contacts_due_for_ping(now, 600, 32, false);
+        assert_eq!(due.len(), 32);
+        assert_eq!(
+            due.iter().filter(|c| !c.is_verified()).count(),
+            31,
+            "the one verified contact aside, the budget should go to leads"
+        );
+    }
+
+    /// A verified contact still inside the freshness window is not due, so it
+    /// must not consume budget that a lead could use.
+    #[test]
+    fn fresh_verified_contacts_are_not_due_for_a_ping() {
+        let mut d = dht(13);
+        let local = d.local_id();
+        let now = 100_000i64;
+        for bucket in 0..6 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, now - 10)));
+        }
+        for bucket in 10..16 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, 0)));
+        }
+
+        let due = d.contacts_due_for_ping(now, 600, 8, false);
+        assert!(
+            due.iter().all(|c| !c.is_verified()),
+            "only the leads are due"
+        );
+        assert_eq!(due.len(), 6, "and there are only six of them");
+    }
+
+    /// Dead gossip accumulates failures before eviction; it must not hold the
+    /// lead reserve against leads we have never tried.
+    #[test]
+    fn untried_leads_are_probed_before_ones_already_failing() {
+        let mut d = dht(14);
+        let local = d.local_id();
+        let now = 100_000i64;
+        for bucket in 10..21 {
+            let mut c = contact_in_bucket(local, bucket, 0);
+            c.failed_queries = 2;
+            assert!(d.add_contact(c));
+        }
+        let fresh = contact_in_bucket(local, 30, 0);
+        assert!(d.add_contact(fresh.clone()));
+
+        let due = d.contacts_due_for_ping(now, 600, 4, false);
+        assert!(
+            due.iter().any(|c| c.node_id == fresh.node_id),
+            "an untried lead must outrank ones that have already missed"
+        );
     }
 
     /// Publishing sends `STORE_RECORD` only to *other* contacts, so a node

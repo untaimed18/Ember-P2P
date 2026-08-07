@@ -99,9 +99,24 @@ impl RoutingTable {
         }
     }
 
-    /// Current permissiveness of the diversity limits, from table occupancy.
+    /// Current permissiveness of the diversity limits, from how much of the
+    /// network we have actually reached.
+    ///
+    /// Counted in verified contacts rather than table occupancy. A table
+    /// padded with leads we have only been told about is not diversity, and
+    /// counting it as such drove the limits to their strict tier while the
+    /// node still had almost no peer it could reach — refusing real contacts
+    /// at precisely the moment the permissive tier exists to admit them, and
+    /// letting anyone who can gossip at us provoke it. Every other reading of
+    /// "how much network do we have" — the liveness-ping budget, the KAD
+    /// bridge cutoff, the rendezvous lookup — already counts verified only.
+    ///
+    /// The cost is that a node under a gossip flood stays permissive for
+    /// longer, so leads are admitted up to the looser per-IP cap. That is
+    /// bounded by the per-bucket subnet limit, and by eviction: a lead that
+    /// never answers a liveness ping faults out after `MAX_FAILED_QUERIES`.
     pub fn scale(&self) -> scale::NetworkScale {
-        scale::NetworkScale::from_contacts(self.total_contacts())
+        scale::NetworkScale::from_contacts(self.verified_len())
     }
 
     /// Share the user's range filter so blocked addresses are refused on
@@ -1540,6 +1555,63 @@ mod tests {
             );
         }
         assert_eq!(rt.total_contacts(), 3);
+    }
+
+    /// Gossip is cheap to send and proves nothing. Sizing the abuse limits by
+    /// raw occupancy let anyone who could talk at us push the table to its
+    /// strict tier, so a node that had reached almost no real peer started
+    /// refusing them — the opposite of what the permissive tier is for.
+    /// A contact one bit of XOR distance from `local`, so each `bucket` gets
+    /// its own occupant rather than all of them crowding into one, in its own
+    /// /24 so the diversity caps never refuse it.
+    fn contact_in_bucket(local: EmberNodeId, bucket: usize, last_seen: i64) -> EmberContact {
+        let mut id = local.0;
+        id[15 - bucket / 8] ^= 1 << (bucket % 8);
+        let b = bucket as u8;
+        EmberContact {
+            node_id: EmberNodeId(id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, b.wrapping_add(1), 1)), 4672),
+            noise_pub: [b; 32],
+            ed25519_pub: [b; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    }
+
+    #[test]
+    fn unverified_gossip_does_not_tighten_the_limits() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // Never heard from: leads, exactly as gossip arrives.
+        for bucket in 0..120 {
+            rt.add_contact(contact_in_bucket(local, bucket, 0));
+        }
+
+        assert!(
+            rt.total_contacts() > K_BUCKET_SIZE * 4,
+            "the table is padded well past the strict threshold"
+        );
+        assert_eq!(rt.verified_len(), 0, "but none of it has answered us");
+        assert_eq!(
+            rt.scale(),
+            scale::NetworkScale::Bootstrap,
+            "limits must follow contacts we have reached, not ones we were told about"
+        );
+    }
+
+    /// The flip side: once contacts genuinely answer, the limits do tighten.
+    #[test]
+    fn verified_contacts_tighten_the_limits() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        for bucket in 0..120 {
+            rt.add_contact(contact_in_bucket(local, bucket, 1_700_000_000));
+        }
+
+        assert!(rt.verified_len() >= K_BUCKET_SIZE * 4);
+        assert_eq!(rt.scale(), scale::NetworkScale::Established);
     }
 
     /// The private-IP setting is a user preference that can change at runtime,

@@ -358,6 +358,28 @@ export interface EmberDiagnostics {
    * Ember badge.
    */
   ember_dht_published_files: number;
+  /**
+   * Every source listed in an EPX payload we accepted, before filtering. The
+   * denominator for EPX yield — compare against `epx_sources_received` on
+   * `NetworkStats`, which counts only those that reached a live download.
+   */
+  epx_sources_offered?: number;
+  /**
+   * EPX sources for a file we are downloading that were still dropped as
+   * IP-filtered, banned, known-dead, or an unreachable LowID peer. A peer
+   * feeding us junk shows up here.
+   */
+  epx_sources_filtered?: number;
+  /**
+   * UDP EPX replies dropped before sending because the payload could not fit
+   * one Ember datagram. Otherwise indistinguishable from nobody asking.
+   */
+  epx_udp_oversized_skipped?: number;
+  /**
+   * Inbound DHT records refused because the store already holds its maximum
+   * number of distinct keys. This cap has no eviction path.
+   */
+  ember_dht_store_key_cap_rejections?: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
