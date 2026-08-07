@@ -5074,7 +5074,7 @@ async fn download_parts_from_source(
         }
     }
 
-    // Ember Peer Exchange: only share sources after Ed25519 PoP.
+    // Ember Peer Exchange: share sources after HELLO hash↔pubkey binding.
     // Snapshot the generation we sent so the periodic-resend loop below
     // can correctly detect rebuilds during file-status-wait / queue-wait.
     info!(
@@ -7858,7 +7858,8 @@ async fn download_parts_from_source(
                             ),
                         }
                     }
-                    // Ember-only; gated on `hello_caps.is_ember` + PoP (see upload.rs).
+                    // EPX is Ember-only; gate on HELLO + hash↔pubkey binding.
+                    // Friend privileges still require PoP / secure_v2.
                     (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                         if hello_caps.is_ember && ember_hash_binding_verified =>
                     {

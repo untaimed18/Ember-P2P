@@ -2386,7 +2386,8 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
+                // EPX is Ember-only; gate on HELLO + hash↔pubkey binding.
+                // Friend privileges still require PoP / secure_v2.
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                     if peer_is_ember && ember_hash_binding_verified =>
                 {
@@ -4164,7 +4165,8 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        // Ember-only; gated on `peer_is_ember` + PoP (see upload.rs).
+                        // EPX is Ember-only; gate on HELLO + hash↔pubkey binding.
+                        // Friend privileges still require PoP / secure_v2.
                         (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                             if peer_is_ember && ember_hash_binding_verified =>
                         {

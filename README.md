@@ -66,7 +66,7 @@ for Ember mesh building. v2 and v3 payloads are still accepted.
 
 Private/reserved IPs and zero-port entries are silently dropped. These caps prevent abuse from poisoned or malicious payloads.
 
-TCP EPX ingest and send require Ed25519 proof-of-possession on the session (same bar as Ember chat/browse). UDP EPX (`ExchangeData`) requires an authenticated Noise_IK session. The per-source `relay-capable` flag is advisory only — relay candidates are admitted solely from verified ERAT trailers.
+TCP EPX ingest and send require the Ember HELLO handshake plus a verified BLAKE3 binding between the peer's advertised Ed25519 public key and its Ember hash. That binding is an offline consistency check rather than proof the peer holds the matching private key — an attacker who observed the pair on the wire can replay it — so it is deliberately a lower bar than the proof-of-possession required for chat, browse and other friend privileges. EPX carries source data only, bounded by the caps above, and never grants those privileges. UDP EPX (`ExchangeData`) requires an authenticated Noise_IK session. The per-source `relay-capable` flag is advisory only — relay candidates are admitted solely from verified ERAT trailers.
 
 ### ERAT — relay attestation trailer (v4)
 
@@ -90,7 +90,7 @@ Attestations are verified before the connection broker records a relay candidate
 
 ### Backward compatibility
 
-Non-Ember eMule clients silently ignore the `0xF0` opcode — it causes no errors, disconnects, or side effects. Ember detects peer support via the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake (not `ET_MOD_VERSION` or `CT_EMULE_MISCOPTIONS2`). EPX is only exchanged with peers that complete Ember Hello and Ed25519 PoP on that TCP session.
+Non-Ember eMule clients silently ignore the `0xF0` opcode — it causes no errors, disconnects, or side effects. Ember detects peer support via the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake (not `ET_MOD_VERSION` or `CT_EMULE_MISCOPTIONS2`). EPX is only exchanged with peers that complete Ember Hello and whose advertised key binds to their Ember hash on that TCP session.
 
 ## Friends — Ember-Exclusive Social Features
 

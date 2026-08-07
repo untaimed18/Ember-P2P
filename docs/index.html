@@ -997,7 +997,7 @@
     <p>When two Ember clients connect (during a download or upload), they exchange compact lists of the files they are currently downloading along with the sources they know about for each file. If the receiving peer is downloading one of those files, it immediately gains new sources it may not have found through KAD or ED2K peer exchange alone.</p>
 
     <div class="callout-info callout">
-      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake. TCP EPX also requires Ed25519 proof-of-possession on the session; UDP EPX requires an authenticated Noise_IK session. Legacy <code>ET_MOD_VERSION</code> / <code>CT_EMULE_MISCOPTIONS2</code> Ember bits are not used.</p>
+      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake. TCP EPX also requires the peer's advertised Ed25519 public key to BLAKE3-bind to its Ember hash &mdash; an offline check that a replayed key pair can pass, and so a deliberately lower bar than the proof of possession behind chat, browse and other friend privileges. UDP EPX requires an authenticated Noise_IK session. Legacy <code>ET_MOD_VERSION</code> / <code>CT_EMULE_MISCOPTIONS2</code> Ember bits are not used.</p>
     </div>
 
     <h3 id="epx-wire">Wire Protocol</h3>

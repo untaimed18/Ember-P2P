@@ -9679,9 +9679,9 @@ impl UploadHandler {
                                     }
                                 }
                             }
-                            // First EPX push after PoP — mirrors download
-                            // paths that only share sources once the peer
-                            // has proven possession of its Ember identity.
+                            // First EPX push after binding — mirrors download
+                            // paths that only share sources once the peer's
+                            // advertised key binds to its Ember hash.
                             if hello_caps.is_ember && !epx_sent_after_binding {
                                 let epx_data = self.ember_payload.read().await.clone();
                                 if !epx_data.is_empty() {
