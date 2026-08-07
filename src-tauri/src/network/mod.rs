@@ -8781,6 +8781,15 @@ struct NetworkState {
     share_browsing_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the EPX payload needs rebuilding (set on source changes, cleared after rebuild)
     ember_payload_dirty: bool,
+    /// The same EPX payload packed to fit one Ember UDP datagram.
+    ///
+    /// Built from the same entries as `shared_ember_payload` on each rebuild,
+    /// because the TCP payload it parallels is sized for a stream and cannot
+    /// be sent as a datagram — see [`ember::MAX_EPX_UDP_PAYLOAD`]. Kept on
+    /// `NetworkState` rather than behind an `Arc<RwLock<_>>` like its TCP
+    /// counterpart because only the network task's UDP handler reads it; the
+    /// TCP one is shared with every spawned transfer task.
+    ember_udp_payload: Arc<Vec<u8>>,
     /// Known Ember peer addresses for peer discovery mesh building.
     /// Value is the last time we saw this peer (either by direct connect or
     /// via EPX from another peer). Stale entries are pruned by
@@ -13138,6 +13147,7 @@ pub async fn start_network(
             ))
         },
         ember_payload_dirty: true,
+        ember_udp_payload: Arc::new(Vec::new()),
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
         ember_keyless_peers: HashMap::new(),
@@ -15165,7 +15175,6 @@ pub async fn start_network(
                                     &transfer_manager,
                                     &source_manager,
                                     &local_index,
-                                    &shared_ember_payload,
                                 ).await;
                             }
                         } else if state.stats.status != NetworkStatus::Disconnected {
@@ -15189,7 +15198,6 @@ pub async fn start_network(
                                 &credit_manager,
                                 &transfer_manager,
                                 &source_manager,
-                                &shared_ember_payload,
                             ).await;
                         }
                     }
@@ -15223,7 +15231,6 @@ pub async fn start_network(
                                         &transfer_manager,
                                         &source_manager,
                                         &local_index,
-                                        &shared_ember_payload,
                                     ).await;
                                 }
                             } else if state.stats.status != NetworkStatus::Disconnected {
@@ -15247,7 +15254,6 @@ pub async fn start_network(
                                     &credit_manager,
                                     &transfer_manager,
                                     &source_manager,
-                                    &shared_ember_payload,
                                 ).await;
                             }
                         }
@@ -29591,6 +29597,15 @@ pub async fn start_network(
                     &ember_peers,
                     &relay_attestations,
                 );
+                // Same entries, datagram-sized. Built here rather than per
+                // request so an inbound `ExchangeRequest` stays cheap to
+                // answer, and from the same inputs so the two payloads cannot
+                // describe different sources.
+                state.ember_udp_payload = Arc::new(ember::build_udp_exchange_payload(
+                    &entries,
+                    &ember_peers,
+                    &relay_attestations,
+                ));
                 *shared_ember_payload.write().await = Arc::new(payload);
                 ember_payload_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.ember_payload_dirty = false;
@@ -32151,7 +32166,6 @@ async fn handle_ember_native_udp(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
-    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
         socket,
@@ -32161,7 +32175,6 @@ async fn handle_ember_native_udp(
         transfer_manager,
         source_manager,
         local_index,
-        shared_ember_payload,
     ))
     .catch_unwind()
     .await
@@ -32182,7 +32195,6 @@ async fn handle_ember_native_udp_inner(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
-    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     use ember::transport::EmberControlMessage;
 
@@ -32241,34 +32253,32 @@ async fn handle_ember_native_udp_inner(
                 .ember_exchange_requests_received
                 .saturating_add(1);
 
-            // Answer with our current EPX payload over the same encrypted
-            // session. Clone the `Arc` out first so the immutable borrow
-            // of `shared_ember_payload` ends before we touch
-            // `state.ember_transport` mutably.
-            let payload_arc = shared_ember_payload.read().await.clone();
-            // `MAX_EPX_PAYLOAD` (64KB, ember/mod.rs) is sized for the TCP
-            // EPX path, which has no per-datagram ceiling. UDP EPX shares
-            // the same builder output but must fit inside a single Ember
-            // UDP datagram (`MAX_EMBER_DATAGRAM_BYTES`) after the 2-byte
-            // control header and Noise AEAD/framing overhead — there is no
-            // fragmentation here. A realistic EPX body (many files/
-            // sources/peers/ERAT) routinely exceeds that budget; sending
-            // it as-is used to look like a successful reply while
-            // `process_incoming` silently dropped the oversized datagram,
-            // undecrypted, on the peer's side. Skip the send (log only)
-            // rather than transmit something we know can't arrive.
-            const EPX_UDP_OVERHEAD_BUDGET: usize = 64;
-            let epx_udp_budget =
-                ember::transport::MAX_EMBER_DATAGRAM_BYTES.saturating_sub(EPX_UDP_OVERHEAD_BUDGET);
-            if payload_arc.len() > epx_udp_budget {
+            // Answer with the datagram-sized build of our EPX payload, not
+            // the TCP one: `MAX_EPX_PAYLOAD` (64KB) assumes a stream, and a
+            // UDP reply over that budget is dropped by the receiver before
+            // decryption — which looks like a successful send here and like
+            // silence there. `build_udp_exchange_payload` packs the same
+            // entries to `MAX_EPX_UDP_PAYLOAD` instead, so a busy node sends
+            // fewer files rather than nothing at all.
+            let payload_arc = state.ember_udp_payload.clone();
+            // The builder honours the budget, so this is a backstop against a
+            // future change to the framing overhead rather than an expected
+            // path. Counted, because silently skipping is exactly the failure
+            // mode this replaced.
+            if payload_arc.len() > ember::MAX_EPX_UDP_PAYLOAD {
                 state.ember_diagnostics.epx_udp_oversized_skipped = state
                     .ember_diagnostics
                     .epx_udp_oversized_skipped
                     .saturating_add(1);
                 debug!(
-                    "ember-udp: EPX payload too large for a single UDP datagram ({} bytes > {epx_udp_budget} budget); skipping ExchangeData reply to {from}",
+                    "ember-udp: EPX payload unexpectedly over the datagram budget ({} bytes > {} budget); skipping ExchangeData reply to {from}",
                     payload_arc.len(),
+                    ember::MAX_EPX_UDP_PAYLOAD,
                 );
+                return;
+            }
+            if payload_arc.is_empty() {
+                debug!("ember-udp: no EPX payload built yet; skipping ExchangeData reply to {from}");
                 return;
             }
             let msg = EmberControlMessage::ExchangeData {
@@ -34491,7 +34501,6 @@ async fn handle_udp_packet(
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
-    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -34507,7 +34516,6 @@ async fn handle_udp_packet(
         credit_manager,
         transfer_manager,
         source_manager,
-        shared_ember_payload,
     ))
     .catch_unwind()
     .await
@@ -34534,7 +34542,6 @@ async fn handle_udp_packet_inner(
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
-    shared_ember_payload: &ember::SharedEmberPayload,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -34597,7 +34604,6 @@ async fn handle_udp_packet_inner(
                     transfer_manager,
                     source_manager,
                     local_index,
-                    shared_ember_payload,
                 )
                 .await;
             }

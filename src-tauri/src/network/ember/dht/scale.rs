@@ -7,21 +7,27 @@
 //! Sybil cluster if you only count addresses.
 //!
 //! Rather than pick one compromise value, limits are derived from how much of
-//! the network we can actually see. While the routing table is nearly empty
-//! the limits are permissive, because refusing a contact then can cost us the
-//! only path into the network. As the table fills, they tighten toward values
-//! at or below what eMule KAD enforces, because by then there is enough
-//! diversity that refusing a duplicate costs nothing.
+//! the network we can actually see — meaning contacts that have answered us,
+//! not every entry in the routing table. Gossip is cheap to send and proves
+//! nothing, so counting leads here would let anyone who can talk at us drive
+//! the limits to their strict tier while we had reached almost nobody.
+//!
+//! While we have reached nearly no one the limits are permissive, because
+//! refusing a contact then can cost us the only path into the network. As the
+//! count of proven contacts grows, they tighten toward values at or below what
+//! eMule KAD enforces, because by then there is enough diversity that refusing
+//! a duplicate costs nothing.
 //!
 //! Tightening is always safe: it only refuses *new* admissions, never evicts
 //! entries admitted under an earlier, looser limit.
 
 use super::K_BUCKET_SIZE;
 
-/// Below this many contacts we are still bootstrapping, and refusing a peer
-/// risks having no route into the network at all.
+/// Below this many *verified* contacts we are still bootstrapping, and
+/// refusing a peer risks having no route into the network at all.
 const BOOTSTRAP_CONTACTS: usize = K_BUCKET_SIZE / 2;
-/// Above this the table has enough diversity that strict limits cost nothing.
+/// Above this many verified contacts we have enough proven diversity that
+/// strict limits cost nothing.
 const ESTABLISHED_CONTACTS: usize = K_BUCKET_SIZE * 4;
 
 /// How permissive the DHT's abuse limits currently are.
@@ -36,10 +42,12 @@ pub enum NetworkScale {
 }
 
 impl NetworkScale {
-    pub fn from_contacts(contacts: usize) -> Self {
-        if contacts < BOOTSTRAP_CONTACTS {
+    /// Pick a tier from the number of contacts that have answered us. See
+    /// [`super::routing::RoutingTable::scale`] for why leads do not count.
+    pub fn from_contacts(verified: usize) -> Self {
+        if verified < BOOTSTRAP_CONTACTS {
             NetworkScale::Bootstrap
-        } else if contacts < ESTABLISHED_CONTACTS {
+        } else if verified < ESTABLISHED_CONTACTS {
             NetworkScale::Small
         } else {
             NetworkScale::Established

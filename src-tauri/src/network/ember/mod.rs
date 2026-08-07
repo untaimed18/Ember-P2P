@@ -30,6 +30,27 @@ pub const EPX_VERSION: u8 = 4;
 pub const MAX_EPX_FILES: usize = 200;
 pub const MAX_EPX_SOURCES_PER_FILE: usize = 100;
 pub const MAX_EPX_PAYLOAD: usize = 65536;
+
+/// Payload ceiling for EPX carried over the Ember UDP transport.
+///
+/// [`MAX_EPX_PAYLOAD`] sizes the TCP path, which streams and has no
+/// per-datagram ceiling. UDP has no fragmentation here, so a reply must
+/// survive `ExchangeData` framing (a 2-byte control header) plus Noise
+/// transport overhead inside a single
+/// [`transport::MAX_EMBER_DATAGRAM_BYTES`] packet. Anything larger is dropped
+/// by the receiver *before* decryption, which looks to the sender like a
+/// successful send and to the peer like silence.
+///
+/// Building to this cap rather than checking against it afterwards is the
+/// difference between a smaller answer and no answer: the TCP-sized payload of
+/// a node with a real download list routinely exceeds a datagram, so the
+/// check alone meant an active node never answered a UDP exchange at all.
+pub const MAX_EPX_UDP_PAYLOAD: usize = transport::MAX_EMBER_DATAGRAM_BYTES
+    - dht::messages::TRANSPORT_OVERHEAD
+    - EXCHANGE_DATA_HEADER_SIZE;
+
+/// `EmberControlMessage::ExchangeData` prefix: control version + kind.
+const EXCHANGE_DATA_HEADER_SIZE: usize = 2;
 /// Max total sources accepted from a single EPX event (anti-poisoning)
 pub const MAX_EPX_TOTAL_SOURCES: usize = 2000;
 /// Max EPX packets accepted per TCP connection (anti-flood)
@@ -139,6 +160,31 @@ pub fn build_exchange_payload_with_relay_attestations(
     peers: &[EmberPeer],
     relay_attestations: &[RelayAttestation],
 ) -> Vec<u8> {
+    build_exchange_payload_within(entries, peers, relay_attestations, MAX_EPX_PAYLOAD)
+}
+
+/// The same payload packed to fit one Ember UDP datagram.
+///
+/// Identical wire format — a peer parses it with `parse_exchange_payload` and
+/// cannot tell which transport built it. Only the size budget differs, so a
+/// busy node answers a UDP exchange with as many files and sources as fit
+/// instead of declining to answer at all. See [`MAX_EPX_UDP_PAYLOAD`].
+pub fn build_udp_exchange_payload(
+    entries: &[EmberFileEntry],
+    peers: &[EmberPeer],
+    relay_attestations: &[RelayAttestation],
+) -> Vec<u8> {
+    build_exchange_payload_within(entries, peers, relay_attestations, MAX_EPX_UDP_PAYLOAD)
+}
+
+/// Shared packer. `budget` is the hard ceiling on the returned payload; files,
+/// then peers, then attestations are dropped in that order to respect it.
+fn build_exchange_payload_within(
+    entries: &[EmberFileEntry],
+    peers: &[EmberPeer],
+    relay_attestations: &[RelayAttestation],
+    budget: usize,
+) -> Vec<u8> {
     // Reserve room for the ERAT trailer *before* packing files/peers so a
     // busy node with many file/source entries can't starve its own relay
     // advertisement. Previously files were packed all the way to
@@ -167,7 +213,9 @@ pub fn build_exchange_payload_with_relay_attestations(
         let aich_size = if entry.aich_root.is_some() { 20 } else { 0 };
         let entry_size = V3_FILE_ENTRY_HEADER_SIZE + aich_size + src_count * V3_SOURCE_ENTRY_SIZE;
 
-        if buf.len() + entry_size > MAX_EPX_PAYLOAD - 2 - attestations_reserve {
+        // `saturating_sub`: a budget smaller than its own reserves packs no
+        // files rather than wrapping into a huge ceiling.
+        if buf.len() + entry_size > budget.saturating_sub(2 + attestations_reserve) {
             break;
         }
 
@@ -201,7 +249,7 @@ pub fn build_exchange_payload_with_relay_attestations(
     // Peer discovery section — also reserve the ERAT trailer's space.
     let peer_count = peers.len().min(MAX_EPX_PEERS);
     let peers_size = 2 + peer_count * 6;
-    if buf.len() + peers_size + attestations_reserve <= MAX_EPX_PAYLOAD {
+    if buf.len() + peers_size + attestations_reserve <= budget {
         buf.write_u16::<LittleEndian>(peer_count as u16).unwrap();
         for peer in peers.iter().take(peer_count) {
             buf.write_all(&peer.ip.octets()).unwrap();
@@ -217,7 +265,7 @@ pub fn build_exchange_payload_with_relay_attestations(
         buf.write_u16::<LittleEndian>(0).unwrap();
     }
 
-    append_relay_attestations(&mut buf, relay_attestations);
+    append_relay_attestations(&mut buf, relay_attestations, budget);
     buf
 }
 
@@ -299,26 +347,25 @@ pub fn verify_relay_attestation(attestation: &RelayAttestation, now_unix: u64) -
     crypto::verify(&vk, &payload, &attestation.signature)
 }
 
-fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation]) {
+fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation], budget: usize) {
     let mut count = attestations.len().min(MAX_RELAY_ATTESTATIONS);
     if count == 0 {
         return;
     }
-    // Callers (`build_exchange_payload_with_relay_attestations`) reserve
-    // trailer space before packing files/peers, so this should always
-    // fit. Shrink to whatever *does* fit instead of dropping the whole
-    // trailer as a defensive fallback — e.g. if a caller ever builds a
-    // payload directly without going through the reservation path. A
-    // partial trailer (fewer attestations) is strictly better than an
-    // empty one: each one still verifies independently on the wire.
-    while count > 0
-        && buf.len() + 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE > MAX_EPX_PAYLOAD
-    {
+    // `build_exchange_payload_within` reserves trailer space before packing
+    // files/peers, so this should always fit. Shrink to whatever *does* fit
+    // instead of dropping the whole trailer as a defensive fallback — e.g. if
+    // a caller ever builds a payload directly without going through the
+    // reservation path. A partial trailer (fewer attestations) is strictly
+    // better than an empty one: each one still verifies independently on the
+    // wire. This is also the last guard on `budget`, so it has to honour the
+    // caller's ceiling rather than the TCP one.
+    while count > 0 && buf.len() + 4 + 1 + 2 + count * RELAY_ATTESTATION_FIXED_SIZE > budget {
         count -= 1;
     }
     if count == 0 {
         tracing::debug!(
-            "EPX builder: dropping all {} relay attestation(s) — payload already at {}B, cap is {MAX_EPX_PAYLOAD}B",
+            "EPX builder: dropping all {} relay attestation(s) — payload already at {}B, cap is {budget}B",
             attestations.len(),
             buf.len()
         );
@@ -326,7 +373,7 @@ fn append_relay_attestations(buf: &mut Vec<u8>, attestations: &[RelayAttestation
     }
     if count < attestations.len().min(MAX_RELAY_ATTESTATIONS) {
         tracing::debug!(
-            "EPX builder: truncating relay attestations from {} to {count} — payload already at {}B, cap is {MAX_EPX_PAYLOAD}B",
+            "EPX builder: truncating relay attestations from {} to {count} — payload already at {}B, cap is {budget}B",
             attestations.len().min(MAX_RELAY_ATTESTATIONS),
             buf.len()
         );
@@ -698,6 +745,106 @@ mod tests {
             expires_at_unix,
             RELAY_ATTESTATION_CAP_RELAY_V1,
         )
+    }
+
+    /// A file list far larger than a datagram, as a busy node would have.
+    fn crowded_entries(files: usize, sources_per_file: usize) -> Vec<EmberFileEntry> {
+        (0..files)
+            .map(|f| EmberFileEntry {
+                file_hash: [f as u8; 16],
+                file_size: 1 << 30,
+                aich_root: Some([f as u8; 20]),
+                sources: (0..sources_per_file)
+                    .map(|s| make_source(80, (f % 250) as u8, (s % 250) as u8, 1, 4662))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The bug this guards: the UDP path reused the TCP payload, which for any
+    /// node with a real download list exceeds a datagram. The receiver drops
+    /// an oversized datagram before decrypting it, so the reply looked sent
+    /// and arrived as silence — an active node never answered a UDP exchange.
+    #[test]
+    fn a_udp_payload_fits_one_datagram_where_the_tcp_one_cannot() {
+        let entries = crowded_entries(200, 100);
+        let peers: Vec<EmberPeer> = (0..MAX_EPX_PEERS)
+            .map(|i| EmberPeer {
+                ip: Ipv4Addr::new(90, 1, i as u8, 2),
+                tcp_port: 4662,
+            })
+            .collect();
+        let attestations = vec![make_attestation(1_700_000_600)];
+
+        let tcp = build_exchange_payload_with_relay_attestations(&entries, &peers, &attestations);
+        assert!(
+            tcp.len() > MAX_EPX_UDP_PAYLOAD,
+            "this fixture must be the case the TCP builder handles and UDP cannot"
+        );
+
+        let udp = build_udp_exchange_payload(&entries, &peers, &attestations);
+        assert!(
+            udp.len() <= MAX_EPX_UDP_PAYLOAD,
+            "UDP payload is {} bytes, over the {MAX_EPX_UDP_PAYLOAD} budget",
+            udp.len()
+        );
+        assert!(!udp.is_empty(), "a smaller answer, not no answer");
+    }
+
+    /// Pins the arithmetic tying the payload budget to the transport, so a
+    /// change to either framing cannot silently reintroduce undeliverable
+    /// replies. Mirrors the DHT's `a_full_found_value_frame_fits_a_datagram`.
+    #[test]
+    fn a_full_udp_payload_still_fits_after_framing() {
+        let udp = build_udp_exchange_payload(
+            &crowded_entries(200, 100),
+            &[],
+            &[make_attestation(1_700_000_600)],
+        );
+        let datagram =
+            udp.len() + EXCHANGE_DATA_HEADER_SIZE + dht::messages::TRANSPORT_OVERHEAD;
+        assert!(
+            datagram <= transport::MAX_EMBER_DATAGRAM_BYTES,
+            "framed datagram would be {datagram} bytes, over the transport cap"
+        );
+    }
+
+    /// Truncating for the datagram must not produce a payload the peer cannot
+    /// read: same wire format, so a receiver cannot tell which transport built
+    /// it, and the ERAT trailer still survives the tighter budget.
+    #[test]
+    fn a_truncated_udp_payload_still_parses() {
+        let attestation = make_attestation(1_700_000_600);
+        let udp = build_udp_exchange_payload(
+            &crowded_entries(200, 100),
+            &[EmberPeer {
+                ip: Ipv4Addr::new(90, 1, 1, 2),
+                tcp_port: 4662,
+            }],
+            &[attestation.clone()],
+        );
+
+        let parsed = parse_exchange_payload(&udp).expect("a truncated build must still parse");
+        assert!(!parsed.files.is_empty(), "some files must survive");
+        assert_eq!(
+            parsed.relay_attestations,
+            vec![attestation],
+            "the ERAT reserve must hold under the smaller budget too"
+        );
+    }
+
+    /// The TCP path is untouched by the split: it still packs to the large
+    /// budget rather than inheriting the datagram one.
+    #[test]
+    fn the_tcp_builder_still_uses_the_full_budget() {
+        let tcp =
+            build_exchange_payload_with_relay_attestations(&crowded_entries(200, 100), &[], &[]);
+        assert!(
+            tcp.len() > MAX_EPX_UDP_PAYLOAD * 4,
+            "TCP payload was {} bytes, suspiciously close to the datagram budget",
+            tcp.len()
+        );
+        assert!(tcp.len() <= MAX_EPX_PAYLOAD);
     }
 
     /// The standalone block the friend-session relay offer carries must round
