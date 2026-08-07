@@ -13,7 +13,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { hardenManifest } from "./harden-update-manifest.mjs";
+import {
+  collectArtifactPaths,
+  hardenManifest,
+  parseArtifactPaths,
+} from "./harden-update-manifest.mjs";
 import {
   verifyReleasePolicy,
   verifySecurityEpoch,
@@ -164,6 +168,42 @@ test("manifest hardening binds target, size, hash, and security epoch", () => {
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
+});
+
+test("artifact collection resolves supplied and discovered paths", () => {
+  // The release job reaches this through main(), which the hardening tests
+  // below bypass by passing artifactPaths directly. A `.map(resolve)` here once
+  // failed the signing job on every release while those tests stayed green.
+  const fixture = mkdtempSync(join(tmpdir(), "ember-artifact-paths-"));
+  try {
+    const bundle = join(fixture, "src-tauri/target/release/bundle/nsis");
+    mkdirSync(bundle, { recursive: true });
+    const discovered = join(bundle, "Ember_1.2.3_x64-setup.nsis.zip");
+    writeFileSync(discovered, "discovered");
+    const supplied = join(fixture, "Ember_1.2.3_x64-setup.exe");
+    writeFileSync(supplied, "supplied");
+
+    const collected = collectArtifactPaths({
+      root: fixture,
+      suppliedPaths: [supplied, discovered, join(fixture, "absent.zip")],
+    });
+
+    assert.deepEqual([...collected].sort(), [discovered, supplied].sort());
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("artifact path parsing accepts JSON and newline-separated output", () => {
+  assert.deepEqual(parseArtifactPaths('["/a/one.zip","/b/two.exe"]'), [
+    "/a/one.zip",
+    "/b/two.exe",
+  ]);
+  assert.deepEqual(parseArtifactPaths("/a/one.zip\n/b/two.exe"), [
+    "/a/one.zip",
+    "/b/two.exe",
+  ]);
+  assert.deepEqual(parseArtifactPaths("  "), []);
 });
 
 test("manifest hardening rejects unsafe artifact URLs", () => {

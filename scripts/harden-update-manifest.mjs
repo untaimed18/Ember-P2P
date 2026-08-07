@@ -25,7 +25,7 @@ function normalizeAssetName(path) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
-function parseArtifactPaths(raw) {
+export function parseArtifactPaths(raw) {
   if (!raw?.trim()) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -76,6 +76,27 @@ function locateArtifact(assetName, candidates) {
     );
   }
   return matches[0];
+}
+
+/**
+ * Every existing file the manifest may reference: what tauri-action reported
+ * plus whatever is under the build target directory.
+ *
+ * The mapping callback is written out rather than passed as `.map(resolve)`,
+ * which would hand `path.resolve` the array index and the whole array as extra
+ * path segments and throw before a single artifact was hashed.
+ */
+export function collectArtifactPaths({
+  root: base = root,
+  suppliedPaths = [],
+} = {}) {
+  const discoveredPaths = walkFiles(join(base, "src-tauri", "target"));
+  const unique = new Set(
+    [...suppliedPaths, ...discoveredPaths].map((path) => resolve(base, path)),
+  );
+  return [...unique].filter(
+    (path) => existsSync(path) && statSync(path).isFile(),
+  );
 }
 
 export function hardenManifest({
@@ -159,11 +180,9 @@ function main() {
     root,
     process.env.EMBER_UPDATE_MANIFEST ?? "latest.json",
   );
-  const suppliedPaths = parseArtifactPaths(process.env.TAURI_ARTIFACT_PATHS);
-  const discoveredPaths = walkFiles(join(root, "src-tauri", "target"));
-  const artifactPaths = [
-    ...new Set([...suppliedPaths, ...discoveredPaths].map(resolve)),
-  ].filter((path) => existsSync(path) && statSync(path).isFile());
+  const artifactPaths = collectArtifactPaths({
+    suppliedPaths: parseArtifactPaths(process.env.TAURI_ARTIFACT_PATHS),
+  });
   const securityEpoch = Number(process.env.EMBER_UPDATE_SECURITY_EPOCH);
 
   hardenManifest({ manifestPath, artifactPaths, securityEpoch });
