@@ -26,8 +26,24 @@ export interface IpFilterDownloadResult {
   byteCount: number;
 }
 
-export async function updateSettings(settings: AppSettings): Promise<UpdateSettingsResult> {
-  const result = await invoke<UpdateSettingsResult>('update_settings', { settings });
+export interface UpdateSettingsOptions {
+  /** Treat this save as consent to re-approve a download folder whose approval
+   *  was revoked, which is otherwise unrecoverable in-app because re-picking the
+   *  same path is not a change. Only the Settings page's own save button sets
+   *  it: background callers (the UPnP auto-disable handler) reach this with no
+   *  user present, and re-approval grants sandbox access to whatever object now
+   *  sits at that path. */
+  reapproveDownloadRoot?: boolean;
+}
+
+export async function updateSettings(
+  settings: AppSettings,
+  options: UpdateSettingsOptions = {},
+): Promise<UpdateSettingsResult> {
+  const result = await invoke<UpdateSettingsResult>('update_settings', {
+    settings,
+    reapproveDownloadRoot: options.reapproveDownloadRoot ?? false,
+  });
   // Always use the canonical persisted revision, including the partial-success
   // path where runtime application was deferred because the command queue was
   // full. A retry must never submit a stale revision.

@@ -66,15 +66,19 @@ function combineOrigin(a: string, b: string): string {
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number }>();
 
+/** Ranking ceiling for peer-reported counts, matching MAX_PLAUSIBLE_SOURCES in
+ * merge.rs. ed2k carries this count as a u16 on the wire, so anything above it
+ * is a claim no honest peer can make. */
+const MAX_PLAUSIBLE_SOURCES = 65535;
+
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])]));
   // Backend ed2k resights emit absolute noted availability; take max so we do
   // not double-sum. Cross-server summing happens in Rust before the emit.
   // Kad / mixed origins also use max (matches merge.rs).
-  const availability = Math.max(
-    existing.availability || 0,
-    incoming.availability || 0,
-    mergedAddresses.length,
+  const availability = Math.min(
+    Math.max(existing.availability || 0, incoming.availability || 0, mergedAddresses.length),
+    MAX_PLAUSIBLE_SOURCES,
   );
   const existingMedia = existing.media || {};
   const incomingMedia = incoming.media || {};
@@ -89,8 +93,10 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   const hasMedia = Object.values(media).some((v) => v != null && v !== '');
   const existingName = existing.file.name || '';
   const incomingName = incoming.file.name || '';
-  const preferredName =
-    incomingName.length > existingName.length ? incomingName : existingName || incomingName;
+  // Keep the first name we saw. Length is entirely attacker-chosen, so
+  // preferring the longer one let any peer replying with a padded name for a
+  // popular hash rename someone else's file, in the list and on disk.
+  const preferredName = existingName || incomingName;
   const hash = incoming.file.hash || existing.file.hash || '';
   const override = hash ? spamUserOverrides.get(hash) : undefined;
   const spam_rating = override
@@ -115,7 +121,10 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
       extension: incoming.file.extension || existing.file.extension,
       aich_hash: incoming.file.aich_hash || existing.file.aich_hash,
       ember_file_hash: incoming.file.ember_file_hash || existing.file.ember_file_hash,
-      complete_sources: Math.max(existing.file.complete_sources || 0, incoming.file.complete_sources || 0),
+      complete_sources: Math.min(
+        Math.max(existing.file.complete_sources || 0, incoming.file.complete_sources || 0),
+        MAX_PLAUSIBLE_SOURCES,
+      ),
     },
     peer_id: existing.peer_id || incoming.peer_id,
     peer_name: existing.peer_name || incoming.peer_name,

@@ -893,7 +893,10 @@
         const candidate = mergeDraftOntoLatest(draft, latest);
         candidate.friend_session_encryption = true;
         try {
-          result = await updateSettings(candidate);
+          // The explicit Save button is the one user action that counts as
+          // consent to re-approve a revoked download folder, which is otherwise
+          // unrecoverable in-app because re-picking the same path is no change.
+          result = await updateSettings(candidate, { reapproveDownloadRoot: true });
           saved = result.settings;
           break;
         } catch (e) {

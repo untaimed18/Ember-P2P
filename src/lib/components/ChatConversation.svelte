@@ -500,9 +500,12 @@
   function dayLabel(ts: number): string {
     const today = startOfDay(Math.floor(Date.now() / 1000));
     const day = startOfDay(ts);
-    const dayMs = 86_400_000;
     if (day === today) return m.chat_day_today();
-    if (day === today - dayMs) return m.chat_day_yesterday();
+    // Step back a calendar day instead of subtracting 24h: on the day after a
+    // DST change consecutive local midnights are 23 or 25 hours apart.
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (day === yesterday.getTime()) return m.chat_day_yesterday();
     const d = new Date(ts * 1000);
     const sameYear = d.getFullYear() === new Date().getFullYear();
     return d.toLocaleDateString(undefined, {

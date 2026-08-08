@@ -15,6 +15,7 @@
    */
   import { onMount, untrack } from 'svelte';
   import { getSettings, updateSettings } from '$lib/api/settings';
+  import { setAppSettings } from '$lib/stores/settings';
   import {
     getEmberDiagnostics,
     getEmberDhtContacts,
@@ -191,8 +192,12 @@
     toggleError = null;
     try {
       const next: AppSettings = { ...settings, ember_native_enabled: want };
-      await updateSettings(next);
-      settings = next;
+      const result = await updateSettings(next);
+      settings = result.settings;
+      // Mirror the canonical save into the process-wide cache: consumers
+      // outside this page (the /search method gate and readiness strip) read
+      // it, and nothing else refreshes it after app boot.
+      setAppSettings(result.settings);
       lastAppliedEnabled = want;
       await refreshDiag();
     } catch (e) {
