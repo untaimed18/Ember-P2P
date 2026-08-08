@@ -934,8 +934,53 @@ pub fn restrict_file_permissions(path: &Path) {
 /// When `restrict` is true the temp file is created with 0600 on Unix or
 /// has `restrict_file_permissions` applied on Windows before the rename,
 /// so the final file is never world-readable between creation and chmod.
+/// Where [`atomic_write`]'s Windows replace-fallback parks the existing
+/// destination while it publishes the replacement.
+fn interrupted_replace_backup_path(final_path: &Path) -> std::path::PathBuf {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".ember-replace-bak");
+    final_path.with_file_name(name)
+}
+
+/// Restore a destination that a crash left parked by the replace-fallback.
+///
+/// The fallback renames the old file aside and then renames the replacement in.
+/// A process death between those two steps leaves nothing at `final_path` and the
+/// only copy under the backup name. Restoring is safe and unconditional-looking
+/// but strictly guarded: it acts only when `final_path` is genuinely absent, so
+/// it can never overwrite a good file with a stale one, and a leftover backup
+/// beside an intact destination is simply removed.
+///
+/// Call this before *reading* a file whose absence is interpreted as "first run",
+/// which is where the loss would otherwise be silent.
+pub fn recover_interrupted_replace(final_path: &Path) {
+    let backup = interrupted_replace_backup_path(final_path);
+    if !backup.exists() {
+        return;
+    }
+    if final_path.exists() {
+        // The replacement landed; this is just an unreaped backup.
+        let _ = std::fs::remove_file(&backup);
+        return;
+    }
+    match std::fs::rename(&backup, final_path) {
+        Ok(()) => tracing::warn!(
+            "Restored {} from an interrupted atomic replace",
+            final_path.display()
+        ),
+        Err(error) => tracing::error!(
+            "Found an interrupted atomic replace for {} but could not restore it: {error}",
+            final_path.display()
+        ),
+    }
+}
+
 pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::Result<()> {
     use std::io::Write;
+
+    // Reclaim a backup an earlier interrupted replace left behind, before this
+    // write creates a second one. Harmless when there is nothing to reclaim.
+    recover_interrupted_replace(final_path);
 
     let (tmp, mut f) = {
         let mut opened = None;
@@ -1004,7 +1049,15 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
             // replacement, and only then drop the backup. On any failure we
             // restore the original, so the destination is never lost.
             let _ = e;
-            let backup = unique_tmp_path(final_path).with_extension("ember-replace-bak");
+            // Deterministic, not randomised: between the two renames below the
+            // destination does not exist, and a process death in that window used
+            // to leave the only copy under a pid-and-randomness derived name that
+            // nothing ever looked for again. For `identity.json` that is silent
+            // and unrecoverable — the next launch takes the `NotFound` path and
+            // mints a fresh KAD id and user hash, discarding friendships and
+            // upload credits. A fixed name is what lets
+            // `recover_interrupted_replace` below find and restore it.
+            let backup = interrupted_replace_backup_path(final_path);
             match std::fs::rename(final_path, &backup) {
                 Ok(()) => {
                     if let Err(retry_err) = std::fs::rename(&tmp, final_path) {

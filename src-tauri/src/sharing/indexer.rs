@@ -55,6 +55,15 @@ pub fn is_excluded_share_file_name(path: &Path) -> bool {
         || (name.starts_with('.') && name.ends_with(".tmp"))
         || name.ends_with(".migration-tmp")
         || name.ends_with(".bak")
+        // A profile backup is a key container: it holds the DPAPI-unwrapped
+        // identity and SecIdent keys, the chat-history key and the database.
+        // Nothing stops the user pointing the export save dialog at a shared
+        // folder, and once there it was hashed and announced to KAD, the eD2K
+        // offer list and the Ember DHT like any other file — publicly fetchable
+        // and attackable offline behind only the passphrase. Excluded by name so
+        // archives written before this rule are dropped on the next scan too.
+        || name.ends_with(".emberbackup")
+        || name.ends_with(".partial")
 }
 
 /// True when any component of `path` is a directory discovery refuses to

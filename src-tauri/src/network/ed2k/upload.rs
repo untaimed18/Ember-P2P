@@ -903,6 +903,20 @@ const SESSIONMAXTIME_SECS: u64 = 3600;
 const MAX_REQUESTPARTS_BYTES: u64 = SESSIONMAXTRANS;
 /// eMule MIN_UP_CLIENTS_ALLOWED: minimum upload slots regardless of bandwidth
 const MIN_UP_CLIENTS_ALLOWED: usize = 2;
+/// Slots admitted before bandwidth is allowed to veto a new one.
+///
+/// eMule's `CUploadQueue::AcceptNewClient` waives its datarate veto below
+/// `max(MIN_UP_CLIENTS_ALLOWED, 4)` (UploadQueue.cpp), so the constant alone is
+/// not the floor — flooring at 2 served half as many peers as eMule would in
+/// every regime where observed upload sits under the per-slot target, and it is
+/// self-reinforcing because the slot count is derived from observed throughput.
+const ADMISSION_FLOOR_SLOTS: usize = {
+    if MIN_UP_CLIENTS_ALLOWED > 4 {
+        MIN_UP_CLIENTS_ALLOWED
+    } else {
+        4
+    }
+};
 /// eMule MAX_UP_CLIENTS_ALLOWED: maximum upload slots
 const MAX_UP_CLIENTS_ALLOWED: usize = 100;
 /// eMule UPLOAD_CLIENT_MAXDATARATE (opcodes.h:109): the assumed per-slot target
@@ -3451,7 +3465,7 @@ impl UploadHandler {
         };
 
         if effective_rate == 0 {
-            return MIN_UP_CLIENTS_ALLOWED.min(max_configured);
+            return ADMISSION_FLOOR_SLOTS.min(max_configured);
         }
 
         let target_per_slot = if active <= 3 {
@@ -3460,7 +3474,7 @@ impl UploadHandler {
             (3u64 * 1024 + (active as u64 - 3) * 1024).min(UPLOAD_CLIENT_MAXDATARATE)
         };
 
-        let computed = (effective_rate / target_per_slot).max(MIN_UP_CLIENTS_ALLOWED as u64);
+        let computed = (effective_rate / target_per_slot).max(ADMISSION_FLOOR_SLOTS as u64);
         let computed = (computed as usize)
             .min(MAX_UP_CLIENTS_ALLOWED)
             .min(max_configured);
@@ -4384,7 +4398,14 @@ impl UploadHandler {
                         return Ok(());
                     }
                 };
-                if super::secure_stream::is_preamble_first_byte(first_byte) {
+                // `0x00` is a legal eMule obfuscation discriminator, so the
+                // discriminator alone cannot tell a friend preamble from an
+                // ordinary obfuscated dial. Peek the buffered magic before
+                // committing; a mismatch falls through to the negotiator below
+                // with the stream untouched.
+                if super::secure_stream::is_preamble_first_byte(first_byte)
+                    && super::secure_stream::buffered_magic_matches(&mut raw_reader).await
+                {
                     let secure = tokio::time::timeout_at(
                         preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
                         super::secure_stream::accept_after_first(
@@ -8870,7 +8891,23 @@ impl UploadHandler {
                                     self.part_hash_cache.lock().await.get(&cache_key)
                                 };
                                 let compute_md4 = request_md4 && memoized_md4.is_none();
-                                let (computed_md4, aich_hashes) = tokio::task::spawn_blocking(move || {
+                                // The AICH branch needs the same memo, and for the
+                                // same reason: it reads the whole file and builds a
+                                // SHA-1 tree over every 180 KiB block, on a request
+                                // that needs no slot, no queue position and no
+                                // identity, and the abuse tracker counts connections
+                                // rather than packets. Uncached, one looped 20-byte
+                                // packet pinned a core and the disk indefinitely.
+                                // Shares `aich_cache` with `OP_AICHREQUEST` — that
+                                // handler stores the same hash set, so warming
+                                // either opcode now serves both.
+                                let memoized_aich = if is_partial || !request_aich {
+                                    None
+                                } else {
+                                    self.aich_cache.lock().await.get(&cache_key)
+                                };
+                                let compute_aich = request_aich && memoized_aich.is_none();
+                                let (computed_md4, computed_aich) = tokio::task::spawn_blocking(move || {
                                     let md4 = if compute_md4 {
                                         if is_partial {
                                             let tracker = super::part_tracker::PartTracker::new(file_size, &path);
@@ -8886,11 +8923,13 @@ impl UploadHandler {
                                     } else {
                                         None
                                     };
-                                    let aich = if request_aich {
+                                    let aich = if compute_aich {
                                         if is_partial {
                                             None
                                         } else {
-                                            Some(compute_aich_part_hashes(&mut opened)?)
+                                            Some(crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_open_file(
+                                                &mut opened,
+                                            )?)
                                         }
                                     } else {
                                         None
@@ -8905,7 +8944,18 @@ impl UploadHandler {
                                             .insert(cache_key.clone(), hashes.clone());
                                     }
                                 }
+                                if let Some(ref hs) = computed_aich {
+                                    if !is_partial {
+                                        self.aich_cache
+                                            .lock()
+                                            .await
+                                            .insert(cache_key.clone(), hs.clone());
+                                    }
+                                }
                                 let md4_hashes = memoized_md4.or(computed_md4);
+                                let aich_hashes = memoized_aich
+                                    .or(computed_aich)
+                                    .map(|hs| hs.part_hashes());
 
                                 let md4_section = md4_hashes
                                     .as_ref()
@@ -10324,11 +10374,6 @@ fn encode_hashset2_response(
         }
     }
     Some(response)
-}
-
-fn compute_aich_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 20]>> {
-    let hs = crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_open_file(file)?;
-    Ok(hs.part_hashes())
 }
 
 fn read_upload_block(

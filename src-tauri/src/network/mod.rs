@@ -14431,6 +14431,17 @@ pub async fn start_network(
 
     info!("Network event loop starting");
     let mut shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    /// Budget handed to the save sequence when the loop ends without a
+    /// `Shutdown` command, i.e. when nobody supplied a deadline.
+    const UNREQUESTED_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+    // Whether `shutdown_deadline` came from a caller that is waiting on us.
+    // Only a `Shutdown` command sets it; the other two ways out of the loop (a
+    // panic caught below, and the command channel closing) leave the initial
+    // start-up value, which is in the past for any session older than the
+    // budget above — and every phase deadline is `min(global, now + phase)`, so
+    // a past global expires all of them instantly and silently skips
+    // nodes.dat, known.met, credits, reputation, sources.met and server.met.
+    let mut shutdown_requested = false;
 
     let loop_panic = std::panic::AssertUnwindSafe(async {
     loop {
@@ -14445,6 +14456,7 @@ pub async fn start_network(
             match cmd {
                 NetworkCommand::Shutdown { deadline } => {
                     shutdown_deadline = deadline;
+                    shutdown_requested = true;
                     shutting_down = true;
                     break;
                 }
@@ -15394,13 +15406,18 @@ pub async fn start_network(
                                     &local_index,
                                 ).await;
                             }
-                        } else if state.stats.status != NetworkStatus::Disconnected {
-                            last_kad_activity_at = chrono::Utc::now().timestamp();
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::Kad,
-                                crate::storage::statistics::OverheadDirection::Download,
-                                len as u64,
-                            );
+                        } else {
+                            // Always dispatch: this handler owns eD2K peer UDP as
+                            // well as KAD, and it gates the KAD half on connection
+                            // state itself. Only the KAD accounting is conditional.
+                            if state.stats.status != NetworkStatus::Disconnected {
+                                last_kad_activity_at = chrono::Utc::now().timestamp();
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::Kad,
+                                    crate::storage::statistics::OverheadDirection::Download,
+                                    len as u64,
+                                );
+                            }
                             handle_udp_packet(
                                 &udp_socket,
                                 &udp_buf[..len],
@@ -15450,13 +15467,18 @@ pub async fn start_network(
                                         &local_index,
                                     ).await;
                                 }
-                            } else if state.stats.status != NetworkStatus::Disconnected {
-                                last_kad_activity_at = chrono::Utc::now().timestamp();
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::Kad,
-                                    crate::storage::statistics::OverheadDirection::Download,
-                                    len as u64,
-                                );
+                            } else {
+                                // See the first recv branch: dispatch regardless so
+                                // eD2K peer UDP is served with KAD down, and gate
+                                // only the KAD accounting.
+                                if state.stats.status != NetworkStatus::Disconnected {
+                                    last_kad_activity_at = chrono::Utc::now().timestamp();
+                                    stats_manager.add_overhead(
+                                        crate::storage::statistics::OverheadCategory::Kad,
+                                        crate::storage::statistics::OverheadDirection::Download,
+                                        len as u64,
+                                    );
+                                }
                                 handle_udp_packet(
                                     &udp_socket,
                                     &udp_buf[..len],
@@ -15484,6 +15506,7 @@ pub async fn start_network(
                 match cmd {
                     Some(NetworkCommand::Shutdown { deadline }) => {
                         shutdown_deadline = deadline;
+                        shutdown_requested = true;
                         info!("Network shutting down");
                         // See the try_recv drain above: stop the upload listener
                         // before the shutdown save sequence runs.
@@ -28820,11 +28843,20 @@ pub async fn start_network(
                 let ember_contacts = state.ember_dht.bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
                 if !ember_contacts.is_empty() {
                     let ember_path = state.data_dir.join("nodes_ember.dat");
-                    if let Err(e) =
-                        ember::dht::bootstrap::save_nodes(&ember_path, &ember_contacts)
-                    {
-                        error!("Failed periodic nodes_ember.dat save: {e}");
-                    }
+                    // Off the loop, like the nodes.dat write above and for the
+                    // reason `spawn_save_server_met` documents: `save_nodes`
+                    // commits through `atomic_write`, so it fsyncs the file *and*
+                    // the parent directory inline. Running that in the select arm
+                    // stalled UDP receive, every timer and every transfer event for
+                    // the duration, and a full receive buffer drops KAD and Ember
+                    // packets outright.
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) =
+                            ember::dht::bootstrap::save_nodes(&ember_path, &ember_contacts)
+                        {
+                            error!("Failed periodic nodes_ember.dat save: {e}");
+                        }
+                    });
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
@@ -31033,6 +31065,22 @@ pub async fn start_network(
         }));
     }
 
+    // Nobody asked for this shutdown, so nobody is waiting on a deadline and the
+    // one we still hold is the start-up value from `UNREQUESTED_SHUTDOWN_BUDGET`
+    // ago. Start the budget now instead: the saves below are the whole reason
+    // this sequence exists, and an expired global would skip every one of them
+    // while logging it as a slow-disk timeout. A caller-supplied deadline is
+    // left exactly as given, even if it has already elapsed — `run_graceful_
+    // shutdown` bounds its own wait, and overrunning it would race the process
+    // teardown it is about to perform.
+    if !shutdown_requested {
+        shutdown_deadline = tokio::time::Instant::now() + UNREQUESTED_SHUTDOWN_BUDGET;
+        warn!(
+            "Network loop exited without a shutdown command; running the save sequence on a fresh {}s budget",
+            UNREQUESTED_SHUTDOWN_BUDGET.as_secs()
+        );
+    }
+
     // Abort pending server connection if any
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
@@ -31387,8 +31435,20 @@ pub async fn start_network(
                 .await
                 {
                     Ok(Some(result)) => {
-                        if matches!(result.job, PeriodicSaveJob::Known2) {
-                            known2_save_in_flight = false;
+                        // One shared channel carries every periodic save, so clear
+                        // whichever flag this result belongs to. Dropping a
+                        // sibling's completion left its own join below waiting on a
+                        // message already consumed here, burning that phase's slice
+                        // of the *shared* shutdown budget and reporting it as a
+                        // deadline exhaustion — which can then push the later
+                        // sources.met / server.met saves past the global deadline.
+                        match result.job {
+                            PeriodicSaveJob::Known2 => known2_save_in_flight = false,
+                            PeriodicSaveJob::Reputation => reputation_save_in_flight = false,
+                            PeriodicSaveJob::Nodes | PeriodicSaveJob::Stats => {}
+                        }
+                        if let Err(error) = result.result {
+                            error!("Periodic shutdown writer failed before final save: {error}");
                         }
                     }
                     Ok(None) => break,
@@ -35078,8 +35138,29 @@ async fn handle_udp_packet_inner(
                     IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                 };
                 if let Some(v4) = v4_opt {
+                    // These opcodes answer one `OP_REASKFILEPING` about one file,
+                    // and the wire message carries no hash — which is exactly why
+                    // the ACK branch above resolves the file through the reask we
+                    // tracked. Without that correlation this applied a peer's "I
+                    // don't have *that* file" to every download it happens to be a
+                    // source for (routine: A4AF exists because peers serve several
+                    // of our files), demoting healthy sources on unrelated files
+                    // and discarding queue ranks we had just learned. It also made
+                    // a single unsolicited or source-spoofed datagram authoritative.
+                    let Some((file_hash, _)) =
+                        state.pending_udp_reasks.remove(&(v4, from.port()))
+                    else {
+                        debug!(
+                            "Ignoring unsolicited UDP reask negative response (opcode 0x{opcode:02X}) from {from}"
+                        );
+                        return;
+                    };
                     let is_banned = state.banned_ips.contains(&v4);
-                    for pfs in state.per_file_sources.values_mut() {
+                    if let Some(pfs) = state
+                        .per_file_sources
+                        .values_mut()
+                        .find(|pfs| pfs.file_hash == file_hash)
+                    {
                         for src in &mut pfs.sources {
                             if src.ip == v4 && src.udp_port == from.port() {
                                 if is_banned {
@@ -35200,6 +35281,20 @@ async fn handle_udp_packet_inner(
                 return;
             }
         }
+        return;
+    }
+
+    // Everything above serves eD2K *peer* UDP — port test, queue reasks and
+    // their acks, buddy reask relay — none of which involves KAD. Everything
+    // below is KAD's, and an unsolicited KAD packet must not be parsed or folded
+    // into the routing table while KAD is disconnected, so the gate belongs here
+    // rather than around the whole handler. It used to sit at the call site,
+    // which meant an eD2K-only session (the default: `auto_connect_kad` is off,
+    // and such a session never leaves `Disconnected`) discarded every inbound
+    // peer datagram while still sending reasks — queue ranks never updated,
+    // peers queued on us never got an ack, and the UDP port test always failed.
+    if state.stats.status == NetworkStatus::Disconnected {
+        debug!("Dropping KAD UDP packet from {from}: KAD is not connected");
         return;
     }
 

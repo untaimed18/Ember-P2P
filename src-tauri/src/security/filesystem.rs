@@ -535,12 +535,12 @@ pub fn initialize_approved_roots(
     let mut roots: HashMap<String, ApprovedRoot> = if state_exists {
         match read_persisted_roots(&state_path) {
             Ok(roots) => roots,
-            Err(error) => {
-                // Unreadable approval state must not make the app impossible to
-                // launch. Quarantine it and continue with nothing approved: every
-                // root then fails closed until re-approved from Settings, and the
-                // empty set is persisted below so this stays deliberate rather
-                // than looking like a fresh install on the next launch.
+            // Corrupt content: the file will never parse, so quarantining it and
+            // continuing with nothing approved is the only way forward. Every root
+            // fails closed until re-approved from Settings, and the empty set is
+            // persisted below so this stays deliberate rather than looking like a
+            // fresh install on the next launch.
+            Err(error) if is_unparseable_root_state(&error) => {
                 tracing::error!(
                     "Approved-root state at {} is unusable ({error}); quarantining it. \
                      Shared folders and the download folder must be re-approved in Settings.",
@@ -548,6 +548,24 @@ pub fn initialize_approved_roots(
                 );
                 quarantine_file(&state_path);
                 HashMap::new()
+            }
+            // The file is intact; we just could not read it this time — a sharing
+            // violation from a SYSTEM-level scanner, or a transient I/O error.
+            // Treating that as corruption quarantined good state and then wrote an
+            // empty set over it, so one unlucky startup permanently unapproved
+            // every shared folder and the download folder. Worse, `quarantine_file`
+            // renames to a fixed name, so a second occurrence discarded the copy
+            // that still held the real approvals. Fail the launch instead and let
+            // the user retry, matching `NodeIdentity::load_or_create`, which
+            // refuses to mint a new identity on a transient error for the same
+            // reason.
+            Err(error) => {
+                tracing::error!(
+                    "Approved-root state at {} could not be read ({error}); refusing to \
+                     discard it. Retry, or move the file aside if it is genuinely damaged.",
+                    state_path.display()
+                );
+                return Err(error);
             }
         }
     } else {
@@ -603,10 +621,29 @@ pub fn initialize_approved_roots(
     Ok(registry)
 }
 
+/// Whether an error from [`read_persisted_roots`] means the file's *content* is
+/// unusable, as opposed to the read itself having failed.
+///
+/// Both arrive as `io::Error` because the parse failures are wrapped into one,
+/// so the kind is what separates "this will never parse" from "try again".
+fn is_unparseable_root_state(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn read_persisted_roots(state_path: &Path) -> io::Result<HashMap<String, ApprovedRoot>> {
     let data = std::fs::read(state_path)?;
-    let persisted: PersistedRoots = serde_json::from_slice(&data)
-        .map_err(|error| io_other(format!("parse approved roots: {error}")))?;
+    // `InvalidData`, not `Other`: the caller quarantines on that kind and only on
+    // that kind, so a parse failure must be distinguishable from the `std::fs::read`
+    // above having failed for an environmental reason.
+    let persisted: PersistedRoots = serde_json::from_slice(&data).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse approved roots: {error}"),
+        )
+    })?;
     if persisted.version != ROOT_STATE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

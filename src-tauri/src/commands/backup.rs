@@ -351,7 +351,15 @@ fn encrypt_stream(
     let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key.as_ref()));
 
     let io = |e: std::io::Error| coded_ctx("backup_export_failed", "Failed to write backup", e);
-    let mut out = std::fs::File::create(dest).map_err(io)?;
+    // `create_new`, not `create`: `dest` here is the per-export scratch file, and
+    // truncating an existing one would let a second export in flight interleave
+    // its chunk stream with ours. With a randomised scratch name a collision now
+    // means something genuinely unexpected, so fail rather than overwrite.
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(io)?;
     crate::security::restrict_file_permissions(dest);
     out.write_all(MAGIC).map_err(io)?;
     out.write_all(&(header_json.len() as u32).to_le_bytes())
@@ -775,12 +783,27 @@ fn validate_destination(raw: &str) -> Result<PathBuf, String> {
 
 /// Sibling scratch name for an in-progress export. Sits next to the
 /// destination so the final step is a same-volume rename.
+///
+/// Randomised per call, not just per process. `export_backup` holds no lock, so
+/// two overlapping exports to one destination derived the same scratch name and
+/// — with the truncating `File::create` that used to open it — interleaved two
+/// independently keyed chunk streams into one file. The first rename published
+/// that mixture over the user's existing backup and returned `Ok`, leaving a
+/// file no passphrase can decrypt where a good backup used to be. Mirrors
+/// `security::unique_tmp_path`, and the scratch is now opened with
+/// `create_new` so a collision fails loudly instead of truncating.
 fn partial_export_path(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "backup".to_string());
-    dest.with_file_name(format!(".{name}.{}.partial", std::process::id()))
+    let mut unique = [0u8; 8];
+    OsRng.fill_bytes(&mut unique);
+    dest.with_file_name(format!(
+        ".{name}.{}.{}.partial",
+        std::process::id(),
+        hex::encode(unique)
+    ))
 }
 
 fn validate_source(raw: &str) -> Result<PathBuf, String> {

@@ -1189,22 +1189,45 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
         if offset >= payload.len() {
             break;
         }
-        let tag_type = payload[offset];
+        let raw_tag_type = payload[offset];
         offset += 1;
-        if offset + 3 > payload.len() {
-            break;
-        }
-        let name_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
-        offset += 2;
-        if offset + name_len > payload.len() {
-            break;
-        }
-        let name_id = if name_len == 1 {
-            Some(payload[offset])
+        // eD2K tags have two encodings on the wire. eMule builds network-packet
+        // tags with `CTag::WriteNewEd2kTag`, which uses the compact form —
+        // `type | 0x80` followed by a single name-id byte instead of a
+        // length-prefixed name — whenever the tag has a numeric id, and accepts
+        // both forms when parsing. We advertise `SRVCAP_NEWTAGS`, so a server may
+        // answer `OP_SERVERIDENT` compactly; handling only the old form meant the
+        // first such tag fell through to the catch-all `break` below and the
+        // server name was dropped, leaving the list showing a dotted quad for any
+        // server learned from an `OP_SERVERLIST` push. The `.met` *file* parsers
+        // are correct to reject `0x80`: `CTag::WriteTagToFile` always writes the
+        // old form to disk, so the two cases genuinely differ.
+        let compact = raw_tag_type & 0x80 != 0;
+        let tag_type = raw_tag_type & 0x7F;
+        let name_id = if compact {
+            if offset >= payload.len() {
+                break;
+            }
+            let id = payload[offset];
+            offset += 1;
+            Some(id)
         } else {
-            None
+            if offset + 3 > payload.len() {
+                break;
+            }
+            let name_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += 2;
+            if offset + name_len > payload.len() {
+                break;
+            }
+            let id = if name_len == 1 {
+                Some(payload[offset])
+            } else {
+                None
+            };
+            offset += name_len;
+            id
         };
-        offset += name_len;
 
         match tag_type {
             0x02 => {
@@ -1307,6 +1330,42 @@ mod tests {
             parse_server_ident_name(&payload).as_deref(),
             Some("MyServer")
         );
+    }
+
+    /// eMule writes network-packet tags with `WriteNewEd2kTag`, which uses the
+    /// compact `type | 0x80` + name-id form for any tag with a numeric id. Only
+    /// handling the old form meant the first compact tag hit the catch-all `break`
+    /// and the server name was dropped, leaving a dotted quad in the server list.
+    #[test]
+    fn server_ident_reads_a_compact_name_tag() {
+        let mut payload = vec![0u8; 26];
+        payload[22..26].copy_from_slice(&1u32.to_le_bytes());
+        payload.push(0x02 | 0x80); // compact TAGTYPE_STRING
+        payload.push(0x01); // server-name tag id, no length prefix
+        payload.extend_from_slice(&8u16.to_le_bytes());
+        payload.extend_from_slice(b"Compact!");
+
+        assert_eq!(
+            parse_server_ident_name(&payload).as_deref(),
+            Some("Compact!")
+        );
+    }
+
+    /// A compact tag ahead of the name must be skipped correctly rather than
+    /// desynchronising the loop or aborting it.
+    #[test]
+    fn server_ident_skips_a_compact_tag_before_the_name() {
+        let mut payload = vec![0u8; 26];
+        payload[22..26].copy_from_slice(&2u32.to_le_bytes());
+        payload.push(0x03 | 0x80); // compact TAGTYPE_UINT32
+        payload.push(0x99);
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.push(0x02 | 0x80); // compact TAGTYPE_STRING
+        payload.push(0x01);
+        payload.extend_from_slice(&6u16.to_le_bytes());
+        payload.extend_from_slice(b"Second");
+
+        assert_eq!(parse_server_ident_name(&payload).as_deref(), Some("Second"));
     }
 
     #[test]

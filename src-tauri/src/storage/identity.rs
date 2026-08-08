@@ -121,6 +121,15 @@ impl NodeIdentity {
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
         let protected_marker = data_dir.join("identity.protected");
+        // A crash inside `atomic_write`'s Windows replace-fallback can leave the
+        // identity parked under its backup name with nothing at `path`. Reaching
+        // the `NotFound` arm below would then mint a fresh KAD id and user hash and
+        // discard every friendship and upload credit — the one loss this function
+        // otherwise goes out of its way to refuse. Restore first; a no-op when
+        // there is nothing parked.
+        crate::security::recover_interrupted_replace(&path);
+        #[cfg(target_os = "windows")]
+        crate::security::recover_interrupted_replace(&protected_marker);
         match std::fs::read(&path) {
             Ok(raw) => {
                 // Unwrap DPAPI at-rest protection. Legacy plaintext files pass

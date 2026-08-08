@@ -53,6 +53,13 @@ pub(super) const KEYWORD_TTL_SECS: i64 = 86_400; // 24 hours
 const SOURCE_TTL_SECS: i64 = 18_000; // 5 hours
 const NOTES_TTL_SECS: i64 = 86_400; // 24 hours
 const MAX_NOTES_PER_FILE: usize = 150;
+/// Share of `MAX_TOTAL_ENTRIES` that stored notes may occupy.
+///
+/// Notes are the least load-bearing record type — losing one costs a comment or
+/// a rating, where losing a source record costs a download and losing a keyword
+/// record costs a search hit. Ring-fencing them means an unbudgeted notes flood
+/// cannot deny the two that matter. See `store_notes_entry`.
+const MAX_NOTES_TOTAL_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct StoredEntry {
@@ -389,6 +396,50 @@ impl DhtStore {
             // 64 MiB byte cap: gating on bytes alone meant eviction never ran
             // at all and the full-store lockout it exists to prevent stayed
             // reachable for the whole `KEYWORD_TTL_SECS`.
+            // Price the arriving publisher's *own* allowance first. Eviction
+            // spends somebody else's entries, and the caps below belong to this
+            // publisher, so an entry its own allowance refuses must cost nobody
+            // anything. Checking them only after the eviction ran let a peer with
+            // a deliberately small footprint shed up to
+            // `MAX_KEYWORD_EVICTIONS_PER_PUBLISH` of the heaviest *other*
+            // publisher's records per packet and then have its entry dropped by
+            // the `continue`s further down — free, repeatable deletion of honest
+            // records, against publishers that only republish every 20 hours.
+            // Replacements are exempt: they cost no slot, their byte delta is
+            // already priced below, and the branch that applies them has its own
+            // guards.
+            let is_replacement = self.keyword_entries.get(target).is_some_and(|bucket| {
+                bucket
+                    .iter()
+                    .any(|e| e.id == entry.id && e.source_id == *sender_id)
+            });
+            if !is_replacement {
+                let existing = self.keyword_entries.get(target);
+                let bucket_len = existing.map_or(0, |bucket| bucket.len());
+                let key_bytes_now = existing.map_or(0, |bucket| retained_bytes(bucket));
+                let publisher_bytes_now: usize = existing.map_or(0, |bucket| {
+                    bucket
+                        .iter()
+                        .filter(|stored| stored.source_id == *sender_id)
+                        .map(|stored| stored.retained_bytes)
+                        .sum()
+                });
+                let usage = self.keyword_publisher_usage.get(&budget_key);
+                let publisher_entries_now = usage.map_or(0, |usage| usage.entries);
+                let publisher_total_bytes_now = usage.map_or(0, |usage| usage.bytes);
+                if sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER
+                    || publisher_entries_now >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER
+                    || bucket_len >= MAX_ENTRIES_PER_KEY
+                    || key_bytes_now.saturating_add(entry_bytes) > MAX_RETAINED_BYTES_PER_KEY
+                    || publisher_bytes_now.saturating_add(entry_bytes)
+                        > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
+                    || publisher_total_bytes_now.saturating_add(entry_bytes)
+                        > MAX_KEYWORD_BYTES_PER_PUBLISHER
+                {
+                    continue;
+                }
+            }
+
             let over_total_bytes =
                 self.total_retained_bytes.saturating_add(entry_bytes) > MAX_TOTAL_RETAINED_BYTES;
             let over_total_count = self.total_count >= MAX_TOTAL_ENTRIES;
@@ -930,6 +981,25 @@ impl DhtStore {
             return self.compute_load();
         }
 
+        // Notes get their own share of the store rather than competing for the
+        // shared entry cap.
+        //
+        // `sender_id` is a wire field and `target` only has to fall inside our
+        // search tolerance, so one peer can mint a fresh entry *and* a fresh
+        // bucket per packet; the per-target `MAX_NOTES_PER_FILE` bounds neither.
+        // Unlike keywords (`keyword_publisher_usage`) and sources
+        // (`MAX_SOURCES_PER_IP`), notes have no publisher accounting to charge,
+        // and a note entry carries no publisher tag to count one from. Until it
+        // does, this at least keeps the damage inside the notes budget: filling
+        // it denies further notes, where filling the shared cap used to refuse
+        // every new source record and start evicting honest keyword entries.
+        //
+        // Summed on demand rather than tracked: it is a few thousand `Vec::len`
+        // reads on a path a peer can only reach 8–16 times per 15s, which is far
+        // cheaper than keeping another counter correct across expiry, eviction
+        // and overwrite.
+        let notes_total: usize = self.notes_entries.values().map(Vec::len).sum();
+
         let bucket = self.notes_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
 
@@ -944,7 +1014,9 @@ impl DhtStore {
         let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
         if existing_pos.is_none()
-            && (self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_NOTES_PER_FILE)
+            && (self.total_count >= MAX_TOTAL_ENTRIES
+                || notes_total.saturating_sub(removed) >= MAX_NOTES_TOTAL_ENTRIES
+                || bucket.len() >= MAX_NOTES_PER_FILE)
         {
             // See the matching comment in `store_keyword_entries`/
             // `store_source_entry`: don't leave an empty bucket key behind
@@ -1326,6 +1398,58 @@ mod keyword_store_tests {
             store.search_keywords(&hog_target).len(),
             1,
             "exactly one of the heaviest publisher's entries pays for the slot"
+        );
+    }
+
+    /// Eviction spends another publisher's entries, so it must not run for an
+    /// entry the arriving publisher's *own* allowance is going to refuse. Checking
+    /// those caps only afterwards let a peer with a small footprint delete honest
+    /// records for free, once per entry, indefinitely.
+    #[test]
+    fn a_publisher_over_its_own_cap_evicts_nobody() {
+        let mut store = DhtStore::new();
+        let honest = KadId([0xD1; 16]);
+        let attacker = KadId([0xD2; 16]);
+        let honest_target = numbered_target(1);
+        let attacker_target = numbered_target(2);
+
+        // An honest publisher with bulk worth evicting.
+        store.store_keyword_entries(
+            &honest_target,
+            vec![sized_entry(1, 2048), sized_entry(2, 2048)],
+            &honest,
+            None,
+        );
+        let honest_before = store.search_keywords(&honest_target).len();
+        assert_eq!(honest_before, 2);
+
+        // Saturate the attacker's own per-key bucket so any further new entry of
+        // its own is refused, then force the global entry cap so eviction would
+        // otherwise be considered.
+        for index in 0..MAX_ENTRIES_PER_KEY {
+            store
+                .keyword_entries
+                .entry(attacker_target)
+                .or_default()
+                .push(StoredEntry {
+                    id: KadId([(index % 251) as u8; 16]),
+                    tags: Vec::new(),
+                    stored_at: chrono::Utc::now().timestamp(),
+                    ttl_secs: KEYWORD_TTL_SECS,
+                    source_id: attacker,
+                    publisher_ip: Some(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+                    retained_bytes: 1,
+                });
+        }
+        store.total_count = MAX_TOTAL_ENTRIES;
+
+        store.store_keyword_entries(&attacker_target, vec![entry(9)], &attacker, None);
+
+        assert_eq!(
+            store.search_keywords(&honest_target).len(),
+            honest_before,
+            "an entry refused by its own publisher's caps must not cost another \
+             publisher a record"
         );
     }
 

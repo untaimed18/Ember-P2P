@@ -160,6 +160,13 @@ pub struct SearchState {
     /// Next start_position for pagination: re-fetch contacts that returned a
     /// full page (200 results) with an incremented offset to get more.
     fetch_page_offset: HashMap<KadId, u16>,
+    /// Entries a contact has delivered for its *current* page, accumulated across
+    /// datagrams. A responder splits one page over many `SearchRes` packets —
+    /// batched to `UDP_KAD_MAXFRAGMENT`, so ~20 entries each against a 200-result
+    /// page — which is why a single packet's count can never reach the page size
+    /// and pagination has to be driven by the running total. Reset when the offset
+    /// advances.
+    fetch_page_received: HashMap<KadId, usize>,
     /// eMule StorePacket: contacts that have been sent a keyword/source search
     /// request during the Lookup phase (before the formal Fetch transition).
     /// This overlaps fetch with lookup, matching eMule's JumpStart behavior
@@ -222,6 +229,7 @@ impl SearchState {
             in_use_ids: Vec::new(),
             new_in_use_ids: Vec::new(),
             fetch_page_offset: HashMap::new(),
+            fetch_page_received: HashMap::new(),
             store_sent: HashSet::new(),
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
@@ -725,7 +733,19 @@ impl SearchState {
 
         const FETCH_PAGE_SIZE: usize = 200;
         const MAX_PAGES_PER_PEER: u16 = 3;
-        if count >= FETCH_PAGE_SIZE
+        // Against the *running* total for this peer's current page, not this one
+        // datagram's count: the responder fragments a page to fit
+        // `UDP_KAD_MAXFRAGMENT`, so a single packet carries roughly 20 entries and
+        // comparing it to the page size meant the offset never advanced and
+        // `MAX_PAGES_PER_PEER` was unreachable — every peer contributed only its
+        // first page however much more it held.
+        let page_received = self
+            .fetch_page_received
+            .entry(*from)
+            .or_insert(0);
+        *page_received = page_received.saturating_add(count);
+        let page_complete = *page_received >= FETCH_PAGE_SIZE;
+        if page_complete
             && !self.stop_querying
             && self.results.len() < 5000
             && matches!(
@@ -737,6 +757,7 @@ impl SearchState {
             let next_offset = current_offset.saturating_add(FETCH_PAGE_SIZE as u16);
             if current_offset / FETCH_PAGE_SIZE as u16 + 1 < MAX_PAGES_PER_PEER {
                 self.fetch_page_offset.insert(*from, next_offset);
+                self.fetch_page_received.insert(*from, 0);
                 self.fetched.remove(from);
                 // JumpStart `next_store_queries` gates on `!store_sent`. Without
                 // clearing it, page-2+ SearchKey/Source requests never fire

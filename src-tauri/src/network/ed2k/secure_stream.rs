@@ -22,9 +22,12 @@ const PROLOGUE_DOMAIN: &[u8] = b"ember-secure-friend-stream-v2\0";
 /// eD2K/eMule protocol marker.  The upload listener consumes it only when the
 /// entire magic matches; all other first bytes continue through the existing
 /// eMule parser/obfuscation negotiation.
-// Zero is reserved by eMule's encrypted-stream discriminator (its random
-// first byte is non-zero and excludes every plain protocol marker), making
-// this branch collision-free rather than probabilistic.
+// The first byte is NOT a value eMule cannot send: its
+// `GetSemiRandomNotProtocolMarker()` (EncryptedStreamSocket.cpp) rejects only
+// `OP_EDONKEYPROT`, `OP_PACKEDPROT` and `OP_EMULEPROT`, so a stock client opens
+// roughly 1 in 253 obfuscated connections with `0x00`. Committing on this byte
+// alone therefore misrouted those into the preamble reader and dropped them.
+// `buffered_magic_matches` is what disambiguates; see its comment.
 pub const PREAMBLE_MAGIC: [u8; 8] = [0, b'E', b'M', b'B', b'F', b'S', b'2', 0];
 const ACK_MAGIC: [u8; 8] = [0, b'E', b'M', b'B', b'A', b'C', b'2', 0];
 const PREAMBLE_LEN: usize = PREAMBLE_MAGIC.len() + 16 + 16 + 32;
@@ -55,6 +58,37 @@ pub struct SecureStreamParts {
 
 pub fn is_preamble_first_byte(byte: u8) -> bool {
     byte == PREAMBLE_MAGIC[0]
+}
+
+/// Whether the bytes already buffered behind the discriminator are consistent
+/// with the rest of [`PREAMBLE_MAGIC`].
+///
+/// The first byte cannot decide this on its own, because eMule's obfuscation
+/// discriminator is allowed to be `0x00`. This peeks the buffer without
+/// consuming, so a mismatch leaves the stream exactly as the eMule negotiator
+/// expects to find it — no pushback and no change to the inbound path's types.
+///
+/// Both senders write their opening bytes in one go, so in practice the whole
+/// prefix is already buffered and the answer is exact. When fewer bytes are
+/// available (fragmented delivery) it accepts a prefix match rather than
+/// rejecting, so a genuine Ember peer is never turned away; the residual
+/// ambiguity is then one eMule connection whose random key part also begins
+/// `EMBFS2`, which is not a case worth engineering for.
+pub async fn buffered_magic_matches<R>(reader: &mut R) -> bool
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let expected = &PREAMBLE_MAGIC[1..];
+    match reader.fill_buf().await {
+        Ok(buffered) => {
+            let comparable = buffered.len().min(expected.len());
+            buffered[..comparable] == expected[..comparable]
+        }
+        // Let the secure path run and surface the I/O error itself rather than
+        // silently handing a broken stream to the eMule negotiator.
+        Err(_) => true,
+    }
 }
 
 fn prologue(initiator: &[u8; 16], responder: &[u8; 16]) -> Vec<u8> {
@@ -571,6 +605,49 @@ mod tests {
         for marker in [0xE3u8, 0xC5, 0xD4] {
             assert!(!is_preamble_first_byte(marker));
         }
+    }
+
+    /// eMule's `GetSemiRandomNotProtocolMarker()` excludes only the three
+    /// protocol opcodes, so `0x00` is a legal first byte for an ordinary
+    /// obfuscated dial and the discriminator alone cannot decide. The buffered
+    /// magic is what separates the two, and a mismatch must be reported without
+    /// consuming anything so the eMule negotiator still sees an intact stream.
+    #[tokio::test]
+    async fn buffered_magic_rejects_an_emule_obfuscation_handshake() {
+        // A plausible obfuscated request that happens to open with 0x00: random
+        // key part, sync magic, method bytes, padding length.
+        let emule_like = [0x00u8, 0x91, 0x2B, 0x77, 0x0C, 0x1D, 0xEF, 0x43, 0x00];
+        let mut reader = tokio::io::BufReader::new(&emule_like[1..]);
+        assert!(
+            !buffered_magic_matches(&mut reader).await,
+            "an eMule obfuscation handshake must not be taken for a friend preamble"
+        );
+
+        // Nothing was consumed, so the negotiator still gets every byte.
+        use tokio::io::AsyncReadExt;
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(
+            rest, &emule_like[1..],
+            "the peek must leave the stream untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_magic_accepts_a_real_preamble() {
+        let mut tail = PREAMBLE_MAGIC[1..].to_vec();
+        tail.extend_from_slice(&[0xAA; 32]);
+        let mut reader = tokio::io::BufReader::new(tail.as_slice());
+        assert!(buffered_magic_matches(&mut reader).await);
+    }
+
+    /// Fragmented delivery must not turn a genuine Ember peer away: a prefix
+    /// that matches as far as it goes is accepted.
+    #[tokio::test]
+    async fn buffered_magic_accepts_a_short_matching_prefix() {
+        let partial = &PREAMBLE_MAGIC[1..3];
+        let mut reader = tokio::io::BufReader::new(partial);
+        assert!(buffered_magic_matches(&mut reader).await);
     }
 
     #[test]

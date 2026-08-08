@@ -7460,9 +7460,25 @@ async fn download_parts_from_source(
                                     )
                                 })
                             });
+                        // No outstanding request for this start is a stale block,
+                        // not misbehaviour: `batches` and the accumulator are both
+                        // per-part, so a block we legitimately asked for arrives
+                        // unmatched whenever another source closed the last gap in
+                        // this part first, or the pipelined target completed
+                        // elsewhere and we moved on. Treating it as fatal
+                        // propagated out of the worker and dropped a healthy peer
+                        // into its reask cooldown for the rest of the session. The
+                        // uncompressed branch already discards such a block as a
+                        // duplicate; do the same and let the gap be re-requested.
+                        let Some(requested_end) = requested_end else {
+                            tracing::debug!(
+                                "Discarding compressed block at {start} from source {_src_idx}: no outstanding request (part advanced)"
+                            );
+                            continue;
+                        };
                         let Some(decompressed) = pending_compressed.append(
                             start,
-                            requested_end,
+                            Some(requested_end),
                             compressed_total_size,
                             compressed,
                         )?
@@ -9354,9 +9370,21 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
                     return AichAnswerOutcome::NotAvailable;
                 }
             }
-            if deferred_packets.len() >= 64 {
-                // Every packet read so far was whole, so the stream is still
-                // aligned — we just refuse to buffer more.
+            // Bound the buffer by bytes as well as by count. A count alone let a
+            // peer queue 64 whole packets, and a packed frame is capped at 2 MiB
+            // on the wire but may inflate to 10 MiB — roughly 640 MiB resident per
+            // connection, multiplied across source slots, on a path the sender
+            // reaches by failing a part's MD4. Both limits leave the stream on a
+            // packet boundary, so refusing to buffer more is safe either way.
+            const MAX_DEFERRED_PACKETS: usize = 64;
+            const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            let deferred_bytes: usize = deferred_packets
+                .iter()
+                .map(|(_, _, buffered)| buffered.len())
+                .sum();
+            if deferred_packets.len() >= MAX_DEFERRED_PACKETS
+                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+            {
                 return AichAnswerOutcome::NotAvailable;
             }
             deferred_packets.push_back((proto, opcode, payload));

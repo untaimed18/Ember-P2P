@@ -701,6 +701,10 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// window so legitimate transfers can pause briefly, but it releases shared
 /// admission capacity long before the 30-minute absolute ceiling.
 const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How often a bridged relay pings its peer purely to keep the transport's
+/// `HTTP_IDLE_TIMEOUT` from expiring under it. Comfortably inside that window so
+/// a single dropped tick cannot close a healthy session; see `bridge_relay`.
+const RELAY_TRANSPORT_KEEPALIVE: Duration = Duration::from_secs(10);
 /// A downstream WebSocket or relay inbox must never hold a relay task inside
 /// a forwarding await long enough to bypass its idle and absolute deadlines.
 const RELAY_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -716,6 +720,9 @@ const MAX_RELAY_QUEUE_BYTES: usize = 256 * 1024;
 /// abandoned offer cannot become a reusable relay capability later.
 const RELAY_TICKET_TTL: Duration = Duration::from_secs(90);
 const MAX_RELAY_TICKETS: usize = 100_000;
+/// Served mailbox pages retained for idempotent re-reads. Bounded like every
+/// other map here; see `RelayTicketStore::store_mailbox_page`.
+const MAX_MAILBOX_PAGE_CACHE: usize = 10_000;
 /// The offerer can have a small burst for several friends, but cannot hold
 /// every pending-ticket slot by targeting arbitrary responders.
 const MAX_PENDING_RELAY_TICKETS_PER_INITIATOR: usize = 16;
@@ -1281,6 +1288,35 @@ impl RelayTicketStore {
         ticket_ids: Vec<String>,
         now: Instant,
     ) {
+        // An empty page has nothing to replay-protect, and caching one is what made
+        // this map grow with every identity that ever polled: `mailbox_page_ids_inner`
+        // removes the entry for a responder with no pending offers, and the caller
+        // re-inserted it on the very next line, so the removal never stuck.
+        if ticket_ids.is_empty() {
+            self.mailbox_page_cache.remove(responder_id);
+            return;
+        }
+        // Entries carry `expires_at` but nothing swept them — `RelayTicketStore::remove`,
+        // `prune_expired` and the sweep task all leave this map alone — so its size was
+        // the number of distinct identities seen over the process lifetime, unbounded
+        // and cheap to drive with register+poll pairs on fresh keypairs. Prune on
+        // insert and cap, evicting the soonest-to-expire so a legitimate poller is
+        // never refused a cache slot.
+        if self.mailbox_page_cache.len() >= MAX_MAILBOX_PAGE_CACHE {
+            self.mailbox_page_cache
+                .retain(|_, page| page.expires_at > now);
+            while self.mailbox_page_cache.len() >= MAX_MAILBOX_PAGE_CACHE {
+                let Some(soonest) = self
+                    .mailbox_page_cache
+                    .iter()
+                    .min_by_key(|(_, page)| page.expires_at)
+                    .map(|(id, _)| id.clone())
+                else {
+                    break;
+                };
+                self.mailbox_page_cache.remove(&soonest);
+            }
+        }
         self.mailbox_page_cache.insert(
             responder_id.to_owned(),
             MailboxServedPage {
@@ -3942,10 +3978,30 @@ async fn bridge_relay(
 ) {
     let bridge_idle_timeout = tokio::time::sleep(RELAY_BRIDGE_IDLE_TIMEOUT);
     tokio::pin!(bridge_idle_timeout);
+    // The upgraded socket still sits on the `IdleTimeoutStream` that
+    // `serve_connection` was given, and `with_upgrades()` hands that same IO to
+    // this task — so `HTTP_IDLE_TIMEOUT` outranks every relay lifetime rule
+    // above unless bytes keep moving. Silence is the normal state here: an eD2K
+    // peer parked in an upload queue sends nothing until its reask (~29 min) and
+    // an Ember friend session keepalives at 90s, both far longer than the HTTP
+    // idle window, so quiet-but-healthy relays were being killed by the
+    // transport. A ping is a write, and `IdleTimeoutStream::poll_write` resets
+    // the deadline, so this hands liveness back to `RELAY_BRIDGE_IDLE_TIMEOUT`
+    // and the absolute cap while still letting a genuinely dead socket fail on
+    // the write.
+    let mut transport_keepalive = tokio::time::interval(RELAY_TRANSPORT_KEEPALIVE);
+    transport_keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The immediate first tick would ping before anything can go idle.
+    transport_keepalive.tick().await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline.into()) => {
                 break;
+            }
+            _ = transport_keepalive.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
             _ = &mut bridge_idle_timeout => {
                 info!(

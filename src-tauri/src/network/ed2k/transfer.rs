@@ -3902,9 +3902,19 @@ impl Ed2kDownload {
                                     (*requested_start == start).then_some(*requested_end)
                                 },
                             );
+                            // See the matching branch in `multi_source.rs`: an
+                            // unmatched start means the part moved on under us, not
+                            // that the peer misbehaved, so discard the block
+                            // instead of failing the whole session out.
+                            let Some(requested_end) = requested_end else {
+                                debug!(
+                                    "Discarding compressed block at {start}: no outstanding request (part advanced)"
+                                );
+                                continue;
+                            };
                             let Some(decompressed) = pending_compressed.append(
                                 start,
-                                requested_end,
+                                Some(requested_end),
                                 compressed_total_size,
                                 compressed,
                             )?

@@ -925,19 +925,26 @@ pub struct SourceEntry {
 
 /// Which entry to drop when a file's source list is already at capacity.
 ///
-/// Prefer evicting anonymous, never-contacted gossip entries (raw SX/EPX or
-/// server hints we've never even tried to reach) over sources we've already
-/// identified or attempted — otherwise whoever can mint fresh (ip, port) or
-/// LowID rows fastest pushes out legitimate, previously-verified sources
-/// purely by being newer than them. A hostile server answering
-/// `OP_GLOBFOUNDSOURCES` with `max_per_file` distinct LowID ids is enough.
-/// Falls back to the least-recently-seen entry when every row is identified
-/// or contacted.
+/// Prefer evicting never-contacted gossip entries (raw SX/EPX or server hints
+/// we've never even tried to reach) over sources we've already attempted —
+/// otherwise whoever can mint fresh (ip, port) or LowID rows fastest pushes out
+/// legitimate, previously-verified sources purely by being newer than them. A
+/// hostile server answering `OP_GLOBFOUNDSOURCES` with `max_per_file` distinct
+/// LowID ids is enough. Falls back to the least-recently-seen entry when every
+/// row has been contacted.
+///
+/// The test is `last_asked`, which only *we* set, and deliberately not
+/// `user_hash`: that arrives verbatim off the wire
+/// (`entry.user_hash.unwrap_or([0u8; 16])` on every source-exchange path), so
+/// requiring it to be zero handed the attacker the switch. Supplying a distinct
+/// random hash per injected row made every one of them look identified, the
+/// filter matched nothing, and the fallback then evicted the oldest genuine
+/// source — the exact outcome this policy exists to prevent.
 fn source_eviction_index(entries: &[SourceEntry]) -> usize {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.user_hash == [0u8; 16] && e.last_asked == 0)
+        .filter(|(_, e)| e.last_asked == 0)
         .min_by_key(|(_, e)| e.last_seen)
         .map(|(i, _)| i)
         .unwrap_or_else(|| {
@@ -2018,6 +2025,18 @@ impl SourceManager {
         user_hash: [u8; 16],
         connect_options: u8,
     ) {
+        // A zero LowID is not a source. It cannot be called back
+        // (`get_lowid_sources_needing_callback` requires `client_id > 0`), it is
+        // never returned by `get_sources` or advertised over SX because the row
+        // carries `Ipv4Addr::UNSPECIFIED`, and it is the one value the dedup
+        // below cannot match on — so accepting it meant an identical packet
+        // pushed a fresh unusable row every time, evicting a real source once the
+        // list was full. Callers classify LowID as `hybrid_id < 16_777_216`,
+        // which includes zero, so the guard belongs here.
+        if client_id == 0 {
+            return;
+        }
+
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
@@ -2769,6 +2788,75 @@ mod tests {
             "anonymous never-contacted source must be evicted first"
         );
         assert!(ips.contains(&newcomer_ip));
+    }
+
+    /// The eviction policy must not key on `user_hash`, which arrives verbatim in
+    /// a source-exchange packet. Keying on it let an attacker opt every injected
+    /// row out of the "cheap to discard" set by inventing a hash per row, so the
+    /// fallback then evicted the oldest *genuine* source instead.
+    #[test]
+    fn eviction_ignores_a_peer_supplied_user_hash() {
+        let hash = [0x62; 16];
+        let contacted_ip = Ipv4Addr::new(10, 0, 1, 2);
+        let injected_ip = Ipv4Addr::new(10, 0, 1, 3);
+        let newcomer_ip = Ipv4Addr::new(10, 0, 1, 4);
+
+        let mut sm = SourceManager::new();
+        sm.max_per_file = 2;
+
+        // A real source we have actually reached.
+        sm.register_source_full_opts(hash, contacted_ip, 4662, 0, [0xCC; 16], 0);
+        // A gossip row we have never contacted, but which claims an identity —
+        // exactly what a hostile SX answer supplies.
+        sm.register_source_full_opts(hash, injected_ip, 4663, 0, [0xAB; 16], 0);
+
+        // Make the genuine source the older of the two so a plain oldest-wins
+        // eviction would take it.
+        {
+            let entries = sm.sources.get_mut(&hash).unwrap();
+            for e in entries.iter_mut() {
+                if e.ip == contacted_ip {
+                    e.last_seen -= 1000;
+                    e.last_asked = chrono::Utc::now().timestamp();
+                }
+            }
+        }
+
+        sm.register_source_full_opts(hash, newcomer_ip, 4664, 0, [0xCD; 16], 0);
+
+        let ips: Vec<_> = sm
+            .sources
+            .get(&hash)
+            .unwrap()
+            .iter()
+            .map(|e| e.ip)
+            .collect();
+        assert!(
+            ips.contains(&contacted_ip),
+            "a contacted source must outlive a never-contacted one that merely claims an identity"
+        );
+        assert!(
+            !ips.contains(&injected_ip),
+            "the never-contacted row must be evicted even though it supplied a user_hash"
+        );
+    }
+
+    /// A zero LowID can never be called back and is the one value the dedup
+    /// predicate cannot match, so replaying one packet used to push a fresh
+    /// unusable row per send and evict a real source once at capacity.
+    #[test]
+    fn lowid_registration_rejects_a_zero_client_id() {
+        let hash = [0x63; 16];
+        let mut sm = SourceManager::new();
+
+        for _ in 0..5 {
+            sm.register_lowid_source(hash, 0, 4662, 0x0100_0001, 4661, [0xEE; 16], 0);
+        }
+
+        assert!(
+            sm.sources.get(&hash).map_or(true, |e| e.is_empty()),
+            "a zero LowID must never be tracked, however many times it is offered"
+        );
     }
 
     #[test]
