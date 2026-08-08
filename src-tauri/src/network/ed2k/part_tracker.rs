@@ -444,11 +444,13 @@ impl PartTracker {
             return 0;
         }
         if self.gaps.is_empty() && !self.part_verified.iter().all(|&v| v) {
-            let verified = self.verified_bytes();
-            if verified > 0 {
-                return verified.min(self.file_size.saturating_sub(1));
-            }
-            return self.file_size.saturating_sub(1);
+            // Every byte is on disk here, so the figure must not fall back to
+            // `verified_bytes()`: if the last part's bytes all land but the
+            // source that would MD4 it disconnects first, that reported a drop
+            // of about one part (~9.28 MB) and the bar visibly ran backwards.
+            // Hold just short of complete instead — the final whole-file hash
+            // (`mark_file_hash_verified`) releases it.
+            return self.verified_bytes().max(self.file_size.saturating_sub(1));
         }
         filled.min(self.file_size)
     }
@@ -1431,6 +1433,33 @@ mod tests {
         );
         tracker.set_part_verified(0);
         tracker.set_part_verified(1);
+        assert_eq!(tracker.progress_bytes(), file_size);
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// All bytes on disk but only some parts MD4-verified (the source that
+    /// would verify the last part disconnected first) must not rewind the
+    /// bar to `verified_bytes()` — that dropped the reported figure by a
+    /// whole part right at the end of the download.
+    #[test]
+    fn progress_bytes_does_not_regress_when_only_some_parts_verified() {
+        let part_path = temp_part_path("progress_no_regress");
+        let file_size = PARTSIZE * 3;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.fill_range(0, file_size);
+        let all_filled = tracker.progress_bytes();
+        tracker.set_part_verified(0);
+        tracker.set_part_verified(1);
+        assert_eq!(
+            tracker.progress_bytes(),
+            file_size.saturating_sub(1),
+            "progress must hold just short of complete while part 2 awaits MD4"
+        );
+        assert!(
+            tracker.progress_bytes() >= all_filled,
+            "progress must never move backwards"
+        );
+        tracker.mark_file_hash_verified();
         assert_eq!(tracker.progress_bytes(), file_size);
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }

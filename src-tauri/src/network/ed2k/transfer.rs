@@ -779,6 +779,29 @@ mod tests {
         assert!(parse_sending_part_32(&payload).is_err());
     }
 
+    /// A 32-bit OP_SENDINGPART is legal for a file of ANY size: the sender
+    /// picks the opcode from the block's end offset, not the file size, so
+    /// every block inside the first 4 GiB of a >4 GiB file arrives 32-bit.
+    /// Refusing those made files over 4 GiB undownloadable — the first data
+    /// packet from every source tore the connection down.
+    #[test]
+    fn parse_sending_part_32_addresses_a_file_over_4gib() {
+        const FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+        let hash = [0x44; 16];
+        // Highest-addressed block eMule still frames with the 32-bit opcode.
+        let end = u32::MAX;
+        let start = end - 180;
+        let data = vec![0x5Au8; 180];
+        let payload = build_sending_part_32(hash, start, end, &data);
+        let (h, s, e, out) = parse_sending_part_32(&payload).unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(s, start as u64, "32-bit start must widen, not wrap");
+        assert_eq!(e, end as u64, "32-bit end must widen, not wrap");
+        assert_eq!(out, &data[..]);
+        // ...and the receive loop's structural validation must accept it.
+        assert!(s < e && e <= FILE_SIZE && out.len() == (e - s) as usize);
+    }
+
     #[test]
     fn concurrent_completed_files_claim_distinct_names() {
         let dir = std::env::temp_dir().join(format!(
@@ -3700,17 +3723,21 @@ impl Ed2kDownload {
                             let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
                                 parse_sending_part_i64(&payload)?
                             } else {
-                                // D19: a 32-bit SENDINGPART cannot
-                                // address past 4 GiB; refuse it for
-                                // larger files so a mis-negotiated or
-                                // malicious peer can't silently wrap
-                                // the offset and corrupt the part.
-                                if self.file_size > u32::MAX as u64 {
-                                    anyhow::bail!(
-                                            "peer sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
-                                            self.file_size
-                                        );
-                                }
+                                // Accept a 32-bit frame whatever the
+                                // file size: the sender picks the
+                                // opcode from the *block's* end
+                                // offset, not the file size (eMule's
+                                // CreateStandardPackets keys on
+                                // `endpos > _UI32_MAX`), so blocks
+                                // inside the first 4 GiB of a >4 GiB
+                                // file legitimately arrive as a plain
+                                // OP_SENDINGPART — which is what our
+                                // per-block `needs_i64` asked for. The
+                                // 32-bit parser widens u32 to u64, so
+                                // nothing wraps, and a mis-addressed
+                                // block is still caught by the range
+                                // validation below, the gap trimming,
+                                // and the per-part MD4.
                                 parse_sending_part_32(&payload)?
                             };
                             if hash != self.file_hash {
@@ -3849,19 +3876,17 @@ impl Ed2kDownload {
                             {
                                 parse_compressed_part_i64(&payload)?
                             } else {
-                                // D19 (compressed): a 32-bit OP_COMPRESSEDPART
-                                // cannot address past 4 GiB. eMule sends
-                                // OP_COMPRESSEDPART_I64 for large files (see
-                                // CUpDownClient::CreatePackedPackets), so a
-                                // 32-bit frame for a >4 GiB file would have its
-                                // start offset truncated by parse_compressed_part_32
-                                // and mis-write the .part. Reject rather than wrap.
-                                if self.file_size > u32::MAX as u64 {
-                                    anyhow::bail!(
-                                            "peer sent 32-bit OP_COMPRESSEDPART for a {}-byte file (requires I64)",
-                                            self.file_size
-                                        );
-                                }
+                                // Mirror the OP_SENDINGPART branch: accept
+                                // 32-bit frames for files of any size. eMule
+                                // picks the width from the requested block's
+                                // end offset (CreatePackedPackets keys on
+                                // `uEndOffset > UINT32_MAX`), so blocks below
+                                // 4 GiB in a larger file arrive as plain
+                                // OP_COMPRESSEDPART. Nothing truncates here —
+                                // the 32-bit parser widens u32 to u64 — and
+                                // `pending_compressed.append` only accepts a
+                                // start matching a block we actually
+                                // requested.
                                 parse_compressed_part_32(&payload)?
                             };
                             if hash != self.file_hash {
@@ -4631,6 +4656,22 @@ impl Ed2kDownload {
                         continue;
                     }
                     debug!("Part {} hash verified OK", part_idx);
+                    // Durability before persisting verified bits: otherwise a
+                    // crash can leave .part.met claiming verified (it is made
+                    // durable by `atomic_write`'s sync_all + rename) while the
+                    // .part data is still only in the page cache, and uploads
+                    // would serve that range (T5). Mirrors the multi-source
+                    // worker; a failed fsync means we do NOT persist the bit.
+                    if let Err(e) = output.sync_data().await {
+                        warn!("pre-verification fsync failed for part {part_idx}: {e}");
+                        super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
+                        // Bytes we cannot prove reached disk earn no credit.
+                        #[allow(unused_assignments)]
+                        {
+                            pending_credit_bytes = 0;
+                        }
+                        continue;
+                    }
                     let _ = event_tx
                         .send(DownloadEvent::PartVerified {
                             file_hash: self.file_hash,
@@ -5522,7 +5563,17 @@ pub(crate) async fn handle_secident_signature(
     if verified {
         cm.set_ident_state(peer_user_hash, IdentState::Verified);
         cm.check_identity_ip(peer_user_hash, peer_ip_u32);
-    } else {
+    } else if cm
+        .get_record(&peer_user_hash)
+        .is_none_or(|record| record.ident_state == IdentState::Needed)
+    {
+        // Only demote a record that was actually awaiting its first proof,
+        // matching eMule (`ClientCredits.cpp:507`, which sets IS_IDFAILED only
+        // from IS_IDNEEDED). Demoting unconditionally let anyone who knows a
+        // peer's user_hash — it travels in the clear in every Hello — knock an
+        // established peer out of `Verified` with one bogus signature, which
+        // both strips their score multiplier and, before the anchor was made
+        // durable, set them up to have their credits reset later.
         cm.set_ident_state(peer_user_hash, IdentState::Failed);
     }
 }

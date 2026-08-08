@@ -7204,16 +7204,18 @@ async fn download_parts_from_source(
                         let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
                             parse_sending_part_i64(&payload)?
                         } else {
-                            // D19: a 32-bit OP_SENDINGPART cannot address past
-                            // 4 GiB. If our file is larger the peer must use
-                            // OP_SENDINGPART_I64; reject 32-bit frames rather
-                            // than silently wrap / mis-write.
-                            if file_size > u32::MAX as u64 {
-                                anyhow::bail!(
-                                "source {_src_idx} sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
-                                file_size
-                            );
-                            }
+                            // Accept a 32-bit frame whatever the file size: the
+                            // sender picks the opcode from the *block's* end
+                            // offset, not from the file size (eMule's
+                            // CreateStandardPackets keys on `endpos >
+                            // _UI32_MAX`), so every block inside the first
+                            // 4 GiB of a >4 GiB file legitimately arrives as a
+                            // plain OP_SENDINGPART — exactly what our own
+                            // per-block `needs_i64` asked for. The 32-bit
+                            // parser widens u32 to u64, so nothing wraps, and a
+                            // mis-addressed block is still caught by the range
+                            // validation below, the gap trimming, and
+                            // ultimately the per-part MD4.
                             parse_sending_part_32(&payload)?
                         };
                         if hash != *file_hash {
@@ -7414,17 +7416,16 @@ async fn download_parts_from_source(
                         {
                             parse_compressed_part_i64(&payload)?
                         } else {
-                            // D19 (compressed): mirror the OP_SENDINGPART guard
-                            // above. eMule uses OP_COMPRESSEDPART_I64 for files
-                            // over 4 GiB; a 32-bit frame would have its start
-                            // offset truncated by parse_compressed_part_32 and
-                            // mis-write the .part. Reject rather than wrap.
-                            if file_size > u32::MAX as u64 {
-                                anyhow::bail!(
-                                    "source {_src_idx} sent 32-bit OP_COMPRESSEDPART for a {}-byte file (requires I64)",
-                                    file_size
-                                );
-                            }
+                            // Mirror the OP_SENDINGPART branch: accept 32-bit
+                            // frames for files of any size. eMule picks the
+                            // width from the requested block's end offset
+                            // (CreatePackedPackets keys on `uEndOffset >
+                            // UINT32_MAX`), so blocks below 4 GiB in a larger
+                            // file arrive as plain OP_COMPRESSEDPART. Nothing
+                            // truncates on our side — the 32-bit parser widens
+                            // u32 to u64 — and `pending_compressed.append`
+                            // only accepts a start that matches a block we
+                            // actually requested.
                             parse_compressed_part_32(&payload)?
                         };
                         if hash != *file_hash {
@@ -9565,6 +9566,29 @@ mod tests {
         let hash = [0x33; 16];
         let payload = build_sending_part_32(hash, 2000, 1000, &[]);
         assert!(parse_sending_part_32(&payload).is_err());
+    }
+
+    /// A 32-bit OP_SENDINGPART is legal for a file of ANY size: the sender
+    /// picks the opcode from the block's end offset, not the file size, so
+    /// every block inside the first 4 GiB of a >4 GiB file arrives 32-bit.
+    /// Refusing those made files over 4 GiB undownloadable — the first data
+    /// packet from every source tore the connection down.
+    #[test]
+    fn parse_sending_part_32_addresses_a_file_over_4gib() {
+        const FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+        let hash = [0x44; 16];
+        // Highest-addressed block eMule still frames with the 32-bit opcode.
+        let end = u32::MAX;
+        let start = end - 180;
+        let data = vec![0x5Au8; 180];
+        let payload = build_sending_part_32(hash, start, end, &data);
+        let (h, s, e, out) = parse_sending_part_32(&payload).unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(s, start as u64, "32-bit start must widen, not wrap");
+        assert_eq!(e, end as u64, "32-bit end must widen, not wrap");
+        assert_eq!(out, &data[..]);
+        // ...and the receive loop's structural validation must accept it.
+        assert!(s < e && e <= FILE_SIZE && out.len() == (e - s) as usize);
     }
 
     #[test]
