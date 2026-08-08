@@ -708,15 +708,26 @@ fn validate_zip_crc(
         // their uncompressed CRC without a decoder.
         _ => return Ok(true),
     };
-    Ok(actual_crc == expected_crc)
+    Ok(actual_crc == Some(expected_crc))
 }
 
+/// CRC-32 of exactly `expected_size` bytes drained from `reader`, or `None`
+/// when the entry doesn't produce that many bytes — either because it
+/// inflates past its declared size or because it stops short.
+///
+/// Both are per-entry verdicts, not archive-wide failures: recovery exists to
+/// salvage damaged archives, so one malformed entry must be skippable rather
+/// than aborting `recover_zip` (which would delete the output and throw away
+/// every entry already validated). And "size mismatch" has to be out of band
+/// — this used to return `Ok(u32::MAX)` as a sentinel, but `0xFFFFFFFF` is a
+/// perfectly legal CRC-32, so an entry declaring `crc32 = 0xFFFFFFFF` passed
+/// validation no matter what its data was.
 fn crc32_reader_limited(
     mut reader: impl Read,
     expected_size: u64,
     budget: &RecoveryBudget,
     control: Option<&TransferControl>,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<Option<u32>> {
     let mut hasher = crc32fast::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
@@ -728,14 +739,15 @@ fn crc32_reader_limited(
         }
         total = total.saturating_add(n as u64);
         if total > expected_size || total > MAX_RECOVERY_ENTRY_BYTES {
-            anyhow::bail!("ZIP entry decompressed beyond its bounded declared size");
+            debug!("ZIP entry decompressed beyond its bounded declared size, rejecting entry");
+            return Ok(None);
         }
         hasher.update(&buf[..n]);
     }
     if total != expected_size {
-        return Ok(u32::MAX);
+        return Ok(None);
     }
-    Ok(hasher.finalize())
+    Ok(Some(hasher.finalize()))
 }
 
 // ==========================================================================
@@ -1159,6 +1171,36 @@ mod tests {
         bytes
     }
 
+    /// Hand-built local file header + payload, so a test can declare a
+    /// `crc32`/`uncompressed_size` that deliberately disagrees with `data`.
+    fn zip_local_entry(
+        name: &[u8],
+        data: &[u8],
+        method: u16,
+        uncompressed_size: u32,
+        crc: u32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(ZIP_LOCAL_HEADER_MAGIC)
+            .unwrap();
+        bytes.write_u16::<LittleEndian>(20).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u16::<LittleEndian>(method).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.write_u32::<LittleEndian>(crc).unwrap();
+        bytes.write_u32::<LittleEndian>(data.len() as u32).unwrap();
+        bytes
+            .write_u32::<LittleEndian>(uncompressed_size)
+            .unwrap();
+        bytes.write_u16::<LittleEndian>(name.len() as u16).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
     fn approved_recovery_dir(label: &str) -> (std::path::PathBuf, Vec<String>, std::path::PathBuf) {
         let base = std::env::temp_dir().join(format!(
             "ember-archive-{label}-{}-{}",
@@ -1234,6 +1276,71 @@ mod tests {
             &AtomicBool::new(false),
         )
         .is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// `crc32_reader_limited` used to report "size mismatch" as
+    /// `Ok(u32::MAX)`, and the caller compared that straight against the
+    /// declared CRC — so an entry claiming `crc32 = 0xFFFFFFFF` (a legal
+    /// CRC-32 value) validated regardless of its contents.
+    #[test]
+    fn zip_entry_cannot_pass_crc_via_all_ones_sentinel() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, allowed, base) = approved_recovery_dir("crcsentinel");
+        let part = root.join("input.part");
+        // Four bytes of stored data, but the header declares five
+        // uncompressed bytes — the size-mismatch path.
+        let bytes = zip_local_entry(b"a.txt", b"TEST", 0, 5, u32::MAX);
+        std::fs::write(&part, &bytes).unwrap();
+
+        let denied = recover_archive(
+            &part,
+            "sample.zip",
+            &[(0, bytes.len() as u64)],
+            &root,
+            &allowed,
+            None,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            denied.is_err(),
+            "an entry declaring crc32=0xFFFFFFFF must not validate on the size-mismatch path"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Recovery exists to salvage damaged archives, so one entry that
+    /// inflates past its declared size must be skipped like any other
+    /// rejected entry. It used to `bail!`, which propagated out of
+    /// `recover_zip` and made `recover_archive` delete the output —
+    /// discarding every entry already validated.
+    #[test]
+    fn over_inflating_zip_entry_is_skipped_not_fatal() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, allowed, base) = approved_recovery_dir("overinflate");
+        let part = root.join("input.part");
+
+        let mut bytes = stored_zip_entry();
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&[0x5Au8; 64]).unwrap();
+        let deflated = encoder.finish().unwrap();
+        // Declares 16 uncompressed bytes but decompresses to 64.
+        bytes.extend_from_slice(&zip_local_entry(b"b.txt", &deflated, 8, 16, 0));
+        std::fs::write(&part, &bytes).unwrap();
+
+        let recovered = recover_archive(
+            &part,
+            "sample.zip",
+            &[(0, bytes.len() as u64)],
+            &root,
+            &allowed,
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("the valid entry must survive a malformed sibling");
+        let archive = zip::ZipArchive::new(std::fs::File::open(&recovered).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1, "only the valid entry is carried over");
         let _ = std::fs::remove_dir_all(base);
     }
 }

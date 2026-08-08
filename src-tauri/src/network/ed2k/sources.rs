@@ -923,6 +923,33 @@ pub struct SourceEntry {
     pub not_for_reconnect: bool,
 }
 
+/// Which entry to drop when a file's source list is already at capacity.
+///
+/// Prefer evicting anonymous, never-contacted gossip entries (raw SX/EPX or
+/// server hints we've never even tried to reach) over sources we've already
+/// identified or attempted — otherwise whoever can mint fresh (ip, port) or
+/// LowID rows fastest pushes out legitimate, previously-verified sources
+/// purely by being newer than them. A hostile server answering
+/// `OP_GLOBFOUNDSOURCES` with `max_per_file` distinct LowID ids is enough.
+/// Falls back to the least-recently-seen entry when every row is identified
+/// or contacted.
+fn source_eviction_index(entries: &[SourceEntry]) -> usize {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.user_hash == [0u8; 16] && e.last_asked == 0)
+        .min_by_key(|(_, e)| e.last_seen)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| {
+            entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_seen)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        })
+}
+
 /// Tracks known sources (peers) per file hash for source exchange responses.
 #[derive(Debug, Clone)]
 pub struct SourceManager {
@@ -1178,26 +1205,7 @@ impl SourceManager {
         }
 
         if entries.len() >= self.max_per_file {
-            // Prefer evicting anonymous, never-contacted gossip entries
-            // (raw SX/EPX hints we've never even tried to reach) over
-            // sources we've already identified or attempted — otherwise a
-            // peer can flood OP_ANSWERSOURCES with fresh (ip, port) pairs
-            // to push out legitimate, previously-verified sources purely
-            // by being newer than them.
-            let evict_idx = entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.user_hash == [0u8; 16] && e.last_asked == 0)
-                .min_by_key(|(_, e)| e.last_seen)
-                .map(|(i, _)| i)
-                .unwrap_or_else(|| {
-                    entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, e)| e.last_seen)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                });
+            let evict_idx = source_eviction_index(entries);
             entries.remove(evict_idx);
         }
 
@@ -2038,8 +2046,11 @@ impl SourceManager {
         }
 
         if entries.len() >= self.max_per_file {
-            entries.sort_by_key(|e| e.last_seen);
-            entries.remove(0);
+            // Same policy as the HighID path: dropping the plain oldest row
+            // let a server hand us `max_per_file` distinct LowID ids and
+            // evict a real, already-contacted source on every insert.
+            let evict_idx = source_eviction_index(entries);
+            entries.remove(evict_idx);
         }
 
         entries.push(SourceEntry {

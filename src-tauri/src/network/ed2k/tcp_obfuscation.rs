@@ -349,10 +349,28 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                     if self.pending_offset >= self.pending.len() {
                         self.pending.clear();
                         self.pending_offset = 0;
-                        let consumed = self.pending_plaintext_len;
+                        let pending_plaintext_len = self.pending_plaintext_len;
                         self.pending_plaintext_len = 0;
-                        if consumed > 0 {
-                            return Poll::Ready(Ok(consumed));
+                        // A retry of the write we buffered arrives with the
+                        // identical buffer, so its ciphertext is already out
+                        // and the whole slice counts as consumed.
+                        if pending_plaintext_len == buf.len() {
+                            return Poll::Ready(Ok(pending_plaintext_len));
+                        }
+                        // Different length, so the pending count belongs to
+                        // some earlier caller — a write timeout dropped the
+                        // in-flight `write_all` (upload.rs's 60s bound) and
+                        // this packet comes from another call site. Reporting
+                        // it consumed would satisfy `AsyncWrite`'s
+                        // `n <= buf.len()` while never encrypting `buf`,
+                        // punching a hole in the ciphertext stream that
+                        // decrypts cleanly at the peer but desynchronises
+                        // eD2K framing from there on. The pending count is
+                        // already discarded above (nobody is waiting for it);
+                        // yield so the next poll encrypts `buf` for real.
+                        if pending_plaintext_len > 0 {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                     } else {
                         cx.waker().wake_by_ref();
@@ -416,5 +434,145 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             Poll::Pending => return Poll::Pending,
         }
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::Waker;
+
+    /// Inner writer that refuses the very first `poll_write` (accepting
+    /// nothing) and then takes everything it is offered.
+    struct PendingThenAccept {
+        polls: usize,
+        written: Vec<u8>,
+    }
+
+    impl AsyncWrite for PendingThenAccept {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls += 1;
+            if self.polls == 1 {
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Decrypt an observed ciphertext stream with a fresh keystream, which
+    /// only reproduces the plaintext if every byte was encrypted exactly
+    /// once and the ciphertext went out in order.
+    fn decrypt_stream(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+        let mut rc4 = Rc4State::new(key);
+        let mut plaintext = vec![0u8; ciphertext.len()];
+        rc4.process(ciphertext, &mut plaintext);
+        plaintext
+    }
+
+    /// A `write_all` future dropped on a write timeout leaves the whole
+    /// plaintext queued as pending ciphertext with nobody waiting for its
+    /// byte count. The next packet comes from a different call site with a
+    /// different slice, so that orphaned count says nothing about it:
+    /// reporting it consumed would satisfy `AsyncWrite`'s `n <= buf.len()`
+    /// while never encrypting those bytes, leaving a hole that decrypts
+    /// cleanly at the peer and desynchronises eD2K framing from there on.
+    #[test]
+    fn an_orphaned_pending_count_does_not_swallow_the_next_packet() {
+        let key = [0x11u8; 16];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = Rc4Writer::new(
+            PendingThenAccept {
+                polls: 0,
+                written: Vec::new(),
+            },
+            Rc4State::new(&key),
+        );
+
+        let queued = vec![0xAAu8; 64];
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &queued),
+            Poll::Pending
+        ));
+
+        // Drains the orphaned ciphertext and yields rather than claiming
+        // bytes it has not encrypted.
+        let next_packet = [0xBBu8; 4];
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &next_packet),
+            Poll::Pending
+        ));
+
+        match Pin::new(&mut writer).poll_write(&mut cx, &next_packet) {
+            Poll::Ready(Ok(n)) => assert_eq!(
+                n,
+                next_packet.len(),
+                "the retry must consume the whole packet"
+            ),
+            other => panic!("expected a completed write, got {other:?}"),
+        }
+
+        let mut expected = queued.clone();
+        expected.extend_from_slice(&next_packet);
+        assert_eq!(
+            decrypt_stream(&key, &writer.inner.written),
+            expected,
+            "both packets must reach the wire once, in order",
+        );
+    }
+
+    /// The fast path: a `write_all` that was interrupted mid-write retries
+    /// with the identical buffer, whose ciphertext is already queued. It must
+    /// be reported consumed without re-encrypting it — a second pass over the
+    /// same plaintext would emit it twice and desynchronise the keystream.
+    #[test]
+    fn a_retry_with_the_same_buffer_is_reported_consumed_once() {
+        let key = [0x22u8; 16];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = Rc4Writer::new(
+            PendingThenAccept {
+                polls: 0,
+                written: Vec::new(),
+            },
+            Rc4State::new(&key),
+        );
+
+        let packet = vec![0xCCu8; 64];
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &packet),
+            Poll::Pending
+        ));
+        match Pin::new(&mut writer).poll_write(&mut cx, &packet) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, packet.len()),
+            other => panic!("expected a completed write, got {other:?}"),
+        }
+        assert_eq!(
+            writer.inner.written.len(),
+            packet.len(),
+            "the queued ciphertext must be delivered exactly once",
+        );
+
+        // A following packet has to pick up the keystream where the first one
+        // left off, which only holds if the retry did not re-encrypt.
+        let followup = [0xDDu8; 8];
+        match Pin::new(&mut writer).poll_write(&mut cx, &followup) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, followup.len()),
+            other => panic!("expected a completed write, got {other:?}"),
+        }
+        let mut expected = packet.clone();
+        expected.extend_from_slice(&followup);
+        assert_eq!(decrypt_stream(&key, &writer.inner.written), expected);
     }
 }

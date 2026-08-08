@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use zeroize::ZeroizeOnDrop;
 
 const MAX_CREDIT_RATIO: f64 = 10.0;
@@ -115,14 +115,35 @@ const CLIENTS_MET_MAGIC: u32 = 0xE3B2_0001;
 /// v1: user_hash, uploaded, downloaded, last_seen, ident_ip, ident_state,
 /// public_key.
 ///
-/// v2 (current): appends a per-record Ember-identity trailer after the
+/// v2: appends a per-record Ember-identity trailer after the
 /// public key — a presence byte followed by 16 bytes of `ember_hash` when
 /// set. This survives the eD2K user_hash ↔ Ember identity binding
 /// (`set_ember_hash`) across restarts, which is what lets friend rendezvous
 /// discovery relocate `sources.met` rows before a fresh HELLO re-binds it
 /// in-memory (see `reseed_friend_endpoint` in `network/mod.rs`). Readers
 /// stay backward compatible with v1 files (no trailer to read).
-const CLIENTS_MET_VERSION: u8 = 2;
+///
+/// v3 (current): appends the crypto-anchor section (see
+/// [`CLIENTS_MET_ANCHOR_MAGIC`]) *after* the record array. The per-record
+/// layout is byte-identical to v2 on purpose: a v2 reader consumes exactly
+/// `count` records and stops, so it ignores the section instead of
+/// mis-framing the record after it, and a v2 file simply has no section for
+/// us to find.
+const CLIENTS_MET_VERSION: u8 = 3;
+
+/// Introduces the v3 crypto-anchor section: `magic | u32 count | count ×
+/// 16-byte user_hash`, naming the records whose credits are already anchored
+/// to a key that proved itself ([`CreditRecord::crypto_verified_once`]).
+///
+/// It has to be persisted, not derived. eMule's equivalent anchor
+/// (`CreditStruct::nKeySize`, written only inside `CClientCredits::Verified`)
+/// lives in the credit struct on disk and is monotonic, but `ident_state`
+/// is not: any peer can drive a record out of `Verified` by claiming its
+/// user_hash — which travels in the clear in every Hello — from another IP
+/// and failing the challenge that `secident_request_state` then issues. If
+/// the anchor were reconstructed from a persisted `Failed`, the honest
+/// peer's totals would be reset to 1 the next time it re-proved itself.
+const CLIENTS_MET_ANCHOR_MAGIC: u32 = 0xE3B2_0003;
 
 pub const CRYPT_CIP_REMOTECLIENT: u8 = 10;
 pub const CRYPT_CIP_LOCALCLIENT: u8 = 20;
@@ -142,6 +163,27 @@ pub struct CreditRecord {
     /// Distinct from SecIdent RSA `public_key` — used by Known Clients
     /// to mark friends (friends are keyed by ember hash, not user hash).
     pub ember_hash: Option<[u8; 16]>,
+    /// Whether these credits have ever been anchored to a *proven* key.
+    ///
+    /// eMule reads this off `CreditStruct::nKeySize`, which it only ever
+    /// fills in from inside `CClientCredits::Verified()` — so for eMule "a
+    /// key is stored" and "a key has proven itself" are the same fact. Ours
+    /// aren't: [`CreditManager::set_public_key`] binds the key the moment
+    /// `OP_PUBLICKEY` arrives, long before any challenge is answered, so a
+    /// bound key says nothing about verification and neither does
+    /// `ident_state` (the inbound path parks at `Needed` in between).
+    ///
+    /// Persisted in the v3 `clients.met` crypto-anchor section (see
+    /// `CLIENTS_MET_ANCHOR_MAGIC`) rather than derived, because
+    /// `ident_state` is not monotonic and a remote peer can drive it
+    /// backwards out of `Verified`. Files that predate the section fall
+    /// back to `ident_state == Verified` on load.
+    ///
+    /// NOTE: the primary credit store is the SQLite `credits` table
+    /// (`clients.met` is only the fallback cache used when that table is
+    /// empty), so the anchor has to be carried in that table's row as well
+    /// or the reset stays reachable across every restart.
+    pub crypto_verified_once: bool,
 }
 
 /// Enhanced credit record for verified Ember peers.
@@ -267,6 +309,7 @@ impl CreditRecord {
             ident_state: IdentState::Unknown,
             ident_ip: 0,
             ember_hash: None,
+            crypto_verified_once: false,
         }
     }
 }
@@ -860,10 +903,22 @@ impl CreditManager {
         let record = self.get_or_create(user_hash);
         // eMule Verified(): on first-time crypto verification, reset pre-existing
         // credits to prevent credit theft via identity spoofing before crypto
-        // was established. Only reset if transitioning from Unknown → Verified,
-        // meaning the record existed without any prior crypto handshake.
+        // was established.
+        //
+        // "First time" has to mean "these credits were never anchored to a
+        // proven key" (`crypto_verified_once`), not "we have never seen a
+        // key". Testing `ident_state == Unknown` made this dead code on the
+        // whole inbound path: `upload.rs` answers `OP_PUBLICKEY` by binding
+        // the key and immediately setting `Needed`, so verification always
+        // arrived at `Needed`, never `Unknown` — and `Needed` is persisted in
+        // clients.met, so it stayed dead across restarts. A record can hold
+        // credits with no key bound (accrued while `crypto_available == false`,
+        // or imported from a legacy clients.met), and a user_hash travels in
+        // the clear in every Hello, so whoever claims it first gets TOFU'd and
+        // would have inherited the victim's totals — and their score
+        // multiplier and queue position with it.
         if state == IdentState::Verified
-            && record.ident_state == IdentState::Unknown
+            && !record.crypto_verified_once
             && (record.uploaded > 0 || record.downloaded > 0)
         {
             // Log only the user-hash prefix — the full 16-byte value is PII
@@ -875,6 +930,16 @@ impl CreditManager {
             );
             record.uploaded = 1;
             record.downloaded = 1;
+        }
+        if state == IdentState::Verified {
+            // Sticky, so a peer that later fails a challenge (or that a
+            // stranger claiming the same user_hash fails on its behalf) isn't
+            // charged the reset a second time when it re-proves itself. It is
+            // also persisted (v3 clients.met anchor section), because that
+            // failed challenge is remembered as `ident_state = Failed` and
+            // deriving the anchor from the state would hand the reset back to
+            // the attacker one restart later.
+            record.crypto_verified_once = true;
         }
         record.ident_state = state;
     }
@@ -1086,6 +1151,8 @@ impl CreditManager {
     /// Known Clients tab's last-IP and country flag survive a restart. Old
     /// builds reading this file see the magic as an implausibly large record
     /// count and load nothing rather than misparsing — see `load_from_file`.
+    /// The v3 crypto-anchor section is appended after the record array, where
+    /// a v2 reader (which stops after `count` records) never looks.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         // Keep a record even with zero credits when it carries an Ember
@@ -1118,6 +1185,20 @@ impl CreditManager {
                 None => buf.push(0),
             }
         }
+        // v3 crypto-anchor section. Always emitted, even when empty: an
+        // absent section means "written before v3, fall back to
+        // `ident_state`", which is a different answer from "no record is
+        // anchored yet".
+        let anchored: Vec<&[u8; 16]> = records
+            .iter()
+            .filter(|r| r.crypto_verified_once)
+            .map(|r| &r.user_hash)
+            .collect();
+        buf.extend_from_slice(&CLIENTS_MET_ANCHOR_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(anchored.len() as u32).to_le_bytes());
+        for user_hash in anchored {
+            buf.extend_from_slice(user_hash);
+        }
         buf
     }
 
@@ -1143,6 +1224,9 @@ impl CreditManager {
         // `CLIENTS_MET_VERSION` doc comment). `versioned` alone doesn't
         // distinguish the two, so check the version byte directly.
         let has_ember_trailer = versioned && data.len() > 4 && data[4] >= 2;
+        // Same idea for the v3 crypto-anchor section, which follows the whole
+        // record array rather than sitting inside a record.
+        let has_anchor_section = versioned && data.len() > 4 && data[4] >= 3;
         let (count, mut offset) = if versioned {
             if data.len() < 9 {
                 return Ok(0);
@@ -1166,7 +1250,9 @@ impl CreditManager {
 
         let read_err = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record");
         let mut loaded = 0;
-        for _ in 0..count.min(50000) {
+        let expected = count.min(50000);
+        let mut loaded_hashes: Vec<[u8; 16]> = Vec::new();
+        for _ in 0..expected {
             if offset + fixed_prefix > data.len() {
                 break;
             }
@@ -1247,13 +1333,73 @@ impl CreditManager {
                 ident_state,
                 ident_ip,
                 ember_hash,
+                // Fallback for files written before v3, which the anchor
+                // section below can only strengthen. A persisted `Verified`
+                // was reached by `set_ident_state(Verified)`, i.e. by a
+                // challenge this record's own key answered, so it is the best
+                // guess available for those files — but only a guess: it is
+                // exactly the state a stranger can knock back to `Failed`,
+                // which is why v3 stores the anchor instead.
+                crypto_verified_once: ident_state == IdentState::Verified,
             };
             self.credits.insert(user_hash, record);
+            loaded_hashes.push(user_hash);
             loaded += 1;
+        }
+        // Only read the anchor section when every record parsed: a truncated
+        // array leaves `offset` mid-record, where a chance 4-byte match would
+        // fabricate anchors for rows that never earned one.
+        //
+        // The section only ever adds anchors, it never clears the fallback
+        // above. Nothing in the codebase reaches a persisted `Verified`
+        // without having gone through `set_ident_state(Verified)` — the one
+        // exception restores it from the SQLite `credits` table, i.e. from an
+        // earlier verification — so "Verified but absent from the section"
+        // means the writer had no anchor column to read, not that the record
+        // is unanchored.
+        if has_anchor_section && loaded == expected {
+            if let Some(anchored) = read_anchor_section(&data, offset) {
+                for user_hash in &loaded_hashes {
+                    if !anchored.contains(user_hash) {
+                        continue;
+                    }
+                    if let Some(record) = self.credits.get_mut(user_hash) {
+                        record.crypto_verified_once = true;
+                    }
+                }
+            }
         }
         tracing::info!("Loaded {} credit records from {}", loaded, path.display());
         Ok(loaded)
     }
+}
+
+/// Read the v3 crypto-anchor section sitting at `offset`, i.e. the set of
+/// user hashes whose credits are already anchored to a proven key.
+///
+/// `None` means there is no section we can trust — an older file, or one
+/// truncated mid-section — and the caller keeps the `ident_state` fallback
+/// rather than clearing anchors it failed to read. The size of the set is
+/// bounded by the bytes actually present, so a bogus count can't make us
+/// allocate.
+fn read_anchor_section(data: &[u8], offset: usize) -> Option<HashSet<[u8; 16]>> {
+    let header = data.get(offset..offset + 8)?;
+    if u32::from_le_bytes(header[0..4].try_into().ok()?) != CLIENTS_MET_ANCHOR_MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let body_start = offset + 8;
+    let body_end = count.checked_mul(16)?.checked_add(body_start)?;
+    let body = data.get(body_start..body_end)?;
+    Some(
+        body.chunks_exact(16)
+            .map(|chunk| {
+                let mut user_hash = [0u8; 16];
+                user_hash.copy_from_slice(chunk);
+                user_hash
+            })
+            .collect(),
+    )
 }
 
 fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
@@ -1468,6 +1614,280 @@ mod tests {
             IdentState::Verified,
             "a peer that re-proved its identity must not stay BadGuy",
         );
+    }
+
+    /// The inbound (upload) ordering is `Unknown -> Needed -> Verified`,
+    /// because `upload.rs` binds the key on `OP_PUBLICKEY` and immediately
+    /// sets `Needed`. The old `ident_state == Unknown` guard therefore never
+    /// fired there, so a stranger could claim a user_hash that carried
+    /// credits but no bound key, TOFU its own key in, answer one challenge
+    /// and inherit the totals.
+    #[test]
+    fn first_verification_resets_credits_inherited_through_the_needed_state() {
+        let mut cm = CreditManager::new();
+        let victim = [0x33u8; 16];
+        {
+            let r = cm.get_or_create(victim);
+            r.uploaded = 50 * 1024 * 1024;
+            r.downloaded = 10 * 1024 * 1024;
+        }
+
+        // Attacker binds its own key to the unbound hash (TOFU), which parks
+        // the record at `Needed`, then answers the challenge.
+        assert!(cm.set_public_key(victim, vec![0xBBu8; 64]));
+        cm.set_ident_state(victim, IdentState::Needed);
+        cm.set_ident_state(victim, IdentState::Verified);
+
+        let record = cm.get_record(&victim).expect("record");
+        assert_eq!(record.uploaded, 1, "inherited upload total must be wiped");
+        assert_eq!(
+            record.downloaded, 1,
+            "inherited download total must be wiped"
+        );
+    }
+
+    /// The reset is a one-shot: once a key has proven itself, a peer that
+    /// re-verifies (new address, new session, or after a stranger failed a
+    /// challenge on its user_hash) must keep what it earned.
+    #[test]
+    fn reverification_does_not_wipe_already_anchored_credits() {
+        let mut cm = CreditManager::new();
+        let peer = [0x44u8; 16];
+        assert!(cm.set_public_key(peer, vec![0xAAu8; 64]));
+        cm.set_ident_state(peer, IdentState::Needed);
+        cm.set_ident_state(peer, IdentState::Verified);
+        {
+            let r = cm.get_or_create(peer);
+            r.uploaded = 4096;
+            r.downloaded = 8192;
+        }
+
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.set_ident_state(peer, IdentState::Failed);
+        cm.set_ident_state(peer, IdentState::Verified);
+
+        let record = cm.get_record(&peer).expect("record");
+        assert_eq!(record.uploaded, 4096);
+        assert_eq!(record.downloaded, 8192);
+    }
+
+    /// `ident_state` is persisted, so a `Needed` record survives a restart —
+    /// which is what kept the old guard dead across launches. Only a
+    /// persisted `Verified` may load as already-anchored.
+    #[test]
+    fn a_persisted_needed_record_still_faces_the_reset_after_restart() {
+        let mut cm = CreditManager::new();
+        let victim = [0x55u8; 16];
+        {
+            let r = cm.get_or_create(victim);
+            r.uploaded = 1_000_000;
+            r.downloaded = 2_000_000;
+            r.public_key = vec![0xBBu8; 64];
+            r.ident_state = IdentState::Needed;
+        }
+        let bytes = cm.serialize();
+        let path = std::env::temp_dir().join(format!("ember-clients-needed-{}.met", unique_nanos()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut restored = CreditManager::new();
+        restored.load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !restored.get_record(&victim).unwrap().crypto_verified_once,
+            "a stored `Needed` must not load as already crypto-verified",
+        );
+
+        restored.set_ident_state(victim, IdentState::Verified);
+        let record = restored.get_record(&victim).expect("record");
+        assert_eq!(record.uploaded, 1);
+        assert_eq!(record.downloaded, 1);
+    }
+
+    /// `ident_state` is not monotonic, so it cannot carry the anchor across a
+    /// restart. A stranger who claims a peer's user_hash (it is in the clear
+    /// in every Hello) from a different address draws a challenge out of
+    /// `secident_request_state` even though the record is already `Verified`;
+    /// answering it with a bogus signature persists `Failed`. Reconstructing
+    /// the anchor from that state wiped the victim's totals the next time it
+    /// re-proved itself — remote griefing for the price of one restart.
+    #[test]
+    fn a_failed_challenge_from_a_stranger_cannot_wipe_credits_across_a_restart() {
+        let mut cm = CreditManager::new();
+        let victim = [0x66u8; 16];
+        assert!(cm.set_public_key(victim, vec![0xAAu8; 64]));
+        cm.set_ident_state(victim, IdentState::Needed);
+        cm.set_ident_state(victim, IdentState::Verified);
+        {
+            let r = cm.get_or_create(victim);
+            r.uploaded = 50 * 1024 * 1024;
+            r.downloaded = 10 * 1024 * 1024;
+        }
+        // The attacker's forged signature fails, and `transfer.rs` records
+        // that as `Failed` on the victim's record.
+        cm.set_ident_state(victim, IdentState::Failed);
+
+        let bytes = cm.serialize();
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_anchor_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &bytes).expect("write temp clients.met");
+        let mut restored = CreditManager::new();
+        restored
+            .load_from_file(&path)
+            .expect("load v3 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            restored.get_record(&victim).unwrap().crypto_verified_once,
+            "the anchor must outlive a persisted `Failed`",
+        );
+
+        // The victim reconnects and passes its own challenge.
+        restored.set_ident_state(victim, IdentState::Verified);
+        let record = restored.get_record(&victim).expect("record");
+        assert_eq!(
+            record.uploaded,
+            50 * 1024 * 1024,
+            "an honest peer's uploads must survive the round trip"
+        );
+        assert_eq!(
+            record.downloaded,
+            10 * 1024 * 1024,
+            "an honest peer's downloads must survive the round trip"
+        );
+    }
+
+    /// A clients.met written before v3 has no anchor section, so the loader
+    /// falls back to the old reconstruction rather than treating every record
+    /// as unanchored (which would wipe every verified peer once).
+    #[test]
+    fn a_pre_v3_file_falls_back_to_reconstructing_the_anchor_from_ident_state() {
+        let verified = [0x77u8; 16];
+        let needed = [0x78u8; 16];
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
+        v2.push(2);
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        for (user_hash, state) in [
+            (verified, IdentState::Verified),
+            (needed, IdentState::Needed),
+        ] {
+            v2.extend_from_slice(&user_hash);
+            v2.extend_from_slice(&4096u64.to_le_bytes());
+            v2.extend_from_slice(&8192u64.to_le_bytes());
+            v2.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+            v2.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+            v2.push(state.to_u8());
+            v2.extend_from_slice(&0u16.to_le_bytes());
+            v2.push(0);
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_v2_no_anchor_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &v2).expect("write v2 clients.met");
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).expect("load v2 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 2);
+        assert!(
+            cm.get_record(&verified).unwrap().crypto_verified_once,
+            "a stored `Verified` is the best anchor guess a v2 file offers",
+        );
+        assert!(
+            !cm.get_record(&needed).unwrap().crypto_verified_once,
+            "a stored `Needed` must still face the reset",
+        );
+    }
+
+    /// A v3 file can be written by a build whose *other* credit store — the
+    /// SQLite `credits` table, which is the primary one — doesn't carry the
+    /// anchor yet, so its section comes out empty while the records restored
+    /// from that table say `Verified`. Those records were verified in an
+    /// earlier session, so the section may only add anchors, never clear the
+    /// `ident_state` fallback; otherwise every verified peer would be wiped
+    /// once on the first fallback load.
+    #[test]
+    fn a_verified_record_missing_from_the_anchor_section_keeps_its_anchor() {
+        let peer = [0x7Au8; 16];
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
+        v3.push(3);
+        v3.extend_from_slice(&1u32.to_le_bytes());
+        v3.extend_from_slice(&peer);
+        v3.extend_from_slice(&4096u64.to_le_bytes());
+        v3.extend_from_slice(&8192u64.to_le_bytes());
+        v3.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        v3.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        v3.push(IdentState::Verified.to_u8());
+        v3.extend_from_slice(&0u16.to_le_bytes());
+        v3.push(0);
+        v3.extend_from_slice(&CLIENTS_MET_ANCHOR_MAGIC.to_le_bytes());
+        v3.extend_from_slice(&0u32.to_le_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_v3_empty_anchor_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &v3).expect("write v3 clients.met");
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).expect("load v3 clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 1);
+        assert!(
+            cm.get_record(&peer).unwrap().crypto_verified_once,
+            "an empty section must not demote a persisted `Verified`",
+        );
+    }
+
+    /// The v3 section is strictly appended. The record array must stay
+    /// byte-identical to v2, because an older build reads exactly `count`
+    /// records and stops: anything added *inside* a record would shift the
+    /// next one and cost the user their whole ledger on a downgrade.
+    #[test]
+    fn the_anchor_section_is_appended_after_an_unchanged_record_array() {
+        let mut cm = CreditManager::new();
+        let hash = [0x79u8; 16];
+        {
+            let r = cm.get_or_create(hash);
+            r.uploaded = 4096;
+            r.downloaded = 8192;
+            r.last_seen = 1_700_000_123;
+            r.ident_ip = 0x0102_0304;
+            r.ident_state = IdentState::Verified;
+            r.public_key = vec![0xABu8; 12];
+            r.crypto_verified_once = true;
+        }
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
+        expected.push(CLIENTS_MET_VERSION);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        // --- unchanged v2 record ---
+        expected.extend_from_slice(&hash);
+        expected.extend_from_slice(&4096u64.to_le_bytes());
+        expected.extend_from_slice(&8192u64.to_le_bytes());
+        expected.extend_from_slice(&1_700_000_123i64.to_le_bytes());
+        expected.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        expected.push(IdentState::Verified.to_u8());
+        expected.extend_from_slice(&12u16.to_le_bytes());
+        expected.extend_from_slice(&[0xABu8; 12]);
+        expected.push(0);
+        // --- v3 anchor section ---
+        expected.extend_from_slice(&CLIENTS_MET_ANCHOR_MAGIC.to_le_bytes());
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&hash);
+
+        // The version byte stays >= 2, so an older reader still expects the
+        // per-record Ember trailer that v3 keeps writing.
+        assert_eq!(cm.serialize(), expected);
     }
 
     /// Monotonic-ish suffix for temp filenames so concurrent test runs don't

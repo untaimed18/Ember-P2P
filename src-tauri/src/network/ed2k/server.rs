@@ -56,6 +56,19 @@ const SERVER_POLL_DRAIN_BUDGET_SECS: u64 = 15;
 /// an ordinary connection, short enough to bound the worst case.
 const SERVER_WRITE_TIMEOUT_SECS: u64 = 30;
 
+/// Overall deadline for one `Ed2kServerConnection::login` exchange.
+///
+/// The per-packet reads are bounded, but nothing bounded the whole sequence:
+/// the loop accepts up to 50 packets and only `OP_IDCHANGE` ends it, so a
+/// server that drip-feeds a tiny `OP_SERVERMESSAGE` just inside the 30s
+/// per-packet budget holds login for ~25 minutes — doubled by the
+/// encrypted-then-plain retry in `network/mod.rs`. That all happens in the
+/// single `pending_server_connect` slot, which gates auto-reconnect *and*
+/// initial auto-connect, so eD2k connectivity sits on "Connecting…" with no
+/// fallback for the duration. A real server completes the exchange in well
+/// under a second; 45s leaves room for a slow link and a long MOTD.
+const SERVER_LOGIN_TIMEOUT_SECS: u64 = 45;
+
 // Server protocol opcodes (OP_EDONKEYHEADER)
 pub const OP_LOGINREQUEST: u8 = 0x01;
 pub const OP_SERVERMESSAGE: u8 = 0x38;
@@ -261,6 +274,11 @@ impl Ed2kServerConnection {
         wire_packet.push(OP_LOGINREQUEST);
         wire_packet.extend_from_slice(&payload);
 
+        // Absolute, so it covers the request write and every response read
+        // together rather than resetting per packet.
+        let login_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(SERVER_LOGIN_TIMEOUT_SECS);
+
         tokio::time::timeout(
             std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
             async {
@@ -296,15 +314,23 @@ impl Ed2kServerConnection {
         let mut last_error: Option<String> = None;
 
         for i in 0..50 {
-            let (opcode, payload) = match self.read_packet().await {
-                Ok(p) => p,
-                Err(e) => {
+            let (opcode, payload) = match tokio::time::timeout_at(login_deadline, self.read_packet())
+                .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
                     info!(
                         "Server read error on packet {i}: kind={:?} msg={e}",
                         e.kind()
                     );
                     last_error = Some(format!("{} ({})", e, e.kind()));
                     break;
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "Login did not complete within {SERVER_LOGIN_TIMEOUT_SECS}s \
+                         ({packets_read} packet(s) received, no IDCHANGE)"
+                    );
                 }
             };
             packets_read += 1;
@@ -1899,15 +1925,24 @@ impl ServerResultTags {
     /// Route a decoded unsigned-int value to the right field by tag id or name.
     fn apply_uint(&mut self, name_id: u8, name: Option<&str>, value: u64) {
         let is = |n: &str| name == Some(n);
+        // Clamp rather than `as`-truncate, exactly as the UDP parser for these
+        // same tag ids does (`server_udp.rs::apply_udp_uint_tag`), so an
+        // oversized wire value lands somewhere predictable instead of wrapping
+        // into an arbitrary one (a truncated 256 reads as 0 stars, 261 as 5).
+        // Note the direction for the 0..=5 star ratings: `min(5)` maps *every*
+        // out-of-range value to the maximum, so the clamp inflates where
+        // truncation would have deflated. That costs nothing — a server that
+        // wants to claim five stars can just send 5 — and keeps the field
+        // inside the range the UI renders.
         match name_id {
-            0x15 => self.source_count = value as u32,
-            0x30 => self.complete_sources = value as u32,
+            0x15 => self.source_count = value.min(u32::MAX as u64) as u32,
+            0x30 => self.complete_sources = value.min(u32::MAX as u64) as u32,
             0xD3 if value > 0 => self.media.duration = Some(value as u32),
             0xD4 if value > 0 => self.media.bitrate = Some(value as u32),
-            0xF7 => self.rating = Some(value as u8),
+            0xF7 => self.rating = Some(value.min(5) as u8),
             _ if is("bitrate") && value > 0 => self.media.bitrate = Some(value as u32),
             _ if is("length") && value > 0 => self.media.duration = Some(value as u32),
-            _ if (is("filerating") || is("rating")) => self.rating = Some(value as u8),
+            _ if (is("filerating") || is("rating")) => self.rating = Some(value.min(5) as u8),
             _ => {}
         }
     }

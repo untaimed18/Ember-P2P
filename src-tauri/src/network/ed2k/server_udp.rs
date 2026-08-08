@@ -815,9 +815,10 @@ fn apply_udp_uint_tag(
         0x30 => *complete_source_count = value.min(u32::MAX as u64) as u32,
         0xD3 if value > 0 => media.duration = Some(value as u32),
         0xD4 if value > 0 => media.bitrate = Some(value as u32),
-        // eMule file ratings are 0..=5; clamp rather than `as u8`-truncate so a
-        // bogus server value (e.g. 256 -> 0, 261 -> 5) can't wrap into a
-        // misleading rating.
+        // eMule file ratings are 0..=5. Clamp rather than `as u8`-truncate so a
+        // bogus server value lands at the top of the range instead of wrapping
+        // to an arbitrary point inside it (truncation mapped 256 to 0 and 261 to
+        // 5). No security delta either way — a server can simply send 5.
         0xF7 => *rating = Some(value.min(5) as u8),
         _ if is("bitrate") && value > 0 => media.bitrate = Some(value as u32),
         _ if is("length") && value > 0 => media.duration = Some(value as u32),

@@ -38,22 +38,11 @@ pub fn compute_aich_root_cancellable(
         return Ok(Sha1::digest([]).into());
     }
 
-    let block_size_u64 = AICH_BLOCK_SIZE as u64;
-    let num_blocks = ((file_size + block_size_u64 - 1) / block_size_u64) as usize;
-    let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
-    let mut buf = vec![0u8; AICH_BLOCK_SIZE];
-    let mut remaining = file_size;
-
-    for _ in 0..num_blocks {
-        if cancelled.load(Ordering::Relaxed) {
-            anyhow::bail!("cancelled");
-        }
-        let block_size = remaining.min(block_size_u64) as usize;
-        let buf_slice = &mut buf[..block_size];
-        file.read_exact(buf_slice)?;
-        leaf_hashes.push(hash_leaf(buf_slice));
-        remaining -= block_size as u64;
-    }
+    // Must go through `hash_leaves_from_reader`: chunking the whole file into
+    // fixed AICH_BLOCK_SIZE blocks (what this used to do) ignores the
+    // PARTSIZE restart rule and produces a master hash that disagrees with
+    // `AICHRecoveryHashSet` and with real eMule peers for any multi-part file.
+    let leaf_hashes = hash_leaves_from_reader_cancellable(&mut file, file_size, cancelled)?;
 
     Ok(hierarchical_root(&leaf_hashes, file_size))
 }
@@ -107,6 +96,18 @@ fn hash_leaves_from_reader<R: Read>(
     reader: &mut R,
     file_size: u64,
 ) -> std::io::Result<Vec<[u8; 20]>> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    hash_leaves_from_reader_cancellable(reader, file_size, &NEVER)
+}
+
+/// [`hash_leaves_from_reader`] with an abort flag, checked once per block so a
+/// cancelled share re-hash drops out promptly instead of walking a whole
+/// multi-gigabyte file first.
+fn hash_leaves_from_reader_cancellable<R: Read>(
+    reader: &mut R,
+    file_size: u64,
+    cancelled: &AtomicBool,
+) -> std::io::Result<Vec<[u8; 20]>> {
     let block_size_u64 = AICH_BLOCK_SIZE as u64;
     let num_blocks_upper_bound = ((file_size + block_size_u64 - 1) / block_size_u64) as usize;
     let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks_upper_bound);
@@ -122,6 +123,12 @@ fn hash_leaves_from_reader<R: Read>(
         };
         let mut part_remaining = part_size;
         while part_remaining > 0 {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                ));
+            }
             let block_size = part_remaining.min(block_size_u64) as usize;
             let buf_slice = &mut buf[..block_size];
             reader.read_exact(buf_slice)?;
@@ -253,7 +260,15 @@ fn top_level_audit_path(
         let left_id = id * 2 + 1;
         let right_id = id * 2;
         if target < n_left {
-            out.push((right_id, merkle_root(&leaves[n_left..])));
+            // The sibling is a *right* branch, so its own split point is
+            // `(len + 0) / 2`, not `(len + 1) / 2`. `merkle_root` hardcodes
+            // `is_left_branch = true`, which silently disagrees with the
+            // master root whenever the right subtree has an odd size >= 3
+            // (6, 7, 10, 11, ... parts at the top level) — and eMule
+            // verifies our OP_AICHANSWER against the master it already has,
+            // so a mismatched sibling makes it discard the answer and
+            // re-download the whole part.
+            out.push((right_id, build_tree_recursive(&leaves[n_left..], false)));
             walk(&leaves[..n_left], target, left_id, true, out)
         } else {
             out.push((left_id, merkle_root(&leaves[..n_left])));
@@ -1138,5 +1153,105 @@ mod tests {
         )
         .expect("recovery for corrupted part 1 should still verify");
         assert_eq!(corrupt, vec![1]);
+    }
+
+    /// Every sibling hash we ship in an audit path must be built with the
+    /// branch flag of the subtree it actually stands for. `merkle_root`
+    /// hardcodes `is_left_branch = true`, so using it for the *right*
+    /// sibling picked the wrong split point whenever that subtree had an
+    /// odd size >= 3 — first at 6 parts (right subtree `[P3,P4,P5]`), then
+    /// 7, 10, 11, 14, 15 at the top level and 12 one level down. Exhaustive
+    /// over the small part counts because the old
+    /// `multi_part_recovery_survives_audit_path_and_detects_corruption`
+    /// (3 parts, sibling subtrees of size 1) structurally could not fail.
+    #[test]
+    fn top_level_audit_path_reproduces_master_for_every_part_count() {
+        for num_parts in 2..=16usize {
+            let part_hashes: Vec<[u8; 20]> =
+                (0..num_parts).map(|p| hash_leaf(&[p as u8])).collect();
+            let master = build_tree_recursive(&part_hashes, true);
+            for target in 0..num_parts {
+                let (_, _, siblings) = top_level_audit_path(&part_hashes, target);
+                let (_, _, structure) = top_level_path_structure(num_parts, target);
+                let map: HashMap<u64, [u8; 20]> = siblings.into_iter().collect();
+                let mut cur = part_hashes[target];
+                for &(sibling_id, i_am_left) in structure.iter().rev() {
+                    let sibling = *map
+                        .get(&sibling_id)
+                        .unwrap_or_else(|| panic!("missing sibling {sibling_id}"));
+                    cur = if i_am_left {
+                        hash_internal(&cur, &sibling)
+                    } else {
+                        hash_internal(&sibling, &cur)
+                    };
+                }
+                assert_eq!(
+                    cur, master,
+                    "audit path for part {target} of {num_parts} must climb to the master root"
+                );
+            }
+        }
+    }
+
+    /// File-level counterpart of the above: 6 parts is the smallest count
+    /// whose root-level right subtree (`[P3,P4,P5]`) is odd and >= 3, so
+    /// parts 0-2 carry a right-sibling hash that used to disagree with the
+    /// published master. Stock eMule verifies an `OP_AICHANSWER` against
+    /// the master it already holds, so those answers were discarded and the
+    /// requester re-fetched the whole 9.28 MB part instead of one 180 KiB
+    /// block.
+    #[test]
+    fn six_part_recovery_audit_path_verifies_against_master() {
+        let file_size = PARTSIZE * 5 + AICH_BLOCK_SIZE * 3;
+        let mut data = vec![0xABu8; file_size];
+        // Give each part distinct content so a mis-indexed sibling can't
+        // accidentally still hash to the right value.
+        for p in 0..6usize {
+            data[p * PARTSIZE] = 0x10 + p as u8;
+        }
+        let trusted = AICHRecoveryHashSet::build_from_data(&data);
+        assert_eq!(
+            trusted.leaf_hashes.len(),
+            BLOCKS_PER_FULL_PART * 5 + 3,
+            "six parts: five full ones plus a three-block tail"
+        );
+
+        for part_index in 0..6usize {
+            let start = part_index * PARTSIZE;
+            let end = (start + PARTSIZE).min(file_size);
+            let recovery = trusted.create_part_recovery_data(part_index, PARTSIZE);
+            let corrupt = corrupt_blocks_from_aich_recovery(
+                trusted.root_hash,
+                &recovery,
+                part_index,
+                &data[start..end],
+                end - start,
+                file_size as u64,
+            )
+            .unwrap_or_else(|| {
+                panic!("part {part_index} recovery must verify against the master root")
+            });
+            assert!(
+                corrupt.is_empty(),
+                "part {part_index} should have no corrupt blocks"
+            );
+        }
+
+        // Part 0 sits left of the root, so its audit path is the one that
+        // carries the mis-built right sibling — and it must still localize
+        // an injected corruption.
+        let recovery = trusted.create_part_recovery_data(0, PARTSIZE);
+        let mut bad_part0 = data[..PARTSIZE].to_vec();
+        bad_part0[AICH_BLOCK_SIZE * 2 + 9] ^= 0xFF;
+        let corrupt = corrupt_blocks_from_aich_recovery(
+            trusted.root_hash,
+            &recovery,
+            0,
+            &bad_part0,
+            bad_part0.len(),
+            file_size as u64,
+        )
+        .expect("part 0 recovery should still verify against the master");
+        assert_eq!(corrupt, vec![2]);
     }
 }
