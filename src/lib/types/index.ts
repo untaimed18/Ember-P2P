@@ -228,6 +228,10 @@ export interface NetworkStats {
   public_udp_port?: number;
   public_tcp_port?: number;
   tcp_mapping_hold_ok?: boolean;
+  /** Ember-native Noise DHT enabled — drives the status-bar EmberDHT dot. */
+  ember_native_enabled: boolean;
+  /** Live Ember DHT routing-table contacts for the status-bar peer count. */
+  ember_dht_contacts: number;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via

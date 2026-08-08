@@ -58,6 +58,22 @@
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
+  function emberDhtStatus(stats: typeof $networkStats): 'connected' | 'connecting' | 'disconnected' {
+    if (!stats.ember_native_enabled) return 'disconnected';
+    return stats.ember_dht_contacts > 0 ? 'connected' : 'connecting';
+  }
+
+  function emberDhtTitle(stats: typeof $networkStats): string {
+    const status = emberDhtStatus(stats);
+    if (status === 'connected') {
+      const peers = stats.ember_dht_contacts;
+      return peers === 1
+        ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
+        : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });
+    }
+    return m.statusbar_ember_dht_title({ status: statusLabel(status) });
+  }
+
   function epxStatusLabel(status: 'active' | 'idle' | 'inactive'): string {
     switch (status) {
       case 'active': return m.statusbar_epx_status_active();
@@ -103,6 +119,10 @@
 
 <footer class="statusbar">
   <div class="status-left" role="status" aria-live="polite">
+    <span class="status-label" title={emberDhtTitle($networkStats)}>
+      {m.statusbar_ember_dht_label()}
+      <span class="dot {emberDhtStatus($networkStats)}" aria-label={statusLabel(emberDhtStatus($networkStats))}></span>
+    </span>
     <span class="status-label" title={m.statusbar_kad_title({ status: statusLabel($networkStats.status) })}>
       {m.statusbar_kad_label()}
       <span class="dot {$networkStats.status}" aria-label={statusLabel($networkStats.status)}></span>

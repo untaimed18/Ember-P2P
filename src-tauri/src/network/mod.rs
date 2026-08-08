@@ -39487,6 +39487,9 @@ async fn handle_command_inner(
             // stale "Unknown" after connect-backs / HighID already proved Open.
             state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
             state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+            // EmberDHT status-bar gauges — same sources as GetEmberDiagnostics.
+            state.stats.ember_native_enabled = settings.ember_native_enabled;
+            state.stats.ember_dht_contacts = state.ember_dht.contact_count() as u32;
             let _ = tx.send(state.stats.clone());
         }
 

@@ -1473,8 +1473,9 @@ pub async fn get_reputation_stats(
 
 /// Developer / harness-facing diagnostic counters for the Ember mesh:
 /// EPX event counts, broker punch / relay outcomes, and the size of
-/// the mesh peer cache. Distinct from `get_network_stats` so the
-/// hot status-bar IPC payload stays small and user-focused.
+/// the mesh peer cache. Distinct from `get_network_stats` (which carries
+/// the EmberDHT status-bar gauges) so heavy diagnostic counters stay off
+/// the hot poll path.
 #[tauri::command]
 pub async fn get_ember_diagnostics(
     state: tauri::State<'_, AppState>,

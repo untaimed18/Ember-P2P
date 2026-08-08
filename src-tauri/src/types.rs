@@ -480,11 +480,17 @@ pub struct NetworkStats {
     /// Whether the last TCP mapping hold (reuseaddr connect) succeeded.
     #[serde(default)]
     pub tcp_mapping_hold_ok: bool,
+    /// Whether Ember-native (Noise DHT) is enabled — status-bar EmberDHT dot.
+    #[serde(default)]
+    pub ember_native_enabled: bool,
+    /// Live Ember DHT routing-table contacts — status-bar EmberDHT peer count.
+    #[serde(default)]
+    pub ember_dht_contacts: u32,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
-/// via `get_ember_diagnostics` only — kept off `NetworkStats` so the
-/// hot status-bar IPC payload stays focused on user-visible state.
+/// via `get_ember_diagnostics`; status-bar gauges (`ember_native_enabled`,
+/// `ember_dht_contacts`) also live on `NetworkStats` for the hot poll path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmberDiagnostics {
     /// Source-exchange events accepted from a connected Ember peer this session.
@@ -805,6 +811,8 @@ impl Default for NetworkStats {
             public_udp_port: 0,
             public_tcp_port: 0,
             tcp_mapping_hold_ok: false,
+            ember_native_enabled: false,
+            ember_dht_contacts: 0,
         }
     }
 }
