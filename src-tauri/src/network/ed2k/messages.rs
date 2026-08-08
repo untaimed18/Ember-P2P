@@ -448,9 +448,12 @@ pub struct PeerCapabilities {
     /// Ember peer — set only from `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`
     /// (never from MISCOPTIONS2; that legacy in-band signal was removed).
     pub is_ember: bool,
-    /// Ember-specific identity hash for the friend system (from EmuleInfo tag 0x56)
+    /// Ember-specific identity hash for the friend system. Learned from
+    /// `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` only; the `ET_EMBER_HASH`
+    /// EmuleInfo harvest was removed (see the tag loop in `parse_emule_info`).
     pub ember_hash: Option<[u8; 16]>,
-    /// Ed25519 public key for Ember auth (from EmuleInfo tag 0x57)
+    /// Ed25519 public key for Ember auth, from the same private handshake as
+    /// `ember_hash`. The `ET_EMBER_PUBKEY` EmuleInfo harvest was removed too.
     pub ember_pubkey: Option<[u8; 32]>,
 }
 

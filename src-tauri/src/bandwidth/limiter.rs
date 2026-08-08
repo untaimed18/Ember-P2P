@@ -425,11 +425,31 @@ pub async fn start_token_refill(
 
     loop {
         interval.tick().await;
-        if shutdown.load(Ordering::Relaxed) {
-            uss.disable();
-            break;
-        }
+        // Refill before the teardown check, because `bw_shutdown` means "flush
+        // state now", not "this process is about to die". The updater raises it
+        // before handing the bundle to the installer, and an install that fails
+        // returns with the process still running (`commands/updater.rs`).
+        // Returning here ended the only task that ever adds tokens, so every
+        // rate-limited upload drained the bucket and then parked on it for the
+        // rest of the session — the "if the refill task dies" case
+        // `drain_tokens` warns about, and invisible unless someone reads the
+        // log. Downloads escaped it only when left unlimited, since
+        // `acquire_download` returns early at rate 0.
         limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
+        if shutdown.load(Ordering::Relaxed) {
+            // Stand USS down once, and hand back any throttle it was holding:
+            // `set_configured_limits` treats a still-`uss_active` limiter as
+            // mid-throttle and declines to raise the effective rate, waiting for
+            // USS to ramp on its own — which never happens again from here.
+            if uss.is_enabled() {
+                uss.disable();
+                limiter.set_uss_active(false);
+                limiter.set_upload_limit(limiter.configured_upload_rate());
+            }
+            // Keep refilling, but stop managing USS: re-reading the settings
+            // flag below would re-enable it a tick later.
+            continue;
+        }
 
         // Drain real KAD RTT samples from the network loop. Cap drain size so a
         // stuck lock elsewhere cannot leave an ever-growing queue.
@@ -523,6 +543,7 @@ pub async fn start_token_refill(
 #[cfg(test)]
 mod tests {
     use super::BandwidthLimiter;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -617,5 +638,77 @@ mod tests {
             .await
             .expect("acquire must return after rate switched to unlimited")
             .expect("spawned task should not panic");
+    }
+
+    /// Poll `done` on a short interval until it holds or the budget runs out.
+    /// The refill task ticks at `REFILL_INTERVAL_MS`, so state changes land a
+    /// tick or two after the flag that causes them.
+    async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// `bw_shutdown` is raised by the updater's pre-install flush as well as by
+    /// process exit, and an install that fails returns with this process still
+    /// running. Returning from the refill loop there left nothing to add tokens
+    /// ever again, so with an upload limit set every `acquire_upload` drained
+    /// the bucket and then parked on it for the rest of the session.
+    #[tokio::test]
+    async fn refill_outlives_a_shutdown_the_process_survives() {
+        let bw = Arc::new(BandwidthLimiter::new(10_000, 0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(super::start_token_refill(
+            bw.clone(),
+            shutdown.clone(),
+            crate::bandwidth::new_uss_rtt_queue(),
+            crate::bandwidth::new_uss_enabled_flag(false),
+        ));
+
+        // Spend the seeded bucket so the next acquire has to wait on a refill.
+        bw.acquire_upload(10_000).await;
+        shutdown.store(true, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(5), bw.acquire_upload(3_000))
+            .await
+            .expect("uploads must keep flowing after a shutdown the process survived");
+
+        task.abort();
+    }
+
+    /// USS holds the effective rate at 10% of the cap while it measures a quiet
+    /// baseline. Standing the controller down without clearing `uss_active`
+    /// leaves `set_configured_limits` deferring to a controller that is gone,
+    /// so the throttle would never lift.
+    #[tokio::test]
+    async fn teardown_releases_a_uss_throttle() {
+        const CAP: u64 = 1_000_000;
+        let bw = Arc::new(BandwidthLimiter::new(CAP, 0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(super::start_token_refill(
+            bw.clone(),
+            shutdown.clone(),
+            crate::bandwidth::new_uss_rtt_queue(),
+            crate::bandwidth::new_uss_enabled_flag(true),
+        ));
+
+        // No RTT samples are produced here, so USS stays in Preparing and holds
+        // the quiet-baseline rate.
+        assert!(
+            wait_for(|| bw.effective_upload_rate() < CAP).await,
+            "USS should throttle below the configured cap while preparing"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(
+            wait_for(|| bw.effective_upload_rate() == CAP).await,
+            "teardown must hand the configured cap back, not leave the throttle in place"
+        );
+
+        task.abort();
     }
 }
