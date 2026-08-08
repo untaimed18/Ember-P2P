@@ -17,7 +17,34 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 25;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 26;
+
+/// One row of the eD2K `credits` table, in `load_credits` order. The trailing
+/// flag is the durable "has ever been cryptographically verified" anchor.
+pub type CreditRow = (
+    [u8; 16],
+    u64,
+    u64,
+    i64,
+    Vec<u8>,
+    u32,
+    u8,
+    Option<[u8; 16]>,
+    bool,
+);
+
+/// Borrowed form of [`CreditRow`] used by the save path.
+pub type CreditRowRef<'a> = (
+    &'a [u8; 16],
+    u64,
+    u64,
+    i64,
+    &'a [u8],
+    u32,
+    u8,
+    Option<&'a [u8; 16]>,
+    bool,
+);
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -231,8 +258,12 @@ impl Database {
                 let has_encrypted_rows = has_chat_table
                     && conn
                         .query_row(
+                            // Case-sensitive GLOB, matching `starts_with`
+                            // elsewhere: under LIKE a plaintext body beginning
+                            // `embrchat1:` counts as ciphertext and seals chat
+                            // permanently instead of minting a fresh key.
                             "SELECT EXISTS(SELECT 1 FROM chat_messages \
-                             WHERE message LIKE 'EMBRCHAT1:%' LIMIT 1)",
+                             WHERE message GLOB 'EMBRCHAT1:*' LIMIT 1)",
                             [],
                             |row| row.get::<_, bool>(0),
                         )
@@ -436,6 +467,67 @@ impl Database {
                 destination.display()
             )
         })
+    }
+
+    /// Encrypt every chat body that is still stored as plaintext, through
+    /// `conn` so the caller owns the transaction. Returns how many rows were
+    /// rewritten.
+    ///
+    /// `authenticate_existing` also decrypts the rows that already carry the
+    /// ciphertext marker, which the v23 migration requires: a partially
+    /// prepared or hand-made database must prove those rows open, not merely
+    /// carry the prefix. The deferred pass leaves them untouched and asks
+    /// SQLite for the plaintext rows only, so it stays cheap enough to run on
+    /// every open and cannot turn a damaged ciphertext row into a failed open.
+    fn encrypt_chat_history_rows(
+        &self,
+        conn: &Connection,
+        authenticate_existing: bool,
+    ) -> anyhow::Result<usize> {
+        let key = self.require_chat_key()?;
+        let rows = {
+            // GLOB rather than LIKE: SQLite's LIKE is ASCII case-insensitive, so
+            // a plaintext body starting with e.g. `embrchat1:` would be filtered
+            // out of the deferred pass, never encrypted (v23 has already run, so
+            // it never runs again), and then fail the case-sensitive
+            // `starts_with` on every read — [Message unavailable] forever.
+            let mut stmt = conn.prepare(if authenticate_existing {
+                "SELECT id, friend_hash, direction, message, timestamp \
+                 FROM chat_messages ORDER BY id"
+            } else {
+                "SELECT id, friend_hash, direction, message, timestamp \
+                 FROM chat_messages WHERE message NOT GLOB 'EMBRCHAT1:*' ORDER BY id"
+            })?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut rewritten = 0usize;
+        for (id, friend_hash, direction, stored, timestamp) in rows {
+            if stored.starts_with(CHAT_CIPHERTEXT_PREFIX) {
+                if authenticate_existing {
+                    // A partially prepared/manual database must authenticate,
+                    // not merely carry the marker, before migration completes.
+                    Self::decrypt_chat_body(key, id, &friend_hash, &direction, timestamp, &stored)?;
+                }
+                continue;
+            }
+            let encrypted =
+                Self::encrypt_chat_body(key, id, &friend_hash, &direction, timestamp, &stored)?;
+            conn.execute(
+                "UPDATE chat_messages SET message = ?1 WHERE id = ?2",
+                params![encrypted, id],
+            )?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
     }
 
     fn run_migrations(&self) -> anyhow::Result<()> {
@@ -955,59 +1047,38 @@ impl Database {
             )?;
             Self::add_column_if_missing(&tx, "friends", "ed25519_pubkey", "BLOB")?;
             Self::add_column_if_missing(&tx, "friend_requests", "sender_pubkey", "BLOB")?;
-            let rows = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, friend_hash, direction, message, timestamp \
-                     FROM chat_messages ORDER BY id",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                })?;
-                rows.collect::<Result<Vec<_>, _>>()?
+            // Encrypting the bodies needs the chat key, which may be
+            // unrecoverable: `load_or_create_chat_key` then returns `None`, the
+            // deliberate "chat is locked, everything else still works" state.
+            // Failing here failed the whole open, so a locked key stopped the
+            // application from launching at all. The schema work above must
+            // still land — friends and friend requests depend on it — so v23
+            // completes and the row pass is deferred to the first open that can
+            // recover the key. Nothing is rotated, rewritten or dropped in the
+            // meantime; the rows read as unavailable exactly like sealed
+            // ciphertext does.
+            let encrypted_now = if self.chat_key.is_some() {
+                self.encrypt_chat_history_rows(&tx, true)?;
+                true
+            } else {
+                warn!(
+                    "Chat history is locked, so the v23 encryption pass is deferred: existing \
+                     messages are left exactly as they are and will be encrypted on the first \
+                     launch that recovers the key."
+                );
+                false
             };
-            for (id, friend_hash, direction, stored, timestamp) in rows {
-                let encrypted = if stored.starts_with(CHAT_CIPHERTEXT_PREFIX) {
-                    // A partially prepared/manual database must authenticate,
-                    // not merely carry the marker, before migration completes.
-                    Self::decrypt_chat_body(
-                        self.require_chat_key()?,
-                        id,
-                        &friend_hash,
-                        &direction,
-                        timestamp,
-                        &stored,
-                    )?;
-                    stored
-                } else {
-                    Self::encrypt_chat_body(
-                        self.require_chat_key()?,
-                        id,
-                        &friend_hash,
-                        &direction,
-                        timestamp,
-                        &stored,
-                    )?
-                };
-                tx.execute(
-                    "UPDATE chat_messages SET message = ?1 WHERE id = ?2",
-                    params![encrypted, id],
-                )?;
-            }
             set_version(&tx, 23)?;
             tx.commit()?;
 
-            // Remove plaintext remnants from WAL/free pages after the
-            // transactional rewrite. `secure_delete=ON` protects released
-            // cells; checkpoint+VACUUM also rewrites the main file so a raw
-            // database scan cannot recover old message canaries.
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-            info!("Encrypted local chat history (database v23)");
+            if encrypted_now {
+                // Remove plaintext remnants from WAL/free pages after the
+                // transactional rewrite. `secure_delete=ON` protects released
+                // cells; checkpoint+VACUUM also rewrites the main file so a raw
+                // database scan cannot recover old message canaries.
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+                info!("Encrypted local chat history (database v23)");
+            }
         }
 
         if version < 24 {
@@ -1058,6 +1129,77 @@ impl Database {
             )?;
             set_version(&tx, 25)?;
             tx.commit()?;
+        }
+
+        if version < 26 {
+            // The anti-credit-theft reset fires unless a record has ever been
+            // cryptographically verified by us. That anchor has to be durable
+            // and monotonic (eMule persists the equivalent `nKeySize` and only
+            // ever writes it inside `Verified()`), because `ident_state` is
+            // not: a stranger claiming a peer's user_hash can fail one
+            // challenge and knock an established record out of `Verified`.
+            // Deriving the anchor from `ident_state` at load would then wipe
+            // that peer's accumulated credits on their next verification.
+            let tx = conn.unchecked_transaction()?;
+            // Guarded on the table existing so a partially-formed database
+            // cannot turn this into a failed open, which would stop the app
+            // launching entirely.
+            let has_credits: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type='table' AND name='credits')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_credits {
+                Self::add_column_if_missing(
+                    &tx,
+                    "credits",
+                    "crypto_verified_once",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                // Existing rows get the one-time benefit of the doubt: a
+                // persisted `Verified` (1) can only have been reached through a
+                // real challenge, so treat it as the anchor rather than
+                // resetting every peer the first time they reconnect after
+                // this upgrade.
+                tx.execute(
+                    "UPDATE credits SET crypto_verified_once = 1 WHERE ident_state = 1",
+                    [],
+                )?;
+            }
+            set_version(&tx, 26)?;
+            tx.commit()?;
+        }
+
+        // Finish a v23 encryption pass that was deferred because chat was
+        // locked at the time. The version is already 23 or later, so the
+        // migration itself will never run again — without this the history
+        // would stay in plaintext on disk and unreadable forever, even once the
+        // key came back. A database that migrated normally has no plaintext
+        // bodies left, so this finds nothing and writes nothing.
+        if self.chat_key.is_some() {
+            let has_chat_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type='table' AND name='chat_messages')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_chat_table {
+                let tx = conn.unchecked_transaction()?;
+                let encrypted = self.encrypt_chat_history_rows(&tx, false)?;
+                if encrypted > 0 {
+                    tx.commit()?;
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+                    info!(
+                        "Encrypted {encrypted} chat history row(s) left in plaintext by a \
+                         migration that ran while the chat key was unavailable"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -1745,12 +1887,10 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_credits(
-        &self,
-    ) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8, Option<[u8; 16]>)>> {
+    pub fn load_credits(&self) -> anyhow::Result<Vec<CreditRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash FROM credits",
+            "SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once FROM credits",
         )?;
         let records = stmt
             .query_map([], |row| {
@@ -1785,6 +1925,7 @@ impl Database {
                     row.get::<_, i64>(5)?.clamp(0, u32::MAX as i64) as u32,
                     row.get::<_, i64>(6)?.clamp(0, u8::MAX as i64) as u8,
                     ember_hash,
+                    row.get::<_, i64>(8)? != 0,
                 ))
             })?
             .filter_map(|r| match r {
@@ -1979,16 +2120,13 @@ impl Database {
     // Retained as a focused, unit-tested building block (full-replacement
     // semantics); production flushes go through `save_all_credits_with_ember`.
     #[allow(dead_code)]
-    pub fn save_all_credits(
-        &self,
-        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)],
-    ) -> anyhow::Result<()> {
+    pub fn save_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             )?;
             for (
                 hash,
@@ -1999,6 +2137,7 @@ impl Database {
                 ident_ip,
                 ident_state,
                 ember_hash,
+                crypto_verified_once,
             ) in credits
             {
                 stmt.execute(params![
@@ -2010,6 +2149,7 @@ impl Database {
                     i64::from(*ident_ip),
                     i64::from(*ident_state),
                     ember_hash.map(|eh| eh.as_slice()),
+                    i64::from(*crypto_verified_once),
                 ])?;
             }
         }
@@ -2144,7 +2284,7 @@ impl Database {
     #[allow(clippy::type_complexity)]
     pub fn save_all_credits_with_ember(
         &self,
-        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)],
+        credits: &[CreditRowRef<'_>],
         ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -2152,7 +2292,7 @@ impl Database {
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             )?;
             for (
                 hash,
@@ -2163,6 +2303,7 @@ impl Database {
                 ident_ip,
                 ident_state,
                 ember_hash,
+                crypto_verified_once,
             ) in credits
             {
                 stmt.execute(params![
@@ -2174,6 +2315,7 @@ impl Database {
                     i64::from(*ident_ip),
                     i64::from(*ident_state),
                     ember_hash.map(|eh| eh.as_slice()),
+                    i64::from(*crypto_verified_once),
                 ])?;
             }
         }
@@ -3292,7 +3434,8 @@ mod tests {
                 public_key BLOB NOT NULL DEFAULT x'',
                 ident_ip INTEGER NOT NULL DEFAULT 0,
                 ident_state INTEGER NOT NULL DEFAULT 0,
-                ember_hash BLOB
+                ember_hash BLOB,
+                crypto_verified_once INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -3716,9 +3859,9 @@ mod tests {
 
         // Seed three records.
         db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None),
-            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None),
-            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None),
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false),
         ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
@@ -3727,7 +3870,7 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None)])
+        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true)])
             .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -3750,12 +3893,47 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let db = credits_only_db();
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None)])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false)])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
         db.save_all_credits(&[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
+    }
+
+    /// The "has ever been cryptographically verified" anchor must survive the
+    /// database round-trip. It gates the anti-credit-theft reset, and the DB is
+    /// the primary credit store, so an anchor that did not persist would let
+    /// every peer's accumulated totals be reset on their first verification
+    /// after any restart.
+    #[test]
+    fn crypto_verified_anchor_round_trips() {
+        let db = credits_only_db();
+        let anchored = [0x11u8; 16];
+        let fresh = [0x22u8; 16];
+        let pk: &[u8] = &[0xAA; 4];
+
+        db.save_all_credits(&[
+            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true),
+            // Persisted `Failed` (2) with no anchor: exactly the state a
+            // stranger can force by failing one challenge under this hash.
+            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false),
+        ])
+        .expect("seed");
+
+        let loaded = db.load_credits().expect("reload");
+        let anchor_of = |hash: [u8; 16]| {
+            loaded
+                .iter()
+                .find(|row| row.0 == hash)
+                .map(|row| row.8)
+                .expect("row present")
+        };
+        assert!(anchor_of(anchored), "a verified anchor must persist");
+        assert!(
+            !anchor_of(fresh),
+            "an unanchored record must not gain an anchor from its ident_state"
+        );
     }
 
     /// In-memory `Database` with just the `banned_ips` table for
@@ -3981,7 +4159,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert_eq!(version, 25);
+        assert_eq!(version, MAX_SUPPORTED_SCHEMA_VERSION);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -4255,6 +4433,88 @@ mod tests {
         drop(db);
         let raw_db = std::fs::read(&path).unwrap();
         assert!(!raw_db.windows(canary.len()).any(|w| w == canary.as_bytes()));
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A locked chat key must not turn a pre-v23 database into a failed open.
+    /// The migration completes its schema work, leaves the message rows exactly
+    /// as it found them, and encrypts them on the first launch that recovers
+    /// the key — nothing is rotated, rewritten or lost in between.
+    #[test]
+    fn locked_chat_key_defers_v23_encryption_instead_of_failing_the_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-locked-migrate-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let friend = "55".repeat(16);
+        let canary = "locked-migration-canary-90ab";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO schema_version(version) VALUES (22);
+                 CREATE TABLE friends (
+                    user_hash TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '',
+                    added_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE friend_requests (
+                    sender_hash TEXT PRIMARY KEY, sender_nickname TEXT NOT NULL DEFAULT '',
+                    received_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    friend_hash TEXT NOT NULL, direction TEXT NOT NULL,
+                    message TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_messages(friend_hash,direction,message,timestamp,read) \
+                 VALUES (?1,'received',?2,77,0)",
+                params![friend, canary],
+            )
+            .unwrap();
+        }
+        // An unrecoverable key file: not DPAPI-wrapped and not 32 bytes, so it
+        // is rejected without being rewritten, exactly like a blob protected
+        // under another Windows account.
+        let key_path = dir.join(CHAT_KEY_FILE);
+        std::fs::write(&key_path, b"unrecoverable").unwrap();
+
+        let locked = Database::open_at(&path).expect("a locked chat key must not fail the open");
+        assert!(locked.chat_locked());
+        assert_eq!(locked.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        let stored: String = locked
+            .conn
+            .lock()
+            .query_row("SELECT message FROM chat_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, canary, "the row must be left exactly as it was");
+        let sealed = locked.get_chat_messages(&friend, 10, None).unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].2, CHAT_UNAVAILABLE_TEXT);
+        drop(locked);
+
+        // With the key recoverable again the deferred pass finishes the job.
+        std::fs::remove_file(&key_path).unwrap();
+        let recovered = Database::open_at(&path).expect("reopen");
+        assert!(!recovered.chat_locked());
+        let stored: String = recovered
+            .conn
+            .lock()
+            .query_row("SELECT message FROM chat_messages", [], |row| row.get(0))
+            .unwrap();
+        assert!(stored.starts_with(CHAT_CIPHERTEXT_PREFIX));
+        let messages = recovered.get_chat_messages(&friend, 10, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].2, canary);
+        drop(recovered);
+
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);
     }

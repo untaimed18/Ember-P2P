@@ -243,6 +243,7 @@ struct NatProbeResult {
 const PERIODIC_SAVE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
 const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
+const RENDEZVOUS_REGISTER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn spawn_nat_probe(
     udp_socket: Arc<UdpSocket>,
@@ -5720,6 +5721,33 @@ mod tests {
         blob
     }
 
+    /// The same for a source blob, as `parse_ember_source_records` parses it.
+    /// `last_octet` only has to keep the advertised contacts distinct.
+    fn ember_source_blob(
+        sk: &ed25519_dalek::SigningKey,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        last_octet: u8,
+    ) -> Vec<u8> {
+        let rec = ember::dht::publish::SignedRecord::source(
+            file_hash,
+            ember_file_hash,
+            1,
+            "shared.iso",
+            ember::dht::publish::SourceContact {
+                ip: Ipv4Addr::new(1, 2, 3, last_octet),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: [0u8; 32],
+            },
+            sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
     fn record_ref(file: u8, key: u8) -> EmberRecordRef {
         EmberRecordRef {
             file_hash: [file; 16],
@@ -6429,6 +6457,65 @@ mod tests {
             results.is_empty(),
             "source records and garbage must not become keyword hits"
         );
+    }
+
+    /// A source record is self-signed by a key it carries, so one hostile
+    /// publisher used to be able to name the digest the transfer enforces at
+    /// completion — and a mismatch there finds no corrupt parts, so the whole
+    /// file is re-downloaded forever.
+    #[test]
+    fn one_ember_source_publisher_cannot_name_the_expected_digest() {
+        let honest_a = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let honest_b = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let file_hash = [0x77u8; 16];
+        let honest_digest = [0x01u8; 32];
+        let blobs = vec![
+            ember_source_blob(&honest_a, file_hash, honest_digest, 4),
+            ember_source_blob(&honest_b, file_hash, honest_digest, 5),
+            // Parsed last, which is exactly what the old code believed.
+            ember_source_blob(&attacker, file_hash, [0xFEu8; 32], 6),
+        ];
+        let mut diag = crate::types::EmberDiagnostics::default();
+        let mut noise_keys = HashMap::new();
+        let mut content_hashes = HashMap::new();
+        let sources = parse_ember_source_records(
+            &blobs,
+            file_hash,
+            None,
+            &mut diag,
+            &mut noise_keys,
+            &mut content_hashes,
+        );
+        assert_eq!(sources.len(), 3, "every contact stays connectable");
+        assert_eq!(content_hashes.get(&file_hash), Some(&honest_digest));
+    }
+
+    /// The digest seeded at `StartDownload` from the UI / known.met / a hash we
+    /// computed ourselves outranks the DHT however many publishers disagree.
+    #[test]
+    fn ember_source_records_never_overwrite_a_trusted_digest() {
+        let sk1 = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let file_hash = [0x88u8; 16];
+        let trusted = [0x02u8; 32];
+        let blobs = vec![
+            ember_source_blob(&sk1, file_hash, [0xFEu8; 32], 1),
+            ember_source_blob(&sk2, file_hash, [0xFEu8; 32], 2),
+        ];
+        let mut diag = crate::types::EmberDiagnostics::default();
+        let mut noise_keys = HashMap::new();
+        let mut content_hashes: HashMap<[u8; 16], [u8; 32]> =
+            HashMap::from([(file_hash, trusted)]);
+        parse_ember_source_records(
+            &blobs,
+            file_hash,
+            None,
+            &mut diag,
+            &mut noise_keys,
+            &mut content_hashes,
+        );
+        assert_eq!(content_hashes.get(&file_hash), Some(&trusted));
     }
 
     #[test]
@@ -11286,7 +11373,7 @@ async fn flush_credit_state(
     let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
-        let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8, Option<[u8; 16]>)> = cm
+        let records: Vec<crate::storage::database::CreditRow> = cm
             .all_records()
             .iter()
             .map(|r| {
@@ -11299,6 +11386,7 @@ async fn flush_credit_state(
                     r.ident_ip,
                     r.ident_state.to_u8(),
                     r.ember_hash,
+                    r.crypto_verified_once,
                 )
             })
             .collect();
@@ -11334,9 +11422,11 @@ async fn flush_credit_state(
     let data_dir = data_dir.to_path_buf();
     let save_result = tokio::task::spawn_blocking(move || {
         let _ownership = ownership;
-        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8], u32, u8, Option<&[u8; 16]>)> = owned
+        let refs: Vec<crate::storage::database::CreditRowRef<'_>> = owned
             .iter()
-            .map(|(h, u, d, l, p, ip, st, eh)| (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref()))
+            .map(|(h, u, d, l, p, ip, st, eh, cv)| {
+                (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref(), *cv)
+            })
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
         // never diverge across a crash or partial failure.
@@ -13564,6 +13654,7 @@ pub async fn start_network(
                 ident_ip,
                 ident_state,
                 ember_hash,
+                crypto_verified_once,
             ) in records
             {
                 // `get_or_create` bumps `last_seen` to "now" — the right
@@ -13585,6 +13676,12 @@ pub async fn start_network(
                 record.ident_ip = ident_ip;
                 record.ident_state = ed2k::credits::IdentState::from_u8(ident_state);
                 record.ember_hash = ember_hash;
+                // Assigning `ident_state` directly bypasses `set_ident_state`,
+                // which is what makes the anchor sticky in memory — so it has
+                // to be restored explicitly. Without this every record loads
+                // unanchored and the anti-theft reset wipes each peer's totals
+                // on their first verification after a restart.
+                record.crypto_verified_once = crypto_verified_once;
             }
             info!(
                 "Loaded {} credit records from database",
@@ -15146,8 +15243,24 @@ pub async fn start_network(
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
             }
-            rendezvous_register_in_flight = false;
-            rendezvous_register_started_at = None;
+            // Same trap as the NAT probe above, and for the same reason: with
+            // `auto_connect_kad` off the node is `Disconnected` for the whole
+            // session, so clearing unconditionally left the in-flight guard
+            // permanently false. The bootstrap timer then respawned
+            // registration every tick, each spawn bumped
+            // `rendezvous_register_generation`, and the result handler dropped
+            // every reply as stale — `rendezvous_registered` and
+            // `friend_presence_initial_done` could never latch and friends
+            // never saw us. Only give up on an attempt the watchdog would have
+            // abandoned anyway.
+            let register_is_fresh = rendezvous_register_in_flight
+                && rendezvous_register_started_at
+                    .map(|t| t.elapsed() < RENDEZVOUS_REGISTER_WATCHDOG)
+                    .unwrap_or(false);
+            if !register_is_fresh {
+                rendezvous_register_in_flight = false;
+                rendezvous_register_started_at = None;
+            }
         }
 
         // Probe NAT when we already know an external IP (refine type), or when
@@ -21505,7 +21618,7 @@ pub async fn start_network(
                 // and panic the spawned task.
                 if rendezvous_register_in_flight
                     && rendezvous_register_started_at
-                        .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(60))
+                        .is_some_and(|started| started.elapsed() > RENDEZVOUS_REGISTER_WATCHDOG)
                 {
                     warn!("Rendezvous registration exceeded watchdog timeout; allowing retry");
                     state.rendezvous_register_generation =
@@ -32302,8 +32415,6 @@ async fn handle_ember_native_udp_inner(
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
 ) {
-    use ember::transport::EmberControlMessage;
-
     let outcome = state.ember_transport.dispatch_incoming(data, from);
 
     if outcome.rejected {
@@ -32319,21 +32430,62 @@ async fn handle_ember_native_udp_inner(
 
     // DHT (and future Ember-native) frames ride the same Noise session
     // as the control Ping/Pong but are larger than the 10-byte control
-    // frame, so the transport surfaces them here as `app_payload` with
+    // frame, so the transport surfaces them here as `app_payloads` with
     // the peer's Noise key attached for the reply path.
-    if let (Some(payload), Some(remote_noise_pub)) = (outcome.app_payload, outcome.remote_noise_pub)
-    {
-        handle_ember_dht_message(socket, &payload, from, remote_noise_pub, state).await;
+    //
+    // Plural because one datagram can yield more than one: an IK_INIT's
+    // embedded request is withheld until the source address proves
+    // routable, so it is released alongside whatever frame proved it.
+    // Order is preserved within each list, but app payloads are drained
+    // ahead of controls, so a deferred control released by a DHT frame is
+    // handled after it. Nothing here depends on the relative order of the
+    // two kinds.
+    if let Some(remote_noise_pub) = outcome.remote_noise_pub {
+        for payload in &outcome.app_payloads {
+            handle_ember_dht_message(socket, payload, from, remote_noise_pub, state).await;
+        }
     }
 
-    match outcome.control {
-        Some(EmberControlMessage::Ping { .. }) => {
+    for control in outcome.controls {
+        handle_ember_control_message(
+            socket,
+            control,
+            from,
+            state,
+            transfer_manager,
+            source_manager,
+            local_index,
+        )
+        .await;
+    }
+}
+
+/// Handle one decoded Ember control frame.
+///
+/// Split out of `handle_ember_native_udp_inner` because a single datagram can
+/// carry more than one: the frame that proves a source address routable also
+/// releases whatever the peer's `IK_INIT` was holding. An early return has to
+/// abandon just that frame, not the rest of the batch.
+#[allow(clippy::too_many_arguments)]
+async fn handle_ember_control_message(
+    socket: &UdpSocket,
+    control: ember::transport::EmberControlMessage,
+    from: SocketAddr,
+    state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
+) {
+    use ember::transport::EmberControlMessage;
+
+    match control {
+        EmberControlMessage::Ping { .. } => {
             state.ember_diagnostics.ember_pings_received = state
                 .ember_diagnostics
                 .ember_pings_received
                 .saturating_add(1);
         }
-        Some(EmberControlMessage::Pong { nonce }) => {
+        EmberControlMessage::Pong { nonce } => {
             state.ember_diagnostics.ember_pongs_received = state
                 .ember_diagnostics
                 .ember_pongs_received
@@ -32347,7 +32499,7 @@ async fn handle_ember_native_udp_inner(
                 );
             }
         }
-        Some(EmberControlMessage::ExchangeRequest) => {
+        EmberControlMessage::ExchangeRequest => {
             if !state.ember_transport.peer_is_ik_authenticated(&from) {
                 debug!(
                     "ember-udp: refusing EPX exchange request from unauthenticated XX session {from}"
@@ -32410,7 +32562,7 @@ async fn handle_ember_native_udp_inner(
                 }
             }
         }
-        Some(EmberControlMessage::ExchangeData { payload }) => {
+        EmberControlMessage::ExchangeData { payload } => {
             if !state.ember_transport.peer_is_ik_authenticated(&from) {
                 debug!(
                     "ember-udp: refusing EPX ExchangeData from unauthenticated XX session {from}"
@@ -32474,10 +32626,6 @@ async fn handle_ember_native_udp_inner(
                     debug!("ember-udp: failed to parse EPX payload from {from}: {e}");
                 }
             }
-        }
-        None => {
-            // Pure handshake-progress packet, or unknown control
-            // payload. Either way nothing more to do here.
         }
     }
 }
@@ -32686,12 +32834,15 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // sweep clears `ember_pending` and `search-complete` fires.
                 let results =
                     build_ember_keyword_results(&records, &kw.keywords, kw.query_expr.as_ref());
+                // Publisher-majority already, but still a DHT claim: only fill
+                // a gap, so a search hit cannot displace the digest a running
+                // download was given by the UI / known.met / a local hash.
                 for r in &results {
                     let digest = parse_ember_file_hash(&r.file.ember_file_hash);
                     if digest != [0u8; 32] {
                         if let Ok(bytes) = hex::decode(r.file.hash.trim()) {
                             if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                                state.ember_content_hashes.insert(ed2k, digest);
+                                state.ember_content_hashes.entry(ed2k).or_insert(digest);
                             }
                         }
                     }
@@ -32738,6 +32889,12 @@ fn parse_ember_source_records(
     content_hashes: &mut HashMap<[u8; 16], [u8; 32]>,
 ) -> Vec<(Ipv4Addr, u16, u16, u8)> {
     let mut out = Vec::new();
+    // Expected-digest votes, keyed by publisher. A source record is signed
+    // only by a key the record carries itself, so there is no trust anchor —
+    // any node can assert any digest for any file hash. Collect the claims and
+    // take the publisher majority below (same defence the keyword path
+    // applies) instead of believing whichever record parsed last.
+    let mut publisher_digests: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     for blob in blobs {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
             continue;
@@ -32751,7 +32908,7 @@ fn parse_ember_source_records(
             continue;
         }
         if rec.ember_file_hash != [0u8; 32] {
-            content_hashes.insert(file_hash, rec.ember_file_hash);
+            publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
         }
         let Some(sc) = rec.source_contact else {
             continue;
@@ -32765,6 +32922,15 @@ fn parse_ember_source_records(
             let _ = record_ember_noise_key(noise_keys, sc.ip, sc.udp_port, sc.noise_pub);
         }
         out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
+    }
+    // Fill a gap, never correct one. This map is the digest the transfer
+    // enforces at completion, and anything already in it was seeded from a
+    // trusted source (the UI / known.met / a hash we computed ourselves) when
+    // the download started. Overwriting that with a DHT claim fails the
+    // completion verify, leaves `corrupt_part_indices_on_disk` with nothing to
+    // point at, and re-downloads every part of the file forever.
+    if let Some(digest) = majority_ember_digest(&publisher_digests) {
+        content_hashes.entry(file_hash).or_insert(digest);
     }
     out
 }
@@ -32911,17 +33077,21 @@ fn build_ember_keyword_results(
 
 /// Pick the most common non-zero Ember BLAKE3 among publishers; empty if none.
 fn majority_ember_digest_hex(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> String {
+    majority_ember_digest(publisher_digests)
+        .map(hex::encode)
+        .unwrap_or_default()
+}
+
+/// Raw-byte form of [`majority_ember_digest_hex`]: the digest the most
+/// distinct publishers agree on, or `None` when none of them published one.
+fn majority_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
     let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
     for digest in publisher_digests.values() {
         if *digest != [0u8; 32] {
             *counts.entry(*digest).or_insert(0) += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(d, _)| hex::encode(d))
-        .unwrap_or_default()
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d)
 }
 
 /// Send everything the batch publisher has queued, one or more `STORE_BATCH`
@@ -36634,10 +36804,15 @@ async fn handle_udp_packet_inner(
             } else {
                 // Keyword publishes have no wire client hash; account by a
                 // stable (ip,port)-derived publisher id for per-sender caps.
+                // The global per-publisher budget is charged to the source
+                // address instead, which a port rotation can't shed.
                 let sender_kad_id = resolve_keyword_publisher_id(state, from);
-                let load = state
-                    .dht_store
-                    .store_keyword_entries(&target, entries, &sender_kad_id);
+                let load = state.dht_store.store_keyword_entries(
+                    &target,
+                    entries,
+                    &sender_kad_id,
+                    from_ip_v4(from),
+                );
                 let res = KadMessage::PublishRes {
                     target,
                     load,
@@ -36806,6 +36981,13 @@ async fn handle_udp_packet_inner(
                     _ => {}
                 }
             }
+            // Same treatment the KAD search-result path gives a remote
+            // TAG_DESCRIPTION: `add_peer_comment` caps length but filters no
+            // characters, so controls and bidi overrides would otherwise reach
+            // the comment UI verbatim. Sanitized before the emptiness test so a
+            // comment that is nothing but formatting characters is not stored
+            // as a blank one.
+            note_comment = crate::security::sanitize_remote_text(&note_comment, 4096);
             if note_rating > 0 || !note_comment.is_empty() {
                 let hash_hex = target.to_hex();
                 let peer_name = sender_id.to_hex()[..8].to_string();
@@ -43768,9 +43950,17 @@ fn convert_search_results(
             .split(':')
             .map(|p| p.trim().parse::<u32>().ok())
             .collect::<Option<Vec<u32>>>()?;
+        // The components come straight off the wire, and release builds have
+        // `overflow-checks` off, so an unchecked multiply turns a hostile
+        // "4294967295:0:0" into a plausible-looking duration (and panics in
+        // debug, costing the whole result batch). Reject instead.
         match parts.as_slice() {
-            [h, m, sec] => Some(h * 3600 + m * 60 + sec),
-            [m, sec] => Some(m * 60 + sec),
+            [h, m, sec] => {
+                let hours = h.checked_mul(3600)?;
+                let minutes = m.checked_mul(60)?;
+                hours.checked_add(minutes)?.checked_add(*sec)
+            }
+            [m, sec] => m.checked_mul(60)?.checked_add(*sec),
             [sec] => Some(*sec),
             _ => None,
         }

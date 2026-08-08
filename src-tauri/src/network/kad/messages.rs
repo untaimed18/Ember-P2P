@@ -66,8 +66,27 @@ pub const KADEMLIA_FIND_NODE: u8 = 0x0B;
 
 pub const UDP_KAD_MAXFRAGMENT: usize = 1420;
 
-/// Maximum allowed decompressed payload size (512 KiB) to prevent decompression bombs.
+/// Absolute ceiling on a decompressed payload (512 KiB). The effective limit
+/// is the smaller of this and the wire-proportional bound in `decode_packet`.
 const MAX_DECOMPRESSED_SIZE: usize = 512 * 1024;
+
+/// Floor under the wire-proportional bound: the decompressed size we accept
+/// no matter how few bytes the datagram paid for.
+///
+/// Derived from the largest packed packet our own senders can legitimately
+/// produce. `send_kad_search_results` only flushes a batch that is already
+/// non-empty, so a single result bigger than `UDP_KAD_MAXFRAGMENT` goes out
+/// as a packet of its own — and one stored keyword/notes entry may hold up
+/// to `store::MAX_RETAINED_BYTES_PER_ENTRY` (64 KiB), whose accounting
+/// charges at least one byte per byte the wire form carries plus more
+/// per-tag overhead than the wire spends. So such a packet's body cannot
+/// exceed 64 KiB plus the 34-byte `SEARCH_RES` header. eMule's own worst
+/// case is far smaller (`CIndexed::SendValidKeywordResult` builds into a
+/// fixed `byte byPacket[1024 * 5]`). 96 KiB clears our 64 KiB bound with
+/// room for future per-entry accounting changes while still cutting the
+/// worst-case expansion of a minimum-size datagram to a fifth of the old
+/// flat 512 KiB ceiling.
+const MIN_PACKED_EXPANSION: usize = 96 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum KadMessage {
@@ -256,6 +275,35 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
             let opcode = data[1];
             let compressed = &data[2..];
             let mut decompressed = Vec::new();
+            // Bound expansion by what the datagram paid for on the wire: the
+            // flat 512 KiB ceiling alone let a ~600-byte datagram inflate
+            // ~800x, and framed as a `KADEMLIA2_SEARCH_RES` that then drives
+            // up to 300 entries x 255 tags of parsing — all of it before
+            // `validate_response` gets to reject the batch as unsolicited.
+            //
+            // The proportional term is *not* eMule's rule. eMule's packed-KAD
+            // receive path (`CClientUDPSocket::OnReceive`,
+            // ClientUDPSocket.cpp:98-108) uses `nPacketLen * 10 + 300` only as
+            // its first unpack-buffer guess and doubles it on `Z_BUF_ERROR`
+            // while `nNewSize < 250000` — same shape as `Packet::UnPackPacket`
+            // (Packets.cpp:215-232) — so its real ceiling is ~250 KB whatever
+            // the wire size. Hence the `MIN_PACKED_EXPANSION` floor: without
+            // it we rejected our own traffic, because a maximum-size keyword
+            // entry (a 4 KiB filename compresses to ~60 bytes) is sent as a
+            // single oversized batch and `60 * 10 + 300` is far below its
+            // ~4 KB body. Every Ember node answering for such a keyword would
+            // have emitted an undecodable response for the full 24h TTL.
+            let max_output = compressed
+                .len()
+                .saturating_mul(10)
+                .saturating_add(300)
+                .max(MIN_PACKED_EXPANSION)
+                .min(MAX_DECOMPRESSED_SIZE);
+            // Tracked separately from the error kind: the raw-deflate retry
+            // below triggers on `InvalidData`, so reporting an over-size
+            // packet that way made us decompress the same hostile input a
+            // second time before finally rejecting it.
+            let mut over_size_limit = false;
 
             let decompress_result = {
                 let mut decoder = ZlibDecoder::new(compressed);
@@ -267,7 +315,8 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                         Err(e) => break Err(e),
                     };
                     decompressed.extend_from_slice(&buf[..n]);
-                    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+                    if decompressed.len() > max_output {
+                        over_size_limit = true;
                         break Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "decompressed KAD packet exceeds size limit",
@@ -276,7 +325,8 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                 }
             };
 
-            if matches!(&decompress_result, Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other))
+            if !over_size_limit
+                && matches!(&decompress_result, Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other))
             {
                 decompressed.clear();
                 let mut decoder2 = DeflateDecoder::new(compressed);
@@ -287,7 +337,7 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                         break;
                     }
                     decompressed.extend_from_slice(&buf[..n]);
-                    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+                    if decompressed.len() > max_output {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "decompressed KAD packet exceeds size limit",
@@ -1755,6 +1805,18 @@ mod buddy_hash_wire_tests {
         }
     }
 
+    fn pack_zlib(opcode: u8, body: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = ZlibEncoder::new(&mut compressed, Compression::best());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap();
+        }
+        let mut packet = vec![OP_KADEMLIAPACKEDPROT, opcode];
+        packet.extend_from_slice(&compressed);
+        packet
+    }
+
     #[test]
     fn packed_kad_search_response_round_trips_emule_framing() {
         let results = (0..150)
@@ -1786,5 +1848,86 @@ mod buddy_hash_wire_tests {
             KadMessage::SearchRes { results, .. } => assert_eq!(results.len(), 150),
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// The largest single result our sender can emit must survive its own
+    /// round trip. `send_kad_search_results` only flushes a non-empty batch,
+    /// so one entry over `UDP_KAD_MAXFRAGMENT` becomes a packet by itself,
+    /// and a stored keyword entry may carry a `MAX_STORED_FILENAME_BYTES`
+    /// (4 KiB) filename plus `MAX_STORED_STRING_BYTES` (8 KiB) tags up to
+    /// `MAX_RETAINED_BYTES_PER_ENTRY` (64 KiB) in total. Repetitive content
+    /// compresses to a couple of hundred bytes, so the wire-proportional term
+    /// alone rejects it — which is exactly how a planted keyword entry could
+    /// make every Ember node's answer for that keyword undecodable.
+    #[test]
+    fn maximum_size_stored_entry_round_trips_as_its_own_packet() {
+        let mut tags = vec![
+            KadTag {
+                name: TagName::Id(TAG_FILENAME),
+                value: TagValue::String("a".repeat(4 * 1024)),
+            },
+            KadTag {
+                name: TagName::Id(TAG_FILESIZE),
+                value: TagValue::Uint64(1024),
+            },
+        ];
+        for _ in 0..7 {
+            tags.push(KadTag {
+                name: TagName::Str("filler".to_string()),
+                value: TagValue::String("b".repeat(8 * 1024)),
+            });
+        }
+        let encoded = encode_packet(&KadMessage::SearchRes {
+            sender_id: KadId([1; 16]),
+            target: KadId([2; 16]),
+            results: vec![SearchResultEntry {
+                id: KadId([0x55; 16]),
+                tags,
+            }],
+        })
+        .unwrap();
+        assert_eq!(encoded[0], OP_KADEMLIAPACKEDPROT);
+        match decode_packet(&encoded).unwrap() {
+            KadMessage::SearchRes { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].tags.len(), 9);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// Beyond `MIN_PACKED_EXPANSION` a datagram may only expand in proportion
+    /// to what it paid for on the wire. Under the absolute-only 512 KiB cap a
+    /// few hundred wire bytes bought ~800x of decompression plus a full
+    /// `SEARCH_RES` parse, all before `validate_response` could reject the
+    /// batch as unsolicited. (eMule itself does not bound this proportionally
+    /// — `CClientUDPSocket::OnReceive` doubles its unpack buffer on
+    /// `Z_BUF_ERROR` up to ~250 KB regardless of wire size — so this is
+    /// stricter than stock, which is why the floor has to clear everything a
+    /// real sender can produce.)
+    #[test]
+    fn packed_packet_expansion_is_bounded_by_wire_size() {
+        const BOMB_BYTES: usize = 256 * 1024;
+        let bomb = pack_zlib(KADEMLIA2_SEARCH_RES, &vec![0u8; BOMB_BYTES]);
+        assert!(
+            bomb.len() <= UDP_KAD_MAXFRAGMENT,
+            "the bomb must be an ordinary-sized datagram"
+        );
+        let bound = ((bomb.len() - 2) * 10 + 300).max(MIN_PACKED_EXPANSION);
+        assert!(
+            BOMB_BYTES > bound,
+            "fixture must actually exceed the effective bound"
+        );
+
+        let err = decode_packet(&bomb).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Also pins the second half of the fix: the size-limit failure must
+        // not fall through into the raw-`DeflateDecoder` retry, which would
+        // decompress the same hostile input a second time and surface a
+        // corrupt-stream error from that pass instead.
+        assert!(
+            err.to_string().contains("exceeds size limit"),
+            "size-limit rejection must be final, got: {err}"
+        );
     }
 }

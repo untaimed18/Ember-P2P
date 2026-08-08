@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 
 use tracing::debug;
@@ -22,6 +22,28 @@ const MAX_STORED_BLOB_BYTES: usize = 8 * 1024;
 // monopolising an entire 1000-entry keyword bucket while accepting a complete
 // standards-sized publish from an ordinary peer.
 const MAX_KEYWORD_ENTRIES_PER_SENDER: usize = 150;
+/// Global budget for one publisher *across every keyword target*.
+///
+/// Every other keyword cap is per key, so nothing bounded what a single
+/// publisher consumed in total. `is_within_tolerance_for` only checks XOR
+/// distance to a target the publisher picks, and our `local_id` isn't
+/// secret, so in-tolerance targets are trivial to mint: 16 of them at the
+/// 2 MiB per-publisher-per-key allowance exhausted the whole 64 MiB store,
+/// after which we refused every keyword, source and notes publish from
+/// honest peers for the full 24-hour `KEYWORD_TTL_SECS` while still
+/// advertising ourselves as a storage node. These mirror what the source
+/// path already does per IP with `MAX_SOURCES_PER_IP`.
+const MAX_KEYWORD_ENTRIES_PER_PUBLISHER: usize = 2_000;
+const MAX_KEYWORD_BYTES_PER_PUBLISHER: usize = 4 * 1024 * 1024;
+/// How many of a publisher's targets one eviction pass inspects. `targets`
+/// is a hint that can name buckets the publisher no longer occupies, and
+/// walking the whole keyword index on a packet path is the same O(n)-per-
+/// datagram shape the flood-protection tables were fixed for.
+const KEYWORD_EVICTION_TARGET_PROBES: usize = 4;
+/// Entries one `PublishKeyReq` may shed in total. Budgeted per packet, not
+/// per entry: a packet carries up to 300 entries, so a per-entry budget
+/// would put the eviction scan itself back on the amplification menu.
+const MAX_KEYWORD_EVICTIONS_PER_PUBLISH: usize = 8;
 /// How long a keyword entry we're storing *for another node* survives
 /// before we evict it. `publish::keyword_republish_interval` assumes
 /// every other KAD node enforces this same TTL against entries *we*
@@ -40,12 +62,24 @@ pub struct StoredEntry {
     pub ttl_secs: i64,
     /// The KAD ID of the node that published this entry (used for dedup).
     pub source_id: KadId,
+    /// Source address of the packet that stored this keyword entry, i.e. the
+    /// `keyword_publisher_usage` record its bytes are charged to. Source and
+    /// notes entries take no part in that index and leave this `None`.
+    publisher_ip: Option<std::net::Ipv4Addr>,
     retained_bytes: usize,
 }
 
 impl StoredEntry {
     pub fn is_expired(&self, now: i64) -> bool {
         now.saturating_sub(self.stored_at) >= self.ttl_secs
+    }
+
+    /// The `keyword_publisher_usage` record this entry's bytes are charged
+    /// to. Every add, remove and rebuild has to agree on this or the global
+    /// budget silently drifts, so derive it in one place from the entry
+    /// itself rather than from whatever the current packet claims.
+    fn keyword_budget_key(&self) -> PublisherKey {
+        keyword_budget_key(&self.source_id, self.publisher_ip)
     }
 }
 
@@ -111,6 +145,102 @@ fn retained_bytes(entries: &[StoredEntry]) -> usize {
     entries.iter().map(|entry| entry.retained_bytes).sum()
 }
 
+/// Who the *global* per-publisher keyword budget is charged to.
+///
+/// Not the `(ip, port)`-derived publisher id the per-key caps use: for any
+/// peer not in our routing table that id is `md5(ip || port)`
+/// (`resolve_keyword_publisher_id`), so rotating the UDP source port mints
+/// unlimited distinct publisher identities from a single address — roughly
+/// 25 ports is enough to place 50,000 entries and reach `MAX_TOTAL_ENTRIES`,
+/// which is precisely the store-wide lockout the budget was added to prevent.
+/// The source address can't be rotated without also giving up delivery, so
+/// the global budget is charged to that, matching what the source path
+/// already does with `MAX_SOURCES_PER_IP`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PublisherKey {
+    Ip(std::net::Ipv4Addr),
+    /// Fallback when the caller has no source address. Reachable from tests
+    /// only: the KAD socket is bound `AF_INET`, so the publish handler's
+    /// `from_ip_v4` always yields an address. Even if an IPv6 source could
+    /// arrive it would not be a bypass — `resolve_keyword_publisher_id`
+    /// gives every non-IPv4 sender `KadId::zero()`, so they would all share
+    /// one budget, which is stricter than a per-address one.
+    Id(KadId),
+}
+
+fn keyword_budget_key(sender_id: &KadId, sender_ip: Option<std::net::Ipv4Addr>) -> PublisherKey {
+    match sender_ip {
+        Some(ip) => PublisherKey::Ip(ip),
+        None => PublisherKey::Id(*sender_id),
+    }
+}
+
+/// What one publisher is holding in the keyword index in total, so the
+/// global per-publisher budget can be enforced without walking every bucket.
+#[derive(Debug, Default)]
+struct PublisherUsage {
+    entries: usize,
+    bytes: usize,
+    /// Targets this publisher holds entries under. A search hint for
+    /// eviction, not authoritative: stale names are pruned when an eviction
+    /// pass trips over them and the whole map is rebuilt by `cleanup_expired`.
+    targets: HashSet<KadId>,
+}
+
+/// Fold a stored keyword entry into its publisher's global usage.
+/// `freed_bytes` is the size of the entry it replaced, if any.
+fn publisher_usage_add(
+    usage: &mut HashMap<PublisherKey, PublisherUsage>,
+    heaviest: &mut Option<PublisherKey>,
+    publisher: &PublisherKey,
+    target: &KadId,
+    added_entries: usize,
+    bytes: usize,
+    freed_bytes: usize,
+) {
+    let record = usage.entry(*publisher).or_default();
+    record.entries = record.entries.saturating_add(added_entries);
+    record.bytes = record
+        .bytes
+        .saturating_sub(freed_bytes)
+        .saturating_add(bytes);
+    record.targets.insert(*target);
+    let record_bytes = record.bytes;
+
+    // Cheap running "who is holding the most" hint. It can go stale when the
+    // named publisher shrinks, but it always names a publisher that was the
+    // heaviest at some point, and `cleanup_expired` recomputes it exactly —
+    // that's enough to aim eviction while keeping this O(1) on the packet path.
+    let heaviest_bytes = heaviest
+        .as_ref()
+        .and_then(|id| usage.get(id))
+        .map_or(0, |record| record.bytes);
+    if record_bytes > heaviest_bytes {
+        *heaviest = Some(*publisher);
+    }
+}
+
+/// Fold one removed keyword entry out of its publisher's global usage.
+fn publisher_usage_remove(
+    usage: &mut HashMap<PublisherKey, PublisherUsage>,
+    heaviest: &mut Option<PublisherKey>,
+    publisher: &PublisherKey,
+    bytes: usize,
+) {
+    let Some(record) = usage.get_mut(publisher) else {
+        return;
+    };
+    record.entries = record.entries.saturating_sub(1);
+    record.bytes = record.bytes.saturating_sub(bytes);
+    let drained = record.entries == 0;
+    if drained {
+        usage.remove(publisher);
+        if heaviest.as_ref() == Some(publisher) {
+            *heaviest = None;
+        }
+    }
+}
+
 /// eMule `CIndexed::AddKeyword` minimum-content gate for a single
 /// `PublishKeyReq` entry: non-empty `TAG_FILENAME`, non-zero `TAG_FILESIZE`,
 /// and at least one tag present.
@@ -134,6 +264,11 @@ pub struct DhtStore {
     notes_entries: HashMap<KadId, Vec<StoredEntry>>,
     total_count: usize,
     total_retained_bytes: usize,
+    /// Keyword usage per publisher, summed across every target.
+    keyword_publisher_usage: HashMap<PublisherKey, PublisherUsage>,
+    /// Running hint at the publisher holding the most keyword bytes; the
+    /// eviction target when the global byte cap is reached.
+    heaviest_keyword_publisher: Option<PublisherKey>,
     local_id: KadId,
 }
 
@@ -145,6 +280,8 @@ impl DhtStore {
             notes_entries: HashMap::new(),
             total_count: 0,
             total_retained_bytes: 0,
+            keyword_publisher_usage: HashMap::new(),
+            heaviest_keyword_publisher: None,
             local_id: KadId::zero(),
         }
     }
@@ -171,26 +308,55 @@ impl DhtStore {
         publisher_ip.is_some_and(super::ip_filter::is_lan_ip)
     }
 
+    /// `sender_ip` is the address the publish packet arrived from; the
+    /// global per-publisher budget is charged to it (see `PublisherKey`).
+    /// `None` means the caller has no address to charge — tests only, the
+    /// publish handler always has one.
     pub fn store_keyword_entries(
         &mut self,
         target: &KadId,
         entries: Vec<PublishEntry>,
         sender_id: &KadId,
+        sender_ip: Option<std::net::Ipv4Addr>,
     ) -> u8 {
-        let bucket = self.keyword_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
+        let budget_key = keyword_budget_key(sender_id, sender_ip);
 
-        let len_before = bucket.len();
-        let bytes_before = retained_bytes(bucket);
-        bucket.retain(|e| !e.is_expired(now));
-        self.total_count = self.total_count.saturating_sub(len_before - bucket.len());
-        self.total_retained_bytes = self
-            .total_retained_bytes
-            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
-        let mut sender_entry_count = bucket
-            .iter()
-            .filter(|entry| entry.source_id == *sender_id)
-            .count();
+        // Scoped so the bucket borrow ends before the global-budget
+        // bookkeeping below, which needs `&mut self`.
+        let mut expired: Vec<(PublisherKey, usize)> = Vec::new();
+        {
+            let bucket = self.keyword_entries.entry(*target).or_default();
+            let len_before = bucket.len();
+            let bytes_before = retained_bytes(bucket);
+            bucket.retain(|e| {
+                if e.is_expired(now) {
+                    expired.push((e.keyword_budget_key(), e.retained_bytes));
+                    false
+                } else {
+                    true
+                }
+            });
+            self.total_count = self.total_count.saturating_sub(len_before - bucket.len());
+            self.total_retained_bytes = self
+                .total_retained_bytes
+                .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
+        }
+        for (publisher, bytes) in expired {
+            publisher_usage_remove(
+                &mut self.keyword_publisher_usage,
+                &mut self.heaviest_keyword_publisher,
+                &publisher,
+                bytes,
+            );
+        }
+        let mut sender_entry_count = self.keyword_entries.get(target).map_or(0, |bucket| {
+            bucket
+                .iter()
+                .filter(|entry| entry.source_id == *sender_id)
+                .count()
+        });
+        let mut eviction_budget = MAX_KEYWORD_EVICTIONS_PER_PUBLISH;
 
         for entry in entries {
             // eMule `CIndexed::AddKeyword` rejects a keyword entry outright
@@ -209,6 +375,65 @@ impl DhtStore {
             let Some((tags, entry_bytes)) = normalize_and_size_tags(entry.tags) else {
                 continue;
             };
+
+            // Shed the heaviest publisher's bulk rather than refusing every
+            // publish once the store is full — see `evict_keyword_bytes`.
+            // Done before the bucket is borrowed, and deliberately only when
+            // a *global* cap is the blocker: the per-key and per-publisher
+            // caps below are this publisher's own allowance and must not be
+            // bought with somebody else's entries.
+            //
+            // Both global caps have to be gates here. `MAX_TOTAL_ENTRIES` is
+            // shared across keyword, source and notes, and real entries run
+            // 100-200 bytes, so the count cap binds at roughly 5-10 MB of the
+            // 64 MiB byte cap: gating on bytes alone meant eviction never ran
+            // at all and the full-store lockout it exists to prevent stayed
+            // reachable for the whole `KEYWORD_TTL_SECS`.
+            let over_total_bytes =
+                self.total_retained_bytes.saturating_add(entry_bytes) > MAX_TOTAL_RETAINED_BYTES;
+            let over_total_count = self.total_count >= MAX_TOTAL_ENTRIES;
+            if over_total_bytes || over_total_count {
+                // A refresh of an entry we already hold costs no slot and only
+                // the byte difference, so price it before deciding to evict.
+                let replaced = self.keyword_entries.get(target).and_then(|bucket| {
+                    bucket
+                        .iter()
+                        .find(|e| e.id == entry.id && e.source_id == *sender_id)
+                });
+                let replaced_bytes = replaced.map_or(0, |e| e.retained_bytes);
+                let needs_bytes = self
+                    .total_retained_bytes
+                    .saturating_sub(replaced_bytes)
+                    .saturating_add(entry_bytes)
+                    > MAX_TOTAL_RETAINED_BYTES;
+                let needs_slot = over_total_count && replaced.is_none();
+                if (needs_bytes || needs_slot)
+                    && self.evict_keyword_bytes(
+                        entry_bytes.saturating_sub(replaced_bytes),
+                        &mut eviction_budget,
+                    )
+                {
+                    // Eviction may have taken entries this sender holds under
+                    // this very target, so refresh the per-key tally.
+                    sender_entry_count = self.keyword_entries.get(target).map_or(0, |bucket| {
+                        bucket
+                            .iter()
+                            .filter(|stored| stored.source_id == *sender_id)
+                            .count()
+                    });
+                }
+            }
+
+            let publisher_entries = self
+                .keyword_publisher_usage
+                .get(&budget_key)
+                .map_or(0, |usage| usage.entries);
+            let publisher_total_bytes = self
+                .keyword_publisher_usage
+                .get(&budget_key)
+                .map_or(0, |usage| usage.bytes);
+
+            let bucket = self.keyword_entries.entry(*target).or_default();
             let key_bytes = retained_bytes(bucket);
             let publisher_bytes: usize = bucket
                 .iter()
@@ -220,6 +445,15 @@ impl DhtStore {
                 .position(|e| e.id == entry.id && e.source_id == *sender_id)
             {
                 let old_bytes = bucket[pos].retained_bytes;
+                // A routing-table contact keeps its KAD id across an address
+                // change, so the entry being replaced can be charged to a
+                // different budget key than this packet arrives on. When it
+                // is, the entry is landing on the new key for the first time
+                // and has to fit there outright — crediting it bytes and a
+                // slot it never held there is free budget.
+                let old_key = bucket[pos].keyword_budget_key();
+                let same_budget_key = old_key == budget_key;
+                let publisher_credit = if same_budget_key { old_bytes } else { 0 };
                 if key_bytes
                     .saturating_sub(old_bytes)
                     .saturating_add(entry_bytes)
@@ -228,6 +462,11 @@ impl DhtStore {
                         .saturating_sub(old_bytes)
                         .saturating_add(entry_bytes)
                         > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
+                    || publisher_total_bytes
+                        .saturating_sub(publisher_credit)
+                        .saturating_add(entry_bytes)
+                        > MAX_KEYWORD_BYTES_PER_PUBLISHER
+                    || (!same_budget_key && publisher_entries >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER)
                     || self
                         .total_retained_bytes
                         .saturating_sub(old_bytes)
@@ -239,10 +478,44 @@ impl DhtStore {
                 bucket[pos].tags = tags;
                 bucket[pos].stored_at = now;
                 bucket[pos].retained_bytes = entry_bytes;
+                bucket[pos].publisher_ip = sender_ip;
                 self.total_retained_bytes = self
                     .total_retained_bytes
                     .saturating_sub(old_bytes)
                     .saturating_add(entry_bytes);
+                if same_budget_key {
+                    publisher_usage_add(
+                        &mut self.keyword_publisher_usage,
+                        &mut self.heaviest_keyword_publisher,
+                        &budget_key,
+                        target,
+                        0,
+                        entry_bytes,
+                        old_bytes,
+                    );
+                } else {
+                    // Netting the delta against the new key alone would
+                    // leave the old key holding bytes and an entry count no
+                    // stored entry points at, and the new key short by the
+                    // same amount, until `cleanup_expired` rebuilt the index
+                    // 300 seconds later — the short side is budget the
+                    // publisher gets for free. Move the entry across.
+                    publisher_usage_remove(
+                        &mut self.keyword_publisher_usage,
+                        &mut self.heaviest_keyword_publisher,
+                        &old_key,
+                        old_bytes,
+                    );
+                    publisher_usage_add(
+                        &mut self.keyword_publisher_usage,
+                        &mut self.heaviest_keyword_publisher,
+                        &budget_key,
+                        target,
+                        1,
+                        entry_bytes,
+                        0,
+                    );
+                }
             } else {
                 // Skip *this* new entry when full, but keep scanning the rest
                 // of the batch: later entries may be updates to existing records
@@ -251,6 +524,9 @@ impl DhtStore {
                 // happens to include one over-cap new entry would let its other
                 // (already-stored) entries expire.
                 if sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER {
+                    continue;
+                }
+                if publisher_entries >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER {
                     continue;
                 }
                 if self.total_count >= MAX_TOTAL_ENTRIES {
@@ -262,6 +538,8 @@ impl DhtStore {
                 if key_bytes.saturating_add(entry_bytes) > MAX_RETAINED_BYTES_PER_KEY
                     || publisher_bytes.saturating_add(entry_bytes)
                         > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
+                    || publisher_total_bytes.saturating_add(entry_bytes)
+                        > MAX_KEYWORD_BYTES_PER_PUBLISHER
                     || self.total_retained_bytes.saturating_add(entry_bytes)
                         > MAX_TOTAL_RETAINED_BYTES
                 {
@@ -273,11 +551,21 @@ impl DhtStore {
                     stored_at: now,
                     ttl_secs: KEYWORD_TTL_SECS,
                     source_id: *sender_id,
+                    publisher_ip: sender_ip,
                     retained_bytes: entry_bytes,
                 });
                 self.total_count += 1;
                 self.total_retained_bytes += entry_bytes;
                 sender_entry_count += 1;
+                publisher_usage_add(
+                    &mut self.keyword_publisher_usage,
+                    &mut self.heaviest_keyword_publisher,
+                    &budget_key,
+                    target,
+                    1,
+                    entry_bytes,
+                    0,
+                );
             }
         }
 
@@ -292,11 +580,123 @@ impl DhtStore {
         // `target` within our tolerance zone (our `local_id` isn't
         // secret, and KAD's UDP transport has no handshake to rate-limit
         // via source IP once an attacker spoofs a fresh one per packet).
-        if bucket.is_empty() {
+        if self
+            .keyword_entries
+            .get(target)
+            .is_some_and(|bucket| bucket.is_empty())
+        {
             self.keyword_entries.remove(target);
         }
 
         self.compute_load()
+    }
+
+    /// Free keyword bytes by shedding the publisher currently holding the
+    /// most, largest entry first (ties broken by the oldest `stored_at`, i.e.
+    /// least recently refreshed). Returns whether anything was evicted.
+    ///
+    /// Called only when `MAX_TOTAL_RETAINED_BYTES` or `MAX_TOTAL_ENTRIES`
+    /// would otherwise refuse a publish. Refusing outright is what let one
+    /// publisher spreading 4 MiB across 16 self-chosen in-tolerance targets
+    /// shut the keyword index down for honest peers for a full
+    /// `KEYWORD_TTL_SECS`. Aiming at the heaviest
+    /// publisher means the pressure lands on whoever is actually consuming
+    /// the store, including the arriving publisher when that is them.
+    fn evict_keyword_bytes(&mut self, needed: usize, budget: &mut usize) -> bool {
+        let mut freed = 0usize;
+        while freed < needed && *budget > 0 {
+            let publisher = match self.heaviest_keyword_publisher {
+                Some(publisher) => publisher,
+                // The hint is cleared once its publisher is drained, and
+                // `publisher_usage_add` only ever ratchets it upward, so
+                // stopping here left eviction dead until the next
+                // `cleanup_expired` recomputed it — a 300-second timer, during
+                // which the store stayed full and refused everyone. Re-aim
+                // exactly instead. This costs one pass over
+                // `keyword_publisher_usage` per *drained publisher*, which
+                // `MAX_KEYWORD_EVICTIONS_PER_PUBLISH` already bounds per
+                // packet; it is not a per-packet cost.
+                None => match self.recompute_heaviest_keyword_publisher() {
+                    Some(publisher) => publisher,
+                    None => break,
+                },
+            };
+            let Some(bytes) = self.evict_one_keyword_entry(&publisher) else {
+                break;
+            };
+            *budget -= 1;
+            freed = freed.saturating_add(bytes);
+        }
+        freed > 0
+    }
+
+    /// Point `heaviest_keyword_publisher` at whoever actually holds the most
+    /// keyword bytes right now, and return it.
+    fn recompute_heaviest_keyword_publisher(&mut self) -> Option<PublisherKey> {
+        self.heaviest_keyword_publisher = self
+            .keyword_publisher_usage
+            .iter()
+            .max_by_key(|(_, record)| record.bytes)
+            .map(|(publisher, _)| *publisher);
+        self.heaviest_keyword_publisher
+    }
+
+    /// Drop `publisher`'s largest keyword entry among a bounded sample of the
+    /// targets it holds. Returns the bytes reclaimed.
+    fn evict_one_keyword_entry(&mut self, publisher: &PublisherKey) -> Option<usize> {
+        let candidates: Vec<KadId> = self
+            .keyword_publisher_usage
+            .get(publisher)?
+            .targets
+            .iter()
+            .take(KEYWORD_EVICTION_TARGET_PROBES)
+            .copied()
+            .collect();
+
+        let mut stale: Vec<KadId> = Vec::new();
+        // (target, index, bytes)
+        let mut victim: Option<(KadId, usize, usize)> = None;
+        for candidate in candidates {
+            let best = self.keyword_entries.get(&candidate).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stored)| stored.keyword_budget_key() == *publisher)
+                    .max_by_key(|(_, stored)| (stored.retained_bytes, -stored.stored_at))
+                    .map(|(index, stored)| (index, stored.retained_bytes))
+            });
+            match best {
+                Some((index, bytes)) => {
+                    if victim.map_or(true, |(_, _, best_bytes)| bytes > best_bytes) {
+                        victim = Some((candidate, index, bytes));
+                    }
+                }
+                // The publisher no longer occupies this target.
+                None => stale.push(candidate),
+            }
+        }
+        if let Some(record) = self.keyword_publisher_usage.get_mut(publisher) {
+            for candidate in stale {
+                record.targets.remove(&candidate);
+            }
+        }
+
+        let (target, index, bytes) = victim?;
+        let bucket = self.keyword_entries.get_mut(&target)?;
+        bucket.remove(index);
+        let emptied = bucket.is_empty();
+        if emptied {
+            self.keyword_entries.remove(&target);
+        }
+        self.total_count = self.total_count.saturating_sub(1);
+        self.total_retained_bytes = self.total_retained_bytes.saturating_sub(bytes);
+        publisher_usage_remove(
+            &mut self.keyword_publisher_usage,
+            &mut self.heaviest_keyword_publisher,
+            publisher,
+            bytes,
+        );
+        Some(bytes)
     }
 
     pub fn store_source_entry(
@@ -434,6 +834,7 @@ impl DhtStore {
             stored_at: now,
             ttl_secs: SOURCE_TTL_SECS,
             source_id: sender_id,
+            publisher_ip: None,
             retained_bytes: entry_bytes,
         };
         if let Some(pos) = existing_pos {
@@ -584,6 +985,7 @@ impl DhtStore {
             stored_at: now,
             ttl_secs: NOTES_TTL_SECS,
             source_id: sender_id,
+            publisher_ip: None,
             retained_bytes: entry_bytes,
         };
         if let Some(pos) = existing_pos {
@@ -652,6 +1054,29 @@ impl DhtStore {
             .chain(self.notes_entries.values())
             .map(|entries| retained_bytes(entries))
             .sum();
+
+        // Rebuild the per-publisher index from scratch: the incremental
+        // updates on the publish path keep the counts exact, but this also
+        // drops stale `targets` hints and re-establishes the heaviest-holder
+        // hint that `evict_one_keyword_entry` aims with.
+        self.keyword_publisher_usage.clear();
+        for (target, entries) in &self.keyword_entries {
+            for entry in entries {
+                let record = self
+                    .keyword_publisher_usage
+                    .entry(entry.keyword_budget_key())
+                    .or_default();
+                record.entries += 1;
+                record.bytes = record.bytes.saturating_add(entry.retained_bytes);
+                record.targets.insert(*target);
+            }
+        }
+        self.heaviest_keyword_publisher = self
+            .keyword_publisher_usage
+            .iter()
+            .max_by_key(|(_, record)| record.bytes)
+            .map(|(publisher, _)| *publisher);
+
         let removed = count_before.saturating_sub(self.total_count);
         if removed > 0 {
             debug!(
@@ -679,6 +1104,7 @@ impl DhtStore {
 #[cfg(test)]
 mod keyword_store_tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn entry(index: u16) -> PublishEntry {
         let mut id = [0u8; 16];
@@ -712,8 +1138,8 @@ mod keyword_store_tests {
         let oversized_batch = (0..(MAX_KEYWORD_ENTRIES_PER_SENDER as u16 + 25))
             .map(entry)
             .collect();
-        store.store_keyword_entries(&target, oversized_batch, &first_sender);
-        store.store_keyword_entries(&target, vec![entry(500)], &second_sender);
+        store.store_keyword_entries(&target, oversized_batch, &first_sender, None);
+        store.store_keyword_entries(&target, vec![entry(500)], &second_sender, None);
 
         let bucket = store.keyword_entries.get(&target).unwrap();
         assert_eq!(
@@ -726,6 +1152,211 @@ mod keyword_store_tests {
         assert!(bucket
             .iter()
             .any(|stored| stored.source_id == second_sender));
+    }
+
+    fn sized_entry(index: u16, filler: usize) -> PublishEntry {
+        let mut entry = entry(index);
+        entry.tags.push(KadTag {
+            name: TagName::Str("filler".to_string()),
+            value: TagValue::String("f".repeat(filler)),
+        });
+        entry
+    }
+
+    fn numbered_target(index: u16) -> KadId {
+        let mut target = [0u8; 16];
+        target[..2].copy_from_slice(&index.to_le_bytes());
+        KadId(target)
+    }
+
+    /// Every other keyword cap is per key, so a publisher could spread its
+    /// load over self-chosen in-tolerance targets and consume the whole
+    /// store. The global per-publisher budget is what bounds that.
+    #[test]
+    fn one_publisher_cannot_spread_across_keys_to_exhaust_the_store() {
+        let mut store = DhtStore::new();
+        let publisher = KadId([0x81; 16]);
+        let keys = MAX_KEYWORD_ENTRIES_PER_PUBLISHER / MAX_KEYWORD_ENTRIES_PER_SENDER + 3;
+        for key in 0..keys {
+            let batch = (0..MAX_KEYWORD_ENTRIES_PER_SENDER as u16)
+                .map(entry)
+                .collect();
+            store.store_keyword_entries(&numbered_target(key as u16), batch, &publisher, None);
+        }
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Id(publisher)].entries,
+            MAX_KEYWORD_ENTRIES_PER_PUBLISHER,
+            "the per-key caps must not add up to an unbounded global footprint"
+        );
+
+        // An honest publisher must still get in.
+        let honest = KadId([0x82; 16]);
+        let honest_target = KadId([0x99; 16]);
+        store.store_keyword_entries(&honest_target, vec![entry(1)], &honest, None);
+        assert_eq!(store.search_keywords(&honest_target).len(), 1);
+    }
+
+    /// When the global byte cap blocks a publish we shed the heaviest
+    /// publisher's largest entry rather than refusing everyone — otherwise
+    /// whoever fills the store first locks it for a full `KEYWORD_TTL_SECS`.
+    #[test]
+    fn eviction_sheds_the_heaviest_publishers_largest_entry() {
+        let mut store = DhtStore::new();
+        let heavy = KadId([0x91; 16]);
+        let light = KadId([0x92; 16]);
+        let heavy_target = numbered_target(1);
+        let light_target = numbered_target(2);
+
+        store.store_keyword_entries(
+            &heavy_target,
+            vec![sized_entry(1, 1024), sized_entry(2, 8000)],
+            &heavy,
+            None,
+        );
+        store.store_keyword_entries(&light_target, vec![sized_entry(3, 512)], &light, None);
+        assert_eq!(
+            store.heaviest_keyword_publisher,
+            Some(PublisherKey::Id(heavy))
+        );
+
+        let bytes_before = store.total_retained_bytes;
+        let mut budget = MAX_KEYWORD_EVICTIONS_PER_PUBLISH;
+        assert!(store.evict_keyword_bytes(1, &mut budget));
+
+        assert_eq!(
+            store.search_keywords(&light_target).len(),
+            1,
+            "the light publisher must not pay for the heavy one's footprint"
+        );
+        let remaining = store.search_keywords(&heavy_target);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].id,
+            entry(1).id,
+            "the largest entry must be the one shed"
+        );
+        assert!(store.total_retained_bytes < bytes_before);
+        assert_eq!(
+            store.total_retained_bytes,
+            store
+                .keyword_publisher_usage
+                .values()
+                .map(|usage| usage.bytes)
+                .sum::<usize>(),
+            "eviction must keep the global and per-publisher counters in step"
+        );
+    }
+
+    /// Draining the hinted publisher used to end the eviction pass, and
+    /// because the hint only ratchets upward it stayed pinned to whoever was
+    /// heaviest first — so the first publish needing space wiped an arbitrary
+    /// early publisher and eviction then sat dead until the next
+    /// `cleanup_expired` 300 seconds later.
+    #[test]
+    fn eviction_moves_to_the_next_heaviest_once_a_publisher_drains() {
+        let mut store = DhtStore::new();
+        let first = KadId([0xB1; 16]);
+        let second = KadId([0xB2; 16]);
+        let first_target = numbered_target(1);
+        let second_target = numbered_target(2);
+
+        store.store_keyword_entries(&first_target, vec![sized_entry(1, 4000)], &first, None);
+        store.store_keyword_entries(
+            &second_target,
+            vec![sized_entry(2, 1000), sized_entry(3, 1000)],
+            &second,
+            None,
+        );
+        assert_eq!(
+            store.heaviest_keyword_publisher,
+            Some(PublisherKey::Id(first))
+        );
+
+        // One byte more than the hinted publisher holds, so draining it is
+        // not enough and the pass has to find the next heaviest.
+        let needed = store.keyword_publisher_usage[&PublisherKey::Id(first)].bytes + 1;
+        let mut budget = MAX_KEYWORD_EVICTIONS_PER_PUBLISH;
+        assert!(store.evict_keyword_bytes(needed, &mut budget));
+
+        assert!(
+            !store
+                .keyword_publisher_usage
+                .contains_key(&PublisherKey::Id(first)),
+            "the hinted publisher must be drained first"
+        );
+        assert_eq!(
+            store.search_keywords(&second_target).len(),
+            1,
+            "eviction must carry on into the next heaviest publisher \
+             instead of stopping when the hint is cleared"
+        );
+    }
+
+    /// `MAX_TOTAL_ENTRIES` is shared across keyword, source and notes, and
+    /// realistic 100-200 byte entries reach it at roughly 5-10 MB — a
+    /// fraction of the 64 MiB byte cap. Gating eviction on bytes alone meant
+    /// it never ran, leaving the full-store lockout it exists to prevent
+    /// reachable for a whole `KEYWORD_TTL_SECS`.
+    #[test]
+    fn eviction_runs_when_the_shared_entry_count_cap_is_reached() {
+        let mut store = DhtStore::new();
+        let hog = KadId([0xC1; 16]);
+        let honest = KadId([0xC2; 16]);
+        let hog_target = numbered_target(1);
+        let honest_target = numbered_target(2);
+
+        store.store_keyword_entries(
+            &hog_target,
+            vec![sized_entry(1, 2048), sized_entry(2, 2048)],
+            &hog,
+            None,
+        );
+        // Reaching 50,000 entries for real needs ~25 publishers at their full
+        // per-publisher allowance; pin the counter so the test exercises the
+        // gate rather than the fill.
+        store.total_count = MAX_TOTAL_ENTRIES;
+
+        store.store_keyword_entries(&honest_target, vec![entry(3)], &honest, None);
+        assert_eq!(
+            store.search_keywords(&honest_target).len(),
+            1,
+            "a full entry table must shed the heaviest publisher, not refuse everyone"
+        );
+        assert_eq!(
+            store.search_keywords(&hog_target).len(),
+            1,
+            "exactly one of the heaviest publisher's entries pays for the slot"
+        );
+    }
+
+    #[test]
+    fn publisher_usage_tracks_replace_and_expiry_exactly() {
+        let mut store = DhtStore::new();
+        let publisher = KadId([0xA1; 16]);
+        let target = KadId([0xA2; 16]);
+
+        store.store_keyword_entries(&target, vec![entry(1), entry(2)], &publisher, None);
+        let key = PublisherKey::Id(publisher);
+        assert_eq!(store.keyword_publisher_usage[&key].entries, 2);
+        assert_eq!(
+            store.keyword_publisher_usage[&key].bytes,
+            store.total_retained_bytes
+        );
+
+        // Re-publishing an id we already hold replaces it rather than adding.
+        store.store_keyword_entries(&target, vec![sized_entry(1, 256)], &publisher, None);
+        assert_eq!(store.keyword_publisher_usage[&key].entries, 2);
+        assert_eq!(
+            store.keyword_publisher_usage[&key].bytes,
+            store.total_retained_bytes
+        );
+
+        for stored in store.keyword_entries.get_mut(&target).unwrap() {
+            stored.stored_at = 0;
+        }
+        store.cleanup_expired();
+        assert!(store.keyword_publisher_usage.is_empty());
+        assert_eq!(store.heaviest_keyword_publisher, None);
     }
 
     /// eMule `CIndexed::AddKeyword` rejects an entry with no filename, no
@@ -744,6 +1375,7 @@ mod keyword_store_tests {
                 tags: Vec::new(),
             }],
             &sender,
+            None,
         );
         assert!(
             store.search_keywords(&target).is_empty(),
@@ -766,6 +1398,7 @@ mod keyword_store_tests {
                 }],
             }],
             &sender,
+            None,
         );
         assert!(
             store.search_keywords(&target).is_empty(),
@@ -794,6 +1427,7 @@ mod keyword_store_tests {
                 ],
             }],
             &sender,
+            None,
         );
         assert!(
             store.search_keywords(&target).is_empty(),
@@ -806,7 +1440,7 @@ mod keyword_store_tests {
         let mut store = DhtStore::new();
         let target = KadId([0x55; 16]);
         let sender = KadId([0x66; 16]);
-        store.store_keyword_entries(&target, vec![entry(1)], &sender);
+        store.store_keyword_entries(&target, vec![entry(1)], &sender, None);
         assert_eq!(store.search_keywords(&target).len(), 1);
     }
 
@@ -815,7 +1449,7 @@ mod keyword_store_tests {
         let mut store = DhtStore::new();
         let target = KadId([0x70; 16]);
         let sender = KadId([0x71; 16]);
-        store.store_keyword_entries(&target, vec![entry(1)], &sender);
+        store.store_keyword_entries(&target, vec![entry(1)], &sender, None);
         let first = store.keyword_entries[&target][0].retained_bytes;
         assert_eq!(store.total_retained_bytes, first);
 
@@ -824,7 +1458,7 @@ mod keyword_store_tests {
             name: TagName::Str("format".to_string()),
             value: TagValue::String("application/octet-stream".repeat(20)),
         });
-        store.store_keyword_entries(&target, vec![replacement], &sender);
+        store.store_keyword_entries(&target, vec![replacement], &sender, None);
         let second = store.keyword_entries[&target][0].retained_bytes;
         assert!(second > first);
         assert_eq!(store.total_retained_bytes, second);
@@ -842,7 +1476,7 @@ mod keyword_store_tests {
         let sender = KadId([0x73; 16]);
         let mut oversized = entry(1);
         oversized.tags[0].value = TagValue::String("x".repeat(MAX_STORED_FILENAME_BYTES + 1));
-        store.store_keyword_entries(&target, vec![oversized], &sender);
+        store.store_keyword_entries(&target, vec![oversized], &sender, None);
         assert!(!store.keyword_entries.contains_key(&target));
         assert_eq!(store.total_retained_bytes, 0);
     }
@@ -851,8 +1485,18 @@ mod keyword_store_tests {
     fn keyword_publish_and_search_keep_emule_batch_and_page_sizes() {
         let mut store = DhtStore::new();
         let target = KadId([0x74; 16]);
-        store.store_keyword_entries(&target, (0..150).map(entry).collect(), &KadId([0x75; 16]));
-        store.store_keyword_entries(&target, (150..300).map(entry).collect(), &KadId([0x76; 16]));
+        store.store_keyword_entries(
+            &target,
+            (0..150).map(entry).collect(),
+            &KadId([0x75; 16]),
+            None,
+        );
+        store.store_keyword_entries(
+            &target,
+            (150..300).map(entry).collect(),
+            &KadId([0x76; 16]),
+            None,
+        );
         assert_eq!(
             store.keyword_entries[&target]
                 .iter()
@@ -862,6 +1506,215 @@ mod keyword_store_tests {
         );
         let page = store.search_keywords_page(&target, 25, 200, |_, _| true);
         assert_eq!(page.len(), 200);
+    }
+
+    /// Stand-in for `resolve_keyword_publisher_id`'s `md5(ip || port)`: a
+    /// peer outside our routing table gets a different publisher id for
+    /// every UDP source port it sends from.
+    fn rotated_sender(port_index: u16) -> KadId {
+        let mut id = [0xE0u8; 16];
+        id[..2].copy_from_slice(&port_index.to_le_bytes());
+        KadId(id)
+    }
+
+    /// Recompute the per-publisher index from the entries actually stored
+    /// and compare. Drift is silent and one-sided in the attacker's favour:
+    /// an under-count is budget nobody is charged for.
+    fn assert_usage_matches_entries(store: &DhtStore) {
+        let mut expected: HashMap<PublisherKey, (usize, usize)> = HashMap::new();
+        for entries in store.keyword_entries.values() {
+            for stored in entries {
+                let slot = expected.entry(stored.keyword_budget_key()).or_default();
+                slot.0 += 1;
+                slot.1 += stored.retained_bytes;
+            }
+        }
+        assert_eq!(
+            store.keyword_publisher_usage.len(),
+            expected.len(),
+            "publisher index holds records no stored entry accounts for"
+        );
+        for (key, (entries, bytes)) in expected {
+            let record = &store.keyword_publisher_usage[&key];
+            assert_eq!(record.entries, entries, "entry count drifted for {key:?}");
+            assert_eq!(record.bytes, bytes, "byte count drifted for {key:?}");
+        }
+    }
+
+    /// The global budget used to be keyed on the `(ip, port)`-derived
+    /// publisher id, so rotating the UDP source port minted a fresh budget
+    /// per port: ~25 ports placed 50,000 entries and reached
+    /// `MAX_TOTAL_ENTRIES` from one address, which is the store-wide lockout
+    /// the budget exists to prevent.
+    #[test]
+    fn port_rotation_from_one_ip_cannot_exceed_the_publisher_budget() {
+        let mut store = DhtStore::new();
+        let attacker_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let ports = MAX_KEYWORD_ENTRIES_PER_PUBLISHER / MAX_KEYWORD_ENTRIES_PER_SENDER + 5;
+
+        for port_index in 0..ports {
+            let batch = (0..MAX_KEYWORD_ENTRIES_PER_SENDER as u16)
+                .map(entry)
+                .collect();
+            store.store_keyword_entries(
+                &numbered_target(port_index as u16),
+                batch,
+                &rotated_sender(port_index as u16),
+                Some(attacker_ip),
+            );
+        }
+
+        assert_eq!(
+            store.keyword_publisher_usage.len(),
+            1,
+            "every rotated port must land on the one address's budget"
+        );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Ip(attacker_ip)].entries,
+            MAX_KEYWORD_ENTRIES_PER_PUBLISHER,
+            "rotating the source port must not mint extra budget"
+        );
+        assert_usage_matches_entries(&store);
+
+        // And the lockout the budget exists to prevent must not have happened.
+        let honest_target = KadId([0x99; 16]);
+        store.store_keyword_entries(
+            &honest_target,
+            vec![entry(1)],
+            &KadId([0x9A; 16]),
+            Some(Ipv4Addr::new(198, 51, 100, 4)),
+        );
+        assert_eq!(store.search_keywords(&honest_target).len(), 1);
+    }
+
+    #[test]
+    fn separate_ips_keep_separate_publisher_budgets() {
+        let mut store = DhtStore::new();
+        let first_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let second_ip = Ipv4Addr::new(198, 51, 100, 4);
+        let keys = MAX_KEYWORD_ENTRIES_PER_PUBLISHER / MAX_KEYWORD_ENTRIES_PER_SENDER + 2;
+
+        for (index, ip) in [first_ip, second_ip].into_iter().enumerate() {
+            for key in 0..keys {
+                let batch = (0..MAX_KEYWORD_ENTRIES_PER_SENDER as u16)
+                    .map(entry)
+                    .collect();
+                store.store_keyword_entries(
+                    &numbered_target((index * keys + key) as u16),
+                    batch,
+                    &rotated_sender(index as u16),
+                    Some(ip),
+                );
+            }
+        }
+
+        for ip in [first_ip, second_ip] {
+            assert_eq!(
+                store.keyword_publisher_usage[&PublisherKey::Ip(ip)].entries,
+                MAX_KEYWORD_ENTRIES_PER_PUBLISHER,
+                "one address exhausting its budget must not spend another's"
+            );
+        }
+        assert_usage_matches_entries(&store);
+    }
+
+    #[test]
+    fn ip_keyed_accounting_stays_exact_across_store_replace_evict_and_expire() {
+        let mut store = DhtStore::new();
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let other_ip = Ipv4Addr::new(198, 51, 100, 4);
+        let first_target = numbered_target(1);
+        let second_target = numbered_target(2);
+
+        // Two source ports from one address, so the two publishes share a
+        // budget record but not a per-key sender id.
+        store.store_keyword_entries(
+            &first_target,
+            vec![sized_entry(1, 1024), sized_entry(2, 4096)],
+            &rotated_sender(1),
+            Some(ip),
+        );
+        store.store_keyword_entries(
+            &second_target,
+            vec![sized_entry(3, 512)],
+            &rotated_sender(2),
+            Some(ip),
+        );
+        store.store_keyword_entries(
+            &second_target,
+            vec![sized_entry(4, 2048)],
+            &rotated_sender(3),
+            Some(other_ip),
+        );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Ip(ip)].entries,
+            3
+        );
+        assert_usage_matches_entries(&store);
+
+        // Replace: same id and sender, more bytes.
+        store.store_keyword_entries(
+            &first_target,
+            vec![sized_entry(1, 8192)],
+            &rotated_sender(1),
+            Some(ip),
+        );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Ip(ip)].entries,
+            3,
+            "a replacement must not add a slot"
+        );
+        assert_usage_matches_entries(&store);
+
+        let mut budget = MAX_KEYWORD_EVICTIONS_PER_PUBLISH;
+        assert!(store.evict_keyword_bytes(1, &mut budget));
+        assert_usage_matches_entries(&store);
+
+        for entries in store.keyword_entries.values_mut() {
+            for stored in entries {
+                stored.stored_at = 0;
+            }
+        }
+        store.cleanup_expired();
+        assert!(store.keyword_publisher_usage.is_empty());
+        assert_eq!(store.heaviest_keyword_publisher, None);
+    }
+
+    /// A routing-table contact keeps its KAD id across an address change, so
+    /// a replacement can arrive on a different budget key than the entry it
+    /// replaces. Netting the byte delta against the new key alone would
+    /// strand bytes on the old one and short the new one — free budget.
+    #[test]
+    fn replacing_from_a_new_address_moves_the_entry_between_budgets() {
+        let mut store = DhtStore::new();
+        let contact = KadId([0xD1; 16]);
+        let old_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let new_ip = Ipv4Addr::new(198, 51, 100, 4);
+        let target = numbered_target(1);
+
+        store.store_keyword_entries(&target, vec![sized_entry(1, 1024)], &contact, Some(old_ip));
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Ip(old_ip)].entries,
+            1
+        );
+
+        store.store_keyword_entries(&target, vec![sized_entry(1, 4096)], &contact, Some(new_ip));
+        assert_eq!(
+            store.keyword_entries[&target].len(),
+            1,
+            "the address change must replace the entry, not duplicate it"
+        );
+        assert!(
+            !store
+                .keyword_publisher_usage
+                .contains_key(&PublisherKey::Ip(old_ip)),
+            "the old address must stop being charged for an entry it no longer holds"
+        );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Ip(new_ip)].entries,
+            1
+        );
+        assert_usage_matches_entries(&store);
     }
 }
 

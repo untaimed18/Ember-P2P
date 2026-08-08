@@ -28,7 +28,17 @@ const REJECT_AUTH: u8 = 0x03;
 const REJECT_BAD_SIGNATURE: u8 = 0x04;
 /// How long a (requester pubkey, nonce) pair is remembered to block replays.
 const RELAY_REQUEST_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
-const MAX_RELAY_REQUEST_NONCE_CACHE: usize = 4096;
+/// Nonces remembered per requester identity, and identities tracked at once.
+///
+/// The replay cache used to be one global map with a single 4,096-entry cap
+/// that failed closed, so any peer able to send ~7 signed RELAY_REQUESTs a
+/// second for ten minutes filled it and every *other* peer's honest request
+/// was refused (as `REJECT_BAD_SIGNATURE`, which reads like a client bug).
+/// Splitting the budget per identity means a flood only evicts the flooder's
+/// own history; the product of the two caps keeps the worst-case footprint at
+/// the same 4,096 entries.
+const MAX_NONCES_PER_REQUESTER: usize = 16;
+const MAX_RELAY_REQUEST_NONCE_IDENTITIES: usize = 256;
 
 /// Build a hardened reqwest client for relay/punch HTTP calls.
 ///
@@ -186,13 +196,21 @@ impl RelaySession {
     }
 }
 
+/// Nonces recently seen from one requester identity, with the time each
+/// arrived so the identity's *own* oldest entry is the one dropped when it
+/// reaches [`MAX_NONCES_PER_REQUESTER`].
+struct RequesterNonces {
+    seen: HashMap<[u8; 16], Instant>,
+    last_activity: Instant,
+}
+
 /// Manages relay sessions when this node acts as a relay for others.
 pub struct RelayManager {
     sessions: HashMap<u32, RelaySession>,
     attestation_hashes: HashMap<[u8; 32], u64>,
-    /// Recently seen (requester_pubkey, nonce) pairs to reject replays of
+    /// Recently seen nonces per requester pubkey, to reject replays of
     /// otherwise-valid signed RELAY_REQUESTs within [`RELAY_REQUEST_NONCE_TTL`].
-    recent_request_nonces: HashMap<([u8; 32], [u8; 16]), Instant>,
+    recent_request_nonces: HashMap<[u8; 32], RequesterNonces>,
     next_session_id: u32,
     total_bytes_relayed: u64,
     /// Whether we carry traffic for other peers at all. Mirrors
@@ -250,21 +268,60 @@ impl RelayManager {
         self.attestation_hashes.contains_key(hash)
     }
 
-    /// Returns `true` if this nonce is fresh for `pubkey` and records it.
-    /// Returns `false` on replay (or when the cache is full of still-fresh
-    /// entries for other peers — fail closed rather than accept unbounded growth).
+    /// Returns `true` if this nonce is fresh for `pubkey` and records it,
+    /// `false` on replay.
+    ///
+    /// Every limit here is charged to the identity that signed the request,
+    /// never to the cache as a whole: a requester that overruns its own
+    /// nonce quota loses its own oldest entry, and one that has been quiet
+    /// longest is the identity dropped when we are tracking too many. So a
+    /// peer can only ever shorten *its own* replay window, and no amount of
+    /// traffic from one identity can turn another's honest request away.
     fn consume_request_nonce(&mut self, pubkey: &[u8; 32], nonce: &[u8; 16]) -> bool {
         let now = Instant::now();
-        self.recent_request_nonces
-            .retain(|_, seen| now.duration_since(*seen) < RELAY_REQUEST_NONCE_TTL);
-        let key = (*pubkey, *nonce);
-        if self.recent_request_nonces.contains_key(&key) {
+        // Expire stale nonces, then forget identities left with none.
+        self.recent_request_nonces.retain(|_, entry| {
+            entry
+                .seen
+                .retain(|_, seen| now.duration_since(*seen) < RELAY_REQUEST_NONCE_TTL);
+            !entry.seen.is_empty()
+        });
+
+        if !self.recent_request_nonces.contains_key(pubkey)
+            && self.recent_request_nonces.len() >= MAX_RELAY_REQUEST_NONCE_IDENTITIES
+        {
+            if let Some(idlest) = self
+                .recent_request_nonces
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_activity)
+                .map(|(key, _)| *key)
+            {
+                self.recent_request_nonces.remove(&idlest);
+            }
+        }
+
+        let entry = self
+            .recent_request_nonces
+            .entry(*pubkey)
+            .or_insert_with(|| RequesterNonces {
+                seen: HashMap::new(),
+                last_activity: now,
+            });
+        if entry.seen.contains_key(nonce) {
             return false;
         }
-        if self.recent_request_nonces.len() >= MAX_RELAY_REQUEST_NONCE_CACHE {
-            return false;
+        if entry.seen.len() >= MAX_NONCES_PER_REQUESTER {
+            if let Some(oldest) = entry
+                .seen
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(key, _)| *key)
+            {
+                entry.seen.remove(&oldest);
+            }
         }
-        self.recent_request_nonces.insert(key, now);
+        entry.seen.insert(*nonce, now);
+        entry.last_activity = now;
         true
     }
 
@@ -1287,6 +1344,16 @@ impl AsyncRead for WsStream {
                                     ),
                                 )));
                             }
+                            // An empty binary frame is legal WebSocket but
+                            // carries no data, and returning here having
+                            // filled nothing is the `AsyncRead` signal for
+                            // end-of-stream — `tokio::io::copy` would stop
+                            // and the relayed transfer would truncate while
+                            // looking like a clean completion. Treat it like
+                            // the other non-data frames below.
+                            if data.is_empty() {
+                                continue;
+                            }
                             let to_copy = data.len().min(buf.remaining());
                             buf.put_slice(&data[..to_copy]);
                             if to_copy < data.len() {
@@ -1794,9 +1861,7 @@ pub async fn run_quic_accept_loop(
                     }
                     if !mgr_lock.consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
                     {
-                        debug!(
-                            "QUIC accept: refusing relay request from {remote}: replayed or cache-full nonce"
-                        );
+                        debug!("QUIC accept: refusing relay request from {remote}: replayed nonce");
                         let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
                         let _ = init_send.write_all(&reject).await;
                         return;
@@ -2347,6 +2412,55 @@ mod tests {
         let nonce = [6u8; 16];
         assert!(mgr.consume_request_nonce(&pk, &nonce));
         assert!(!mgr.consume_request_nonce(&pk, &nonce));
+    }
+
+    /// The replay cache used to be one global map that failed closed, so a
+    /// single peer spending every slot on fresh nonces took the relay out of
+    /// service for everyone else. Quotas are per identity now: a flooder can
+    /// only evict its own history.
+    #[test]
+    fn one_requester_cannot_exhaust_the_relay_nonce_cache_for_others() {
+        let mut mgr = RelayManager::new();
+        let flooder = [1u8; 32];
+
+        // Far more fresh nonces than any cap in play, all from one identity.
+        for i in 0..(MAX_NONCES_PER_REQUESTER * MAX_RELAY_REQUEST_NONCE_IDENTITIES * 2) {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(
+                mgr.consume_request_nonce(&flooder, &nonce),
+                "a fresh nonce from the same identity is never a replay"
+            );
+        }
+
+        let honest = [2u8; 32];
+        let honest_nonce = [7u8; 16];
+        assert!(
+            mgr.consume_request_nonce(&honest, &honest_nonce),
+            "one peer's flood must not deny service to another"
+        );
+        assert!(
+            !mgr.consume_request_nonce(&honest, &honest_nonce),
+            "replay protection still holds for the peers we serve"
+        );
+
+        // Churning identities is just as cheap for an attacker, so the
+        // identity ceiling has to evict rather than refuse too.
+        for i in 0..(MAX_RELAY_REQUEST_NONCE_IDENTITIES * 2) {
+            let mut pubkey = [0xAAu8; 32];
+            pubkey[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(mgr.consume_request_nonce(&pubkey, &[9u8; 16]));
+        }
+        assert!(
+            mgr.consume_request_nonce(&honest, &[8u8; 16]),
+            "no amount of churn may turn an honest requester away"
+        );
+
+        // And the whole cache stays bounded by the two caps.
+        assert!(mgr.recent_request_nonces.len() <= MAX_RELAY_REQUEST_NONCE_IDENTITIES);
+        for entry in mgr.recent_request_nonces.values() {
+            assert!(entry.seen.len() <= MAX_NONCES_PER_REQUESTER);
+        }
     }
 
     #[test]

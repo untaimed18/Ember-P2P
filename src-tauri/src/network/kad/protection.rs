@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
@@ -22,8 +22,70 @@ const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 8;
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
 const MAX_PACKETS_PER_SEC_KNOWN: u32 = 40;
 
+/// Request opcodes whose responses are big enough to arrive packed. An
+/// outstanding one of these in `outgoing_requests` marks the source as
+/// answering us, which exempts it from the aggregate compressed budget in
+/// `over_compressed_budget`.
+const PACKED_RESPONSE_REQUESTS: [u8; 5] = [
+    0x01, // BootstrapReq -> BootstrapRes (up to 20 contacts)
+    0x21, // KadReq -> KadRes
+    0x33, // SearchKeyReq -> SearchRes
+    0x34, // SearchSourceReq -> SearchRes
+    0x35, // SearchNotesReq -> SearchRes
+];
+
 const MAX_IP_ENTRIES: usize = 10_000;
 const MAX_OPCODE_ENTRIES: usize = 50_000;
+
+/// How many keys one eviction attempt inspects before giving up.
+const EVICTION_PROBES: usize = 8;
+
+/// Bounded-work eviction for the fixed-capacity counter tables.
+///
+/// Probes at most `EVICTION_PROBES` keys from the front of `order` and
+/// removes the first one whose rate-limit window has already elapsed — such
+/// an entry's counter resets to 1 on its very next packet anyway, so
+/// reclaiming its slot loses no enforcement state. Entries still inside
+/// their window are rotated to the back (CLOCK-style) and never evicted;
+/// when nothing idle turns up the caller must drop the packet.
+///
+/// This replaces a `min_by_key(window_start)` full-map scan that had two
+/// distinct problems. It was O(n) on the single `select!` arm that services
+/// all inbound KAD UDP — with both tables full that is ~60,000 hash-map
+/// iterations per packet from a fresh source IP, ahead of any real work,
+/// and UDP source addresses are unauthenticated so filling them is cheap.
+/// And because the sort key is the *window start* — refreshed only on
+/// window rollover — the victim was systematically the entry that had been
+/// accumulating the longest, i.e. the peer with the highest current count:
+/// an attacker interleaving spoofed-source filler with its own traffic got
+/// its own counter evicted and restarted at 1, defeating the per-opcode
+/// limit entirely.
+fn evict_idle<K, V>(
+    map: &mut HashMap<K, V>,
+    order: &mut VecDeque<K>,
+    is_idle: impl Fn(&V) -> bool,
+) -> bool
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    for _ in 0..EVICTION_PROBES {
+        let Some(key) = order.pop_front() else {
+            return false;
+        };
+        match map.get(&key) {
+            Some(value) if is_idle(value) => {
+                map.remove(&key);
+                return true;
+            }
+            Some(_) => order.push_back(key),
+            // Dropped by `cleanup()`, which rebuilds the order queues, so
+            // this is only reachable transiently. Discard the stale key and
+            // keep probing.
+            None => {}
+        }
+    }
+    false
+}
 
 fn opcode_limit(opcode: u8) -> u32 {
     match opcode {
@@ -106,6 +168,19 @@ pub struct FloodProtection {
     /// we can decline to decompress over-quota traffic. Tracks
     /// (packet_count, compressed_wire_bytes, window_start).
     compressed_counters: HashMap<IpAddr, (u32, usize, Instant)>,
+    /// K21: same budget applied across *all* sources. The per-IP window is
+    /// charged once per source address, so a spoofed-source flood never
+    /// trips it; this bounds aggregate decompression work regardless of how
+    /// many addresses the traffic claims to come from.
+    /// (packet_count, compressed_wire_bytes, window_start).
+    global_compressed: (u32, usize, Instant),
+    /// Probe order for the four fixed-capacity counter tables above. Kept
+    /// alongside each map so a full table can be evicted from in O(1)
+    /// instead of scanning every entry — see `evict_idle`.
+    ip_order: VecDeque<IpAddr>,
+    opcode_order: VecDeque<(IpAddr, u8)>,
+    outgoing_order: VecDeque<IpAddr>,
+    compressed_order: VecDeque<IpAddr>,
 }
 
 impl FloodProtection {
@@ -119,6 +194,11 @@ impl FloodProtection {
             outgoing_counters: HashMap::new(),
             recent_ips: HashMap::new(),
             compressed_counters: HashMap::new(),
+            global_compressed: (0, 0, Instant::now()),
+            ip_order: VecDeque::new(),
+            opcode_order: VecDeque::new(),
+            outgoing_order: VecDeque::new(),
+            compressed_order: VecDeque::new(),
         }
     }
 
@@ -129,20 +209,35 @@ impl FloodProtection {
         const MAX_COMPRESSED_PER_SEC: u32 = 10;
         const MAX_COMPRESSED_BYTES_PER_SEC: usize = 64 * 1024;
         const MAX_COMPRESSED_ENTRIES: usize = 10_000;
+        // Aggregate ceiling across every source: the per-IP window is charged
+        // once per address, so a spoofed-source flood never trips it.
+        //
+        // Both halves have to stay live. At the old 200 packets the two caps
+        // crossed at 5.2 KB — above the 1420-byte fragment ceiling — so the
+        // byte budget could never bind and 200 packets was the whole control,
+        // reachable by ~20 spoofed addresses at ~290 kbit/s, which then
+        // blackholed every packed KAD packet (chiefly the inbound
+        // `KADEMLIA2_SEARCH_RES` our own searches depend on) for the rest of
+        // the second. 200/s is also below plausible honest load: unsolicited
+        // packed traffic is mostly `PublishKeyReq` intake on a popular
+        // storage node. At 1,000 the caps cross at ~1 KB, inside the range a
+        // packed datagram actually occupies, so small packets are bounded by
+        // the packet cap and large ones by the byte cap.
+        const MAX_GLOBAL_COMPRESSED_PER_SEC: u32 = 1_000;
+        const MAX_GLOBAL_COMPRESSED_BYTES_PER_SEC: usize = 1024 * 1024;
         let now = Instant::now();
-        if self.compressed_counters.len() >= MAX_COMPRESSED_ENTRIES
-            && !self.compressed_counters.contains_key(&ip)
-        {
-            if let Some(oldest) = self
-                .compressed_counters
-                .iter()
-                .min_by_key(|(_, (_, _, t))| *t)
-                .map(|(k, _)| *k)
+
+        if !self.compressed_counters.contains_key(&ip) {
+            if self.compressed_counters.len() >= MAX_COMPRESSED_ENTRIES
+                && !evict_idle(
+                    &mut self.compressed_counters,
+                    &mut self.compressed_order,
+                    |(_, _, t)| now.saturating_duration_since(*t).as_secs() >= 1,
+                )
             {
-                self.compressed_counters.remove(&oldest);
-            } else {
                 return true;
             }
+            self.compressed_order.push_back(ip);
         }
         let entry = self.compressed_counters.entry(ip).or_insert((0, 0, now));
         if now.saturating_duration_since(entry.2).as_secs() >= 1 {
@@ -153,7 +248,38 @@ impl FloodProtection {
             entry.0 = entry.0.saturating_add(1);
             entry.1 = entry.1.saturating_add(wire_bytes);
         }
-        entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC
+        if entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC {
+            // Return before charging the aggregate counter. Charging it first
+            // meant a source already over its own allowance still spent
+            // budget it was never going to be permitted to use, which is what
+            // let a handful of spoofed addresses buy a global denial for free.
+            return true;
+        }
+
+        if now
+            .saturating_duration_since(self.global_compressed.2)
+            .as_secs()
+            >= 1
+        {
+            self.global_compressed = (1, wire_bytes, now);
+        } else {
+            self.global_compressed.0 = self.global_compressed.0.saturating_add(1);
+            self.global_compressed.1 = self.global_compressed.1.saturating_add(wire_bytes);
+        }
+        if self.global_compressed.0 <= MAX_GLOBAL_COMPRESSED_PER_SEC
+            && self.global_compressed.1 <= MAX_GLOBAL_COMPRESSED_BYTES_PER_SEC
+        {
+            return false;
+        }
+
+        // A peer answering a request we actually sent must never be starved
+        // by unsolicited traffic from elsewhere: the aggregate budget exists
+        // to bound decompression work from strangers, not to drop the search
+        // results we asked for. Probing the fixed set of request opcodes
+        // whose replies can arrive packed keeps this O(1) on the packet path.
+        !PACKED_RESPONSE_REQUESTS
+            .iter()
+            .any(|opcode| self.outgoing_requests.contains_key(&(ip, *opcode)))
     }
 
     /// Layer 1 only: per-(IP, opcode) request-flood check within
@@ -169,24 +295,30 @@ impl FloodProtection {
         }
         let now = Instant::now();
         let op_key = (ip, opcode);
-        if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
-            && !self.opcode_counters.contains_key(&op_key)
-        {
-            // K19: previous behaviour rejected the new peer outright as
-            // soon as the per-opcode table filled — an attacker that fills
-            // the table with one-shot spam permanently locks out legit
-            // peers. We now LRU-evict: drop the entry whose window-start
-            // timestamp is oldest, freeing a slot for the new peer.
-            if let Some(oldest_key) = self
-                .opcode_counters
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| *k)
+        if !self.opcode_counters.contains_key(&op_key) {
+            // K19: a full table must not reject every new peer outright —
+            // one-shot spam would then lock legit peers out. Reclaim a slot
+            // whose 15-second window has already lapsed instead. When every
+            // probed slot is still live we drop *this* packet rather than
+            // free space by evicting a counter that is actively holding a
+            // peer under its limit; that lockout lasts as long as the flood
+            // does — `OPCODE_WINDOW_SECS` bounds how long any one entry
+            // stays live, not how long the table stays saturated, so an
+            // attacker refreshing it at ~3,333 packets/sec holds it open
+            // indefinitely — whereas evicting a hot counter would hand the
+            // attacker a permanent bypass of the per-opcode cap.
+            if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
+                && !evict_idle(
+                    &mut self.opcode_counters,
+                    &mut self.opcode_order,
+                    |(_, t)| {
+                        now.saturating_duration_since(*t).as_secs() >= OPCODE_WINDOW_SECS
+                    },
+                )
             {
-                self.opcode_counters.remove(&oldest_key);
-            } else {
                 return true;
             }
+            self.opcode_order.push_back(op_key);
         }
         let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
         if now.saturating_duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
@@ -260,18 +392,17 @@ impl FloodProtection {
         let now = Instant::now();
 
         // Layer 2: global per-IP per-second cap
-        if self.ip_counters.len() >= MAX_IP_ENTRIES && !self.ip_counters.contains_key(&ip) {
-            // K19: same LRU eviction rationale as above.
-            if let Some(oldest_ip) = self
-                .ip_counters
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| *k)
+        if !self.ip_counters.contains_key(&ip) {
+            // K19: same idle-only eviction rationale as above; the window
+            // here is one second.
+            if self.ip_counters.len() >= MAX_IP_ENTRIES
+                && !evict_idle(&mut self.ip_counters, &mut self.ip_order, |(_, t)| {
+                    now.saturating_duration_since(*t).as_secs() >= 1
+                })
             {
-                self.ip_counters.remove(&oldest_ip);
-            } else {
                 return true;
             }
+            self.ip_order.push_back(ip);
         }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
         let max_packets = if known_peer {
@@ -298,20 +429,19 @@ impl FloodProtection {
     /// Returns true if we've sent too many packets to this IP recently.
     pub fn check_outgoing_rate(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        if self.outgoing_counters.len() >= MAX_IP_ENTRIES
-            && !self.outgoing_counters.contains_key(&ip)
-        {
-            // K19: LRU-evict instead of hard-failing.
-            if let Some(oldest_ip) = self
-                .outgoing_counters
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| *k)
+        if !self.outgoing_counters.contains_key(&ip) {
+            // K19: reclaim a lapsed one-second window instead of
+            // hard-failing, and throttle rather than evict a live counter.
+            if self.outgoing_counters.len() >= MAX_IP_ENTRIES
+                && !evict_idle(
+                    &mut self.outgoing_counters,
+                    &mut self.outgoing_order,
+                    |(_, t)| now.saturating_duration_since(*t).as_secs() >= 1,
+                )
             {
-                self.outgoing_counters.remove(&oldest_ip);
-            } else {
                 return true;
             }
+            self.outgoing_order.push_back(ip);
         }
         let entry = self.outgoing_counters.entry(ip).or_insert((0, now));
 
@@ -505,6 +635,44 @@ impl FloodProtection {
         // K21: compressed-packet budget table follows the same 60s cleanup.
         self.compressed_counters
             .retain(|_, (_, _, last)| now.saturating_duration_since(*last).as_secs() < 60);
+
+        // Drop the order-queue records for everything just retained away,
+        // so `evict_idle` never wastes probes on keys that no longer exist.
+        let ip_counters = &self.ip_counters;
+        self.ip_order.retain(|ip| ip_counters.contains_key(ip));
+        let opcode_counters = &self.opcode_counters;
+        self.opcode_order
+            .retain(|key| opcode_counters.contains_key(key));
+        let outgoing_counters = &self.outgoing_counters;
+        self.outgoing_order
+            .retain(|ip| outgoing_counters.contains_key(ip));
+        let compressed_counters = &self.compressed_counters;
+        self.compressed_order
+            .retain(|ip| compressed_counters.contains_key(ip));
+    }
+
+    /// Test-only: rewind every rate-limit window start by `by`, so eviction
+    /// behaviour against idle vs. live counters can be exercised without
+    /// sleeping through a 15-second opcode window.
+    #[cfg(test)]
+    fn age_counters(&mut self, by: std::time::Duration) {
+        fn rewind(at: &mut Instant, by: std::time::Duration) {
+            if let Some(earlier) = at.checked_sub(by) {
+                *at = earlier;
+            }
+        }
+        for (_, at) in self.ip_counters.values_mut() {
+            rewind(at, by);
+        }
+        for (_, at) in self.opcode_counters.values_mut() {
+            rewind(at, by);
+        }
+        for (_, at) in self.outgoing_counters.values_mut() {
+            rewind(at, by);
+        }
+        for (_, _, at) in self.compressed_counters.values_mut() {
+            rewind(at, by);
+        }
     }
 }
 
@@ -512,29 +680,77 @@ impl FloodProtection {
 mod kad_protection_tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
-    /// K19: when the opcode-tracker table is full, a new IP should still
-    /// be accepted by LRU-evicting the oldest entry.
+    fn filler_ip(i: usize) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(
+            ((i >> 24) & 0xFF) as u8,
+            ((i >> 16) & 0xFF) as u8,
+            ((i >> 8) & 0xFF) as u8,
+            (i & 0xFF) as u8,
+        ))
+    }
+
+    /// K19: once every window in a full opcode table has lapsed, those
+    /// counters would reset on their next packet anyway, so their slots are
+    /// free for the taking and a fresh peer must not be locked out.
     #[test]
-    fn lru_evicts_when_opcode_table_full() {
+    fn full_opcode_table_reclaims_idle_slots() {
         let mut fp = FloodProtection::new();
-        // Fill the table with distinct (IP, opcode) pairs up to the cap.
         for i in 0..MAX_OPCODE_ENTRIES {
-            let ip = IpAddr::V4(Ipv4Addr::new(
-                ((i >> 24) & 0xFF) as u8,
-                ((i >> 16) & 0xFF) as u8,
-                ((i >> 8) & 0xFF) as u8,
-                (i & 0xFF) as u8,
-            ));
-            let _ = fp.check_rate_limit_with_opcode(ip, false, 0x21);
+            let _ = fp.check_rate_limit_with_opcode(filler_ip(i), false, 0x21);
         }
         assert_eq!(fp.opcode_counters.len(), MAX_OPCODE_ENTRIES);
-        // Introduce a brand new IP. With the LRU fix this must succeed
-        // (return false meaning "not rate-limited").
+
+        fp.age_counters(Duration::from_secs(OPCODE_WINDOW_SECS + 1));
         let new_ip = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 254));
         assert!(
             !fp.check_rate_limit_with_opcode(new_ip, false, 0x21),
-            "LRU eviction must admit a fresh peer even when the table is full"
+            "an elapsed window is a free slot; a fresh peer must be admitted"
+        );
+        assert_eq!(
+            fp.opcode_counters.len(),
+            MAX_OPCODE_ENTRIES,
+            "admitting the new peer must reclaim a slot, not grow the table"
+        );
+    }
+
+    /// The eviction victim used to be `min_by_key(window_start)`, and the
+    /// window start is only refreshed on rollover — so the entry picked was
+    /// always the one that had been accumulating longest, i.e. the peer with
+    /// the *highest* count. An attacker interleaving its own requests with
+    /// spoofed-source filler therefore got its own counter evicted and
+    /// restarted at 1. A full table must now drop the incoming packet
+    /// instead of freeing a slot at a live counter's expense.
+    #[test]
+    fn full_opcode_table_never_evicts_a_live_counter() {
+        let mut fp = FloodProtection::new();
+        let victim = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        // KadReq (0x21) allows 10 per window for an unknown peer.
+        for i in 0..10 {
+            assert!(
+                !fp.check_opcode_limit(victim, false, 0x21),
+                "KadReq #{} is still inside the per-opcode budget",
+                i + 1
+            );
+        }
+        // Spoofed-source filler, inserted after the victim so the victim is
+        // the oldest entry and hence the old code's eviction target.
+        for i in 0..(MAX_OPCODE_ENTRIES - 1) {
+            let _ = fp.check_opcode_limit(filler_ip(i), false, 0x21);
+        }
+        assert_eq!(fp.opcode_counters.len(), MAX_OPCODE_ENTRIES);
+
+        let fresh = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 254));
+        assert!(
+            fp.check_opcode_limit(fresh, false, 0x21),
+            "with no idle slot the packet must be dropped, not admitted by \
+             evicting somebody's live counter"
+        );
+        assert!(
+            fp.check_opcode_limit(victim, false, 0x21),
+            "the victim's 11th KadReq must still be refused — its counter \
+             must survive a table-full admission attempt"
         );
     }
 
@@ -599,6 +815,70 @@ mod kad_protection_tests {
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
         assert!(!fp.over_compressed_budget(ip, 32 * 1024));
         assert!(fp.over_compressed_budget(ip, 32 * 1024 + 1));
+    }
+
+    /// K21: the per-IP window is charged once per source address, so a
+    /// spoofed-source flood never trips it. The aggregate budget must.
+    #[test]
+    fn global_compressed_budget_bounds_spoofed_sources() {
+        let mut fp = FloodProtection::new();
+        for i in 0..16 {
+            assert!(
+                !fp.over_compressed_budget(filler_ip(i), 64 * 1024),
+                "packet {i} from a distinct source is within both budgets"
+            );
+        }
+        assert!(
+            fp.over_compressed_budget(filler_ip(16), 64 * 1024),
+            "a fresh source address must not buy more aggregate \
+             decompression once the global byte budget is spent"
+        );
+    }
+
+    /// The aggregate counter used to be charged before (and independently of)
+    /// the per-IP decision, so packets we were already refusing still spent
+    /// global budget. ~20 spoofed addresses at 20 packets each then blackholed
+    /// every packed KAD packet for the rest of the second.
+    #[test]
+    fn packets_the_per_ip_budget_refuses_do_not_spend_global_budget() {
+        let mut fp = FloodProtection::new();
+        // 60 addresses x 20 packets is 1,200 charges if every packet counts
+        // against the aggregate, but only 600 once each address's 10-packet
+        // per-IP allowance stops paying — either side of the packet cap.
+        for i in 0..60 {
+            for _ in 0..20 {
+                fp.over_compressed_budget(filler_ip(i), 400);
+            }
+        }
+        assert!(
+            !fp.over_compressed_budget(filler_ip(1000), 400),
+            "a flood that is already being refused per-IP must not deny \
+             service to everyone else"
+        );
+    }
+
+    /// A peer answering a request we sent must not be starved by unsolicited
+    /// compressed traffic — losing `KADEMLIA2_SEARCH_RES` this way stops
+    /// keyword search returning results at all.
+    #[test]
+    fn solicited_sources_survive_an_exhausted_global_budget() {
+        let mut fp = FloodProtection::new();
+        let peer: SocketAddr = "203.0.113.20:4672".parse().unwrap();
+        fp.track_request(peer, 0x33);
+
+        // Spend the whole aggregate byte budget from other sources, staying
+        // inside each one's per-IP allowance so it is genuinely charged.
+        for i in 0..17 {
+            fp.over_compressed_budget(filler_ip(i), 64 * 1024);
+        }
+        assert!(
+            fp.over_compressed_budget(filler_ip(100), 1400),
+            "an unsolicited source must be refused once the aggregate budget is spent"
+        );
+        assert!(
+            !fp.over_compressed_budget(peer.ip(), 1400),
+            "a SearchRes from a peer we queried must still be decoded"
+        );
     }
 
     /// outgoing_requests is multiset: sending N requests to the same

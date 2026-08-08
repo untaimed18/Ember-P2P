@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use rand::rngs::OsRng;
+use rand::RngCore;
 use tracing::{debug, trace, warn};
 
 /// Magic bytes that distinguish Ember-encrypted UDP from KAD/ED2K traffic.
@@ -12,6 +14,12 @@ const PKT_IK_RESP: u8 = 0x02;
 const PKT_XX_MSG1: u8 = 0x03;
 const PKT_XX_MSG2: u8 = 0x04;
 const PKT_XX_MSG3: u8 = 0x05;
+/// Stateless retry cookie handed back to an XX initiator whose source address
+/// is not yet proven return-routable. Only sent once the unvalidated-msg2
+/// budget is spent, so a peer that does not know this packet type still
+/// completes first contact whenever we are not under a flood. See
+/// [`EmberTransport::handle_xx_msg1`].
+const PKT_XX_COOKIE: u8 = 0x06;
 const PKT_TRANSPORT: u8 = 0x10;
 
 const NOISE_PATTERN_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -63,6 +71,73 @@ const MAX_REPLAY_DIGESTS: usize = 8192;
 /// packets.
 const REPLAY_WINDOW_BITS: u64 = 64;
 
+/// Cap on payloads held back from IK initiations whose source address is not
+/// yet proven return-routable, and how long one is held. See
+/// [`EmberTransport::handle_ik_init`]. Bounded like every other cache here so
+/// a flood of spoofed initiations cannot grow it: the worst case is ~256
+/// datagram-sized payloads, and an honest peer whose entry is evicted simply
+/// falls back to retransmitting its request over the session it established.
+const MAX_DEFERRED_IK_PAYLOADS: usize = 256;
+const DEFERRED_IK_PAYLOAD_TTL: Duration = Duration::from_secs(30);
+
+/// Bytes of a Noise XX message 1 that precede its payload: the 32-byte
+/// ephemeral public key. `-> e` establishes no key, so snow appends the
+/// payload in the clear — which is what lets us read the retry cookie off
+/// the wire before spending a Diffie-Hellman on the packet.
+const XX_MSG1_EPHEMERAL_LEN: usize = 32;
+
+/// Length of the XX retry cookie on the wire: the leading 16 bytes of a
+/// keyed BLAKE3 tag. Forging one is a 2^-128 guess, and the whole reply
+/// (3-byte header plus tag) is 19 bytes against the 35-byte msg1 that
+/// triggers it, so the retry cannot itself be turned into an amplifier.
+const XX_COOKIE_LEN: usize = 16;
+
+/// Domain separator, so an XX retry cookie can never collide with another
+/// keyed-BLAKE3 value computed elsewhere from the same kind of input.
+const XX_COOKIE_DOMAIN: &[u8] = b"ember-xx-retry-cookie-v1";
+
+/// How often the cookie secret rotates. A cookie stays valid while the secret
+/// that produced it is still one of the two we hold. Rotation is lazy, so a
+/// cookie minted just after one rotation survives until the second rotation
+/// after it: the real window is one to three intervals (15-45s), not two.
+/// Long enough for a slow RTT plus a retransmit, short enough that a captured
+/// cookie is worthless within a minute — and it is address-bound regardless,
+/// so a longer window only ever lets an address prove itself for itself.
+const XX_COOKIE_ROTATION: Duration = Duration::from_secs(15);
+
+/// Sustained ceiling on Noise XX message 2 answers to sources that have not
+/// proven return-routability, in packets per second, plus the burst allowed
+/// above it.
+///
+/// msg2 carries our encrypted static key: 99 bytes for the 35-byte msg1 that
+/// triggers it, 2.83x, aimed at whatever source address the sender wrote
+/// down — and nothing dedupes a flood, because every distinct ephemeral
+/// hashes to a fresh replay digest.
+///
+/// Demanding a cookie unconditionally would fix the ratio and break the
+/// network: deployed peers do not know [`PKT_XX_COOKIE`] and will never echo
+/// one, so their XX first contact would fail outright. So spend the ratio up
+/// to a budget and no further, the way a SYN-cookie deployment does. What
+/// this bounds is the *amplifying* volume, not reflection as such: past the
+/// budget each 35-byte msg1 still draws a 19-byte cookie, so total reflected
+/// bytes are `XX_UNVALIDATED_MSG2_PER_SEC * 99` per second plus 0.54x of the
+/// attacker's own rate. The second term is de-amplifying (0.75x once IP and
+/// UDP headers are counted), so it is useless as an amplifier — the channel
+/// stays open, exactly as it does with QUIC Retry, but paying for it costs
+/// the attacker more than it delivers. Before, the whole thing scaled at
+/// 2.83x of whatever the attacker could push.
+///
+/// Rate-based rather than keyed on `pending` occupancy on purpose: occupancy
+/// can be held just below a threshold indefinitely at no cost, so it buys an
+/// attacker the full ratio for free. The only way to exhaust this budget is
+/// to actually make us emit the packets it counts.
+///
+/// XX is the fallback path — we take it only when the peer's static key is
+/// unknown — so 16/s sustained with a 64-packet burst sits far above what
+/// honest first contact needs and far below anything useful as a reflector.
+const XX_UNVALIDATED_MSG2_PER_SEC: u32 = 16;
+const XX_UNVALIDATED_MSG2_BURST: u32 = 64;
+
 /// Largest Ember UDP datagram we will parse. Valid Noise handshake and
 /// transport packets are far smaller than this; the cap prevents an oversized
 /// UDP datagram from driving proportional allocation during handshake parsing.
@@ -89,6 +164,25 @@ struct NoiseSession {
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
     ik_authenticated: bool,
+    /// Whether the peer has proven it can *receive* at this socket address.
+    ///
+    /// Authentication and return-routability are different questions: a
+    /// Noise_IK message 1 proves who signed it but says nothing about where
+    /// the sender actually is, because the pattern is 1-RTT and every node
+    /// publishes its static key in `FOUND_NODE` contact lists. Set when the
+    /// peer does something only reachability makes possible — answers a
+    /// handshake message we sent to this address, or decrypts under keys it
+    /// could only derive from our handshake reply. Sessions default to
+    /// `false` so a new code path has to opt in deliberately.
+    addr_validated: bool,
+    /// Nonce of the return-routability probe we sealed onto this session,
+    /// until its `Pong` comes back. The probe is ours, not the caller's, so
+    /// its answer is swallowed rather than surfaced — otherwise it looks
+    /// like an unsolicited reply to the caller's pending-ping registry.
+    /// Lives here rather than on the deferred payload because the payload
+    /// can be released by an earlier frame (see `dispatch_incoming`), and
+    /// the probe still has an answer in flight after that.
+    probe_nonce: Option<u64>,
     /// Next nonce to stamp on an outbound transport packet (monotonic).
     send_nonce: u64,
     /// Highest accepted inbound nonce.
@@ -109,10 +203,21 @@ impl NoiseSession {
             remote_noise_pub,
             last_activity: Instant::now(),
             ik_authenticated,
+            addr_validated: false,
+            probe_nonce: None,
             send_nonce: 0,
             recv_high: 0,
             recv_window: 0,
         }
+    }
+
+    /// Mark a session whose peer has already proven return-routability: we
+    /// started the handshake and it answered, or it completed a leg that
+    /// required reading a message we sent to this address. See
+    /// [`Self::addr_validated`].
+    fn validated(mut self) -> Self {
+        self.addr_validated = true;
+        self
     }
 
     /// Frame + encrypt `message` as a transport packet, advancing the send
@@ -189,6 +294,12 @@ enum PendingHandshake {
         state: snow::HandshakeState,
         queued: Vec<Vec<u8>>,
         created: Instant,
+        /// Whether this handshake was already re-sent carrying a retry
+        /// cookie. Nothing is keyed yet at msg1, so the cookie packet is
+        /// unauthenticated: without a one-shot limit, anyone able to spoof
+        /// the responder's address could answer every msg1 with another
+        /// cookie and keep us minting ephemerals forever.
+        cookie_retried: bool,
     },
     /// Noise_XX: responder read message 1, sent message 2, waiting for message 3.
     /// Application payloads enqueued here while we wait for the initiator's
@@ -264,16 +375,23 @@ pub struct DispatchOutcome {
     /// Raw packets to send back to the source address. May contain
     /// handshake responses, an encoded Pong reply, or both.
     pub responses: Vec<Vec<u8>>,
-    /// Decoded control message embedded in the packet. `None` for
-    /// pure handshake-progress packets and rejected packets.
-    pub control: Option<EmberControlMessage>,
-    /// Decrypted application payload that was *not* a 10-byte control
-    /// frame — i.e. an Ember DHT message (or a future Ember-native
-    /// frame) the caller is expected to route. Control frames are
-    /// exactly 10 bytes (`version`+`kind`+`nonce`); every DHT frame is
-    /// far larger (its Ed25519 signature alone is 64 bytes), so frame
-    /// length disambiguates the two without a dedicated channel byte.
-    pub app_payload: Option<Vec<u8>>,
+    /// Decoded control messages carried by the packet, in the order the
+    /// peer sent them. Empty for pure handshake-progress packets and
+    /// rejected packets.
+    ///
+    /// A vector rather than a single slot because one packet can deliver
+    /// two payloads: a frame that proves return-routability also releases
+    /// whatever the peer's IK_INIT was holding (see `dispatch_incoming`).
+    /// Callers must drain this, not peek at its first element.
+    pub controls: Vec<EmberControlMessage>,
+    /// Decrypted application payloads that were *not* 10-byte control
+    /// frames — i.e. Ember DHT messages (or future Ember-native frames)
+    /// the caller is expected to route, in the order the peer sent them.
+    /// Control frames are exactly 10 bytes (`version`+`kind`+`nonce`);
+    /// every DHT frame is far larger (its Ed25519 signature alone is 64
+    /// bytes), so frame length disambiguates the two without a dedicated
+    /// channel byte. Plural for the same reason as `controls`.
+    pub app_payloads: Vec<Vec<u8>>,
     /// The peer's Noise static public key, present whenever the packet
     /// carried a decrypted payload (control or app) or completed a
     /// handshake. Lets the caller dial the peer back over the
@@ -393,6 +511,40 @@ pub struct EmberTransport {
     /// "replayed init re-runs the handshake, re-emits its embedded payload, and
     /// resets the live session" vector. Pruned in [`Self::cleanup`].
     recent_handshakes: HashMap<[u8; 32], RecentHandshake>,
+    /// Payloads carried inside an inbound IK initiation, held until the
+    /// source address proves it can receive. See [`Self::handle_ik_init`].
+    /// Pruned in [`Self::cleanup`].
+    deferred_ik: HashMap<SocketAddr, DeferredIkPayload>,
+    /// Secret keying the XX retry cookie, and the one it replaced. Two, not
+    /// one, so a cookie minted a moment before a rotation is still honoured
+    /// a moment after it. This is the *only* state an unvalidated XX msg1
+    /// touches, and it is global rather than per-source — a per-source
+    /// entry would trade the amplification vector for a memory-exhaustion
+    /// one, which is no bargain.
+    cookie_secret: [u8; 32],
+    prev_cookie_secret: [u8; 32],
+    cookie_rotated_at: Instant,
+    /// Token bucket governing msg2 answers to sources that have not proven
+    /// return-routability. Two integers rather than a per-source table:
+    /// a per-source budget would be exactly the state an attacker with a
+    /// spoofable source address gets to allocate for free, which is the
+    /// vector the cookie exists to avoid. A single global bucket also bounds
+    /// what any one victim can receive, since aiming every packet at one
+    /// address spends the same tokens.
+    xx_msg2_tokens: u32,
+    xx_msg2_refilled_at: Instant,
+}
+
+/// An application payload that arrived inside a Noise_IK message 1 from an
+/// address we have not yet proven return-routable.
+struct DeferredIkPayload {
+    payload: Vec<u8>,
+    /// The identity that sent it. An address can change hands (NAT rebind,
+    /// or an unvalidated squatter displaced by the address's real owner), and
+    /// surfacing one peer's payload under another's Noise key would let a
+    /// forged initiation borrow a genuine peer's identity binding.
+    remote_noise_pub: [u8; 32],
+    stored: Instant,
 }
 
 /// A handshake initiation we have already processed.
@@ -422,7 +574,96 @@ impl EmberTransport {
             sessions: HashMap::new(),
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
+            deferred_ik: HashMap::new(),
+            cookie_secret: fresh_cookie_secret(),
+            prev_cookie_secret: fresh_cookie_secret(),
+            cookie_rotated_at: Instant::now(),
+            xx_msg2_tokens: XX_UNVALIDATED_MSG2_BURST,
+            xx_msg2_refilled_at: Instant::now(),
         }
+    }
+
+    /// Accrue msg2 budget for the time since the last refill.
+    fn refill_xx_msg2_budget(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.xx_msg2_refilled_at);
+        let earned = (elapsed.as_millis() as u64 * u64::from(XX_UNVALIDATED_MSG2_PER_SEC)) / 1000;
+        // Below a whole token, leave the clock where it is so the remainder
+        // carries: advancing it here would round every sub-token interval away
+        // and a steady trickle of arrivals would never refill at all.
+        if earned == 0 {
+            return;
+        }
+        let refilled = u64::from(self.xx_msg2_tokens).saturating_add(earned);
+        self.xx_msg2_tokens = refilled.min(u64::from(XX_UNVALIDATED_MSG2_BURST)) as u32;
+        self.xx_msg2_refilled_at = now;
+    }
+
+    /// Whether we may still answer an unproven source with msg2.
+    ///
+    /// Checked here and charged only when a msg2 actually goes on the wire:
+    /// a malformed msg1 emits nothing, and charging it would let a stream of
+    /// junk push every honest peer onto the cookie path — an extra round trip
+    /// for the whole network — without the attacker ever reflecting a byte.
+    fn xx_msg2_budget_available(&mut self) -> bool {
+        self.refill_xx_msg2_budget();
+        self.xx_msg2_tokens > 0
+    }
+
+    /// Charge one msg2 put on the wire to a source that has not proven itself.
+    fn spend_xx_msg2_budget(&mut self) {
+        self.xx_msg2_tokens = self.xx_msg2_tokens.saturating_sub(1);
+    }
+
+    /// Age out the cookie secret pair if the rotation interval has passed.
+    ///
+    /// Lazy rather than timer-driven: the only thing a stale secret can do
+    /// is honour a cookie for longer than intended, and every code path that
+    /// mints or checks one comes through here first.
+    fn rotate_cookie_secret_if_due(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.cookie_rotated_at);
+        if elapsed < XX_COOKIE_ROTATION {
+            return;
+        }
+        // Two quiet intervals mean even the outgoing secret is past its
+        // window, so retire both rather than promoting a stale one — an idle
+        // node must not end up honouring a cookie minted an hour ago.
+        self.prev_cookie_secret = if elapsed < XX_COOKIE_ROTATION * 2 {
+            self.cookie_secret
+        } else {
+            fresh_cookie_secret()
+        };
+        self.cookie_secret = fresh_cookie_secret();
+        self.cookie_rotated_at = now;
+    }
+
+    /// The cookie packet answering an XX msg1 from an unproven address:
+    /// `magic | type | tag(16)`, 19 bytes against msg1's 35.
+    fn xx_cookie_packet(&mut self, from: SocketAddr) -> Vec<u8> {
+        self.rotate_cookie_secret_if_due();
+        let mut buf = Vec::with_capacity(HEADER_LEN + XX_COOKIE_LEN);
+        buf.extend_from_slice(&[EMBER_MAGIC[0], EMBER_MAGIC[1], PKT_XX_COOKIE]);
+        buf.extend_from_slice(&xx_cookie_for(&self.cookie_secret, from));
+        buf
+    }
+
+    /// Whether `cookie` is one we issued to `from` and have not yet rotated
+    /// out. Recomputing the tag is two BLAKE3 compressions over ~30 bytes —
+    /// far cheaper than the X25519 the packet used to buy unconditionally,
+    /// so gating msg2 on this lowers the CPU an unproven source can spend.
+    fn xx_cookie_is_valid(&mut self, from: SocketAddr, cookie: &[u8]) -> bool {
+        if cookie.len() != XX_COOKIE_LEN {
+            return false;
+        }
+        self.rotate_cookie_secret_if_due();
+        // `|=`, not `||`: both candidates are always checked, so the time
+        // this takes leaks neither which secret matched nor whether one did.
+        let mut matched = false;
+        for secret in [&self.cookie_secret, &self.prev_cookie_secret] {
+            matched |= cookie_tags_match(&xx_cookie_for(secret, from), cookie);
+        }
+        matched
     }
 
     /// Classify a handshake-initiation packet against the replay cache.
@@ -503,16 +744,22 @@ impl EmberTransport {
     /// whose low bit is forced set followed by a random byte, so they collide
     /// with the magic pair roughly once in 32k packets — and a collision here
     /// means the packet is claimed by the Ember branch and dropped instead of
-    /// reaching the eD2K parser. Only six of the 256 type values are valid,
-    /// so requiring one makes that some forty times rarer at no cost, since
-    /// every genuine Ember packet carries one.
+    /// reaching the eD2K parser. Only seven of the 256 type values are valid,
+    /// so requiring one makes that some thirty-six times rarer at no cost,
+    /// since every genuine Ember packet carries one.
     pub fn is_ember_packet(data: &[u8]) -> bool {
         data.len() >= HEADER_LEN
             && data[0] == EMBER_MAGIC[0]
             && data[1] == EMBER_MAGIC[1]
             && matches!(
                 data[2],
-                PKT_IK_INIT | PKT_IK_RESP | PKT_XX_MSG1 | PKT_XX_MSG2 | PKT_XX_MSG3 | PKT_TRANSPORT
+                PKT_IK_INIT
+                    | PKT_IK_RESP
+                    | PKT_XX_MSG1
+                    | PKT_XX_MSG2
+                    | PKT_XX_MSG3
+                    | PKT_XX_COOKIE
+                    | PKT_TRANSPORT
             )
     }
 
@@ -569,6 +816,7 @@ impl EmberTransport {
             PKT_XX_MSG1 => self.handle_xx_msg1(from, payload),
             PKT_XX_MSG2 => self.handle_xx_msg2(from, payload),
             PKT_XX_MSG3 => self.handle_xx_msg3(from, payload),
+            PKT_XX_COOKIE => self.handle_xx_cookie(from, payload),
             PKT_TRANSPORT => self.handle_transport(from, payload),
             _ => {
                 debug!("Unknown Ember packet type 0x{pkt_type:02x} from {from}");
@@ -587,6 +835,28 @@ impl EmberTransport {
         remote_noise_pub: Option<&[u8; 32]>,
         message: &[u8],
     ) -> OutgoingResult {
+        // An unvalidated session was installed by whoever sent an IK_INIT
+        // claiming this address, which an off-path attacker can forge. When
+        // we mean to reach a *different* identity, sealing to the squatter's
+        // static key hands it our traffic and leaves the peer we asked for
+        // deaf — the other half of the lockout the takeover guard used to
+        // cause. Nothing is lost by dropping an unproven session, so start a
+        // fresh handshake to the identity the caller named.
+        let squatted = match (remote_noise_pub, self.sessions.get(&peer)) {
+            (Some(want), Some(existing)) => {
+                !existing.addr_validated && existing.remote_noise_pub != *want
+            }
+            _ => false,
+        };
+        if squatted {
+            debug!(
+                "Discarding unvalidated session for {peer}: it holds a different static key \
+                 than the peer we are dialling"
+            );
+            self.sessions.remove(&peer);
+            self.deferred_ik.remove(&peer);
+        }
+
         // Fast path: established session
         if self.sessions.contains_key(&peer) {
             let sealed = {
@@ -654,6 +924,8 @@ impl EmberTransport {
         });
         self.recent_handshakes
             .retain(|_, e| now.duration_since(e.seen_at) < HANDSHAKE_REPLAY_TTL);
+        self.deferred_ik
+            .retain(|_, d| now.duration_since(d.stored) < DEFERRED_IK_PAYLOAD_TTL);
     }
 
     /// Remove an existing session for a peer (e.g., on disconnect).
@@ -661,6 +933,7 @@ impl EmberTransport {
     pub fn remove_session(&mut self, addr: &SocketAddr) {
         self.sessions.remove(addr);
         self.pending.remove(addr);
+        self.deferred_ik.remove(addr);
     }
 
     /// Drop every session and pending handshake. Used when the
@@ -672,6 +945,7 @@ impl EmberTransport {
         self.sessions.clear();
         self.pending.clear();
         self.recent_handshakes.clear();
+        self.deferred_ik.clear();
     }
 
     /// Drive the Noise state machine for an inbound UDP packet and
@@ -679,13 +953,13 @@ impl EmberTransport {
     /// back, plus the decoded control message if the packet carried
     /// a payload.
     ///
-    /// When the decoded payload is a `Ping`, the matching `Pong` is
+    /// When a decoded payload is a `Ping`, the matching `Pong` is
     /// encoded on the same session and appended to `responses`, so
     /// the caller only has to drain the response list and update its
     /// counters / pending-ping registry. Pure handshake-progress
-    /// packets (no embedded payload) yield `control: None`. Garbled
-    /// or malformed packets yield `rejected: true` and an empty
-    /// `responses` vector.
+    /// packets (no embedded payload) yield empty `controls` and
+    /// `app_payloads`. Garbled or malformed packets yield
+    /// `rejected: true` and an empty `responses` vector.
     ///
     /// Pulled out of the network task's `handle_ember_native_udp` so
     /// the same code path can be exercised by `cargo test` over real
@@ -701,6 +975,18 @@ impl EmberTransport {
             return outcome;
         }
         let result = self.process_incoming(data, from);
+
+        // A transport frame that authenticates is the proof of
+        // return-routability an inbound IK handshake could not give us, so
+        // whatever that handshake carried can be acted on now. Callers of the
+        // lower-level `process_incoming` do not get this release; they see the
+        // deferral only as a payload that arrives one round trip late.
+        let released = match &result {
+            IncomingResult::Message {
+                remote_noise_pub, ..
+            } => self.take_deferred_ik(from, remote_noise_pub),
+            _ => None,
+        };
 
         let payload = match result {
             IncomingResult::Message {
@@ -735,30 +1021,80 @@ impl EmberTransport {
             return outcome;
         };
 
-        let Some(message) = EmberControlMessage::decode(&payload) else {
-            // Not a 10-byte control frame — hand the raw decrypted
-            // bytes back as an application payload (DHT message, future
-            // Ember-native frame). The caller routes it; the handshake
-            // responses (if any) still ride along in `responses`.
-            outcome.app_payload = Some(payload);
-            return outcome;
-        };
-
-        // Auto-answer `Ping` here: it needs no application state, and
-        // the session is established by definition (we just decrypted a
-        // payload from it), so `prepare_outgoing` should hit the fast
-        // Ready path. `Pong` / `ExchangeRequest` / `ExchangeData` are
-        // surfaced to the caller, which owns the EPX payload and the
-        // source/transfer managers required to act on them.
-        if let EmberControlMessage::Ping { nonce } = &message {
-            let pong = EmberControlMessage::Pong { nonce: *nonce }.encode();
-            if let OutgoingResult::Ready { packet } = self.prepare_outgoing(from, None, &pong) {
-                outcome.responses.push(packet);
-            }
+        // One dispatch can therefore surface two payloads, in the order the
+        // peer sent them: the request we held back, then the frame that
+        // released it. Both must come out, because the releasing frame is
+        // routinely *not* the probe answer — a peer that calls
+        // `prepare_outgoing` twice before our probe reaches it has its second
+        // request flushed by `handle_ik_resp` the instant IK_RESP is read, so
+        // we see that request first and it, not the `Pong`, is what proves
+        // the address. Surfacing only one of the two silently dropped the
+        // request embedded in IK_INIT, which a search retries once and a
+        // one-shot `STORE_RECORD` or `ExchangeRequest` never recovers.
+        // Releasing on a non-probe frame weakens nothing: `take_deferred_ik`
+        // only fires on a frame that authenticated under keys derived from
+        // our IK_RESP, which is the same proof the `Pong` carried.
+        //
+        // The probe answer itself is ours to swallow — surfacing it would
+        // look like an unsolicited reply to the caller's pending-ping
+        // registry — whether or not a deferred payload is still waiting.
+        let probe_answered = self.consume_probe_answer(from, &payload);
+        let mut payloads = Vec::with_capacity(2);
+        if let Some(deferred) = released {
+            payloads.push(deferred.payload);
+        }
+        if !probe_answered {
+            payloads.push(payload);
         }
 
-        outcome.control = Some(message);
+        for payload in payloads {
+            let Some(message) = EmberControlMessage::decode(&payload) else {
+                // Not a 10-byte control frame — hand the raw decrypted
+                // bytes back as an application payload (DHT message, future
+                // Ember-native frame). The caller routes it; the handshake
+                // responses (if any) still ride along in `responses`.
+                outcome.app_payloads.push(payload);
+                continue;
+            };
+
+            // Auto-answer `Ping` here: it needs no application state, and
+            // the session is established by definition (we just decrypted a
+            // payload from it), so `prepare_outgoing` should hit the fast
+            // Ready path. `Pong` / `ExchangeRequest` / `ExchangeData` are
+            // surfaced to the caller, which owns the EPX payload and the
+            // source/transfer managers required to act on them.
+            if let EmberControlMessage::Ping { nonce } = &message {
+                let pong = EmberControlMessage::Pong { nonce: *nonce }.encode();
+                if let OutgoingResult::Ready { packet } = self.prepare_outgoing(from, None, &pong) {
+                    outcome.responses.push(packet);
+                }
+            }
+
+            outcome.controls.push(message);
+        }
+
         outcome
+    }
+
+    /// Whether `payload` is the `Pong` answering the return-routability probe
+    /// we sealed onto this peer's session, consuming the expectation if so.
+    ///
+    /// Kept on the session rather than on the deferred payload because the
+    /// two now come apart: an earlier frame can release the payload while the
+    /// probe's answer is still in flight, and that answer must still be
+    /// swallowed when it lands.
+    fn consume_probe_answer(&mut self, from: SocketAddr, payload: &[u8]) -> bool {
+        let Some(session) = self.sessions.get_mut(&from) else {
+            return false;
+        };
+        let Some(nonce) = session.probe_nonce else {
+            return false;
+        };
+        if EmberControlMessage::decode(payload) != Some(EmberControlMessage::Pong { nonce }) {
+            return false;
+        }
+        session.probe_nonce = None;
+        true
     }
 
     // ── Noise_IK handshake (1-RTT, we know the peer's static key) ──
@@ -901,8 +1237,17 @@ impl EmberTransport {
         // matching-key re-handshakes are still allowed (session refresh); only
         // a mismatched static key (potential takeover via a shared NAT mapping
         // or on-path attacker) is rejected.
+        //
+        // Only a *validated* incumbent earns that protection. An unvalidated
+        // session proves nothing about who is at the address — anyone able to
+        // forge a source address can install one — so preferring it over a
+        // newcomer inverted the guard into a lockout: one spoofed IK_INIT
+        // claiming a victim's address kept the victim itself from ever
+        // handshaking with us, refreshable with a packet per session lifetime
+        // and unrecoverable because decrypt failures never tear a session
+        // down. Between two unproven claimants, let the newest one try.
         if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub {
+            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
                 debug!(
                     "IK init from {from} carries a different static key than the live session; \
                      rejecting to prevent session takeover"
@@ -922,8 +1267,7 @@ impl EmberTransport {
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
         }
-        self.sessions
-            .insert(from, NoiseSession::new(transport, remote_noise_pub, true));
+        let mut session = NoiseSession::new(transport, remote_noise_pub, true);
         // Clear any stale pending handshake for this address (e.g. an
         // earlier XX attempt we initiated before this IK init arrived).
         // Left in place, it lingers until the 30s pending-cleanup sweep
@@ -933,27 +1277,113 @@ impl EmberTransport {
         self.pending.remove(&from);
         trace!("IK handshake completed (responder) with {from}");
 
-        let decrypted = if payload_len > 0 {
-            Some(payload_buf[..payload_len].to_vec())
-        } else {
-            None
-        };
-
         self.remember_handshake_response(handshake_digest, resp_buf.clone());
+        let mut packets_to_send = vec![resp_buf];
+
+        // Nothing in message 1 proves the sender can *receive* where it says
+        // it is. IK is 1-RTT and every node's static key is published in
+        // FOUND_NODE contact lists, so an off-path attacker can drive this
+        // whole handshake from a forged source address — and acting on the
+        // embedded payload right here is what turned that into an attack:
+        // an embedded FIND_NODE reflected a ~1.4 KB FOUND_NODE at the forged
+        // address for a ~235-byte packet, an embedded EXCHANGE_REQUEST
+        // reflected a multi-kilobyte EPX payload, and an embedded
+        // STORE_RECORD satisfied the DHT's `from.ip() == source.ip`
+        // anti-reflection bind (`dht/engine.rs`) for free, aiming a swarm of
+        // downloaders at whatever host the attacker named.
+        //
+        // So hold the payload until the address is proven, and prompt the
+        // peer to prove it immediately with a control `Ping`: only someone
+        // who actually received our IK_RESP can derive the keys to answer,
+        // and answering a `Ping` on an established session is something
+        // every Ember client already does, so this costs one round trip and
+        // no wire-format change. Until the proof arrives the only bytes an
+        // initiation earns are this 51-byte IK_RESP and the 37-byte probe —
+        // together smaller than the 99-byte minimum IK_INIT that triggered
+        // them, so there is nothing left to amplify.
+        self.deferred_ik.remove(&from);
+        if payload_len > 0 {
+            let probe_nonce = rand::random::<u64>();
+            if self.deferred_ik.len() >= MAX_DEFERRED_IK_PAYLOADS {
+                self.evict_oldest_deferred_ik();
+            }
+            self.deferred_ik.insert(
+                from,
+                DeferredIkPayload {
+                    payload: payload_buf[..payload_len].to_vec(),
+                    remote_noise_pub,
+                    stored: Instant::now(),
+                },
+            );
+            let probe = EmberControlMessage::Ping { nonce: probe_nonce }.encode();
+            match session.seal(&probe) {
+                Some(packet) => {
+                    session.probe_nonce = Some(probe_nonce);
+                    packets_to_send.push(packet);
+                }
+                // The payload stays deferred and is not lost: any
+                // authenticated frame from this peer releases it, so without
+                // a probe it simply waits for the peer's own next frame
+                // instead of a prompt reply.
+                None => warn!("IK responder: failed to seal return-routability probe for {from}"),
+            }
+        }
+
+        self.sessions.insert(from, session);
 
         IncomingResult::HandshakeComplete {
             peer: from,
             remote_noise_pub,
-            packets_to_send: vec![resp_buf],
-            decrypted_payload: decrypted,
+            packets_to_send,
+            decrypted_payload: None,
+        }
+    }
+
+    /// Release the payload deferred for `from`, if the peer that just proved
+    /// return-routability is the one that left it there.
+    fn take_deferred_ik(
+        &mut self,
+        from: SocketAddr,
+        remote_noise_pub: &[u8; 32],
+    ) -> Option<DeferredIkPayload> {
+        let entry = self.deferred_ik.remove(&from)?;
+        // Drop rather than release a payload whose peer has changed — the
+        // address was rebound, or an unvalidated squatter was displaced by
+        // its real owner — or one that has sat here past its TTL.
+        if &entry.remote_noise_pub != remote_noise_pub
+            || Instant::now().duration_since(entry.stored) >= DEFERRED_IK_PAYLOAD_TTL
+        {
+            return None;
+        }
+        Some(entry)
+    }
+
+    fn evict_oldest_deferred_ik(&mut self) {
+        if let Some(oldest) = self
+            .deferred_ik
+            .iter()
+            .min_by_key(|(_, d)| d.stored)
+            .map(|(k, _)| *k)
+        {
+            self.deferred_ik.remove(&oldest);
         }
     }
 
     fn handle_ik_resp(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        let pending = match self.pending.remove(&from) {
-            Some(PendingHandshake::IkInitiator { state, queued, .. }) => (state, queued),
-            Some(other) => {
-                self.pending.insert(from, other);
+        // Authenticate before consuming the pending entry, for the reason
+        // spelled out in `handle_xx_msg2`. This is the more damaging of the
+        // two: IK is the path we take whenever the peer's static key is
+        // already known, so it carries nearly all first contact, and one
+        // unauthenticated packet used to end any handshake in flight.
+        let mut payload_buf = vec![0u8; data.len()];
+        match self.pending.get_mut(&from) {
+            Some(PendingHandshake::IkInitiator { state, .. }) => {
+                if let Err(e) = state.read_message(data, &mut payload_buf) {
+                    debug!("IK resp read_message failed from {from}: {e}");
+                    return IncomingResult::Rejected;
+                }
+            }
+            Some(_) => {
                 debug!("Unexpected IK response from {from} (wrong handshake type)");
                 return IncomingResult::Rejected;
             }
@@ -961,16 +1391,12 @@ impl EmberTransport {
                 debug!("IK response from {from} but no pending handshake");
                 return IncomingResult::Rejected;
             }
-        };
+        }
 
-        let (mut state, queued) = pending;
-        let mut payload_buf = vec![0u8; data.len()];
-        let _payload_len = match state.read_message(data, &mut payload_buf) {
-            Ok(len) => len,
-            Err(e) => {
-                debug!("IK resp read_message failed from {from}: {e}");
-                return IncomingResult::Rejected;
-            }
+        let Some(PendingHandshake::IkInitiator { state, queued, .. }) = self.pending.remove(&from)
+        else {
+            debug!("IK resp from {from}: pending handshake changed shape mid-dispatch");
+            return IncomingResult::Rejected;
         };
 
         let remote_noise_pub = match extract_remote_static(&state) {
@@ -984,9 +1410,11 @@ impl EmberTransport {
         // Mirror the responder guard: never let a completing handshake replace a
         // live session that belongs to a DIFFERENT Noise identity at the same
         // address (session-takeover defense). Same-key completion is a refresh
-        // and allowed.
+        // and allowed, and an unvalidated incumbent — which anyone spoofing
+        // this address could have installed — never outranks a handshake we
+        // started ourselves.
         if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub {
+            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
                 debug!(
                     "IK resp from {from} would replace a live session with a different static key; \
                      rejecting to prevent session takeover"
@@ -1002,7 +1430,10 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub, true);
+        // We started this handshake: message 2 could only be produced by a
+        // peer that read the message 1 we sent to this address, so the
+        // address is proven.
+        let mut session = NoiseSession::new(transport, remote_noise_pub, true).validated();
 
         // Send queued messages
         let mut packets = Vec::new();
@@ -1029,38 +1460,97 @@ impl EmberTransport {
     // ── Noise_XX handshake (2-RTT, we don't know the peer's static key) ──
 
     fn start_xx_handshake(&mut self, peer: SocketAddr, first_message: &[u8]) -> OutgoingResult {
-        let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
-            Ok(p) => p,
-            Err(e) => return OutgoingResult::Error(format!("noise params: {e}")),
-        };
-        let mut initiator = match snow::Builder::new(params)
+        match self.write_xx_msg1(peer, vec![first_message.to_vec()], &[], false) {
+            Ok(packet) => {
+                trace!("Started XX handshake with {peer}");
+                OutgoingResult::HandshakeStarted { packet }
+            }
+            Err(e) => OutgoingResult::Error(e),
+        }
+    }
+
+    /// Build XX message 1 and park the initiator state for `peer`.
+    ///
+    /// `cookie` rides in the message's payload, which `-> e` leaves in the
+    /// clear — it is a return-routability token, not a secret, and carrying
+    /// it there keeps the retry an ordinary msg1 that the replay cache still
+    /// dedupes verbatim, rather than a second packet type on the request
+    /// side. An empty `cookie` produces exactly the 35-byte msg1 this
+    /// function has always produced.
+    fn write_xx_msg1(
+        &mut self,
+        peer: SocketAddr,
+        queued: Vec<Vec<u8>>,
+        cookie: &[u8],
+        cookie_retried: bool,
+    ) -> Result<Vec<u8>, String> {
+        let params = NOISE_PATTERN_XX
+            .parse::<snow::params::NoiseParams>()
+            .map_err(|e| format!("noise params: {e}"))?;
+        let mut initiator = snow::Builder::new(params)
             .local_private_key(&self.local_noise_key)
             .build_initiator()
-        {
-            Ok(s) => s,
-            Err(e) => return OutgoingResult::Error(format!("noise init: {e}")),
-        };
+            .map_err(|e| format!("noise init: {e}"))?;
 
-        // XX message 1: only ephemeral key, no payload
-        let mut buf = vec![0u8; HEADER_LEN + 256];
+        let mut buf = vec![0u8; HEADER_LEN + cookie.len() + 256];
         buf[0] = EMBER_MAGIC[0];
         buf[1] = EMBER_MAGIC[1];
         buf[2] = PKT_XX_MSG1;
-        match initiator.write_message(&[], &mut buf[HEADER_LEN..]) {
-            Ok(len) => {
-                buf.truncate(HEADER_LEN + len);
-                self.pending.insert(
-                    peer,
-                    PendingHandshake::XxInitiatorMsg1 {
-                        state: initiator,
-                        queued: vec![first_message.to_vec()],
-                        created: Instant::now(),
-                    },
-                );
-                trace!("Started XX handshake with {peer}");
-                OutgoingResult::HandshakeStarted { packet: buf }
+        let len = initiator
+            .write_message(cookie, &mut buf[HEADER_LEN..])
+            .map_err(|e| format!("noise write: {e}"))?;
+        buf.truncate(HEADER_LEN + len);
+        self.pending.insert(
+            peer,
+            PendingHandshake::XxInitiatorMsg1 {
+                state: initiator,
+                queued,
+                created: Instant::now(),
+                cookie_retried,
+            },
+        );
+        Ok(buf)
+    }
+
+    /// Re-send message 1 carrying the retry cookie the responder asked for.
+    fn handle_xx_cookie(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
+        if data.len() != XX_COOKIE_LEN {
+            debug!("XX cookie from {from} has wrong length {}", data.len());
+            return IncomingResult::Rejected;
+        }
+        let queued = match self.pending.get(&from) {
+            Some(PendingHandshake::XxInitiatorMsg1 {
+                queued,
+                cookie_retried: false,
+                ..
+            }) => queued.clone(),
+            Some(PendingHandshake::XxInitiatorMsg1 { .. }) => {
+                debug!("Ignoring XX cookie from {from}: this handshake already spent its retry");
+                return IncomingResult::Rejected;
             }
-            Err(e) => OutgoingResult::Error(format!("noise write: {e}")),
+            _ => {
+                debug!("XX cookie from {from} but no XX handshake of ours is in flight");
+                return IncomingResult::Rejected;
+            }
+        };
+
+        // A fresh initiator, not the parked one: msg1's payload is mixed into
+        // the Noise transcript hash, so the cookie has to be present when the
+        // message is written, and snow cannot rewrite one it has already
+        // produced. The queued payloads move across so nothing the caller
+        // handed us during the cookie round trip is dropped.
+        match self.write_xx_msg1(from, queued, data, true) {
+            Ok(packet) => {
+                trace!("Re-sending XX msg1 to {from} with the retry cookie");
+                IncomingResult::HandshakeResponse {
+                    to: from,
+                    packets: vec![packet],
+                }
+            }
+            Err(e) => {
+                debug!("XX cookie retry for {from} failed: {e}");
+                IncomingResult::Rejected
+            }
         }
     }
 
@@ -1077,6 +1567,48 @@ impl EmberTransport {
             debug!("Ignoring XX msg1 from {from}: an initiator handshake is in flight");
             return IncomingResult::Rejected;
         }
+        // Below the ephemeral key there is no msg1 to speak of, and answering
+        // a runt with a 19-byte cookie would be the very amplification the
+        // cookie exists to prevent.
+        if data.len() < XX_MSG1_EPHEMERAL_LEN {
+            debug!(
+                "XX msg1 from {from} is too short to carry an ephemeral key ({} bytes)",
+                data.len()
+            );
+            return IncomingResult::Rejected;
+        }
+        // Noise XX message 1 is 32 bytes of ephemeral key and nothing else:
+        // no signature, no state, no proof of anything. Answering it with
+        // msg2 — which carries our encrypted static key — is 99 bytes for
+        // 35, a 2.83x reflector aimed at whatever source address the sender
+        // wrote down, and nothing dedupes the flood because every distinct
+        // ephemeral is a fresh replay digest.
+        //
+        // The standard answer is a stateless retry cookie the sender has to
+        // echo, as QUIC Retry and DTLS HelloVerifyRequest do and as the QUIC
+        // path in `relay.rs` already does one layer down. Demanding one
+        // unconditionally, though, would break every deployed peer: they do
+        // not know `PKT_XX_COOKIE` and would never echo it, so their XX first
+        // contact would fail outright. So engage it only under pressure. Below
+        // the budget an unproven source is answered exactly as before, at no
+        // extra round trip; once the budget is gone — the flood case and
+        // nothing else — every further msg1 earns a 19-byte cookie instead of
+        // a 99-byte msg2, which is 0.54x and cannot be amplified in turn.
+        //
+        // A valid cookie skips the budget entirely: that address is proven, so
+        // its msg2 is not a reflection, and an honest peer that completes the
+        // round trip during an attack never competes with the flood for
+        // tokens. Note this whole check runs before the replay cache and
+        // before any Noise work, so a cookie-less msg1 we decline costs one
+        // BLAKE3 and leaves no state behind.
+        let cookie_ok = self.xx_cookie_is_valid(from, &data[XX_MSG1_EPHEMERAL_LEN..]);
+        if !cookie_ok && !self.xx_msg2_budget_available() {
+            trace!("XX msg1 from {from} is over the unvalidated msg2 budget; sending a cookie");
+            return IncomingResult::HandshakeResponse {
+                to: from,
+                packets: vec![self.xx_cookie_packet(from)],
+            };
+        }
         // A repeat is either a replay or a peer that never got our msg2.
         // Re-sending the msg2 we already produced serves the honest case and
         // gives a replaying attacker nothing new, whereas dropping it stalled
@@ -1087,6 +1619,14 @@ impl EmberTransport {
                 return match response {
                     Some(packet) => {
                         debug!("Re-sending cached XX msg2 to {from}");
+                        // The cached answer is another 99 bytes to the same
+                        // unproven address, so it is charged like a fresh one.
+                        // Without this, one msg1 replayed inside the cache TTL
+                        // re-emitted msg2 without limit — the cheapest form of
+                        // the flood, since the attacker does no crypto at all.
+                        if !cookie_ok {
+                            self.spend_xx_msg2_budget();
+                        }
                         IncomingResult::HandshakeResponse {
                             to: from,
                             packets: vec![packet],
@@ -1148,6 +1688,9 @@ impl EmberTransport {
         trace!("XX handshake msg2 sent to {from}");
 
         self.remember_handshake_response(handshake_digest, resp_buf.clone());
+        if !cookie_ok {
+            self.spend_xx_msg2_budget();
+        }
 
         IncomingResult::HandshakeResponse {
             to: from,
@@ -1156,10 +1699,38 @@ impl EmberTransport {
     }
 
     fn handle_xx_msg2(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        let pending = match self.pending.remove(&from) {
-            Some(PendingHandshake::XxInitiatorMsg1 { state, queued, .. }) => (state, queued),
-            Some(other) => {
-                self.pending.insert(from, other);
+        // Read against the parked handshake *in place* and take it out of
+        // `pending` only once the message authenticates. Taking it out first
+        // meant a single unauthenticated msg2 — anything of the right packet
+        // type from an address we happen to have a handshake in flight to —
+        // permanently stranded that handshake: the genuine msg2 then arrived
+        // to "no pending handshake" and XX first contact simply never
+        // completed. An attacker does not need to guess anything to do it,
+        // only to spray spoofed msg2s from known peer addresses.
+        //
+        // Retrying against the same state is sound here, but read why before
+        // copying this pattern elsewhere. snow does roll back on a failed
+        // read, and does not advance `pattern_position`, `my_turn`, or the
+        // cipherstate nonce (`handshakestate.rs`, `cipherstate.rs`) — but its
+        // checkpoint is only `{h, ck, has_key}` and does *not* cover the
+        // CipherState's key. What actually makes this safe is the message
+        // pattern: XX msg2 is `<- e, ee, s, es`, so the first cipherstate
+        // touch is `Dh(ee) -> mix_key`, which re-keys and zeroes the nonce at
+        // the start of every attempt, before anything can fail destructively.
+        // A pattern whose first token decrypts against the *existing* key —
+        // XX msg3's `s` — has no such reset and is not safe to retry this way.
+        // The only other residue is the remote-ephemeral buffer, which the
+        // next read overwrites from its own `e` token before anything consumes
+        // it. So the genuine msg2 still verifies afterwards.
+        let mut buf = vec![0u8; data.len() + 64];
+        match self.pending.get_mut(&from) {
+            Some(PendingHandshake::XxInitiatorMsg1 { state, .. }) => {
+                if let Err(e) = state.read_message(data, &mut buf) {
+                    debug!("XX msg2 read failed from {from}: {e}");
+                    return IncomingResult::Rejected;
+                }
+            }
+            Some(_) => {
                 debug!("Unexpected XX msg2 from {from}");
                 return IncomingResult::Rejected;
             }
@@ -1167,14 +1738,19 @@ impl EmberTransport {
                 debug!("XX msg2 from {from} but no pending handshake");
                 return IncomingResult::Rejected;
             }
-        };
-
-        let (mut state, queued) = pending;
-        let mut buf = vec![0u8; data.len() + 64];
-        if let Err(e) = state.read_message(data, &mut buf) {
-            debug!("XX msg2 read failed from {from}: {e}");
-            return IncomingResult::Rejected;
         }
+
+        // Authenticated, so the handshake is ours to consume. The variant is
+        // the one matched above — nothing can have run in between under
+        // `&mut self` — and the arm exists only so a future refactor cannot
+        // turn a mismatch into a panic.
+        let Some(PendingHandshake::XxInitiatorMsg1 {
+            mut state, queued, ..
+        }) = self.pending.remove(&from)
+        else {
+            debug!("XX msg2 from {from}: pending handshake changed shape mid-dispatch");
+            return IncomingResult::Rejected;
+        };
 
         // Write message 3 (includes initiator's static key + first queued message as payload)
         let payload = queued.first().map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1201,9 +1777,10 @@ impl EmberTransport {
 
         // Mirror the responder guard: a completing handshake must not replace a
         // live session belonging to a DIFFERENT Noise identity at the same
-        // address (session-takeover defense).
+        // address (session-takeover defense). An unvalidated incumbent has
+        // proven nothing and does not outrank a handshake we started.
         if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub {
+            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
                 debug!(
                     "XX msg2 from {from} would replace a live session with a different static key; \
                      rejecting to prevent session takeover"
@@ -1219,7 +1796,9 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub, false);
+        // We started this handshake and the peer answered, so the address is
+        // proven (see `handle_ik_resp`).
+        let mut session = NoiseSession::new(transport, remote_noise_pub, false).validated();
 
         // Send remaining queued messages (skip first, it was in msg3 payload)
         let mut packets = vec![resp_buf];
@@ -1244,10 +1823,35 @@ impl EmberTransport {
     }
 
     fn handle_xx_msg3(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        let (mut state, queued) = match self.pending.remove(&from) {
-            Some(PendingHandshake::XxResponderMsg2 { state, queued, .. }) => (state, queued),
-            Some(other) => {
-                self.pending.insert(from, other);
+        // Authenticate before consuming the pending entry, for the reason
+        // spelled out in `handle_xx_msg2`. Here it strands the responder half:
+        // we have already sent msg2 and a forged msg3 used to discard the
+        // state the real one needs.
+        //
+        // This closes the off-path case, which is the one that matters: msg3 is
+        // `-> s, se`, and a forged `s` block fails `decrypt_ad` before the
+        // nonce advances and before `Dh(se)` re-keys, so the state is untouched
+        // and the genuine msg3 still verifies. It does *not* close the on-path
+        // case — see the pattern note in `handle_xx_msg2`. Replaying the real
+        // `s` block with a corrupted payload lets `Dh(se)` re-key before the
+        // failure, and snow's rollback does not restore the CipherState, so the
+        // genuine msg3 can no longer decrypt and the handshake waits out the
+        // pending sweep. Not a regression (the old order stranded this case
+        // too), and an attacker holding that position can strand us just by
+        // dropping msg3. Closing it means snapshotting the responder state
+        // around the read, which costs a clone on every inbound msg3.
+        let mut payload_buf = vec![0u8; data.len()];
+        let payload_len = match self.pending.get_mut(&from) {
+            Some(PendingHandshake::XxResponderMsg2 { state, .. }) => {
+                match state.read_message(data, &mut payload_buf) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        debug!("XX msg3 read failed from {from}: {e}");
+                        return IncomingResult::Rejected;
+                    }
+                }
+            }
+            Some(_) => {
                 debug!("Unexpected XX msg3 from {from}");
                 return IncomingResult::Rejected;
             }
@@ -1257,13 +1861,11 @@ impl EmberTransport {
             }
         };
 
-        let mut payload_buf = vec![0u8; data.len()];
-        let payload_len = match state.read_message(data, &mut payload_buf) {
-            Ok(len) => len,
-            Err(e) => {
-                debug!("XX msg3 read failed from {from}: {e}");
-                return IncomingResult::Rejected;
-            }
+        let Some(PendingHandshake::XxResponderMsg2 { state, queued, .. }) =
+            self.pending.remove(&from)
+        else {
+            debug!("XX msg3 from {from}: pending handshake changed shape mid-dispatch");
+            return IncomingResult::Rejected;
         };
 
         let remote_noise_pub = match extract_remote_static(&state) {
@@ -1281,8 +1883,10 @@ impl EmberTransport {
         // a DIFFERENT Noise identity. A legitimate peer re-handshakes with its
         // own static key (allowed — session refresh); a mismatched key is a
         // potential takeover via a shared NAT mapping or on-path attacker.
+        // Message 3 is itself proof of return-routability, so it outranks an
+        // unvalidated incumbent that only ever claimed this address.
         if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub {
+            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
                 debug!(
                     "XX msg3 from {from} carries a different static key than the live session; \
                      rejecting to prevent session takeover"
@@ -1298,7 +1902,9 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut session = NoiseSession::new(transport, remote_noise_pub, false);
+        // Message 3 can only be produced by a peer that read the message 2 we
+        // sent to this address, so the address is proven.
+        let mut session = NoiseSession::new(transport, remote_noise_pub, false).validated();
 
         // Drain any application payloads that the local app tried to
         // send while we were still in the msg2→msg3 window. Each one
@@ -1372,6 +1978,12 @@ impl EmberTransport {
                 // authenticated it.
                 session.replay_commit(nonce);
                 session.last_activity = Instant::now();
+                // Deriving these keys required reading the handshake reply we
+                // sent to this address, so this frame is the return-routability
+                // proof an IK responder session starts out without. From here
+                // the session can be trusted with the address it is keyed on
+                // (see `handle_ik_init`).
+                session.addr_validated = true;
                 IncomingResult::Message {
                     from,
                     remote_noise_pub: session.remote_noise_pub,
@@ -1415,6 +2027,58 @@ impl EmberTransport {
             self.pending.remove(&oldest);
         }
     }
+}
+
+fn fresh_cookie_secret() -> [u8; 32] {
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    secret
+}
+
+/// The retry cookie for `addr` under `secret`.
+///
+/// Binding the tag to the full source address — not just the IP — is what
+/// makes a captured cookie useless anywhere else: echoing it from a
+/// different address recomputes a different tag. The address is encoded
+/// with a leading version byte so a v4-mapped v6 address cannot be framed
+/// to collide with the v4 address it maps.
+fn xx_cookie_for(secret: &[u8; 32], addr: SocketAddr) -> [u8; XX_COOKIE_LEN] {
+    let mut input = Vec::with_capacity(XX_COOKIE_DOMAIN.len() + 19);
+    input.extend_from_slice(XX_COOKIE_DOMAIN);
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            input.push(4);
+            input.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            input.push(6);
+            input.extend_from_slice(&v6.octets());
+        }
+    }
+    input.extend_from_slice(&addr.port().to_be_bytes());
+
+    let tag = blake3::keyed_hash(secret, &input);
+    let mut cookie = [0u8; XX_COOKIE_LEN];
+    cookie.copy_from_slice(&tag.as_bytes()[..XX_COOKIE_LEN]);
+    cookie
+}
+
+/// Constant-time comparison of a cookie tag against the bytes a peer echoed.
+///
+/// A plain `==` on slices returns at the first differing byte. An attacker
+/// that can time our reply could walk that timing to recover a tag for an
+/// address it cannot receive at, turning a 2^-128 forgery into a 16x256
+/// search — which is precisely the return-routability property the cookie
+/// exists to enforce.
+fn cookie_tags_match(expected: &[u8; XX_COOKIE_LEN], got: &[u8]) -> bool {
+    if got.len() != XX_COOKIE_LEN {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(got.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// Extract the remote peer's static public key from a Noise handshake state.
@@ -1486,8 +2150,10 @@ mod tests {
             } => (packets_to_send, decrypted_payload),
             _ => panic!("expected HandshakeComplete"),
         };
-        assert_eq!(decrypted.as_deref(), Some(msg.as_slice()));
-        assert_eq!(resp_packets.len(), 1);
+        // The embedded payload waits for the address to prove itself; the
+        // responder answers with IK message 2 plus the routability probe.
+        assert_eq!(decrypted, None);
+        assert_eq!(resp_packets.len(), 2);
 
         let result = alice.process_incoming(&resp_packets[0], bob_addr);
         match result {
@@ -1501,6 +2167,12 @@ mod tests {
 
         assert!(alice.has_session(&bob_addr));
         assert!(bob.has_session(&alice_addr));
+
+        // Answering the probe proves the address and releases the payload.
+        let probe_answer = alice.dispatch_incoming(&resp_packets[1], bob_addr);
+        assert_eq!(probe_answer.responses.len(), 1);
+        let released = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+        assert_eq!(released.app_payloads, vec![msg.to_vec()]);
 
         let msg2 = b"subsequent message";
         let packet = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), msg2) {
@@ -1540,6 +2212,42 @@ mod tests {
             _ => panic!("expected HandshakeComplete (initiator)"),
         }
         (alice, bob, alice_addr, bob_addr)
+    }
+
+    /// Put `t` in the state a flood puts it in: no budget left to answer an
+    /// unproven source with msg2, which is the only condition under which it
+    /// asks for a cookie. Set directly rather than by sending 64 real msg1s
+    /// so the cookie tests are deterministic and do not race the refill.
+    fn exhaust_xx_msg2_budget(t: &mut EmberTransport) {
+        t.xx_msg2_tokens = 0;
+        t.xx_msg2_refilled_at = Instant::now();
+    }
+
+    /// Drive `msg1` through the responder's retry cookie and return the msg1
+    /// the responder will actually answer with a handshake. Exhausts the
+    /// budget first, since the cookie is not otherwise demanded.
+    fn xx_cookie_round_trip(
+        initiator: &mut EmberTransport,
+        responder: &mut EmberTransport,
+        initiator_addr: SocketAddr,
+        responder_addr: SocketAddr,
+        msg1: &[u8],
+    ) -> Vec<u8> {
+        exhaust_xx_msg2_budget(responder);
+        let cookie = match responder.process_incoming(msg1, initiator_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets,
+            _ => panic!("expected a retry cookie for an unproven XX msg1"),
+        };
+        assert_eq!(cookie.len(), 1);
+        assert_eq!(cookie[0][2], PKT_XX_COOKIE, "expected a cookie packet");
+
+        match initiator.process_incoming(&cookie[0], responder_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets.len(), 1);
+                packets.into_iter().next().expect("retried msg1")
+            }
+            _ => panic!("expected the initiator to re-send msg1 with the cookie"),
+        }
     }
 
     fn seal_ready(t: &mut EmberTransport, peer: SocketAddr, msg: &[u8]) -> Vec<u8> {
@@ -1621,14 +2329,15 @@ mod tests {
             OutgoingResult::HandshakeStarted { packet } => packet,
             _ => panic!("expected HandshakeStarted"),
         };
-        // First copy completes the handshake and surfaces the embedded payload.
+        // First copy completes the handshake and defers the embedded payload
+        // until the source address proves it can receive.
         let original_response = match bob.process_incoming(&init, alice_addr) {
             IncomingResult::HandshakeComplete {
                 decrypted_payload,
                 packets_to_send,
                 ..
             } => {
-                assert_eq!(decrypted_payload.as_deref(), Some(&b"req"[..]));
+                assert_eq!(decrypted_payload, None);
                 packets_to_send
             }
             _ => panic!("expected HandshakeComplete"),
@@ -1637,8 +2346,9 @@ mod tests {
         match bob.process_incoming(&init, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
                 assert_eq!(
-                    packets, original_response,
-                    "the repeat must get exactly the answer we already sent"
+                    packets,
+                    original_response[..1].to_vec(),
+                    "the repeat must get exactly the handshake answer we already sent"
                 );
             }
             _ => panic!("expected the cached answer to be re-sent"),
@@ -1668,7 +2378,8 @@ mod tests {
 
         let msg = b"hello via XX";
 
-        // Alice → Bob: XX msg1
+        // Alice → Bob: XX msg1. Under the msg2 budget, which is where an
+        // unattacked node lives, this is answered straight away.
         let init_packet = match alice.prepare_outgoing(bob_addr, None, msg) {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got: {}", variant_name(&other)),
@@ -1729,22 +2440,25 @@ mod tests {
                 decrypted_payload,
                 ..
             } => {
-                assert_eq!(
-                    decrypted_payload
-                        .as_deref()
-                        .and_then(EmberControlMessage::decode),
-                    Some(EmberControlMessage::Ping { nonce: 1 }),
-                );
+                // Deferred until the address proves it can receive; see
+                // `an_unvalidated_ik_init_is_never_amplified`.
+                assert_eq!(decrypted_payload, None);
                 packets_to_send
             }
             _ => panic!("expected HandshakeComplete"),
         };
-        assert_eq!(resp_packets.len(), 1);
+        assert_eq!(resp_packets.len(), 2);
 
         match alice.process_incoming(&resp_packets[0], bob_addr) {
             IncomingResult::HandshakeComplete { .. } => {}
             _ => panic!("expected HandshakeComplete"),
         }
+        let probe_answer = alice.dispatch_incoming(&resp_packets[1], bob_addr);
+        assert_eq!(
+            bob.dispatch_incoming(&probe_answer.responses[0], alice_addr)
+                .controls,
+            vec![EmberControlMessage::Ping { nonce: 1 }],
+        );
 
         let pong = EmberControlMessage::Pong { nonce: 1 }.encode();
         let packet = match bob.prepare_outgoing(alice_addr, Some(&alice_pub), &pong) {
@@ -1786,17 +2500,33 @@ mod tests {
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
         };
 
-        let outcome = bob.dispatch_incoming(&init, alice_addr);
+        // The IK responder emits message 2 and the routability probe, and
+        // holds the payload back until the probe is answered.
+        let handshake = bob.dispatch_incoming(&init, alice_addr);
+        assert!(!handshake.rejected);
+        assert!(handshake.app_payloads.is_empty());
+        assert_eq!(handshake.responses.len(), 2);
+
+        assert!(
+            !alice
+                .dispatch_incoming(&handshake.responses[0], bob_addr)
+                .rejected
+        );
+        let probe_answer = alice.dispatch_incoming(&handshake.responses[1], bob_addr);
+        assert_eq!(probe_answer.responses.len(), 1, "the probe must be answered");
+
+        let outcome = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
         assert!(!outcome.rejected);
-        assert_eq!(outcome.control, None, "payload is not a control frame");
-        assert_eq!(outcome.app_payload.as_deref(), Some(dht_like.as_slice()));
+        assert!(
+            outcome.controls.is_empty(),
+            "payload is not a control frame"
+        );
+        assert_eq!(outcome.app_payloads, vec![dht_like]);
         assert_eq!(
             outcome.remote_noise_pub,
             Some(alice_pub),
             "app payload must carry the peer's Noise key for the reply path"
         );
-        // The IK responder still emits message 2.
-        assert_eq!(outcome.responses.len(), 1);
     }
 
     /// The cached answer belongs to the peer that asked for it. Replaying a
@@ -1832,6 +2562,519 @@ mod tests {
             bob.process_incoming(&init, alice_addr),
             IncomingResult::HandshakeResponse { .. }
         ));
+    }
+
+    /// Noise_IK message 1 proves who signed it, never where they are: the
+    /// pattern is 1-RTT and every node publishes its static key in FOUND_NODE
+    /// contact lists, so an off-path attacker can drive a whole handshake
+    /// from a forged source address. Acting on the embedded payload is what
+    /// made that profitable — an embedded FIND_NODE reflected ~1.4 KB at the
+    /// forged address for a ~235-byte packet, and an embedded STORE_RECORD
+    /// walked through the DHT's `from.ip()` anti-reflection bind unchallenged.
+    #[test]
+    fn an_unvalidated_ik_init_is_never_amplified() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        // The address the attacker forged. Nothing proves anyone listens here.
+        let victim_addr: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // A DHT-shaped request embedded in message 1, as a FIND_NODE would be.
+        let query = vec![0x01u8; 136];
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &query) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        let outcome = bob.dispatch_incoming(&init, victim_addr);
+        assert!(!outcome.rejected);
+        assert!(
+            outcome.app_payloads.is_empty(),
+            "the embedded request must not reach the DHT until the address is proven"
+        );
+        assert!(outcome.controls.is_empty());
+        let sent: usize = outcome.responses.iter().map(|p| p.len()).sum();
+        assert!(
+            sent <= init.len(),
+            "forging a source address must never buy more bytes than it costs: \
+             {sent} sent for {} received",
+            init.len()
+        );
+    }
+
+    /// Build `count` XX msg1 packets that are distinct on the wire, the way a
+    /// flood is: each aimed at a different address so it carries its own
+    /// ephemeral, so none of them collide in the handshake replay cache.
+    fn distinct_xx_msg1s(initiator: &mut EmberTransport, count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| {
+                let target: SocketAddr = format!("5.6.7.8:{}", 2000 + i).parse().unwrap();
+                match initiator.prepare_outgoing(target, None, b"find node") {
+                    OutgoingResult::HandshakeStarted { packet } => packet,
+                    other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+                }
+            })
+            .collect()
+    }
+
+    /// The steady state, and the interop guarantee behind making the cookie
+    /// adaptive: a node that is not being flooded answers XX msg1 with msg2
+    /// exactly as it always has. Deployed peers do not know `PKT_XX_COOKIE`
+    /// and would never echo one, so first contact has to keep working with no
+    /// extra round trip and no new packet type on the wire.
+    #[test]
+    fn an_xx_msg1_is_answered_directly_in_the_steady_state() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        match bob.process_incoming(&msg1, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(
+                    packets[0][2], PKT_XX_MSG2,
+                    "an unattacked responder must not cost an existing peer a round trip"
+                );
+            }
+            _ => panic!("expected msg2"),
+        }
+    }
+
+    /// Noise XX message 1 is 32 bytes of ephemeral key with no state and no
+    /// proof of anything behind it, and msg2 answers it with our encrypted
+    /// static key: 99 bytes out for 35 in, a 2.83x reflector pointed at
+    /// whatever source address the sender wrote down. Nothing dedupes the
+    /// flood, since every distinct ephemeral hashes to a fresh digest.
+    ///
+    /// What bounds it is the budget rather than the ratio: honest peers keep
+    /// the cheap path, and once a flood has spent the budget every further
+    /// msg1 earns a cookie instead — so the reflected volume stops growing no
+    /// matter how hard the attacker pushes.
+    #[test]
+    fn an_xx_msg1_flood_falls_back_to_cookies_once_the_budget_is_spent() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        // The address the attacker forged. Nothing proves anyone listens here.
+        let victim_addr: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+
+        // A small budget stands in for the real one so the test cannot race
+        // the refill; the behaviour under test is the same at any size.
+        const BUDGET: usize = 2;
+        bob.xx_msg2_tokens = BUDGET as u32;
+        bob.xx_msg2_refilled_at = Instant::now();
+
+        let flood = distinct_xx_msg1s(&mut alice, BUDGET + 3);
+        let mut answers = Vec::new();
+        let mut state_at_budget = None;
+        for (i, msg1) in flood.iter().enumerate() {
+            let outcome = bob.dispatch_incoming(msg1, victim_addr);
+            assert!(!outcome.rejected);
+            assert_eq!(outcome.responses.len(), 1);
+            answers.push(outcome.responses[0].clone());
+            if i + 1 == BUDGET {
+                state_at_budget = Some((bob.pending.len(), bob.recent_handshakes.len()));
+            }
+        }
+
+        // The budget buys msg2 and nothing past it does.
+        for (i, (msg1, answer)) in flood.iter().zip(&answers).enumerate() {
+            if i < BUDGET {
+                assert_eq!(answer[2], PKT_XX_MSG2, "packet {i} is inside the budget");
+                assert_eq!((msg1.len(), answer.len()), (35, 99), "the 2.83x we cap");
+            } else {
+                assert_eq!(answer[2], PKT_XX_COOKIE, "packet {i} is past the budget");
+                // 19 bytes against 35, 0.54x: the retry cannot be turned into
+                // an amplifier of its own, so the flood has nothing to escalate
+                // to and is strictly worse off than attacking the victim direct.
+                assert_eq!((msg1.len(), answer.len()), (35, HEADER_LEN + XX_COOKIE_LEN));
+                assert!(answer.len() <= msg1.len());
+            }
+        }
+
+        // The cookie is stateless, so the flood cannot be traded from an
+        // amplification vector into a memory-exhaustion one: nothing past the
+        // budget took a handshake slot or reached the replay cache, so it can
+        // neither be grown without bound nor crowd out a genuine handshake.
+        assert_eq!(
+            (bob.pending.len(), bob.recent_handshakes.len()),
+            state_at_budget.expect("budget boundary observed"),
+            "a msg1 answered with a cookie must leave nothing behind"
+        );
+        assert!(bob.sessions.is_empty());
+    }
+
+    /// The cached msg2 is charged like a fresh one. It is the same 99 bytes to
+    /// the same unproven address, and it is the cheapest form of the flood
+    /// because replaying one captured msg1 costs the attacker no crypto at
+    /// all — so leaving it uncharged would have let a single packet re-emit
+    /// msg2 without limit for the whole replay TTL.
+    #[test]
+    fn a_replayed_xx_msg1_cannot_re_emit_the_cached_msg2_for_free() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let victim_addr: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+
+        bob.xx_msg2_tokens = 2;
+        bob.xx_msg2_refilled_at = Instant::now();
+        let msg1 = distinct_xx_msg1s(&mut alice, 1).remove(0);
+
+        // Fresh: the handshake path answers and caches the msg2.
+        let first = bob.dispatch_incoming(&msg1, victim_addr);
+        assert_eq!(first.responses[0][2], PKT_XX_MSG2);
+
+        // Replayed: the cache answers, and that spends the last token.
+        let second = bob.dispatch_incoming(&msg1, victim_addr);
+        assert_eq!(second.responses[0][2], PKT_XX_MSG2);
+        assert_eq!(second.responses[0], first.responses[0]);
+
+        // Replayed again with the budget gone: a cookie, not another msg2.
+        let third = bob.dispatch_incoming(&msg1, victim_addr);
+        assert_eq!(
+            third.responses[0][2], PKT_XX_COOKIE,
+            "the cached msg2 must not outlive the budget"
+        );
+    }
+
+    /// One unauthenticated packet must not be able to end a handshake that is
+    /// in flight. `handle_xx_msg2` used to take the pending state out of the
+    /// map before reading the message, so a forged msg2 — anything of the
+    /// right type from an address we happen to be dialling — discarded the
+    /// state the genuine msg2 needed, and XX first contact simply never
+    /// completed. Spraying spoofed msg2s from known peer addresses needs no
+    /// secret and no guess, so with a deployed population it is a live denial
+    /// of service on first contact, not a theoretical one.
+    #[test]
+    fn a_spoofed_xx_msg2_does_not_strand_the_handshake() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let msg2 = match bob.process_incoming(&msg1, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                packets.into_iter().next().expect("msg2")
+            }
+            _ => panic!("expected msg2"),
+        };
+
+        // The attacker cannot forge a msg2 that verifies — that needs the
+        // ephemeral shared secret — so all it can do is send a well-formed
+        // packet of the right type and hope the failure is destructive. Break
+        // it at both points it can fail: inside the encrypted static key,
+        // which is where a real off-path forgery dies, and on the trailing
+        // payload tag, which fails only after snow has mixed three tokens'
+        // worth of state and so is the harder thing to recover from.
+        for corrupt in [HEADER_LEN + 36, msg2.len() - 1] {
+            let mut forged = msg2.clone();
+            forged[corrupt] ^= 0xff;
+            assert!(
+                matches!(
+                    alice.process_incoming(&forged, bob_addr),
+                    IncomingResult::Rejected
+                ),
+                "a msg2 that does not authenticate must be rejected"
+            );
+            assert!(
+                alice.pending.contains_key(&bob_addr),
+                "the in-flight handshake must survive a packet that proved nothing \
+                 (corrupted at byte {corrupt})"
+            );
+        }
+
+        // And the genuine msg2 still completes: snow rolls its symmetric state
+        // back on a failed read, so the forgery left no residue.
+        let msg3 = match alice.process_incoming(&msg2, bob_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("the genuine msg2 must still complete the handshake"),
+        };
+        assert!(!msg3.is_empty());
+        match bob.process_incoming(&msg3[0], alice_addr) {
+            IncomingResult::HandshakeComplete { .. } => {}
+            _ => panic!("expected the responder to complete on msg3"),
+        }
+    }
+
+    /// The cookie is a keyed tag over the source address, so capturing one
+    /// off the wire buys nothing anywhere else — which is the whole point:
+    /// echoing it is the proof that the sender receives where it claims to.
+    #[test]
+    fn an_xx_cookie_is_bound_to_the_address_it_was_issued_to() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let victim_addr: SocketAddr = "9.9.9.9:9999".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let retried = xx_cookie_round_trip(&mut alice, &mut bob, alice_addr, bob_addr, &msg1);
+
+        // Replayed from anywhere else, the tag simply does not verify, so the
+        // forged address earns another 19-byte cookie rather than a 99-byte
+        // msg2. Checked before the honest case so the replay cache cannot be
+        // what answers.
+        match bob.process_incoming(&retried, victim_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(
+                    packets[0][2], PKT_XX_COOKIE,
+                    "a captured cookie must not buy a handshake from another address"
+                );
+            }
+            _ => panic!("expected a fresh cookie"),
+        }
+
+        // The address it was issued to is served normally.
+        match bob.process_incoming(&retried, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets[0][2], PKT_XX_MSG2);
+            }
+            _ => panic!("the address the cookie was issued to must be served"),
+        }
+    }
+
+    /// The secret rotates, so a cookie has a lifetime: one rotation of grace
+    /// (a cookie in flight across a boundary must not strand an honest peer),
+    /// and nothing beyond that — by then the address may have changed hands.
+    #[test]
+    fn an_xx_cookie_expires_with_its_secret() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let retried = xx_cookie_round_trip(&mut alice, &mut bob, alice_addr, bob_addr, &msg1);
+
+        // One interval on: the next packet demotes the minting secret to
+        // `prev`, where it still verifies.
+        bob.cookie_rotated_at = Instant::now()
+            .checked_sub(XX_COOKIE_ROTATION)
+            .expect("test clock");
+        match bob.process_incoming(&retried, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets[0][2], PKT_XX_MSG2, "one rotation of grace");
+            }
+            _ => panic!("a cookie one rotation old must still be honoured"),
+        }
+
+        // Past both secrets, it buys a fresh cookie and nothing more. The
+        // cookie check runs ahead of the replay cache, so the msg2 cached
+        // above is not what answers here.
+        bob.cookie_rotated_at = Instant::now()
+            .checked_sub(XX_COOKIE_ROTATION * 3)
+            .expect("test clock");
+        // An expired cookie is no cookie, so this only demands one while the
+        // budget is still spent; the msg2 served above refunded nothing but
+        // real time has passed since.
+        exhaust_xx_msg2_budget(&mut bob);
+        match bob.process_incoming(&retried, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(
+                    packets[0][2], PKT_XX_COOKIE,
+                    "an expired cookie must earn a fresh one, not a handshake"
+                );
+            }
+            _ => panic!("expected a fresh cookie"),
+        }
+    }
+
+    /// Alice sends a second request before our return-routability probe can
+    /// reach her: `handle_ik_resp` flushes it the instant IK_RESP is read, so
+    /// that request — not the probe's `Pong` — is the first frame proving her
+    /// address. Releasing the deferred payload only on the `Pong` therefore
+    /// dropped the request embedded in IK_INIT. A DHT search retries once and
+    /// papers over it; a one-shot `STORE_RECORD`, `ANNOUNCE_PEER` or
+    /// `ExchangeRequest` sent as a first message has no retry layer at all
+    /// and was simply lost. This is deterministic, not a race.
+    #[test]
+    fn two_requests_inside_one_round_trip_are_both_delivered() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // DHT-shaped, so both surface as app payloads rather than control.
+        let first = vec![0xA1u8; 96];
+        let second = vec![0xB2u8; 96];
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &first) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(
+            matches!(
+                alice.prepare_outgoing(bob_addr, Some(&bob_pub), &second),
+                OutgoingResult::Queued
+            ),
+            "the second request rides behind the in-flight handshake"
+        );
+
+        let handshake = bob.dispatch_incoming(&init, alice_addr);
+        assert_eq!(handshake.responses.len(), 2, "IK_RESP plus the probe");
+
+        // Alice reads IK_RESP and flushes the queued request at once —
+        // before she has so much as seen the probe.
+        let flushed = alice.dispatch_incoming(&handshake.responses[0], bob_addr);
+        assert_eq!(
+            flushed.responses.len(),
+            1,
+            "the queued request goes out now"
+        );
+
+        let delivered = bob.dispatch_incoming(&flushed.responses[0], alice_addr);
+        assert_eq!(
+            delivered.app_payloads,
+            vec![first, second],
+            "both requests must arrive, in the order Alice sent them"
+        );
+        assert_eq!(delivered.remote_noise_pub, Some(alice_pub));
+
+        // The probe's answer still lands afterwards, and is still ours to
+        // swallow rather than hand back as an unsolicited reply.
+        let probe_answer = alice.dispatch_incoming(&handshake.responses[1], bob_addr);
+        assert_eq!(probe_answer.responses.len(), 1);
+        let after_probe = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+        assert!(after_probe.controls.is_empty());
+        assert!(after_probe.app_payloads.is_empty());
+
+        // Released exactly once: no later frame resurrects it.
+        let third = seal_ready(&mut alice, bob_addr, &[0xC3u8; 96]);
+        assert_eq!(
+            bob.dispatch_incoming(&third, alice_addr).app_payloads.len(),
+            1
+        );
+    }
+
+    /// A session installed from a forged source address has proven nothing,
+    /// so it must not outrank the address's real owner. It used to: the
+    /// takeover guard rejected every later IK_INIT whose static key differed,
+    /// locking the victim out for the whole session lifetime — refreshable by
+    /// the attacker with one packet, and unrecoverable because decrypt
+    /// failures deliberately never tear a session down.
+    #[test]
+    fn an_unvalidated_session_never_locks_out_the_address_owner() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (mallory_priv, mallory_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut mallory = EmberTransport::new(mallory_priv, mallory_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // Mallory completes an IK handshake with Bob while claiming Alice's
+        // address. Bob installs the session; nothing has validated it.
+        let squat = match mallory.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            bob.process_incoming(&squat, alice_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+
+        // Alice, who actually holds the address, must still get in.
+        let genuine = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"genuine") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let responses = match bob.process_incoming(&genuine, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("an unproven squatter must not lock the address owner out"),
+        };
+
+        // Answering the probe proves the address and releases Alice's request
+        // — Mallory's deferred payload is discarded with her session.
+        assert!(!alice.dispatch_incoming(&responses[0], bob_addr).rejected);
+        let probe_answer = alice.dispatch_incoming(&responses[1], bob_addr);
+        let released = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+        assert_eq!(released.app_payloads, vec![b"genuine".to_vec()]);
+
+        // Now that the session is proven, the takeover guard does its job.
+        mallory.remove_session(&bob_addr);
+        let squat_again = match mallory.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat again") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(
+            matches!(
+                bob.process_incoming(&squat_again, alice_addr),
+                IncomingResult::Rejected
+            ),
+            "a validated session is exactly what the takeover guard exists to protect"
+        );
+    }
+
+    /// The other half of the lockout: an unproven session squatting a peer's
+    /// address must not capture the traffic we send to that peer, or the real
+    /// peer receives frames it cannot decrypt and we never notice.
+    #[test]
+    fn dialling_a_peer_discards_an_unvalidated_session_for_another_identity() {
+        let (_alice_priv, alice_pub) = make_keypair();
+        let (mallory_priv, mallory_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut mallory = EmberTransport::new(mallory_priv, mallory_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let squat = match mallory.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            bob.process_incoming(&squat, alice_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+
+        // Talking to the identity the session actually belongs to is fine.
+        assert!(matches!(
+            bob.prepare_outgoing(alice_addr, Some(&mallory_pub), b"for mallory"),
+            OutgoingResult::Ready { .. }
+        ));
+        // Talking to a different identity at that address is not.
+        assert!(
+            matches!(
+                bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"for alice"),
+                OutgoingResult::HandshakeStarted { .. }
+            ),
+            "an unproven session must not intercept traffic meant for another peer"
+        );
     }
 
     /// The header is stripped before dispatch, so hashing the body alone put
@@ -1990,23 +3233,29 @@ mod tests {
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
         };
 
-        // Bob decodes the request; dispatch must NOT auto-respond.
+        // Alice completes the handshake and answers the routability probe;
+        // only then does Bob act on the request, and even then dispatch must
+        // NOT auto-respond to it.
         let bob_outcome = bob.dispatch_incoming(&init, alice_addr);
         assert!(!bob_outcome.rejected);
-        assert_eq!(
-            bob_outcome.control,
-            Some(EmberControlMessage::ExchangeRequest)
-        );
+        assert!(bob_outcome.controls.is_empty(), "the request is deferred");
         assert_eq!(
             bob_outcome.responses.len(),
-            1,
-            "only the IK handshake response, no auto-answer to the exchange request"
+            2,
+            "the IK handshake response and the routability probe, nothing else"
         );
 
-        // Alice completes the handshake.
-        for pkt in &bob_outcome.responses {
-            let _ = alice.dispatch_incoming(pkt, bob_addr);
-        }
+        let _ = alice.dispatch_incoming(&bob_outcome.responses[0], bob_addr);
+        let probe_answer = alice.dispatch_incoming(&bob_outcome.responses[1], bob_addr);
+        let bob_outcome = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+        assert_eq!(
+            bob_outcome.controls,
+            vec![EmberControlMessage::ExchangeRequest]
+        );
+        assert!(
+            bob_outcome.responses.is_empty(),
+            "no auto-answer to the exchange request"
+        );
         assert!(alice.has_session(&bob_addr));
         assert!(bob.has_session(&alice_addr));
 
@@ -2022,8 +3271,8 @@ mod tests {
         };
         let alice_outcome = alice.dispatch_incoming(&pkt, bob_addr);
         assert_eq!(
-            alice_outcome.control,
-            Some(EmberControlMessage::ExchangeData { payload })
+            alice_outcome.controls,
+            vec![EmberControlMessage::ExchangeData { payload }]
         );
     }
 
@@ -2043,7 +3292,7 @@ mod tests {
         let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
         let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
 
-        // Alice → Bob: XX msg1 (no remote pubkey known yet)
+        // Alice → Bob: XX msg1 (no remote pubkey known yet).
         let init_packet = match alice.prepare_outgoing(bob_addr, None, b"first msg from alice") {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
@@ -2137,7 +3386,7 @@ mod tests {
             } => packets_to_send,
             _ => panic!("expected HandshakeComplete on responder side"),
         };
-        assert_eq!(resp.len(), 1);
+        assert_eq!(resp.len(), 2, "IK message 2 plus the routability probe");
         match alice.process_incoming(&resp[0], bob_addr) {
             IncomingResult::HandshakeComplete { .. } => {}
             _ => panic!("expected HandshakeComplete on initiator side"),
@@ -2168,8 +3417,9 @@ mod tests {
     ///
     /// 1. The Noise IK handshake succeeds with the Ping payload
     ///    embedded in message 1.
-    /// 2. The responder's `dispatch_incoming` extracts the Ping AND
-    ///    encodes the matching Pong on the freshly-established
+    /// 2. The responder defers that payload and probes the source
+    ///    address, and once the initiator answers the probe, extracts
+    ///    the Ping AND encodes the matching Pong on the established
     ///    session.
     /// 3. The initiator's `dispatch_incoming` decodes the Pong on
     ///    arrival, with no further responses to send.
@@ -2203,23 +3453,22 @@ mod tests {
         sock_a.send_to(&init_packet, addr_b).await.unwrap();
 
         // ── Step 2: B receives, dispatch_incoming should yield ──
-        //   - Ping as the decoded control
-        //   - Two responses: Noise IK msg 2 + the encoded Pong reply
+        //   - no control yet: the payload waits on return-routability
+        //   - two responses: Noise IK msg 2 + the routability probe
         let mut buf = vec![0u8; 65535];
         let (len, from) = sock_b.recv_from(&mut buf).await.unwrap();
         assert_eq!(from, addr_a);
 
         let outcome_b = transport_b.dispatch_incoming(&buf[..len], from);
         assert!(!outcome_b.rejected, "B rejected the init packet");
-        assert_eq!(
-            outcome_b.control,
-            Some(EmberControlMessage::Ping { nonce }),
-            "B should decode the Ping payload",
+        assert!(
+            outcome_b.controls.is_empty(),
+            "B should hold the Ping until A proves it receives at this address",
         );
         assert_eq!(
             outcome_b.responses.len(),
             2,
-            "B should send back IK msg 2 + the Pong reply, got {} packet(s)",
+            "B should send back IK msg 2 + the routability probe, got {} packet(s)",
             outcome_b.responses.len()
         );
 
@@ -2232,19 +3481,51 @@ mod tests {
         let (len, _) = sock_a.recv_from(&mut buf).await.unwrap();
         let outcome_a_handshake = transport_a.dispatch_incoming(&buf[..len], addr_b);
         assert!(!outcome_a_handshake.rejected);
-        assert_eq!(outcome_a_handshake.control, None);
+        assert!(outcome_a_handshake.controls.is_empty());
         assert!(
             outcome_a_handshake.responses.is_empty(),
             "A should not send anything in response to msg 2"
         );
 
-        // ── Step 4: A receives the Pong on the now-established session. ──
+        // ── Step 4: A answers B's probe, which is what proves the
+        //           address and releases A's own Ping on B's side. ──
+        let (len, _) = sock_a.recv_from(&mut buf).await.unwrap();
+        let outcome_a_probe = transport_a.dispatch_incoming(&buf[..len], addr_b);
+        assert!(!outcome_a_probe.rejected);
+        assert_eq!(
+            outcome_a_probe.responses.len(),
+            1,
+            "A auto-answers the probe Ping"
+        );
+        sock_a
+            .send_to(&outcome_a_probe.responses[0], addr_b)
+            .await
+            .unwrap();
+
+        let (len, from) = sock_b.recv_from(&mut buf).await.unwrap();
+        let outcome_b_released = transport_b.dispatch_incoming(&buf[..len], from);
+        assert_eq!(
+            outcome_b_released.controls,
+            vec![EmberControlMessage::Ping { nonce }],
+            "B should now decode the Ping payload it deferred",
+        );
+        assert_eq!(
+            outcome_b_released.responses.len(),
+            1,
+            "B answers the released Ping with a Pong"
+        );
+        sock_b
+            .send_to(&outcome_b_released.responses[0], from)
+            .await
+            .unwrap();
+
+        // ── Step 5: A receives the Pong on the established session. ──
         let (len, _) = sock_a.recv_from(&mut buf).await.unwrap();
         let outcome_a_pong = transport_a.dispatch_incoming(&buf[..len], addr_b);
         assert!(!outcome_a_pong.rejected);
         assert_eq!(
-            outcome_a_pong.control,
-            Some(EmberControlMessage::Pong { nonce }),
+            outcome_a_pong.controls,
+            vec![EmberControlMessage::Pong { nonce }],
             "A should decode the matching Pong"
         );
         assert!(
