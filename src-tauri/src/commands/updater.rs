@@ -602,6 +602,35 @@ fn reject_rollback(
     Ok(())
 }
 
+/// Distinguishes "the endpoint advertises something older than what I am
+/// running" from "the endpoint advertises something older than a signed
+/// document I have already seen".
+///
+/// Only the second is a rollback signal. The first happens legitimately when a
+/// maintainer yanks a release so GitHub's `latest` reverts, or when the user
+/// runs a pre-release/self-built binary — and because the floor is
+/// `max(running identity, stored)`, [`reject_rollback`] cannot tell them apart
+/// and turns every such check into a hard error instead of "you're up to date".
+fn candidate_is_older_than_running_build_only(
+    current_epoch: u64,
+    current_version: &Version,
+    stored: Option<&RollbackState>,
+    candidate_epoch: u64,
+    candidate_version: &Version,
+) -> Result<bool> {
+    let candidate = (candidate_epoch, candidate_version.clone());
+    if candidate >= (current_epoch, current_version.clone()) {
+        return Ok(false);
+    }
+    match stored {
+        // The persisted floor is the attack-relevant one: it records a signed
+        // manifest this install has already accepted. Dropping below it stays a
+        // hard failure.
+        Some(stored) => Ok(candidate >= rollback_state_identity(stored)?),
+        None => Ok(true),
+    }
+}
+
 /// Offer an update when the signed candidate is strictly newer than the running
 /// binary identity `(CURRENT_SECURITY_EPOCH, current_version)`.
 ///
@@ -775,6 +804,23 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         validate_manifest(raw_json, &config.public_key)?;
     let current_version = app.package_info().version.clone();
     let rollback_path = state_path(app)?;
+    let stored_floor = load_rollback_state(&rollback_path)?;
+    if candidate_is_older_than_running_build_only(
+        CURRENT_SECURITY_EPOCH,
+        &current_version,
+        stored_floor.as_ref(),
+        manifest.security_epoch,
+        &manifest_version,
+    )? {
+        // Nothing to offer, and nothing to ratchet: persisting here would lower
+        // the observation floor. Returning early also skips the plugin's second
+        // fetch, which could only produce the same older release.
+        tracing::debug!(
+            "Signed updater manifest advertises {} which is older than the running build; treating as no update",
+            manifest.version
+        );
+        return Ok(None);
+    }
     // Ratchet immediately after the signed document is fully parsed and
     // accepted. The plugin's deliberately independent second fetch is still
     // fallible; delaying this write until after it allowed an older pending
@@ -993,6 +1039,7 @@ pub async fn secure_updater_check(
 
 #[tauri::command]
 pub async fn secure_updater_install(
+    app: AppHandle,
     service: State<'_, UpdaterService>,
     on_event: Channel<UpdateProgress>,
 ) -> Result<(), String> {
@@ -1025,10 +1072,46 @@ pub async fn secure_updater_install(
                 .to_string(),
         );
     }
-    update
-        .update
-        .install(&artifact)
-        .map_err(|error| public_failure("install", error.into()))?;
+    // `Update::install` never comes back on Windows: it hands the bundle to the
+    // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
+    // own `on_before_exit` hook is `AppHandle::cleanup_before_exit`, which only
+    // clears tray icons/resource tables and hides windows — `RunEvent::Exit` is
+    // never dispatched, so without this every installed update would abandon
+    // the .part.met gap maps, nodes.dat, the known.met checkpoint that exists
+    // precisely so AICH doesn't rehash from scratch, sources.met, server.met,
+    // reputation and stats at their last periodic save, and would skip graceful
+    // ed2k-server / rendezvous deregistration.
+    //
+    // Done here rather than by overriding `on_before_exit`, because that hook
+    // runs synchronously on a runtime worker inside `install`: bridging back to
+    // async from there means blocking that worker while another thread drives
+    // the shutdown, and on a single-worker runtime that starves the very
+    // network task we would be waiting on. Awaiting from the command yields the
+    // worker instead. `run_graceful_shutdown` is internally bounded and safe to
+    // run again from a later `RunEvent::Exit`; the outer timeout is the
+    // backstop for a lock inside it that never becomes available.
+    if timeout(
+        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
+        crate::run_graceful_shutdown(&app, crate::SHUTDOWN_WAIT),
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!(
+            "Graceful shutdown did not complete before the update install deadline; proceeding with a possibly truncated flush"
+        );
+    }
+
+    if let Err(error) = update.update.install(&artifact) {
+        tracing::warn!("Secure updater install failed: {error}");
+        // Distinct from `public_failure`: the teardown above already stopped
+        // Ember's network services, so this process is no longer transferring
+        // even though the window is still up.
+        return Err(
+            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers."
+                .to_string(),
+        );
+    }
     pending.take();
     Ok(())
 }
@@ -1104,6 +1187,41 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             &Version::parse("1.0.0").unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn candidate_older_than_running_build_is_not_a_rollback_attack() {
+        let current = Version::parse("1.2.3").unwrap();
+        let older = Version::parse("1.2.2").unwrap();
+
+        // Yanked release / self-built binary, nothing observed yet: no update.
+        assert!(candidate_is_older_than_running_build_only(1, &current, None, 1, &older).unwrap());
+        // Same, with a persisted floor the candidate still satisfies.
+        let below = observed_rollback_state(1, &Version::parse("1.2.0").unwrap());
+        assert!(
+            candidate_is_older_than_running_build_only(1, &current, Some(&below), 1, &older)
+                .unwrap()
+        );
+
+        // Below a signed observation we already recorded: still a hard error.
+        let above = observed_rollback_state(1, &Version::parse("2.0.0").unwrap());
+        assert!(
+            !candidate_is_older_than_running_build_only(1, &current, Some(&above), 1, &older)
+                .unwrap()
+        );
+        assert!(reject_rollback(1, &current, Some(&above), 1, &older).is_err());
+
+        // Equal, newer, and epoch-bumped candidates all stay on the normal path.
+        for (epoch, version) in [(1, "1.2.3"), (1, "1.3.0"), (2, "1.0.0")] {
+            assert!(!candidate_is_older_than_running_build_only(
+                1,
+                &current,
+                None,
+                epoch,
+                &Version::parse(version).unwrap(),
+            )
+            .unwrap());
+        }
     }
 
     #[test]

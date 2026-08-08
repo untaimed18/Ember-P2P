@@ -101,6 +101,137 @@ async fn reconcile_shared_files(network_tx: &mpsc::Sender<network::NetworkComman
     )
 }
 
+/// Ceiling on the whole graceful teardown. Must exceed the network task's
+/// bounded teardown budget so we don't return (and let the process exit) while
+/// .part.met saves are still in flight: the teardown caps its variable phases
+/// at ~5s (await aborted downloads) + ~8s (concurrent tracker saves) plus a few
+/// seconds of fixed saves (nodes.dat/known.met/stats). The common case
+/// completes in well under a second, so this ceiling only bites if the network
+/// is genuinely stuck.
+pub(crate) const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The one authoritative teardown sequence: stop background work, ask the
+/// network task to flush the state it owns (.part.met gap maps, nodes.dat, the
+/// known.met checkpoint, sources.met, server.met, reputation, transfer stats)
+/// and deregister from ed2k servers / the rendezvous, then flush what it
+/// doesn't own.
+///
+/// `RunEvent::Exit` is not the only way this process dies. Installing an update
+/// ends in `std::process::exit(0)` inside `tauri-plugin-updater`, whose
+/// `on_before_exit` hook only clears tray icons/resources and hides windows —
+/// `RunEvent::Exit` never fires. Both paths call this so an update install can
+/// never silently skip the flush and cost the user a full AICH rehash plus the
+/// gap maps of every in-progress download.
+///
+/// Safe to run more than once: once the network task has exited, the shutdown
+/// send fails closed instead of waiting, and every remaining step is an
+/// idempotent re-save.
+pub(crate) async fn run_graceful_shutdown(
+    app: &tauri::AppHandle,
+    shutdown_wait: std::time::Duration,
+) {
+    network::ed2k::preview::cleanup_previews();
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    state
+        .bw_shutdown
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    // Signal every in-flight hash worker to stop ASAP. The startup indexer
+    // (and `reload_shared_files`) check these flags between files and mid-file
+    // via `FileIndexer::hash_file_cancellable`, so flipping them cuts the
+    // worst-case shutdown wait from the full 5-second `scanning_count` grace
+    // window down to ~100ms (one MD4 chunk). Without this the window
+    // disappears immediately after the user clicks Exit but the process keeps
+    // running until the deadline elapses, which surfaces visually as "stuck on
+    // the Chromium UnregisterClass error".
+    {
+        let flags = state.hash_cancel_flags.read().await;
+        for flag in flags.values() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let tx = state.network_tx.clone();
+    const SHUTDOWN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+    let shutdown_deadline = start + shutdown_wait;
+    let mut command = network::NetworkCommand::Shutdown {
+        deadline: tokio::time::Instant::from_std(shutdown_deadline),
+    };
+    let shutdown_sent = loop {
+        match tx.try_send(command) {
+            Ok(()) => {
+                info!("Sent shutdown command to network, waiting for save...");
+                break true;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned))
+                if start.elapsed() < SHUTDOWN_SEND_WAIT =>
+            {
+                command = returned;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to send shutdown command within bounded window: {e}");
+                break false;
+            }
+        }
+    };
+
+    let flag = state.shutdown_complete.clone();
+    while shutdown_sent && !flag.load(std::sync::atomic::Ordering::Acquire) {
+        if start.elapsed() > shutdown_wait {
+            tracing::warn!(
+                "Network shutdown timed out after {}s",
+                shutdown_wait.as_secs()
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    if flag.load(std::sync::atomic::Ordering::Acquire) {
+        info!("Network shutdown complete");
+    } else {
+        tracing::error!(
+            "Shutdown deadline reached before authoritative network writers completed; result is truncated"
+        );
+    }
+
+    // Wait for in-flight discovery/hash workers to finish or abort after a
+    // short grace window. Prevents scans from mutating state (known.met,
+    // local_index) while we're flushing it to disk below.
+    let scanning = state.scanning_count.clone();
+    while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && std::time::Instant::now() < shutdown_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let handles: Vec<_> = {
+        let mut map = state.background_scans.write().await;
+        map.drain().map(|(_, h)| h).collect()
+    };
+    for h in handles {
+        h.abort();
+    }
+
+    // Flush any learned spam signals not yet persisted by the periodic flush
+    // (e.g. an auto-not-spam that landed since the last tick). Wait briefly for
+    // the lock rather than the old non-blocking `try_write`, which silently
+    // skipped the save under contention. The network task has already shut down
+    // here, so the lock is normally free; the timeout is a safety net so
+    // shutdown can't hang.
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(shutdown_deadline),
+        state.spam_filter.write(),
+    )
+    .await
+    {
+        Ok(mut filter) => filter.save(),
+        Err(_) => tracing::warn!("Spam filter save skipped on shutdown: lock busy"),
+    };
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
@@ -1690,140 +1821,12 @@ pub fn run() {
         })
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                network::ed2k::preview::cleanup_previews();
-                if let Some(state) = app_handle.try_state::<AppState>() {
-                    state.bw_shutdown.store(true, std::sync::atomic::Ordering::Release);
-
-                    // Signal every in-flight hash worker to stop ASAP. The
-                    // startup indexer (and `reload_shared_files`) check
-                    // these flags between files and mid-file via
-                    // `FileIndexer::hash_file_cancellable`, so flipping
-                    // them cuts the worst-case shutdown wait from the
-                    // full 5-second `scanning_count` grace window down
-                    // to ~100ms (one MD4 chunk). Without this the
-                    // window disappears immediately after the user
-                    // clicks Exit but the process keeps running until
-                    // the deadline elapses, which surfaces visually
-                    // as "stuck on the Chromium UnregisterClass error".
-                    {
-                        let cancel_flags = state.hash_cancel_flags.clone();
-                        let rt = tauri::async_runtime::handle();
-                        rt.block_on(async move {
-                            let flags = cancel_flags.read().await;
-                            for flag in flags.values() {
-                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        });
-                    }
-
-                    let tx = state.network_tx.clone();
-                    const SHUTDOWN_WAIT: std::time::Duration =
-                        std::time::Duration::from_secs(45);
-                    const SHUTDOWN_SEND_WAIT: std::time::Duration =
-                        std::time::Duration::from_secs(2);
-                    let start = std::time::Instant::now();
-                    let shutdown_deadline = start + SHUTDOWN_WAIT;
-                    let mut command = network::NetworkCommand::Shutdown {
-                        deadline: tokio::time::Instant::from_std(shutdown_deadline),
-                    };
-                    let shutdown_sent = loop {
-                        match tx.try_send(command) {
-                            Ok(()) => {
-                                info!("Sent shutdown command to network, waiting for save...");
-                                break true;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(returned))
-                                if start.elapsed() < SHUTDOWN_SEND_WAIT =>
-                            {
-                                command = returned;
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to send shutdown command within bounded window: {e}"
-                                );
-                                break false;
-                            }
-                        }
-                    };
-
-                    let flag = state.shutdown_complete.clone();
-                    // Must exceed the network task's bounded teardown budget so
-                    // we don't return (and let the process exit) while .part.met
-                    // saves are still in flight: the teardown caps its variable
-                    // phases at ~5s (await aborted downloads) + ~8s (concurrent
-                    // tracker saves) plus a few seconds of fixed saves
-                    // (nodes.dat/known.met/stats). The common case sets the flag
-                    // in well under a second, so this ceiling only bites if the
-                    // network is genuinely stuck.
-                    while shutdown_sent && !flag.load(std::sync::atomic::Ordering::Acquire) {
-                        if start.elapsed() > SHUTDOWN_WAIT {
-                            tracing::warn!(
-                                "Network shutdown timed out after {}s",
-                                SHUTDOWN_WAIT.as_secs()
-                            );
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    if flag.load(std::sync::atomic::Ordering::Acquire) {
-                        info!("Network shutdown complete");
-                    } else {
-                        tracing::error!(
-                            "Shutdown deadline reached before authoritative network writers completed; result is truncated"
-                        );
-                    }
-
-                    // Wait for in-flight discovery/hash workers to finish or
-                    // abort after a short grace window. Prevents scans from
-                    // mutating state (known.met, local_index) while we're
-                    // flushing it to disk below.
-                    {
-                        let scanning = state.scanning_count.clone();
-                        let bg = state.background_scans.clone();
-                        let rt = tauri::async_runtime::handle();
-                        rt.block_on(async move {
-                            let deadline = shutdown_deadline;
-                            while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
-                                && std::time::Instant::now() < deadline
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            }
-                            let handles: Vec<_> = {
-                                let mut map = bg.write().await;
-                                map.drain().map(|(_, h)| h).collect()
-                            };
-                            for h in handles {
-                                h.abort();
-                            }
-                        });
-                    }
-
-                    // Flush any learned spam signals not yet persisted by the
-                    // periodic flush (e.g. an auto-not-spam that landed since
-                    // the last tick). Wait briefly for the lock rather than the
-                    // old non-blocking `try_write`, which silently skipped the
-                    // save under contention. The network task has already shut
-                    // down here, so the lock is normally free; the timeout is a
-                    // safety net so shutdown can't hang.
-                    {
-                        let rt = tauri::async_runtime::handle();
-                        let spam = state.spam_filter.clone();
-                        rt.block_on(async move {
-                            match tokio::time::timeout_at(
-                                tokio::time::Instant::from_std(shutdown_deadline),
-                                spam.write(),
-                            )
-                            .await
-                            {
-                                Ok(mut filter) => filter.save(),
-                                Err(_) => tracing::warn!(
-                                    "Spam filter save skipped on shutdown: lock busy"
-                                ),
-                            }
-                        });
-                    }
-                }
+                // Exit is delivered on the main thread, outside the async
+                // runtime, and the process is torn down the moment this
+                // returns — block here until the teardown has finished
+                // flushing rather than letting it race the exit.
+                tauri::async_runtime::handle()
+                    .block_on(run_graceful_shutdown(app_handle, SHUTDOWN_WAIT));
             }
         });
 }
