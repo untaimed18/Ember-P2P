@@ -875,7 +875,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.5.0</h3>
+      <h3>Get Ember 1.5.1</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1530,6 +1530,74 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-5-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.1" target="_blank" rel="noopener">Ember v1.5.1</a></h3>
+        <time class="release-date" datetime="2026-08-08">August 8, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.1" target="_blank" rel="noopener"><code>v1.5.1</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s Changed</h4>
+
+        <p>A second full audit, this time reading the whole app in parallel &mdash; the network loop, each eD2K path, Kad, the Ember overlay, storage and security, the command layer, the interface, and the rendezvous server. Twenty-two findings survived checking, and every one of them is fixed here.</p>
+
+        <p>Two were costing people something every day. If you run Ember server-only &mdash; which is what you have if you never press Connect on the Kad page &mdash; <strong>every reply peers sent you was being thrown away</strong>, so queue positions never moved while Ember kept asking for them. And roughly <strong>one in every 250 incoming connections from a stock eMule client was dropped before it started</strong>, because a byte we assumed eMule would never send is in fact one it picks at random.</p>
+
+        <h5>Before you upgrade</h5>
+        <ul>
+          <li><strong>Nothing to do this time.</strong> Unlike 1.5.0, this release does not change your library database, so you can move between 1.5.0 and 1.5.1 freely</li>
+        </ul>
+
+        <h5>Talking to other clients</h5>
+        <ul>
+          <li><strong>Queue positions update again with Kad off</strong> &mdash; Replies from peers &mdash; your place in their queue, whether a source is still alive, the answer to the UDP port test, and reask relaying for firewalled peers &mdash; all arrive on the same socket Kad uses, and Ember discarded the lot whenever Kad was not connected. It kept sending the questions, so the traffic went out and nothing ever came back. Peers waiting in <em>your</em> queue got no acknowledgement either, and had to fall back or give up</li>
+          <li><strong>eMule clients connect reliably</strong> &mdash; Ember&rsquo;s private friend handshake opens with a byte we believed eMule&rsquo;s obfuscation could never begin with. It can: eMule picks that first byte at random and rules out only three values. Every collision sent an ordinary eMule client into the wrong handshake and dropped the connection, usually after making it wait ten seconds first</li>
+          <li><strong>One peer&rsquo;s &ldquo;I don&rsquo;t have that&rdquo; no longer counts against your other downloads</strong> &mdash; A peer declining one file was marked as failed on <em>every</em> file you were getting from it, and any queue position you had just learned was thrown away with it. Peers commonly serve several of your downloads at once, so this quietly cost you working sources</li>
+          <li><strong>Server names show up instead of an address</strong> &mdash; A server that sent its name in the compact form the eMule protocol also allows was not understood, so the list kept showing a bare IP address for it</li>
+        </ul>
+
+        <h5>Uploads</h5>
+        <ul>
+          <li><strong>A single peer can no longer pin your disk and a CPU core</strong> &mdash; One small request asked Ember to hash an entire shared file from start to finish, and nothing remembered the answer, so the same request repeated forever cost the same work every time. It needed no upload slot, no queue position and no identity. On a large share a handful of packets could make the app unresponsive for minutes, and stall your downloads with it</li>
+          <li><strong>More upload slots on a slow connection</strong> &mdash; Ember guaranteed two upload slots where eMule guarantees four, and because the number is worked out from how fast you are actually uploading, two slow peers kept it there. You now serve as many peers as eMule would, and two trickling peers can no longer hold your whole upload</li>
+        </ul>
+
+        <h5>Downloads</h5>
+        <ul>
+          <li><strong>Peers that compress are no longer dropped mid-transfer</strong> &mdash; When another source finished the part you were working on first, a compressed block already on its way arrived with nothing to match it against, and Ember treated that as the peer misbehaving and closed the connection &mdash; then waited out a cooldown of nearly half an hour before trying it again. It happens in ordinary use, with nothing wrong at either end</li>
+          <li><strong>Invented identities cannot push out real sources</strong> &mdash; When a file&rsquo;s source list is full, Ember drops the least valuable entry rather than the oldest. Which entries counted as least valuable depended on a name the sending peer chose, so a peer that made one up for each source it offered could push out sources you had already used, and the replacements were the ones written to disk for next time</li>
+          <li><strong>Repeated junk sources no longer displace working ones</strong> &mdash; A firewalled source offered with an id of zero can never be contacted, and was the one value the duplicate check could not recognise, so sending the same packet again added another dead entry every time</li>
+          <li><strong>A peer cannot make Ember hold hundreds of megabytes</strong> &mdash; While waiting for a corruption-recovery answer, Ember set aside a fixed number of packets regardless of how large they were, which a peer could inflate deliberately</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>Each peer contributes everything it holds</strong> &mdash; Asking a peer for the next page of results was meant to happen once it had sent a full page, but the check compared a single network packet against the size of a whole page, and a page always arrives split across many packets. No peer was ever asked for a second page, so popular keywords returned only the first slice of what each peer actually had</li>
+        </ul>
+
+        <h5>Friends and the Ember Network</h5>
+        <ul>
+          <li><strong>Relayed transfers survive a quiet moment</strong> &mdash; When both sides are firewalled, traffic can go through the rendezvous server. A relayed connection that went quiet for thirty seconds was closed by the layer underneath, even though the relay itself allows three minutes &mdash; and quiet is normal here: a peer parked in an upload queue says nothing for close to half an hour. This is a server-side fix and is already live, so it applies to 1.5.0 too</li>
+          <li><strong>Kad storage cannot be filled by one peer</strong> &mdash; Comments and ratings published to your node had no per-publisher limit at all, so one peer could fill the space shared with keyword and source records &mdash; after which no new source could be stored and honest keyword records were discarded to make room. Separately, a peer whose own record was going to be refused could still make Ember delete somebody else&rsquo;s to make space for it</li>
+        </ul>
+
+        <h5>Your data</h5>
+        <ul>
+          <li><strong>An unexpected exit no longer discards the session</strong> &mdash; Ember&rsquo;s save-on-exit sequence ran on a deadline set forty-five seconds after launch. When the app closed any way other than being asked to, that deadline had long passed and every step was skipped &mdash; peer list, library checkpoint, credits, reputation and server list &mdash; while the log blamed a slow disk. The library checkpoint alone is what avoids re-hashing your whole share on the next start</li>
+          <li><strong>Your identity survives an interrupted save</strong> &mdash; Replacing a file on Windows sometimes needs the old one moved aside first, and if the app died in that instant the only copy was left under a name nothing ever looked for again. For your identity file that meant the next launch generated a brand new one, silently resetting your Kad id, your friendships and your credit with every peer</li>
+          <li><strong>A locked settings file no longer unapproves your folders</strong> &mdash; If the record of which folders Ember may use could not be read at startup &mdash; a backup tool or antivirus holding it open is enough &mdash; it was treated as damaged and replaced with an empty one. Every shared folder and your download folder then had to be re-approved by hand</li>
+          <li><strong>Backups are never shared to the network</strong> &mdash; Saving a profile backup into one of your shared folders got it indexed, hashed and offered to other peers like any other file. It holds your keys, so it should never have been publishable, however strong the passphrase</li>
+          <li><strong>Two exports at once cannot destroy a backup</strong> &mdash; Starting a second export to the same file before the first finished mixed the two together and reported success, leaving a backup no passphrase could ever open where a good one used to be</li>
+          <li>The brief hitch every few minutes while the Ember peer list was written to disk is gone, and a slow save no longer eats into the time the other saves have</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.0...v1.5.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.0...v1.5.1</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-5-0">
       <div class="release-header">
