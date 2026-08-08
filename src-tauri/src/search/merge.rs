@@ -116,6 +116,49 @@ pub fn combine_origin(a: &str, b: &str) -> String {
 
 const MAX_SOURCE_ADDRS: usize = 500;
 
+/// Plausibility ceiling for peer-reported swarm counts.
+///
+/// `complete_sources` and `availability` arrive straight off the wire, so a
+/// peer answering with `u32::MAX` sorted above every honest hit — and the spam
+/// filter, the intended counter, only engages at 8+ results and is skipped
+/// under the `relaxed` profile, so a small poisoned batch was both unflagged
+/// and top-ranked. eD2k carries this same count as a `u16` on the wire
+/// (OP_FILESTATUS), and the most-sighted files on the network sit in the low
+/// thousands of sources, so `u16::MAX` is protocol-plausible and an order of
+/// magnitude above anything real: it never touches an honest row.
+const MAX_PLAUSIBLE_SOURCES: u32 = u16::MAX as u32;
+
+#[inline]
+fn clamp_source_count(count: u32) -> u32 {
+    count.min(MAX_PLAUSIBLE_SOURCES)
+}
+
+/// Filename ballots for one merged row: name → (votes, first-seen order).
+///
+/// eMule votes on the filename across the sources advertising a hash. The old
+/// rule was "longest name wins", and length is entirely attacker-chosen: ed2k
+/// hashes are public, so one reply carrying a real hash with a padded name
+/// renamed the merged row — and, because the UI hands `file.name` to
+/// `start_download`, the file written to disk as well.
+type NameVotes = HashMap<String, (u32, usize)>;
+
+fn vote_name(votes: &mut NameVotes, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    let first_seen = votes.len();
+    let entry = votes.entry(name.to_string()).or_insert((0, first_seen));
+    entry.0 = entry.0.saturating_add(1);
+}
+
+/// Most advertised name, with the first-seen name breaking a tie.
+fn elected_name(votes: &NameVotes) -> Option<&str> {
+    votes
+        .iter()
+        .max_by(|(_, a), (_, b)| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+        .map(|(name, _)| name.as_str())
+}
+
 fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     let prev_origin = existing.result_origin.clone();
     existing.result_origin = combine_origin(&existing.result_origin, &incoming.result_origin);
@@ -128,24 +171,28 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
         }
     }
     // eMule SearchList: ed2k (server/UDP) hits for the same hash *sum*
-    // availability; Kad uses max. Mixed Kad+ed2k keeps max.
-    existing.availability = if is_ed2k_network_origin(&prev_origin)
-        && is_ed2k_network_origin(&incoming.result_origin)
-    {
+    // availability; Kad uses max. Mixed Kad+ed2k keeps max. Both inputs are
+    // peer-supplied, so the result is held to `MAX_PLAUSIBLE_SOURCES` — an
+    // uncapped `saturating_add` let a padded claim keep growing across merges.
+    existing.availability = clamp_source_count(
+        if is_ed2k_network_origin(&prev_origin) && is_ed2k_network_origin(&incoming.result_origin) {
+            existing
+                .availability
+                .saturating_add(incoming.availability)
+                .max(existing.source_addresses.len() as u32)
+        } else {
+            existing
+                .availability
+                .max(incoming.availability)
+                .max(existing.source_addresses.len() as u32)
+        },
+    );
+    existing.file.complete_sources = clamp_source_count(
         existing
-            .availability
-            .saturating_add(incoming.availability)
-            .max(existing.source_addresses.len() as u32)
-    } else {
-        existing
-            .availability
-            .max(incoming.availability)
-            .max(existing.source_addresses.len() as u32)
-    };
-    existing.file.complete_sources = existing
-        .file
-        .complete_sources
-        .max(incoming.file.complete_sources);
+            .file
+            .complete_sources
+            .max(incoming.file.complete_sources),
+    );
     if existing.file_type.is_empty() && !incoming.file_type.is_empty() {
         existing.file_type = incoming.file_type;
     }
@@ -180,7 +227,10 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
             em.title = inc_media.title;
         }
     }
-    if incoming.file.name.len() > existing.file.name.len() {
+    // The filename is *not* decided here: `merge_search_vecs` elects it by vote
+    // across every source that advertised this hash (see `NameVotes`). Keep the
+    // name we already have until that vote is counted.
+    if existing.file.name.is_empty() && !incoming.file.name.is_empty() {
         existing.file.name = incoming.file.name;
     }
     // Prefer a real Ember content digest / AICH root when either side has one
@@ -216,13 +266,24 @@ pub fn merge_search_vecs(
     secondary: Vec<SearchResult>,
 ) -> Vec<SearchResult> {
     let mut map: HashMap<String, SearchResult> = HashMap::new();
+    // Ballots live here rather than on `SearchResult`: that type is serialized
+    // straight to the frontend, so it must not grow a merge-only field.
+    let mut name_votes: HashMap<String, NameVotes> = HashMap::new();
     for r in primary.into_iter().chain(secondary) {
         let k = result_key(&r);
+        vote_name(name_votes.entry(k.clone()).or_default(), &r.file.name);
         if let Some(mut e) = map.remove(&k) {
             merge_into(&mut e, r);
             map.insert(k, e);
         } else {
             map.insert(k, r);
+        }
+    }
+    for (key, result) in map.iter_mut() {
+        if let Some(elected) = name_votes.get(key).and_then(elected_name) {
+            if result.file.name != elected {
+                result.file.name = elected.to_string();
+            }
         }
     }
     let mut out: Vec<SearchResult> = map.into_values().collect();
@@ -232,10 +293,14 @@ pub fn merge_search_vecs(
 
 pub fn sort_search_results(v: &mut [SearchResult]) {
     v.sort_by(|a, b| {
-        b.file
-            .complete_sources
-            .cmp(&a.file.complete_sources)
-            .then_with(|| b.availability.cmp(&a.availability))
+        // Rank on clamped counts: both fields are remote-controlled, so a row
+        // that has never been merged (and therefore never passed through the
+        // cap in `merge_into`) must not buy the top slot with a padded number.
+        clamp_source_count(b.file.complete_sources)
+            .cmp(&clamp_source_count(a.file.complete_sources))
+            .then_with(|| {
+                clamp_source_count(b.availability).cmp(&clamp_source_count(a.availability))
+            })
             .then_with(|| {
                 let an = if a.clean_name.is_empty() {
                     &a.file.name
@@ -379,6 +444,69 @@ mod tests {
         let empty = sample("dd", 2, ORIGIN_KAD);
         merge_into(&mut keep, empty);
         assert_eq!(keep.file.ember_file_hash, "cd".repeat(32));
+    }
+
+    fn named(hash: &str, name: &str, origin: &str) -> SearchResult {
+        let mut r = sample(hash, 1, origin);
+        r.file.name = name.into();
+        r
+    }
+
+    #[test]
+    fn padded_name_cannot_outvote_the_majority_name() {
+        // Two honest sources advertise the real name; one attacker answers with
+        // the same (public) hash and a padded name. Length used to decide.
+        let merged = merge_search_vecs(
+            vec![
+                named("ee", "ubuntu.iso", ORIGIN_SERVER_TCP),
+                named("ee", "ubuntu.iso", ORIGIN_SERVER_UDP),
+            ],
+            vec![named("ee", "ubuntu.iso.VERIFIED.NO.VIRUS.exe", ORIGIN_KAD)],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].file.name, "ubuntu.iso");
+    }
+
+    #[test]
+    fn name_vote_ties_keep_the_first_seen_name() {
+        let merged = merge_search_vecs(
+            vec![named("ff", "clip.avi", ORIGIN_SERVER_TCP)],
+            vec![named("ff", "clip.avi.HD.REPACK.scr", ORIGIN_KAD)],
+        );
+        assert_eq!(merged[0].file.name, "clip.avi");
+    }
+
+    #[test]
+    fn merge_fills_an_empty_name_from_the_other_source() {
+        let merged = merge_search_vecs(
+            vec![named("gg", "", ORIGIN_KAD)],
+            vec![named("gg", "real.bin", ORIGIN_SERVER_TCP)],
+        );
+        assert_eq!(merged[0].file.name, "real.bin");
+    }
+
+    #[test]
+    fn inflated_source_claims_are_clamped_for_ranking() {
+        // A peer claiming u32::MAX must not outrank a result already at the
+        // plausibility ceiling: the two tie and the name tiebreak decides.
+        let mut liar = named("hh", "zzz-fake.bin", ORIGIN_KAD);
+        liar.availability = u32::MAX;
+        liar.file.complete_sources = u32::MAX;
+        let mut honest = named("ii", "aaa-real.bin", ORIGIN_SERVER_TCP);
+        honest.availability = MAX_PLAUSIBLE_SOURCES;
+        honest.file.complete_sources = MAX_PLAUSIBLE_SOURCES;
+        let mut v = vec![liar, honest];
+        sort_search_results(&mut v);
+        assert_eq!(v[0].file.name, "aaa-real.bin");
+    }
+
+    #[test]
+    fn merged_counts_are_capped_at_the_plausible_ceiling() {
+        let merged = merge_search_vecs(
+            vec![sample("jj", u32::MAX, ORIGIN_SERVER_TCP)],
+            vec![sample("jj", u32::MAX, ORIGIN_SERVER_UDP)],
+        );
+        assert_eq!(merged[0].availability, MAX_PLAUSIBLE_SOURCES);
     }
 
     #[test]

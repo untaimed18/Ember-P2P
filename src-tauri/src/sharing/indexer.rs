@@ -13,6 +13,14 @@ use crate::types::FileInfo;
 pub struct FileIndexer;
 
 const MAX_DISCOVERED_FILES: usize = 100_000;
+/// Upper bound on the directory frontier (`pending`) during discovery.
+///
+/// `MAX_DISCOVERED_FILES` bounds the returned page, but the globally sorted
+/// heap holds every sibling of every directory opened so far, and children are
+/// enqueued before any cap check: one very wide directory (~500k entries) cost
+/// ~100 MB of transient heap on top of the ~50 MB the page itself holds. Twice
+/// the page cap, so no tree whose page can be returned in full ever trims.
+const MAX_PENDING_FRONTIER: usize = 2 * MAX_DISCOVERED_FILES;
 
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
@@ -134,10 +142,17 @@ impl FileIndexer {
                     Ok(entries) => entries,
                     Err(error) => {
                         warn!("Failed to read shared directory {}: {error}", directory.display());
-                        return;
+                        return false;
                     }
                 };
+                let mut trimmed = false;
                 for entry in entries {
+                    if pending.len() >= MAX_PENDING_FRONTIER {
+                        // Stop growing the frontier; the caller marks the page
+                        // `partial` so nothing is reconciled away against it.
+                        trimmed = true;
+                        break;
+                    }
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
@@ -185,12 +200,20 @@ impl FileIndexer {
                         pending.push(Reverse((key, entry_path, false)));
                     }
                 }
+                trimmed
             };
-        enqueue_children(path, &mut pending);
+        let mut frontier_trimmed = enqueue_children(path, &mut pending);
 
         while let Some(Reverse((_key, entry_path, is_directory))) = pending.pop() {
             if is_directory {
-                enqueue_children(&entry_path, &mut pending);
+                // A full page cannot take more files, so descending further only
+                // grows the frontier. Stop and report the cap: the next scan
+                // resumes from the cursor and picks these directories up there.
+                if files.len() >= MAX_DISCOVERED_FILES {
+                    truncated = true;
+                    break;
+                }
+                frontier_trimmed |= enqueue_children(&entry_path, &mut pending);
                 continue;
             }
             if is_excluded_share_file_name(&entry_path) {
@@ -231,10 +254,18 @@ impl FileIndexer {
         // pinned the "only the first N files were indexed" banner on ordinary
         // reloads and re-published a cursor for the page that finished the
         // folder, costing an extra full re-walk before the cursor could reset.
-        let partial = truncated || (cursor.is_some() && saw_before_cursor);
+        // A trimmed frontier also means entries were never visited, so the page
+        // is not an authoritative listing of the folder either.
+        let partial = truncated || frontier_trimmed || (cursor.is_some() && saw_before_cursor);
         let next_cursor = truncated
             .then(|| files.last().map(|file| normalize_path_key(&file.path)))
             .flatten();
+        if frontier_trimmed {
+            warn!(
+                "Discovery in {dir} hit the {MAX_PENDING_FRONTIER}-entry traversal \
+                 limit; this page is partial"
+            );
+        }
         if truncated {
             warn!(
                 "Discovery page in {dir} reached file cap {MAX_DISCOVERED_FILES}; a later scan resumes after {}",

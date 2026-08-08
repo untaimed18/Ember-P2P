@@ -232,15 +232,21 @@ impl SharedFoldersWatcher {
         // an unreachable share, and holding `watched` across that blocks
         // `sync_paths` — which the add/remove folder commands call — for the
         // same stretch.
-        let watched_now: Vec<PathBuf> = self.watched.lock().iter().cloned().collect();
+        let watched_now: HashSet<PathBuf> = self.watched.lock().iter().cloned().collect();
         let vanished: Vec<PathBuf> = watched_now
-            .into_iter()
+            .iter()
             .filter(|path| !path.exists())
+            .cloned()
             .collect();
+        // Test membership against the snapshot, not a fresh `lock()`: the guard
+        // temporary lived until the end of the closure body, so the lock was
+        // still held across `exists()` — and `&&` short-circuits, so `exists()`
+        // was reached exactly for the not-yet-watched paths this retry exists
+        // for, i.e. the disconnected shares that block longest.
         let reappeared = desired
             .iter()
             .map(PathBuf::from)
-            .any(|path| !self.watched.lock().contains(&path) && path.exists());
+            .any(|path| !watched_now.contains(&path) && path.exists());
 
         if !vanished.is_empty() {
             // Release the OS watch before forgetting the path. Dropping it
@@ -266,7 +272,11 @@ impl SharedFoldersWatcher {
         }
 
         if reappeared {
-            self.sync_paths(&desired);
+            // Straight to `apply_watches`: we are already on a blocking thread,
+            // and re-publishing our own `desired` snapshot through `sync_paths`
+            // would overwrite a newer list an add/remove command may have
+            // installed while we were probing.
+            self.apply_watches(&desired);
         }
     }
 
@@ -277,6 +287,28 @@ impl SharedFoldersWatcher {
         // Remember the full request, including paths that are offline right
         // now, so `resync_unwatched` can pick them up when they reappear.
         *self.desired.lock() = desired.to_vec();
+        // Everything below is blocking syscalls: `exists()` on an offline
+        // SMB/NFS share sits for as long as the OS takes to give up, and so can
+        // `watch()`. Every call site is an async Tauri command running on a
+        // Tokio worker, so doing that inline parked a worker for the duration.
+        // `block_in_place` hands this worker's remaining tasks to another thread
+        // instead, so a stalled probe costs the caller and nothing else.
+        // Outside a multi-threaded runtime — `start()` runs in Tauri's
+        // synchronous `setup` hook — apply directly, since `block_in_place`
+        // is only valid on the multi-threaded scheduler.
+        let on_multi_thread_worker = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if on_multi_thread_worker {
+            tokio::task::block_in_place(|| self.apply_watches(desired));
+        } else {
+            self.apply_watches(desired);
+        }
+    }
+
+    /// The blocking half of [`SharedFoldersWatcher::sync_paths`]: probe every
+    /// desired path and add/remove the OS watches to match.
+    fn apply_watches(&self, desired: &[String]) {
         let desired_set: HashSet<PathBuf> = desired
             .iter()
             .filter_map(|p| {

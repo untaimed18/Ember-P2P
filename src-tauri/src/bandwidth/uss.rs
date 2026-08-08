@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// USS states matching eMule's LastCommonRouteFinder phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,17 @@ pub enum UssState {
 const MAX_PING_HISTORY: usize = 50;
 const BASELINE_SAMPLES: usize = 5;
 const FAST_REACTION_SECS: u64 = 60;
+/// How long the quiet-baseline phase may hold uploads at `min_upload`.
+///
+/// The network loop pings the selected KAD host every 2s, so `BASELINE_SAMPLES`
+/// normally completes in ~10s; 60s covers a host rotation (3 missed pongs) plus
+/// reselection with room to spare. Past it we stop throttling, because the RTT
+/// feed can be *permanently* empty and nothing else notices: samples only exist
+/// while a USS ping host is selected, and none ever is when KAD is disabled,
+/// bootstrap failed, no contact verifies behind a restrictive NAT, or the user
+/// runs eD2k-only / Ember-only. Without a deadline that pinned uploads at
+/// `sanitize_min_upload` (10% of the configured cap) for the whole session.
+const PREPARE_BASELINE_TIMEOUT_SECS: u64 = 60;
 /// KAD peer RTT is noisier than eMule's last-hop ICMP ping, so allow more
 /// headroom than eMule's classic 1.5× before throttling.
 const DEFAULT_PING_TOLERANCE: f64 = 2.0;
@@ -40,6 +51,13 @@ pub struct UploadSpeedSense {
     going_up_divider: f64,
     going_down_divider: f64,
     start_time: Option<Instant>,
+    /// When the current `Preparing` phase began, so a baseline that never
+    /// arrives cannot throttle uploads for the rest of the session.
+    prepare_started: Option<Instant>,
+    /// `Preparing` outlived its deadline with too few samples: run at the
+    /// configured cap instead of `min_upload`. Not a latch — `record_ping`
+    /// still promotes to `Monitoring` if samples show up later.
+    baseline_stalled: bool,
 }
 
 impl UploadSpeedSense {
@@ -57,6 +75,8 @@ impl UploadSpeedSense {
             going_up_divider: DEFAULT_GOING_UP_DIVIDER,
             going_down_divider: DEFAULT_GOING_DOWN_DIVIDER,
             start_time: None,
+            prepare_started: None,
+            baseline_stalled: false,
         }
     }
 
@@ -70,6 +90,8 @@ impl UploadSpeedSense {
             self.state = UssState::Preparing;
             self.initial_ping_ms = 0.0;
             self.start_time = Some(Instant::now());
+            self.prepare_started = Some(Instant::now());
+            self.baseline_stalled = false;
             self.ping_history.clear();
             // Measure baseline under light load (see `compute_limit` while
             // Preparing). After the baseline is ready we jump to the full cap
@@ -83,6 +105,8 @@ impl UploadSpeedSense {
         let was_enabled = self.enabled;
         self.enabled = false;
         self.state = UssState::Disabled;
+        self.prepare_started = None;
+        self.baseline_stalled = false;
         self.ping_history.clear();
         if was_enabled {
             info!("USS disabled");
@@ -115,14 +139,22 @@ impl UploadSpeedSense {
             // makes USS too tolerant of congestion.
             self.initial_ping_ms = self.compute_min();
             self.state = UssState::Monitoring;
+            // A stalled baseline is measured at the full cap rather than at
+            // `min_upload`, so it can read high; the Monitoring ratchet below
+            // pulls it back down once a genuinely quieter window arrives.
+            let was_stalled = self.baseline_stalled;
+            self.baseline_stalled = false;
+            self.prepare_started = None;
             // Start monitoring from the configured ceiling; RTT will pull it
             // down if the full rate congests the path.
             if self.max_upload > 0 {
                 self.current_limit = self.max_upload;
             }
             info!(
-                "USS: Baseline RTT established: {:.1}ms (lowest of {} samples)",
-                self.initial_ping_ms, BASELINE_SAMPLES
+                "USS: Baseline RTT established: {:.1}ms (lowest of {} samples{})",
+                self.initial_ping_ms,
+                BASELINE_SAMPLES,
+                if was_stalled { ", after fallback" } else { "" }
             );
         } else if self.state == UssState::Monitoring
             && self.initial_ping_ms > 0.0
@@ -160,13 +192,39 @@ impl UploadSpeedSense {
     /// Compute the adjusted upload limit based on current latency vs baseline.
     ///
     /// While Preparing, returns the minimum upload so baseline RTT is measured
-    /// on a quiet path. While Monitoring, steps the limit up/down from RTT.
+    /// on a quiet path — unless the baseline never arrived, in which case the
+    /// configured cap is returned (see `PREPARE_BASELINE_TIMEOUT_SECS`). While
+    /// Monitoring, steps the limit up/down from RTT.
     pub fn compute_limit(&mut self) -> Option<u64> {
         if !self.enabled {
             return None;
         }
 
         if self.state == UssState::Preparing {
+            let deadline_passed = self.prepare_started.is_some_and(|started| {
+                started.elapsed().as_secs() >= PREPARE_BASELINE_TIMEOUT_SECS
+            });
+            let starved = self.ping_history.len() < BASELINE_SAMPLES;
+            if !self.baseline_stalled && deadline_passed && starved {
+                self.baseline_stalled = true;
+                warn!(
+                    "USS: no RTT baseline after {PREPARE_BASELINE_TIMEOUT_SECS}s \
+                     ({}/{BASELINE_SAMPLES} samples); running at the configured \
+                     upload cap instead of throttling",
+                    self.ping_history.len()
+                );
+            }
+            if self.baseline_stalled {
+                // Give the cap back rather than sitting at `min_upload`
+                // forever. `record_ping` still promotes to Monitoring the
+                // moment enough samples arrive, so a ping host that only
+                // appears after a late bootstrap re-engages USS by itself —
+                // the fallback must not become a one-way disable.
+                if self.max_upload > 0 {
+                    self.current_limit = self.max_upload;
+                }
+                return Some(self.current_limit.max(self.min_upload));
+            }
             return Some(self.min_upload);
         }
 
@@ -300,6 +358,14 @@ fn sanitize_min_upload(min_upload: u64, max_upload: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Pretend the quiet-baseline phase started before its deadline.
+    fn expire_prepare_deadline(uss: &mut UploadSpeedSense) {
+        uss.prepare_started =
+            Instant::now().checked_sub(Duration::from_secs(PREPARE_BASELINE_TIMEOUT_SECS + 1));
+        assert!(uss.prepare_started.is_some(), "monotonic clock too young");
+    }
 
     #[test]
     fn preparing_holds_min_until_baseline() {
@@ -388,5 +454,54 @@ mod tests {
     fn min_upload_tracks_ten_percent_of_cap() {
         let uss = UploadSpeedSense::new(0, 500_000);
         assert_eq!(uss.min_upload, 50_000);
+    }
+
+    #[test]
+    fn baseline_that_never_arrives_falls_back_to_the_cap() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        // No KAD ping host (KAD off, failed bootstrap, nothing verified) means
+        // `record_ping` is never called at all.
+        assert_eq!(uss.compute_limit(), Some(100_000));
+        expire_prepare_deadline(&mut uss);
+        assert_eq!(uss.compute_limit(), Some(1_000_000));
+        // Still Preparing, so a late baseline is still accepted.
+        assert_eq!(uss.state(), UssState::Preparing);
+    }
+
+    #[test]
+    fn starved_baseline_falls_back_yet_late_samples_still_engage_uss() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        // A host answered a couple of pings, then went away.
+        uss.record_ping(40.0);
+        uss.record_ping(42.0);
+        assert_eq!(uss.compute_limit(), Some(100_000));
+        expire_prepare_deadline(&mut uss);
+        assert_eq!(uss.compute_limit(), Some(1_000_000));
+
+        // The fallback must not latch USS off: enough samples still promote to
+        // Monitoring and hand control of the cap back to RTT.
+        for _ in 0..BASELINE_SAMPLES {
+            uss.record_ping(40.0);
+        }
+        assert_eq!(uss.state(), UssState::Monitoring);
+        assert!(!uss.baseline_stalled);
+        assert!((uss.initial_ping_ms - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn baseline_in_time_is_unaffected_by_the_deadline() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        for _ in 0..BASELINE_SAMPLES {
+            uss.record_ping(40.0);
+        }
+        assert_eq!(uss.state(), UssState::Monitoring);
+        // An expired-looking start time must not disturb an established
+        // baseline; only the Preparing branch consults it.
+        expire_prepare_deadline(&mut uss);
+        assert!(!uss.baseline_stalled);
+        assert_eq!(uss.compute_limit(), Some(1_000_000));
     }
 }

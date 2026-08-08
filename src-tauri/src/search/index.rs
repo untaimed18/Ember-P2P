@@ -816,11 +816,31 @@ impl LocalIndex {
     /// consistent for the affected slot so no full rebuild is required.
     fn upsert_file_indexed(&mut self, mut file: FileInfo) {
         let key = normalize_path_key(&file.path);
-        if let Some(pos) = self
-            .files
-            .iter()
-            .position(|f| normalize_path_key(&f.path) == key)
-        {
+        // `path_map` is authoritative here: the one caller
+        // (`finalize_pending_hash`) arrives straight after
+        // `swap_remove_indexed`, which patches the map incrementally. The scan
+        // this replaces recomputed `normalize_path_key` (two heap allocations on
+        // Windows) for every stored row, per hashed file, with the index write
+        // lock held — ~15ms at `MAX_DISCOVERED_FILES`, blocking upload hash
+        // resolution and the UI's queries for the length of a scan. Keep the
+        // scan as a fallback for a map that has drifted, and verify the hit
+        // actually points at this path so a stale entry cannot overwrite an
+        // unrelated row.
+        let existing = match self.path_map.get(&key) {
+            Some(&pos)
+                if self
+                    .files
+                    .get(pos)
+                    .is_some_and(|f| normalize_path_key(&f.path) == key) =>
+            {
+                Some(pos)
+            }
+            _ => self
+                .files
+                .iter()
+                .position(|f| normalize_path_key(&f.path) == key),
+        };
+        if let Some(pos) = existing {
             let old = self.files[pos].clone();
             self.remove_index_entries(pos, &old);
             preserve_runtime_state(&self.files[pos], &mut file);
@@ -1313,6 +1333,70 @@ mod local_index_tests {
         assert!(index.get_by_path("A/pending.bin").is_some());
         assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
         assert_eq!(index.get_by_path("A/pending.bin").unwrap().priority, "high");
+    }
+
+    #[test]
+    fn finalize_pending_hash_lands_on_its_own_row() {
+        // `upsert_file_indexed` resolves the row through `path_map` instead of
+        // scanning every stored row; with neighbours present the completed
+        // identity must still land on its own path and leave the other lookups
+        // intact (the pending row is swap_removed first, moving another row).
+        let mut index = LocalIndex::new();
+        let mut pending = file("A/second.bin", "", true, "normal");
+        pending.id = "pending:A/second.bin".to_string();
+        index.add_files(vec![
+            file("A/first.bin", &"a".repeat(32), true, "normal"),
+            pending,
+            file("A/third.bin", &"b".repeat(32), true, "normal"),
+        ]);
+
+        let completed = file("A/second.bin", &"c".repeat(32), true, "normal");
+        index
+            .finalize_pending_hash("pending:A/second.bin", completed)
+            .expect("pending row should still exist");
+
+        assert_eq!(index.file_count(), 3);
+        assert_eq!(
+            index.get_by_path("A/second.bin").unwrap().hash,
+            "c".repeat(32)
+        );
+        assert_eq!(
+            index.get_by_hash(&"c".repeat(32)).unwrap().path,
+            "A/second.bin"
+        );
+        assert_eq!(
+            index.get_by_hash(&"a".repeat(32)).unwrap().path,
+            "A/first.bin"
+        );
+        assert_eq!(
+            index.get_by_hash(&"b".repeat(32)).unwrap().path,
+            "A/third.bin"
+        );
+    }
+
+    #[test]
+    fn indexed_upsert_replaces_the_row_for_a_known_path() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/one.bin", &"a".repeat(32), true, "normal"),
+            file("A/two.bin", &"b".repeat(32), true, "normal"),
+        ]);
+
+        // Same path, new content hash: the `path_map` hit must replace in place
+        // rather than append a second row for the same file.
+        index.add_file_no_rebuild(file("A/two.bin", &"e".repeat(32), true, "normal"));
+
+        assert_eq!(index.file_count(), 2);
+        assert_eq!(index.get_by_path("A/two.bin").unwrap().hash, "e".repeat(32));
+        assert!(index.get_by_hash(&"b".repeat(32)).is_none());
+        assert_eq!(
+            index.get_by_hash(&"e".repeat(32)).unwrap().path,
+            "A/two.bin"
+        );
+        assert_eq!(
+            index.get_by_hash(&"a".repeat(32)).unwrap().path,
+            "A/one.bin"
+        );
     }
 
     #[test]
