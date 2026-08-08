@@ -1139,17 +1139,6 @@ pub fn sanitize_filename(name: &str) -> String {
         return "unnamed_file".to_string();
     }
 
-    // Prevent Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-    let upper = safe.to_uppercase();
-    let base = upper.split('.').next().unwrap_or("");
-    let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if reserved.contains(&base) {
-        return format!("_{safe}");
-    }
-
     let safe = if safe.len() > 255 {
         let mut end = 255;
         while end > 0 && !safe.is_char_boundary(end) {
@@ -1165,6 +1154,23 @@ pub fn sanitize_filename(name: &str) -> String {
         .to_string();
     if safe.is_empty() {
         return "unnamed_file".to_string();
+    }
+
+    // Prevent Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+    // This has to run last, on the trimmed and truncated name: Windows drops
+    // trailing dots and spaces when it resolves a path, so "CON " names the
+    // console device exactly as "CON" does. Comparing before the trim let the
+    // trim produce the very name this check exists to prevent, and the result
+    // reaches ShellExecute/Explorer through `open_with_default_app` and
+    // `reveal_in_file_manager`, which do resolve device names.
+    let upper = safe.to_uppercase();
+    let base = upper.split('.').next().unwrap_or("");
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if reserved.contains(&base) {
+        return format!("_{safe}");
     }
 
     safe
@@ -1362,6 +1368,28 @@ mod tests {
         assert_eq!(sanitize_filename(".."), "unnamed_file");
         assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
         assert_eq!(sanitize_filename("file:name"), "file_name");
+    }
+
+    /// Windows strips trailing dots and spaces when it resolves a path, so a
+    /// peer-supplied "CON " is the console device. The reserved-name check used
+    /// to run before the trim, which meant the trim handed back exactly the
+    /// name the check was there to prevent.
+    #[test]
+    fn sanitize_filename_rejects_reserved_names_after_trailing_trim() {
+        assert_eq!(sanitize_filename("CON "), "_CON");
+        assert_eq!(sanitize_filename("nul  "), "_nul");
+        assert_eq!(sanitize_filename("CON."), "_CON");
+        assert_eq!(sanitize_filename("LPT1 . "), "_LPT1");
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        // Truncation can expose a device name too: the trim runs on the cut
+        // string, so the reserved check has to see that result as well.
+        assert_eq!(
+            sanitize_filename(&format!("COM1{}x", " ".repeat(252))),
+            "_COM1"
+        );
+        // An ordinary name only loses its trailing space.
+        assert_eq!(sanitize_filename("report.txt "), "report.txt");
+        assert_eq!(sanitize_filename("console.txt "), "console.txt");
     }
 
     #[test]

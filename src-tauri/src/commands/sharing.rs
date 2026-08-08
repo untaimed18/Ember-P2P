@@ -1302,6 +1302,7 @@ pub async fn add_shared_folder(
             registry,
             &roots,
             std::slice::from_ref(&approved),
+            &[],
             || crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path),
         )
     })
@@ -1888,7 +1889,7 @@ pub async fn remove_shared_folder(
     let registry = state.approved_roots.clone();
     let (data, tmp, final_path) = save_data;
     tokio::task::spawn_blocking(move || {
-        super::settings::persist_with_root_transaction(registry, &roots, &[], || {
+        super::settings::persist_with_root_transaction(registry, &roots, &[], &[], || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
         })
     })

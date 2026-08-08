@@ -237,10 +237,31 @@ fn copy_file_atomically(src: &Path, dst: &Path, expected_len: u64) -> std::io::R
 
     let result = (|| {
         let mut source = std::fs::File::open(src)?;
-        let mut target = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            // WRITE_DAC must be requested when the handle is opened; the ACL
+            // restriction below cannot rewrite a DACL through a handle that was
+            // not granted it, and GENERIC_WRITE does not imply it.
+            const WRITE_DAC: u32 = 0x0004_0000;
+            options.access_mode(GENERIC_WRITE | WRITE_DAC);
+        }
+        let mut target = options.open(&tmp)?;
+        // This copies identity.json, chat-history.key and cryptkey.dat for
+        // upgrading users, so the secret must never exist on disk under
+        // inherited access — restrict the open handle before the first byte is
+        // written, and fail the migration if that cannot be done rather than
+        // logging a warning and publishing the copy anyway. Same contract as
+        // `security::atomic_write`.
+        crate::security::restrict_open_file_permissions_checked(&target, false)?;
         let copied = std::io::copy(&mut source, &mut target)?;
         target.flush()?;
         target.sync_all()?;
@@ -262,7 +283,6 @@ fn copy_file_atomically(src: &Path, dst: &Path, expected_len: u64) -> std::io::R
             ));
         }
         drop(target);
-        crate::security::restrict_file_permissions(&tmp);
         std::fs::rename(&tmp, dst)?;
         Ok(())
     })();
@@ -380,6 +400,38 @@ mod tests {
             b"canonical"
         );
         assert_eq!(std::fs::read(canonical.join("ember.db")).unwrap(), b"db");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The migration carries key material (identity.json, chat-history.key,
+    /// cryptkey.dat) into the canonical directory, so the copy must be
+    /// restricted before it holds any bytes and the copy must fail if it
+    /// cannot be.
+    #[test]
+    fn migrated_secret_files_are_restricted() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-paths-restrict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("cryptkey.dat");
+        let dst = root.join("cryptkey.copy.dat");
+        let secret = b"secret-key-material";
+        std::fs::write(&src, secret).unwrap();
+
+        copy_file_atomically(&src, &dst, secret.len() as u64).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), secret);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "migrated secret must be owner-only");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -67,10 +67,11 @@ pub(crate) fn persist_with_root_transaction(
     registry: std::sync::Arc<crate::security::filesystem::ApprovedRootRegistry>,
     configured_roots: &[String],
     explicit_additions: &[String],
+    reapprovals: &[String],
     persist_settings: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut update = registry
-        .prepare_update(configured_roots, explicit_additions)
+        .prepare_update(configured_roots, explicit_additions, reapprovals)
         .map_err(|error| anyhow::anyhow!("prepare approved roots: {error}"))?;
     update
         .commit()
@@ -821,7 +822,10 @@ pub async fn update_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     settings: serde_json::Value,
+    // Absent for every background/partial save; see the re-approval block below.
+    reapprove_download_root: Option<bool>,
 ) -> Result<UpdateSettingsResult, String> {
+    let reapprove_download_root = reapprove_download_root.unwrap_or(false);
     // Serialize the read/merge/write transaction before deserializing the
     // renderer payload. Internal cursor/pending maps can advance without
     // changing the visible settings revision, so reading them before this lock
@@ -915,11 +919,40 @@ pub async fn update_settings(
             explicit_additions.push(settings.download_folder.clone());
         }
         let registry = state.approved_roots.clone();
+        // A root revoked for an identity mismatch stays unusable until it is
+        // re-approved, and the download folder has no other way back:
+        // re-picking the same folder is not an addition, so it never reaches
+        // `explicit_additions` and every download keeps failing.
+        //
+        // Deliberately narrow. `reapprove_download_root` is set only by the
+        // Settings page's own save button, because `update_settings` is also
+        // reached from background paths with no user present — the UPnP
+        // auto-disable handler persists through it from a network event — and
+        // re-approval grants the sandbox to whatever object now sits at the
+        // path. It is also skipped unless something is actually there: a root
+        // that is merely offline (unplugged drive, disconnected share) must
+        // keep its record, which `build_next` retains on `NotFound`, rather
+        // than be re-captured and lost.
+        let mut reapprovals = Vec::new();
+        if reapprove_download_root
+            && !settings.download_folder.is_empty()
+            && std::fs::symlink_metadata(&settings.download_folder).is_ok()
+            && registry
+                .verify_root(std::path::Path::new(&settings.download_folder))
+                .is_err()
+        {
+            tracing::info!("Re-approving download folder on an explicit settings save");
+            reapprovals.push(settings.download_folder.clone());
+        }
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
-            persist_with_root_transaction(registry, &roots, &explicit_additions, || {
-                crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-            })
+            persist_with_root_transaction(
+                registry,
+                &roots,
+                &explicit_additions,
+                &reapprovals,
+                || crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path),
+            )
         })
         .await
         .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
@@ -1526,6 +1559,7 @@ mod tests {
             registry.clone(),
             std::slice::from_ref(&new),
             std::slice::from_ref(&new),
+            &[],
             || anyhow::bail!("injected config write failure"),
         )
         .unwrap_err();
@@ -1537,7 +1571,7 @@ mod tests {
         assert!(!data.join("approved_roots.transaction.json").exists());
 
         let mut interrupted = registry
-            .prepare_update(std::slice::from_ref(&new), std::slice::from_ref(&new))
+            .prepare_update(std::slice::from_ref(&new), std::slice::from_ref(&new), &[])
             .unwrap();
         interrupted.commit().unwrap();
         drop(interrupted);

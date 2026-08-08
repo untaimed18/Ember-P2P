@@ -15,16 +15,37 @@ const ROOT_TRANSACTION_FILE: &str = "approved_roots.transaction.json";
 /// `GetFileInformationByHandle`, together with the reparse attribute. On Unix
 /// this is `st_dev` + `st_ino` from `lstat` so replacing a root at the same
 /// path cannot retain a prior approval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     #[serde(default)]
     pub volume_serial: u64,
     #[serde(default)]
     pub file_id: u64,
+    /// Recorded for diagnostics and to keep an existing `approved_roots.json`
+    /// round-tripping unchanged. Deliberately not part of equality; see the
+    /// `PartialEq` impl below.
     #[serde(default)]
     pub attributes: u32,
     #[serde(default)]
     pub reparse_point: bool,
+}
+
+/// Only the volume serial and the file ID name an object; `dwFileAttributes` is
+/// mutable metadata that a live system changes underneath us. Comparing it made
+/// enabling NTFS compression, clearing "allow contents indexed", marking a
+/// folder hidden or read-only, or a sync client toggling its pinned bits
+/// indistinguishable from the folder having been replaced — which revoked the
+/// approval durably and, for the download folder, with no way back.
+///
+/// The reparse flag stays in the comparison: an existing empty directory can be
+/// turned into a junction in place, keeping its file ID, so it is a genuine
+/// change of what the path names rather than metadata drift.
+impl PartialEq for ObjectIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.volume_serial == other.volume_serial
+            && self.file_id == other.file_id
+            && self.reparse_point == other.reparse_point
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,18 +232,29 @@ impl ApprovedRootRegistry {
         &self,
         configured_roots: &[String],
         explicit_additions: &[String],
+        reapprovals: &[String],
         on_mismatch: IdentityMismatch,
     ) -> io::Result<(HashMap<String, ApprovedRoot>, HashMap<String, ApprovedRoot>)> {
+        let reapprovals: HashSet<String> = reapprovals
+            .iter()
+            .filter(|root| !root.is_empty())
+            .map(|root| path_key(Path::new(root)))
+            .collect();
         let additions: HashSet<String> = explicit_additions
             .iter()
             .map(|root| path_key(Path::new(root)))
+            .chain(reapprovals.iter().cloned())
             .collect();
         let current = self.roots.read().clone();
         let mut next = HashMap::new();
         for configured in configured_roots.iter().filter(|root| !root.is_empty()) {
             let configured_path = Path::new(configured);
             let key = path_key(configured_path);
-            if let Some(existing) = current.get(&key) {
+            // An explicit re-approval ignores whatever record is on file so the
+            // path is captured afresh — otherwise a stale record would be
+            // verified against the object that replaced it and rejected again.
+            let existing = current.get(&key).filter(|_| !reapprovals.contains(&key));
+            if let Some(existing) = existing {
                 match existing.verify() {
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -248,7 +280,15 @@ impl ApprovedRootRegistry {
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         // There is no identity to approve yet. Keep it absent
-                        // and fail closed if an operation is attempted.
+                        // and fail closed if an operation is attempted —
+                        // unless a record already exists, which means this is a
+                        // re-approval (or re-add) of a root that is merely
+                        // offline. Dropping it there would destroy a still-good
+                        // approval that comes back with the volume, turning a
+                        // recovery action into permanent breakage.
+                        if let Some(previous) = current.get(&key) {
+                            next.insert(key, previous.clone());
+                        }
                     }
                     Err(error) => return Err(error),
                 }
@@ -271,13 +311,24 @@ impl ApprovedRootRegistry {
     }
 
     /// Build, but do not persist or publish, a replacement root set.
+    ///
+    /// `reapprovals` re-captures a root whose recorded identity no longer
+    /// matches. It is threaded through the transaction rather than applied by a
+    /// separate [`ApprovedRootRegistry::reapprove_roots`] call so the recovery
+    /// commits and rolls back with the settings write, and so every other root
+    /// keeps [`IdentityMismatch::Reject`] instead of being silently revoked.
     pub fn prepare_update(
         self: &Arc<Self>,
         configured_roots: &[String],
         explicit_additions: &[String],
+        reapprovals: &[String],
     ) -> io::Result<ApprovedRootUpdate> {
-        let (previous, next) =
-            self.build_next(configured_roots, explicit_additions, IdentityMismatch::Reject)?;
+        let (previous, next) = self.build_next(
+            configured_roots,
+            explicit_additions,
+            reapprovals,
+            IdentityMismatch::Reject,
+        )?;
         Ok(ApprovedRootUpdate {
             registry: self.clone(),
             previous,
@@ -298,17 +349,55 @@ impl ApprovedRootRegistry {
         self.update_roots_with_policy(
             configured_roots,
             explicit_additions,
+            &[],
             IdentityMismatch::Reject,
         )
+    }
+
+    /// Re-approve configured roots that lost their approval, without requiring
+    /// the user to change the configured value.
+    ///
+    /// A root whose identity no longer matches is revoked at startup and then
+    /// stays unusable, because only a path the user just *added* gets a new
+    /// identity captured. A shared folder can be removed and re-added in
+    /// Settings; the download folder cannot — re-picking the same folder is not
+    /// an addition — so every download failed with no in-app way back. This is
+    /// that way back. It grants approval to whatever object now sits at the
+    /// configured path, so it must only ever run from an explicit user action,
+    /// never automatically at startup.
+    ///
+    /// Roots that are not listed keep the approval they already hold. A
+    /// mismatch on one of them revokes it (exactly as startup does) rather than
+    /// failing the call: a recovery action must not be blocked by an unrelated
+    /// stale root. Returns an error if a requested root could not be approved
+    /// after all — it is absent, offline, or not among `configured_roots` — so
+    /// the caller can say so instead of reporting a recovery that did nothing.
+    pub fn reapprove_roots(
+        &self,
+        configured_roots: &[String],
+        roots_to_reapprove: &[String],
+    ) -> io::Result<()> {
+        self.update_roots_with_policy(
+            configured_roots,
+            &[],
+            roots_to_reapprove,
+            IdentityMismatch::Revoke,
+        )?;
+        for root in roots_to_reapprove.iter().filter(|root| !root.is_empty()) {
+            self.verify_root(Path::new(root))?;
+        }
+        Ok(())
     }
 
     fn update_roots_with_policy(
         &self,
         configured_roots: &[String],
         explicit_additions: &[String],
+        reapprovals: &[String],
         on_mismatch: IdentityMismatch,
     ) -> io::Result<()> {
-        let (_, next) = self.build_next(configured_roots, explicit_additions, on_mismatch)?;
+        let (_, next) =
+            self.build_next(configured_roots, explicit_additions, reapprovals, on_mismatch)?;
         self.persist_roots(&next)?;
         *self.roots.write() = next;
         Ok(())
@@ -509,7 +598,7 @@ pub fn initialize_approved_roots(
     // Startup revokes roots whose identity changed rather than refusing to run:
     // a folder that was deleted and recreated (or a re-imaged volume) otherwise
     // left the app unable to launch at all, with no in-app way to recover.
-    registry.update_roots_with_policy(configured_roots, &additions, IdentityMismatch::Revoke)?;
+    registry.update_roots_with_policy(configured_roots, &additions, &[], IdentityMismatch::Revoke)?;
     *global_slot().write() = Some(registry.clone());
     Ok(registry)
 }
@@ -2361,6 +2450,193 @@ mod tests {
             reloaded.roots.is_empty(),
             "revocation must be durable, not re-trusted on the next launch"
         );
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Attribute bits are not identity. Compression, the content-indexed flag,
+    /// hidden/read-only and a sync client's pinned bits all change without the
+    /// folder being replaced, and each one used to revoke the approval durably.
+    #[test]
+    fn attribute_drift_keeps_an_approved_root() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-attribute-drift-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+
+        // Flip the recorded attribute word the way the filesystem would when
+        // the folder is compressed or excluded from the index. Every other
+        // recorded field still describes the object that is on disk.
+        let state_path = data.join(ROOT_STATE_FILE);
+        let mut persisted: PersistedRoots =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(persisted.roots.len(), 1);
+        for record in &mut persisted.roots {
+            record.configured_identity.attributes ^= 0x0000_2800;
+            record.target_identity.attributes ^= 0x0000_2800;
+        }
+        std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        assert!(
+            registry.verify_root(&root).is_ok(),
+            "attribute drift must not look like a replaced directory"
+        );
+        let reloaded: PersistedRoots =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.roots.len(),
+            1,
+            "the approval must survive on disk too"
+        );
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A revoked root — the download folder deleted and recreated, say — has to
+    /// be recoverable in place. Settings cannot re-add it, because its value
+    /// never changed, so an explicit re-approval is the only way back.
+    #[test]
+    fn revoked_root_can_be_reapproved_without_changing_its_path() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-reapprove-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+
+        let state_path = data.join(ROOT_STATE_FILE);
+        let mut persisted: PersistedRoots =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        for record in &mut persisted.roots {
+            record.configured_identity.file_id ^= 0xFFFF_FFFF;
+            record.target_identity.file_id ^= 0xFFFF_FFFF;
+        }
+        std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        assert!(registry.verify_root(&root).is_err(), "must start revoked");
+
+        registry
+            .reapprove_roots(
+                std::slice::from_ref(&root_string),
+                std::slice::from_ref(&root_string),
+            )
+            .expect("an explicit re-approval must restore a revoked root");
+        assert!(registry.verify_root(&root).is_ok());
+
+        // And it must be durable: the next launch has to find the record.
+        let reopened = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        assert!(reopened.verify_root(&root).is_ok());
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Re-approving a root that is merely offline must not destroy its record.
+    /// Capturing a fresh identity fails with `NotFound`, and dropping the
+    /// approval there would turn "unplugged drive" into permanent breakage that
+    /// survives the drive coming back.
+    #[test]
+    fn reapproving_an_offline_root_keeps_its_existing_record() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-reapprove-offline-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let before = std::fs::read(data.join("approved_roots.json")).unwrap();
+
+        // Simulate the volume going away, then ask for a re-approval anyway.
+        std::fs::remove_dir_all(&root).unwrap();
+        registry
+            .update_roots_with_policy(
+                std::slice::from_ref(&root_string),
+                &[],
+                std::slice::from_ref(&root_string),
+                IdentityMismatch::Reject,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(data.join("approved_roots.json")).unwrap(),
+            before,
+            "an offline root's approval must survive a re-approval attempt"
+        );
+
+        // Recreating the path is a *different* object (new file id), so it must
+        // still fail closed — the point is that the record was kept for the
+        // original object rather than deleted, not that any directory at that
+        // path now inherits the approval.
+        std::fs::create_dir_all(&root).unwrap();
+        let reopened = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        assert!(reopened.verify_root(&root).is_err());
+
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Re-approval only touches the paths it was given: an unrelated root is
+    /// neither granted an approval it never had nor silently kept when its
+    /// identity has moved.
+    #[test]
+    fn reapproval_does_not_approve_unrelated_roots() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-root-reapprove-scope-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let approved = base.join("approved");
+        let stranger = base.join("stranger");
+        let data = base.join("data");
+        std::fs::create_dir_all(&approved).unwrap();
+        std::fs::create_dir_all(&stranger).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let approved_string = approved.to_string_lossy().into_owned();
+        let stranger_string = stranger.to_string_lossy().into_owned();
+        let registry =
+            initialize_approved_roots(&data, std::slice::from_ref(&approved_string)).unwrap();
+
+        let configured = [approved_string.clone(), stranger_string];
+        registry
+            .reapprove_roots(&configured, std::slice::from_ref(&approved_string))
+            .unwrap();
+        assert!(registry.verify_root(&approved).is_ok());
+        assert!(
+            registry.verify_root(&stranger).is_err(),
+            "a root that was not re-approved must stay unapproved"
+        );
+
+        // A path that is not configured at all cannot be approved this way.
+        let outsider = base.join("outsider");
+        std::fs::create_dir_all(&outsider).unwrap();
+        let outsider_string = outsider.to_string_lossy().into_owned();
+        assert!(registry
+            .reapprove_roots(&configured, std::slice::from_ref(&outsider_string))
+            .is_err());
+        assert!(registry.verify_root(&outsider).is_err());
 
         *global_slot().write() = None;
         let _ = std::fs::remove_dir_all(base);
