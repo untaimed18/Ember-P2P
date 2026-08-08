@@ -3195,6 +3195,13 @@
                 <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
               </span>
             {/if}
+            {#if selectedFile.ember_file_hash}
+              <span class="meta-label">{m.library_meta_ember()}</span>
+              <span class="meta-value meta-hash">
+                <code title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
+                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.ember_file_hash, m.library_copied_ember()); }} title={m.library_meta_copy_ember()}>{m.common_copy()}</button>
+              </span>
+            {/if}
           </div>
         </section>
 
