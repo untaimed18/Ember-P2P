@@ -859,7 +859,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.4.1</h3>
+      <h3>Get Ember 1.5.0</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1368,30 +1368,74 @@ npm run tauri build</code></pre>
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
 
-    <article class="release" id="release-1-4-1">
+    <article class="release" id="release-1-5-0">
       <div class="release-header">
-        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.4.1" target="_blank" rel="noopener">Ember v1.4.1</a></h3>
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.0" target="_blank" rel="noopener">Ember v1.5.0</a></h3>
         <time class="release-date" datetime="2026-08-07">August 7, 2026</time>
       </div>
-      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.4.1" target="_blank" rel="noopener"><code>v1.4.1</code></a></p>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.0" target="_blank" rel="noopener"><code>v1.5.0</code></a></p>
       <div class="release-notes">
         <h4>What&rsquo;s Changed</h4>
 
-        <p>A follow-up to the Ember Network beta, from an audit of the EPX and Ember DHT code. Most of what it fixes was invisible: a source exchange that quietly never answered, a routing table that spent its whole budget on peers it had never heard from, and paths that failed without leaving a trace anyone could see.</p>
+        <p>The result of a full read-only audit of every part of the app, plus the work prepared for 1.4.1, which was never published &mdash; there is no 1.4.1 release, and everything intended for it ships here instead.</p>
 
-        <h5>Source exchange (EPX)</h5>
+        <p>The headline is a bug that has been in 1.4.0 the whole time: <strong>no file larger than 4 GiB could be downloaded at all</strong>. Beyond that, most of what follows was invisible from the outside &mdash; uploads quietly capped at a tenth of their limit, friends unable to find you, a source exchange that never answered, and several paths that failed without leaving a trace anyone could see.</p>
+
+        <h5>Before you upgrade</h5>
         <ul>
-          <li><strong>UDP exchanges are answered again</strong> &mdash; The payload sent over UDP was built for the TCP path, where size is not limited. On any client with a real download list it was too big for a single packet and was dropped before sending, so an active peer never answered a UDP source exchange. It is now built to fit, sending fewer files rather than nothing</li>
-          <li><strong>Your own address is no longer accepted back</strong> &mdash; Sources travel peer to peer, so one eventually came back pointing at you, leaving a download trying to connect to itself</li>
-          <li><strong>Relay offers are charged to whoever sent them</strong> &mdash; A single peer could fill the relay list with entries it made up and push out the relays learned elsewhere. Each peer now has a share, as forwarded friend offers already did</li>
+          <li><strong>This release upgrades your library database, and 1.4.0 cannot open it afterwards.</strong> The upgrade is automatic and keeps your data, but it is one-way: if you want the option of going back to 1.4.0, copy your Ember data folder somewhere safe before installing</li>
         </ul>
 
-        <h5>Ember Network</h5>
+        <h5>Downloads</h5>
         <ul>
-          <li><strong>Searches find more</strong> &mdash; A popular file is held by many peers, and every copy it returned used one of the 300 result slots. Copies are now counted once, so a common file no longer crowds out everything else in the results</li>
-          <li><strong>A missed reply is not the end</strong> &mdash; A peer that failed to answer once was dropped from that search for good, even though a single lost packet is enough to cause it. It gets a second chance</li>
-          <li><strong>Known-good peers stay known-good</strong> &mdash; Peers that had answered were being pushed aside by ones merely heard about, so the connections actually in use went stale and were dropped. They are now kept up to date, while new leads still get checked</li>
-          <li><strong>Harder to crowd out</strong> &mdash; Being told about a flood of peers no longer tightens the limits that decide who is let in, which had made it harder to accept real ones. Storage similarly makes room for files it is genuinely responsible for instead of turning them away once full</li>
+          <li><strong>Files larger than 4 GiB download again</strong> &mdash; Ember rejected the very first block of data every source sent for a large file, on the mistaken belief that the packet could not describe a position that far into the file. Every source disconnected immediately and the download never started. Nothing above 4 GiB could be fetched, from eMule peers or from other Ember clients</li>
+          <li><strong>Less re-downloading after corruption</strong> &mdash; When a peer asked us to help pinpoint which small piece of a part was damaged, our answer was built wrong for most file sizes and was rejected. That peer then had to fetch the whole 9 MB part again instead of the 180 KB block that was actually bad</li>
+          <li><strong>Damaged archives salvage what they can</strong> &mdash; A single unreadable entry threw away the entire recovery, including everything already checked and rescued &mdash; the opposite of the point of the feature</li>
+          <li><strong>Finished parts are on disk before they are trusted</strong> &mdash; A part could be recorded as verified while its data was still only in memory. A power cut at that moment left Ember convinced the data was good, and it would then serve it to other peers</li>
+          <li><strong>Progress no longer jumps backwards</strong> &mdash; The bar could drop by a whole part near the end while the last piece waited to be checked</li>
+        </ul>
+
+        <h5>Uploads and sharing</h5>
+        <ul>
+          <li><strong>Uploads are no longer stuck at a tenth of your limit</strong> &mdash; Upload Speed Sense briefly lowers your upload to measure a quiet connection before it starts managing speed. If it could not find a peer to measure against &mdash; which is the normal case with Kad disabled, a failed bootstrap, or a restrictive router &mdash; it never finished measuring and simply stayed there for the whole session, with nothing on screen to say so</li>
+          <li><strong>Your credit with other peers survives a restart</strong> &mdash; Credit earned by uploading was reset the first time each peer verified itself after Ember restarted, costing you the queue position you had built up</li>
+          <li><strong>Credit is harder to steal</strong> &mdash; The protection against a stranger claiming another peer&rsquo;s identity to inherit their credit could never actually trigger. Separately, anyone who knew a peer&rsquo;s identifier could strip that peer&rsquo;s standing by failing a single check on their behalf</li>
+          <li><strong>Large libraries scan without stalling the app</strong> &mdash; Each finished file was matched by scanning every other file already indexed, which on a big share held up uploads and the interface for the length of the scan. Watching offline network shares no longer blocks the window either</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>Nobody else can rename your download</strong> &mdash; When several peers answered for the same file, Ember kept the longest name offered. Since anyone can pad a name, a single peer could rename a file in the results &mdash; and, because that name is what the download is saved as, on your disk too. The name most peers agree on now wins</li>
+          <li><strong>Inflated results sink</strong> &mdash; A peer claiming an impossible number of sources sorted above every honest result</li>
+          <li><strong>Turning Ember on takes effect immediately</strong> &mdash; Enabling the Ember Network from its own page left Search still convinced it was off, refusing Ember searches until the app was restarted</li>
+          <li><strong>Searches find more</strong> &mdash; A popular file is held by many peers, and every copy it returned used one of the 300 result slots. Copies are now counted once, so a common file no longer crowds out everything else</li>
+        </ul>
+
+        <h5>Friends and the Ember Network</h5>
+        <ul>
+          <li><strong>Friends can find you again</strong> &mdash; Registration with the rendezvous server restarted every ten seconds and threw away its own result each time, so it never completed. For most setups this meant you were never discoverable, friend transfers could not start, and the app quietly re-registered forever</li>
+          <li><strong>UDP source exchanges are answered again</strong> &mdash; The reply was built for a connection where size is not limited, so on any client with a real download list it was too big to send and was dropped. It is now built to fit, sending fewer files rather than nothing</li>
+          <li><strong>Your own address is no longer accepted back</strong> &mdash; Sources travel peer to peer, so one eventually came back pointing at you, leaving a download trying to connect to itself</li>
+          <li><strong>Relay offers are charged to whoever sent them</strong> &mdash; A single peer could fill the relay list with entries it made up and push out relays learned elsewhere</li>
+          <li><strong>A missed reply is not the end</strong> &mdash; A peer that failed to answer once was dropped from that search for good, though one lost packet is enough to cause it</li>
+          <li><strong>Known-good peers stay known-good</strong> &mdash; Peers that had answered were pushed aside by ones merely heard about, so the connections actually in use went stale and were dropped</li>
+          <li><strong>Downloads cannot be misdirected</strong> &mdash; Any peer could publish a false fingerprint for a file. Ember would finish the download, find it did not match, discover nothing actually wrong with it, and start over from scratch &mdash; forever. Fingerprints now need agreement from several peers and never override one Ember worked out itself</li>
+        </ul>
+
+        <h5>Network protection</h5>
+        <ul>
+          <li><strong>Ember is no longer usable as a reflector</strong> &mdash; Two handshakes replied to whoever a packet claimed to come from, with a larger response than the request. Both now prove an address is real before spending anything substantial on it, which also stops one peer being locked out of another&rsquo;s connection list</li>
+          <li><strong>Flood defences cost less than the flood</strong> &mdash; The tables protecting against packet floods searched tens of thousands of entries per packet, and chose the busiest peer to forget &mdash; letting an attacker reset the very limit that was meant to catch it. One tracker grew without limit</li>
+          <li><strong>Shared storage cannot be monopolised</strong> &mdash; A single peer could fill the space Ember offers the network and lock out every honest publisher for a day, and could sidestep its own quota simply by changing port</li>
+          <li><strong>A stalled server cannot wedge reconnection</strong> &mdash; A server that answered slowly but never finished logging in could hold Ember on &ldquo;Connecting&rdquo; for close to an hour with no fallback</li>
+        </ul>
+
+        <h5>Files, folders and updates</h5>
+        <ul>
+          <li><strong>Changing a folder&rsquo;s properties no longer breaks downloads</strong> &mdash; Compressing your download folder, turning off search indexing on it, or a cloud client marking it looked identical to the folder being swapped out. Ember revoked its own access and every download failed, with no way to restore it from inside the app. Saving Settings now restores it, and ordinary property changes are ignored</li>
+          <li><strong>Installing an update no longer loses progress</strong> &mdash; The installer shut Ember down in a way that skipped saving, so every update discarded the resume data for in-progress downloads, the library checkpoint that exists to avoid a full re-scan, and the peer and server lists</li>
+          <li><strong>Checking for updates reports honestly</strong> &mdash; If the published release was older than the version installed, every check failed with a security warning instead of simply saying you are up to date</li>
+          <li>Chat day separators stay correct across daylight saving changes, and remote text can no longer use invisible characters to disguise how a name reads</li>
         </ul>
 
         <h5>Diagnostics</h5>
@@ -1399,14 +1443,9 @@ npm run tauri build</code></pre>
           <li>The Ember Network page gains counters for source exchanges, how many offered sources are used versus filtered, replies too large for UDP, and storage rejections &mdash; each covering a path that previously failed silently</li>
         </ul>
 
-        <h5>Documentation</h5>
-        <ul>
-          <li>The EPX section described a stronger identity check than the code performs. Source exchange requires the Ember handshake and a key that matches the advertised identity; chat, browsing and other friend features continue to require full proof of key ownership</li>
-        </ul>
-
         <p class="full-changelog">
           <strong>Full Changelog</strong>
-          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.4.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.4.1</a>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.5.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.4.0...v1.5.0</a>
         </p>
       </div>
     </article>
