@@ -1529,7 +1529,7 @@ npm run tauri build</code></pre>
   <!-- Release History -->
   <section id="releases">
     <h2>Release History</h2>
-    <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+    <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
 
     <article class="release" id="release-1-5-2">
       <div class="release-header">
@@ -1541,59 +1541,59 @@ npm run tauri build</code></pre>
         <h4>What&rsquo;s New</h4>
 
         <ul>
-          <li><strong>The Ember Network has its own light on the status bar</strong> &mdash; It used to appear only once Kad was up, which hid the fact that the two are independent. You can now see at a glance whether the Ember overlay is running and how many peers it holds</li>
-          <li><strong>Downloads say when their Ember hash was checked</strong> &mdash; A completed download that was verified against the content hash published on the Ember Network now carries a badge. It only appears when the check actually ran, so it never claims more than it did &mdash; a file recovered after a crash, or one with no Ember hash to check, simply does not show it</li>
-          <li><strong>File properties show the Ember content hash</strong> &mdash; Alongside the ed2k and AICH hashes, so you can see the digest your downloads are verified against</li>
-          <li><strong>The Ember Network page shows what you are holding for other people</strong> &mdash; A node stores records on the network&rsquo;s behalf, and that figure was invisible. It now counts only records published by someone else, so it reflects what you are genuinely contributing rather than your own entries</li>
+          <li><strong>The Ember Network has its own light on the status bar.</strong> We only showed it once Kad was up, which made the two look like the same thing. They aren&rsquo;t. You can now see whether the overlay is running and how many peers it is holding</li>
+          <li><strong>Finished downloads say when their Ember hash was checked.</strong> If we verified a completed file against the content hash published on the Ember Network and it matched, the row gets a badge. It only appears when the check actually ran, so a file recovered after a crash, or one with no Ember hash to check against, won&rsquo;t have it</li>
+          <li><strong>File properties show the Ember content hash</strong> next to the ed2k and AICH hashes, so you can see the digest your downloads are checked against</li>
+          <li><strong>The Ember Network page shows what you&rsquo;re holding for other people.</strong> Your node stores records on the network&rsquo;s behalf and there was no way to see how many. We count only records somebody else published, so the number is what you&rsquo;re actually contributing rather than your own entries coming back to you</li>
         </ul>
 
         <h4>What&rsquo;s Fixed</h4>
 
-        <p>A third audit, reading every change made since 1.4.2 across seven passes in parallel. Twenty-eight findings came back; twenty-six survived checking and are fixed here, and two were shown to be false alarms.</p>
+        <p>Our third audit since 1.4.2, this time seven passes reading in parallel over everything we had changed. It turned up 28 findings. 26 held up and are fixed here; two were our own false alarms.</p>
 
         <h5>Before you upgrade</h5>
         <ul>
-          <li><strong>Nothing to do.</strong> Your library database is untouched, so you can move between 1.5.0, 1.5.1 and 1.5.2 freely</li>
+          <li><strong>Nothing to do.</strong> We didn&rsquo;t touch the library database, so you can move between 1.5.0, 1.5.1 and 1.5.2 in either direction</li>
         </ul>
 
         <h5>Friends and the Ember Network</h5>
         <ul>
-          <li><strong>Your friend code cannot be used to take over your presence</strong> &mdash; An <code>ember2:</code> code is meant to be public, and it is enough to work out where your presence is registered. Anyone holding it could claim that spot with their own identity, so friends looking you up were sent to a stranger or found nothing at all &mdash; repeatable with one request. Presence now belongs to the identity it is derived from and nobody else. This is a server-side fix and is already live, so it protects 1.5.0 and 1.5.1 too</li>
-          <li><strong>Your node can act as a relay for friends again</strong> &mdash; Offering yourself as a relay was tied to Kad being connected, which it is not by default, so a default install advertised nothing and turned away every friend that tried to use it. This is the one discovery channel that works for two friends who share no downloads, which is exactly the case it was built for</li>
-          <li><strong>Relayed transfers survive a quiet moment from both ends</strong> &mdash; The fix in 1.5.1 kept the second peer&rsquo;s side of a relay alive but not the first, so a quiet relayed session was still being closed after thirty seconds. Also server-side and already live</li>
-          <li><strong>A spoofed packet cannot stop a peer reaching you</strong> &mdash; Someone forging a peer&rsquo;s address could repeatedly displace that peer&rsquo;s half-finished connection, so its reply had nothing to match and first contact never completed. Both halves of the handshake now survive a forged packet</li>
-          <li><strong>A download cannot be failed forever by one unverified claim</strong> &mdash; A single node could assert the content hash for a file, and Ember would enforce it at completion. If it was wrong the download failed, found nothing to repair, and started over &mdash; indefinitely. A hash learned from the network now needs agreement from more than one publisher before it is enforced</li>
+          <li><strong>Your friend code can&rsquo;t be used to take over your presence.</strong> An <code>ember2:</code> code is meant to be public, and it&rsquo;s enough to work out where your presence is registered. Anyone holding yours could claim that spot with their own key, so friends looking you up reached a stranger or found nothing at all. One request was enough, and it worked every time. A presence slot now belongs to the identity it was derived from and to nobody else. This one is server-side and already deployed, so 1.5.0 and 1.5.1 are covered too</li>
+          <li><strong>Your node can relay for friends again.</strong> We tied the relay offer to Kad being connected, and Kad is off in a default install, so a default install advertised nothing and turned away every friend that tried to use it. Relaying is the one discovery path that works for two friends who share no downloads, which is the case we built it for</li>
+          <li><strong>Relayed transfers survive both ends going quiet.</strong> Our 1.5.1 fix kept the second peer&rsquo;s side of a relay alive and missed the first, so a quiet relayed session was still being closed at thirty seconds. Also server-side, also already deployed</li>
+          <li><strong>A spoofed packet can&rsquo;t stop a peer reaching you.</strong> Someone forging a peer&rsquo;s address could displace that peer&rsquo;s half-finished handshake over and over, so when the real reply turned up there was nothing left to match it against and first contact never completed. Both halves of the handshake now survive a forged packet</li>
+          <li><strong>One unverified claim can&rsquo;t fail a download forever.</strong> A single node could assert the content hash for a file and we would enforce it at completion. If the claim was wrong the download failed, found nothing to repair, and started again from the top, indefinitely. A hash we learn from the network now needs two publishers to agree before we hold a file to it</li>
         </ul>
 
         <h5>Talking to other clients</h5>
         <ul>
-          <li><strong>Obfuscated connections no longer corrupt themselves after a stall</strong> &mdash; When a peer stopped reading for a minute, the next packet could put part of the previous one back on the wire. The other end decrypts it cleanly, so nothing looks wrong until the framing has drifted and the connection is unusable</li>
-          <li><strong>One byte can no longer hold an incoming connection slot</strong> &mdash; A connection that sent a single byte and then went silent was waited on forever, and about thirty-four of them were enough to fill the listener and shut out every real peer, upload and port test</li>
-          <li><strong>Source swapping works with Kad off</strong> &mdash; Moving a peer from a file it cannot help with to one it can was tied to Kad being connected, though it only ever concerns ordinary ed2k sources, so it never ran at all for anyone running server-only</li>
-          <li><strong>A peer cannot make Ember hold hundreds of megabytes</strong> &mdash; The corruption-recovery buffer was bounded by bytes in one download path and only by packet count in the other, and the one that was missed is the path a single-source download takes</li>
+          <li><strong>Obfuscated connections don&rsquo;t corrupt themselves after a stall.</strong> If a peer stopped reading for a minute, the next packet could put part of the previous one back on the wire. It decrypts cleanly at the far end, so nothing looks wrong until the framing has drifted and the connection is finished</li>
+          <li><strong>One byte can&rsquo;t hold an incoming connection slot.</strong> A connection that sent a single byte and then went silent was waited on with no timeout at all. Around thirty-four of those filled the listener and shut out every real peer, upload and port test</li>
+          <li><strong>Source swapping runs with Kad off.</strong> Moving a peer from a file it can&rsquo;t help with to one it can was gated on Kad, even though it only ever deals with ordinary ed2k sources. Nobody running server-only ever saw it work</li>
+          <li><strong>A peer can&rsquo;t make us hold hundreds of megabytes.</strong> We bounded the corruption-recovery buffer by bytes in one download path and by packet count in the other. The one we missed is the path a single-source download takes</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li><strong>The name you see is the name you get</strong> &mdash; Two different rules decided the filename shown in the list and the filename written to disk, so a result could display one name and download another</li>
-          <li><strong>Peers contribute a full page of results</strong> &mdash; The limit on how many packets one answer could use was smaller than a page of results, so the fix in 1.5.1 could not take effect and each peer still returned only part of what it held</li>
+          <li><strong>The name you see is the name you get.</strong> Two different rules picked the filename for the results list and the filename written to disk, so a result could show one name and download another</li>
+          <li><strong>Peers send a full page of results.</strong> Our budget for how many packets one answer may use was smaller than a single page, so the 1.5.1 fix couldn&rsquo;t take effect and each peer still returned a slice of what it held</li>
         </ul>
 
         <h5>Kad</h5>
         <ul>
-          <li><strong>One peer cannot block all publishing on your node</strong> &mdash; Comments, ratings and source records shared one space with keyword records, and only keyword records could be trimmed to make room. Whichever of the other two filled that space first locked the whole store &mdash; five hours for sources, a full day for comments &mdash; refusing everything else in the meantime</li>
-          <li><strong>A refused publish cannot delete somebody else&rsquo;s records</strong> &mdash; The 1.5.1 fix covered new records but not updates to existing ones, so a peer could still make Ember discard another publisher&rsquo;s entries to make space for a record its own limits were about to turn down</li>
+          <li><strong>One peer can&rsquo;t block all publishing on your node.</strong> Comments, ratings and source records shared one space with keyword records, and only keyword records could be trimmed to make room. Whichever of the other two filled it first locked the whole store and refused everything else in the meantime: five hours for sources, a full day for comments</li>
+          <li><strong>A refused publish can&rsquo;t delete somebody else&rsquo;s records.</strong> Our 1.5.1 fix covered new records and not updates to existing ones, so a peer could still make us drop another publisher&rsquo;s entries to clear space for a record its own limits were about to turn down</li>
         </ul>
 
         <h5>Your data</h5>
         <ul>
-          <li><strong>An interrupted save no longer resets your settings</strong> &mdash; Replacing a file on Windows sometimes needs the old one moved aside first. 1.5.1 taught your identity file to recover from that; every other file still could not. For your settings it meant a launch that looked like a fresh install: every preference back to default and every shared folder dropped</li>
-          <li><strong>Your approved folders stay approved &mdash; and stay yours</strong> &mdash; The record of which folders Ember may use failed the same way, and it failed open: an empty record looked like a first run, so whatever now sat at each configured path was approved again without asking you</li>
-          <li><strong>Chat history is not locked out by an interrupted save</strong> &mdash; The chat key could be left under the same set-aside name, and Ember then reported the history sealed and told you to restore a backup while the key sat next to the database</li>
-          <li><strong>Backups are never shared, whatever you call them</strong> &mdash; The rule that keeps a profile backup out of your shared folders matched the extension exactly, so saving one as <code>.EmberBackup</code> slipped past it and the file was indexed and offered to peers like any other</li>
-          <li><strong>Restoring an old backup cannot stop Ember opening</strong> &mdash; A chat message that happened to begin with the text Ember uses to mark encrypted messages made the upgrade of a pre-1.4 database fail, and fail again on every launch afterwards</li>
-          <li><strong>The last saves on exit are no longer skipped</strong> &mdash; One save finishing at the wrong moment consumed the signal another was waiting for, and the wait that followed ate the time the reputation, source list and server list saves needed</li>
-          <li>File permissions on Windows are now applied through a handle that cannot be redirected between the check and the change, and the peer credit counters saturate instead of wrapping when a stored value is out of range</li>
+          <li><strong>An interrupted save doesn&rsquo;t reset your settings.</strong> Replacing a file on Windows sometimes needs the old one moved aside first. In 1.5.1 we taught the identity file to recover from that and left every other file as it was. For settings it meant a launch that looked like a fresh install: every preference back to default and every shared folder gone</li>
+          <li><strong>Approved folders stay approved, and stay yours.</strong> The record of which folders Ember may use failed the same way, and it failed open. An empty record looked like a first run, so whatever was sitting at each configured path got approved again without anyone asking you</li>
+          <li><strong>An interrupted save doesn&rsquo;t lock you out of chat history.</strong> The chat key could be left under the set-aside name, and we would then report the history sealed and tell you to restore a backup, with the key sitting right next to the database</li>
+          <li><strong>Backups are never shared, whatever you call them.</strong> Our rule for keeping a profile backup out of your shared folders matched the extension exactly, so a file saved as <code>.EmberBackup</code> went straight past it and got indexed and offered to peers like anything else</li>
+          <li><strong>Restoring an old backup can&rsquo;t stop Ember opening.</strong> A chat message that happened to start with the text we use to mark encrypted messages made the upgrade of a pre-1.4 database fail, and then fail again on every launch after that</li>
+          <li><strong>The last saves on exit aren&rsquo;t skipped.</strong> One save finishing at the wrong moment consumed the signal another was waiting on, and the wait that followed ate the time the reputation, source list and server list saves needed</li>
+          <li>Two smaller ones: file permissions on Windows are applied through a handle that can&rsquo;t be redirected between the check and the change, and the peer credit counters saturate instead of wrapping when a stored value is out of range</li>
         </ul>
 
         <p class="full-changelog">
@@ -1610,58 +1610,58 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.1" target="_blank" rel="noopener"><code>v1.5.1</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <p>A second full audit, this time reading the whole app in parallel &mdash; the network loop, each eD2K path, Kad, the Ember overlay, storage and security, the command layer, the interface, and the rendezvous server. Twenty-two findings survived checking, and every one of them is fixed here.</p>
+        <p>No new features in this one. It&rsquo;s our second full audit, read in parallel across the network loop, each eD2K path, Kad, the Ember overlay, storage and security, the command layer, the interface and the rendezvous server. Twenty-two findings held up and all of them are fixed here.</p>
 
-        <p>Two were costing people something every day. If you run Ember server-only &mdash; which is what you have if you never press Connect on the Kad page &mdash; <strong>every reply peers sent you was being thrown away</strong>, so queue positions never moved while Ember kept asking for them. And roughly <strong>one in every 250 incoming connections from a stock eMule client was dropped before it started</strong>, because a byte we assumed eMule would never send is in fact one it picks at random.</p>
+        <p>Two of them were costing people something every day. If you run Ember server-only, which is what you have if you&rsquo;ve never pressed Connect on the Kad page, <strong>every reply peers sent you was being thrown away</strong>, so queue positions never moved while we kept asking for them. And roughly <strong>one in every 250 incoming connections from a stock eMule client was dropped before it started</strong>, over a byte we assumed eMule would never send and it turns out picks at random.</p>
 
         <h5>Before you upgrade</h5>
         <ul>
-          <li><strong>Nothing to do this time.</strong> Unlike 1.5.0, this release does not change your library database, so you can move between 1.5.0 and 1.5.1 freely</li>
+          <li><strong>Nothing to do this time.</strong> Unlike 1.5.0, we didn&rsquo;t change your library database, so you can move between 1.5.0 and 1.5.1 freely</li>
         </ul>
 
         <h5>Talking to other clients</h5>
         <ul>
-          <li><strong>Queue positions update again with Kad off</strong> &mdash; Replies from peers &mdash; your place in their queue, whether a source is still alive, the answer to the UDP port test, and reask relaying for firewalled peers &mdash; all arrive on the same socket Kad uses, and Ember discarded the lot whenever Kad was not connected. It kept sending the questions, so the traffic went out and nothing ever came back. Peers waiting in <em>your</em> queue got no acknowledgement either, and had to fall back or give up</li>
-          <li><strong>eMule clients connect reliably</strong> &mdash; Ember&rsquo;s private friend handshake opens with a byte we believed eMule&rsquo;s obfuscation could never begin with. It can: eMule picks that first byte at random and rules out only three values. Every collision sent an ordinary eMule client into the wrong handshake and dropped the connection, usually after making it wait ten seconds first</li>
-          <li><strong>One peer&rsquo;s &ldquo;I don&rsquo;t have that&rdquo; no longer counts against your other downloads</strong> &mdash; A peer declining one file was marked as failed on <em>every</em> file you were getting from it, and any queue position you had just learned was thrown away with it. Peers commonly serve several of your downloads at once, so this quietly cost you working sources</li>
-          <li><strong>Server names show up instead of an address</strong> &mdash; A server that sent its name in the compact form the eMule protocol also allows was not understood, so the list kept showing a bare IP address for it</li>
+          <li><strong>Queue positions update again with Kad off.</strong> Replies from peers all arrive on the socket Kad uses: your place in their queue, whether a source is still alive, the answer to the UDP port test, reask relaying for firewalled peers. We discarded the lot whenever Kad wasn&rsquo;t connected, and we kept sending the questions, so the traffic went out and nothing ever came back. Peers waiting in <em>your</em> queue got no acknowledgement either, and had to fall back or give up</li>
+          <li><strong>eMule clients connect reliably.</strong> Our private friend handshake opens with a byte we believed eMule&rsquo;s obfuscation could never begin with. It can: eMule picks that first byte at random and rules out only three values. Every collision sent an ordinary eMule client into the wrong handshake and dropped the connection, usually after making it wait ten seconds first</li>
+          <li><strong>One peer&rsquo;s &ldquo;I don&rsquo;t have that&rdquo; doesn&rsquo;t count against your other downloads.</strong> A peer declining one file was marked failed on <em>every</em> file you were getting from it, and any queue position you had just learned went out with it. Peers commonly serve several of your downloads at once, so this cost people working sources</li>
+          <li><strong>Server names show up instead of an address.</strong> A server that sent its name in the compact form the eMule protocol also allows wasn&rsquo;t parsed, so the list kept showing a bare IP for it</li>
         </ul>
 
         <h5>Uploads</h5>
         <ul>
-          <li><strong>A single peer can no longer pin your disk and a CPU core</strong> &mdash; One small request asked Ember to hash an entire shared file from start to finish, and nothing remembered the answer, so the same request repeated forever cost the same work every time. It needed no upload slot, no queue position and no identity. On a large share a handful of packets could make the app unresponsive for minutes, and stall your downloads with it</li>
-          <li><strong>More upload slots on a slow connection</strong> &mdash; Ember guaranteed two upload slots where eMule guarantees four, and because the number is worked out from how fast you are actually uploading, two slow peers kept it there. You now serve as many peers as eMule would, and two trickling peers can no longer hold your whole upload</li>
+          <li><strong>A single peer can&rsquo;t pin your disk and a CPU core.</strong> One small request asked us to hash an entire shared file start to finish, and nothing remembered the answer, so repeating the request cost the same work every time. It needed no upload slot, no queue position and no identity. On a large share a handful of packets could make the app unresponsive for minutes and stall your downloads with it</li>
+          <li><strong>More upload slots on a slow connection.</strong> We guaranteed two upload slots where eMule guarantees four, and since the number comes from how fast you&rsquo;re actually uploading, two slow peers kept it at two. You now serve as many peers as eMule would, and two trickling peers can&rsquo;t hold your whole upload</li>
         </ul>
 
         <h5>Downloads</h5>
         <ul>
-          <li><strong>Peers that compress are no longer dropped mid-transfer</strong> &mdash; When another source finished the part you were working on first, a compressed block already on its way arrived with nothing to match it against, and Ember treated that as the peer misbehaving and closed the connection &mdash; then waited out a cooldown of nearly half an hour before trying it again. It happens in ordinary use, with nothing wrong at either end</li>
-          <li><strong>Invented identities cannot push out real sources</strong> &mdash; When a file&rsquo;s source list is full, Ember drops the least valuable entry rather than the oldest. Which entries counted as least valuable depended on a name the sending peer chose, so a peer that made one up for each source it offered could push out sources you had already used, and the replacements were the ones written to disk for next time</li>
-          <li><strong>Repeated junk sources no longer displace working ones</strong> &mdash; A firewalled source offered with an id of zero can never be contacted, and was the one value the duplicate check could not recognise, so sending the same packet again added another dead entry every time</li>
-          <li><strong>A peer cannot make Ember hold hundreds of megabytes</strong> &mdash; While waiting for a corruption-recovery answer, Ember set aside a fixed number of packets regardless of how large they were, which a peer could inflate deliberately</li>
+          <li><strong>Peers that compress aren&rsquo;t dropped mid-transfer.</strong> When another source finished the part you were working on first, a compressed block already in flight arrived with nothing to match it against, and we treated that as the peer misbehaving, closed the connection, then sat out a cooldown of nearly half an hour before trying again. Nothing is wrong at either end when this happens</li>
+          <li><strong>Invented identities can&rsquo;t push out real sources.</strong> When a file&rsquo;s source list is full we drop the least valuable entry rather than the oldest. Which entries counted as least valuable depended on a name the sending peer chose, so a peer that made one up for each source it offered could push out sources you had already used, and its replacements were what we wrote to disk for next time</li>
+          <li><strong>Repeated junk sources don&rsquo;t displace working ones.</strong> A firewalled source offered with an id of zero can never be contacted, and zero was the one value our duplicate check couldn&rsquo;t recognise, so the same packet sent again added another dead entry every time</li>
+          <li><strong>A peer can&rsquo;t make us hold hundreds of megabytes.</strong> While waiting for a corruption-recovery answer we set aside a fixed number of packets regardless of how large they were, and a peer could inflate them on purpose</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li><strong>Each peer contributes everything it holds</strong> &mdash; Asking a peer for the next page of results was meant to happen once it had sent a full page, but the check compared a single network packet against the size of a whole page, and a page always arrives split across many packets. No peer was ever asked for a second page, so popular keywords returned only the first slice of what each peer actually had</li>
+          <li><strong>Each peer contributes everything it holds.</strong> Asking a peer for another page of results was meant to happen once it had sent a full page, but we compared a single network packet against the size of a whole page, and a page always arrives split across many packets. No peer was ever asked for a second page, so popular keywords returned only the first slice of what each one actually had</li>
         </ul>
 
         <h5>Friends and the Ember Network</h5>
         <ul>
-          <li><strong>Relayed transfers survive a quiet moment</strong> &mdash; When both sides are firewalled, traffic can go through the rendezvous server. A relayed connection that went quiet for thirty seconds was closed by the layer underneath, even though the relay itself allows three minutes &mdash; and quiet is normal here: a peer parked in an upload queue says nothing for close to half an hour. This is a server-side fix and is already live, so it applies to 1.5.0 too</li>
-          <li><strong>Kad storage cannot be filled by one peer</strong> &mdash; Comments and ratings published to your node had no per-publisher limit at all, so one peer could fill the space shared with keyword and source records &mdash; after which no new source could be stored and honest keyword records were discarded to make room. Separately, a peer whose own record was going to be refused could still make Ember delete somebody else&rsquo;s to make space for it</li>
+          <li><strong>Relayed transfers survive a quiet moment.</strong> When both sides are firewalled, traffic can go through the rendezvous server. A relayed connection that went quiet for thirty seconds was closed by the layer underneath even though the relay itself allows three minutes, and quiet is normal here: a peer parked in an upload queue says nothing for close to half an hour. This is a server-side fix and is already deployed, so it applies to 1.5.0 too</li>
+          <li><strong>Kad storage can&rsquo;t be filled by one peer.</strong> Comments and ratings published to your node had no per-publisher limit at all, so one peer could fill the space shared with keyword and source records. After that no new source could be stored, and honest keyword records were discarded to make room. Separately, a peer whose own record was about to be refused could still make us delete somebody else&rsquo;s to clear space for it</li>
         </ul>
 
         <h5>Your data</h5>
         <ul>
-          <li><strong>An unexpected exit no longer discards the session</strong> &mdash; Ember&rsquo;s save-on-exit sequence ran on a deadline set forty-five seconds after launch. When the app closed any way other than being asked to, that deadline had long passed and every step was skipped &mdash; peer list, library checkpoint, credits, reputation and server list &mdash; while the log blamed a slow disk. The library checkpoint alone is what avoids re-hashing your whole share on the next start</li>
-          <li><strong>Your identity survives an interrupted save</strong> &mdash; Replacing a file on Windows sometimes needs the old one moved aside first, and if the app died in that instant the only copy was left under a name nothing ever looked for again. For your identity file that meant the next launch generated a brand new one, silently resetting your Kad id, your friendships and your credit with every peer</li>
-          <li><strong>A locked settings file no longer unapproves your folders</strong> &mdash; If the record of which folders Ember may use could not be read at startup &mdash; a backup tool or antivirus holding it open is enough &mdash; it was treated as damaged and replaced with an empty one. Every shared folder and your download folder then had to be re-approved by hand</li>
-          <li><strong>Backups are never shared to the network</strong> &mdash; Saving a profile backup into one of your shared folders got it indexed, hashed and offered to other peers like any other file. It holds your keys, so it should never have been publishable, however strong the passphrase</li>
-          <li><strong>Two exports at once cannot destroy a backup</strong> &mdash; Starting a second export to the same file before the first finished mixed the two together and reported success, leaving a backup no passphrase could ever open where a good one used to be</li>
-          <li>The brief hitch every few minutes while the Ember peer list was written to disk is gone, and a slow save no longer eats into the time the other saves have</li>
+          <li><strong>An unexpected exit doesn&rsquo;t discard the session.</strong> Our save-on-exit sequence ran against a deadline set forty-five seconds after launch. If the app closed any way other than being asked to, that deadline was long gone and every step was skipped: peer list, library checkpoint, credits, reputation, server list. The log blamed a slow disk. The library checkpoint on its own is what saves you re-hashing your whole share on the next start</li>
+          <li><strong>Your identity survives an interrupted save.</strong> Replacing a file on Windows sometimes needs the old one moved aside first, and if the app died in that instant the only copy was left under a name nothing ever looked for again. For the identity file that meant the next launch generated a brand new one, silently resetting your Kad id, your friendships and your credit with every peer</li>
+          <li><strong>A locked settings file doesn&rsquo;t unapprove your folders.</strong> If we couldn&rsquo;t read the record of which folders Ember may use at startup, and a backup tool or antivirus holding it open is enough for that, we treated it as damaged and replaced it with an empty one. Every shared folder and your download folder then had to be re-approved by hand</li>
+          <li><strong>Backups are never shared to the network.</strong> Saving a profile backup into one of your shared folders got it indexed, hashed and offered to other peers like any other file. It holds your keys, so it should never have been publishable, however strong the passphrase</li>
+          <li><strong>Two exports at once can&rsquo;t destroy a backup.</strong> Starting a second export to the same file before the first finished interleaved the two and reported success, leaving a backup no passphrase could ever open where a good one used to be</li>
+          <li>The brief hitch every few minutes while we wrote the Ember peer list to disk is gone, and a slow save no longer eats into the time the other saves have</li>
         </ul>
 
         <p class="full-changelog">
@@ -1678,72 +1678,73 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.0" target="_blank" rel="noopener"><code>v1.5.0</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <p>Our first full read-only audit of the app, plus the work that was prepared for 1.4.1. There is no 1.4.1 release; all of it ships here instead.</p>
 
-        <p>The result of a full read-only audit of every part of the app, plus the work prepared for 1.4.1, which was never published &mdash; there is no 1.4.1 release, and everything intended for it ships here instead.</p>
-
-        <p>The headline is a bug that has been in 1.4.0 the whole time: <strong>no file larger than 4 GiB could be downloaded at all</strong>. Beyond that, most of what follows was invisible from the outside &mdash; uploads quietly capped at a tenth of their limit, friends unable to find you, a source exchange that never answered, and several paths that failed without leaving a trace anyone could see.</p>
+        <p>The headline is a bug that had been in 1.4.0 from the start: <strong>no file larger than 4 GiB could be downloaded at all</strong>. Most of the rest you had no way of seeing from outside the app. Uploads capped at a tenth of their limit, friends unable to find you, a source exchange that never answered, and several paths that failed without leaving a trace.</p>
 
         <h5>Before you upgrade</h5>
         <ul>
-          <li><strong>This release upgrades your library database, and 1.4.0 cannot open it afterwards.</strong> The upgrade is automatic and keeps your data, but it is one-way: if you want the option of going back to 1.4.0, copy your Ember data folder somewhere safe before installing</li>
+          <li><strong>This release upgrades your library database, and 1.4.0 can&rsquo;t open it afterwards.</strong> The upgrade is automatic and keeps your data, but it only goes one way. If you want the option of going back to 1.4.0, copy your Ember data folder somewhere safe before you install</li>
         </ul>
+
+        <h4>What&rsquo;s New</h4>
+
+        <ul>
+          <li><strong>Diagnostics on the Ember Network page.</strong> Counters for source exchanges, how many offered sources we use versus filter out, replies too large for UDP, and storage rejections. Every one of them covers a path that used to fail without saying anything</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
 
         <h5>Downloads</h5>
         <ul>
-          <li><strong>Files larger than 4 GiB download again</strong> &mdash; Ember rejected the very first block of data every source sent for a large file, on the mistaken belief that the packet could not describe a position that far into the file. Every source disconnected immediately and the download never started. Nothing above 4 GiB could be fetched, from eMule peers or from other Ember clients</li>
-          <li><strong>Less re-downloading after corruption</strong> &mdash; When a peer asked us to help pinpoint which small piece of a part was damaged, our answer was built wrong for most file sizes and was rejected. That peer then had to fetch the whole 9 MB part again instead of the 180 KB block that was actually bad</li>
-          <li><strong>Damaged archives salvage what they can</strong> &mdash; A single unreadable entry threw away the entire recovery, including everything already checked and rescued &mdash; the opposite of the point of the feature</li>
-          <li><strong>Finished parts are on disk before they are trusted</strong> &mdash; A part could be recorded as verified while its data was still only in memory. A power cut at that moment left Ember convinced the data was good, and it would then serve it to other peers</li>
-          <li><strong>Progress no longer jumps backwards</strong> &mdash; The bar could drop by a whole part near the end while the last piece waited to be checked</li>
+          <li><strong>Files larger than 4 GiB download again.</strong> We rejected the very first block of data every source sent for a large file, because we believed the packet couldn&rsquo;t describe a position that far in. Every source disconnected immediately and the download never started. Nothing above 4 GiB could be fetched from anyone, eMule or Ember</li>
+          <li><strong>Less re-downloading after corruption.</strong> When a peer asked us to help pinpoint which small piece of a part was damaged, we built the answer wrong for most file sizes and it was rejected. That peer then had to fetch the whole 9 MB part again instead of the 180 KB block that was actually bad</li>
+          <li><strong>Damaged archives salvage what they can.</strong> A single unreadable entry threw away the entire recovery, including everything already checked and rescued</li>
+          <li><strong>Finished parts are on disk before we trust them.</strong> A part could be recorded as verified while its data was still only in memory. A power cut at that moment left us convinced the data was good, and we would then serve it to other peers</li>
+          <li><strong>Progress doesn&rsquo;t jump backwards.</strong> The bar could drop by a whole part near the end while the last piece waited to be checked</li>
         </ul>
 
         <h5>Uploads and sharing</h5>
         <ul>
-          <li><strong>Uploads are no longer stuck at a tenth of your limit</strong> &mdash; Upload Speed Sense briefly lowers your upload to measure a quiet connection before it starts managing speed. If it could not find a peer to measure against &mdash; which is the normal case with Kad disabled, a failed bootstrap, or a restrictive router &mdash; it never finished measuring and simply stayed there for the whole session, with nothing on screen to say so</li>
-          <li><strong>Your credit with other peers survives a restart</strong> &mdash; Credit earned by uploading was reset the first time each peer verified itself after Ember restarted, costing you the queue position you had built up</li>
-          <li><strong>Credit is harder to steal</strong> &mdash; The protection against a stranger claiming another peer&rsquo;s identity to inherit their credit could never actually trigger. Separately, anyone who knew a peer&rsquo;s identifier could strip that peer&rsquo;s standing by failing a single check on their behalf</li>
-          <li><strong>Large libraries scan without stalling the app</strong> &mdash; Each finished file was matched by scanning every other file already indexed, which on a big share held up uploads and the interface for the length of the scan. Watching offline network shares no longer blocks the window either</li>
+          <li><strong>Uploads aren&rsquo;t stuck at a tenth of your limit.</strong> Upload Speed Sense briefly lowers your upload to measure a quiet connection before it starts managing speed. If it couldn&rsquo;t find a peer to measure against, which is the normal case with Kad disabled, a failed bootstrap, or a restrictive router, it never finished measuring and stayed there for the whole session. Nothing in the interface said so</li>
+          <li><strong>Your credit with other peers survives a restart.</strong> Credit earned by uploading was reset the first time each peer verified itself after we restarted, costing you the queue position you had built up</li>
+          <li><strong>Credit is harder to steal.</strong> Our protection against a stranger claiming another peer&rsquo;s identity to inherit their credit could never actually fire. Separately, anyone who knew a peer&rsquo;s identifier could strip that peer&rsquo;s standing by failing a single check on their behalf</li>
+          <li><strong>Large libraries scan without stalling the app.</strong> We matched each finished file by scanning every file already indexed, which on a big share held up uploads and the interface for the length of the scan. Watching offline network shares doesn&rsquo;t block the window any more either</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li><strong>Nobody else can rename your download</strong> &mdash; When several peers answered for the same file, Ember kept the longest name offered. Since anyone can pad a name, a single peer could rename a file in the results &mdash; and, because that name is what the download is saved as, on your disk too. The name most peers agree on now wins</li>
-          <li><strong>Inflated results sink</strong> &mdash; A peer claiming an impossible number of sources sorted above every honest result</li>
-          <li><strong>Turning Ember on takes effect immediately</strong> &mdash; Enabling the Ember Network from its own page left Search still convinced it was off, refusing Ember searches until the app was restarted</li>
-          <li><strong>Searches find more</strong> &mdash; A popular file is held by many peers, and every copy it returned used one of the 300 result slots. Copies are now counted once, so a common file no longer crowds out everything else</li>
+          <li><strong>Nobody else can rename your download.</strong> When several peers answered for the same file we kept the longest name offered. Anyone can pad a name, so a single peer could rename a file in the results, and since that name is what we save the download as, on your disk too. The name most peers agree on now wins</li>
+          <li><strong>Inflated results sink.</strong> A peer claiming an impossible number of sources sorted above every honest result</li>
+          <li><strong>Turning Ember on takes effect immediately.</strong> Enabling the Ember Network from its own page left Search still convinced it was off, refusing Ember searches until you restarted the app</li>
+          <li><strong>Searches find more.</strong> A popular file is held by many peers, and every copy it returned used one of the 300 result slots. Copies are counted once now, so a common file doesn&rsquo;t crowd out everything else</li>
         </ul>
 
         <h5>Friends and the Ember Network</h5>
         <ul>
-          <li><strong>Friends can find you again</strong> &mdash; Registration with the rendezvous server restarted every ten seconds and threw away its own result each time, so it never completed. For most setups this meant you were never discoverable, friend transfers could not start, and the app quietly re-registered forever</li>
-          <li><strong>UDP source exchanges are answered again</strong> &mdash; The reply was built for a connection where size is not limited, so on any client with a real download list it was too big to send and was dropped. It is now built to fit, sending fewer files rather than nothing</li>
-          <li><strong>Your own address is no longer accepted back</strong> &mdash; Sources travel peer to peer, so one eventually came back pointing at you, leaving a download trying to connect to itself</li>
-          <li><strong>Relay offers are charged to whoever sent them</strong> &mdash; A single peer could fill the relay list with entries it made up and push out relays learned elsewhere</li>
-          <li><strong>A missed reply is not the end</strong> &mdash; A peer that failed to answer once was dropped from that search for good, though one lost packet is enough to cause it</li>
-          <li><strong>Known-good peers stay known-good</strong> &mdash; Peers that had answered were pushed aside by ones merely heard about, so the connections actually in use went stale and were dropped</li>
-          <li><strong>Downloads cannot be misdirected</strong> &mdash; Any peer could publish a false fingerprint for a file. Ember would finish the download, find it did not match, discover nothing actually wrong with it, and start over from scratch &mdash; forever. Fingerprints now need agreement from several peers and never override one Ember worked out itself</li>
+          <li><strong>Friends can find you again.</strong> Registration with the rendezvous server restarted every ten seconds and threw away its own result each time, so it never completed. For most setups that meant you were never discoverable, friend transfers couldn&rsquo;t start, and we re-registered forever</li>
+          <li><strong>UDP source exchanges get answered.</strong> We built the reply for a connection where size isn&rsquo;t limited, so on any client with a real download list it was too big to send and got dropped. It&rsquo;s built to fit now, and sends fewer files rather than nothing</li>
+          <li><strong>Your own address isn&rsquo;t accepted back.</strong> Sources travel peer to peer, so one eventually came back pointing at you and left a download trying to connect to itself</li>
+          <li><strong>Relay offers are charged to whoever sent them.</strong> A single peer could fill the relay list with entries it made up and push out relays learned elsewhere</li>
+          <li><strong>A missed reply isn&rsquo;t the end.</strong> A peer that failed to answer once was dropped from that search for good, and one lost packet is enough to cause it</li>
+          <li><strong>Known-good peers stay known-good.</strong> Peers that had answered were pushed aside by ones we had merely heard about, so the connections actually in use went stale and were dropped</li>
+          <li><strong>Downloads can&rsquo;t be misdirected.</strong> Any peer could publish a false fingerprint for a file. We would finish the download, find it didn&rsquo;t match, find nothing actually wrong with it, and start over from scratch, forever. Fingerprints now need agreement from several peers, and they never override one we worked out ourselves</li>
         </ul>
 
         <h5>Network protection</h5>
         <ul>
-          <li><strong>Ember is no longer usable as a reflector</strong> &mdash; Two handshakes replied to whoever a packet claimed to come from, with a larger response than the request. Both now prove an address is real before spending anything substantial on it, which also stops one peer being locked out of another&rsquo;s connection list</li>
-          <li><strong>Flood defences cost less than the flood</strong> &mdash; The tables protecting against packet floods searched tens of thousands of entries per packet, and chose the busiest peer to forget &mdash; letting an attacker reset the very limit that was meant to catch it. One tracker grew without limit</li>
-          <li><strong>Shared storage cannot be monopolised</strong> &mdash; A single peer could fill the space Ember offers the network and lock out every honest publisher for a day, and could sidestep its own quota simply by changing port</li>
-          <li><strong>A stalled server cannot wedge reconnection</strong> &mdash; A server that answered slowly but never finished logging in could hold Ember on &ldquo;Connecting&rdquo; for close to an hour with no fallback</li>
+          <li><strong>Ember isn&rsquo;t usable as a reflector.</strong> Two of our handshakes replied to whoever a packet claimed to come from, with a response larger than the request. Both prove an address is real now before spending anything substantial on it, which also stops one peer being locked out of another&rsquo;s connection list</li>
+          <li><strong>Flood defences cost less than the flood.</strong> The tables protecting against packet floods searched tens of thousands of entries per packet, and chose the busiest peer to forget, which let an attacker reset the very limit meant to catch it. One tracker grew without limit</li>
+          <li><strong>Shared storage can&rsquo;t be monopolised.</strong> A single peer could fill the space we offer the network and lock out every honest publisher for a day, and could sidestep its own quota by changing port</li>
+          <li><strong>A stalled server can&rsquo;t wedge reconnection.</strong> A server that answered slowly but never finished logging in could hold us on &ldquo;Connecting&rdquo; for close to an hour with no fallback</li>
         </ul>
 
         <h5>Files, folders and updates</h5>
         <ul>
-          <li><strong>Changing a folder&rsquo;s properties no longer breaks downloads</strong> &mdash; Compressing your download folder, turning off search indexing on it, or a cloud client marking it looked identical to the folder being swapped out. Ember revoked its own access and every download failed, with no way to restore it from inside the app. Saving Settings now restores it, and ordinary property changes are ignored</li>
-          <li><strong>Installing an update no longer loses progress</strong> &mdash; The installer shut Ember down in a way that skipped saving, so every update discarded the resume data for in-progress downloads, the library checkpoint that exists to avoid a full re-scan, and the peer and server lists</li>
-          <li><strong>Checking for updates reports honestly</strong> &mdash; If the published release was older than the version installed, every check failed with a security warning instead of simply saying you are up to date</li>
-          <li>Chat day separators stay correct across daylight saving changes, and remote text can no longer use invisible characters to disguise how a name reads</li>
-        </ul>
-
-        <h5>Diagnostics</h5>
-        <ul>
-          <li>The Ember Network page gains counters for source exchanges, how many offered sources are used versus filtered, replies too large for UDP, and storage rejections &mdash; each covering a path that previously failed silently</li>
+          <li><strong>Changing a folder&rsquo;s properties doesn&rsquo;t break downloads.</strong> Compressing your download folder, turning off search indexing on it, or a cloud client marking it, all looked identical to the folder being swapped out. We revoked our own access, every download failed, and there was no way to restore it from inside the app. Saving Settings restores it now, and ordinary property changes are ignored</li>
+          <li><strong>Installing an update doesn&rsquo;t lose progress.</strong> The installer shut us down in a way that skipped saving, so every update discarded the resume data for downloads in progress, the library checkpoint that exists to avoid a full re-scan, and the peer and server lists</li>
+          <li><strong>&ldquo;Up to date&rdquo; instead of a security warning.</strong> If the published release was older than the version installed, every check failed with a warning rather than telling you there was nothing to install</li>
+          <li>Chat day separators stay correct across daylight saving changes, and remote text can&rsquo;t use invisible characters to disguise how a name reads</li>
         </ul>
 
         <p class="full-changelog">
@@ -1760,31 +1761,32 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.4.0" target="_blank" rel="noopener"><code>v1.4.0</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <p>The Ember Network beta. 1.4.0 turns on our own encrypted overlay by default, so peers can find each other, publish what they share, and discover download sources without a central directory. File bytes still move over the familiar eD2K path.</p>
 
-        <p>The Ember Network beta. Ember 1.4.0 turns on Ember&rsquo;s own encrypted overlay by default so peers can find each other, publish shared files, and discover download sources without a central directory &mdash; while file bytes still move over the familiar eD2K path.</p>
+        <h4>What&rsquo;s New</h4>
 
-        <h5>Ember Network (BETA)</h5>
+        <h5>Ember Network (beta)</h5>
         <ul>
-          <li><strong>On by Default</strong> &mdash; The Ember overlay joins automatically. Profiles that still had it off from an older default are migrated on, with a clear notice if anything was flipped</li>
-          <li><strong>Find Other Ember Users</strong> &mdash; Nodes meet through a well-known KAD rendezvous key, through Ember peers noticed in ordinary KAD traffic, and through eD2K transfers with Ember-capable clients. There is no central bootstrap pool and no shipped seed list</li>
-          <li><strong>Publish &amp; Search</strong> &mdash; Shared files are published so other Ember users can find them. Keyword search and source lookup run on the Ember DHT alongside KAD and servers</li>
-          <li><strong>Downloads Still Use eD2K</strong> &mdash; Ember finds the source; the file still transfers over eD2K client-to-client. Keep KAD and/or servers available so a fresh install can join</li>
-          <li><strong>Ember Network Page</strong> &mdash; A redesigned status page shows whether you are connected, whether people can reach you, and whether your shared files are published, with technical diagnostics kept collapsed</li>
-          <li><strong>Honest Versioning</strong> &mdash; The DHT wire format is versioned so incompatible peers refuse each other cleanly instead of looking like packet loss</li>
+          <li><strong>On by default.</strong> The overlay joins on its own. Profiles that still had it switched off from an older default are migrated on, and we tell you if anything was flipped</li>
+          <li><strong>Finding other Ember users.</strong> Nodes meet through a well-known KAD rendezvous key, through Ember peers we notice in ordinary KAD traffic, and through eD2K transfers with Ember-capable clients. There is no central bootstrap pool and no seed list shipped in the build</li>
+          <li><strong>Publish and search.</strong> Shared files are published so other Ember users can find them, and keyword search and source lookup run on the Ember DHT alongside KAD and servers</li>
+          <li><strong>Downloads still use eD2K.</strong> Ember finds the source; the file transfers client to client over eD2K. Keep KAD or servers available so a fresh install can join</li>
+          <li><strong>Ember Network page.</strong> Redesigned to show whether you&rsquo;re connected, whether people can reach you, and whether your shared files are published, with the technical diagnostics kept collapsed</li>
+          <li><strong>A versioned wire format.</strong> Incompatible peers refuse each other cleanly instead of looking like packet loss</li>
         </ul>
 
         <h5>Library</h5>
         <ul>
-          <li><strong>No Full Re-hash on Every Launch</strong> &mdash; Idle startups no longer re-hash the whole library when nothing changed</li>
-          <li><strong>Ember Share Badges</strong> &mdash; The Library Shared column shows when a file has a live Ember source record</li>
+          <li><strong>Ember share badges.</strong> The Library&rsquo;s Shared column shows when a file has a live Ember source record</li>
         </ul>
 
-        <h5>Hardening</h5>
+        <h4>What&rsquo;s Fixed</h4>
+
         <ul>
-          <li>Post-1.3.5 audit pass across publish, search, store replay limits, table admission, and related edges</li>
-          <li>Disabling Ember stops advertising under the rendezvous key so other nodes do not waste bridge pings on a peer that will not answer</li>
-          <li>Developer-only Ember console removed from the shipping UI</li>
+          <li><strong>No full re-hash on every launch.</strong> An idle startup doesn&rsquo;t re-hash the whole library when nothing has changed</li>
+          <li>An audit pass over everything added since 1.3.5: publish, search, store replay limits, table admission, and the edges around them</li>
+          <li>Disabling Ember stops advertising under the rendezvous key, so other nodes don&rsquo;t spend bridge pings on a peer that won&rsquo;t answer</li>
+          <li>The developer-only Ember console is out of the shipping build</li>
         </ul>
 
         <p class="full-changelog">
@@ -1801,70 +1803,70 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.5" target="_blank" rel="noopener"><code>v1.3.5</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <p>A reliability release. Ember 1.3.5 is the result of a full audit of the app, and it fixes a number of faults that were quiet by nature &mdash; settings that did not apply, messages that were never shown, and a library that could stop indexing without saying so.</p>
+        <p>A reliability release, and the result of a full audit. Most of what it fixes was quiet by nature: settings that didn&rsquo;t apply, messages that were never shown, and a library that could stop indexing without telling you.</p>
 
-        <h5>Library &amp; Sharing</h5>
+        <h5>Library and sharing</h5>
         <ul>
-          <li><strong>One Slow File No Longer Empties Your Library</strong> &mdash; A file that took more than five minutes to hash used to cancel the whole scan and discard everything not yet indexed, and it happened again on every launch, so files were silently missing from your share. Large files on a network share, an external drive or OneDrive are now left for a later attempt while the rest of the scan carries on</li>
-          <li><strong>Adding a Folder Cannot Wedge</strong> &mdash; A file whose read never returned could hold the scan lock for the rest of the session, blocking every later folder add or reload and delaying shutdown. The wait no longer holds anything</li>
-          <li><strong>Copy All Links on Large Libraries</strong> &mdash; Copying every link failed outright above 50,000 files. It is now sent in batches</li>
-          <li><strong>Honest Scan Warnings</strong> &mdash; The &ldquo;only the first 100,000 files were indexed&rdquo; notice appeared on ordinary reloads of any large folder. It now only appears when that limit was genuinely reached</li>
-          <li><strong>Excluded Files Stay Excluded</strong> &mdash; Part-finished downloads, Ember&rsquo;s own temporary and backup files, and anything inside its data folder could return to your share through the known-files list. They no longer can</li>
-          <li><strong>Failures Are Visible</strong> &mdash; When the library failed to load, it rendered as an empty library with an invitation to add a folder. It now reports the error</li>
+          <li><strong>One slow file doesn&rsquo;t empty your library.</strong> A file that took more than five minutes to hash cancelled the whole scan and discarded everything not yet indexed, and it happened again on every launch, so files went missing from your share with no explanation. Large files on a network share, an external drive or OneDrive are left for a later attempt now, while the rest of the scan carries on</li>
+          <li><strong>Adding a folder can&rsquo;t wedge.</strong> A file whose read never returned could hold the scan lock for the rest of the session, blocking every later folder add or reload and delaying shutdown. That wait doesn&rsquo;t hold the lock any more</li>
+          <li><strong>Copy All Links on large libraries.</strong> Copying every link failed outright above 50,000 files. It&rsquo;s sent in batches now</li>
+          <li><strong>Accurate scan warnings.</strong> The &ldquo;only the first 100,000 files were indexed&rdquo; notice appeared on ordinary reloads of any large folder. It only shows up when the limit was actually hit</li>
+          <li><strong>Excluded files stay excluded.</strong> Part-finished downloads, our own temporary and backup files, and anything inside the Ember data folder could come back into your share through the known-files list</li>
+          <li><strong>Failures are visible.</strong> When the library failed to load, we rendered an empty library with an invitation to add a folder. It reports the error now</li>
         </ul>
 
-        <h5>Friends &amp; Chat</h5>
+        <h5>Friends and chat</h5>
         <ul>
-          <li><strong>Privacy Toggles Take Effect</strong> &mdash; Turning off incoming chat or browsing did nothing at all when the save failed: the switch stayed on, and the setting never reached the network. The switch now reverts and the failure is reported</li>
-          <li><strong>No More Missing Messages</strong> &mdash; Sending the same text twice in quick succession delivered both but only ever showed one, and the second stayed invisible until the conversation was reopened</li>
-          <li><strong>Queued Messages Reach Their Friend</strong> &mdash; A message typed while a friend was offline could stay marked queued indefinitely after they came back, if the reconnect reused a connection that was already open</li>
-          <li><strong>Abandoned Messages Say So</strong> &mdash; A queued message Ember has given up on now shows as failed instead of reading &ldquo;queued&rdquo; for the rest of the session</li>
-          <li><strong>Unread Badges While Minimised</strong> &mdash; Messages that arrived with the window minimised were marked read and raised no badge, so they were easy to miss entirely</li>
-          <li><strong>Browsing a Friend</strong> &mdash; A friend sharing two copies of one file could blank the browse window</li>
+          <li><strong>Privacy toggles take effect.</strong> Turning off incoming chat or browsing did nothing at all if the save failed: the switch stayed on and the setting never reached the network. The switch reverts now, and you get told</li>
+          <li><strong>No more missing messages.</strong> Sending the same text twice in quick succession delivered both and showed one, and the second stayed invisible until you reopened the conversation</li>
+          <li><strong>Queued messages reach their friend.</strong> A message typed while a friend was offline could stay marked queued indefinitely after they came back, if the reconnect reused a connection that was already open</li>
+          <li><strong>Abandoned messages say so.</strong> A queued message we&rsquo;ve given up on shows as failed instead of reading &ldquo;queued&rdquo; for the rest of the session</li>
+          <li><strong>Unread badges while minimised.</strong> Messages that arrived with the window minimised were marked read and raised no badge, so they were easy to miss entirely</li>
+          <li><strong>Browsing a friend.</strong> A friend sharing two copies of one file could blank the browse window</li>
         </ul>
 
         <h5>Transfers</h5>
         <ul>
-          <li><strong>Archive Recovery Works Again on Large Files</strong> &mdash; Recovery of a part-finished archive ran out of time before it began on anything multi-gigabyte, which is exactly the case it exists for</li>
-          <li><strong>Lighter Known Clients Tab</strong> &mdash; Trust badges issued one lookup per credit record every few seconds, which on a mature client list meant thousands at once and could crowd out other work</li>
+          <li><strong>Archive recovery works again on large files.</strong> Recovery of a part-finished archive ran out of time before it began on anything multi-gigabyte. Those are the files people actually want it for</li>
+          <li><strong>Lighter Known Clients tab.</strong> Trust badges issued one lookup per credit record every few seconds, which on a mature client list meant thousands at once and could crowd out other work</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li><strong>Preferences Are Saved</strong> &mdash; Search method, filters, sort order and column choices were never written to disk and reset on every launch</li>
-          <li><strong>Stop Actually Stops</strong> &mdash; Results kept arriving in a search that had been stopped, and a stop that failed to reach the network said nothing</li>
-          <li><strong>Held Enter</strong> &mdash; Holding or repeatedly pressing Enter opened an unbounded number of searches and tabs</li>
-          <li><strong>Notes</strong> &mdash; A failed notes lookup was indistinguishable from a file that genuinely has none</li>
+          <li><strong>Preferences are saved.</strong> Search method, filters, sort order and column choices were never written to disk and reset on every launch</li>
+          <li><strong>Stop actually stops.</strong> Results kept arriving in a search that had been stopped, and a stop that failed to reach the network said nothing</li>
+          <li><strong>Held Enter.</strong> Holding or repeatedly pressing Enter opened an unbounded number of searches and tabs</li>
+          <li>A failed notes lookup was indistinguishable from a file that genuinely has none</li>
         </ul>
 
         <h5>Settings</h5>
         <ul>
-          <li><strong>Unsaved Changes Are Protected</strong> &mdash; Clicking away to another page discarded pending edits without asking</li>
-          <li><strong>Empty Number Fields</strong> &mdash; Clearing a box and saving quietly stored that field&rsquo;s factory default, including the listening ports, and could prompt a restart for a change never made</li>
-          <li><strong>Choosing a Language</strong> &mdash; Arrow keys committed a language and restarted the app mid-selection, so the list could not be browsed from the keyboard</li>
-          <li><strong>Bandwidth Fields</strong> &mdash; After typing in a speed box, Apply Recommended and Discard no longer updated what was shown, so the value saved was not the value on screen</li>
+          <li><strong>Unsaved changes are protected.</strong> Clicking away to another page discarded pending edits without asking</li>
+          <li><strong>Empty number fields.</strong> Clearing a box and saving stored that field&rsquo;s factory default, including the listening ports, and could prompt a restart for a change you never made</li>
+          <li><strong>Choosing a language.</strong> Arrow keys committed a language and restarted the app mid-selection, so you couldn&rsquo;t browse the list from the keyboard</li>
+          <li><strong>Bandwidth fields.</strong> After typing in a speed box, Apply Recommended and Discard didn&rsquo;t update what was shown, so the value saved wasn&rsquo;t the value on screen</li>
         </ul>
 
         <h5>Security</h5>
         <ul>
-          <li><strong>Fail Closed on Durable State</strong> &mdash; Closes silent data loss from unsaved transfers, mixed backup restores, and chat that vanished after a reload, and bounds resource exhaustion in rendezvous admission, relays, and oversized friend requests</li>
-          <li><strong>Stricter URL Checks</strong> &mdash; The rejection of credentials embedded in a URL could be sidestepped by omitting the slashes after <code>https:</code>, which would let a download link display a trusted host while fetching from another. IPv6 addresses are also handled properly again</li>
-          <li><strong>Deep Links</strong> &mdash; An <code>ed2k://</code> link that failed once stopped every later link from being handled for the rest of the session, and the confirmation prompt now shows the file name, size and hash on separate lines rather than running them together</li>
-          <li><strong>Archive Recovery Limits</strong> &mdash; A deliberately crafted archive could keep recovery scanning past its own time limit and ignore a cancel</li>
-          <li><strong>Relay Stability</strong> &mdash; Live relay sessions were torn down by ordinary congestion rather than waiting for it to clear</li>
+          <li><strong>Fail closed on durable state.</strong> Closes silent data loss from unsaved transfers, mixed backup restores and chat that vanished after a reload, and bounds resource exhaustion in rendezvous admission, relays and oversized friend requests</li>
+          <li><strong>Stricter URL checks.</strong> Our rejection of credentials embedded in a URL could be sidestepped by leaving out the slashes after <code>https:</code>, which would let a download link display a trusted host while fetching from somewhere else. IPv6 addresses are handled properly again too</li>
+          <li><strong>Deep links.</strong> An <code>ed2k://</code> link that failed once stopped every later link from being handled for the rest of the session. The confirmation prompt also shows the file name, size and hash on separate lines rather than running them together</li>
+          <li><strong>Archive recovery limits.</strong> A deliberately crafted archive could keep recovery scanning past its own time limit and ignore a cancel</li>
+          <li><strong>Relay stability.</strong> Live relay sessions were torn down by ordinary congestion instead of waiting for it to clear</li>
         </ul>
 
-        <h5>Fixes</h5>
+        <h5>Smaller things</h5>
         <ul>
           <li>Two crashes that blanked a page outright: repeated lines in the server log, and duplicate entries in a friend&rsquo;s file list</li>
           <li>Error notifications appeared behind the dialog whose failure they were reporting, so the message was invisible at the moment it mattered</li>
           <li>The &ldquo;TCP port already in use&rdquo; warning disappeared a few seconds after appearing, while uploads stayed broken</li>
-          <li>Later on the update notice did nothing once an update had downloaded or failed, leaving the banner on screen until restart</li>
+          <li>The update notice did nothing once an update had downloaded or failed, leaving the banner on screen until restart</li>
           <li>A security notice was unreadable in the light theme, and several error messages ended in the word &ldquo;undefined&rdquo;</li>
           <li>Re-selecting a played audio or video file restarted it from the beginning without being asked</li>
-          <li>A folder priority the app rejected stayed on screen as though it had been applied</li>
+          <li>A folder priority we had rejected stayed on screen as though it had been applied</li>
         </ul>
 
         <p class="full-changelog">
@@ -1881,31 +1883,32 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.4" target="_blank" rel="noopener"><code>v1.3.4</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <h4>What&rsquo;s New</h4>
 
-        <h5>Backup &amp; Restore</h5>
+        <h5>Backup and restore</h5>
         <ul>
-          <li><strong>Move Ember to a New PC</strong> &mdash; Settings &gt; Backup writes your whole profile to one passphrase-encrypted <code>.emberbackup</code> file and restores it on another machine or after a reinstall. Your identity, secure-identification keys and upload credits come across, so your standing on the network survives the move</li>
-          <li><strong>What It Covers</strong> &mdash; Identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads stay out, so the backup stays small</li>
-          <li><strong>Always Encrypted</strong> &mdash; The archive contains your private keys, so a passphrase is required rather than optional, and Windows-bound key material is re-wrapped for whichever account restores it. A lost passphrase cannot be recovered</li>
-          <li><strong>Safe Restores</strong> &mdash; A restore is prepared immediately and applied while Ember next starts, because the files it replaces are in use while Ember runs. The replaced originals are kept in a <code>pre-restore</code> folder, and a pending restore can be discarded before it is applied</li>
+          <li><strong>Move Ember to a new PC.</strong> Settings &gt; Backup writes your whole profile to one passphrase-encrypted <code>.emberbackup</code> file and restores it on another machine or after a reinstall. Your identity, secure-identification keys and upload credits come across, so your standing on the network survives the move</li>
+          <li><strong>What it covers.</strong> Identity and SecIdent keys, credits, settings, the shared-folder list, known files, friends, chat history, the transfer list, server and KAD contacts, the IP filter, and learned spam data. The files you share and part-finished downloads stay out, so the backup stays small</li>
+          <li><strong>Always encrypted.</strong> The archive holds your private keys, so a passphrase is required rather than optional, and Windows-bound key material is re-wrapped for whichever account restores it. A lost passphrase can&rsquo;t be recovered</li>
+          <li><strong>Safe restores.</strong> A restore is prepared immediately and applied while Ember next starts, because the files it replaces are in use while Ember runs. We keep the replaced originals in a <code>pre-restore</code> folder, and you can discard a pending restore before it&rsquo;s applied</li>
         </ul>
 
         <h5>Transfers</h5>
         <ul>
-          <li><strong>Stop All and Cancel All</strong> &mdash; Both now sit beside Pause All and Resume All in the toolbar&rsquo;s More menu. With the Filter box narrowed they act only on the downloads you can see, and the confirmation says which filter it matched</li>
-          <li><strong>Bulk Actions on Finished Downloads</strong> &mdash; Completed and failed rows can be selected like active ones and removed from the list together, instead of one right-click at a time. Your files are kept; only the list entries go</li>
-          <li><strong>Clearer Selection</strong> &mdash; Each bulk button reports how many rows it would affect and greys out when none apply, so a mixed selection cannot silently do nothing</li>
+          <li><strong>Stop All and Cancel All.</strong> Both sit beside Pause All and Resume All in the toolbar&rsquo;s More menu. With the Filter box narrowed they act only on the downloads you can see, and the confirmation says which filter it matched</li>
+          <li><strong>Bulk actions on finished downloads.</strong> Completed and failed rows can be selected like active ones and removed together, instead of one right-click at a time. Your files are kept; only the list entries go</li>
+          <li><strong>Clearer selection.</strong> Each bulk button reports how many rows it would affect and greys out when none apply, so a mixed selection can&rsquo;t silently do nothing</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li><strong>Copy eD2K Links</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole list at once, from the right-click menu, the selection bar, or Ctrl+C. No need to start a download just to get its link</li>
+          <li><strong>Copy eD2K links</strong> for one result, for every ticked result, or for the whole list at once, from the right-click menu, the selection bar, or Ctrl+C. No need to start a download just to get its link</li>
         </ul>
 
-        <h5>Fixes</h5>
+        <h4>What&rsquo;s Fixed</h4>
+
         <ul>
-          <li>Ember no longer looks like an eMule misreporting its version. The MuleInfo packet carried a real version byte where eMule expects a sentinel, which matched what anti-leecher mods treat as a spoofed client and could cost users upload slots or credit score</li>
+          <li>We stopped looking like an eMule that misreports its version. Our MuleInfo packet carried a real version byte where eMule expects a sentinel, which is what anti-leecher mods treat as a spoofed client, and it could cost you upload slots or credit score</li>
         </ul>
 
         <p class="full-changelog">
@@ -1922,25 +1925,26 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.3" target="_blank" rel="noopener"><code>v1.3.3</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Friends</h5>
         <ul>
-          <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them. Non-friends are refused at the protocol layer</li>
-          <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline, with rate limits and expiry</li>
-          <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session when ordinary HighID or callback paths are unavailable. Ember can also discover optional peer relays through friend gossip for harder NAT cases</li>
-          <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Blocking also removes any existing mutual friendship with that identity</li>
-          <li><strong>Durable Offline Chat Queue</strong> &mdash; Outbound friend messages stay queued across reconnects and app restarts, then retry when the friend session is back. Undeliverable messages surface as failed instead of hanging forever</li>
-          <li><strong>Discoverability Clarity</strong> &mdash; The Friends page warns when you are not currently discoverable on the rendezvous network, and friend cards can show when a peer is online but not reachable for a direct connection</li>
-          <li><strong>Optional Friend Relaying</strong> &mdash; Help friends connect (Settings) controls whether your client advertises willingness to assist LowID&harr;LowID paths. Turn it off if you prefer not to relay for others</li>
-          <li><strong>Friend Chat Polish</strong> &mdash; Clearer conversation grouping, day separators, and tab scrolling in the chat dock</li>
+          <li><strong>Friends-only shares.</strong> Mark Library files as friends-only so they stay out of public search and only mutual friends can request them. Non-friends are refused at the protocol layer</li>
+          <li><strong>Friend file offers.</strong> Push a specific shared file to a mutual friend from the Friends page. Offers arrive as notifications the recipient can accept or decline, with rate limits and expiry</li>
+          <li><strong>Friend transfers without HighID.</strong> Mutual-friend downloads can use the Noise-secured friend session when ordinary HighID or callback paths aren&rsquo;t available. We can also discover optional peer relays through friend gossip for harder NAT cases</li>
+          <li><strong>Friend block list.</strong> Block a Friend ID and future requests, chat, browse and offers from that identity are rejected. Blocking also removes any existing mutual friendship with it</li>
+          <li><strong>Durable offline chat queue.</strong> Outbound friend messages stay queued across reconnects and app restarts, then retry when the friend session is back. Undeliverable messages surface as failed instead of hanging forever</li>
+          <li><strong>Knowing when you&rsquo;re reachable.</strong> The Friends page warns when you aren&rsquo;t currently discoverable on the rendezvous network, and a friend card can show when a peer is online but not reachable for a direct connection</li>
+          <li><strong>Optional friend relaying.</strong> Help friends connect (Settings) controls whether you advertise willingness to assist LowID&harr;LowID paths. Turn it off if you&rsquo;d rather not relay for other people</li>
+          <li><strong>Friend chat polish.</strong> Clearer conversation grouping, day separators, and tab scrolling in the chat dock</li>
         </ul>
 
-        <h5>Fixes</h5>
+        <h4>What&rsquo;s Fixed</h4>
+
         <ul>
-          <li>Friends-only share flags are preserved across Library rescans and resume paths, and enforced for in-progress downloads&mdash;not only fresh requests</li>
-          <li>Friend relay discovery works in both directions on secure friend sessions, with safer candidate caps and clearer failure attribution so good relays are not dropped for target-side refusals</li>
-          <li>Friend file-offer handling is harder to spam, and friend-connect hints no longer mis-attribute progress to the wrong peer</li>
+          <li>Friends-only share flags survive Library rescans and resume paths, and are enforced for downloads already in progress rather than only fresh requests</li>
+          <li>Friend relay discovery works in both directions on secure friend sessions, with safer candidate caps and clearer failure attribution, so we don&rsquo;t drop a good relay because the far side refused</li>
+          <li>Friend file offers are harder to spam, and friend-connect hints don&rsquo;t mis-attribute progress to the wrong peer</li>
         </ul>
 
         <p class="full-changelog">
@@ -1957,35 +1961,40 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.2" target="_blank" rel="noopener"><code>v1.3.2</code></a></p>
       <div class="release-notes">
-        <h4>What&rsquo;s Changed</h4>
-
-        <h5>Reliability</h5>
-        <ul>
-          <li>Ember no longer fails to start when a shared or download folder&rsquo;s filesystem identity has changed &mdash; for example a folder that was deleted and recreated, or a re-imaged drive. The affected folder is <strong>revoked</strong> instead and can be re-approved from Settings, so a stale record can never keep the app from launching</li>
-          <li>Unreadable folder-approval state is quarantined rather than treated as fatal</li>
-          <li><strong>Panics are now written to <code>ember.log</code></strong>, so a crash during startup records its cause instead of closing silently</li>
-        </ul>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Friends</h5>
         <ul>
-          <li>Friend downloads reconnect after <strong>both</strong> clients restart &mdash; a rediscovered friend&rsquo;s address is reseeded into your existing download sources</li>
-          <li><strong>Friend cards redesigned</strong>: one compact row per friend, presence shown once, and secondary actions (Browse, Reconnect, Copy Friend ID, Remove) collected in an overflow menu with the Friend ID and last address</li>
-          <li><strong>Friend browse redesigned</strong>: download controls are clearly visible and a filter box narrows a large shared library</li>
-          <li>Far fewer interruptions &mdash; no toast when a friend comes online or goes offline, since the card already shows it. Actionable notices (behind a firewall, needs a newer Ember) still appear</li>
+          <li><strong>Friend cards redesigned.</strong> One compact row per friend, presence shown once, and the secondary actions (Browse, Reconnect, Copy Friend ID, Remove) collected in an overflow menu with the Friend ID and last address</li>
+          <li><strong>Friend browse redesigned.</strong> Download controls are clearly visible, and a filter box narrows a large shared library</li>
+          <li><strong>Fewer interruptions.</strong> No toast when a friend comes online or goes offline, since the card already shows it. Actionable notices, like a friend being behind a firewall or needing a newer Ember, still appear</li>
         </ul>
 
-        <h5>Transfers &amp; Statistics</h5>
+        <h5>Diagnostics</h5>
         <ul>
-          <li><strong>Known Clients</strong> now shows a friend&rsquo;s nickname, last address, country, and last-seen instead of just a name</li>
-          <li>Statistics: <strong>File Requests</strong> protocol overhead is now actually measured &mdash; it previously always read zero</li>
+          <li><strong>Panics are written to <code>ember.log</code></strong>, so a crash during startup records its cause instead of closing silently</li>
+        </ul>
+
+        <h5>Transfers and statistics</h5>
+        <ul>
+          <li><strong>Known Clients</strong> shows a friend&rsquo;s nickname, last address, country and last-seen, instead of just a name</li>
         </ul>
 
         <h5>Interface</h5>
         <ul>
-          <li><strong>Fits laptop screens</strong>: the sidebar auto-collapses on narrower windows, the status bar and Transfers columns compact, and the Library folder drawer overlays instead of squeezing the file table. 4K layouts are unchanged</li>
-          <li>The default window is now 1400&times;900 so the app fits without scrolling on a 16&Prime; laptop</li>
-          <li>Unread chats show as a <strong>blue dot</strong> rather than an orange count</li>
-          <li>KAD page: removed the redundant Ember peers and EPX sources tiles (both remain in the status bar)</li>
+          <li><strong>Fits laptop screens.</strong> The sidebar auto-collapses on narrower windows, the status bar and Transfers columns compact, and the Library folder drawer overlays instead of squeezing the file table. 4K layouts are unchanged</li>
+          <li>The default window is 1400&times;900, so the app fits without scrolling on a 16&Prime; laptop</li>
+          <li>Unread chats show a <strong>blue dot</strong> rather than an orange count</li>
+          <li>KAD page: we removed the redundant Ember peers and EPX sources tiles. Both are still in the status bar</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <ul>
+          <li>Ember starts when a shared or download folder&rsquo;s filesystem identity has changed, for example a folder that was deleted and recreated, or a re-imaged drive. We <strong>revoke</strong> the affected folder instead, and you can re-approve it from Settings, so a stale record can&rsquo;t keep the app from launching</li>
+          <li>Unreadable folder-approval state is quarantined instead of being treated as fatal</li>
+          <li>Friend downloads reconnect after <strong>both</strong> clients restart. A rediscovered friend&rsquo;s address is reseeded into your existing download sources</li>
+          <li>Statistics: <strong>File Requests</strong> protocol overhead is measured now. It used to always read zero</li>
         </ul>
 
         <p class="full-changelog">
@@ -2002,19 +2011,19 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.1" target="_blank" rel="noopener"><code>v1.3.1</code></a></p>
       <div class="release-notes">
-        <h4>What's Changed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
         <h5>Friends</h5>
         <ul>
-          <li>Fix one-sided Add Friend when both peers are online: friend-code <strong>intro presence</strong> lets you find someone before mutual pairwise capabilities exist</li>
-          <li>Force a rendezvous presence refresh on add/accept so discovery doesn&rsquo;t wait ~2 minutes</li>
+          <li>One-sided Add Friend when both peers are online. Friend-code <strong>intro presence</strong> lets you find someone before mutual pairwise capabilities exist</li>
+          <li>Adding or accepting a friend forces a rendezvous presence refresh, so discovery doesn&rsquo;t wait about two minutes</li>
           <li>Clearer &ldquo;not found&rdquo; messaging when the peer is offline or still needs to add you back</li>
         </ul>
 
-        <h5>Ember / EPX</h5>
+        <h5>Ember and EPX</h5>
         <ul>
-          <li>Unlock EPX and Ember mesh peer discovery on HELLO <strong>hash&harr;pubkey binding</strong> (legacy PoP is disabled and was blocking StatusBar EPX / KAD Ember peer count)</li>
-          <li>Friend privileges (chat, browse, verified requests) still require secure friend session / PoP</li>
+          <li>EPX and Ember mesh peer discovery unlock on the HELLO <strong>hash&harr;pubkey binding</strong>. Legacy proof-of-possession is disabled and was blocking the status bar EPX count and the KAD Ember peer count</li>
+          <li>Friend privileges (chat, browse, verified requests) still need a secure friend session or PoP</li>
         </ul>
 
         <p class="full-changelog">
@@ -2031,56 +2040,58 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.3.0" target="_blank" rel="noopener"><code>v1.3.0</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
-        <p>Security and Friends-focused release: end-to-end friend chat, hardened sessions and updater, safer file opens, and a batch of Library / EPX / connectivity fixes since v1.2.3. <strong>Please report any issues you have with these features.</strong></p>
+        <h4>What&rsquo;s New</h4>
+
+        <p>A security and Friends release: end-to-end friend chat, hardened sessions and updater, safer file opens, and a batch of Library, EPX and connectivity fixes since 1.2.3. <strong>Please tell us if anything here misbehaves.</strong></p>
+
         <ul>
-          <li>Friend chat is <strong>end-to-end encrypted</strong> (static X25519 ECDH + AEAD); plaintext chat fallbacks are rejected after session setup</li>
-          <li>Chat UI shows an <strong>Encrypted</strong> badge and clearer reconnect-oriented errors when encryption fails</li>
+          <li>Friend chat is <strong>end-to-end encrypted</strong> (static X25519 ECDH plus AEAD), and plaintext chat fallbacks are rejected once a session is set up</li>
+          <li>Chat shows an <strong>Encrypted</strong> badge, and errors point you at reconnecting when encryption fails</li>
           <li>Friend sessions use <strong>Noise IK</strong> secure streams, with chat history encrypted in the local database</li>
-          <li><strong>v2 Friend Codes</strong> and privacy-preserving rendezvous capabilities (pairwise presence); Friends page explains how mutual chat/browse unlocks</li>
-          <li><strong>Signed anti-rollback updater</strong> with security epochs &mdash; installs only advance when the signed epoch allows it</li>
-          <li>Deep links require <strong>confirm / review</strong> before opening (pending links can be reviewed later)</li>
-          <li>Library drag-and-drop shared folders asks you to <strong>confirm in a system folder picker</strong> before sharing</li>
-          <li>Queued downloads that exceed the safety budget are <strong>quarantined</strong> (not deleted), with an in-app notice</li>
-          <li>Corrupted / unreadable ban&ndash;reputation policy prompts an explicit <strong>acknowledge &amp; reset</strong> before networking continues</li>
-          <li>Default window size is <strong>1920&times;1200</strong> on first launch</li>
-          <li>Secure updater treats a missing update manifest or signature (<strong>HTTP 404</strong>) as &ldquo;no update,&rdquo; so checks don&rsquo;t fail while release assets are still publishing</li>
-          <li>First-run / Settings IP filter download uses the live <strong><code>ipfilter.zip</code></strong> mirror (same as Security) and persists the enable preference</li>
+          <li><strong>v2 Friend Codes</strong> and privacy-preserving rendezvous capabilities (pairwise presence). The Friends page explains how mutual chat and browse unlock</li>
+          <li>A <strong>signed anti-rollback updater</strong> with security epochs. An install only advances when the signed epoch allows it</li>
+          <li>Deep links need <strong>confirming</strong> before they open, and you can review a pending link later</li>
+          <li>Dragging a folder into Library asks you to <strong>confirm in a system folder picker</strong> before sharing it</li>
+          <li>Queued downloads over the safety budget are <strong>quarantined</strong> rather than deleted, with a notice in the app</li>
+          <li>A corrupted or unreadable ban&ndash;reputation policy prompts an explicit <strong>acknowledge and reset</strong> before networking continues</li>
+          <li>The default window is <strong>1920&times;1200</strong> on first launch</li>
+          <li>The updater treats a missing manifest or signature (<strong>HTTP 404</strong>) as &ldquo;no update&rdquo;, so a check doesn&rsquo;t fail while release assets are still uploading</li>
+          <li>The first-run and Settings IP filter download uses the live <strong><code>ipfilter.zip</code></strong> mirror, the same one Security uses, and remembers the enable preference</li>
         </ul>
 
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Library &amp; media</h5>
+        <h5>Library and media</h5>
         <ul>
-          <li>Library activity, collections, media playback, and bulk actions persist and clear busy state correctly</li>
-          <li>Media serve no longer reopens files by path after approval (TOCTOU); reads stay on the approved handle</li>
+          <li>Library activity, collections, media playback and bulk actions persist and clear busy state correctly</li>
+          <li>Media serve doesn&rsquo;t reopen files by path after approval, which was a TOCTOU. Reads stay on the approved handle</li>
         </ul>
 
-        <h5>Friends, EPX &amp; transfers</h5>
+        <h5>Friends, EPX and transfers</h5>
         <ul>
           <li><code>EmuleInfo</code> no longer clears Ember identity during EPX auth</li>
-          <li>AICH trust is scoped to the local file hash; AICH upload requests use the pinned open handle</li>
-          <li>Oversized UDP exchanges are refused; ERAT trailer space is reserved; UDP ingest is rate-limited</li>
-          <li>Attestation expiry is honored; reserved EPX versions are rejected; mesh discovery requires PoP</li>
-          <li>Friend / Ember upload-queue priority flags reset correctly across sessions (no sticky queue boost)</li>
+          <li>AICH trust is scoped to the local file hash, and AICH upload requests use the pinned open handle</li>
+          <li>Oversized UDP exchanges are refused, ERAT trailer space is reserved, and UDP ingest is rate-limited</li>
+          <li>Attestation expiry is honored, reserved EPX versions are rejected, and mesh discovery requires PoP</li>
+          <li>Friend and Ember upload-queue priority flags reset correctly across sessions, so there&rsquo;s no sticky queue boost</li>
           <li>Archive recovery hashing opens the recovery file handle-safe instead of reopening by path</li>
-          <li>Upload / completion paths pin approved handles so path-swap races can&rsquo;t slip through</li>
+          <li>Upload and completion paths pin approved handles so a path-swap race can&rsquo;t slip through</li>
         </ul>
 
-        <h5>Connectivity &amp; rendezvous</h5>
+        <h5>Connectivity and rendezvous</h5>
         <ul>
-          <li>NAT TCP mappings are discovered over <strong>TCP</strong>, not inferred from UDP STUN readings</li>
-          <li>Friend punch no longer fail-opens on legacy proof v3 during v4 sessions; rendezvous filters legacy entries on v4 polls</li>
-          <li>Mailbox delivery is page-cached with <strong>idempotent replay</strong> so a crash mid-page can&rsquo;t permanently skip messages</li>
-          <li>Rendezvous / friend flows stay compatible across protocol v3 and v4 without breaking stock eMule traffic</li>
+          <li>NAT TCP mappings are discovered over <strong>TCP</strong> instead of inferred from UDP STUN readings</li>
+          <li>Friend punch doesn&rsquo;t fail open on legacy proof v3 during v4 sessions, and rendezvous filters legacy entries on v4 polls</li>
+          <li>Mailbox delivery is page-cached with <strong>idempotent replay</strong>, so a crash mid-page can&rsquo;t permanently skip messages</li>
+          <li>Rendezvous and friend flows stay compatible across protocol v3 and v4 without breaking stock eMule traffic</li>
         </ul>
 
-        <h5>Updater, deep links &amp; setup</h5>
+        <h5>Updater, deep links and setup</h5>
         <ul>
           <li>Install stays offered when a verified pending update is retained after the native updater clears pending state</li>
-          <li>Deferred deep links survive handler remounts without duplicate reopen</li>
-          <li>Windows shared-folder prepare no longer deletes an opened directory entry on path/type mismatch</li>
-          <li>Missing translation for invalid terminal deep links (<code>deeplink_terminal_invalid</code>)</li>
+          <li>Deferred deep links survive handler remounts without reopening twice</li>
+          <li>Windows shared-folder prepare doesn&rsquo;t delete an opened directory entry on a path or type mismatch</li>
+          <li>Added the missing translation for invalid terminal deep links (<code>deeplink_terminal_invalid</code>)</li>
         </ul>
 
         <p class="full-changelog">
@@ -2097,16 +2108,19 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.3" target="_blank" rel="noopener"><code>v1.2.3</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
-        <p>Connectivity fix for STUN/NATMAP keep-alive: the remapped public TCP port is advertised again, and LowID sessions reconnect so the eD2k server learns it. Please report any issues you have with this feature.</p>
+        <h4>What&rsquo;s New</h4>
+
+        <p>A connectivity fix for STUN and NATMAP keep-alive: we advertise the remapped public TCP port again, and a LowID session reconnects so the eD2k server learns it. Please tell us if anything here misbehaves.</p>
+
         <ul>
-          <li>When STUN keep-alive confirms a remapped public <strong>TCP port</strong> while you are still <strong>LowID</strong>, Ember reconnects to the eD2k server (with a 60s cooldown) so the server can retry HighID connect-back with the corrected port</li>
+          <li>When STUN keep-alive confirms a remapped public <strong>TCP port</strong> while you&rsquo;re still <strong>LowID</strong>, we reconnect to the eD2k server, with a 60-second cooldown, so it can retry HighID connect-back with the corrected port</li>
         </ul>
 
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
+
         <ul>
-          <li>STUN keep-alive again <strong>advertises</strong> the twin-probe&rsquo;s public TCP port (stability-gated: corroborated immediately, or after two matching readings) instead of always mirroring the configured listen port &mdash; HighID / public port status can improve behind full-cone NAT and CGNAT</li>
-          <li>A remapped TCP port discovered <strong>after</strong> login is no longer stuck unused on an already-connected LowID session</li>
+          <li>STUN keep-alive <strong>advertises</strong> the twin-probe&rsquo;s public TCP port again, gated on stability (corroborated immediately, or after two matching readings), instead of always mirroring the configured listen port. HighID and public port status can improve behind full-cone NAT and CGNAT</li>
+          <li>A remapped TCP port discovered <strong>after</strong> login isn&rsquo;t left unused on an already-connected LowID session</li>
         </ul>
 
         <p class="full-changelog">
@@ -2123,66 +2137,68 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.2" target="_blank" rel="noopener"><code>v1.2.2</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
-        <p>Reliability-focused release: Library sharing and large-collection workflows, download source counting, Settings save hangs, relay/friend connects, and KAD publish validation.</p>
+        <h4>What&rsquo;s New</h4>
+
+        <p>A reliability release: Library sharing and large-collection workflows, download source counting, Settings save hangs, relay and friend connects, and KAD publish validation.</p>
+
         <ul>
-          <li>Library shows a clear warning when a shared folder hits the <strong>100,000-file</strong> per-folder indexing cap</li>
-          <li><strong>Settings</strong> / <strong>Security</strong> report whether saves, <code>nodes.dat</code>, and IP filter updates were <strong>applied live</strong>, <strong>deferred</strong>, or need a <strong>restart</strong></li>
-          <li>Collection <strong>create / load</strong> uses native OS dialogs (exports are no longer forced into shared/download folders)</li>
-          <li><code>ed2k://</code> links and collection opens are <strong>persisted</strong> until successfully handled, so they survive relaunches and setup-wizard restarts</li>
+          <li>Library warns clearly when a shared folder hits the <strong>100,000-file</strong> per-folder indexing cap</li>
+          <li><strong>Settings</strong> and <strong>Security</strong> report whether saves, <code>nodes.dat</code> and IP filter updates were <strong>applied live</strong>, <strong>deferred</strong>, or need a <strong>restart</strong></li>
+          <li>Collection <strong>create</strong> and <strong>load</strong> use native OS dialogs, so exports aren&rsquo;t forced into shared or download folders</li>
+          <li><code>ed2k://</code> links and collection opens are <strong>persisted</strong> until they&rsquo;re handled, so they survive relaunches and setup-wizard restarts</li>
         </ul>
 
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
         <h5>Library</h5>
         <ul>
-          <li>Stale <strong>pending share / priority intents</strong> no longer silently re-share or flip priority after a rehash</li>
-          <li>Share, unshare, and priority changes persist more safely (with rollback) and apply <strong>hash-wide</strong> across identical copies</li>
-          <li>Bulk share / unshare / priority actions work on <strong>large selections</strong> (batched IPC)</li>
-          <li><strong>Remove missing</strong> keeps clearing until the scan is actually finished (no leftover missing rows after the 10k batch limit)</li>
-          <li>Large collections: <strong>Download All</strong> queues in chunks instead of failing wholesale, with skip / oversize / failure feedback</li>
+          <li>Stale <strong>pending share and priority intents</strong> don&rsquo;t silently re-share or flip priority after a rehash</li>
+          <li>Share, unshare and priority changes persist more safely, with rollback, and apply <strong>hash-wide</strong> across identical copies</li>
+          <li>Bulk share, unshare and priority actions work on <strong>large selections</strong> (batched IPC)</li>
+          <li><strong>Remove missing</strong> keeps clearing until the scan has actually finished, so no missing rows are left over after the 10k batch limit</li>
+          <li>Large collections: <strong>Download All</strong> queues in chunks instead of failing wholesale, with skip, oversize and failure feedback</li>
           <li><strong>Top Uploads</strong> de-dupes by hash, shows <strong>total uploaded</strong>, and explains unattributed older history when only aggregate totals exist</li>
-          <li>Keyboard shortcuts work again with the collections panel open; blocked correctly during stop-hash confirmation</li>
-          <li>In-app media playback uses a scoped <strong><code>ember-media</code></strong> protocol that re-checks shared/download roots per request</li>
-          <li>Duplicate library copies no longer force unnecessary rehashes of non-canonical paths</li>
+          <li>Keyboard shortcuts work again with the collections panel open, and are blocked correctly during stop-hash confirmation</li>
+          <li>In-app media playback uses a scoped <strong><code>ember-media</code></strong> protocol that re-checks shared and download roots per request</li>
+          <li>Duplicate library copies don&rsquo;t force unnecessary rehashes of non-canonical paths</li>
         </ul>
 
-        <h5>Downloads &amp; Sources</h5>
+        <h5>Downloads and sources</h5>
         <ul>
-          <li>Ephemeral <strong>callback / push-grant ports</strong> are session-only &mdash; they no longer inflate per-download <strong>source counts</strong> across relaunches</li>
+          <li>Ephemeral <strong>callback and push-grant ports</strong> are session-only, so they don&rsquo;t inflate per-download <strong>source counts</strong> across relaunches</li>
           <li>Resume and reasks prefer <strong>dialable</strong> listening ports and skip undialable ephemerals</li>
-          <li><strong>Max download file size</strong> aligned to the ED2K wire limit (<strong>593 GiB</strong>); large-file part-count / hashset handling no longer truncates into bogus values</li>
-          <li><strong>MultiPacket</strong> parsing more tolerant of peer extended-request variants</li>
+          <li><strong>Max download file size</strong> is aligned to the ED2K wire limit (<strong>593 GiB</strong>), and large-file part-count and hashset handling doesn&rsquo;t truncate into bogus values</li>
+          <li><strong>MultiPacket</strong> parsing is more tolerant of peer extended-request variants</li>
         </ul>
 
-        <h5>Sharing &amp; Settings</h5>
+        <h5>Sharing and settings</h5>
         <ul>
-          <li>Saving Settings no longer <strong>hangs</strong> behind long library hash/scans when shared folders change (folder reconcile runs in the background)</li>
+          <li>Saving Settings doesn&rsquo;t <strong>hang</strong> behind long library hashes and scans when shared folders change; folder reconcile runs in the background</li>
           <li>Removing a shared folder cancels in-progress scans under that root sooner</li>
-          <li>Clearer save / download outcome messaging when a live network apply must wait for restart</li>
+          <li>Clearer save and download messaging when a live network apply has to wait for a restart</li>
         </ul>
 
-        <h5>Relay, Rendezvous &amp; Friends</h5>
+        <h5>Relay, rendezvous and friends</h5>
         <ul>
-          <li>Friend <strong>relay tickets</strong> hardened (v3 candidate polling, quota / reservation cleanup, legacy v2 cursor sweep) for more reliable LowID friend connects</li>
-          <li><strong>Browse friend</strong> cancels and correlates by request ID &mdash; stale or swapped results no longer land in the wrong dialog</li>
-          <li>Friend sessions close/evict cleanly; relay tickets are limited to <strong>manually known friends</strong></li>
-          <li>STUN keep-alive no longer overrides your configured <strong>TCP listen port</strong> in Hello / advertising (UDP mapping stays UDP-only)</li>
+          <li>Friend <strong>relay tickets</strong> hardened (v3 candidate polling, quota and reservation cleanup, legacy v2 cursor sweep) for more reliable LowID friend connects</li>
+          <li><strong>Browse friend</strong> cancels and correlates by request ID, so stale or swapped results don&rsquo;t land in the wrong dialog</li>
+          <li>Friend sessions close and evict cleanly, and relay tickets are limited to <strong>manually known friends</strong></li>
+          <li>STUN keep-alive doesn&rsquo;t override your configured <strong>TCP listen port</strong> in Hello and advertising. The UDP mapping stays UDP-only</li>
         </ul>
 
-        <h5>KAD &amp; Protocol</h5>
+        <h5>KAD and protocol</h5>
         <ul>
-          <li>KAD <strong>keyword publishes</strong> without a filename, size, or tags are rejected (no more empty junk served back to searchers)</li>
-          <li>Published source entries with <strong>UDP port 0</strong> fall back to the packet&rsquo;s real source port (eMule-compatible)</li>
-          <li>Safer <code>.part.met</code> save-path guard cleanup after downloads are removed</li>
+          <li>KAD <strong>keyword publishes</strong> without a filename, size or tags are rejected, so there&rsquo;s no more empty junk served back to searchers</li>
+          <li>Published source entries with <strong>UDP port 0</strong> fall back to the packet&rsquo;s real source port, which is what eMule does</li>
+          <li>Safer <code>.part.met</code> save-path guard cleanup after a download is removed</li>
         </ul>
 
-        <h5>Search &amp; UI</h5>
+        <h5>Search and UI</h5>
         <ul>
-          <li><strong>Backspace</strong> no longer deletes a hovered saved search &mdash; only <strong>Delete</strong> removes recent entries</li>
-          <li>Deep-link handling no longer double-applies or drops links across restarts / HMR</li>
-          <li>Setup wizard reports deferred / failed live apply for <code>nodes.dat</code> and IP filter more clearly</li>
-          <li>Library table rows support <strong>Enter</strong> / <strong>Space</strong> keyboard activation; assorted i18n gaps filled</li>
+          <li><strong>Backspace</strong> doesn&rsquo;t delete a hovered saved search. Only <strong>Delete</strong> removes recent entries</li>
+          <li>Deep-link handling doesn&rsquo;t double-apply or drop links across restarts and HMR</li>
+          <li>The setup wizard reports deferred or failed live apply for <code>nodes.dat</code> and the IP filter more clearly</li>
+          <li>Library table rows support <strong>Enter</strong> and <strong>Space</strong> activation, and we filled assorted i18n gaps</li>
         </ul>
 
         <p class="full-changelog">
@@ -2199,31 +2215,33 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.1" target="_blank" rel="noopener"><code>v1.2.1</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
-        <p>Connectivity and Library quality-of-life release: STUN/NATMAP port keep-alive for CGNAT and cone NATs, Simplified Chinese UI, and a few Library / chat fixes.</p>
+        <h4>What&rsquo;s New</h4>
 
-        <h5>Network &amp; HighID</h5>
+        <p>Connectivity and Library quality of life: STUN and NATMAP port keep-alive for CGNAT and cone NATs, a Simplified Chinese interface, and a few Library and chat fixes.</p>
+
+        <h5>Network and HighID</h5>
         <ul>
-          <li><strong>STUN port keep-alive</strong> (Settings, on by default): keeps NAT mappings alive with periodic STUN plus a TCP hold from your listen port, and advertises the discovered public TCP/UDP ports for HighID &mdash; useful behind CGNAT or full-cone NAT without UPnP</li>
-          <li>Auto-suspends on Open / Symmetric NAT or unstable port remapping, then falls back to your Settings ports</li>
-          <li>Home status shows when STUN keep-alive is active and which public ports are being advertised</li>
+          <li><strong>STUN port keep-alive</strong> (Settings, on by default) keeps NAT mappings alive with periodic STUN plus a TCP hold from your listen port, and advertises the discovered public TCP and UDP ports for HighID. Useful behind CGNAT or full-cone NAT without UPnP</li>
+          <li>It auto-suspends on Open or Symmetric NAT, or on unstable port remapping, then falls back to your Settings ports</li>
+          <li>Home status shows when keep-alive is active and which public ports are being advertised</li>
         </ul>
 
         <h5>Library</h5>
         <ul>
-          <li><strong>Copy all eD2K links</strong> for the current Library view in one shot (single IPC batch, works on large libraries)</li>
+          <li><strong>Copy all eD2K links</strong> for the current Library view in one shot, as a single IPC batch, so it works on large libraries</li>
         </ul>
 
         <h5>Localization</h5>
         <ul>
-          <li><strong>Simplified Chinese (zh-CN)</strong> UI language, including Settings picker and system-language detection (<code>zh</code> / <code>zh-Hans</code> &rarr; zh-CN)</li>
+          <li><strong>Simplified Chinese (zh-CN)</strong>, including the Settings picker and system-language detection (<code>zh</code> and <code>zh-Hans</code> map to zh-CN)</li>
         </ul>
 
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
+
         <ul>
           <li>Library <strong>Missing</strong> stays greyed out until a scan actually finds missing files</li>
-          <li>Closing an active chat tab no longer resurrects its wiped draft when you reopen a chat later</li>
-          <li>Rendezvous-server Docker image builds again (Rust toolchain pin aligned with <code>rust-version</code>)</li>
+          <li>Closing an active chat tab doesn&rsquo;t resurrect its wiped draft when you reopen a chat later</li>
+          <li>The rendezvous-server Docker image builds again; the Rust toolchain pin is aligned with <code>rust-version</code></li>
         </ul>
 
         <p class="full-changelog">
@@ -2240,63 +2258,69 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.2.0" target="_blank" rel="noopener"><code>v1.2.0</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
-        <p>Stability and accuracy release focused on transfers, search, KAD, Security/Statistics, Settings, and Library.</p>
+        <p>Stability and accuracy across transfers, search, KAD, Security and Statistics, Settings and Library.</p>
 
-        <h5>Downloads &amp; uploads</h5>
+        <h4>What&rsquo;s New</h4>
+
         <ul>
-          <li>Final hash failures can be retried instead of staying permanently failed</li>
-          <li>Stop no longer races into a false Failed state</li>
-          <li>Disk space checks use remaining bytes (large near-done resumes no longer false-flag Insufficient)</li>
-          <li>Uploads end on unique coverage; soft rejects preserve queue seniority</li>
-          <li>Pause/cancel teardown and concurrent-slot promotion hardened</li>
-          <li>Soft disk probe and startup hash timeout behavior improved</li>
+          <li>Internal protocol knobs and the rendezvous URL are out of the Settings interface</li>
+          <li>Friend session encryption is always on</li>
+          <li>The misleading obfuscation &ldquo;Restart&rdquo; badge is gone</li>
+          <li>Incremental <code>auto_vacuum</code> is enabled on the database (schema v21)</li>
+          <li>i18n updates across en, de, es, fr and pt-BR</li>
         </ul>
 
-        <h5>Sources &amp; discovery</h5>
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Downloads and uploads</h5>
         <ul>
-          <li>Soft-dropped peers can re-inject; LowID callbacks flush for active downloads</li>
-          <li>Pause/resume reseeds from per-file sources; pause-offline source rows stay visible</li>
+          <li>A final hash failure can be retried instead of staying permanently failed</li>
+          <li>Stop doesn&rsquo;t race into a false Failed state</li>
+          <li>Disk space checks use remaining bytes, so a large near-done resume doesn&rsquo;t false-flag Insufficient</li>
+          <li>Uploads end on unique coverage, and soft rejects preserve queue seniority</li>
+          <li>Pause and cancel teardown, and concurrent-slot promotion, hardened</li>
+          <li>Better soft disk probe and startup hash timeout behavior</li>
+        </ul>
+
+        <h5>Sources and discovery</h5>
+        <ul>
+          <li>Soft-dropped peers can re-inject, and LowID callbacks flush for active downloads</li>
+          <li>Pause and resume reseed from per-file sources, and pause-offline source rows stay visible</li>
           <li>Source counts and offer tracking corrected</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li>Cancel and KAD keyword results preserved across capacity eviction</li>
-          <li>Hardened filters, notes, source safety, download gating, and spam overrides</li>
-          <li>Clear Results / bulk UX races fixed; method-specific search hints improved</li>
+          <li>Cancel and KAD keyword results are preserved across capacity eviction</li>
+          <li>Hardened filters, notes, source safety, download gating and spam overrides</li>
+          <li>Fixed Clear Results and bulk UX races, and improved method-specific search hints</li>
         </ul>
 
-        <h5>KAD &amp; network</h5>
+        <h5>KAD and network</h5>
         <ul>
-          <li>Fail-closed IP filter no longer blocks KAD bootstrap / RT admission while ranges load</li>
-          <li>Quiet KAD timeout no longer tears down eD2K</li>
-          <li>eD2K reconnect and related filter side effects fixed</li>
-          <li>Server list / routing table no longer wiped during filter load</li>
+          <li>A fail-closed IP filter doesn&rsquo;t block KAD bootstrap or routing-table admission while ranges load</li>
+          <li>A quiet KAD timeout doesn&rsquo;t tear down eD2K</li>
+          <li>Fixed eD2K reconnect and the related filter side effects</li>
+          <li>The server list and routing table aren&rsquo;t wiped during a filter load</li>
         </ul>
 
-        <h5>Security &amp; Statistics</h5>
+        <h5>Security and Statistics</h5>
         <ul>
-          <li>IP filter Hits column tracks per-range blocks (not only the header total)</li>
-          <li><code>ranges_ready</code> shown; enable refresh/poll; fail-closed load failures visible</li>
-          <li>KAD upload overhead and status-ping wire bytes counted correctly</li>
-          <li>Fake overhead estimates removed; uptime/ratio/locale formatting cleaned up</li>
+          <li>The IP filter Hits column tracks per-range blocks, not only the header total</li>
+          <li><code>ranges_ready</code> is shown, enable refresh and poll work, and fail-closed load failures are visible</li>
+          <li>KAD upload overhead and status-ping wire bytes are counted correctly</li>
+          <li>Fake overhead estimates are gone, and uptime, ratio and locale formatting are cleaned up</li>
         </ul>
 
-        <h5>Library &amp; Settings</h5>
+        <h5>Library and Settings</h5>
         <ul>
-          <li>Library Peers column updates live, clears when peers drop, and counts complete copies / KAD publish ACKs only</li>
-          <li>Internal protocol knobs and rendezvous URL removed from Settings UI</li>
-          <li>Friend session encryption forced on</li>
-          <li>Misleading obfuscation “Restart” badge removed</li>
-          <li>Database incremental auto_vacuum enabled (schema v21)</li>
+          <li>The Library Peers column updates live, clears when peers drop, and counts complete copies and KAD publish acks only</li>
         </ul>
 
-        <h5>Friends &amp; UI</h5>
+        <h5>Friends and UI</h5>
         <ul>
-          <li>Friend connect slots / firewall rules cleared correctly; settings toggles repaired</li>
-          <li>Source drawer empty state authoritative; minor search/transfers UI polish</li>
-          <li>i18n updates across en / de / es / fr / pt-BR</li>
+          <li>Friend connect slots and firewall rules clear correctly, and the settings toggles work</li>
+          <li>The source drawer empty state is authoritative, plus minor search and transfers polish</li>
         </ul>
 
         <p class="full-changelog">
@@ -2313,25 +2337,25 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.8" target="_blank" rel="noopener"><code>v1.1.8</code></a></p>
       <div class="release-notes">
-        <h4>What's Fixed / Hardened</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Startup &amp; connectivity</h5>
+        <h5>Startup and connectivity</h5>
         <ul>
-          <li>Defer heavy network startup I/O (UPnP, ipfilter, known.met, GeoIP) so splash IPC stays responsive</li>
-          <li>Fail-close the IP filter until ranges finish loading so peers cannot slip through an empty enabled list</li>
-          <li>Fix HighID port-test / firewall sticky LowID, preferred-server auto-connect, and auto-ban edge cases</li>
+          <li>Heavy network startup I/O (UPnP, ipfilter, <code>known.met</code>, GeoIP) is deferred so splash IPC stays responsive</li>
+          <li>The IP filter fails closed until ranges finish loading, so peers can&rsquo;t slip through an empty enabled list</li>
+          <li>Fixed HighID port-test and firewall sticky LowID, preferred-server auto-connect, and auto-ban edge cases</li>
         </ul>
 
-        <h5>Transfers &amp; bandwidth</h5>
+        <h5>Transfers and bandwidth</h5>
         <ul>
-          <li>Require an upload limit for Upload Speed Sense; fix RTT throttling and single-sample USS ratchet bugs</li>
-          <li>Prevent cancelled downloads from briefly flashing red</li>
+          <li>Upload Speed Sense requires an upload limit, and we fixed RTT throttling and the single-sample USS ratchet</li>
+          <li>Cancelled downloads don&rsquo;t briefly flash red</li>
         </ul>
 
-        <h5>Persistence &amp; sharing</h5>
+        <h5>Persistence and sharing</h5>
         <ul>
-          <li>Prevent silent friend-loss, disk-full state wipes, settings resets, orphaned KAD searches, and share/indexer leaks</li>
-          <li>Harden related UI races and friend-connect proof-of-possession test mocks</li>
+          <li>Fixed silent friend loss, disk-full state wipes, settings resets, orphaned KAD searches, and share and indexer leaks</li>
+          <li>Hardened the related UI races and the friend-connect proof-of-possession test mocks</li>
         </ul>
 
         <p class="full-changelog">
@@ -2348,60 +2372,60 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.7" target="_blank" rel="noopener"><code>v1.1.7</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Search</h5>
         <ul>
-          <li>Align Global / Server / Kad search more closely with eMule (UDP eligibility &amp; reply auth, Arc/Iso→Pro wire types, Kad AND stripping, availability merge, and stop-cap accounting)</li>
-          <li>Automatically request more server results (<code>OP_QUERY_MORE</code>) when a page is full, up to the eMule-style limits</li>
-          <li>Skip shared and downloading files when counting toward the ed2k search stop limit (results still appear)</li>
-          <li>Move <strong>Hide spam</strong> into Advanced Filters; remove the empty-server “retry” banner</li>
+          <li>Global, Server and KAD search line up more closely with eMule: UDP eligibility and reply auth, Arc/Iso&rarr;Pro wire types, KAD AND stripping, availability merge, and stop-cap accounting</li>
+          <li>We request more server results (<code>OP_QUERY_MORE</code>) automatically when a page is full, up to the eMule-style limits</li>
+          <li>Shared and downloading files are skipped when counting toward the ed2k search stop limit. The results still appear</li>
+          <li><strong>Hide spam</strong> moved into Advanced Filters, and the empty-server &ldquo;retry&rdquo; banner is gone</li>
         </ul>
 
         <h5>Uploads</h5>
         <ul>
-          <li>Dial HighID waiting peers to grant upload slots (<code>AddUpNextClient</code> / push-grant), with concurrency and backoff limits</li>
-          <li>Fix soft-zone admission so newcomers are judged by credit + file priority (not a zero-wait score)</li>
+          <li>HighID waiting peers are dialled to grant upload slots (<code>AddUpNextClient</code> / push-grant), with concurrency and backoff limits</li>
+          <li>Soft-zone admission judges newcomers by credit and file priority instead of a zero-wait score</li>
         </ul>
 
-        <h5>Downloads &amp; transfers</h5>
+        <h5>Downloads and transfers</h5>
         <ul>
-          <li>Start KAD / TCP / UDP source discovery for queued and add-paused downloads so sources are ready on resume</li>
-          <li><strong>Resume All</strong> now includes Stopped downloads</li>
-          <li>Collapse Pause All / Resume All / Clear Completed into a <strong>More</strong> menu (closes on Escape and outside click)</li>
+          <li>KAD, TCP and UDP source discovery start for queued and add-paused downloads, so sources are ready when you resume</li>
+          <li><strong>Resume All</strong> includes Stopped downloads</li>
+          <li>Pause All, Resume All and Clear Completed are collapsed into a <strong>More</strong> menu, which closes on Escape and on an outside click</li>
         </ul>
 
-        <h5>Library &amp; status</h5>
+        <h5>Library and status</h5>
         <ul>
-          <li>Redesign the Library detail drawer (sections, missing/hashing banners, context Properties)</li>
-          <li>Show total shared size next to the shared-file count in the status bar</li>
-          <li>Improve missing-file scan feedback and bulk selection toasts</li>
+          <li>Redesigned Library detail drawer, with sections, missing and hashing banners, and context Properties</li>
+          <li>Total shared size sits next to the shared-file count in the status bar</li>
+          <li>Better missing-file scan feedback and bulk selection toasts</li>
         </ul>
 
         <h5>Statistics</h5>
         <ul>
-          <li>Count <strong>Completed Uploads</strong> only when a peer received the entire file in that session</li>
-          <li>Keep cumulative counters from rolling backward across save races; show <code>0s</code> for zero durations; hide empty overhead bars</li>
+          <li><strong>Completed Uploads</strong> counts only when a peer received the entire file in that session</li>
+          <li>Cumulative counters don&rsquo;t roll backward across save races, zero durations show as <code>0s</code>, and empty overhead bars are hidden</li>
         </ul>
 
-        <h4>What's Fixed / Hardened</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Connectivity &amp; firewall</h5>
+        <h5>Connectivity and firewall</h5>
         <ul>
-          <li>Honor reconnect backoff and per-server cooldowns; keep LowID sticky against false “Open” from UPnP</li>
-          <li>Handle mid-session <code>OP_IDCHANGE</code> (LowID ↔ HighID) without a full disconnect when possible</li>
-          <li>Prefer a known Open/Firewalled status over a stale Unknown in the UI</li>
+          <li>Reconnect backoff and per-server cooldowns are honored, and LowID stays sticky against a false &ldquo;Open&rdquo; from UPnP</li>
+          <li>Mid-session <code>OP_IDCHANGE</code> (LowID to HighID) is handled without a full disconnect where possible</li>
+          <li>A known Open or Firewalled status is preferred over a stale Unknown in the interface</li>
         </ul>
 
         <h5>Transfers</h5>
         <ul>
-          <li>Batch cancel always removes DB rows so cancelled downloads no longer resurrect after restart</li>
-          <li>Serialize spam-filter saves to avoid lost/out-of-order writes</li>
+          <li>Batch cancel always removes the database rows, so cancelled downloads don&rsquo;t resurrect after a restart</li>
+          <li>Spam-filter saves are serialized to avoid lost or out-of-order writes</li>
         </ul>
 
         <h5>Installer</h5>
         <ul>
-          <li>Skip recreating the desktop shortcut during in-app updates (<code>/UPDATE</code>), fixing duplicate desktop icons</li>
+          <li>The desktop shortcut isn&rsquo;t recreated during in-app updates (<code>/UPDATE</code>), which was making duplicate desktop icons</li>
         </ul>
 
         <p class="full-changelog">
@@ -2418,36 +2442,36 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.6" target="_blank" rel="noopener"><code>v1.1.6</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Library</h5>
         <ul>
-          <li>Add an in-app media player for playable audio and video in Library</li>
-          <li>Open playable files from the detail drawer while keeping <strong>Open Externally</strong></li>
+          <li>An in-app media player for playable audio and video</li>
+          <li>Playable files open from the detail drawer, with <strong>Open Externally</strong> still there</li>
         </ul>
 
         <h5>Search</h5>
         <ul>
-          <li>Polish search tab stop/close controls</li>
-          <li>Align Kad store/search/verify paths more closely with eMule behavior (wire publisher IDs, verified contact seeding after cold start, legacy Hello challenges, drop oversized KadRes)</li>
+          <li>Polished the search tab stop and close controls</li>
+          <li>KAD store, search and verify paths line up more closely with eMule: wire publisher IDs, verified contact seeding after a cold start, legacy Hello challenges, and dropping oversized KadRes</li>
         </ul>
 
-        <h4>What's Fixed / Hardened</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Security &amp; trust</h5>
+        <h5>Security and trust</h5>
         <ul>
-          <li>Require Ed25519 proof-of-possession on peer-relay (<code>ERAT</code>) requests; reject legacy hash-only <code>RELAY_REQUEST</code> payloads</li>
-          <li>Harden EPX trust: require PoP on TCP source exchange, pin KAD Noise keys, and align ERAT TTL handling</li>
-          <li>Drop bare-nonce Ember auth in favor of domain-separated signed auth only</li>
-          <li>Harden IP filtering: keep the live filter during async reload/enable, fail closed on reload errors, always reject bogus inbound TCP, and honor <code>block_private</code> on source inject paths</li>
+          <li>Peer-relay (<code>ERAT</code>) requests require Ed25519 proof-of-possession, and legacy hash-only <code>RELAY_REQUEST</code> payloads are rejected</li>
+          <li>EPX trust hardened: PoP required on TCP source exchange, KAD Noise keys pinned, and ERAT TTL handling aligned</li>
+          <li>Bare-nonce Ember auth is gone in favor of domain-separated signed auth only</li>
+          <li>IP filtering hardened: the live filter is kept during an async reload or enable, we fail closed on reload errors, always reject bogus inbound TCP, and honor <code>block_private</code> on source inject paths</li>
         </ul>
 
-        <h5>Downloads &amp; sources</h5>
+        <h5>Downloads and sources</h5>
         <ul>
-          <li>Unify IP-filter / ban / reputation checks across dial and inject paths</li>
-          <li>Keep insufficient-space downloads across restart</li>
-          <li>Classify mid-download disk-full as insufficient instead of a generic failure</li>
-          <li>Apply friend-related and settings hot-reload fixes from the audit pass (live friend toggles, browse/chat gates, nickname / max-sources / filter-server updates without restart noise)</li>
+          <li>IP filter, ban and reputation checks are unified across dial and inject paths</li>
+          <li>Insufficient-space downloads are kept across a restart</li>
+          <li>Mid-download disk-full is classified as insufficient space instead of a generic failure</li>
+          <li>Friend-related and settings hot-reload fixes from the audit pass: live friend toggles, browse and chat gates, and nickname, max-sources and filter-server updates without restart noise</li>
         </ul>
 
         <p class="full-changelog">
@@ -2464,26 +2488,25 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.5" target="_blank" rel="noopener"><code>v1.1.5</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Languages</h5>
         <ul>
-          <li>Add French, Brazilian Portuguese, and German UI translations</li>
-          <li>Show country flags on the Settings language picker cards</li>
+          <li>French, Brazilian Portuguese and German interface translations</li>
+          <li>Country flags on the Settings language picker cards</li>
         </ul>
 
         <h5>Dependencies</h5>
         <ul>
-          <li>Update frontend stack (Vite 8, SvelteKit, TypeScript 5.9, Tauri JS packages)</li>
-          <li>Update Rust crates (including rusqlite, reqwest, directories, lofty, zip, and related lockfile refreshes)</li>
-          <li>Raise Rust MSRV to 1.94 for newer crate requirements</li>
+          <li>Frontend stack updated (Vite 8, SvelteKit, TypeScript 5.9, Tauri JS packages)</li>
+          <li>Rust crates updated, including rusqlite, reqwest, directories, lofty and zip, with the lockfile refreshes that go with them</li>
+          <li>Rust MSRV raised to 1.94 for the newer crate requirements</li>
         </ul>
 
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Localization</h5>
         <ul>
-          <li>Remove duplicate <code>search_bitrate_value</code> keys from English, Spanish, and French catalogs</li>
+          <li>Removed duplicate <code>search_bitrate_value</code> keys from the English, Spanish and French catalogs</li>
         </ul>
 
         <p class="full-changelog">
@@ -2500,18 +2523,18 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.4" target="_blank" rel="noopener"><code>v1.1.4</code></a></p>
       <div class="release-notes">
-        <h4>What's Fixed</h4>
+        <p>If you&rsquo;re on 1.1.3, this is the one to install. 1.1.3 migrated the database on first launch and then refused to open it again.</p>
 
-        <h5>Database</h5>
+        <h4>What&rsquo;s New</h4>
+
         <ul>
-          <li>Fix schema version gate so Ember can open databases after the v20 migration (<code>credits.ember_hash</code>). 1.1.3 migrated on first launch, then refused to start on every later launch.</li>
+          <li>A link to the Ember website from the About dialog and Settings &rarr; About</li>
         </ul>
 
-        <h4>What's New</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>About</h5>
         <ul>
-          <li>Link to the Ember website from the About dialog and Settings &rarr; About</li>
+          <li>Fixed the schema version gate so Ember can open databases after the v20 migration (<code>credits.ember_hash</code>). 1.1.3 migrated on first launch, then refused to start on every later launch</li>
         </ul>
 
         <p class="full-changelog">
@@ -2528,48 +2551,49 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.3" target="_blank" rel="noopener"><code>v1.1.3</code></a></p>
       <div class="release-notes">
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s New</h4>
 
-        <h5>KAD &amp; ED2K</h5>
         <ul>
-          <li>Clear store / FindBuddy / routing failure modes that could stall discovery and publish</li>
-          <li>Restore callback peer caps and source-search capacity handling</li>
+          <li>A row context menu on Known Clients for copy hash, add friend and ban</li>
+          <li>A Release History section on the docs site, with GitHub-style changelogs</li>
+          <li>Expanded <code>.gitignore</code> for runtime data, installer copies and tooling artifacts</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>KAD and eD2K</h5>
+        <ul>
+          <li>Cleared store, FindBuddy and routing failure modes that could stall discovery and publishing</li>
+          <li>Restored callback peer caps and source-search capacity handling</li>
         </ul>
 
         <h5>GeoIP</h5>
         <ul>
-          <li>Refresh the bundled DB-IP country lite database (July 2026)</li>
-          <li>Update the MaxMind reader dependency</li>
+          <li>Refreshed the bundled DB-IP country lite database (July 2026)</li>
+          <li>Updated the MaxMind reader dependency</li>
         </ul>
 
         <h5>Known Clients</h5>
         <ul>
-          <li>Friend markers match on Ember hash (not only eD2K user hash)</li>
-          <li>Trust badge reflects manual bans</li>
-          <li>Reputation refreshes on each poll; friend list keeps the same cadence</li>
-          <li>Row context menu for copy hash / add friend / ban</li>
+          <li>Friend markers match on the Ember hash, not only the eD2K user hash</li>
+          <li>The trust badge reflects manual bans</li>
+          <li>Reputation refreshes on each poll, and the friend list keeps the same cadence</li>
         </ul>
 
         <h5>Library</h5>
         <ul>
-          <li>Stop hashing stays stopped against FS-watcher rescans</li>
+          <li>Stop hashing stays stopped against filesystem-watcher rescans</li>
           <li>Windows folder filters are case-insensitive</li>
-          <li>KAD / eD2K badges mean published, not merely connected</li>
-          <li>Missing-file scan reports when results are truncated</li>
+          <li>KAD and eD2K badges mean published, not merely connected</li>
+          <li>The missing-file scan reports when results are truncated</li>
         </ul>
 
         <h5>Statistics</h5>
         <ul>
-          <li>Session and connection time use monotonic elapsed time (immune to clock jumps)</li>
-          <li>Download completions counted only after the transfer is confirmed complete</li>
-          <li>Status bar and protocol-overhead labels match real scopes (payload / session)</li>
-          <li>Transfer-stats cache refreshes every second; session vs all-time upload ratio clarified</li>
-        </ul>
-
-        <h5>Website &amp; repository</h5>
-        <ul>
-          <li>Add a Release History section to the docs site with GitHub-style changelogs</li>
-          <li>Expand <code>.gitignore</code> for runtime data, installer copies, and tooling artifacts</li>
+          <li>Session and connection time use monotonic elapsed time, so a clock jump can&rsquo;t affect them</li>
+          <li>Download completions are counted only after the transfer is confirmed complete</li>
+          <li>Status bar and protocol-overhead labels match their real scopes (payload, session)</li>
+          <li>The transfer-stats cache refreshes every second, and session versus all-time upload ratio is clearer</li>
         </ul>
 
         <p class="full-changelog">
@@ -2586,28 +2610,28 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.2" target="_blank" rel="noopener"><code>v1.1.2</code></a></p>
       <div class="release-notes">
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Search &amp; downloads</h5>
+        <h5>Search and downloads</h5>
         <ul>
-          <li>Search results with a file hash but no embedded peer IPs can be downloaded again (backend discovers sources)</li>
-          <li>Batch cancel no longer fails the UI after transfers are already cancelled; incomplete teardown only retains partials and logs a warning</li>
+          <li>Search results with a file hash but no embedded peer IPs can be downloaded again; the backend discovers the sources</li>
+          <li>Batch cancel doesn&rsquo;t fail the interface after transfers are already cancelled. An incomplete teardown retains the partials and logs a warning</li>
         </ul>
 
-        <h5>Sharing &amp; settings</h5>
+        <h5>Sharing and settings</h5>
         <ul>
-          <li>Overlapping shared folders from older configs are soft-deduped on upgrade instead of resetting all settings</li>
-          <li>Temporarily unavailable shared folders no longer block saving unrelated settings</li>
-          <li>Share/unshare and priority updates succeed even if network persistence is briefly busy (best-effort reconcile)</li>
+          <li>Overlapping shared folders from older configs are soft-deduped on upgrade instead of resetting all your settings</li>
+          <li>A temporarily unavailable shared folder doesn&rsquo;t block saving unrelated settings</li>
+          <li>Share, unshare and priority updates succeed even if network persistence is briefly busy (best-effort reconcile)</li>
         </ul>
 
-        <h5>Reliability &amp; compatibility</h5>
+        <h5>Reliability and compatibility</h5>
         <ul>
-          <li>Corrupt <code>known.met</code> keeps previously parsed records instead of wiping the whole catalog</li>
-          <li>Corrupt <code>ember.db</code> still recreates safely, and now shows a recovery toast with the backup path</li>
-          <li>Ember auth works across mixed versions (transitional bare-nonce emit; dual verify retained)</li>
-          <li>Network command send timeout increased to reduce false failures under load</li>
-          <li>Note publish softens a slow KAD ack into &ldquo;queued&rdquo; instead of a hard error</li>
+          <li>A corrupt <code>known.met</code> keeps the records we already parsed instead of wiping the whole catalog</li>
+          <li>A corrupt <code>ember.db</code> still recreates safely, and now shows a recovery toast with the backup path</li>
+          <li>Ember auth works across mixed versions (transitional bare-nonce emit, dual verify retained)</li>
+          <li>The network command send timeout is longer, which reduces false failures under load</li>
+          <li>A slow KAD ack on a note publish softens to &ldquo;queued&rdquo; instead of a hard error</li>
         </ul>
 
         <p class="full-changelog">
@@ -2624,23 +2648,23 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.1" target="_blank" rel="noopener"><code>v1.1.1</code></a></p>
       <div class="release-notes">
-        <h4>What's Fixed</h4>
+        <h4>What&rsquo;s Fixed</h4>
 
-        <h5>Persistence &amp; transfers</h5>
+        <h5>Persistence and transfers</h5>
         <ul>
-          <li>Prevent stale persistence from writing outdated transfer and settings state</li>
-          <li>Fix divergence between on-disk progress and the in-app transfer tracker</li>
+          <li>Stale persistence can&rsquo;t write outdated transfer and settings state</li>
+          <li>Fixed a divergence between on-disk progress and the in-app transfer tracker</li>
         </ul>
 
-        <h5>KAD &amp; networking</h5>
+        <h5>KAD and networking</h5>
         <ul>
-          <li>Stop dropped KAD work from silently stalling discovery and publish paths</li>
-          <li>Harden relay networking while preserving eMule-compatible behavior</li>
+          <li>Dropped KAD work doesn&rsquo;t silently stall discovery and publish paths</li>
+          <li>Hardened relay networking while keeping eMule-compatible behavior</li>
         </ul>
 
         <h5>Frontend</h5>
         <ul>
-          <li>Close state races that could leave the UI out of sync with the backend</li>
+          <li>Closed state races that could leave the interface out of sync with the backend</li>
         </ul>
 
         <p class="full-changelog">
@@ -2657,31 +2681,31 @@ npm run tauri build</code></pre>
       </div>
       <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.1.0" target="_blank" rel="noopener"><code>v1.1.0</code></a></p>
       <div class="release-notes">
-        <h4>What's New</h4>
+        <h4>What&rsquo;s New</h4>
 
         <h5>Networking</h5>
         <ul>
-          <li>Full eMule KAD v8/v9 participation with automatic Security-server ED2K peer exchange</li>
-          <li>Credits, SecIdent, protocol obfuscation, and AICH</li>
+          <li>Full eMule KAD v8/v9 participation, with automatic Security-server ED2K peer exchange</li>
+          <li>Credits, SecIdent, protocol obfuscation and AICH</li>
           <li>EPX (Ember Peer Exchange) for faster source discovery between Ember clients</li>
         </ul>
 
-        <h5>Transfers &amp; library</h5>
+        <h5>Transfers and library</h5>
         <ul>
-          <li>Multi-source downloads with queue management, health monitoring, and real-time progress</li>
+          <li>Multi-source downloads with queue management, health monitoring and live progress</li>
           <li>Multi-tab search with filters and spam detection</li>
-          <li>Virtual-scrolling library with priorities, comments, and collections</li>
+          <li>A virtual-scrolling library with priorities, comments and collections</li>
         </ul>
 
-        <h5>Friends &amp; security</h5>
+        <h5>Friends and security</h5>
         <ul>
-          <li>Ember-exclusive Friend IDs with rendezvous discovery, mutual requests, chat, remote browsing, and priority upload slots</li>
-          <li>IP filtering, private-IP blocking, path traversal protection, and a strict webview CSP</li>
+          <li>Ember-exclusive Friend IDs with rendezvous discovery, mutual requests, chat, remote browsing and priority upload slots</li>
+          <li>IP filtering, private-IP blocking, path traversal protection and a strict webview CSP</li>
         </ul>
 
         <h5>Desktop app</h5>
         <ul>
-          <li>Windows 10/11 installer, first-run setup wizard, statistics, GeoIP peer countries, and signed in-app updates</li>
+          <li>A Windows 10/11 installer, a first-run setup wizard, statistics, GeoIP peer countries and signed in-app updates</li>
         </ul>
       </div>
     </article>
