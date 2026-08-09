@@ -875,7 +875,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.5.1</h3>
+      <h3>Get Ember 1.5.2</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1530,6 +1530,78 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Official Ember releases for Windows. Notes mirror the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a> changelog style. Ember can also update itself in-app when a signed release is published.</p>
+
+    <article class="release" id="release-1-5-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.2" target="_blank" rel="noopener">Ember v1.5.2</a></h3>
+        <time class="release-date" datetime="2026-08-09">August 9, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.2" target="_blank" rel="noopener"><code>v1.5.2</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+
+        <ul>
+          <li><strong>The Ember Network has its own light on the status bar</strong> &mdash; It used to appear only once Kad was up, which hid the fact that the two are independent. You can now see at a glance whether the Ember overlay is running and how many peers it holds</li>
+          <li><strong>Downloads say when their Ember hash was checked</strong> &mdash; A completed download that was verified against the content hash published on the Ember Network now carries a badge. It only appears when the check actually ran, so it never claims more than it did &mdash; a file recovered after a crash, or one with no Ember hash to check, simply does not show it</li>
+          <li><strong>File properties show the Ember content hash</strong> &mdash; Alongside the ed2k and AICH hashes, so you can see the digest your downloads are verified against</li>
+          <li><strong>The Ember Network page shows what you are holding for other people</strong> &mdash; A node stores records on the network&rsquo;s behalf, and that figure was invisible. It now counts only records published by someone else, so it reflects what you are genuinely contributing rather than your own entries</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <p>A third audit, reading every change made since 1.4.2 across seven passes in parallel. Twenty-eight findings came back; twenty-six survived checking and are fixed here, and two were shown to be false alarms.</p>
+
+        <h5>Before you upgrade</h5>
+        <ul>
+          <li><strong>Nothing to do.</strong> Your library database is untouched, so you can move between 1.5.0, 1.5.1 and 1.5.2 freely</li>
+        </ul>
+
+        <h5>Friends and the Ember Network</h5>
+        <ul>
+          <li><strong>Your friend code cannot be used to take over your presence</strong> &mdash; An <code>ember2:</code> code is meant to be public, and it is enough to work out where your presence is registered. Anyone holding it could claim that spot with their own identity, so friends looking you up were sent to a stranger or found nothing at all &mdash; repeatable with one request. Presence now belongs to the identity it is derived from and nobody else. This is a server-side fix and is already live, so it protects 1.5.0 and 1.5.1 too</li>
+          <li><strong>Your node can act as a relay for friends again</strong> &mdash; Offering yourself as a relay was tied to Kad being connected, which it is not by default, so a default install advertised nothing and turned away every friend that tried to use it. This is the one discovery channel that works for two friends who share no downloads, which is exactly the case it was built for</li>
+          <li><strong>Relayed transfers survive a quiet moment from both ends</strong> &mdash; The fix in 1.5.1 kept the second peer&rsquo;s side of a relay alive but not the first, so a quiet relayed session was still being closed after thirty seconds. Also server-side and already live</li>
+          <li><strong>A spoofed packet cannot stop a peer reaching you</strong> &mdash; Someone forging a peer&rsquo;s address could repeatedly displace that peer&rsquo;s half-finished connection, so its reply had nothing to match and first contact never completed. Both halves of the handshake now survive a forged packet</li>
+          <li><strong>A download cannot be failed forever by one unverified claim</strong> &mdash; A single node could assert the content hash for a file, and Ember would enforce it at completion. If it was wrong the download failed, found nothing to repair, and started over &mdash; indefinitely. A hash learned from the network now needs agreement from more than one publisher before it is enforced</li>
+        </ul>
+
+        <h5>Talking to other clients</h5>
+        <ul>
+          <li><strong>Obfuscated connections no longer corrupt themselves after a stall</strong> &mdash; When a peer stopped reading for a minute, the next packet could put part of the previous one back on the wire. The other end decrypts it cleanly, so nothing looks wrong until the framing has drifted and the connection is unusable</li>
+          <li><strong>One byte can no longer hold an incoming connection slot</strong> &mdash; A connection that sent a single byte and then went silent was waited on forever, and about thirty-four of them were enough to fill the listener and shut out every real peer, upload and port test</li>
+          <li><strong>Source swapping works with Kad off</strong> &mdash; Moving a peer from a file it cannot help with to one it can was tied to Kad being connected, though it only ever concerns ordinary ed2k sources, so it never ran at all for anyone running server-only</li>
+          <li><strong>A peer cannot make Ember hold hundreds of megabytes</strong> &mdash; The corruption-recovery buffer was bounded by bytes in one download path and only by packet count in the other, and the one that was missed is the path a single-source download takes</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>The name you see is the name you get</strong> &mdash; Two different rules decided the filename shown in the list and the filename written to disk, so a result could display one name and download another</li>
+          <li><strong>Peers contribute a full page of results</strong> &mdash; The limit on how many packets one answer could use was smaller than a page of results, so the fix in 1.5.1 could not take effect and each peer still returned only part of what it held</li>
+        </ul>
+
+        <h5>Kad</h5>
+        <ul>
+          <li><strong>One peer cannot block all publishing on your node</strong> &mdash; Comments, ratings and source records shared one space with keyword records, and only keyword records could be trimmed to make room. Whichever of the other two filled that space first locked the whole store &mdash; five hours for sources, a full day for comments &mdash; refusing everything else in the meantime</li>
+          <li><strong>A refused publish cannot delete somebody else&rsquo;s records</strong> &mdash; The 1.5.1 fix covered new records but not updates to existing ones, so a peer could still make Ember discard another publisher&rsquo;s entries to make space for a record its own limits were about to turn down</li>
+        </ul>
+
+        <h5>Your data</h5>
+        <ul>
+          <li><strong>An interrupted save no longer resets your settings</strong> &mdash; Replacing a file on Windows sometimes needs the old one moved aside first. 1.5.1 taught your identity file to recover from that; every other file still could not. For your settings it meant a launch that looked like a fresh install: every preference back to default and every shared folder dropped</li>
+          <li><strong>Your approved folders stay approved &mdash; and stay yours</strong> &mdash; The record of which folders Ember may use failed the same way, and it failed open: an empty record looked like a first run, so whatever now sat at each configured path was approved again without asking you</li>
+          <li><strong>Chat history is not locked out by an interrupted save</strong> &mdash; The chat key could be left under the same set-aside name, and Ember then reported the history sealed and told you to restore a backup while the key sat next to the database</li>
+          <li><strong>Backups are never shared, whatever you call them</strong> &mdash; The rule that keeps a profile backup out of your shared folders matched the extension exactly, so saving one as <code>.EmberBackup</code> slipped past it and the file was indexed and offered to peers like any other</li>
+          <li><strong>Restoring an old backup cannot stop Ember opening</strong> &mdash; A chat message that happened to begin with the text Ember uses to mark encrypted messages made the upgrade of a pre-1.4 database fail, and fail again on every launch afterwards</li>
+          <li><strong>The last saves on exit are no longer skipped</strong> &mdash; One save finishing at the wrong moment consumed the signal another was waiting for, and the wait that followed ate the time the reputation, source list and server list saves needed</li>
+          <li>File permissions on Windows are now applied through a handle that cannot be redirected between the check and the change, and the peer credit counters saturate instead of wrapping when a stored value is out of range</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.1...v1.5.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.1...v1.5.2</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-5-1">
       <div class="release-header">
