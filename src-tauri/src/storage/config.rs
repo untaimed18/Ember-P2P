@@ -127,6 +127,12 @@ impl AppConfig {
 
         let config_path = app_dir.join("config.json");
 
+        // An interrupted Windows replace parks the destination under a fixed
+        // backup name and leaves nothing at `config_path`. Reading that as
+        // "absent" means a fresh install: every setting resets and every shared
+        // folder is dropped, and the defaults are then written back over the
+        // recovered file, making the loss permanent. Restore before deciding.
+        crate::security::recover_interrupted_replace(&config_path);
         let config_existed = config_path.exists();
         let mut corrupt_backup: Option<PathBuf> = None;
         let mut config_missing_during_read = false;

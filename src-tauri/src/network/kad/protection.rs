@@ -16,7 +16,14 @@ const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
 /// SearchKey/Source/Notes request. eMule may split results across multiple
 /// packets, so one response per request is too strict; leaving the request as
 /// an unlimited pass until the 180s expiry is too loose.
-const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 8;
+///
+/// Sized to carry a whole `FETCH_PAGE_SIZE` page of results. A responder
+/// fragments a page to fit `UDP_KAD_MAXFRAGMENT` (1420 bytes), so at the ~120
+/// bytes a keyword entry with a typical filename occupies, a 200-entry page
+/// needs roughly 18 datagrams. The previous 8 admitted only ~88 entries, so the
+/// page-complete test that drives pagination could never fire for realistic
+/// result sizes and every peer contributed only part of its first page.
+const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 20;
 
 /// Per-IP global cap (second-level, matching eMule's "massive flood" detection).
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;

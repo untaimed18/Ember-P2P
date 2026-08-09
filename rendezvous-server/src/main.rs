@@ -242,7 +242,12 @@ fn now_unix_secs() -> i64 {
 
 fn timestamp_fresh(ts: i64) -> bool {
     let now = now_unix_secs();
-    (now - ts).abs() <= MAX_TIMESTAMP_SKEW_SECS
+    // `ts` is unauthenticated request data, and `(now - ts).abs()` overflows for
+    // `ts == now - i64::MIN`: the subtraction wraps to `i64::MIN`, whose `abs`
+    // wraps to itself, which compares `<=` and passes the gate. A security
+    // predicate must not fail open on an input an attacker chooses, and with
+    // overflow checks enabled the same expression is an unauthenticated panic.
+    now.abs_diff(ts) <= MAX_TIMESTAMP_SKEW_SECS.unsigned_abs()
 }
 
 fn decode_hex_pubkey(s: &str) -> Option<[u8; 32]> {
@@ -635,6 +640,12 @@ const MAX_PUNCH_PER_MINUTE: u64 = 60;
 /// from many IPs to fill more slots, which is also bounded by
 /// `MAX_GLOBAL_RELAY_SESSIONS` upstream).
 const MAX_PUNCH_PER_TARGET: usize = 8;
+/// Of [`MAX_PUNCH_PER_TARGET`], how many slots requesters authorized only by a
+/// public friend-code intro capability may hold at once. Everyone else's claim
+/// rests on a pairwise capability the target itself handed out, so reserving the
+/// remainder keeps a stranger with the target's `ember2:` code from crowding its
+/// actual friends out of the queue.
+const MAX_PUNCH_PER_TARGET_OPEN_INTRO: usize = 2;
 const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
 /// Per-IP relay session cap. Was `2`, which was the cause of every
 /// `WebSocket protocol error: Sending after closing is not allowed`
@@ -802,6 +813,24 @@ fn capability_allows_peer(
         && (entry.open_intro || entry.peer_pubkey == *peer_pubkey)
 }
 
+/// Whether requesters holding only the target's public intro capability have
+/// already taken their share of its punch queue.
+///
+/// Identities are free to mint and the per-target cap is keyed on
+/// `(target, from)`, so without this a handful of throwaway keys filled all of
+/// [`MAX_PUNCH_PER_TARGET`] — the cap's own rationale assumes an attacker must
+/// source from many IPs, which the open-intro path removes.
+fn open_intro_punch_slots_exhausted(
+    punches: &HashMap<(String, String), PunchEntry>,
+    target: &str,
+) -> bool {
+    punches
+        .iter()
+        .filter(|((candidate, _), entry)| candidate == target && entry.via_open_intro)
+        .count()
+        >= MAX_PUNCH_PER_TARGET_OPEN_INTRO
+}
+
 /// A live capability remains owned by the identity that first registered it.
 /// An expired entry is not presence and may be claimed by a new owner.
 fn capability_owner_allows_register(
@@ -847,6 +876,11 @@ struct PunchEntry {
     /// Present only for v4. Legacy v3 deliberately preserves its original
     /// response shape and relies on the server-observed source address.
     register_nonce: Option<[u8; 16]>,
+    /// This requester was authorized only by the target's public intro
+    /// capability, not by a pairwise one the target handed it. Bounds how many of
+    /// the target's slots strangers can hold — see
+    /// [`MAX_PUNCH_PER_TARGET_OPEN_INTRO`].
+    via_open_intro: bool,
     register_ts: Option<i64>,
     register_sig: Option<[u8; 64]>,
     from_pubkey: Option<[u8; 32]>,
@@ -2615,7 +2649,9 @@ async fn capability_register_impl(
     if !validate_hex_id(&body.capability)
         || body.port == 0
         || !timestamp_fresh(body.ts)
-        || (body.epoch - now_unix_secs().div_euclid(15 * 60)).abs() > 1
+        // Same overflow as `timestamp_fresh`: `body.epoch` is attacker-chosen,
+        // so compute the distance without a subtraction that can wrap.
+        || body.epoch.abs_diff(now_unix_secs().div_euclid(15 * 60)) > 1
     {
         return StatusCode::BAD_REQUEST;
     }
@@ -2738,9 +2774,21 @@ async fn capability_register_impl(
     // Let an expired entry be claimed by a new owner: it is no longer a live
     // presence, and the normal insertion path below will replace it. A live
     // owner can still refresh an address, port, proof version, or peer binding.
-    if capabilities
-        .get(&key)
-        .is_some_and(|entry| !capability_owner_allows_register(entry, &pubkey, now))
+    //
+    // Reaching here with `body.intro` set means the derivation above matched,
+    // which proves this claimant owns the namespace — a stronger claim than
+    // first-come, so it outranks the pin and reclaims the entry. That matters
+    // because the derivation check only applies to intro registrations: a
+    // *pairwise* registration can name a victim's derivable intro capability
+    // and skip the proof entirely, and the pin would otherwise make that squat
+    // permanent, locking the owner out of its own friend-code presence for as
+    // long as the squatter kept refreshing. A proved intro claim cannot collide
+    // with a real pairwise capability without a BLAKE3 preimage, so letting it
+    // win cannot be turned around against pairwise entries.
+    if !body.intro
+        && capabilities
+            .get(&key)
+            .is_some_and(|entry| !capability_owner_allows_register(entry, &pubkey, now))
     {
         return StatusCode::FORBIDDEN;
     }
@@ -3139,14 +3187,22 @@ async fn punch_register_impl(
         };
         (target_pubkey, from_pubkey)
     };
-    let capability_authorized = state
+    // `capability_allows_peer` short-circuits on `open_intro`, so a public
+    // friend-code capability authorizes *any* registered identity — which is the
+    // point, since a stranger holding the code must be able to reach the owner.
+    // Track whether that is the only reason this request passed, so the slot
+    // accounting below can keep strangers from filling a target's queue and
+    // starving the friends it is actually bound to.
+    let (capability_authorized, via_open_intro) = state
         .capability_store
         .read()
         .await
         .get(&body.capability.to_lowercase())
-        .is_some_and(|entry| {
-            capability_allows_peer(entry, &from_pubkey, body.epoch, Instant::now())
-                && entry.pubkey == target_pubkey
+        .map_or((false, false), |entry| {
+            let authorized = capability_allows_peer(entry, &from_pubkey, body.epoch, Instant::now())
+                && entry.pubkey == target_pubkey;
+            let pairwise_bound = entry.peer_pubkey == from_pubkey;
+            (authorized, authorized && entry.open_intro && !pairwise_bound)
         });
     if !capability_authorized {
         return StatusCode::FORBIDDEN;
@@ -3163,6 +3219,18 @@ async fn punch_register_impl(
                 .filter(|(candidate, _)| candidate == &target)
                 .count()
                 >= MAX_PUNCH_PER_TARGET)
+    {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    // A stranger authorized only by a public intro capability gets a small share
+    // of the per-target queue. Identities are free to mint and the per-target cap
+    // is keyed on `(target, from)`, so without this a handful of throwaway keys
+    // filled all eight slots — the cap's own rationale assumes an attacker has to
+    // source from many IPs, which the open-intro path removes. Friends bound to a
+    // pairwise capability keep the rest.
+    if via_open_intro
+        && !punches.contains_key(&key)
+        && open_intro_punch_slots_exhausted(&punches, &target)
     {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
@@ -3183,6 +3251,7 @@ async fn punch_register_impl(
             register_ts: (version == RendezvousVersion::IpBoundV4).then_some(body.ts),
             register_sig: (version == RendezvousVersion::IpBoundV4).then_some(sig),
             from_pubkey: (version == RendezvousVersion::IpBoundV4).then_some(from_pubkey),
+            via_open_intro,
         },
     );
     StatusCode::OK
@@ -3906,10 +3975,29 @@ async fn run_peer1_loop(
     let mut total_bytes: Option<Arc<AtomicUsize>> = None;
     let mut prebridge_frames = VecDeque::<Vec<u8>>::new();
     let mut prebridge_bytes = 0usize;
+    // A bridged session has two halves, and only the second joiner runs
+    // `bridge_relay` — the first stays here for the whole session. This loop
+    // writes only when forwarding a frame from peer2, so during a quiet session
+    // peer1's socket saw neither reads nor writes and `HTTP_IDLE_TIMEOUT` killed
+    // it from the transport at 30s, tearing the relay down from this end. Adding
+    // the keepalive to `bridge_relay` alone fixed only peer2's half. Nothing
+    // pings us: the client library answers pings but never initiates them.
+    let mut transport_keepalive = tokio::time::interval(RELAY_TRANSPORT_KEEPALIVE);
+    transport_keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The immediate first tick would ping before anything can go idle.
+    transport_keepalive.tick().await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(session_deadline.into()) => {
                 break;
+            }
+            // Only once bridged: before that `RELAY_IDLE_TIMEOUT` is the shorter
+            // deadline anyway, and a session still waiting for peer2 has nothing
+            // to keep alive.
+            _ = transport_keepalive.tick(), if peer2_tx.is_some() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
             _ = &mut idle_timeout, if peer2_tx.is_none() => {
                 info!("relay session {} timed out waiting for peer2", &session_id[..8.min(session_id.len())]);
@@ -4810,6 +4898,114 @@ mod relay_ticket_tests {
         assert_eq!(entry.port, 4662);
     }
 
+    /// The derivation proof only gates `intro: true`, so a pairwise registration
+    /// can name a victim's derivable intro capability and skip it. Owner pinning
+    /// must not then lock the real owner out of its own namespace — before the
+    /// pin existed the owner's next heartbeat simply overwrote such a squat, and
+    /// that must stay true.
+    #[tokio::test]
+    async fn a_proved_intro_owner_reclaims_a_namespace_squatted_as_pairwise() {
+        let state = test_state();
+        let (attacker, _attacker_id, attacker_pubkey) = insert_test_identity(&state, 3).await;
+        let (victim, _victim_id, victim_pubkey) = insert_test_identity(&state, 5).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let register_ts = now_unix_secs();
+        let capability = derive_intro_presence_capability(&victim_pubkey, epoch);
+
+        let squat = |port: u16, octet: u8| {
+            let signed_ip = encode_signed_ip(IpAddr::V4(Ipv4Addr::new(octet, 1, 1, 1)));
+            let message = build_capability_register_v4_msg(
+                &capability,
+                epoch,
+                port,
+                &signed_ip,
+                &attacker_pubkey,
+                &attacker_pubkey,
+                register_ts,
+            );
+            CapabilityRegisterRequest {
+                capability: hex::encode(capability),
+                epoch,
+                port,
+                ip: format!("{octet}.1.1.1"),
+                pubkey: hex::encode(attacker_pubkey),
+                peer_pubkey: hex::encode(attacker_pubkey),
+                ts: register_ts,
+                sig: hex::encode(attacker.sign(&message).to_bytes()),
+                // Skipping the derivation proof is the whole point of the squat.
+                intro: false,
+                legacy_sig: None,
+            }
+        };
+
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(squat(4663, 1)),
+            )
+            .await,
+            StatusCode::OK,
+            "a pairwise registration for an unclaimed key is accepted"
+        );
+
+        let owner_message = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4662,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            &victim_pubkey,
+            &victim_pubkey,
+            register_ts,
+        );
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("8.8.4.4:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(CapabilityRegisterRequest {
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 4662,
+                    ip: "8.8.4.4".to_string(),
+                    pubkey: hex::encode(victim_pubkey),
+                    peer_pubkey: hex::encode(victim_pubkey),
+                    ts: register_ts,
+                    sig: hex::encode(victim.sign(&owner_message).to_bytes()),
+                    intro: true,
+                    legacy_sig: None,
+                }),
+            )
+            .await,
+            StatusCode::OK,
+            "the derivation-proved owner must reclaim its own namespace"
+        );
+
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("the reclaimed capability is present");
+        assert_eq!(entry.pubkey, victim_pubkey);
+        assert!(entry.open_intro, "the reclaimed entry is intro presence");
+        assert_eq!(entry.ip, "8.8.4.4".parse::<IpAddr>().unwrap());
+
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("2.1.1.1:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(squat(4664, 2)),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "the squatter cannot take a live owned namespace back"
+        );
+    }
+
     /// Owner pinning alone would leave an unclaimed epoch open: whoever
     /// registers first wins, so an attacker holding a public friend code could
     /// take the victim's namespace at each epoch rollover and suppress their
@@ -5638,6 +5834,68 @@ mod relay_ticket_tests {
         assert!(tickets.pending_by_responder.get(&responder_id).is_some());
     }
 
+    /// `(now - ts).abs()` wrapped to `i64::MIN` for a crafted `ts`, which
+    /// compares `<= MAX_TIMESTAMP_SKEW_SECS` — so the freshness gate, which runs
+    /// on an unauthenticated body before any signature check, failed open.
+    #[test]
+    fn timestamp_freshness_rejects_values_that_overflow_the_skew_check() {
+        assert!(!timestamp_fresh(now_unix_secs().wrapping_sub(i64::MIN)));
+        assert!(!timestamp_fresh(i64::MIN));
+        assert!(!timestamp_fresh(i64::MAX));
+        assert!(timestamp_fresh(now_unix_secs()));
+        assert!(timestamp_fresh(now_unix_secs() - MAX_TIMESTAMP_SKEW_SECS));
+        assert!(!timestamp_fresh(now_unix_secs() - MAX_TIMESTAMP_SKEW_SECS - 1));
+    }
+
+    /// Strangers holding only a public friend-code capability must not be able
+    /// to crowd a target's actual friends out of its punch queue.
+    #[test]
+    fn open_intro_requesters_only_get_their_share_of_a_targets_punch_slots() {
+        let target = "tt".repeat(32);
+        let mut punches = HashMap::new();
+        let entry = |from: &str, via_open_intro: bool| PunchEntry {
+            punch_id: "11".repeat(32),
+            from_id: from.to_string(),
+            from_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            from_port: 4662,
+            nat_type: 1,
+            capability: [3; 32],
+            epoch: 1,
+            created_at: Instant::now(),
+            leased_until: None,
+            proof_version: RendezvousVersion::IpBoundV4,
+            register_nonce: Some([4; 16]),
+            register_ts: Some(1),
+            register_sig: Some([5; 64]),
+            from_pubkey: Some([6; 32]),
+            via_open_intro,
+        };
+
+        assert!(!open_intro_punch_slots_exhausted(&punches, &target));
+        for i in 0..MAX_PUNCH_PER_TARGET_OPEN_INTRO {
+            punches.insert(
+                (target.clone(), format!("{i:064x}")),
+                entry(&format!("{i:064x}"), true),
+            );
+        }
+        assert!(
+            open_intro_punch_slots_exhausted(&punches, &target),
+            "a stranger past the reserved share must be refused"
+        );
+
+        // Pairwise-bound friends never count against that share, and the share is
+        // per target rather than global.
+        let mut pairwise_only = HashMap::new();
+        for i in 0..MAX_PUNCH_PER_TARGET {
+            pairwise_only.insert(
+                (target.clone(), format!("{i:064x}")),
+                entry(&format!("{i:064x}"), false),
+            );
+        }
+        assert!(!open_intro_punch_slots_exhausted(&pairwise_only, &target));
+        assert!(!open_intro_punch_slots_exhausted(&punches, &"uu".repeat(32)));
+    }
+
     #[test]
     fn punch_lease_hides_entry_until_expiry() {
         let now = Instant::now();
@@ -5656,6 +5914,7 @@ mod relay_ticket_tests {
             register_ts: Some(1),
             register_sig: Some([5; 64]),
             from_pubkey: Some([6; 32]),
+            via_open_intro: false,
         };
         assert!(!punch_available(&entry, now));
         assert!(punch_available(
@@ -5685,6 +5944,7 @@ mod relay_ticket_tests {
                 register_ts: Some(1),
                 register_sig: Some([1; 64]),
                 from_pubkey: Some([1; 32]),
+                via_open_intro: false,
             },
         );
         punches.insert(
@@ -5704,6 +5964,7 @@ mod relay_ticket_tests {
                 register_ts: Some(1),
                 register_sig: Some([2; 64]),
                 from_pubkey: Some([2; 32]),
+                via_open_intro: false,
             },
         );
         let target = "tt".repeat(32);

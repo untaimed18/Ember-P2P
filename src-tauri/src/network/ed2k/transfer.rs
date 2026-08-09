@@ -5667,9 +5667,22 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
                     return AichAnswerOutcome::NotAvailable;
                 }
             }
-            if deferred_packets.len() >= 64 {
-                // Everything read so far was a whole packet, so the stream is
-                // still aligned; we just refuse to buffer more.
+            // Bound the buffer by bytes as well as by count, as the multi-source
+            // twin does. A count alone let a peer queue 64 whole packets, and a
+            // packed frame is capped at 2 MiB on the wire but may inflate to
+            // 10 MiB — roughly 640 MiB resident per connection, on a path the
+            // sender reaches by corrupting a part so its MD4 fails. Both limits
+            // leave the stream on a packet boundary, so refusing is safe either
+            // way.
+            const MAX_DEFERRED_PACKETS: usize = 64;
+            const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            let deferred_bytes: usize = deferred_packets
+                .iter()
+                .map(|(_, _, buffered)| buffered.len())
+                .sum();
+            if deferred_packets.len() >= MAX_DEFERRED_PACKETS
+                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+            {
                 return AichAnswerOutcome::NotAvailable;
             }
             deferred_packets.push_back((proto, opcode, payload));

@@ -209,6 +209,11 @@ impl Database {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join(CHAT_KEY_FILE);
+        // Wrapping a legacy plaintext key rewrites this file, so an interrupted
+        // replace can park it. Reading that as missing seals the history behind
+        // the "restore it from backup" path below while the key is sitting right
+        // next to the database under its backup name.
+        crate::security::recover_interrupted_replace(&key_path);
         match std::fs::read(&key_path) {
             Ok(stored) => {
                 let was_protected = crate::storage::secret_store::is_protected(&stored);
@@ -512,12 +517,36 @@ impl Database {
         let mut rewritten = 0usize;
         for (id, friend_hash, direction, stored, timestamp) in rows {
             if stored.starts_with(CHAT_CIPHERTEXT_PREFIX) {
-                if authenticate_existing {
-                    // A partially prepared/manual database must authenticate,
-                    // not merely carry the marker, before migration completes.
-                    Self::decrypt_chat_body(key, id, &friend_hash, &direction, timestamp, &stored)?;
+                // A partially prepared/manual database must authenticate, not
+                // merely carry the marker, before migration completes.
+                //
+                // A failure here does not fail the migration, because in a
+                // pre-v23 database these bodies are plaintext straight off the
+                // wire: a friend who opened a message with the marker text
+                // produces a row that cannot decrypt, and propagating that error
+                // aborted `run_migrations` — and with it every future database
+                // open, deterministically, with no corruption path to recover
+                // through. Treat it as the plaintext it is and encrypt it.
+                if authenticate_existing
+                    && Self::decrypt_chat_body(
+                        key,
+                        id,
+                        &friend_hash,
+                        &direction,
+                        timestamp,
+                        &stored,
+                    )
+                    .is_ok()
+                {
+                    continue;
                 }
-                continue;
+                if !authenticate_existing {
+                    continue;
+                }
+                warn!(
+                    "Chat message {id} carries the ciphertext marker but does not authenticate; \
+                     treating it as plaintext that happened to start with it."
+                );
             }
             let encrypted =
                 Self::encrypt_chat_body(key, id, &friend_hash, &direction, timestamp, &stored)?;

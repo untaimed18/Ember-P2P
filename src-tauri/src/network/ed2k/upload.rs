@@ -4403,9 +4403,23 @@ impl UploadHandler {
                 // ordinary obfuscated dial. Peek the buffered magic before
                 // committing; a mismatch falls through to the negotiator below
                 // with the stream untouched.
-                if super::secure_stream::is_preamble_first_byte(first_byte)
-                    && super::secure_stream::buffered_magic_matches(&mut raw_reader).await
-                {
+                // The peek stays behind the cheap first-byte test so an ordinary
+                // obfuscated dial never waits on it, and is bounded like every
+                // other pre-auth read here: `read_u8` above emptied the buffer,
+                // so it issues a socket read, and a peer that sends one `0x00`
+                // and then nothing would otherwise park this task forever
+                // holding an admission slot. A timeout falls through to the
+                // eMule negotiator, which is bounded by the same deadline.
+                let is_ember_preamble = super::secure_stream::is_preamble_first_byte(first_byte)
+                    && matches!(
+                        tokio::time::timeout_at(
+                            preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
+                            super::secure_stream::buffered_magic_matches(&mut raw_reader),
+                        )
+                        .await,
+                        Ok(true)
+                    );
+                if is_ember_preamble {
                     let secure = tokio::time::timeout_at(
                         preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
                         super::secure_stream::accept_after_first(

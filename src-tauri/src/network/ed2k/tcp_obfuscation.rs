@@ -316,7 +316,17 @@ pub struct Rc4Writer<W> {
     rc4: Rc4State,
     pending: Vec<u8>,
     pending_offset: usize,
-    pending_plaintext_len: usize,
+    /// The plaintext `pending` was encrypted from, retained only while the
+    /// caller has not been told those bytes were consumed.
+    ///
+    /// The bytes themselves, not just a length: once the ciphertext is flushed we
+    /// have to decide whether the buffer now offered *is* that same plaintext
+    /// (its prefix, re-presented by a `BufWriter` whose flush was cancelled) or
+    /// an unrelated one from another call site. A length comparison cannot tell
+    /// those apart, and getting it wrong either resends the prefix or claims
+    /// bytes that were never encrypted — both desynchronise eD2K framing at the
+    /// peer, which decrypts the stream cleanly either way.
+    pending_plaintext: Vec<u8>,
 }
 
 impl<W> Rc4Writer<W> {
@@ -326,7 +336,7 @@ impl<W> Rc4Writer<W> {
             rc4,
             pending: Vec::new(),
             pending_offset: 0,
-            pending_plaintext_len: 0,
+            pending_plaintext: Vec::new(),
         }
     }
 }
@@ -349,29 +359,27 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                     if self.pending_offset >= self.pending.len() {
                         self.pending.clear();
                         self.pending_offset = 0;
-                        let pending_plaintext_len = self.pending_plaintext_len;
-                        self.pending_plaintext_len = 0;
-                        // A retry of the write we buffered arrives with the
-                        // identical buffer, so its ciphertext is already out
-                        // and the whole slice counts as consumed.
-                        if pending_plaintext_len == buf.len() {
-                            return Poll::Ready(Ok(pending_plaintext_len));
+                        let pending_plaintext = std::mem::take(&mut self.pending_plaintext);
+                        // The `Poll::Pending` arm below advances the keystream but
+                        // reports nothing consumed, so the caller keeps that slice
+                        // and re-presents it — every caller wraps this in a
+                        // `BufWriter`, whose cancelled `flush_buf` leaves its
+                        // buffer intact and later offers the same prefix plus
+                        // newly appended bytes. Its ciphertext is on the wire now,
+                        // so report exactly those bytes consumed; re-encrypting
+                        // them would send the prefix twice, and because the
+                        // keystream stays aligned the peer would decrypt the
+                        // duplicate cleanly and desynchronise its eD2K framing.
+                        //
+                        // Match on the plaintext rather than its length: a longer
+                        // buffer from an unrelated call site is not this prefix,
+                        // and claiming bytes of it that were never encrypted
+                        // leaves a hole with the same consequence.
+                        if !pending_plaintext.is_empty() && buf.starts_with(&pending_plaintext) {
+                            return Poll::Ready(Ok(pending_plaintext.len()));
                         }
-                        // Different length, so the pending count belongs to
-                        // some earlier caller — a write timeout dropped the
-                        // in-flight `write_all` (upload.rs's 60s bound) and
-                        // this packet comes from another call site. Reporting
-                        // it consumed would satisfy `AsyncWrite`'s
-                        // `n <= buf.len()` while never encrypting `buf`,
-                        // punching a hole in the ciphertext stream that
-                        // decrypts cleanly at the peer but desynchronises
-                        // eD2K framing from there on. The pending count is
-                        // already discarded above (nobody is waiting for it);
-                        // yield so the next poll encrypts `buf` for real.
-                        if pending_plaintext_len > 0 {
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
+                        // Not that plaintext, so none of `buf` is on the wire yet:
+                        // fall through and encrypt all of it.
                     } else {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -391,7 +399,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                 if n < encrypted.len() {
                     self.pending = encrypted;
                     self.pending_offset = n;
-                    self.pending_plaintext_len = 0;
+                    // Reported consumed, so the caller will not offer these bytes
+                    // again and there is no prefix left to recognise.
+                    self.pending_plaintext.clear();
                     cx.waker().wake_by_ref();
                 }
                 Poll::Ready(Ok(plaintext_len))
@@ -399,7 +409,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             Poll::Pending => {
                 self.pending = encrypted;
                 self.pending_offset = 0;
-                self.pending_plaintext_len = plaintext_len;
+                self.pending_plaintext = buf.to_vec();
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -507,19 +517,14 @@ mod tests {
             Poll::Pending
         ));
 
-        // Drains the orphaned ciphertext and yields rather than claiming
-        // bytes it has not encrypted.
+        // Drains the orphaned ciphertext and then encrypts this shorter slice
+        // for real, rather than claiming bytes it has not encrypted.
         let next_packet = [0xBBu8; 4];
-        assert!(matches!(
-            Pin::new(&mut writer).poll_write(&mut cx, &next_packet),
-            Poll::Pending
-        ));
-
         match Pin::new(&mut writer).poll_write(&mut cx, &next_packet) {
             Poll::Ready(Ok(n)) => assert_eq!(
                 n,
                 next_packet.len(),
-                "the retry must consume the whole packet"
+                "the shorter slice must be encrypted, not swallowed"
             ),
             other => panic!("expected a completed write, got {other:?}"),
         }
@@ -530,6 +535,99 @@ mod tests {
             decrypt_stream(&key, &writer.inner.written),
             expected,
             "both packets must reach the wire once, in order",
+        );
+    }
+
+    /// Every caller wraps this writer in a `tokio::io::BufWriter`, and a
+    /// `flush_buf` cancelled by a write timeout leaves that buffer intact: the
+    /// next packet appends to it, so the retry presents the same prefix *plus*
+    /// new bytes. Only the prefix is already on the wire, so re-encrypting the
+    /// whole slice would send it twice — and because the keystream stays
+    /// aligned the peer decrypts the duplicate cleanly and its eD2K framing
+    /// desynchronises from there on.
+    #[test]
+    fn a_superset_retry_does_not_resend_the_prefix() {
+        let key = [0x33u8; 16];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = Rc4Writer::new(
+            PendingThenAccept {
+                polls: 0,
+                written: Vec::new(),
+            },
+            Rc4State::new(&key),
+        );
+
+        let first = vec![0xAAu8; 64];
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &first),
+            Poll::Pending
+        ));
+
+        // What a `BufWriter` re-presents: the un-drained prefix plus 16 newly
+        // appended bytes.
+        let mut superset = first.clone();
+        superset.extend_from_slice(&[0xCCu8; 16]);
+        match Pin::new(&mut writer).poll_write(&mut cx, &superset) {
+            Poll::Ready(Ok(n)) => assert_eq!(
+                n, 64,
+                "only the prefix whose ciphertext is already out counts as consumed"
+            ),
+            other => panic!("expected the prefix to be reported consumed, got {other:?}"),
+        }
+
+        let tail = [0xCCu8; 16];
+        match Pin::new(&mut writer).poll_write(&mut cx, &tail) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, tail.len()),
+            other => panic!("expected the tail to be written, got {other:?}"),
+        }
+
+        assert_eq!(
+            decrypt_stream(&key, &writer.inner.written),
+            superset,
+            "every byte must reach the wire exactly once, in order",
+        );
+    }
+
+    /// A longer buffer is not automatically the `BufWriter` prefix retry: a
+    /// timed-out `write_all` can be followed by an unrelated, larger packet from
+    /// another call site. Deciding on length alone claimed that packet's leading
+    /// bytes as written without ever encrypting them, leaving a hole the peer
+    /// decrypts cleanly — the same framing desync as sending them twice.
+    #[test]
+    fn a_longer_unrelated_buffer_is_encrypted_rather_than_claimed() {
+        let key = [0x44u8; 16];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = Rc4Writer::new(
+            PendingThenAccept {
+                polls: 0,
+                written: Vec::new(),
+            },
+            Rc4State::new(&key),
+        );
+
+        let orphaned = vec![0xAAu8; 8];
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &orphaned),
+            Poll::Pending
+        ));
+
+        // Longer than the orphaned count, but a different payload entirely.
+        let unrelated = vec![0xDDu8; 32];
+        match Pin::new(&mut writer).poll_write(&mut cx, &unrelated) {
+            Poll::Ready(Ok(n)) => assert_eq!(
+                n,
+                unrelated.len(),
+                "an unrelated packet must be encrypted in full, not partly claimed"
+            ),
+            other => panic!("expected the unrelated packet to be written, got {other:?}"),
+        }
+
+        let mut expected = orphaned.clone();
+        expected.extend_from_slice(&unrelated);
+        assert_eq!(
+            decrypt_stream(&key, &writer.inner.written),
+            expected,
+            "every byte reaches the wire exactly once, in order",
         );
     }
 

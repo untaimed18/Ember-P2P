@@ -8565,6 +8565,11 @@ struct NetworkState {
     server_met_save_lock: Arc<std::sync::Mutex<()>>,
     /// Same ownership rule for periodic/disconnect/shutdown nodes.dat writes.
     nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The same rule for `nodes_ember.dat`, on its own lock: the periodic write
+    /// is spawned from the arm that has just handed `nodes_save_lock` to the
+    /// nodes.dat task, so sharing one would either stall the event loop or skip
+    /// the ember save every tick.
+    ember_nodes_save_lock: Arc<tokio::sync::Mutex<()>>,
     external_ip: Option<Ipv4Addr>,
     external_udp_port: Option<u16>,
     /// STUN-over-TCP-confirmed public TCP port (probe from the listen port),
@@ -13204,6 +13209,7 @@ pub async fn start_network(
         server_met_save_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
@@ -22297,8 +22303,6 @@ pub async fn start_network(
             // missing UDP obfuscation, dead servers).
             _ = udp_discovery_health_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
-
                 // Forward what we know about relays to every live friend
                 // session. This is the only channel that does not depend on
                 // sharing a swarm with the peer, which is exactly the case the
@@ -22397,6 +22401,16 @@ pub async fn start_network(
                             .retain(|eh, _| sessions.contains_key(eh));
                     }
                 }
+
+                // Only the eD2K UDP-discovery diagnostics below are KAD-scoped.
+                // The friend relay-offer work above must not be: `stats.status`
+                // is advanced only by KAD paths, so an eD2K-only session (the
+                // default) sits at `Disconnected` for its whole life — and this
+                // gate then meant we never registered our own attestation hash,
+                // so every friend that tried to use us as a relay was answered
+                // with REJECT_AUTH, starving the one discovery channel that does
+                // not need a shared swarm.
+                if state.stats.status == NetworkStatus::Disconnected { return; }
 
                 let cur = UdpDiscoveryHealthSnapshot {
                     sent: state.udp_discovery_sent,
@@ -25772,6 +25786,14 @@ pub async fn start_network(
                                     let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                     pkt.extend_from_slice(&reask_payload);
                                     let addr = SocketAddr::new(v4.into(), moved_udp_port);
+                                    // Both reply branches resolve the file through
+                                    // this map, so a reask that skips it has its
+                                    // answer discarded as unsolicited — the queue
+                                    // rank and state this swap just asked for.
+                                    state.pending_udp_reasks.insert(
+                                        (v4, moved_udp_port),
+                                        (swap.to_file, chrono::Utc::now().timestamp()),
+                                    );
                                     let _ = udp_socket.send_to(&pkt, addr).await;
                                 }
                             }
@@ -28195,6 +28217,13 @@ pub async fn start_network(
                         };
                         let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                         pkt.extend_from_slice(&reask_payload);
+                        // Register like the source-timer senders do: an answer to
+                        // a reask that is not in this map is dropped as
+                        // unsolicited by both reply branches.
+                        state.pending_udp_reasks.insert(
+                            (dest_ip, dest_port),
+                            (file_hash, chrono::Utc::now().timestamp()),
+                        );
                         let _ = udp_socket.send_to(&pkt, addr).await;
                         debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
                     }
@@ -28862,7 +28891,19 @@ pub async fn start_network(
                     // stalled UDP receive, every timer and every transfer event for
                     // the duration, and a full receive buffer drops KAD and Ember
                     // packets outright.
+                    // Take ownership for the write so the shutdown writer, which
+                    // waits on the same lock, cannot have its newer snapshot
+                    // renamed over by a save spawned just before the loop exits.
+                    // `try_lock` rather than `lock().await`: this arm must never
+                    // block the event loop on disk I/O, and skipping a periodic
+                    // save is free — the next tick writes the same state. It gets
+                    // its own lock because `nodes_save_lock` is still held by the
+                    // nodes.dat task spawned a few lines above.
+                    let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
+                        return;
+                    };
                     tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
                         if let Err(e) =
                             ember::dht::bootstrap::save_nodes(&ember_path, &ember_contacts)
                         {
@@ -31248,8 +31289,29 @@ pub async fn start_network(
     let ember_contacts = state.ember_dht.bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
     if !ember_contacts.is_empty() {
         let ember_nodes_path = state.data_dir.join("nodes_ember.dat");
-        if let Err(e) = ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts) {
-            error!("Failed to save nodes_ember.dat on shutdown: {e}");
+        // Wait out a periodic save that is still in flight, bounded by the shared
+        // shutdown budget, and skip the write if it will not let go — exactly as
+        // the nodes.dat path above does. Writing anyway would race that task on
+        // the same file: whichever rename landed last would win, so the older
+        // periodic snapshot could bury this newer one.
+        match tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2)),
+            state.ember_nodes_save_lock.lock(),
+        )
+        .await
+        {
+            Ok(_ownership) => {
+                if let Err(e) = ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts)
+                {
+                    error!("Failed to save nodes_ember.dat on shutdown: {e}");
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "Skipping the nodes_ember.dat shutdown save: a periodic save still holds the \
+                     lock, and its snapshot is the one on disk"
+                );
+            }
         }
     }
 
@@ -31285,7 +31347,13 @@ pub async fn start_network(
                     other => {
                         match other {
                             PeriodicSaveJob::Reputation => reputation_save_in_flight = false,
-                            PeriodicSaveJob::Known2 | PeriodicSaveJob::Nodes => {}
+                            // Known2 belongs here too: consuming its completion
+                            // while leaving the flag set left the join below
+                            // waiting on a message already taken, which burns its
+                            // wait and can push the later sources.met/server.met
+                            // saves past the global deadline.
+                            PeriodicSaveJob::Known2 => known2_save_in_flight = false,
+                            PeriodicSaveJob::Nodes => {}
                             PeriodicSaveJob::Stats => unreachable!(),
                         }
                         if let Err(e) = result.result {
@@ -31435,10 +31503,13 @@ pub async fn start_network(
         // above), and losing it discards the AICH recovery sets computed
         // since that save began.
         if known2_save_in_flight {
-            let waited_from = tokio::time::Instant::now();
-            while known2_save_in_flight
-                && waited_from.elapsed() < std::time::Duration::from_secs(5)
-            {
+            // Charged to the shared shutdown budget like every sibling phase. A
+            // bare 5s of wall clock was not deducted from any phase but still
+            // advanced the clock, so it could silently consume the headroom the
+            // reputation / sources.met / server.met saves below depend on.
+            let known2_join_deadline =
+                shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
+            while known2_save_in_flight && tokio::time::Instant::now() < known2_join_deadline {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(100),
                     periodic_save_result_rx.recv(),
@@ -33004,13 +33075,17 @@ fn parse_ember_source_records(
         }
         out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
     }
-    // Fill a gap, never correct one. This map is the digest the transfer
-    // enforces at completion, and anything already in it was seeded from a
-    // trusted source (the UI / known.met / a hash we computed ourselves) when
-    // the download started. Overwriting that with a DHT claim fails the
-    // completion verify, leaves `corrupt_part_indices_on_disk` with nothing to
-    // point at, and re-downloads every part of the file forever.
-    if let Some(digest) = majority_ember_digest(&publisher_digests) {
+    // Fill a gap, never correct one, and only on corroboration. This map is the
+    // digest the transfer enforces at completion, so overwriting an entry fails
+    // the verify, leaves `corrupt_part_indices_on_disk` nothing to point at, and
+    // re-downloads every part forever.
+    //
+    // What is already in the map is *not* necessarily trusted, which an earlier
+    // version of this comment claimed: a keyword search pre-seeds the same map
+    // from its own results a little further up, so a gap can be filled by remote
+    // data either way. `insert` on the `StartDownload` path does still let the
+    // user's own choice overwrite whatever was pre-seeded.
+    if let Some(digest) = corroborated_ember_digest(&publisher_digests) {
         content_hashes.entry(file_hash).or_insert(digest);
     }
     out
@@ -33165,14 +33240,42 @@ fn majority_ember_digest_hex(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) ->
 
 /// Raw-byte form of [`majority_ember_digest_hex`]: the digest the most
 /// distinct publishers agree on, or `None` when none of them published one.
+///
+/// This is a plurality with no minimum, which is right for display — one
+/// publisher's claim is worth showing — but not for anything enforced. Use
+/// [`corroborated_ember_digest`] for that.
 fn majority_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
+    majority_ember_digest_with_count(publisher_digests).map(|(digest, _)| digest)
+}
+
+fn majority_ember_digest_with_count(
+    publisher_digests: &HashMap<[u8; 32], [u8; 32]>,
+) -> Option<([u8; 32], usize)> {
     let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
     for digest in publisher_digests.values() {
         if *digest != [0u8; 32] {
             *counts.entry(*digest).or_insert(0) += 1;
         }
     }
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d)
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, n)| (d, n))
+}
+
+/// Distinct publishers that must agree before a DHT-sourced digest is allowed
+/// into the map a transfer *enforces* at completion.
+///
+/// Publisher keys are free to mint, so this does not bound a determined Sybil —
+/// it only stops a single record from deciding, which is what a plurality of one
+/// amounted to. The cost of being wrong is asymmetric: a missing digest just
+/// means the ed2k/AICH hashes carry the verification, while a wrong one fails
+/// completion forever and leaves `corrupt_part_indices_on_disk` nothing to point
+/// at, so the file re-downloads endlessly.
+const MIN_EMBER_DIGEST_PUBLISHERS: usize = 2;
+
+/// The plurality digest, but only once [`MIN_EMBER_DIGEST_PUBLISHERS`] agree.
+fn corroborated_ember_digest(publisher_digests: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
+    majority_ember_digest_with_count(publisher_digests)
+        .filter(|(_, agreeing)| *agreeing >= MIN_EMBER_DIGEST_PUBLISHERS)
+        .map(|(digest, _)| digest)
 }
 
 /// Send everything the batch publisher has queued, one or more `STORE_BATCH`
@@ -33476,6 +33579,68 @@ fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
 /// those zeros until its republish interval elapsed.
 fn is_ember_publishable(file: &FileInfo) -> bool {
     file.is_public_listable() && !file.hash.is_empty() && !file.ember_file_hash.is_empty()
+}
+
+/// The map a transfer enforces at completion may only be seeded from remote
+/// claims that more than one publisher backs. A plurality with no minimum made a
+/// lone record its own majority, and because the entry is then pinned by
+/// `or_insert`, a single wrong claim failed that file's verification for as long
+/// as the process lived.
+#[cfg(test)]
+mod ember_digest_corroboration_tests {
+    use super::*;
+
+    fn digests(pairs: &[(u8, u8)]) -> HashMap<[u8; 32], [u8; 32]> {
+        pairs
+            .iter()
+            .map(|(publisher, digest)| ([*publisher; 32], [*digest; 32]))
+            .collect()
+    }
+
+    #[test]
+    fn one_publisher_is_not_a_majority() {
+        let single = digests(&[(1, 0xAA)]);
+        assert_eq!(
+            majority_ember_digest(&single),
+            Some([0xAA; 32]),
+            "display still shows a lone claim"
+        );
+        assert_eq!(
+            corroborated_ember_digest(&single),
+            None,
+            "but nothing enforced may rest on it"
+        );
+    }
+
+    #[test]
+    fn two_agreeing_publishers_corroborate() {
+        assert_eq!(
+            corroborated_ember_digest(&digests(&[(1, 0xAA), (2, 0xAA)])),
+            Some([0xAA; 32])
+        );
+    }
+
+    #[test]
+    fn disagreeing_publishers_do_not_corroborate() {
+        assert_eq!(
+            corroborated_ember_digest(&digests(&[(1, 0xAA), (2, 0xBB), (3, 0xCC)])),
+            None,
+            "a plurality of one each is still one each"
+        );
+        // A real majority inside a disputed set still wins.
+        assert_eq!(
+            corroborated_ember_digest(&digests(&[(1, 0xAA), (2, 0xAA), (3, 0xCC)])),
+            Some([0xAA; 32])
+        );
+    }
+
+    #[test]
+    fn publishers_that_named_no_digest_are_not_counted() {
+        assert_eq!(
+            corroborated_ember_digest(&digests(&[(1, 0xAA), (2, 0x00), (3, 0x00)])),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

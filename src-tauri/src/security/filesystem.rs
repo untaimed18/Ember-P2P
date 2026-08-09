@@ -531,6 +531,13 @@ pub fn initialize_approved_roots(
 ) -> io::Result<Arc<ApprovedRootRegistry>> {
     let state_path = data_dir.join(ROOT_STATE_FILE);
     let transaction_path = data_dir.join(ROOT_TRANSACTION_FILE);
+    // An interrupted replace parks this file under a fixed backup name. Reading
+    // that as "absent" is the one case that fails *open*: it looks like a first
+    // run, so every configured root is captured fresh — silently approving
+    // whatever object now sits at each path, which is exactly what the
+    // "must have been added by an explicit settings action" rule below forbids.
+    crate::security::recover_interrupted_replace(&state_path);
+    crate::security::recover_interrupted_replace(&transaction_path);
     let state_exists = state_path.exists();
     let mut roots: HashMap<String, ApprovedRoot> = if state_exists {
         match read_persisted_roots(&state_path) {
@@ -593,14 +600,25 @@ pub fn initialize_approved_roots(
             let _ = std::fs::remove_file(&transaction_path);
         }
         Ok(None) => {}
-        Err(error) => {
-            // Same reasoning as the state file: an unreadable journal leaves the
-            // roots we already loaded in place instead of blocking startup.
+        // Content that will never parse is quarantined; a transient failure to
+        // read is not. This used to quarantine on any error kind while claiming
+        // parity with the state file, which distinguishes the two — so one
+        // sharing violation discarded the crash-recovery journal, and an
+        // interrupted settings save could then leave a configured root with no
+        // approval record until it was re-approved by hand.
+        Err(error) if is_unparseable_root_state(&error) => {
             tracing::error!(
                 "Approved-root transaction journal at {} is unusable ({error}); quarantining it.",
                 transaction_path.display()
             );
             quarantine_file(&transaction_path);
+        }
+        Err(error) => {
+            tracing::error!(
+                "Could not read the approved-root transaction journal at {} ({error}); \
+                 leaving it in place for the next launch.",
+                transaction_path.display()
+            );
         }
     }
 
@@ -668,8 +686,16 @@ fn read_root_transaction(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let transaction: PersistedRootTransaction = serde_json::from_slice(&data)
-        .map_err(|error| io_other(format!("parse approved-root transaction: {error}")))?;
+    // `InvalidData`, matching `read_persisted_roots`: the caller quarantines on
+    // that kind and only on that kind, so a parse failure has to be
+    // distinguishable from the `std::fs::read` above failing environmentally.
+    let transaction: PersistedRootTransaction =
+        serde_json::from_slice(&data).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse approved-root transaction: {error}"),
+            )
+        })?;
     if transaction.version != ROOT_STATE_VERSION
         || transaction.previous.version != ROOT_STATE_VERSION
         || transaction.next.version != ROOT_STATE_VERSION

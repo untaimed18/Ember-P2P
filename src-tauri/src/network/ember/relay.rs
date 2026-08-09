@@ -274,9 +274,17 @@ impl RelayManager {
     /// Every limit here is charged to the identity that signed the request,
     /// never to the cache as a whole: a requester that overruns its own
     /// nonce quota loses its own oldest entry, and one that has been quiet
-    /// longest is the identity dropped when we are tracking too many. So a
-    /// peer can only ever shorten *its own* replay window, and no amount of
-    /// traffic from one identity can turn another's honest request away.
+    /// longest is the identity dropped when we are tracking too many.
+    ///
+    /// No amount of traffic from one identity can turn another's honest request
+    /// away: the identity ceiling evicts rather than refuses, and a requester
+    /// whose history was dropped has its next nonce treated as fresh and
+    /// accepted. What that eviction *does* cross identities — contrary to what
+    /// this comment used to claim — is the replay window: 256 throwaway keys
+    /// shorten someone else's, not just their own. Reaching that costs the
+    /// attacker a captured request the relay itself has seen, since the
+    /// attestation hash is bound into the signed transcript and the request
+    /// travels inside QUIC.
     fn consume_request_nonce(&mut self, pubkey: &[u8; 32], nonce: &[u8; 16]) -> bool {
         let now = Instant::now();
         // Expire stale nonces, then forget identities left with none.
@@ -1849,23 +1857,36 @@ pub async fn run_quic_accept_loop(
                     return;
                 }
 
-                {
+                // Decide under the lock, write outside it. `init_send` is the
+                // write half of a stream the *peer* opened, so the peer controls
+                // its flow-control credit and can stall the write indefinitely.
+                // Holding this guard across that write froze the whole network
+                // event loop, which takes the same mutex on its relay-cleanup
+                // tick — one connection advertising zero credit was enough.
+                let reject_reason = {
                     let mut mgr_lock = mgr.lock().await;
                     if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
                         debug!(
                             "QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash"
                         );
-                        let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                        let _ = init_send.write_all(&reject).await;
-                        return;
-                    }
-                    if !mgr_lock.consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
+                        Some(REJECT_AUTH)
+                    } else if !mgr_lock
+                        .consume_request_nonce(&verified.requester_pubkey, &verified.nonce)
                     {
                         debug!("QUIC accept: refusing relay request from {remote}: replayed nonce");
-                        let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
-                        let _ = init_send.write_all(&reject).await;
-                        return;
+                        Some(REJECT_BAD_SIGNATURE)
+                    } else {
+                        None
                     }
+                };
+                if let Some(reason) = reject_reason {
+                    let reject = build_relay_reject(peer_session_id, reason);
+                    let _ = tokio::time::timeout(
+                        RELAY_CONTROL_TIMEOUT,
+                        init_send.write_all(&reject),
+                    )
+                    .await;
+                    return;
                 }
 
                 let initiator_ip = match remote.ip() {
@@ -1880,19 +1901,28 @@ pub async fn run_quic_accept_loop(
                 let target_port = verified.target_port;
                 let file_hash = verified.file_hash;
 
+                // Same rule as the reject above: the capacity refusal must not
+                // write while holding the manager lock.
                 let session_id = {
-                    let mut mgr_lock = mgr.lock().await;
-                    match mgr_lock.create_session(
-                        initiator_ip,
-                        initiator_port,
-                        target_ip,
-                        target_port,
-                        file_hash,
-                    ) {
+                    let created = {
+                        let mut mgr_lock = mgr.lock().await;
+                        mgr_lock.create_session(
+                            initiator_ip,
+                            initiator_port,
+                            target_ip,
+                            target_port,
+                            file_hash,
+                        )
+                    };
+                    match created {
                         Some(sid) => sid,
                         None => {
                             let reject = build_relay_reject(peer_session_id, REJECT_CAPACITY);
-                            let _ = init_send.write_all(&reject).await;
+                            let _ = tokio::time::timeout(
+                                RELAY_CONTROL_TIMEOUT,
+                                init_send.write_all(&reject),
+                            )
+                            .await;
                             debug!("QUIC accept: at capacity, rejected relay from {remote}");
                             return;
                         }

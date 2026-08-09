@@ -73,11 +73,19 @@ const REPLAY_WINDOW_BITS: u64 = 64;
 
 /// Cap on payloads held back from IK initiations whose source address is not
 /// yet proven return-routable, and how long one is held. See
-/// [`EmberTransport::handle_ik_init`]. Bounded like every other cache here so
-/// a flood of spoofed initiations cannot grow it: the worst case is ~256
-/// datagram-sized payloads, and an honest peer whose entry is evicted simply
-/// falls back to retransmitting its request over the session it established.
-const MAX_DEFERRED_IK_PAYLOADS: usize = 256;
+/// [`EmberTransport::handle_ik_init`]. Bounded like every other cache here so a
+/// flood of spoofed initiations cannot grow it.
+///
+/// Sized to match `MAX_SESSIONS` so the deferral is not the weaker link: at 256
+/// it took only ~1,300 spoofed initiations per second to evict an honest peer's
+/// entry before its handshake completed, an order of magnitude cheaper than
+/// evicting the session the payload rides on.
+///
+/// An evicted entry is not always recoverable, which an earlier version of this
+/// comment claimed: a DHT search retries (`MAX_QUERY_ATTEMPTS`), but a one-shot
+/// `STORE_RECORD` or `ExchangeRequest` sent as a first message has no retry
+/// layer and is simply lost — see the note in `dispatch_incoming`.
+const MAX_DEFERRED_IK_PAYLOADS: usize = 4096;
 const DEFERRED_IK_PAYLOAD_TTL: Duration = Duration::from_secs(30);
 
 /// Bytes of a Noise XX message 1 that precede its payload: the 32-byte
@@ -1246,6 +1254,19 @@ impl EmberTransport {
         // handshaking with us, refreshable with a packet per session lifetime
         // and unrecoverable because decrypt failures never tear a session
         // down. Between two unproven claimants, let the newest one try.
+        // KNOWN RESIDUAL: "newest unproven claimant wins" is what keeps a
+        // spoofed session from locking the address owner out (see
+        // `an_unvalidated_session_never_locks_out_the_address_owner`), but it
+        // also means a spoofer sending one init every few tens of milliseconds
+        // can replace a real peer's session before its `Pong` lands, so a
+        // targeted peer never completes inbound first contact. The two are in
+        // direct tension here and a grace window only moves the loss around:
+        // protecting the incumbent for one round trip reinstates a bounded
+        // version of the lockout, and one-shot payloads (`STORE_RECORD`,
+        // `ExchangeRequest`) have no retry to survive it. Keying sessions by
+        // `(addr, static_key)` so both claimants coexist — and the wrong one is
+        // simply never selected — removes the need to rank them at all, which is
+        // the actual fix and is deliberately not attempted here.
         if let Some(existing) = self.sessions.get(&from) {
             if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
                 debug!(
@@ -1346,7 +1367,14 @@ impl EmberTransport {
         from: SocketAddr,
         remote_noise_pub: &[u8; 32],
     ) -> Option<DeferredIkPayload> {
-        let entry = self.deferred_ik.remove(&from)?;
+        // Logged rather than silently returning `None`: a dropped deferral means
+        // a peer's first-contact request is gone, and for a one-shot publish or
+        // exchange there is no retry to make it look like anything but a peer
+        // that never asked.
+        let Some(entry) = self.deferred_ik.remove(&from) else {
+            trace!("No deferred IK payload for {from}: evicted, expired, or never held one");
+            return None;
+        };
         // Drop rather than release a payload whose peer has changed — the
         // address was rebound, or an unvalidated squatter was displaced by
         // its real owner — or one that has sat here past its TTL.

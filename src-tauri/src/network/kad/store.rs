@@ -9,6 +9,18 @@ use super::types::*;
 const MAX_ENTRIES_PER_KEY: usize = 1000;
 const MAX_TOTAL_ENTRIES: usize = 50_000;
 const MAX_TOTAL_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+/// Shares of [`MAX_TOTAL_RETAINED_BYTES`] reserved from the record types that
+/// carry no per-publisher byte budget and are never evicted.
+///
+/// All three types draw on one byte cap, but only keyword records are charged to
+/// a publisher (`keyword_publisher_usage`) and only keyword records can be shed
+/// (`evict_keyword_bytes`). So whichever of the other two reached the cap first
+/// locked the whole store: every later publish of any type was refused, for the
+/// five hours a source record lives or the day a note does. Fencing them leaves
+/// keyword publishing at least a quarter of the cap, inside which its own
+/// budgets and eviction still apply.
+const MAX_SOURCE_RETAINED_BYTES: usize = MAX_TOTAL_RETAINED_BYTES / 2;
+const MAX_NOTES_RETAINED_BYTES: usize = MAX_TOTAL_RETAINED_BYTES / 8;
 const MAX_RETAINED_BYTES_PER_KEY: usize = 4 * 1024 * 1024;
 const MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY: usize = 2 * 1024 * 1024;
 const MAX_RETAINED_BYTES_PER_ENTRY: usize = 64 * 1024;
@@ -421,9 +433,23 @@ impl DhtStore {
             // publisher's records per packet and then have its entry dropped by
             // the `continue`s further down — free, repeatable deletion of honest
             // records, against publishers that only republish every 20 hours.
-            // Replacements are exempt: they cost no slot, their byte delta is
-            // already priced below, and the branch that applies them has its own
-            // guards.
+            // Replacements are exempt: they cost no slot and their byte delta is
+            // priced below.
+            //
+            // KNOWN RESIDUAL: that exemption is not airtight, and neither is the
+            // new-entry path. Both branches evaluate their remaining guards
+            // *after* `evict_keyword_bytes` has run and can still `continue`, and
+            // an eviction is never refunded — so a publisher republishing one
+            // entry near `MAX_RETAINED_BYTES_PER_ENTRY` can shed up to
+            // `MAX_KEYWORD_EVICTIONS_PER_PUBLISH` of the heaviest other
+            // publisher's records and store nothing. It needs the store already
+            // at `MAX_TOTAL_RETAINED_BYTES`, which the per-type byte shares now
+            // make much harder to reach, and the victim must be the heaviest
+            // publisher. Fixing it properly means splitting the per-key and
+            // per-publisher guards (final regardless of eviction) from the total
+            // caps (the only thing eviction can help) and checking the former
+            // before evicting — deliberately not attempted here, because getting
+            // that arithmetic subtly wrong would hand out free budget instead.
             let is_replacement = self.keyword_entries.get(target).is_some_and(|bucket| {
                 bucket
                     .iter()
@@ -796,6 +822,18 @@ impl DhtStore {
             return self.compute_load();
         }
 
+        // `MAX_SOURCES_PER_IP` bounds one bucket, and the number of buckets is
+        // not bounded — an in-tolerance target is free to pick — so it is not a
+        // global per-publisher budget. Source records are never evicted and live
+        // for five hours, so without a share of the byte cap one address could
+        // take all of it and deny every keyword and notes publish too. Summed on
+        // demand for the same reason the notes share is.
+        let source_bytes_all: usize = self
+            .source_entries
+            .values()
+            .map(|bucket| retained_bytes(bucket))
+            .sum();
+
         let bucket = self.source_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
 
@@ -803,10 +841,10 @@ impl DhtStore {
         let bytes_before = retained_bytes(bucket);
         bucket.retain(|e| !e.is_expired(now));
         let removed = len_before - bucket.len();
+        let pruned_bytes = bytes_before.saturating_sub(retained_bytes(bucket));
+        let source_bytes_now = source_bytes_all.saturating_sub(pruned_bytes);
         self.total_count = self.total_count.saturating_sub(removed);
-        self.total_retained_bytes = self
-            .total_retained_bytes
-            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
+        self.total_retained_bytes = self.total_retained_bytes.saturating_sub(pruned_bytes);
         let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
         if existing_pos.is_none()
@@ -886,6 +924,10 @@ impl DhtStore {
             .saturating_sub(old_bytes)
             .saturating_add(entry_bytes)
             > MAX_RETAINED_BYTES_PER_KEY
+            || source_bytes_now
+                .saturating_sub(old_bytes)
+                .saturating_add(entry_bytes)
+                > MAX_SOURCE_RETAINED_BYTES
             || self
                 .total_retained_bytes
                 .saturating_sub(old_bytes)
@@ -1017,6 +1059,18 @@ impl DhtStore {
         // cheaper than keeping another counter correct across expiry, eviction
         // and overwrite.
         let notes_total: usize = self.notes_entries.values().map(Vec::len).sum();
+        // `MAX_NOTES_TOTAL_ENTRIES` fences the entry *count* only, which is the
+        // wrong dimension when the binding limit is bytes: a note may carry up
+        // to `MAX_RETAINED_BYTES_PER_ENTRY`, so a few hundred fat notes reach
+        // the shared byte cap while the count fence is still an order of
+        // magnitude away. Notes are never evicted and live for a day, so that
+        // refused every new source record and left keyword eviction with only
+        // keyword bytes to shed — the store-wide lockout this share prevents.
+        let notes_bytes_all: usize = self
+            .notes_entries
+            .values()
+            .map(|bucket| retained_bytes(bucket))
+            .sum();
 
         let bucket = self.notes_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
@@ -1025,10 +1079,10 @@ impl DhtStore {
         let bytes_before = retained_bytes(bucket);
         bucket.retain(|e| !e.is_expired(now));
         let removed = len_before - bucket.len();
+        let pruned_bytes = bytes_before.saturating_sub(retained_bytes(bucket));
+        let notes_bytes_now = notes_bytes_all.saturating_sub(pruned_bytes);
         self.total_count = self.total_count.saturating_sub(removed);
-        self.total_retained_bytes = self
-            .total_retained_bytes
-            .saturating_sub(bytes_before.saturating_sub(retained_bytes(bucket)));
+        self.total_retained_bytes = self.total_retained_bytes.saturating_sub(pruned_bytes);
         let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
         if existing_pos.is_none()
@@ -1058,6 +1112,10 @@ impl DhtStore {
             .saturating_sub(old_bytes)
             .saturating_add(entry_bytes)
             > MAX_RETAINED_BYTES_PER_KEY
+            || notes_bytes_now
+                .saturating_sub(old_bytes)
+                .saturating_add(entry_bytes)
+                > MAX_NOTES_RETAINED_BYTES
             || self
                 .total_retained_bytes
                 .saturating_sub(old_bytes)

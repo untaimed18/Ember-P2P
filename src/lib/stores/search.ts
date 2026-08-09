@@ -136,7 +136,15 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     media: hasMedia ? media : existing.media || incoming.media,
     spam_rating,
     is_spam,
-    clean_name: incoming.clean_name || existing.clean_name,
+    // `clean_name` is derived from whichever `file.name` its own row carried, so
+    // it has to follow the name we kept above. Taking the incoming one while
+    // `file.name` keeps the first meant the row could display one filename and
+    // hand a different one to `startDownload` — i.e. to disk. Falling back to
+    // '' is safe: every consumer already falls back to `file.name`.
+    clean_name:
+      incomingName === preferredName
+        ? incoming.clean_name || existing.clean_name
+        : existing.clean_name,
     result_origin: combineOrigin(existing.result_origin || '', incoming.result_origin || ''),
   };
 }

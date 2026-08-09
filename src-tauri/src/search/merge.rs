@@ -228,8 +228,17 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
         }
     }
     // The filename is *not* decided here: `merge_search_vecs` elects it by vote
-    // across every source that advertised this hash (see `NameVotes`). Keep the
-    // name we already have until that vote is counted.
+    // (see `NameVotes`). Keep the name we already have until that vote is
+    // counted.
+    //
+    // That vote arbitrates the network row against the local-library row, not
+    // "every source that advertised this hash" as this used to say: its only
+    // caller receives results that `convert_search_results` has already
+    // collapsed to one row per hash, and eD2K server hits never reach it at all.
+    // Across DHT publishers the name is still decided upstream by
+    // `name_spam_penalty`, which a responder can steer by choosing a name that
+    // scores lower than the honest one — better than the old "longest wins", but
+    // not a cross-source majority.
     if existing.file.name.is_empty() && !incoming.file.name.is_empty() {
         existing.file.name = incoming.file.name;
     }
