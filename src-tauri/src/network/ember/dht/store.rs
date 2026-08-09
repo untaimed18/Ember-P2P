@@ -64,6 +64,23 @@ fn record_ttl(data: &[u8]) -> Duration {
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
 
+/// One record on its way to or from disk.
+///
+/// Everything here is either signed by the publisher or re-derived on load, so
+/// a tampered file cannot introduce a record: [`DhtStore::restore`] feeds each
+/// one back through the ordinary validating store path, which re-checks the
+/// signature and recomputes expiry from `created_at`. A record already past its
+/// TTL is simply refused, so the file cleans itself up.
+#[derive(Debug, Clone)]
+pub struct PersistedRecord {
+    pub key: [u8; 16],
+    pub data: Vec<u8>,
+    pub signature: [u8; 64],
+    pub publisher_key: [u8; 32],
+    pub created_at: i64,
+    pub attributed_ip: Option<std::net::Ipv4Addr>,
+}
+
 /// One live key in the local store, for the diagnostic UI (slice 16).
 #[derive(Debug, Clone)]
 pub struct DhtStoreEntry {
@@ -802,6 +819,76 @@ impl DhtStore {
         // The pass covered every key, so the next one starts fresh.
         self.republish_cursor = None;
         out
+    }
+
+    /// Records worth carrying across a restart, closest keys first.
+    ///
+    /// A restart drops every record this node was holding for other publishers.
+    /// Storer replication refills them within the hour and the original
+    /// publishers re-announce on their own schedule, so nothing is lost
+    /// permanently — but on a young network with few replicas per record, and
+    /// especially when an update restarts many nodes at once, that leaves a
+    /// window where content is simply missing. Carrying the store over closes it.
+    ///
+    /// Ordered by distance from our own ID so a truncated save keeps the keys we
+    /// are most responsible for, matching how the byte budget chooses what to
+    /// drop.
+    pub fn persistable(&self, max: usize) -> Vec<PersistedRecord> {
+        let now = Instant::now();
+        let mut keys: Vec<[u8; 16]> = self.entries.keys().copied().collect();
+        if let Some(local) = self.local_id {
+            keys.sort_by_key(|key| xor_distance(&local.0, key));
+        }
+
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(records) = self.entries.get(&key) else {
+                continue;
+            };
+            for record in records {
+                if out.len() >= max {
+                    return out;
+                }
+                // No point writing something that expires before the next
+                // launch reads it.
+                if record.expires_at <= now {
+                    continue;
+                }
+                out.push(PersistedRecord {
+                    key,
+                    data: record.data.clone(),
+                    signature: record.signature,
+                    publisher_key: record.publisher_key,
+                    created_at: record.created_at,
+                    attributed_ip: record.attributed_ip,
+                });
+            }
+        }
+        out
+    }
+
+    /// Feed persisted records back in through the ordinary store path.
+    ///
+    /// Returns how many were accepted. Everything the live path enforces still
+    /// applies — signature, TTL from the signed creation time, per-key and
+    /// per-IP caps, the byte budget — so a file that was edited, truncated, or
+    /// simply left too long cannot put anything in the store that a peer could
+    /// not have sent us legitimately.
+    pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
+        let mut accepted = 0usize;
+        for record in records {
+            if self.store_attributed(
+                record.key,
+                record.data,
+                record.signature,
+                record.publisher_key,
+                record.created_at,
+                record.attributed_ip,
+            ) {
+                accepted += 1;
+            }
+        }
+        accepted
     }
 
     /// How many records are waiting to be replicated onward — those a
@@ -1749,6 +1836,69 @@ mod tests {
     /// file exists under a word and stays true regardless. Giving both the
     /// keyword lifetime meant a peer that left was still handed to downloaders
     /// for the rest of the day.
+    /// A restart used to drop every record held for other publishers. On a young
+    /// network with few replicas each — or when an update restarts many nodes at
+    /// once — that content is missing until replication refills it.
+    #[test]
+    fn the_store_survives_a_restart_without_trusting_the_file() {
+        use super::super::publish::SignedRecord;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+
+        // Three files sharing one word: one key holding three records, which is
+        // the shape a keyword key normally has.
+        let mut key = [0u8; 16];
+        for i in 0..3u8 {
+            let rec = SignedRecord::keyword("ubuntu", [i; 16], [0u8; 32], 100, "u.iso", &sk);
+            key = rec.keyword_hash;
+            assert!(store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ));
+        }
+        assert_eq!(store.total_records(), 3);
+
+        let saved = store.persistable(100);
+        assert_eq!(saved.len(), 3);
+
+        // A fresh store, as a restart would build it.
+        let mut restored = DhtStore::new();
+        restored.set_local_id(EmberNodeId([0u8; 16]));
+        assert_eq!(restored.restore(saved.clone()), 3);
+        assert_eq!(restored.total_records(), 3);
+        assert_eq!(
+            restored.get_live(&key).len(),
+            3,
+            "every record under the key came back"
+        );
+
+        // The file is not trusted: a record whose body was edited fails the same
+        // signature check every live STORE passes through.
+        let mut tampered = saved.clone();
+        tampered[0].data.push(0xFF);
+        let mut victim = DhtStore::new();
+        assert_eq!(
+            victim.restore(tampered),
+            2,
+            "the edited record must be refused and the others kept"
+        );
+
+        // Expiry is recomputed from the signed creation time rather than from
+        // when we happen to read the file, so a stale save cannot revive records
+        // that died while we were closed.
+        let mut aged = saved.clone();
+        for record in &mut aged {
+            record.created_at -= KEYWORD_RECORD_TTL.as_secs() as i64 + 60;
+        }
+        let mut later = DhtStore::new();
+        assert_eq!(later.restore(aged), 0, "expired records must not come back");
+    }
+
     #[test]
     fn a_source_record_dies_sooner_than_a_keyword_record() {
         use super::super::publish::{source_key, SignedRecord, SourceContact};

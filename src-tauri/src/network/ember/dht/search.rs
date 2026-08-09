@@ -24,6 +24,30 @@ const MAX_SEARCH_RESULTS: usize = 300;
 /// work at one repeat query per node so a search still converges.
 const MAX_QUERY_ATTEMPTS: u8 = 2;
 
+/// Consecutive responses that bring nothing closer before a `FIND_NODE` walk
+/// calls itself converged.
+///
+/// One round's worth: with [`ALPHA`] queries outstanding, this many answers in a
+/// row that fail to improve on the best node we have seen means the frontier has
+/// stopped moving. Kademlia's own termination rule is that a lookup ends once it
+/// has heard from the k closest nodes it knows of, and continuing past that is
+/// spending round trips to re-learn what we already have.
+///
+/// Deliberately not applied to `FIND_VALUE`. There, every extra node asked is
+/// another chance at a record the closer ones did not hold, so recall is worth
+/// more than the saved traffic — the walk keeps going until it runs out of
+/// shortlist.
+const STALE_RESPONSES_TO_CONVERGE: u8 = ALPHA as u8;
+
+/// Nodes that must have answered before convergence may end a `FIND_NODE`.
+///
+/// Guards the case where the first few answers happen to arrive from the nodes
+/// we already had: without a floor, a walk seeded from a thin table could
+/// declare itself converged after a handful of replies and never reach the
+/// neighbourhood it was looking for. Half a bucket matches the bar KAD sets
+/// before its own stale-round rule may fire.
+const MIN_RESPONSES_TO_CONVERGE: usize = K_BUCKET_SIZE / 2;
+
 /// Diagnostic row for one in-flight Ember DHT search (slice 16).
 #[derive(Debug, Clone)]
 pub struct SearchSnapshot {
@@ -147,6 +171,9 @@ pub struct IterativeSearch {
     next_request_id: u32,
     /// Request IDs we've sent mapped to the node we sent them to.
     pending_requests: HashMap<u32, EmberNodeId>,
+    /// Answers in a row that brought nothing closer than the best node already
+    /// on the shortlist. See [`STALE_RESPONSES_TO_CONVERGE`].
+    stale_responses: u8,
 }
 
 impl IterativeSearch {
@@ -185,6 +212,7 @@ impl IterativeSearch {
             complete: false,
             pending_requests: HashMap::new(),
             next_request_id: 1,
+            stale_responses: 0,
         }
     }
 
@@ -348,6 +376,14 @@ impl IterativeSearch {
             });
         }
 
+        // An answer that moved the frontier resets the convergence count; one
+        // that did not brings a `FIND_NODE` walk closer to finishing.
+        if new_closer {
+            self.stale_responses = 0;
+        } else {
+            self.stale_responses = self.stale_responses.saturating_add(1);
+        }
+
         // Check convergence
         self.check_complete();
 
@@ -425,10 +461,35 @@ impl IterativeSearch {
             return;
         }
 
+        // A FIND_NODE walk whose frontier has stopped moving has the answer it
+        // came for; querying the rest of the shortlist only re-learns nodes we
+        // already hold. FIND_VALUE is excluded on purpose — see
+        // [`STALE_RESPONSES_TO_CONVERGE`].
+        if self.search_type == SearchType::FindNode
+            && self.stale_responses >= STALE_RESPONSES_TO_CONVERGE
+            && self.responded_count() >= MIN_RESPONSES_TO_CONVERGE
+        {
+            trace!(
+                "Search {}: converged after {} answers brought nothing closer",
+                self.id,
+                self.stale_responses
+            );
+            self.complete = true;
+            return;
+        }
+
         // For FIND_VALUE, complete if we have enough results
         if self.search_type == SearchType::FindValue && self.results.len() >= MAX_SEARCH_RESULTS {
             self.complete = true;
         }
+    }
+
+    /// Shortlist entries that have answered us.
+    fn responded_count(&self) -> usize {
+        self.shortlist
+            .iter()
+            .filter(|e| e.state == NodeState::Responded)
+            .count()
     }
 
     /// Get the closest responded nodes (useful for FIND_NODE results).
@@ -717,6 +778,77 @@ mod tests {
         blob.extend_from_slice(&[filler; 16]);
         blob.extend_from_slice(&[filler; 64]);
         blob
+    }
+
+    /// A table with a full bucket's worth of contacts, each in its own /24 so
+    /// the diversity caps never refuse one.
+    fn table_with_contacts(local: EmberNodeId, count: u8) -> RoutingTable {
+        let mut rt = RoutingTable::new(local, false);
+        for i in 0..count {
+            rt.add_contact(make_contact(0x40 + i));
+        }
+        rt
+    }
+
+    /// Answer every query with nothing closer, until the walk either finishes
+    /// or runs out of shortlist. Returns how many nodes answered.
+    fn walk_until_done(search: &mut IterativeSearch) -> usize {
+        let mut answered = 0usize;
+        while !search.complete {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for (contact, req_id) in batch {
+                search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                answered += 1;
+            }
+        }
+        answered
+    }
+
+    /// A lookup used to query every entry that ever reached the shortlist, so a
+    /// walk whose frontier had already stopped moving still spent round trips
+    /// re-learning nodes it held. Kademlia ends a lookup once it has heard from
+    /// the closest nodes it knows of.
+    #[test]
+    fn a_find_node_walk_stops_once_the_frontier_stops_moving() {
+        let target = make_id(0x01);
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let answered = walk_until_done(search);
+
+        assert!(search.complete, "the walk must finish");
+        assert!(
+            answered >= MIN_RESPONSES_TO_CONVERGE,
+            "convergence must not fire before the response floor, got {answered}"
+        );
+        assert!(
+            answered < K_BUCKET_SIZE,
+            "stopping early is the point: asked {answered} of {K_BUCKET_SIZE}"
+        );
+    }
+
+    /// The same rule must not touch FIND_VALUE. There, one more node asked is
+    /// one more chance at a record the closer ones did not hold, so recall is
+    /// worth more than the round trips convergence would save.
+    #[test]
+    fn a_find_value_walk_keeps_asking_after_the_frontier_settles() {
+        let target = make_id(0x01);
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let answered = walk_until_done(search);
+
+        assert_eq!(
+            answered, K_BUCKET_SIZE,
+            "every peer on the shortlist must still be asked for records"
+        );
     }
 
     /// Two peers holding the same record is the normal case for anything

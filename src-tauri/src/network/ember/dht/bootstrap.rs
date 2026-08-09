@@ -207,6 +207,155 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
     Ok(contacts)
 }
 
+const STORE_EMBER_MAGIC: u32 = 0x454D_5331; // "EMS1" in LE
+const STORE_EMBER_VERSION: u8 = 1;
+/// Largest record body accepted from the file. A record has to fit an Ember
+/// datagram to have arrived over the wire in the first place, so anything larger
+/// on disk is corruption or tampering.
+const MAX_PERSISTED_RECORD_BYTES: usize = 4096;
+
+/// Persist the local record store to `store_ember.dat`.
+///
+/// Written on shutdown only, not on a timer. The store can be several megabytes
+/// and a periodic write of that size is exactly the every-few-minutes disk hitch
+/// that was removed from the peer-list save; an abnormal exit falls back to what
+/// happens today, which is replication refilling the store within the hour.
+///
+/// Format:
+///   magic(4) + version(1) + count(u32 LE) +
+///   for each record:
+///     key(16) + created_at(i64 LE) + publisher_key(32) + signature(64) +
+///     ip_present(1) + ip(4, only when present) + data_len(u32 LE) + data
+pub fn save_store(path: &Path, records: &[super::store::PersistedRecord]) -> anyhow::Result<()> {
+    if records.is_empty() {
+        // Nothing to say, and an empty file would only cost the next launch the
+        // store it could have kept.
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        return Ok(());
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64 + records.len() * 160);
+    buf.write_u32::<LittleEndian>(STORE_EMBER_MAGIC)?;
+    buf.write_u8(STORE_EMBER_VERSION)?;
+    buf.write_u32::<LittleEndian>(records.len() as u32)?;
+
+    for record in records {
+        buf.write_all(&record.key)?;
+        buf.write_i64::<LittleEndian>(record.created_at)?;
+        buf.write_all(&record.publisher_key)?;
+        buf.write_all(&record.signature)?;
+        match record.attributed_ip {
+            Some(ip) => {
+                buf.write_u8(1)?;
+                buf.write_all(&ip.octets())?;
+            }
+            None => buf.write_u8(0)?,
+        }
+        buf.write_u32::<LittleEndian>(record.data.len() as u32)?;
+        buf.write_all(&record.data)?;
+    }
+
+    crate::security::atomic_write(path, &buf, false)?;
+    info!(
+        "Saved {} Ember DHT records to {}",
+        records.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Load records from `store_ember.dat`.
+///
+/// Nothing here is trusted: every record goes back through
+/// [`super::store::DhtStore::restore`], which re-verifies its publisher
+/// signature and recomputes expiry from the signed creation time. A short or
+/// malformed file yields whatever parsed cleanly before the damage.
+pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedRecord>> {
+    let data = std::fs::read(path)?;
+    if data.len() < 9 {
+        anyhow::bail!("store_ember.dat too small");
+    }
+
+    let mut cursor = std::io::Cursor::new(&data);
+    let magic = cursor.read_u32::<LittleEndian>()?;
+    if magic != STORE_EMBER_MAGIC {
+        anyhow::bail!("Invalid store_ember.dat magic: 0x{magic:08x}");
+    }
+    let version = cursor.read_u8()?;
+    if version > STORE_EMBER_VERSION {
+        anyhow::bail!("Unsupported store_ember.dat version {version}");
+    }
+
+    let count = cursor.read_u32::<LittleEndian>()? as usize;
+    // The declared count sizes nothing up front: a forged header must not be
+    // able to ask for an allocation the file cannot possibly fill.
+    let mut out: Vec<super::store::PersistedRecord> = Vec::new();
+    for _ in 0..count {
+        let mut key = [0u8; 16];
+        if cursor.read_exact(&mut key).is_err() {
+            break;
+        }
+        let Ok(created_at) = cursor.read_i64::<LittleEndian>() else {
+            break;
+        };
+        let mut publisher_key = [0u8; 32];
+        if cursor.read_exact(&mut publisher_key).is_err() {
+            break;
+        }
+        let mut signature = [0u8; 64];
+        if cursor.read_exact(&mut signature).is_err() {
+            break;
+        }
+        let Ok(ip_present) = cursor.read_u8() else {
+            break;
+        };
+        let attributed_ip = if ip_present == 1 {
+            let mut octets = [0u8; 4];
+            if cursor.read_exact(&mut octets).is_err() {
+                break;
+            }
+            Some(std::net::Ipv4Addr::from(octets))
+        } else {
+            None
+        };
+        let Ok(len) = cursor.read_u32::<LittleEndian>() else {
+            break;
+        };
+        let len = len as usize;
+        if len == 0 || len > MAX_PERSISTED_RECORD_BYTES {
+            warn!("store_ember.dat declares a {len}-byte record; stopping there");
+            break;
+        }
+        let mut body = vec![0u8; len];
+        if cursor.read_exact(&mut body).is_err() {
+            break;
+        }
+        out.push(super::store::PersistedRecord {
+            key,
+            data: body,
+            signature,
+            publisher_key,
+            created_at,
+            attributed_ip,
+        });
+    }
+
+    if out.len() < count {
+        warn!(
+            "store_ember.dat declared {count} records but {} parsed; using what loaded",
+            out.len()
+        );
+    }
+    info!(
+        "Loaded {} Ember DHT records from {}",
+        out.len(),
+        path.display()
+    );
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

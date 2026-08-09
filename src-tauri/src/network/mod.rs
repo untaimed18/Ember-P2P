@@ -3247,6 +3247,68 @@ mod friend_transfer_tests {
         assert_eq!(choice.method(), ed2k::messages::EmberXferMethod::Punch);
     }
 
+    /// Publishing used to take our own table's closest as the answer to "who is
+    /// closest to this key", which it cannot be for a distant key: one bucket
+    /// holds twenty nodes drawn from a huge range, while a searcher's walk
+    /// converges on the true closest. Records therefore landed beside where
+    /// lookups go looking.
+    #[test]
+    fn publish_targets_prefer_a_real_lookup_and_queue_the_key_until_they_have_one() {
+        use std::collections::VecDeque;
+
+        let local = ember::dht::EmberNodeId([0u8; 16]);
+        let mut routing = ember::dht::routing::RoutingTable::new(local, false);
+        for i in 0..4u8 {
+            routing.add_contact(ember::dht::EmberContact {
+                node_id: ember::dht::EmberNodeId([0x40 + i; 16]),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, i + 1, 1)), 4672),
+                noise_pub: [i; 32],
+                ed25519_pub: [i; 32],
+                last_seen: 1_700_000_000,
+                failed_queries: 0,
+            });
+        }
+
+        let key = [0xAB; 16];
+        let now = 1_700_000_000i64;
+        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
+        let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
+
+        // Nothing learned yet: fall back to the table, but queue the key.
+        let from_table = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        assert!(!from_table.is_empty(), "publishing must not stall on a lookup");
+        assert_eq!(queue.len(), 1, "the key is queued for a real lookup");
+
+        // Asking again must not queue it twice.
+        let _ = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        assert_eq!(queue.len(), 1, "one entry per key");
+
+        // Once a lookup has resolved, its answer wins and the key stops queueing.
+        let looked_up = vec![ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0xAA; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 9, 9, 9)), 4672),
+            noise_pub: [9u8; 32],
+            ed25519_pub: [9u8; 32],
+            last_seen: now,
+            failed_queries: 0,
+        }];
+        cache.insert(key, (looked_up.clone(), now));
+        queue.clear();
+        let fresh = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].node_id, looked_up[0].node_id);
+        assert!(queue.is_empty(), "a fresh set needs no new lookup");
+
+        // And it is re-learned rather than trusted forever.
+        let stale_at = now + EMBER_PUBLISH_TARGETS_TTL_SECS;
+        let stale = ember_publish_targets_for(&cache, &mut queue, &routing, key, stale_at);
+        assert_eq!(queue.len(), 1, "an aged set queues the key again");
+        assert!(
+            !stale.is_empty(),
+            "and still publishes meanwhile, from the table"
+        );
+    }
+
     /// `udp_firewalled` starts `true` and is only ever cleared by KAD's UDP
     /// probe, so with KAD switched off a node could never learn its port was
     /// open and advertised every source record as firewalled for the life of
@@ -9143,6 +9205,25 @@ struct NetworkState {
     /// Unix time we last received any Ember DHT frame. `None` until the first
     /// one arrives. Drives disconnect detection.
     ember_last_inbound: Option<i64>,
+    /// Nodes a real lookup found to be closest to a record key, per key, with
+    /// the unix time we learned them.
+    ///
+    /// Kademlia says to find the k closest nodes to a key and store there. Our
+    /// own table cannot answer that question well for a distant key: bucket `b`
+    /// holds twenty nodes drawn from a range of `2^b` addresses, so its
+    /// "closest" are nowhere near the true closest, while a searcher's walk
+    /// converges on exactly those. Publishing from the table alone therefore
+    /// puts records slightly beside where lookups go looking, and further beside
+    /// as the network grows. Storer-side replication drags them back over a few
+    /// hours, so it self-heals rather than failing outright — but starting in
+    /// the right place is cheaper than converging on it.
+    ember_publish_targets: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    /// Keys waiting for such a lookup, oldest first. Publishing never blocks on
+    /// this: a key with no cached set publishes from the table now and gets a
+    /// better set for its next republish.
+    ember_publish_target_queue: std::collections::VecDeque<[u8; 16]>,
+    /// In-flight target lookups, search id to the key each is resolving.
+    ember_publish_target_lookups: HashMap<u32, [u8; 16]>,
     /// Unix time a peer we had never contacted reached us on our own UDP port,
     /// which is the only Ember-native evidence that the port is open to the
     /// internet. `None` until that happens.
@@ -12748,6 +12829,9 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_self_lookup_done = false;
     state.ember_last_self_lookup = 0;
     state.ember_last_inbound = None;
+    state.ember_publish_targets.clear();
+    state.ember_publish_target_queue.clear();
+    state.ember_publish_target_lookups.clear();
     state.ember_udp_reachable_at = None;
 
     // Cumulative dev-console counters: start each enable-session clean
@@ -13483,6 +13567,9 @@ pub async fn start_network(
         ember_self_lookup_done: false,
         ember_last_self_lookup: 0,
         ember_last_inbound: None,
+        ember_publish_targets: HashMap::new(),
+        ember_publish_target_queue: std::collections::VecDeque::new(),
+        ember_publish_target_lookups: HashMap::new(),
         ember_udp_reachable_at: None,
         ember_kad_bridge_attempted: HashMap::new(),
         ember_udp_epx_rate: HashMap::new(),
@@ -13586,6 +13673,28 @@ pub async fn start_network(
         }
     } else {
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
+    }
+
+    // Carry the record store across the restart too. Every record is re-verified
+    // and re-dated on the way in, so anything that expired while we were closed
+    // is refused rather than revived. Without this a restart dropped everything
+    // this node was holding for other publishers, and on a young network with
+    // few replicas per record — or when an update restarts many nodes at once —
+    // that content is missing until replication and the original publishers
+    // refill it.
+    let store_ember_path = data_dir.join("store_ember.dat");
+    if store_ember_path.exists() {
+        match ember::dht::bootstrap::load_store(&store_ember_path) {
+            Ok(records) => {
+                let offered = records.len();
+                let accepted = state.ember_dht.restore_records(records);
+                info!(
+                    "Restored {accepted} of {offered} Ember DHT records from store_ember.dat \
+                     (the rest expired while closed or failed validation)"
+                );
+            }
+            Err(e) => warn!("Failed to load store_ember.dat: {e}"),
+        }
     }
 
     // A table that comes up empty — brand-new install, or a lost/corrupt
@@ -31436,6 +31545,19 @@ pub async fn start_network(
         }
     }
 
+    // Persist the record store so the next session starts holding what this one
+    // held. Shutdown only, deliberately: the store can be several megabytes and
+    // writing that every few minutes is the disk hitch the peer-list save was
+    // changed to avoid. An abnormal exit falls back to replication refilling the
+    // store, which is what happened on every exit before this.
+    let ember_records = state
+        .ember_dht
+        .persistable_records(EMBER_PERSIST_MAX_RECORDS);
+    let store_ember_path = state.data_dir.join("store_ember.dat");
+    if let Err(e) = ember::dht::bootstrap::save_store(&store_ember_path, &ember_records) {
+        error!("Failed to save store_ember.dat on shutdown: {e}");
+    }
+
     // Drain any in-flight periodic statistics save before the final write.
     // The 60s timer spawns a detached `spawn_blocking` with a snapshot of
     // `cumulative_save_pairs()` — the same stale-overwrite race we already
@@ -33073,6 +33195,42 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                     .collect();
                 let _ = tx.send(infos);
             }
+            // A publish-target lookup: file the closest nodes that answered
+            // under the key they were found for. An empty result is not cached,
+            // so a walk that reached nobody leaves the key queued rather than
+            // pinning an empty target set for the whole TTL.
+            if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
+                if contacts.is_empty() {
+                    debug!(
+                        "Ember DHT: target lookup for {} found nobody; keeping the table's answer",
+                        hex::encode(key)
+                    );
+                } else {
+                    if state.ember_publish_targets.len() >= EMBER_PUBLISH_TARGETS_MAX
+                        && !state.ember_publish_targets.contains_key(&key)
+                    {
+                        // Drop whichever set we learned longest ago: it is the
+                        // one closest to needing a fresh lookup anyway.
+                        if let Some(stalest) = state
+                            .ember_publish_targets
+                            .iter()
+                            .min_by_key(|(_, (_, at))| *at)
+                            .map(|(k, _)| *k)
+                        {
+                            state.ember_publish_targets.remove(&stalest);
+                        }
+                    }
+                    let now = chrono::Utc::now().timestamp();
+                    state
+                        .ember_publish_targets
+                        .insert(key, (contacts.clone(), now));
+                    debug!(
+                        "Ember DHT: {} publish targets learned for {}",
+                        contacts.len(),
+                        hex::encode(key)
+                    );
+                }
+            }
         }
         ember::dht::search::SearchType::FindValue => {
             let records = state
@@ -33846,6 +34004,59 @@ mod ember_publish_scope_tests {
     }
 }
 
+/// Records carried across a restart in `store_ember.dat`.
+///
+/// Each one costs an Ed25519 verification on the way back in, so this bounds
+/// startup work as well as file size: twenty thousand is a fraction of a second
+/// of verification and a few megabytes on disk, and more than a node holding a
+/// healthy share of a young network's keys will have.
+const EMBER_PERSIST_MAX_RECORDS: usize = 20_000;
+
+/// How long a looked-up target set is trusted before the key queues again.
+///
+/// Long enough that a republish reuses the lookup rather than paying for a new
+/// one, short enough that the set still reflects a network peers join and leave.
+const EMBER_PUBLISH_TARGETS_TTL_SECS: i64 = 4 * 3600;
+
+/// Target lookups started per maintenance cycle.
+///
+/// A lookup is a handful of round trips, and there are as many keys as shared
+/// files, so resolving every key on every publish would undo the batching the
+/// publisher exists for. Two a minute costs almost nothing and works through a
+/// large library over a few hours — comfortably inside the keyword republish
+/// interval, which is when a better target set actually gets used.
+const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 2;
+
+/// Keys that may be waiting for a target lookup at once.
+const EMBER_PUBLISH_TARGET_QUEUE_MAX: usize = 512;
+
+/// Looked-up target sets kept. Each is at most `K_EMBER_REPLICAS` contacts.
+const EMBER_PUBLISH_TARGETS_MAX: usize = 2048;
+
+/// The nodes to store a record under `key` on.
+///
+/// Prefers the set a real lookup found, and falls back to our own table's
+/// closest while no lookup has resolved yet — queueing the key so the next
+/// republish does better. See [`NetworkState::ember_publish_targets`] for why
+/// the table's answer is not the same as the network's.
+fn ember_publish_targets_for(
+    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    queue: &mut std::collections::VecDeque<[u8; 16]>,
+    routing: &ember::dht::routing::RoutingTable,
+    key: [u8; 16],
+    now: i64,
+) -> Vec<ember::dht::EmberContact> {
+    if let Some((targets, learned_at)) = cache.get(&key) {
+        if now.saturating_sub(*learned_at) < EMBER_PUBLISH_TARGETS_TTL_SECS && !targets.is_empty() {
+            return targets.clone();
+        }
+    }
+    if queue.len() < EMBER_PUBLISH_TARGET_QUEUE_MAX && !queue.contains(&key) {
+        queue.push_back(key);
+    }
+    routing.find_closest_prefer_verified(&ember::dht::EmberNodeId(key), K_EMBER_REPLICAS)
+}
+
 /// How long a stranger's PING keeps proving our UDP port is open.
 ///
 /// Long enough that the evidence does not lapse between arrivals — once we are
@@ -34066,9 +34277,12 @@ async fn maybe_publish_ember_sources(
         // peer acks, so a publish that reached nobody is retried next tick
         // instead of locking the file out for the full republish interval —
         // which is what happened when the timestamp was written at dispatch.
-        let targets = state.ember_dht.routing().find_closest_prefer_verified(
-            &ember::dht::EmberNodeId(record.keyword_hash),
-            K_EMBER_REPLICAS,
+        let targets = ember_publish_targets_for(
+            &state.ember_publish_targets,
+            &mut state.ember_publish_target_queue,
+            state.ember_dht.routing(),
+            record.keyword_hash,
+            chrono::Utc::now().timestamp(),
         );
         let reference = EmberRecordRef {
             file_hash,
@@ -34240,9 +34454,12 @@ async fn maybe_publish_ember_keywords(
             // Queue rather than send: records bound for the same peer travel
             // together, which is what makes a large library's republish cycle
             // fit inside the record TTL.
-            let targets = state.ember_dht.routing().find_closest_prefer_verified(
-                &ember::dht::EmberNodeId(record.keyword_hash),
-                K_EMBER_REPLICAS,
+            let targets = ember_publish_targets_for(
+                &state.ember_publish_targets,
+                &mut state.ember_publish_target_queue,
+                state.ember_dht.routing(),
+                record.keyword_hash,
+                chrono::Utc::now().timestamp(),
             );
             let reference = EmberRecordRef {
                 file_hash,
@@ -34532,6 +34749,33 @@ async fn run_ember_maintenance(
         }
     }
 
+    // 1b) Publish-target lookups — resolve the nodes genuinely closest to keys
+    //     we publish under, a couple per cycle, so republishes stop relying on
+    //     our own table's answer for a distant key. Same shape as a bucket
+    //     refresh: the search has no waiter, and `maybe_finish_ember_search`
+    //     files the result under the key it was resolving.
+    for _ in 0..EMBER_MAINT_MAX_TARGET_LOOKUPS {
+        let Some(key) = state.ember_publish_target_queue.pop_front() else {
+            break;
+        };
+        let target = ember::dht::EmberNodeId(key);
+        match state
+            .ember_search
+            .start_find_node(target, state.ember_dht.routing())
+        {
+            Some(search_id) => {
+                state.ember_publish_target_lookups.insert(search_id, key);
+                drive_ember_search(socket, state, search_id).await;
+            }
+            None => {
+                // Search cap reached. Put it back so the key is not silently
+                // dropped from the rotation, and stop for this cycle.
+                state.ember_publish_target_queue.push_front(key);
+                break;
+            }
+        }
+    }
+
     // 2) Liveness pings — probe contacts we haven't heard from recently.
     //    A PONG refreshes the contact; silence past EMBER_MAINT_PING_TIMEOUT
     //    faults it (and eventually evicts it) in the 1-second sweep.
@@ -34615,9 +34859,12 @@ async fn run_ember_maintenance(
             Some(r) => r,
             None => continue, // already verified when stored; skip if somehow malformed
         };
-        let targets = state.ember_dht.routing().find_closest_prefer_verified(
-            &ember::dht::EmberNodeId(record.keyword_hash),
-            K_EMBER_REPLICAS,
+        let targets = ember_publish_targets_for(
+            &state.ember_publish_targets,
+            &mut state.ember_publish_target_queue,
+            state.ember_dht.routing(),
+            record.keyword_hash,
+            chrono::Utc::now().timestamp(),
         );
         // Replication carries someone else's record, so there is no local
         // file schedule to advance; the reference is only used to line the

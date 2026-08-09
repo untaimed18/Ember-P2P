@@ -790,6 +790,18 @@ impl EmberDht {
         self.store.take_republish_batch(interval, max, force)
     }
 
+    /// Records worth carrying across a restart (see
+    /// [`DhtStore::persistable`]).
+    pub fn persistable_records(&self, max: usize) -> Vec<super::store::PersistedRecord> {
+        self.store.persistable(max)
+    }
+
+    /// Load persisted records back into the store, returning how many were
+    /// accepted (see [`DhtStore::restore`]).
+    pub fn restore_records(&mut self, records: Vec<super::store::PersistedRecord>) -> usize {
+        self.store.restore(records)
+    }
+
     /// Records waiting to be replicated onward (see
     /// [`DhtStore::republish_backlog`]).
     pub fn republish_backlog(&self, interval: Duration) -> usize {
