@@ -35,8 +35,31 @@ const MAX_STORE_BYTES: usize = 48 * 1024 * 1024;
 fn record_cost(data_len: usize) -> usize {
     data_len + std::mem::size_of::<DhtRecord>()
 }
-/// Default record TTL.
-const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Record TTL for everything that is not a source record.
+const KEYWORD_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Record TTL for source records.
+///
+/// A source record names an address to download from, so it stops being true
+/// the moment that peer goes offline. A keyword record only says a file exists
+/// under a word, which stays true whoever is online, so the two do not deserve
+/// the same lifetime. Sharing one 24-hour TTL meant a peer that left kept being
+/// handed to downloaders for the rest of the day, and nothing about the record
+/// hinted that it was stale.
+///
+/// Publishers re-announce their own source records every two hours
+/// (`EMBER_SOURCE_REPUBLISH` in `network::mod`), so six hours survives two
+/// missed republishes while clearing a departed peer four times sooner than
+/// before. KAD settles on five hours against a five-hour republish, which is a
+/// tighter margin than this.
+const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// How long a record of this type lives, from its leading type byte.
+fn record_ttl(data: &[u8]) -> Duration {
+    match data.first() {
+        Some(&RECORD_TYPE_SOURCE) => SOURCE_RECORD_TTL,
+        _ => KEYWORD_RECORD_TTL,
+    }
+}
 /// How far a record's signed creation timestamp may sit in the future before
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
@@ -390,9 +413,8 @@ impl DhtStore {
     /// seconds). The record's expiry is derived from it rather than from the
     /// moment we happen to receive it, so replaying an old (still validly
     /// signed) record cannot revive it with a fresh local TTL: it expires
-    /// `DEFAULT_RECORD_TTL` after the publisher created it, full stop. A
-    /// record dated past its TTL, or implausibly far in the future, is
-    /// rejected outright.
+    /// [`record_ttl`] after the publisher created it, full stop. A record dated
+    /// past its TTL, or implausibly far in the future, is rejected outright.
     pub fn store(
         &mut self,
         key: [u8; 16],
@@ -429,7 +451,7 @@ impl DhtStore {
         }
 
         // Derive remaining lifetime from the signed creation time.
-        let ttl_secs = DEFAULT_RECORD_TTL.as_secs() as i64;
+        let ttl_secs = record_ttl(&data).as_secs() as i64;
         let now_unix = chrono::Utc::now().timestamp();
         if created_at > now_unix + CLOCK_SKEW_TOLERANCE_SECS {
             debug!(
@@ -573,11 +595,72 @@ impl DhtStore {
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
+            // The key is full. Refusing outright handed it to whoever filled it
+            // first, and filling it is cheap: records dedupe on (publisher,
+            // file), so one identity can take all MAX_RECORDS_PER_KEY slots
+            // under a popular word by varying the file hash, then hold them
+            // indefinitely by republishing. Every other publisher's records for
+            // that word became unstorable, which is to say undiscoverable.
+            //
+            // Capping how many slots one *sender* may introduce would break
+            // replication, for the reason in the note above. But the *author*
+            // of each record is signed, and charging slots to the author is
+            // both safe for replication — a storer's re-STORE is charged to the
+            // original publisher, not to the storer — and exactly the fairness
+            // wanted here.
+            //
+            // So displace the publisher holding the most slots, but only while
+            // it holds more than this newcomer would after being admitted. That
+            // is max-min fairness by water-filling: a publisher may use as much
+            // of a key as nobody else is asking for, every admission strictly
+            // reduces the imbalance, and N publishers converge on an even split
+            // with no per-publisher quota to pick or tune. A publisher that is
+            // already the heaviest cannot displace anyone, so the flood above
+            // stops at its fair share instead of the whole key.
+            let mut held: HashMap<[u8; 32], usize> = HashMap::new();
+            for r in records.iter() {
+                *held.entry(r.publisher_key).or_insert(0) += 1;
+            }
+            let mine = held.get(&publisher_key).copied().unwrap_or(0);
+            // Ties break on the key bytes so the choice is deterministic
+            // rather than dependent on HashMap iteration order.
+            let heaviest = held
+                .iter()
+                .max_by_key(|(pk, count)| (**count, **pk))
+                .map(|(pk, count)| (*pk, *count));
+            let Some((heaviest_key, heaviest_count)) = heaviest else {
+                return false;
+            };
+            if heaviest_count <= mine + 1 {
+                debug!(
+                    "Key {} is full and publisher {} is already at its share, rejecting",
+                    hex::encode(key),
+                    hex::encode(publisher_key),
+                );
+                return false;
+            }
+            // Within that publisher's slots give up whatever expires soonest:
+            // it is worth the least to the network, matching the ranking
+            // `enforce_byte_budget` uses.
+            let Some(victim) = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.publisher_key == heaviest_key)
+                .min_by_key(|(_, r)| r.expires_at)
+                .map(|(i, _)| i)
+            else {
+                return false;
+            };
+            let evicted = records.remove(victim);
+            self.bytes = self
+                .bytes
+                .saturating_sub(record_cost(evicted.data.len()));
             debug!(
-                "Key {} has {MAX_RECORDS_PER_KEY} records, rejecting",
-                hex::encode(key)
+                "Key {} full: displaced a record from publisher {} ({heaviest_count} slots) for {}",
+                hex::encode(key),
+                hex::encode(heaviest_key),
+                hex::encode(publisher_key),
             );
-            return false;
         }
 
         self.bytes += record_cost(record.data.len());
@@ -920,6 +1003,30 @@ mod tests {
         store
     }
 
+    /// Fill one keyword key with `count` records from a single publisher, one
+    /// per invented file hash — what a flooder does to claim a whole word.
+    /// Returns the key they landed on.
+    fn fill_keyword_key(store: &mut DhtStore, sk: &SigningKey, count: usize) -> [u8; 16] {
+        use super::super::publish::SignedRecord;
+
+        let mut key = [0u8; 16];
+        for i in 0..count {
+            let mut file = [0u8; 16];
+            file[0] = (i >> 8) as u8;
+            file[1] = (i & 0xFF) as u8;
+            let rec = SignedRecord::keyword("ubuntu", file, [0u8; 32], 100, "spam.iso", sk);
+            key = rec.keyword_hash;
+            assert!(store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ));
+        }
+        key
+    }
+
     /// The cap used to refuse outright, so a publisher spreading records over
     /// random keys could fill the map and lock out the keys this node is the
     /// closest in the network to — the ones it exists to serve.
@@ -1096,6 +1203,105 @@ mod tests {
             refreshed.timestamp,
         ));
         assert_eq!(store.total_records(), 2, "a republish is not a new record");
+    }
+
+    /// Records dedupe on (publisher, file), so one identity can take every
+    /// slot under a popular word just by varying the file hash, and hold them
+    /// by republishing. While a full key was refused outright, that handed the
+    /// word to whoever filled it first and made every other publisher's files
+    /// for it unstorable, which is to say undiscoverable.
+    #[test]
+    fn one_publisher_cannot_lock_everyone_out_of_a_keyword() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let spammer = SigningKey::generate(&mut OsRng);
+        let key = fill_keyword_key(&mut store, &spammer, MAX_RECORDS_PER_KEY);
+        assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+
+        let honest = SigningKey::generate(&mut OsRng);
+        let good = SignedRecord::keyword("ubuntu", [0xEE; 16], [0u8; 32], 4096, "real.iso", &honest);
+        assert!(
+            store.store(
+                key,
+                good.data.clone(),
+                good.signature,
+                good.publisher_key,
+                good.timestamp,
+            ),
+            "an honest publisher must still reach a key somebody else filled"
+        );
+
+        let records = store.get(&key).unwrap();
+        assert_eq!(
+            records.len(),
+            MAX_RECORDS_PER_KEY,
+            "admitting the newcomer must not grow the key past its cap"
+        );
+        assert!(
+            records.iter().any(|r| r.publisher_key == good.publisher_key),
+            "the newcomer's record is the one that was admitted"
+        );
+    }
+
+    /// Displacing the heaviest publisher only while it holds more than the
+    /// arrival would is max-min fairness by water-filling: the split evens out
+    /// on its own, and once it has, neither side can take from the other. The
+    /// flood therefore settles at a fair share instead of the whole key, with
+    /// no per-publisher quota to pick.
+    #[test]
+    fn a_contested_keyword_settles_on_an_even_split() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let spammer = SigningKey::generate(&mut OsRng);
+        let key = fill_keyword_key(&mut store, &spammer, MAX_RECORDS_PER_KEY);
+
+        let honest = SigningKey::generate(&mut OsRng);
+        let honest_pk = honest.verifying_key().to_bytes();
+        let mut admitted = 0usize;
+        for i in 0..MAX_RECORDS_PER_KEY {
+            let mut file = [0xC0u8; 16];
+            file[0] = (i >> 8) as u8;
+            file[1] = (i & 0xFF) as u8;
+            let rec = SignedRecord::keyword("ubuntu", file, [0u8; 32], 4096, "real.iso", &honest);
+            if store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ) {
+                admitted += 1;
+            }
+        }
+
+        let records = store.get(&key).unwrap();
+        let held_by_honest = records
+            .iter()
+            .filter(|r| r.publisher_key == honest_pk)
+            .count();
+        assert_eq!(
+            admitted,
+            MAX_RECORDS_PER_KEY / 2,
+            "the contest converges rather than running to either extreme"
+        );
+        assert_eq!(held_by_honest, MAX_RECORDS_PER_KEY / 2);
+        assert_eq!(records.len(), MAX_RECORDS_PER_KEY, "the key stays full");
+
+        // With the key evenly split, the original flooder cannot buy back a
+        // slot either: it is no longer holding more than the arrival would.
+        let more = SignedRecord::keyword("ubuntu", [0x5A; 16], [0u8; 32], 100, "spam.iso", &spammer);
+        assert!(
+            !store.store(
+                key,
+                more.data.clone(),
+                more.signature,
+                more.publisher_key,
+                more.timestamp,
+            ),
+            "a publisher at its share must not displace anyone"
+        );
     }
 
     /// A source record names an address to download from. Without a per-IP
@@ -1519,6 +1725,64 @@ mod tests {
             remaining <= Duration::from_secs(3600 + 60)
                 && remaining >= Duration::from_secs(3600 - 300),
             "expected ~1h of remaining TTL, got {remaining:?}"
+        );
+    }
+
+    /// A source record names an address to download from, so it stops being
+    /// true the moment that peer goes offline; a keyword record only says a
+    /// file exists under a word and stays true regardless. Giving both the
+    /// keyword lifetime meant a peer that left was still handed to downloaders
+    /// for the rest of the day.
+    #[test]
+    fn a_source_record_dies_sooner_than_a_keyword_record() {
+        use super::super::publish::{source_key, SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut store = DhtStore::new();
+        // Past a source's life, comfortably inside a keyword's.
+        let age = SOURCE_RECORD_TTL.as_secs() as i64 + 60;
+        assert!(
+            age < KEYWORD_RECORD_TTL.as_secs() as i64,
+            "the ages must straddle exactly one of the two TTLs"
+        );
+
+        let word = SignedRecord::keyword("ubuntu", [0x11; 16], [0u8; 32], 100, "u.iso", &sk);
+        assert!(
+            store.store(
+                word.keyword_hash,
+                word.data.clone(),
+                word.signature,
+                word.publisher_key,
+                now_ts() - age,
+            ),
+            "a keyword record of this age is still worth holding"
+        );
+
+        let file_hash = [0x22u8; 16];
+        let src = SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            100,
+            "u.iso",
+            SourceContact {
+                ip: Ipv4Addr::new(198, 51, 100, 7),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: [1u8; 32],
+            },
+            &sk,
+        );
+        assert!(
+            !store.store(
+                source_key(&file_hash),
+                src.data.clone(),
+                src.signature,
+                src.publisher_key,
+                now_ts() - age,
+            ),
+            "a source record this old points at a peer that left hours ago"
         );
     }
 

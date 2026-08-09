@@ -3247,6 +3247,64 @@ mod friend_transfer_tests {
         assert_eq!(choice.method(), ed2k::messages::EmberXferMethod::Punch);
     }
 
+    /// `udp_firewalled` starts `true` and is only ever cleared by KAD's UDP
+    /// probe, so with KAD switched off a node could never learn its port was
+    /// open and advertised every source record as firewalled for the life of
+    /// the process — relaying connections that did not need it. These are the
+    /// two things Ember can establish on its own.
+    #[test]
+    fn ember_learns_its_udp_port_is_open_without_kad() {
+        let now = 1_000_000i64;
+        let ttl = EMBER_UDP_REACHABLE_TTL_SECS;
+
+        // Nothing known yet: stay pessimistic and keep using a buddy.
+        assert!(!ember_udp_reachable_from(
+            ember::nat::NatType::Unknown,
+            None,
+            now
+        ));
+        assert!(!ember_udp_reachable_from(
+            ember::nat::NatType::Symmetric,
+            None,
+            now
+        ));
+        // A cone NAT filters unsolicited inbound, so the type alone proves
+        // nothing — this is the case that needs a peer to reach us.
+        assert!(!ember_udp_reachable_from(
+            ember::nat::NatType::PortRestricted,
+            None,
+            now
+        ));
+
+        // No NAT at all needs no peer to confirm it.
+        assert!(ember_udp_reachable_from(
+            ember::nat::NatType::Open,
+            None,
+            now
+        ));
+
+        // A stranger's PING settles it behind any NAT, and the proof ages out
+        // so a network change we did not otherwise notice stops us claiming a
+        // reachability we have lost.
+        assert!(ember_udp_reachable_from(
+            ember::nat::NatType::Symmetric,
+            Some(now - ttl + 1),
+            now
+        ));
+        assert!(!ember_udp_reachable_from(
+            ember::nat::NatType::Symmetric,
+            Some(now - ttl),
+            now
+        ));
+        // A clock that jumped backwards must not read as fresh-forever or
+        // panic on the subtraction.
+        assert!(ember_udp_reachable_from(
+            ember::nat::NatType::Symmetric,
+            Some(now + 60),
+            now
+        ));
+    }
+
     /// Every precondition a punch needs, each removed in turn. With relay
     /// deliberately excluded, an `Err` here is a genuine dead end for the
     /// pair. The reason is asserted too, because only `SymmetricNat` is shown
@@ -9055,6 +9113,20 @@ struct NetworkState {
     /// Unix time we last received any Ember DHT frame. `None` until the first
     /// one arrives. Drives disconnect detection.
     ember_last_inbound: Option<i64>,
+    /// Unix time a peer we had never contacted reached us on our own UDP port,
+    /// which is the only Ember-native evidence that the port is open to the
+    /// internet. `None` until that happens.
+    ///
+    /// Reachability otherwise comes entirely from the eD2K/KAD side —
+    /// `firewalled` from the server's connect-back or KAD's firewall check,
+    /// `udp_firewalled` from KAD's UDP probe. Both start pessimistic and
+    /// `udp_firewalled` is only ever cleared by a KAD result, so a node running
+    /// Ember with KAD switched off could never learn it was reachable and
+    /// advertised every source record as firewalled for the life of the
+    /// process. That fails safe, but it routes connections through a relay that
+    /// did not need one, and it hides exactly the open-port nodes that make the
+    /// best relays for everyone else. See [`ember_udp_reachable`].
+    ember_udp_reachable_at: Option<i64>,
     /// KAD-bridge bootstrap bookkeeping (slice 13): when the maintenance loop
     /// last DHT-pinged each KAD-learned Ember peer, so the bridge moves
     /// through the `ember_noise_keys` cache instead of re-pinging the same
@@ -12629,6 +12701,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_self_lookup_done = false;
     state.ember_last_self_lookup = 0;
     state.ember_last_inbound = None;
+    state.ember_udp_reachable_at = None;
 
     // Cumulative dev-console counters: start each enable-session clean
     // (matching the session reset above). The live fields — session count,
@@ -13363,6 +13436,7 @@ pub async fn start_network(
         ember_self_lookup_done: false,
         ember_last_self_lookup: 0,
         ember_last_inbound: None,
+        ember_udp_reachable_at: None,
         ember_kad_bridge_attempted: HashMap::new(),
         ember_udp_epx_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
@@ -32067,6 +32141,21 @@ fn can_advertise_direct_udp_callback(state: &NetworkState) -> bool {
 fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
+        // An Ember source record embeds the address peers should dial, and is
+        // only re-announced once `EMBER_SOURCE_REPUBLISH` has elapsed. Leaving
+        // the schedule alone here meant a DHCP lease change or an ISP
+        // reconnection left every source record we had placed advertising the
+        // old address for up to two hours, sending downloaders to whoever holds
+        // it now. Dropping the schedule makes the next publish tick re-announce
+        // with the new address; that tick is already bounded per cycle, so a
+        // large library spreads the work rather than bursting. Keyword records
+        // carry no address, so their schedule is deliberately untouched.
+        state.ember_source_publish_at.clear();
+        // Whatever proved our port was open, proved it about the old address.
+        // A new address can mean a new NAT, a new router, or a different
+        // network entirely, so the evidence has to be earned again rather than
+        // coasting to the end of its TTL.
+        state.ember_udp_reachable_at = None;
     }
     state.external_ip = ip;
     state.routing_table.set_external_ip(ip);
@@ -33710,6 +33799,47 @@ mod ember_publish_scope_tests {
     }
 }
 
+/// How long a stranger's PING keeps proving our UDP port is open.
+///
+/// Long enough that the evidence does not lapse between arrivals — once we are
+/// in the network, gossip keeps bringing strangers to us, but on no fixed
+/// schedule — and short enough that a network change we did not otherwise
+/// notice stops us claiming reachability we have lost. An address change clears
+/// the evidence outright (see [`set_external_ip`]), which catches the common
+/// case long before this expires.
+const EMBER_UDP_REACHABLE_TTL_SECS: i64 = 3600;
+
+/// [`ember_udp_reachable`] over its inputs alone, so the rule can be tested
+/// without standing up a whole `NetworkState`.
+fn ember_udp_reachable_from(
+    nat_type: ember::nat::NatType,
+    proven_at: Option<i64>,
+    now: i64,
+) -> bool {
+    // No NAT at all. The prober reports `Open` only when our own socket address
+    // is the address the world sees, so there is nothing between us and inbound
+    // traffic. This is the one case we can settle without waiting for a peer,
+    // and it covers the dedicated-IP nodes that make the best relays.
+    if nat_type == ember::nat::NatType::Open {
+        return true;
+    }
+    match proven_at {
+        Some(at) => now.saturating_sub(at) < EMBER_UDP_REACHABLE_TTL_SECS,
+        None => false,
+    }
+}
+
+/// Whether Ember has its own evidence that our UDP port is reachable from the
+/// internet, so `udp_firewalled` does not force relayed publishing on a node
+/// that does not need it. See [`NetworkState::ember_udp_reachable_at`].
+fn ember_udp_reachable(state: &NetworkState) -> bool {
+    ember_udp_reachable_from(
+        state.nat_info.nat_type,
+        state.ember_udp_reachable_at,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
 /// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
 /// Runs on the 60-second publish tick, gated on `ember_native_enabled`
@@ -33733,7 +33863,11 @@ async fn maybe_publish_ember_sources(
     // Refresh firewall-awareness gauges every tick (slice 15), even when
     // we skip publishing (empty table / no IP yet).
     let firewalled_like = state.firewalled || state.low_id;
-    let needs_buddy = firewalled_like || state.udp_firewalled;
+    // Only the UDP half of the decision defers to Ember's own evidence. TCP
+    // LowID still forces the firewalled flag: `SOURCE_FLAG_FIREWALLED` also
+    // tells downloaders to reach us through the broker, and an open UDP port
+    // says nothing about whether our TCP port accepts connections.
+    let needs_buddy = firewalled_like || (state.udp_firewalled && !ember_udp_reachable(state));
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
 
@@ -34596,6 +34730,9 @@ async fn handle_ember_dht_message(
     }
 
     let now = chrono::Utc::now().timestamp();
+    // Whether this address was a stranger, read before `handle_message`, which
+    // adds the asker to the routing table at its top.
+    let was_stranger = state.ember_dht.routing().contact_at(from).is_none();
     let inbound = state
         .ember_dht
         .handle_message(payload, from, remote_noise_pub, now);
@@ -34604,6 +34741,20 @@ async fn handle_ember_dht_message(
     // silence is what triggers a re-bootstrap in the maintenance loop.
     if inbound.sender_id.is_some() {
         state.ember_last_inbound = Some(now);
+    }
+
+    // A PING from a public address we had no contact for is the one thing that
+    // proves our own UDP port is open to the internet: we only ever dial peers
+    // already in the routing table, so a stranger cannot be answering us, and
+    // the frame arrived inside a Noise session, so its source cannot have been
+    // spoofed. That leaves no way for it to have reached us through a NAT
+    // mapping we opened. `ember_udp_reachable_at` is the only such evidence
+    // available with KAD switched off — see the field's own note.
+    if inbound.ping_received && was_stranger && !crate::security::is_private_ip(from.ip()) {
+        if state.ember_udp_reachable_at.is_none() {
+            info!("Ember DHT: a stranger reached us on {from}, treating our UDP port as open");
+        }
+        state.ember_udp_reachable_at = Some(now);
     }
 
     if inbound.store_replay_rejected {
