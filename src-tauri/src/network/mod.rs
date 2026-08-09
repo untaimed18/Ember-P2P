@@ -6142,17 +6142,47 @@ mod tests {
     /// minutes, during which publishes had one target and lookups one seed.
     #[test]
     fn a_starved_table_gets_a_wider_ping_budget() {
-        assert_eq!(ember_maint_ping_budget(0), EMBER_MAINT_MAX_PINGS_STARVED);
+        let starved = EMBER_PING_STARVED_BELOW;
         assert_eq!(
-            ember_maint_ping_budget(EMBER_PING_STARVED_BELOW - 1),
+            ember_maint_ping_budget(0, 0),
             EMBER_MAINT_MAX_PINGS_STARVED
         );
-        // Once joined it drops back to the steady-state trickle.
         assert_eq!(
-            ember_maint_ping_budget(EMBER_PING_STARVED_BELOW),
+            ember_maint_ping_budget(starved - 1, starved - 1),
+            EMBER_MAINT_MAX_PINGS_STARVED
+        );
+        // Once joined, a small table drops back to the steady-state trickle.
+        assert_eq!(
+            ember_maint_ping_budget(starved, starved),
             EMBER_MAINT_MAX_PINGS
         );
         assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
+    }
+
+    /// The budget used to be one absolute rate for every table size, so a full
+    /// table took hours to work through and contacts in buckets no lookup
+    /// touched stayed dead until the much later stale sweep.
+    #[test]
+    fn the_ping_budget_follows_the_size_of_the_table() {
+        let joined = EMBER_PING_STARVED_BELOW;
+        let full = ember::dht::K_BUCKET_SIZE * ember::dht::ID_BITS;
+
+        let small = ember_maint_ping_budget(joined, 60);
+        let large = ember_maint_ping_budget(joined, 600);
+        assert!(
+            large > small,
+            "a bigger table has more to check, so it must check more"
+        );
+
+        // Never below the old trickle, and never above a rate the join path
+        // already sustains.
+        for contacts in [0, 1, 60, 600, 6_000, full, usize::MAX] {
+            let budget = ember_maint_ping_budget(joined, contacts);
+            assert!(
+                (EMBER_MAINT_MAX_PINGS..=EMBER_MAINT_MAX_PINGS_STARVED).contains(&budget),
+                "{contacts} contacts produced {budget}"
+            );
+        }
     }
 
     fn queued_record(seed: u8) -> EmberQueuedRecord {
@@ -10183,13 +10213,30 @@ const EMBER_MAINT_MAX_PINGS_STARVED: usize = 32;
 /// k-bucket, the same bar the bridge and rendezvous lookup use for "joined".
 const EMBER_PING_STARVED_BELOW: usize = ember::dht::K_BUCKET_SIZE;
 
-/// Liveness pings this cycle, given how many contacts have actually answered.
-fn ember_maint_ping_budget(verified: usize) -> usize {
+/// Liveness pings this cycle, from how many contacts have answered and how many
+/// there are to keep an eye on.
+///
+/// A flat eight a minute is the same absolute rate whether the table holds
+/// twenty contacts or two thousand, and the table can hold `128 * K` of them.
+/// At eight a minute a full table takes hours to work through, so entries in
+/// buckets no lookup happens to touch sit there dead until the much later stale
+/// sweep. Aiming instead to reach every contact within the window that decides
+/// whether one is stale keeps the sweep proportional to the work in front of it.
+///
+/// Bounded above by the starved budget rather than by a new number: the join
+/// path already sustains that rate, so this cannot ask for more traffic than
+/// the code already treats as acceptable. Bucket refresh deliberately does not
+/// scale the same way — there are always exactly `ID_BITS` buckets however
+/// large the network gets, and three a minute already rotates all of them well
+/// inside `EMBER_BUCKET_REFRESH_SECS`.
+fn ember_maint_ping_budget(verified: usize, contacts: usize) -> usize {
     if verified < EMBER_PING_STARVED_BELOW {
-        EMBER_MAINT_MAX_PINGS_STARVED
-    } else {
-        EMBER_MAINT_MAX_PINGS
+        return EMBER_MAINT_MAX_PINGS_STARVED;
     }
+    let ticks_per_window =
+        (EMBER_CONTACT_PING_SECS.max(1) as u64 / EMBER_MAINT_INTERVAL.as_secs().max(1)).max(1);
+    let per_tick = contacts.div_ceil(ticks_per_window as usize);
+    per_tick.clamp(EMBER_MAINT_MAX_PINGS, EMBER_MAINT_MAX_PINGS_STARVED)
 }
 /// Records a storer replicates onward per maintenance cycle.
 ///
@@ -34489,7 +34536,10 @@ async fn run_ember_maintenance(
     //    A PONG refreshes the contact; silence past EMBER_MAINT_PING_TIMEOUT
     //    faults it (and eventually evicts it) in the 1-second sweep.
     let now = chrono::Utc::now().timestamp();
-    let ping_budget = ember_maint_ping_budget(state.ember_dht.routing().verified_len());
+    let ping_budget = ember_maint_ping_budget(
+        state.ember_dht.routing().verified_len(),
+        state.ember_dht.contact_count(),
+    );
     let due =
         state
             .ember_dht
@@ -39847,6 +39897,26 @@ async fn handle_command_inner(
             diag.ember_dht_node_id = state.ember_dht.local_id().to_hex();
             diag.local_ed25519_public_key = hex::encode(state.ember_dht.ed25519_public_key());
             diag.ember_dht_contacts = state.ember_dht.contact_count() as u32;
+            diag.ember_dht_verified_contacts = state.ember_dht.routing().verified_len() as u32;
+            diag.ember_dht_estimated_nodes = state
+                .ember_dht
+                .routing()
+                .estimated_network_size()
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            diag.ember_dht_republish_backlog = state
+                .ember_dht
+                .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS))
+                as u32;
+            diag.ember_dht_seconds_since_inbound = state
+                .ember_last_inbound
+                .map(|at| {
+                    chrono::Utc::now()
+                        .timestamp()
+                        .saturating_sub(at)
+                        .clamp(0, u32::MAX as i64) as u32
+                })
+                .unwrap_or(0);
             diag.ember_dht_active_searches = state.ember_search.active_count() as u32;
             diag.ember_dht_published_files = state.ember_published_sources.len() as u32;
             let (store_keys, store_records) = state.ember_dht.store_stats();

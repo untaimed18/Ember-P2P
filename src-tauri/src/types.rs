@@ -586,6 +586,29 @@ pub struct EmberDiagnostics {
     /// Live contacts in the Ember DHT routing table.
     #[serde(default)]
     pub ember_dht_contacts: u32,
+    /// Of the above, contacts that have actually answered us. The rest are
+    /// gossip we have been told about and not yet reached, so a table that
+    /// looks full while this stays near zero is a node that is not really in
+    /// the network — which the total alone cannot show.
+    #[serde(default)]
+    pub ember_dht_verified_contacts: u32,
+    /// Rough size of the whole Ember network, from how tightly the peers we
+    /// have proven are packed around our own ID (see
+    /// `RoutingTable::estimated_network_size`). Zero while too few have
+    /// answered for the density to mean anything. A diagnostic only: it is an
+    /// estimate, and a determined peer could skew it.
+    #[serde(default)]
+    pub ember_dht_estimated_nodes: u32,
+    /// Records held for other publishers that are due to be replicated onward
+    /// and have not been yet. Persistently above the per-cycle budget means
+    /// replication is falling behind, which a republish count cannot show.
+    #[serde(default)]
+    pub ember_dht_republish_backlog: u32,
+    /// Seconds since any Ember DHT frame arrived, or zero if none ever has.
+    /// The one number that separates "still joining" from "joined and quiet"
+    /// from "stuck", none of which the other counters distinguish.
+    #[serde(default)]
+    pub ember_dht_seconds_since_inbound: u32,
     /// Ember DHT `PING` frames we sent this session.
     #[serde(default)]
     pub ember_dht_pings_sent: u32,

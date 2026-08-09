@@ -675,6 +675,67 @@ impl RoutingTable {
             .count()
     }
 
+    /// Rough size of the whole network, from the density of the neighbourhood
+    /// we can see.
+    ///
+    /// The nodes nearest us occupy a slice of the keyspace: if the furthest of
+    /// the `m` closest sits at XOR distance `d`, then a `d / 2^128` fraction of
+    /// the space holds `m` nodes, so the whole space holds about
+    /// `m * 2^128 / d`. Counting leading zero bits turns that into a shift — a
+    /// distance with `lz` leading zeros is about `2^(128 - lz)` — which leaves
+    /// `m << lz`.
+    ///
+    /// eMule KAD extrapolates from the depth of its zone tree instead
+    /// (`CRoutingZone::EstimateCount`), which this table has no equivalent of,
+    /// being a flat bucket array. Measuring the neighbourhood directly is the
+    /// standard alternative and does not care how the table is arranged.
+    ///
+    /// Only verified contacts count: gossip is free to send, so counting leads
+    /// would let anyone move the figure by announcing invented neighbours.
+    /// `None` until enough peers have answered for a density to mean anything.
+    /// A sparse neighbourhood reads low rather than high, which is the safe
+    /// direction — it never claims the network is bigger than we can see.
+    ///
+    /// This is a diagnostic, not an input to any limit. Someone willing to grind
+    /// keys until several of them land very close to our ID could inflate what
+    /// it reports, so nothing that decides admission or spending should be
+    /// derived from it without thinking that through first.
+    pub fn estimated_network_size(&self) -> Option<u64> {
+        /// Below this many answered contacts the neighbourhood is too sparse
+        /// for its density to say anything about the whole keyspace.
+        const MIN_SAMPLE: usize = 4;
+
+        let mut distances: Vec<[u8; 16]> = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.contacts.iter())
+            .filter(|c| c.is_verified())
+            .map(|c| self.local_id.distance(&c.node_id).0)
+            .collect();
+        if distances.len() < MIN_SAMPLE {
+            return None;
+        }
+        distances.sort_unstable();
+
+        // One k-bucket's worth is the neighbourhood Kademlia actually keeps
+        // track of; sampling wider would measure buckets we only partly fill.
+        let sample = distances.len().min(K_BUCKET_SIZE);
+        let furthest = distances[sample - 1];
+
+        let mut leading_zeros = 0u32;
+        for byte in furthest {
+            if byte == 0 {
+                leading_zeros += 8;
+            } else {
+                leading_zeros += byte.leading_zeros();
+                break;
+            }
+        }
+
+        let span = 1u64.checked_shl(leading_zeros).unwrap_or(u64::MAX);
+        Some((sample as u64).saturating_mul(span))
+    }
+
     /// Return the `count` closest contacts to `target`, verified ones first
     /// and unverified leads only in slots that would otherwise be empty.
     ///
@@ -1612,6 +1673,50 @@ mod tests {
 
         assert!(rt.verified_len() >= K_BUCKET_SIZE * 4);
         assert_eq!(rt.scale(), scale::NetworkScale::Established);
+    }
+
+    /// KAD extrapolates network size from the depth of its zone tree, which a
+    /// flat bucket array has no equivalent of. How tightly the peers we have
+    /// proven are packed around our own ID answers the same question without
+    /// depending on the table's shape. `contact_in_bucket` flips exactly one
+    /// bit, so a contact in bucket `b` sits at distance `2^b` and the
+    /// arithmetic below is exact rather than approximate.
+    #[test]
+    fn network_size_is_estimated_from_neighbourhood_density() {
+        let local = make_id(0);
+        let seen = 1_700_000_000;
+
+        let mut rt = RoutingTable::new(local, false);
+        for bucket in 124..127 {
+            rt.add_contact(contact_in_bucket(local, bucket, seen));
+        }
+        assert_eq!(rt.verified_len(), 3);
+        assert_eq!(
+            rt.estimated_network_size(),
+            None,
+            "three peers is not a density"
+        );
+
+        // A fourth, the furthest of them half the keyspace away: four nodes
+        // spread over everything is what a four-node network looks like.
+        rt.add_contact(contact_in_bucket(local, 127, seen));
+        assert_eq!(rt.estimated_network_size(), Some(4));
+
+        // The same peer count packed ten bits tighter describes a network 2^10
+        // times larger, which is the whole point of measuring density.
+        let mut tight = RoutingTable::new(local, false);
+        for bucket in 114..118 {
+            tight.add_contact(contact_in_bucket(local, bucket, seen));
+        }
+        assert_eq!(tight.estimated_network_size(), Some(4 * 1024));
+
+        // Gossip is free to send, so it must not move the figure at all.
+        let mut gossiped = RoutingTable::new(local, false);
+        for bucket in 114..118 {
+            gossiped.add_contact(contact_in_bucket(local, bucket, 0));
+        }
+        assert!(gossiped.total_contacts() >= 4);
+        assert_eq!(gossiped.estimated_network_size(), None);
     }
 
     /// The private-IP setting is a user preference that can change at runtime,

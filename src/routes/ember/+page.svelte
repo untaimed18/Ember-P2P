@@ -30,6 +30,7 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { translateError } from '$lib/i18n';
+  import { formatDurationSecs } from '$lib/utils';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -349,11 +350,30 @@
       : m.ember_health_sharing_waiting_hint(),
   );
 
+  // The estimate is a density measurement, so it is shown as approximate and
+  // as unknown until the backend has enough answered contacts to make one.
+  let estimatedNodes = $derived(
+    (diag?.ember_dht_estimated_nodes ?? 0) > 0
+      ? `~${(diag?.ember_dht_estimated_nodes ?? 0).toLocaleString()}`
+      : '\u2014',
+  );
+  // Zero means nothing has ever arrived, which reads as unknown rather than as
+  // "a frame landed this instant".
+  let lastInboundLabel = $derived(
+    (diag?.ember_dht_seconds_since_inbound ?? 0) > 0
+      ? formatDurationSecs(diag?.ember_dht_seconds_since_inbound ?? 0)
+      : '\u2014',
+  );
+
   // `id` exists so the `{#each}` below is keyed on something stable. Keying
   // on the label would put a translator in a position to crash the page:
   // two of these strings colliding in one locale is a duplicate-key error.
   let metrics = $derived([
     { id: 'contacts', k: m.ember_stat_contacts(), v: String(peerCount) },
+    { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: `${diag?.ember_dht_verified_contacts ?? 0}/${peerCount}` },
+    { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
+    { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
+    { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: String(diag?.ember_dht_republish_backlog ?? 0) },
     { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
     { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
     { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },

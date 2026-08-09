@@ -804,6 +804,22 @@ impl DhtStore {
         out
     }
 
+    /// How many records are waiting to be replicated onward — those a
+    /// [`Self::take_republish_batch`] pass would hand out right now.
+    ///
+    /// Purely a gauge, so a maintainer can see replication falling behind its
+    /// per-cycle budget instead of inferring it from a flat republish counter.
+    /// Source records are excluded for the same reason the batch skips them.
+    pub fn republish_backlog(&self, interval: Duration) -> usize {
+        let now = Instant::now();
+        self.entries
+            .values()
+            .flat_map(|records| records.iter())
+            .filter(|r| r.data.first() != Some(&RECORD_TYPE_SOURCE))
+            .filter(|r| r.republish_due || now.duration_since(r.last_republished) >= interval)
+            .count()
+    }
+
     /// Make a record due for republish again after its re-store was dropped
     /// before it reached the wire.
     ///

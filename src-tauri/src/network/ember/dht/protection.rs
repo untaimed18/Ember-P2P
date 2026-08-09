@@ -10,12 +10,35 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use super::messages::{MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD};
+use super::messages::{
+    MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD,
+};
 
 /// Sliding window for per-IP message counts.
 const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// Max DHT frames accepted from one IP per [MSG_WINDOW].
 const MAX_MSGS_PER_WINDOW: u32 = 40;
+
+/// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE`).
+const LOOKUP_WINDOW: Duration = Duration::from_secs(10);
+/// Lookup queries accepted from one peer per [`LOOKUP_WINDOW`].
+///
+/// The frame cap above is one number for every message type, and answering a
+/// lookup is far from the cheapest thing a frame can ask for: a `FIND_VALUE`
+/// costs a store lookup, and both kinds cost a signature over a reply that can
+/// be a hundred times the size of the question. At the flat cap one peer could
+/// ask forty times a second indefinitely. KAD, which has no session to hide
+/// behind, holds keyword searches to five per fifteen seconds; Ember can afford
+/// to be looser because a query only counts once its sender has completed a
+/// Noise handshake, so it cannot be spoofed and the sender pays for its own
+/// traffic.
+///
+/// Six a second sustained is still far above anything honest. The bound to
+/// respect is a peer running many searches at once: each of its walks queries us
+/// at most once per hop, and its own concurrency is capped
+/// (`MAX_ACTIVE_SEARCHES`), so even a peer searching flat out stays well inside
+/// this over a ten-second window.
+const MAX_LOOKUPS_PER_WINDOW: u32 = 60;
 /// Sliding window for STORE floods. The per-peer budget within it is adaptive
 /// — see [`super::scale::NetworkScale::max_stores_per_minute`].
 const STORE_WINDOW: Duration = Duration::from_secs(60);
@@ -100,6 +123,9 @@ pub enum StoreBudgetKey {
 pub struct DhtProtection {
     msg_counters: HashMap<IpAddr, WindowCounter>,
     store_counters: HashMap<StoreBudgetKey, WindowCounter>,
+    /// Lookup budgets, keyed like the store budgets so peers behind one NAT do
+    /// not spend each other's.
+    lookup_counters: HashMap<StoreBudgetKey, WindowCounter>,
     dropped_rate: u64,
     /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
     /// routing table's view of network size.
@@ -117,6 +143,7 @@ impl DhtProtection {
         Self {
             msg_counters: HashMap::new(),
             store_counters: HashMap::new(),
+            lookup_counters: HashMap::new(),
             dropped_rate: 0,
             max_stores: super::scale::NetworkScale::Bootstrap.max_stores_per_minute(),
         }
@@ -206,6 +233,28 @@ impl DhtProtection {
             }
         }
 
+        if matches!(msg_type, MSG_FIND_NODE | MSG_FIND_VALUE) {
+            let budget_key = match sender_id {
+                Some(id) => StoreBudgetKey::Node(id),
+                None => StoreBudgetKey::Addr(ip),
+            };
+            if self.lookup_counters.len() >= MAX_IP_ENTRIES
+                && !self.lookup_counters.contains_key(&budget_key)
+            {
+                self.dropped_rate = self.dropped_rate.saturating_add(1);
+                return false;
+            }
+            let lookup_ok = self
+                .lookup_counters
+                .entry(budget_key)
+                .or_default()
+                .allow(now, LOOKUP_WINDOW, MAX_LOOKUPS_PER_WINDOW);
+            if !lookup_ok {
+                self.dropped_rate = self.dropped_rate.saturating_add(1);
+                return false;
+            }
+        }
+
         true
     }
 
@@ -221,6 +270,13 @@ impl DhtProtection {
             self.store_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.duration_since(s) < STORE_WINDOW * 2)
+                    .unwrap_or(false)
+            });
+        }
+        if self.lookup_counters.len() > MAX_IP_ENTRIES / 2 {
+            self.lookup_counters.retain(|_, c| {
+                c.last_activity()
+                    .map(|s| now.duration_since(s) < LOOKUP_WINDOW * 2)
                     .unwrap_or(false)
             });
         }
@@ -257,6 +313,38 @@ mod tests {
         assert!(!p.allow_message(ip, MSG_STORE_BATCH, None, 1));
         // Non-store traffic from the same peer is unaffected.
         assert!(p.allow_message(ip, MSG_PING, None, 1));
+    }
+
+    /// One flat frame cap treated a `FIND_VALUE` — a store lookup plus a signed
+    /// reply many times the size of the question — as costing the same as a
+    /// `PING`, so one peer could ask forty times a second indefinitely.
+    #[test]
+    fn lookups_are_capped_tighter_than_the_flat_frame_rate() {
+        let mut p = DhtProtection::new();
+        let id = Some([3u8; 16]);
+        // Vary the address so the per-IP frame cap never fires first. The
+        // lookup budget follows the identity, so moving address buys nothing.
+        let addr = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i));
+
+        for i in 0..MAX_LOOKUPS_PER_WINDOW {
+            assert!(p.allow_message(addr(i), MSG_FIND_VALUE, id, 1));
+        }
+        assert!(
+            !p.allow_message(addr(9_999), MSG_FIND_VALUE, id, 1),
+            "the budget is spent, and a fresh address does not restore it"
+        );
+        assert!(
+            !p.allow_message(addr(9_998), MSG_FIND_NODE, id, 1),
+            "both lookup kinds draw on the same budget"
+        );
+        // Cheap traffic from the same peer is unaffected.
+        assert!(p.allow_message(addr(9_997), MSG_PING, id, 1));
+
+        assert!(
+            MAX_LOOKUPS_PER_WINDOW
+                < MAX_MSGS_PER_WINDOW * LOOKUP_WINDOW.as_secs().max(1) as u32,
+            "the lookup cap has to be tighter than the flat frame cap to mean anything"
+        );
     }
 
     /// Two instances behind one NAT must not eat each other's STORE budget.

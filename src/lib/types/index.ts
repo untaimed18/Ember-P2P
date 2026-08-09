@@ -293,6 +293,23 @@ export interface EmberDiagnostics {
   local_ed25519_public_key: string;
   /** Live contacts in the Ember DHT routing table. */
   ember_dht_contacts: number;
+  /** Of `ember_dht_contacts`, those that have actually answered us. The rest
+   *  are gossip we have been told about and not yet reached, so a table that
+   *  looks full while this stays near zero is a node that is not really in the
+   *  network — which the total on its own cannot show. */
+  ember_dht_verified_contacts: number;
+  /** Rough size of the whole Ember network, from how tightly the peers we have
+   *  proven are packed around our own ID. Zero while too few have answered for
+   *  the density to mean anything. An estimate, and a determined peer could
+   *  skew it, so treat it as a diagnostic rather than a fact. */
+  ember_dht_estimated_nodes: number;
+  /** Records held for other publishers that are due to be replicated onward
+   *  and have not been yet. Persistently high means replication is falling
+   *  behind its per-cycle budget. */
+  ember_dht_republish_backlog: number;
+  /** Seconds since any Ember DHT frame arrived, or 0 if none ever has. Separates
+   *  "still joining" from "joined and quiet" from "stuck". */
+  ember_dht_seconds_since_inbound: number;
   ember_dht_pings_sent: number;
   ember_dht_pings_received: number;
   ember_dht_pongs_received: number;

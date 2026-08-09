@@ -790,6 +790,12 @@ impl EmberDht {
         self.store.take_republish_batch(interval, max, force)
     }
 
+    /// Records waiting to be replicated onward (see
+    /// [`DhtStore::republish_backlog`]).
+    pub fn republish_backlog(&self, interval: Duration) -> usize {
+        self.store.republish_backlog(interval)
+    }
+
     /// Re-arm a record whose republish was never queued (see
     /// [`DhtStore::mark_republish_due`]).
     pub fn mark_republish_due(&mut self, key: &[u8; 16], signature: &[u8; 64]) {
