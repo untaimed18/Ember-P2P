@@ -65,19 +65,43 @@ const EXPIRE_VERIFIED_SECS: i64 = 5400; // type 1: 1.5 hours
 const EXPIRE_OPEN_SECS: i64 = 3600; // type 2: 1 hour
 const EXPIRE_CHECKING_SECS: i64 = 120; // CheckingType probe: 2 minutes
 
-/// UDP verification key for KAD 3-way handshake
+/// A peer's UDP verification key, as stored on that peer's contact.
+///
+/// The peer derives the value from *our* address, so it is only the value the
+/// peer expects for as long as our public IP stays the same. `ip` records the
+/// address it is bound to, mirroring eMule's
+/// `CKadUDPKey(nSenderVerifyKey, theApp.GetPublicIP(false))` and the
+/// "key bound IP" field of `nodes.dat`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KadUDPKey {
     pub key: u32,
+    /// Our public IP at the time this key was received. Read the key through
+    /// [`Self::get_key_value`] so a binding left over from a previous address
+    /// reports 0 ("no usable key") instead of a stale value.
     pub ip: u32,
 }
 
 impl KadUDPKey {
-    /// Generate a UDP verify key for a specific peer IP using a keyed hash.
-    /// eMule CPrefs::GetUDPVerifyKey packs into uint64: (key << 32) | ip,
-    /// which on x86 LE means memory layout is [ip_le_4][key_le_4].
-    /// Then XOR-folds the MD5 output and applies % 0xFFFFFFFE + 1.
-    pub fn generate(our_udp_key: u32, their_ip: u32) -> Self {
+    /// Bind a key just received from a peer to our current public IP.
+    pub fn received(key: u32, our_public_ip: u32) -> Self {
+        KadUDPKey {
+            key,
+            ip: our_public_ip,
+        }
+    }
+
+    /// Our own verify key for a peer at `their_ip`, which we send so the peer
+    /// can echo it back (eMule `CPrefs::GetUDPVerifyKey`).
+    ///
+    /// Returns the bare value rather than a [`KadUDPKey`]: this direction binds
+    /// to the *peer's* address, the opposite of a stored key, and conflating
+    /// the two is what previously let the routing-table guard compare a key
+    /// against the wrong address.
+    ///
+    /// eMule packs into a uint64 `(key << 32) | ip`, which on x86 LE means the
+    /// memory layout is `[ip_le_4][key_le_4]`, then XOR-folds the MD5 output
+    /// and applies `% 0xFFFFFFFE + 1`.
+    pub fn verify_key_for(our_udp_key: u32, their_ip: u32) -> u32 {
         let mut hasher = md5::Md5::new();
         // eMule: uint64 buf = (key << 32) | ip => on LE: [ip bytes][key bytes]
         hasher.update(their_ip.to_le_bytes());
@@ -89,15 +113,26 @@ impl KadUDPKey {
         let w2 = u32::from_le_bytes([result[8], result[9], result[10], result[11]]);
         let w3 = u32::from_le_bytes([result[12], result[13], result[14], result[15]]);
         let folded = w0 ^ w1 ^ w2 ^ w3;
-        let key = (folded % 0xFFFFFFFE) + 1;
-        KadUDPKey { key, ip: their_ip }
+        (folded % 0xFFFFFFFE) + 1
     }
 
-    pub fn get_key_value(&self, ip: u32) -> u32 {
-        if ip == self.ip {
+    /// The key while it is still bound to `our_public_ip`, else 0.
+    pub fn get_key_value(&self, our_public_ip: u32) -> u32 {
+        if our_public_ip == self.ip {
             self.key
         } else {
             0
+        }
+    }
+
+    /// The value to echo to the peer. A stale binding yields 0, since the peer
+    /// would reject the old value anyway. With no confirmed public IP yet we
+    /// cannot judge staleness, so send the stored value as a best effort rather
+    /// than dropping to 0 and losing key verification entirely.
+    pub fn value_for(&self, our_public_ip: Option<u32>) -> u32 {
+        match our_public_ip {
+            Some(ip) => self.get_key_value(ip),
+            None => self.key,
         }
     }
 

@@ -1731,7 +1731,7 @@ pub fn run() {
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,
-            commands::deeplink::open_collection_file,
+            commands::deeplink::open_pending_collection,
             commands::updater::secure_updater_check,
             commands::updater::secure_updater_install,
         ])

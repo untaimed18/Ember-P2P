@@ -3933,7 +3933,7 @@
                           <span class="known-friend-dot" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
                         {/if}
                         {#if friendNick}
-                          <span class="known-hash-nick">{friendNick}</span>
+                          <span class="known-hash-nick"><bdi dir="auto">{friendNick}</bdi></span>
                           <span class="known-hash-hex">{kc.user_hash.slice(0, 8) + '\u2026'}</span>
                         {:else}
                           <span class="known-hash-hex">{kc.user_hash.slice(0, 16) + '\u2026'}</span>

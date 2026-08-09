@@ -29,7 +29,7 @@
   import {
     ackPendingDeepLink,
     listPendingDeepLinks,
-    openCollectionFile,
+    openPendingCollection,
     previewDeepLink,
     type DeepLinkPreview,
   } from '$lib/api/deeplink';
@@ -107,7 +107,7 @@
     resolve?.(decision);
   }
 
-  async function handlePayload(raw: string): Promise<HandleResult> {
+  async function handlePayload(raw: string, pendingId: string): Promise<HandleResult> {
     const payload = raw.trim();
     let preview: DeepLinkPreview;
     try {
@@ -186,7 +186,10 @@
         const msg = await downloadServerMet(url);
         if (!destroyed) toastSuccess(msg);
       } else if (preview.kind === 'collection') {
-        const coll = await openCollectionFile(payload);
+        // The native side resolves this durable queue id to the OS-delivered
+        // path. Never return the raw path to an unrestricted path-taking IPC
+        // command, or a compromised renderer could probe arbitrary files.
+        const coll = await openPendingCollection(pendingId);
         if (destroyed) return 'defer';
         const presented = presentIncomingCollection(coll);
         await goto('/library');
@@ -291,7 +294,7 @@
           if (destroyed) break;
           const reviewingDeferred = link.id === reviewRequestedId;
           if (!completedIds.has(link.id)) {
-            const result = await handlePayload(link.payload);
+            const result = await handlePayload(link.payload, link.id);
             if (reviewingDeferred) reviewRequestedId = null;
             if (result === 'done') {
               if (deferredIds.delete(link.id)) syncDeferredCount();

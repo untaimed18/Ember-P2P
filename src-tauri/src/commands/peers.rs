@@ -1529,13 +1529,10 @@ pub async fn ember_ping_peer(
             e,
         )
     })?;
-    let harness_mode = cfg!(debug_assertions) || std::env::var_os("EMBER_HARNESS").is_some();
-    if !harness_mode && crate::security::is_private_ip(ip) {
-        return Err(coded(
-            "peers_cannot_ping_private",
-            "Cannot ping private, loopback, or special-use addresses",
-        ));
-    }
+    require_public_ember_peer_ip(
+        ip,
+        "Cannot ping private, loopback, or special-use addresses",
+    )?;
     let addr = SocketAddr::new(ip, peer_port);
 
     // Treat both an absent field and an empty string as "look it up
@@ -1649,13 +1646,10 @@ pub async fn ember_request_sources(
             e,
         )
     })?;
-    let harness_mode = cfg!(debug_assertions) || std::env::var_os("EMBER_HARNESS").is_some();
-    if !harness_mode && crate::security::is_private_ip(ip) {
-        return Err(coded(
-            "peers_cannot_ping_private",
-            "Cannot exchange with private, loopback, or special-use addresses",
-        ));
-    }
+    require_public_ember_peer_ip(
+        ip,
+        "Cannot exchange with private, loopback, or special-use addresses",
+    )?;
     let addr = SocketAddr::new(ip, peer_port);
 
     // Same "absent or empty string ⇒ look it up" handling as ember_ping_peer.
@@ -1722,6 +1716,28 @@ fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
     let mut k = [0u8; 32];
     k.copy_from_slice(&bytes);
     Ok(k)
+}
+
+/// Local multi-node harnesses intentionally target loopback/LAN peers, but a
+/// production webview must not be able to turn a diagnostic IPC command into
+/// an outbound probe of private or special-use infrastructure.
+fn ember_harness_mode() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("EMBER_HARNESS").is_some()
+}
+
+fn require_public_ember_peer_ip_for_mode(
+    ip: IpAddr,
+    harness_mode: bool,
+    message: &'static str,
+) -> Result<(), String> {
+    if !harness_mode && crate::security::is_private_ip(ip) {
+        return Err(coded("peers_cannot_ping_private", message));
+    }
+    Ok(())
+}
+
+fn require_public_ember_peer_ip(ip: IpAddr, message: &'static str) -> Result<(), String> {
+    require_public_ember_peer_ip_for_mode(ip, ember_harness_mode(), message)
 }
 
 /// Parse a 32-char hex string into a 16-byte Ember node ID / lookup
@@ -1815,6 +1831,10 @@ pub async fn add_ember_dht_contact(
             e,
         )
     })?;
+    require_public_ember_peer_ip(
+        ip,
+        "Cannot add a private, loopback, or special-use DHT contact",
+    )?;
     let ed25519_pub = parse_key32("ed25519_pubkey_hex", ed25519_pubkey_hex.trim())?;
     let noise_pub = parse_key32("noise_pubkey_hex", noise_pubkey_hex.trim())?;
 
@@ -1862,6 +1882,10 @@ pub async fn ember_dht_ping_peer(
             e,
         )
     })?;
+    require_public_ember_peer_ip(
+        ip,
+        "Cannot ping a private, loopback, or special-use DHT peer",
+    )?;
     let addr = SocketAddr::new(ip, peer_port);
 
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
@@ -1950,6 +1974,10 @@ pub async fn ember_dht_find_node(
             e,
         )
     })?;
+    require_public_ember_peer_ip(
+        ip,
+        "Cannot query a private, loopback, or special-use DHT peer",
+    )?;
     let addr = SocketAddr::new(ip, peer_port);
 
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
@@ -2336,7 +2364,9 @@ pub async fn ember_dht_run_maintenance(
 
 #[cfg(test)]
 mod tests {
-    use super::chat_failure_is_permanent;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{chat_failure_is_permanent, require_public_ember_peer_ip_for_mode};
 
     /// The exact strings the `SendChatMessage` handler returns. Pinned here so
     /// renaming one on the network side fails this test instead of silently
@@ -2367,5 +2397,35 @@ mod tests {
                 "{transient:?} must be queued and retried"
             );
         }
+    }
+
+    #[test]
+    fn explicit_ember_peer_targets_are_public_outside_the_harness() {
+        let message = "private peer";
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)),
+        ] {
+            assert!(
+                require_public_ember_peer_ip_for_mode(ip, false, message).is_err(),
+                "{ip} must be rejected outside the local harness"
+            );
+            assert!(
+                require_public_ember_peer_ip_for_mode(ip, true, message).is_ok(),
+                "{ip} must remain available to the local harness"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_ember_peer_accepts_public_ip_outside_the_harness() {
+        assert!(require_public_ember_peer_ip_for_mode(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            false,
+            "public peer",
+        )
+        .is_ok());
     }
 }

@@ -29,11 +29,7 @@ export async function ackPendingDeepLink(id: string): Promise<void> {
   return invoke('ack_pending_deep_link', { id });
 }
 
-/**
- * Load a .emulecollection that was opened via the OS file association. Unlike
- * {@link loadCollection}, the path may live anywhere on disk (Downloads,
- * Desktop, etc.) because the user explicitly opened it.
- */
-export async function openCollectionFile(path: string): Promise<Collection> {
-  return invoke('open_collection_file', { path });
+/** Load an OS-delivered collection through its durable pending-link id. */
+export async function openPendingCollection(id: string): Promise<Collection> {
+  return invoke('open_pending_collection', { id });
 }

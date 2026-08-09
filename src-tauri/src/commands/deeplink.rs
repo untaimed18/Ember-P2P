@@ -10,6 +10,11 @@ use crate::network::ed2k::collection::Collection;
 /// collection paths are well under this; anything larger is almost certainly
 /// junk and rejected before it reaches the buffer.
 const MAX_PAYLOAD_LEN: usize = 8192;
+/// Pending deep-link identifiers are opaque, app-generated tokens. Bound an
+/// IPC-supplied id before using it as a lookup key so arbitrary webview input
+/// cannot turn the durable queue lookup into an unbounded allocation/logging
+/// surface.
+const MAX_PENDING_ID_LEN: usize = 128;
 
 /// Cap on the pending buffer so a flood of links (or a misbehaving caller)
 /// can't grow it without bound before the frontend drains it.
@@ -285,7 +290,8 @@ pub async fn ack_pending_deep_link(
     Ok(())
 }
 
-/// Load a collection from a path supplied by the OS file association.
+/// Load a collection from a path already authorized by an OS file association
+/// or the native file picker.
 ///
 /// Unlike `collections::load_collection` (which constrains the path to the
 /// user's shared/download folders because it's driven by an in-app file
@@ -293,8 +299,12 @@ pub async fn ack_pending_deep_link(
 /// (Downloads, Desktop, an email attachment). The user double-clicking the
 /// file *is* the authorization, so we drop the folder-containment check and
 /// instead lean on extension, regular-file, and size validation.
-#[tauri::command]
-pub async fn open_collection_file(path: String) -> Result<Collection, String> {
+///
+/// This is deliberately not a Tauri command. Exposing a raw unrestricted path
+/// to the webview would let injected renderer code use the OS-authorized
+/// loader as a filesystem oracle. [`open_pending_collection`] resolves an
+/// opaque, server-owned queue id before calling this function.
+pub(crate) async fn open_collection_file(path: String) -> Result<Collection, String> {
     const MAX_PATH_LEN: usize = 4 * 1024;
     if path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
@@ -348,6 +358,46 @@ pub async fn open_collection_file(path: String) -> Result<Collection, String> {
     .map_err(|e| coded_ctx("collections_load_task_failed", "Load task failed", e))?
 }
 
+fn collection_path_from_pending(pending: &[PendingDeepLink], id: &str) -> Result<String, String> {
+    if id.is_empty() || id.len() > MAX_PENDING_ID_LEN {
+        return Err(coded(
+            "deeplink_terminal_invalid",
+            "Unknown pending deep link",
+        ));
+    }
+    let payload = pending
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.payload.clone())
+        .ok_or_else(|| coded("deeplink_terminal_invalid", "Unknown pending deep link"))?;
+    let preview = preview_deep_link_payload(&payload)?;
+    if preview.kind != "collection" {
+        return Err(coded(
+            "deeplink_terminal_invalid",
+            "Pending deep link is not a collection",
+        ));
+    }
+    Ok(payload)
+}
+
+/// Open an OS-delivered collection by its durable queue identifier.
+///
+/// The server resolves the opaque identifier against `pending_deep_links`
+/// rather than accepting a renderer-provided path. The entry remains queued
+/// until the existing acknowledgement flow confirms the Library presentation,
+/// preserving retry behaviour if parsing or navigation fails.
+#[tauri::command]
+pub async fn open_pending_collection(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Collection, String> {
+    let path = {
+        let pending = state.pending_deep_links.lock();
+        collection_path_from_pending(&pending, &id)?
+    };
+    open_collection_file(path).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +430,30 @@ mod tests {
         assert!(preview_deep_link_payload("ed2k://|server|not-an-ip|0|/").is_err());
         assert!(preview_deep_link_payload("ed2k://|serverlist|http://example.test/x|/").is_err());
         assert!(preview_deep_link_payload("ed2k://|unknown|value|/").is_err());
+    }
+
+    #[test]
+    fn pending_collection_lookup_authorizes_only_queued_collection_paths() {
+        let pending = vec![
+            PendingDeepLink {
+                id: "collection".to_string(),
+                payload: r"C:\Users\Ember\Downloads\shared.emulecollection".to_string(),
+            },
+            PendingDeepLink {
+                id: "file-link".to_string(),
+                payload: "ed2k://|file|example.iso|1|0123456789abcdef0123456789abcdef|/"
+                    .to_string(),
+            },
+        ];
+
+        assert_eq!(
+            collection_path_from_pending(&pending, "collection").unwrap(),
+            r"C:\Users\Ember\Downloads\shared.emulecollection"
+        );
+        assert!(collection_path_from_pending(&pending, "file-link").is_err());
+        assert!(collection_path_from_pending(&pending, "unknown").is_err());
+        assert!(
+            collection_path_from_pending(&pending, &"a".repeat(MAX_PENDING_ID_LEN + 1)).is_err()
+        );
     }
 }

@@ -20817,7 +20817,6 @@ pub async fn start_network(
                     if let Some(ip) = state.firewall_checker.external_ip() {
                         set_external_ip(&mut state, Some(ip));
                         state.stats.external_ip = ip.to_string();
-                        state.routing_table.set_external_ip(ip);
                     }
                     info!("Firewall check result: TCP={:?} UDP={:?} (ports tcp={} udp={})",
                         tcp_status, udp_status, state.tcp_port, state.udp_port);
@@ -25512,7 +25511,10 @@ pub async fn start_network(
             // A4AF swap evaluation every 8 minutes
             _ = a4af_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
+                // A4AF only retasks existing eD2K peer sources. It has no
+                // KAD dependency, so a KAD-only status gate silently disabled
+                // it for the default server-only configuration. Empty pending
+                // downloads/source lists make the work below a no-op.
                 let mut file_priorities: HashMap<[u8; 16], ed2k::a4af::FileSwapInfo> = HashMap::new();
                 let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
                 for (tid, pd) in &state.pending_downloads {
@@ -28990,7 +28992,6 @@ pub async fn start_network(
                         if let std::net::IpAddr::V4(ip) = addr.ip() {
                             set_external_ip(&mut state, Some(ip));
                             state.stats.external_ip = ip.to_string();
-                            state.routing_table.set_external_ip(ip);
                             info!(
                                 "NAT probe ({}): learned external IP {} via STUN",
                                 result.reason, ip
@@ -31684,14 +31685,16 @@ async fn send_kad_packet(
             std::net::IpAddr::V4(ip) => u32::from(ip),
             _ => 0,
         };
-        let sender_key = KadUDPKey::generate(state.udp_key_seed, their_ip);
+        let sender_key = KadUDPKey::verify_key_for(state.udp_key_seed, their_ip);
+        // The peer's key is bound to *our* address, not theirs, so echo it back
+        // against our own public IP.
         let receiver_key_val = contact
             .and_then(|c| c.udp_key)
             .filter(|k| k.is_valid())
-            .map(|k| k.get_key_value(their_ip))
+            .map(|k| k.value_for(state.external_ip.map(u32::from)))
             .unwrap_or(0);
         let encrypted =
-            obfuscation::encrypt_kad_packet(packet, target_id, sender_key.key, receiver_key_val);
+            obfuscation::encrypt_kad_packet(packet, target_id, sender_key, receiver_key_val);
         socket.send_to(&encrypted, addr).await
     } else {
         socket.send_to(packet, addr).await
@@ -31833,15 +31836,18 @@ async fn send_kad_response(
         std::net::IpAddr::V4(ip) => u32::from(ip),
         _ => 0,
     };
+    // A peer's key is bound to *our* public IP, so it is read back against that
+    // rather than the peer's address.
+    let our_public_ip = state.external_ip.map(u32::from);
     let receiver_key_val = peer_udp_key
         .filter(|k| k.is_valid())
-        .map(|k| k.get_key_value(their_ip))
+        .map(|k| k.value_for(our_public_ip))
         .unwrap_or_else(|| {
             target_id
                 .and_then(|id| state.routing_table.get_contact(id))
                 .and_then(|c| c.udp_key)
                 .filter(|k| k.is_valid())
-                .map(|k| k.get_key_value(their_ip))
+                .map(|k| k.value_for(our_public_ip))
                 .unwrap_or(0)
         });
     let target_kad_id = target_id.copied();
@@ -31864,7 +31870,7 @@ async fn send_kad_response(
         // `supports_obfuscation` branch requires `target_id`), so this always
         // resolves to a valid eMule key path.
         let kad_id = target_kad_id.unwrap_or_else(KadId::zero);
-        let sender_key = KadUDPKey::generate(state.udp_key_seed, their_ip).key;
+        let sender_key = KadUDPKey::verify_key_for(state.udp_key_seed, their_ip);
         let encrypted =
             obfuscation::encrypt_kad_packet(packet, &kad_id, sender_key, receiver_key_val);
         socket.send_to(&encrypted, addr).await
@@ -31983,11 +31989,16 @@ fn can_advertise_direct_udp_callback(state: &NetworkState) -> bool {
 /// the atomic back to `0`, which the Hello builder interprets as "advertise
 /// client_id=0 and let the peer's BaseClient auto-heal from the connect IP"
 /// — correct fallback behavior when we don't yet have a trusted public IP.
+///
+/// The routing table is updated here too: KAD contact UDP keys are bound to our
+/// public address, so a table left on a stale IP would judge every stored key
+/// against the wrong one.
 fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
     }
     state.external_ip = ip;
+    state.routing_table.set_external_ip(ip);
     let client_id_le = match ip {
         Some(v4) => u32::from_le_bytes(v4.octets()),
         None => 0,
@@ -32280,7 +32291,7 @@ async fn send_udp_firewall_probe_request(
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&udp_port.to_le_bytes());
     payload.extend_from_slice(&external_udp_port.to_le_bytes());
-    let receiver_key = KadUDPKey::generate(udp_key_seed, u32::from(contact.ip)).key;
+    let receiver_key = KadUDPKey::verify_key_for(udp_key_seed, u32::from(contact.ip));
     payload.extend_from_slice(&receiver_key.to_le_bytes());
     write_ed2k_packet_simple(
         &mut writer,
@@ -32322,7 +32333,7 @@ async fn send_kad_udp_firewall_result(
         };
         let addr = SocketAddr::new(peer_ip.into(), port);
         let result = if receiver_udp_key != 0 {
-            let sender_key = KadUDPKey::generate(state.udp_key_seed, u32::from(peer_ip)).key;
+            let sender_key = KadUDPKey::verify_key_for(state.udp_key_seed, u32::from(peer_ip));
             let encrypted = obfuscation::encrypt_kad_packet(
                 &packet,
                 &KadId::zero(),
@@ -33574,7 +33585,6 @@ async fn maybe_publish_ember_sources(
                 std::net::IpAddr::V4(ip) => {
                     set_external_ip(state, Some(ip));
                     state.stats.external_ip = ip.to_string();
-                    state.routing_table.set_external_ip(ip);
                     ip
                 }
                 std::net::IpAddr::V6(_) => {
@@ -35395,7 +35405,7 @@ async fn handle_udp_packet_inner(
         Err(_first_err) => {
             let receiver_vk = match from.ip() {
                 std::net::IpAddr::V4(ip) => {
-                    KadUDPKey::generate(state.udp_key_seed, u32::from(ip)).key
+                    KadUDPKey::verify_key_for(state.udp_key_seed, u32::from(ip))
                 }
                 _ => 0,
             };
@@ -35410,7 +35420,14 @@ async fn handle_udp_packet_inner(
                 receiver_vk,
                 sender_ip_u32,
             ) {
-                packet_sender_udp_key = decrypted.sender_udp_key;
+                // The peer derived this key from our address, so bind it to our
+                // current public IP: eMule's
+                // `CKadUDPKey(nSenderVerifyKey, theApp.GetPublicIP())`. That
+                // binding is what lets a key left over from a previous address
+                // read as absent instead of as a hijack attempt.
+                packet_sender_udp_key = decrypted
+                    .sender_verify_key
+                    .map(|key| KadUDPKey::received(key, state.external_ip.map_or(0, u32::from)));
                 packet_valid_receiver_key = decrypted.valid_receiver_key;
                 // Obfuscation hides the packed-protocol marker from the
                 // pre-decrypt check. Charge the same CPU/byte budget now,

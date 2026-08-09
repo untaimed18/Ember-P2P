@@ -888,32 +888,44 @@ enum AddResult {
 fn apply_existing_contact_update(
     bin: &mut RoutingBin,
     contact: KadContact,
-    // Host-order external IP (`RoutingTable::external_ip`). Retained for the
-    // caller's signature; the UDP-key check below is keyed on the peer's
-    // address, not ours.
-    _external_ip: Option<u32>,
+    // Host-order external IP (`RoutingTable::external_ip`). A stored UDP key is
+    // bound to our address, so the check below needs it to tell a stale binding
+    // from a real conflict.
+    external_ip: Option<u32>,
     global_ip_count: &HashMap<Ipv4Addr, u32>,
     global_subnet_count: &HashMap<u32, u32>,
 ) -> Option<(Ipv4Addr, Ipv4Addr)> {
     let Some(existing) = bin.get_contact_mut(&contact.id) else {
         return None;
     };
-    // eMule UDPKey sender verification: once a contact has a valid UDP key,
-    // an update claiming its KadID must present the same key. Prevents
-    // contact hijacking.
+    // eMule UDPKey sender verification: once a contact has a valid UDP key, an
+    // update claiming its KadID must present the same key. Prevents contact
+    // hijacking, since a claimant cannot produce the value without the original
+    // peer's seed.
     //
-    // Compare the raw key values. This used to ask `get_key_value(our_ip)`
-    // on both sides, but in this codebase a UDP key is tagged with the *peer*
-    // address it was derived for (`KadUDPKey::generate(our_udp_key,
-    // their_ip)`, and both send paths read it back with the destination's
-    // IP) — so querying with our own address always returned 0, the guard
-    // body never executed, and any peer that had learned our verify key
-    // could retarget an arbitrary routing-table entry to itself. Because the
-    // key is a function of the peer's address, a claimant at a different
-    // address cannot produce it.
+    // Read both sides through `get_key_value(our_ip)`, as eMule does. A stored
+    // key is the peer's key *for us* — it is derived from our address, so our
+    // own public IP changing makes every stored key something the peer will
+    // never send again. Evaluating a stale binding to 0 turns it into "no key
+    // on record", which skips the guard and lets the contact refresh normally;
+    // comparing raw values instead treated it as a permanent conflict and
+    // locked out every keyed contact until it expired.
+    //
+    // Note this is deliberately *not* keyed on the peer's address: the value
+    // does not depend on it, so a contact rebinding behind NAT keeps matching
+    // and migrates through `change_contact_ip` below.
     if let Some(existing_key) = existing.udp_key.filter(|k| k.is_valid()) {
-        let incoming_key_val = contact.udp_key.map(|k| k.key).unwrap_or(0);
-        if incoming_key_val != existing_key.key {
+        let (stored_key_val, incoming_key_val) = match external_ip {
+            Some(our_ip) => (
+                existing_key.get_key_value(our_ip),
+                contact.udp_key.map_or(0, |k| k.get_key_value(our_ip)),
+            ),
+            // With no confirmed public IP we cannot distinguish a stale binding
+            // from a mismatch. Compare raw values so an unverifiable update is
+            // refused: not knowing our address must not open the guard.
+            None => (existing_key.key, contact.udp_key.map_or(0, |k| k.key)),
+        };
+        if stored_key_val != 0 && incoming_key_val != stored_key_val {
             tracing::debug!(
                 "RT reject update for {}: UDPKey mismatch (sender key empty: {})",
                 existing.id,
@@ -1079,9 +1091,11 @@ impl RoutingTable {
         self.big_timer_global_deadline = now;
     }
 
-    /// Set our external/public IP for UDPKey sender verification.
-    pub fn set_external_ip(&mut self, ip: Ipv4Addr) {
-        self.external_ip = Some(u32::from(ip));
+    /// Set our external/public IP for UDPKey sender verification. `None` (no
+    /// confirmed address) makes the guard fall back to comparing raw key values
+    /// rather than treating every stored binding as stale.
+    pub fn set_external_ip(&mut self, ip: Option<Ipv4Addr>) {
+        self.external_ip = ip.map(u32::from);
     }
 
     /// Set the range-based IP filter for blocking contacts on insert.
@@ -1718,6 +1732,141 @@ impl RoutingTable {
 
         let modify = ancestor_contacts as f64 / (K_BUCKET_SIZE as f64 * 2.0);
         (2.0f64.powi(leaf_level as i32 - 2) * K_BUCKET_SIZE as f64 * modify) as u32
+    }
+}
+
+/// A stored contact UDP key is bound to *our* public address, so these cover
+/// both halves of that: a binding from a previous address must not be mistaken
+/// for a hijack attempt, and a current binding must still refuse a key it
+/// doesn't match.
+#[cfg(test)]
+mod udp_key_guard_tests {
+    use super::*;
+
+    const OUR_IP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+    const OUR_PREVIOUS_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+    const PEER_KEY: u32 = 0x1234_5678;
+    const OTHER_KEY: u32 = 0x8765_4321;
+
+    fn keyed_contact(udp_key: Option<KadUDPKey>, tcp_port: u16) -> KadContact {
+        let now = chrono::Utc::now().timestamp();
+        KadContact {
+            id: KadId([0x5A; 16]),
+            ip: Ipv4Addr::new(1, 2, 3, 4),
+            udp_port: 4672,
+            tcp_port,
+            version: KADEMLIA_VERSION9_50A,
+            last_seen: now,
+            verified: true,
+            contact_type: CONTACT_TYPE_OPEN,
+            udp_key,
+            kad_options: 0,
+            created_at: now,
+            expires_at: 0,
+            last_type_set: 0,
+            received_hello: false,
+        }
+    }
+
+    /// `tcp_port` is copied over unconditionally once the guard admits an
+    /// update, which makes it a clean probe for "was this applied?" — the
+    /// return value of `insert` cannot distinguish a refusal from an
+    /// applied update that left the IP unchanged.
+    fn tcp_port_after_update(
+        stored: Option<KadUDPKey>,
+        incoming: Option<KadUDPKey>,
+        our_ip: Option<Ipv4Addr>,
+    ) -> u16 {
+        let mut table = RoutingTable::new(KadId([0xFF; 16]), false);
+        table.set_external_ip(our_ip);
+        assert!(
+            table.insert(keyed_contact(stored, 4662)),
+            "the initial contact must be accepted"
+        );
+        let update = keyed_contact(incoming, 4663);
+        table.insert(update.clone());
+        table
+            .get_contact(&update.id)
+            .expect("the contact must survive either outcome")
+            .tcp_port
+    }
+
+    #[test]
+    fn a_binding_from_our_previous_address_lets_the_contact_refresh() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_PREVIOUS_IP))),
+                Some(KadUDPKey::received(OTHER_KEY, u32::from(OUR_IP))),
+                Some(OUR_IP),
+            ),
+            4663,
+            "a key bound to our old address is stale, not conflicting"
+        );
+    }
+
+    /// After our address changes, a peer has no key we would recognise. It must
+    /// still be able to refresh, or every keyed contact goes stale until expiry.
+    #[test]
+    fn a_stale_binding_accepts_a_peer_presenting_no_key() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_PREVIOUS_IP))),
+                None,
+                Some(OUR_IP),
+            ),
+            4663,
+        );
+    }
+
+    #[test]
+    fn a_current_binding_still_refuses_a_different_key() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_IP))),
+                Some(KadUDPKey::received(OTHER_KEY, u32::from(OUR_IP))),
+                Some(OUR_IP),
+            ),
+            4662,
+            "a claimant without the peer's key must not retarget the entry"
+        );
+    }
+
+    #[test]
+    fn a_current_binding_still_refuses_an_absent_key() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_IP))),
+                None,
+                Some(OUR_IP),
+            ),
+            4662,
+        );
+    }
+
+    #[test]
+    fn a_matching_key_updates_the_contact() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_IP))),
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_IP))),
+                Some(OUR_IP),
+            ),
+            4663,
+        );
+    }
+
+    /// Before any address is confirmed, staleness is indistinguishable from a
+    /// mismatch, so the guard has to stay closed rather than fail open.
+    #[test]
+    fn an_unknown_external_ip_keeps_the_guard_closed() {
+        assert_eq!(
+            tcp_port_after_update(
+                Some(KadUDPKey::received(PEER_KEY, u32::from(OUR_IP))),
+                Some(KadUDPKey::received(OTHER_KEY, u32::from(OUR_IP))),
+                None,
+            ),
+            4662,
+        );
     }
 }
 

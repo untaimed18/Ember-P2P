@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::mem::size_of;
 
 use tracing::debug;
@@ -188,10 +188,11 @@ fn keyword_budget_key(sender_id: &KadId, sender_ip: Option<std::net::Ipv4Addr>) 
 struct PublisherUsage {
     entries: usize,
     bytes: usize,
-    /// Targets this publisher holds entries under. A search hint for
-    /// eviction, not authoritative: stale names are pruned when an eviction
-    /// pass trips over them and the whole map is rebuilt by `cleanup_expired`.
-    targets: HashSet<KadId>,
+    /// Per-target entry counts for this publisher. Keeping counts rather than
+    /// a plain set lets removals retire a target as soon as its final entry
+    /// leaves, so eviction never wastes its bounded probe budget on a long
+    /// prefix of expired names.
+    targets: HashMap<KadId, usize>,
 }
 
 /// Fold a stored keyword entry into its publisher's global usage.
@@ -211,7 +212,14 @@ fn publisher_usage_add(
         .bytes
         .saturating_sub(freed_bytes)
         .saturating_add(bytes);
-    record.targets.insert(*target);
+    if added_entries > 0 {
+        *record.targets.entry(*target).or_insert(0) += added_entries;
+    } else {
+        // An in-place refresh normally finds an existing count. Preserve a
+        // minimally useful hint if a prior interrupted migration left the
+        // derived index incomplete; the periodic rebuild will make it exact.
+        record.targets.entry(*target).or_insert(1);
+    }
     let record_bytes = record.bytes;
 
     // Cheap running "who is holding the most" hint. It can go stale when the
@@ -232,6 +240,7 @@ fn publisher_usage_remove(
     usage: &mut HashMap<PublisherKey, PublisherUsage>,
     heaviest: &mut Option<PublisherKey>,
     publisher: &PublisherKey,
+    target: &KadId,
     bytes: usize,
 ) {
     let Some(record) = usage.get_mut(publisher) else {
@@ -239,6 +248,12 @@ fn publisher_usage_remove(
     };
     record.entries = record.entries.saturating_sub(1);
     record.bytes = record.bytes.saturating_sub(bytes);
+    if let Some(target_entries) = record.targets.get_mut(target) {
+        *target_entries = target_entries.saturating_sub(1);
+        if *target_entries == 0 {
+            record.targets.remove(target);
+        }
+    }
     let drained = record.entries == 0;
     if drained {
         usage.remove(publisher);
@@ -354,6 +369,7 @@ impl DhtStore {
                 &mut self.keyword_publisher_usage,
                 &mut self.heaviest_keyword_publisher,
                 &publisher,
+                target,
                 bytes,
             );
         }
@@ -555,6 +571,7 @@ impl DhtStore {
                         &mut self.keyword_publisher_usage,
                         &mut self.heaviest_keyword_publisher,
                         &old_key,
+                        target,
                         old_bytes,
                     );
                     publisher_usage_add(
@@ -699,7 +716,7 @@ impl DhtStore {
             .keyword_publisher_usage
             .get(publisher)?
             .targets
-            .iter()
+            .keys()
             .take(KEYWORD_EVICTION_TARGET_PROBES)
             .copied()
             .collect();
@@ -745,6 +762,7 @@ impl DhtStore {
             &mut self.keyword_publisher_usage,
             &mut self.heaviest_keyword_publisher,
             publisher,
+            &target,
             bytes,
         );
         Some(bytes)
@@ -1140,7 +1158,7 @@ impl DhtStore {
                     .or_default();
                 record.entries += 1;
                 record.bytes = record.bytes.saturating_add(entry.retained_bytes);
-                record.targets.insert(*target);
+                *record.targets.entry(*target).or_insert(0) += 1;
             }
         }
         self.heaviest_keyword_publisher = self
@@ -1290,6 +1308,11 @@ mod keyword_store_tests {
             store.heaviest_keyword_publisher,
             Some(PublisherKey::Id(heavy))
         );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Id(heavy)].targets[&heavy_target],
+            2,
+            "per-target accounting must retain every entry under this key"
+        );
 
         let bytes_before = store.total_retained_bytes;
         let mut budget = MAX_KEYWORD_EVICTIONS_PER_PUBLISH;
@@ -1306,6 +1329,11 @@ mod keyword_store_tests {
             remaining[0].id,
             entry(1).id,
             "the largest entry must be the one shed"
+        );
+        assert_eq!(
+            store.keyword_publisher_usage[&PublisherKey::Id(heavy)].targets[&heavy_target],
+            1,
+            "eviction must retire exactly one per-target usage count"
         );
         assert!(store.total_retained_bytes < bytes_before);
         assert_eq!(

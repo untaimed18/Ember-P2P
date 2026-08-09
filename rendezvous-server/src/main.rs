@@ -802,6 +802,28 @@ fn capability_allows_peer(
         && (entry.open_intro || entry.peer_pubkey == *peer_pubkey)
 }
 
+/// A live capability remains owned by the identity that first registered it.
+/// An expired entry is not presence and may be claimed by a new owner.
+fn capability_owner_allows_register(
+    entry: &PairwisePresenceEntry,
+    pubkey: &[u8; 32],
+    now: Instant,
+) -> bool {
+    entry.expires_at <= now || entry.pubkey == *pubkey
+}
+
+/// Recompute a friend-code intro capability from the owner's public key.
+///
+/// Must stay byte-identical to the client's `derive_intro_presence_capability`.
+/// Because the inputs are public, the server can check that an intro registrant
+/// actually owns the namespace it claims instead of merely owning some key.
+/// Pairwise capabilities come from a shared secret and remain unverifiable
+/// here, which is why they rely on secrecy plus the owner pin above.
+fn derive_intro_presence_capability(owner_pubkey: &[u8; 32], epoch: i64) -> [u8; 32] {
+    let context = format!("ember-intro-presence-v1:{epoch}");
+    blake3::derive_key(&context, owner_pubkey)
+}
+
 #[derive(Clone)]
 struct RateEntry {
     count: u64,
@@ -2611,6 +2633,16 @@ async fn capability_register_impl(
     if body.intro && peer_pubkey != pubkey {
         return StatusCode::BAD_REQUEST;
     }
+    // An intro capability is derived from the owner's public key and the epoch,
+    // both of which travel in a public `ember2:` friend code. Anyone holding
+    // that code can therefore derive a victim's current capability and sign a
+    // valid registration for it with their own key. Recomputing the derivation
+    // binds the namespace to its owner, so a stranger cannot claim it at all —
+    // neither to replace a live entry nor to squat an epoch before the owner
+    // registers, which the owner pin alone would still permit.
+    if body.intro && capability != derive_intro_presence_capability(&pubkey, body.epoch) {
+        return StatusCode::FORBIDDEN;
+    }
     let Ok(ip) = body.ip.parse::<IpAddr>() else {
         return StatusCode::BAD_REQUEST;
     };
@@ -2694,8 +2726,26 @@ async fn capability_register_impl(
     }
     let mut capabilities = state.capability_store.write().await;
     let key = body.capability.to_lowercase();
+    let now = Instant::now();
+    // A capability is a namespace whose presence owner must remain stable for
+    // its live lifetime. Pairwise capabilities are secret, but friend-code
+    // intro capabilities are intentionally derivable from a public key and
+    // epoch; without this pin, anyone holding a friend's public code could
+    // register the same current-epoch intro capability with their own identity
+    // and replace the real owner's address. The signature proves only that the
+    // *claimant* owns its key, not that it owns this capability.
+    //
+    // Let an expired entry be claimed by a new owner: it is no longer a live
+    // presence, and the normal insertion path below will replace it. A live
+    // owner can still refresh an address, port, proof version, or peer binding.
+    if capabilities
+        .get(&key)
+        .is_some_and(|entry| !capability_owner_allows_register(entry, &pubkey, now))
+    {
+        return StatusCode::FORBIDDEN;
+    }
     if capabilities.len() >= MAX_STORE_ENTRIES && !capabilities.contains_key(&key) {
-        capabilities.retain(|_, entry| entry.expires_at > Instant::now());
+        capabilities.retain(|_, entry| entry.expires_at > now);
         if capabilities.len() >= MAX_STORE_ENTRIES {
             return StatusCode::SERVICE_UNAVAILABLE;
         }
@@ -4594,13 +4644,44 @@ mod relay_ticket_tests {
         ));
     }
 
+    #[test]
+    fn capability_owner_pin_allows_refresh_and_expired_reclaim() {
+        let owner = [0x22; 32];
+        let claimant = [0x33; 32];
+        let now = Instant::now();
+        let entry = PairwisePresenceEntry {
+            ip: "8.8.8.8".parse().unwrap(),
+            port: 4662,
+            expires_at: now + Duration::from_secs(30),
+            peer_pubkey: owner,
+            open_intro: true,
+            pubkey: owner,
+            epoch: 7,
+            legacy_proof: None,
+            v4_proof: None,
+        };
+
+        assert!(capability_owner_allows_register(&entry, &owner, now));
+        assert!(!capability_owner_allows_register(&entry, &claimant, now));
+
+        let expired = PairwisePresenceEntry {
+            expires_at: now
+                .checked_sub(Duration::from_secs(1))
+                .expect("instant supports a one-second subtraction"),
+            ..entry
+        };
+        assert!(capability_owner_allows_register(&expired, &claimant, now));
+    }
+
     #[tokio::test]
     async fn intro_capability_registration_allows_any_registered_lookup() {
         let state = test_state();
         let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
         let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
-        let capability = [0xB1; 32];
         let epoch = now_unix_secs().div_euclid(15 * 60);
+        // The server recomputes this derivation, so an intro registration only
+        // succeeds for the key the capability actually belongs to.
+        let capability = derive_intro_presence_capability(&bob_pubkey, epoch);
         let register_ts = now_unix_secs();
         let register_message = build_capability_register_v4_msg(
             &capability,
@@ -4672,6 +4753,112 @@ mod relay_ticket_tests {
         assert_eq!(response.0.ip, "8.8.4.4");
         assert_eq!(response.0.port, 4662);
         assert_eq!(response.0.pubkey, hex::encode(bob_pubkey));
+
+        // An `ember2:` friend code intentionally exposes enough public data for
+        // anyone to derive the owner's current intro capability, so a registered
+        // attacker can produce a perfectly valid signature over it with their
+        // own identity. The namespace still belongs to the key it derives from.
+        let attacker_message = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4663,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            &alice_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+        let attacker_legacy_message = build_capability_register_v3_msg(
+            &capability,
+            epoch,
+            4663,
+            [1, 1, 1, 1],
+            &alice_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(CapabilityRegisterRequest {
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 4663,
+                    ip: "1.1.1.1".to_string(),
+                    pubkey: hex::encode(alice_pubkey),
+                    peer_pubkey: hex::encode(alice_pubkey),
+                    ts: register_ts,
+                    sig: hex::encode(alice.sign(&attacker_message).to_bytes()),
+                    intro: true,
+                    legacy_sig: Some(hex::encode(alice.sign(&attacker_legacy_message).to_bytes(),)),
+                }),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an intro capability may only be registered by the key it derives from"
+        );
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("the owner's live capability remains");
+        assert_eq!(entry.pubkey, bob_pubkey);
+        assert_eq!(entry.ip, "8.8.4.4".parse::<IpAddr>().unwrap());
+        assert_eq!(entry.port, 4662);
+    }
+
+    /// Owner pinning alone would leave an unclaimed epoch open: whoever
+    /// registers first wins, so an attacker holding a public friend code could
+    /// take the victim's namespace at each epoch rollover and suppress their
+    /// friend-code discovery. Verifying the derivation refuses the claim
+    /// outright, with no live entry needed to defend it.
+    #[tokio::test]
+    async fn intro_capability_cannot_be_squatted_before_its_owner_registers() {
+        let state = test_state();
+        let (alice, _alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
+        let victim_pubkey = [0x77; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let register_ts = now_unix_secs();
+        let capability = derive_intro_presence_capability(&victim_pubkey, epoch);
+        let squat_message = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4663,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            &alice_pubkey,
+            &alice_pubkey,
+            register_ts,
+        );
+
+        assert_eq!(
+            capability_register_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(CapabilityRegisterRequest {
+                    capability: hex::encode(capability),
+                    epoch,
+                    port: 4663,
+                    ip: "1.1.1.1".to_string(),
+                    pubkey: hex::encode(alice_pubkey),
+                    peer_pubkey: hex::encode(alice_pubkey),
+                    ts: register_ts,
+                    sig: hex::encode(alice.sign(&squat_message).to_bytes()),
+                    intro: true,
+                    legacy_sig: None,
+                }),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an unclaimed intro namespace must not be squattable by a stranger"
+        );
+        assert!(
+            state.capability_store.read().await.is_empty(),
+            "a refused squat must not leave presence behind"
+        );
     }
 
     #[tokio::test]

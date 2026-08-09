@@ -1761,6 +1761,9 @@ impl PinnedTempDir {
             let path = self.path.join(name);
             match create_new_nofollow(&path) {
                 Ok(file) => {
+                    // The shared helper re-opens no-follow with WRITE_DAC;
+                    // `create_new_nofollow` does not request that access, so the
+                    // returned handle cannot carry the ACL write itself.
                     crate::security::restrict_file_permissions_checked(&path)?;
                     return Ok((path, file));
                 }

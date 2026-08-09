@@ -770,6 +770,11 @@ pub fn restrict_file_permissions_checked(path: &Path) -> std::io::Result<()> {
 
 /// Restrict an already-opened object, avoiding a second pathname lookup after
 /// filesystem policy has validated the handle.
+///
+/// On Windows the handle must carry both `WRITE_DAC` and `READ_CONTROL`, since
+/// marking the DACL protected makes the write read the existing descriptor
+/// first. `GENERIC_WRITE` supplies `READ_CONTROL` but never `WRITE_DAC`, so an
+/// ordinary write handle is rejected with `ERROR_ACCESS_DENIED`.
 pub fn restrict_open_file_permissions_checked(
     file: &std::fs::File,
     is_dir: bool,
@@ -879,11 +884,169 @@ fn current_user_only_acl(is_dir: bool) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Apply a protected, current-user-only DACL in a single `SetNamedSecurityInfo`
-/// call so inheritance removal and the explicit grant cannot leave an empty
-/// DACL if the process dies mid-update.
+#[cfg(target_os = "windows")]
+fn reparse_acl_refusal() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "refusing to apply an ACL through a reparse point",
+    )
+}
+
+/// Apply a protected, current-user-only DACL, preferring a handle opened
+/// without following a final reparse point.
+///
+/// `SetNamedSecurityInfoW` resolves its pathname argument at call time and
+/// *does* traverse junctions, so a swap between the metadata lookup and the ACL
+/// write could retarget the permissions change at an attacker-chosen object.
+/// Opening once with `FILE_FLAG_OPEN_REPARSE_POINT` and writing the DACL to
+/// that handle closes both the traversal and the race.
 #[cfg(target_os = "windows")]
 fn restrict_windows_acl_atomic(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    // Attributes are served from the parent's directory entry, so they stay
+    // readable even for an object whose own DACL grants nothing.
+    let entry_attributes = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata.file_attributes()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+        Err(error) => return Err(error),
+    };
+    if entry_attributes.is_some_and(|attributes| attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
+        return Err(reparse_acl_refusal());
+    }
+    let hint_directory =
+        entry_attributes.is_some_and(|attributes| attributes & FILE_ATTRIBUTE_DIRECTORY != 0);
+
+    if restrict_windows_acl_by_handle(path, hint_directory)? {
+        return Ok(());
+    }
+    // An object left with an empty DACL denies every handle open — including
+    // the owner's WRITE_DAC — and that lockout is exactly what this helper
+    // exists to repair. The pathname API is the only route the OS still honours
+    // there, so fall back to it for an entry just read as a non-link. That read
+    // does not pin the name the way a handle would, so this last resort keeps a
+    // narrow swap window; it is confined to objects that already deny all
+    // access, which in practice are our own files under our own app directory.
+    let Some(attributes) = entry_attributes else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot restrict an ACL on an object that permits neither an open nor an attribute read",
+        ));
+    };
+    restrict_windows_acl_by_path(path, attributes & FILE_ATTRIBUTE_DIRECTORY != 0)
+}
+
+/// Write the DACL through a no-follow handle.
+///
+/// `Ok(false)` means no handle could be obtained at all because the object's
+/// current DACL denies even its owner, which the caller repairs by pathname.
+#[cfg(target_os = "windows")]
+fn restrict_windows_acl_by_handle(path: &Path, hint_directory: bool) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
+    // Marking the DACL protected makes `SetSecurityInfo` read the existing
+    // descriptor before replacing it, so WRITE_DAC on its own is rejected with
+    // ERROR_ACCESS_DENIED. The pathname API requested this for itself.
+    const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let open = |directory: bool, read_attributes: bool| -> std::io::Result<std::fs::File> {
+        let mut access = WRITE_DAC_ACCESS | READ_CONTROL_ACCESS;
+        if read_attributes {
+            access |= FILE_READ_ATTRIBUTES;
+        }
+        let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+        if directory {
+            flags |= FILE_FLAG_BACKUP_SEMANTICS;
+        }
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+    };
+
+    // Directories only open with BACKUP_SEMANTICS; files open either way. Try
+    // the richest form first and degrade, since attribute access is a
+    // convenience here but a lockout-repair must not depend on it.
+    let mut opened = None;
+    let mut first_error = None;
+    for (directory, read_attributes) in [
+        (hint_directory, true),
+        (hint_directory, false),
+        (!hint_directory, true),
+        (!hint_directory, false),
+    ] {
+        match open(directory, read_attributes) {
+            Ok(file) => {
+                opened = Some((file, directory, read_attributes));
+                break;
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    let Some((file, opened_as_directory, read_attributes)) = opened else {
+        let error = first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "could not open the target to restrict its ACL",
+            )
+        });
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return Ok(false);
+        }
+        return Err(error);
+    };
+
+    let mut is_dir = opened_as_directory;
+    if read_attributes {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The open never followed a final reparse point, so this rejects
+        // applying an ACL *to* a link rather than through one.
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(reparse_acl_refusal());
+        }
+        is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    }
+    restrict_open_file_permissions_checked(&file, is_dir).map(|()| true)
+}
+
+/// Last-resort DACL write by pathname, for an object no handle can be opened
+/// against. Only reachable from [`restrict_windows_acl_atomic`] after the
+/// directory entry has been confirmed to be a non-link.
+#[cfg(target_os = "windows")]
+fn restrict_windows_acl_by_path(path: &Path, is_dir: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
@@ -891,30 +1054,22 @@ fn restrict_windows_acl_atomic(path: &Path) -> std::io::Result<()> {
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    let is_dir = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir(),
-        // Empty DACLs make ordinary metadata fail; still attempt ACL repair.
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
-        Err(error) => return Err(error),
-    };
-
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
-    let acl_buf = current_user_only_acl(is_dir)?;
-
-    unsafe {
-        let status = SetNamedSecurityInfoW(
+    let acl = current_user_only_acl(is_dir)?;
+    let status = unsafe {
+        SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            acl_buf.as_ptr().cast(),
+            acl.as_ptr().cast(),
             std::ptr::null(),
-        );
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
-        }
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
     }
     Ok(())
 }
@@ -1018,6 +1173,9 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
         })?
     };
     if restrict {
+        // `restrict_file_permissions_checked` re-opens no-follow with WRITE_DAC
+        // internally. The write handle above deliberately does not request
+        // WRITE_DAC, so applying the ACL to it directly would fail.
         if let Err(error) = restrict_file_permissions_checked(&tmp) {
             drop(f);
             let _ = std::fs::remove_file(&tmp);
@@ -1627,5 +1785,59 @@ mod tests {
         restrict_file_permissions_checked(&file).expect("ACL repair must restore owner access");
         assert_eq!(std::fs::read(&file).unwrap(), b"state");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pathname that names a junction must never have its ACL written, and the
+    /// junction's target must be left alone: the pathname form of the ACL write
+    /// traverses reparse points, so a swapped name could otherwise redirect a
+    /// permissions change onto an attacker-chosen object.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn refuses_to_apply_an_acl_through_a_junction() {
+        use std::os::windows::process::CommandExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "ember-acl-junction-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let created = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(created.status.success());
+
+        let acl_of = |path: &Path| {
+            let output = std::process::Command::new("icacls")
+                .arg(path)
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let before = acl_of(&target);
+
+        let error = restrict_file_permissions_checked(&link)
+            .expect_err("a junction must not receive the ACL meant for its name");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            acl_of(&target),
+            before,
+            "the junction target's ACL must be untouched"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

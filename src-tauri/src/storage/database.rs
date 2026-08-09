@@ -2208,8 +2208,8 @@ impl Database {
                     row.get::<_, i64>(2)?.max(0) as u64,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?.max(0) as u32,
-                    row.get::<_, i64>(6)?.max(0) as u32,
+                    row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
+                    row.get::<_, i64>(6)?.clamp(0, i64::from(u32::MAX)) as u32,
                     row.get::<_, i64>(7)?.max(0) as u64,
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)? != 0,
@@ -3451,6 +3451,32 @@ mod tests {
         }
     }
 
+    /// Minimal schema for testing the defensive SQLite-to-memory conversion
+    /// used by `load_ember_credits`.
+    fn ember_credits_only_db() -> Database {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE ember_credits (
+                pub_key BLOB PRIMARY KEY,
+                uploaded INTEGER NOT NULL DEFAULT 0,
+                downloaded INTEGER NOT NULL DEFAULT 0,
+                last_upload_time INTEGER NOT NULL DEFAULT 0,
+                last_download_time INTEGER NOT NULL DEFAULT 0,
+                completed_sessions INTEGER NOT NULL DEFAULT 0,
+                total_sessions INTEGER NOT NULL DEFAULT 0,
+                avg_upload_speed INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                ident_verified INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("create schema");
+        Database {
+            conn: Mutex::new(conn),
+            chat_key: Some(Zeroizing::new([0xA5; 32])),
+            corrupt_backup: None,
+        }
+    }
+
     /// Build a `Database` with just the friends-related tables, enough to
     /// exercise blocking without a `tauri::AppHandle`.
     fn friends_only_db() -> Database {
@@ -3503,6 +3529,26 @@ mod tests {
             .lock()
             .query_row(sql, [], |r| r.get(0))
             .expect("count")
+    }
+
+    #[test]
+    fn load_ember_credits_clamps_corrupt_session_counters() {
+        let db = ember_credits_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO ember_credits (
+                    pub_key, uploaded, downloaded, last_upload_time, last_download_time,
+                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified
+                ) VALUES (?1, 0, 0, 0, 0, ?2, ?3, 0, 0, 0)",
+                params![vec![0xA5u8; 32], 5_000_000_000i64, -1i64],
+            )
+            .expect("insert corrupt counters");
+
+        let records = db.load_ember_credits().expect("load credits");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].5, u32::MAX);
+        assert_eq!(records[0].6, 0);
     }
 
     /// The point of a block is that it outlives the friendship it ended.

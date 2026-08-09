@@ -6,7 +6,7 @@
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::types::{KadId, KadUDPKey};
+use super::types::KadId;
 use digest::Digest;
 
 const MAGICVALUE_UDP_SYNC_CLIENT: u32 = 0x395F2EC1;
@@ -75,7 +75,10 @@ impl Rc4State {
 
 pub struct DecryptedKadPacket {
     pub payload: Vec<u8>,
-    pub sender_udp_key: Option<KadUDPKey>,
+    /// The sender's verify key exactly as it arrived. Binding it to our public
+    /// IP is the caller's job (see [`KadUDPKey::received`]); this layer knows
+    /// the sender's address but not ours.
+    pub sender_verify_key: Option<u32>,
     pub valid_receiver_key: bool,
 }
 
@@ -117,7 +120,6 @@ pub fn try_decrypt_kad_packet(
             data,
             &md5::Md5::digest(&key_data[..23]),
             receiver_verify_key,
-            sender_ip,
         ) {
             return Some(result);
         }
@@ -130,7 +132,6 @@ pub fn try_decrypt_kad_packet(
             data,
             &md5::Md5::digest(&vkey_data),
             receiver_verify_key,
-            sender_ip,
         ) {
             return Some(result);
         }
@@ -144,7 +145,6 @@ pub fn try_decrypt_kad_packet(
         data,
         &md5::Md5::digest(&nid_data),
         receiver_verify_key,
-        sender_ip,
     ) {
         return Some(result);
     }
@@ -158,7 +158,6 @@ pub fn try_decrypt_kad_packet(
         data,
         &md5::Md5::digest(&key_data[..23]),
         receiver_verify_key,
-        sender_ip,
     ) {
         return Some(result);
     }
@@ -171,7 +170,6 @@ pub fn try_decrypt_kad_packet(
             data,
             &md5::Md5::digest(&vkey_data),
             receiver_verify_key,
-            sender_ip,
         ) {
             return Some(result);
         }
@@ -333,7 +331,6 @@ fn try_decrypt_with_key(
     data: &[u8],
     rc4_key: &[u8],
     expected_receiver_key: u32,
-    sender_ip: u32,
 ) -> Option<DecryptedKadPacket> {
     let mut rc4 = Rc4State::new(rc4_key);
 
@@ -386,18 +383,10 @@ fn try_decrypt_with_key(
 
     let receiver_key = u32::from_le_bytes(receiver_key_bytes);
     let sender_key = u32::from_le_bytes(sender_key_bytes);
-    let sender_udp_key = if sender_key != 0 {
-        Some(KadUDPKey {
-            key: sender_key,
-            ip: sender_ip,
-        })
-    } else {
-        None
-    };
 
     Some(DecryptedKadPacket {
         payload: decrypted,
-        sender_udp_key,
+        sender_verify_key: (sender_key != 0).then_some(sender_key),
         valid_receiver_key: expected_receiver_key != 0 && receiver_key == expected_receiver_key,
     })
 }

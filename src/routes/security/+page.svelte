@@ -662,7 +662,9 @@
                   <span class="range-arrow">&rarr;</span>
                   <span class="ip-range">{entry.end_ip}</span>
                 </td>
-                <td class="desc-cell" title={entry.description}>{entry.description || '\u2014'}</td>
+                <td class="desc-cell" title={entry.description}>
+                  <bdi dir="auto">{entry.description || '\u2014'}</bdi>
+                </td>
                 <td class="hits-cell">
                   {#if entry.hits === 0}
                     <span class="no-hits">0</span>
