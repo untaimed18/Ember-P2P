@@ -751,6 +751,33 @@ impl DhtStore {
         self.entries.len()
     }
 
+    /// Records this node holds that were **not** authored by
+    /// `local_publisher_key` — genuinely stored on another publisher's
+    /// behalf, as opposed to a record of this node's own that happens to
+    /// have landed in its own store (this node can be one of the k-closest
+    /// nodes to its own content). Expired records are excluded, matching
+    /// [`Self::get_live`] rather than the raw [`Self::get`].
+    ///
+    /// Returns `(keys_with_at_least_one_foreign_record, foreign_record_count)`.
+    pub fn foreign_stats(&self, local_publisher_key: &[u8; 32]) -> (usize, usize) {
+        let now = Instant::now();
+        let mut keys = 0usize;
+        let mut records = 0usize;
+        for recs in self.entries.values() {
+            let mut any = false;
+            for r in recs {
+                if r.expires_at > now && &r.publisher_key != local_publisher_key {
+                    records += 1;
+                    any = true;
+                }
+            }
+            if any {
+                keys += 1;
+            }
+        }
+        (keys, records)
+    }
+
     /// Snapshot of live keys for the diagnostic UI. Sorted by record count
     /// descending, capped at `max`.
     pub fn snapshot(&self, max: usize) -> Vec<DhtStoreEntry> {
@@ -1567,6 +1594,58 @@ mod tests {
         ));
         let kept = &store.get(&key).unwrap()[0].data;
         assert_eq!(&kept[33..65], &good[33..65]);
+    }
+
+    /// The whole point of `foreign_stats` is telling "storing for others"
+    /// apart from "my own record happens to be in my own store" — so a
+    /// record we authored ourselves must not count towards it.
+    #[test]
+    fn foreign_stats_excludes_our_own_records_and_expired_ones() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let us = SigningKey::generate(&mut OsRng);
+        let us_pk = us.verifying_key().to_bytes();
+        let them = SigningKey::generate(&mut OsRng);
+        let them_pk = them.verifying_key().to_bytes();
+
+        let ours = SignedRecord::keyword("ubuntu", [1u8; 16], [0u8; 32], 100, "mine.iso", &us);
+        let theirs =
+            SignedRecord::keyword("fedora", [2u8; 16], [0u8; 32], 200, "theirs.iso", &them);
+        assert!(store.store(
+            ours.keyword_hash,
+            ours.data.clone(),
+            ours.signature,
+            ours.publisher_key,
+            ours.timestamp
+        ));
+        assert!(store.store(
+            theirs.keyword_hash,
+            theirs.data.clone(),
+            theirs.signature,
+            theirs.publisher_key,
+            theirs.timestamp
+        ));
+
+        let (keys, records) = store.foreign_stats(&us_pk);
+        assert_eq!(keys, 1, "only the other publisher's key counts");
+        assert_eq!(records, 1, "our own record must not count as foreign");
+
+        // An expired foreign record must not count either.
+        for r in store.entries.get_mut(&theirs.keyword_hash).unwrap() {
+            r.expires_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        let (keys, records) = store.foreign_stats(&us_pk);
+        assert_eq!(keys, 0, "an expired foreign record must not count");
+        assert_eq!(records, 0);
+
+        // Sanity: nothing crashes and returns zero for a key we hold nothing
+        // foreign under.
+        let (keys, records) = store.foreign_stats(&them_pk);
+        assert_eq!(keys, 1, "our own record is foreign from their point of view");
+        assert_eq!(records, 1);
     }
 
     #[test]

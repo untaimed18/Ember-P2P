@@ -1158,6 +1158,7 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
                     part_hashes: Vec::new(),
+                    ember_verified: false,
                 })
                 .await;
             return Ok(());
@@ -3613,6 +3614,10 @@ impl MultiSourceDownload {
                         transfer_id: self.transfer_id.clone(),
                         final_path: Some(actual_final.to_string_lossy().into_owned()),
                         part_hashes: verified_part_hashes,
+                        // Reaching this branch means `verified_result` was
+                        // `Some`, which only happens after the Ember BLAKE3
+                        // check above passed (or there was none to run).
+                        ember_verified: ember_expected != [0u8; 32],
                     })
                     .await;
             } else {

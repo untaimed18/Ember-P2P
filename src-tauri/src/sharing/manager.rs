@@ -546,6 +546,17 @@ impl TransferManager {
         }
     }
 
+    /// Records whether `DownloadEvent::Completed` actually re-checked this
+    /// download's Ember content BLAKE3 hash and matched it, so the Transfers
+    /// UI can show a badge for a check that ran rather than inferring one
+    /// from `expected_aich`-style presence (which the crash-recovery
+    /// re-verify paths would get wrong, since they skip the Ember check).
+    pub fn set_ember_verified(&mut self, id: &str, verified: bool) {
+        if let Some(t) = self.get_transfer_mut(id) {
+            t.ember_verified = verified;
+        }
+    }
+
     pub fn complete(&mut self, id: &str) -> Option<Vec<Transfer>> {
         let mut transfer = self.active.remove(id);
         if transfer.is_none() {

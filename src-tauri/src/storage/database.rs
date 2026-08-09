@@ -1719,6 +1719,11 @@ impl Database {
                         up_part_status: None,
                         up_part_count: None,
                         up_peer_part_status: None,
+                        // Not persisted (see the `ember_verified` field doc):
+                        // completed transfers never come back through this
+                        // loader, and an incomplete one hasn't been checked
+                        // yet either way.
+                        ember_verified: false,
                     })
                 },
             )?

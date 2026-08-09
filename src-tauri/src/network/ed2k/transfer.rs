@@ -397,6 +397,13 @@ pub enum DownloadEvent {
         /// single-source callback downloads, restart re-verification),
         /// in which case the handler falls back to the old re-read.
         part_hashes: Vec<[u8; 16]>,
+        /// Whether an Ember content BLAKE3 hash was known for this file
+        /// *and* actually re-checked against the completed bytes on disk
+        /// during this completion. `false` for zero-byte files, transfers
+        /// with no Ember hash to check, and the crash-recovery re-verify
+        /// paths in `network::mod` that only re-check ed2k/AICH — never
+        /// `true` on a path that skipped the check.
+        ember_verified: bool,
     },
     Failed {
         transfer_id: String,
@@ -1161,6 +1168,7 @@ impl Ed2kDownload {
                     transfer_id: self.transfer_id.clone(),
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
                     part_hashes: Vec::new(),
+                    ember_verified: false,
                 })
                 .await;
             return Ok(());
@@ -1211,6 +1219,11 @@ impl Ed2kDownload {
                         // internal verified hashset to this out-parameter list;
                         // the completion handler falls back to a disk re-read.
                         part_hashes: Vec::new(),
+                        // `download_from_streams` only reaches `Ok` after its
+                        // internal Ember BLAKE3 check passed (or there was
+                        // none to run) — reflect the latter case here from
+                        // whether we had a hash to check in the first place.
+                        ember_verified: self.ember_file_hash != [0u8; 32],
                     })
                     .await;
                 Ok(())

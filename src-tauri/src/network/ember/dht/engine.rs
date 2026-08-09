@@ -658,6 +658,15 @@ impl EmberDht {
         self.store.key_cap_rejections()
     }
 
+    /// Local store stats `(distinct_keys, total_records)` restricted to
+    /// records authored by someone else — what this node is genuinely
+    /// storing on the network's behalf, as opposed to [`Self::store_stats`],
+    /// which also counts a record of our own that happens to have landed in
+    /// our own store.
+    pub fn foreign_store_stats(&self) -> (usize, usize) {
+        self.store.foreign_stats(&self.ed25519_public_key())
+    }
+
     /// Snapshot of live store keys for the diagnostic UI (capped).
     pub fn store_entries(&self, max: usize) -> Vec<DhtStoreEntry> {
         self.store.snapshot(max)

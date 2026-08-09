@@ -3168,6 +3168,9 @@
                 {:else if column.key === 'status'}
                   <td class="status-cell">
                     <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
+                    {#if t.status === 'completed' && t.ember_verified}
+                      <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
+                    {/if}
                   </td>
                 {:else if column.key === 'remaining'}
                   {@const spd = liveSpeed(t)}
@@ -3328,6 +3331,9 @@
                   {:else if column.key === 'status'}
                     <td class="status-cell">
                       <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
+                      {#if t.status === 'completed' && t.ember_verified}
+                        <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
+                      {/if}
                       <!--
                         L10: surface failure_kind / failure_stage in the
                         tooltip so the user can distinguish transient from
@@ -5118,6 +5124,24 @@
     color: var(--text-muted);
     background: transparent;
     border-color: var(--border);
+  }
+  /* Ember content-hash verification badge: a completed download whose
+     BLAKE3 was actually re-checked on disk (see `Transfer.ember_verified`),
+     not merely a file that happened to have one known. Pill shape shared
+     with `.rep-badge` but kept as its own class since the two badges sit
+     in different columns and answer unrelated questions. */
+  .ember-verified-badge {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1.4;
+    vertical-align: middle;
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--success) 34%, transparent);
   }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */

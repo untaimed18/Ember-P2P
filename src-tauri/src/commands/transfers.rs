@@ -709,6 +709,7 @@ pub async fn start_download(
         up_part_status: None,
         up_part_count: None,
         up_peer_part_status: None,
+        ember_verified: false,
     };
 
     let active_now = {

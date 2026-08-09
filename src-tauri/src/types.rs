@@ -255,6 +255,14 @@ pub struct Transfer {
     /// [`up_part_count`]: Transfer::up_part_count
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_peer_part_status: Option<String>,
+    /// Downloads only: the file's Ember content BLAKE3 was checked against
+    /// `nodes_ember.dat`/DHT-sourced hash during this completion and matched
+    /// (see `DownloadEvent::Completed::ember_verified`). `false` covers both
+    /// "no Ember hash was known to check" and the crash-recovery re-verify
+    /// paths, which only re-check the ed2k/AICH hash — so this only ever
+    /// claims a check that actually ran.
+    #[serde(default)]
+    pub ember_verified: bool,
 }
 
 fn default_priority() -> String {
@@ -604,6 +612,16 @@ pub struct EmberDiagnostics {
     /// Total signed records held in the local Ember DHT store (gauge).
     #[serde(default)]
     pub ember_dht_stored_records: u32,
+    /// Of the above, distinct keys holding at least one record authored by
+    /// someone other than us — what we're genuinely storing on the
+    /// network's behalf, rather than a record of our own that happens to
+    /// have landed in our own store (see `EmberDht::foreign_store_stats`).
+    #[serde(default)]
+    pub ember_dht_stored_for_others_keys: u32,
+    /// Of `ember_dht_stored_records`, how many were authored by someone
+    /// other than us (see `ember_dht_stored_for_others_keys`).
+    #[serde(default)]
+    pub ember_dht_stored_for_others_records: u32,
     /// Records we accepted (verified + stored) this session. Counted per
     /// record rather than per frame, since a `STORE_BATCH` carries many.
     #[serde(default)]

@@ -128,6 +128,12 @@ export interface Transfer {
    *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the
    *  green served-this-session fill. */
   up_peer_part_status?: string;
+  /** Downloads only: true once this completion re-checked the file's Ember
+   *  content BLAKE3 hash on disk and it matched. Only ever set by a
+   *  completion that actually ran the check — never inferred from
+   *  `expected_aich`-style presence, since the crash-recovery re-verify
+   *  path skips it. */
+  ember_verified: boolean;
 }
 
 export interface SourceInfo {
@@ -295,6 +301,13 @@ export interface EmberDiagnostics {
   ember_dht_active_searches: number;
   ember_dht_stored_keys: number;
   ember_dht_stored_records: number;
+  /** Of `ember_dht_stored_keys`, keys holding at least one record authored
+   *  by someone other than us — see `ember_dht_stored_for_others_records`. */
+  ember_dht_stored_for_others_keys: number;
+  /** Of `ember_dht_stored_records`, how many were authored by someone other
+   *  than us: what this node is genuinely storing on the network's behalf,
+   *  rather than a record of its own that happens to be in its own store. */
+  ember_dht_stored_for_others_records: number;
   ember_dht_stores_received: number;
   ember_dht_find_values_received: number;
   ember_dht_active_publishes: number;

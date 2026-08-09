@@ -14796,6 +14796,12 @@ pub async fn start_network(
                                             final_path.to_string_lossy().into_owned(),
                                         ),
                                         part_hashes: Vec::new(),
+                                        // This crash-recovery path only
+                                        // re-checks ed2k/AICH, never Ember's
+                                        // content BLAKE3 (see `hash_matches`
+                                        // above) — never claim a check that
+                                        // did not run.
+                                        ember_verified: false,
                                     })
                                     .await;
                             } else {
@@ -14878,6 +14884,9 @@ pub async fn start_network(
                                                 // re-checks the whole-file ed2k hash,
                                                 // not a per-part hashset.
                                                 part_hashes: Vec::new(),
+                                                // Same path — no Ember content
+                                                // BLAKE3 re-check either.
+                                                ember_verified: false,
                                             })
                                             .await;
                                     }
@@ -15649,6 +15658,7 @@ pub async fn start_network(
                     ref transfer_id,
                     ref final_path,
                     part_hashes: ref event_part_hashes,
+                    ..
                 } = event
                 {
                     {
@@ -39032,6 +39042,7 @@ async fn handle_command_inner(
                                 up_part_status: None,
                                 up_part_count: None,
                                 up_peer_part_status: None,
+                                ember_verified: false,
                             };
                             let _ = db_ref.save_transfer(&db_transfer);
                         }
@@ -39508,6 +39519,9 @@ async fn handle_command_inner(
             let (store_keys, store_records) = state.ember_dht.store_stats();
             diag.ember_dht_stored_keys = store_keys as u32;
             diag.ember_dht_stored_records = store_records as u32;
+            let (foreign_keys, foreign_records) = state.ember_dht.foreign_store_stats();
+            diag.ember_dht_stored_for_others_keys = foreign_keys as u32;
+            diag.ember_dht_stored_for_others_records = foreign_records as u32;
             // Both publish paths: single-record operations (proxy-store
             // forwarding, the manual command) plus batches awaiting an ack.
             // Reading only the former showed zero while the batch publisher
@@ -43538,6 +43552,7 @@ async fn handle_download_event(
         DownloadEvent::Completed {
             transfer_id,
             final_path,
+            ember_verified,
             ..
         } => {
             // A download reaches Completed only after every part is present
@@ -43560,6 +43575,7 @@ async fn handle_download_event(
                 if let Some(ref fp) = final_path {
                     mgr.set_completed_path(&transfer_id, fp.clone());
                 }
+                mgr.set_ember_verified(&transfer_id, ember_verified);
                 mgr.complete(&transfer_id)
             } {
                 // Mirror the upload path: only count after `complete()`
@@ -43819,6 +43835,7 @@ async fn handle_upload_event(
                 up_part_status: None,
                 up_part_count: None,
                 up_peer_part_status: None,
+                ember_verified: false,
             };
             {
                 let mut mgr = transfer_manager.write().await;
