@@ -433,29 +433,26 @@ impl DhtStore {
             // publisher's records per packet and then have its entry dropped by
             // the `continue`s further down — free, repeatable deletion of honest
             // records, against publishers that only republish every 20 hours.
-            // Replacements are exempt: they cost no slot and their byte delta is
-            // priced below.
+            // Replacements are priced here too. Exempting them left the same
+            // hole from the other side: a publisher republishing one entry near
+            // `MAX_RETAINED_BYTES_PER_ENTRY` evicted for the byte delta and was
+            // then refused by its own caps below, so the eviction bought nothing
+            // and was never refunded.
             //
-            // KNOWN RESIDUAL: that exemption is not airtight, and neither is the
-            // new-entry path. Both branches evaluate their remaining guards
-            // *after* `evict_keyword_bytes` has run and can still `continue`, and
-            // an eviction is never refunded — so a publisher republishing one
-            // entry near `MAX_RETAINED_BYTES_PER_ENTRY` can shed up to
-            // `MAX_KEYWORD_EVICTIONS_PER_PUBLISH` of the heaviest other
-            // publisher's records and store nothing. It needs the store already
-            // at `MAX_TOTAL_RETAINED_BYTES`, which the per-type byte shares now
-            // make much harder to reach, and the victim must be the heaviest
-            // publisher. Fixing it properly means splitting the per-key and
-            // per-publisher guards (final regardless of eviction) from the total
-            // caps (the only thing eviction can help) and checking the former
-            // before evicting — deliberately not attempted here, because getting
-            // that arithmetic subtly wrong would hand out free budget instead.
-            let is_replacement = self.keyword_entries.get(target).is_some_and(|bucket| {
+            // Every value read here predates the eviction, and eviction only ever
+            // *removes* entries, so each is an upper bound on the post-eviction
+            // state: whatever passes here still passes afterwards. That is what
+            // lets both branches below re-check only the global caps — the ones
+            // eviction exists to relieve — leaving a publisher's own allowance
+            // decided in exactly one place.
+            let replaced = self.keyword_entries.get(target).and_then(|bucket| {
                 bucket
                     .iter()
-                    .any(|e| e.id == entry.id && e.source_id == *sender_id)
+                    .find(|e| e.id == entry.id && e.source_id == *sender_id)
+                    .map(|e| (e.retained_bytes, e.keyword_budget_key()))
             });
-            if !is_replacement {
+            let is_replacement = replaced.is_some();
+            {
                 let existing = self.keyword_entries.get(target);
                 let bucket_len = existing.map_or(0, |bucket| bucket.len());
                 let key_bytes_now = existing.map_or(0, |bucket| retained_bytes(bucket));
@@ -469,13 +466,33 @@ impl DhtStore {
                 let usage = self.keyword_publisher_usage.get(&budget_key);
                 let publisher_entries_now = usage.map_or(0, |usage| usage.entries);
                 let publisher_total_bytes_now = usage.map_or(0, |usage| usage.bytes);
-                if sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER
-                    || publisher_entries_now >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER
-                    || bucket_len >= MAX_ENTRIES_PER_KEY
-                    || key_bytes_now.saturating_add(entry_bytes) > MAX_RETAINED_BYTES_PER_KEY
-                    || publisher_bytes_now.saturating_add(entry_bytes)
+                // A replacement frees the bytes it already holds. It only keeps
+                // its publisher-level credit while it stays on the same budget
+                // key: a routing-table contact keeps its KAD id across an address
+                // change, so an entry can be charged to a different key than the
+                // packet arrives on, and it is landing on the new key for the
+                // first time.
+                let (old_bytes, same_budget_key) = match replaced {
+                    Some((bytes, old_key)) => (bytes, old_key == budget_key),
+                    None => (0, false),
+                };
+                let publisher_credit = if same_budget_key { old_bytes } else { 0 };
+                if (!is_replacement
+                    && (sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER
+                        || bucket_len >= MAX_ENTRIES_PER_KEY))
+                    || ((!is_replacement || !same_budget_key)
+                        && publisher_entries_now >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER)
+                    || key_bytes_now
+                        .saturating_sub(old_bytes)
+                        .saturating_add(entry_bytes)
+                        > MAX_RETAINED_BYTES_PER_KEY
+                    || publisher_bytes_now
+                        .saturating_sub(old_bytes)
+                        .saturating_add(entry_bytes)
                         > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
-                    || publisher_total_bytes_now.saturating_add(entry_bytes)
+                    || publisher_total_bytes_now
+                        .saturating_sub(publisher_credit)
+                        .saturating_add(entry_bytes)
                         > MAX_KEYWORD_BYTES_PER_PUBLISHER
                 {
                     continue;
@@ -488,18 +505,13 @@ impl DhtStore {
             if over_total_bytes || over_total_count {
                 // A refresh of an entry we already hold costs no slot and only
                 // the byte difference, so price it before deciding to evict.
-                let replaced = self.keyword_entries.get(target).and_then(|bucket| {
-                    bucket
-                        .iter()
-                        .find(|e| e.id == entry.id && e.source_id == *sender_id)
-                });
-                let replaced_bytes = replaced.map_or(0, |e| e.retained_bytes);
+                let replaced_bytes = replaced.map_or(0, |(bytes, _)| bytes);
                 let needs_bytes = self
                     .total_retained_bytes
                     .saturating_sub(replaced_bytes)
                     .saturating_add(entry_bytes)
                     > MAX_TOTAL_RETAINED_BYTES;
-                let needs_slot = over_total_count && replaced.is_none();
+                let needs_slot = over_total_count && !is_replacement;
                 if (needs_bytes || needs_slot)
                     && self.evict_keyword_bytes(
                         entry_bytes.saturating_sub(replaced_bytes),
@@ -517,50 +529,20 @@ impl DhtStore {
                 }
             }
 
-            let publisher_entries = self
-                .keyword_publisher_usage
-                .get(&budget_key)
-                .map_or(0, |usage| usage.entries);
-            let publisher_total_bytes = self
-                .keyword_publisher_usage
-                .get(&budget_key)
-                .map_or(0, |usage| usage.bytes);
-
             let bucket = self.keyword_entries.entry(*target).or_default();
-            let key_bytes = retained_bytes(bucket);
-            let publisher_bytes: usize = bucket
-                .iter()
-                .filter(|stored| stored.source_id == *sender_id)
-                .map(|stored| stored.retained_bytes)
-                .sum();
             if let Some(pos) = bucket
                 .iter()
                 .position(|e| e.id == entry.id && e.source_id == *sender_id)
             {
                 let old_bytes = bucket[pos].retained_bytes;
-                // A routing-table contact keeps its KAD id across an address
-                // change, so the entry being replaced can be charged to a
-                // different budget key than this packet arrives on. When it
-                // is, the entry is landing on the new key for the first time
-                // and has to fit there outright — crediting it bytes and a
-                // slot it never held there is free budget.
                 let old_key = bucket[pos].keyword_budget_key();
                 let same_budget_key = old_key == budget_key;
-                let publisher_credit = if same_budget_key { old_bytes } else { 0 };
-                if key_bytes
-                    .saturating_sub(old_bytes)
-                    .saturating_add(entry_bytes)
-                    > MAX_RETAINED_BYTES_PER_KEY
-                    || publisher_bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(entry_bytes)
-                        > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
-                    || publisher_total_bytes
-                        .saturating_sub(publisher_credit)
-                        .saturating_add(entry_bytes)
-                        > MAX_KEYWORD_BYTES_PER_PUBLISHER
-                    || (!same_budget_key && publisher_entries >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER)
-                    || self
+                // Only the global cap is re-checked. This publisher's own
+                // allowance — per key, per publisher-per-key, and per publisher,
+                // including the credit an entry keeps only while it stays on the
+                // same budget key — was priced above, before any eviction, and
+                // eviction can only have moved those numbers down.
+                if self
                         .total_retained_bytes
                         .saturating_sub(old_bytes)
                         .saturating_add(entry_bytes)
@@ -617,23 +599,10 @@ impl DhtStore {
                 // refresh `stored_at`, otherwise an active republish that
                 // happens to include one over-cap new entry would let its other
                 // (already-stored) entries expire.
-                if sender_entry_count >= MAX_KEYWORD_ENTRIES_PER_SENDER {
-                    continue;
-                }
-                if publisher_entries >= MAX_KEYWORD_ENTRIES_PER_PUBLISHER {
-                    continue;
-                }
-                if self.total_count >= MAX_TOTAL_ENTRIES {
-                    continue;
-                }
-                if bucket.len() >= MAX_ENTRIES_PER_KEY {
-                    continue;
-                }
-                if key_bytes.saturating_add(entry_bytes) > MAX_RETAINED_BYTES_PER_KEY
-                    || publisher_bytes.saturating_add(entry_bytes)
-                        > MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY
-                    || publisher_total_bytes.saturating_add(entry_bytes)
-                        > MAX_KEYWORD_BYTES_PER_PUBLISHER
+                // As in the replacement branch, only the global caps are re-checked
+                // here: everything this publisher is individually allowed was
+                // priced before the eviction above.
+                if self.total_count >= MAX_TOTAL_ENTRIES
                     || self.total_retained_bytes.saturating_add(entry_bytes)
                         > MAX_TOTAL_RETAINED_BYTES
                 {
@@ -1342,6 +1311,69 @@ mod keyword_store_tests {
         let honest_target = KadId([0x99; 16]);
         store.store_keyword_entries(&honest_target, vec![entry(1)], &honest, None);
         assert_eq!(store.search_keywords(&honest_target).len(), 1);
+    }
+
+    /// Eviction spends another publisher's records, so it must not run for an
+    /// entry this publisher's own allowance is going to refuse anyway. Both paths
+    /// used to evict first and refuse afterwards, and an eviction is never
+    /// refunded — free, repeatable deletion of honest records, aimed at whoever
+    /// happens to be heaviest.
+    #[test]
+    fn a_publish_refused_by_its_own_allowance_evicts_nothing() {
+        let mut store = DhtStore::new();
+        let target = numbered_target(1);
+        let greedy = KadId([0x92; 16]);
+
+        // The greedy publisher's own entry, stored while the key still has room.
+        let small = sized_entry(900, 100);
+        store.store_keyword_entries(&target, vec![small.clone()], &greedy, None);
+
+        // Fill this key to its byte cap with other publishers. That does two
+        // things: growth under the key is now refused, and the heaviest publisher
+        // — the one `evict_keyword_bytes` takes from — is somebody other than the
+        // greedy one, without which this test would pass no matter what.
+        for publisher in 0..6u8 {
+            let filler = KadId([0xA0 + publisher; 16]);
+            let batch: Vec<PublishEntry> = (0..MAX_KEYWORD_ENTRIES_PER_SENDER as u16)
+                .map(|index| sized_entry(index, 8000))
+                .collect();
+            store.store_keyword_entries(&target, batch, &filler, None);
+        }
+        let heaviest = store
+            .heaviest_keyword_publisher
+            .expect("some publisher is heaviest");
+        assert_ne!(
+            heaviest,
+            PublisherKey::Id(greedy),
+            "eviction must be aimed at another publisher for this to prove anything"
+        );
+
+        // Park the store against the global byte cap so a publish has to evict to
+        // make room, then offer a replacement the per-key byte cap refuses.
+        store.total_retained_bytes = MAX_TOTAL_RETAINED_BYTES;
+        let before: Vec<(KadId, KadId)> = store.keyword_entries[&target]
+            .iter()
+            .map(|stored| (stored.id, stored.source_id))
+            .collect();
+
+        store.store_keyword_entries(&target, vec![sized_entry(900, 8000)], &greedy, None);
+
+        assert_eq!(
+            store.keyword_entries[&target]
+                .iter()
+                .map(|stored| (stored.id, stored.source_id))
+                .collect::<Vec<_>>(),
+            before,
+            "a refused publish must not have shed anybody's records"
+        );
+        let stored_small = store.keyword_entries[&target]
+            .iter()
+            .find(|stored| stored.id == small.id && stored.source_id == greedy)
+            .expect("the original small entry survives");
+        assert!(
+            stored_small.retained_bytes < 8000,
+            "and the refused replacement must not have been applied either"
+        );
     }
 
     /// When the global byte cap blocks a publish we shed the heaviest

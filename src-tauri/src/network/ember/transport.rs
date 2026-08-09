@@ -1541,6 +1541,17 @@ impl EmberTransport {
     }
 
     /// Re-send message 1 carrying the retry cookie the responder asked for.
+    /// KNOWN RESIDUAL: a cookie packet cannot be authenticated — nothing is keyed
+    /// at msg1 — yet retrying consumes the parked handshake, which makes this the
+    /// one reader that lets an unauthenticated packet displace pending state.
+    /// The blast radius is small: the queued payloads are carried into the retry,
+    /// `cookie_retried` bounds it to once per attempt, and in the legitimate case
+    /// there is no msg2 in flight to lose, because a cookie is sent *instead* of
+    /// one. A spoofer who also floods the responder can still make an XX first
+    /// contact fail until the pending sweep. Binding the cookie to the
+    /// initiator's ephemeral is the fix, and it means adding an echo to this
+    /// packet — a wire change between our own clients, deliberately not made
+    /// here.
     fn handle_xx_cookie(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
         if data.len() != XX_COOKIE_LEN {
             debug!("XX cookie from {from} has wrong length {}", data.len());
