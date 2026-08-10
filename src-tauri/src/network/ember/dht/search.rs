@@ -466,6 +466,7 @@ impl IterativeSearch {
         // already hold. FIND_VALUE is excluded on purpose — see
         // [`STALE_RESPONSES_TO_CONVERGE`].
         if self.search_type == SearchType::FindNode
+            && self.head_has_responded()
             && self.stale_responses >= STALE_RESPONSES_TO_CONVERGE
             && self.responded_count() >= MIN_RESPONSES_TO_CONVERGE
         {
@@ -482,6 +483,39 @@ impl IterativeSearch {
         if self.search_type == SearchType::FindValue && self.results.len() >= MAX_SEARCH_RESULTS {
             self.complete = true;
         }
+    }
+
+    /// Whether the closest node we know of has actually answered.
+    ///
+    /// Required before a walk may converge early, and it is what stops one
+    /// fabricated contact ending every lookup. Progress is measured against the
+    /// head of the shortlist, and contacts arrive inside `FOUND_NODE` unverified,
+    /// so a peer queried in the first round can return an invented ID one bit
+    /// from the target. It is not the target itself, so the only exclusion misses
+    /// it; it sorts to the head; and it is never removed, even once it has failed
+    /// to answer. From then on no real node can be "closer", every later answer
+    /// counts as stale, and the walk would stop at the response floor having
+    /// reached the attacker's node and a few of our own existing contacts —
+    /// which, for a publish-target lookup, then became the cached target set for
+    /// four hours.
+    ///
+    /// An invented ID cannot answer, so requiring the head to have *responded*
+    /// (not merely to have been resolved — a failed entry stays at the head)
+    /// makes the pin block convergence instead of forcing it, and the walk falls
+    /// back to exhausting its shortlist. A node close enough to the target to
+    /// hold the head legitimately has to answer to keep it, which is the
+    /// ordinary eclipse cost rather than a free lunch.
+    ///
+    /// The fallback is not rare, and is not meant to be: any dead contact at the
+    /// head does the same thing, which stale gossip near a popular target produces
+    /// often enough. That costs a walk roughly the difference between the response
+    /// floor and a full shortlist — around six extra queries — and it is the right
+    /// side to err on, since the alternative is ending walks on the word of a peer
+    /// that never spoke.
+    fn head_has_responded(&self) -> bool {
+        self.shortlist
+            .first()
+            .is_some_and(|entry| entry.state == NodeState::Responded)
     }
 
     /// Shortlist entries that have answered us.
@@ -830,6 +864,74 @@ mod tests {
             answered < K_BUCKET_SIZE,
             "stopping early is the point: asked {answered} of {K_BUCKET_SIZE}"
         );
+    }
+
+    /// Contacts inside a `FOUND_NODE` are unverified, so the first peer queried
+    /// can return an invented ID one bit from the target. It pins the head of the
+    /// shortlist for the rest of the walk — it is not the target itself, so the
+    /// only exclusion misses it, and a failed entry is never removed. Every later
+    /// answer then counts as stale, and convergence would end the walk at the
+    /// response floor having reached the attacker and a few contacts we already
+    /// had. For a publish-target lookup that set was then cached for four hours.
+    #[test]
+    fn one_invented_contact_cannot_end_a_find_node_walk() {
+        let target = make_id(0x40);
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Round one: the first peer answers with an ID one bit off the target,
+        // which sorts ahead of every real node and can never answer.
+        let batch = search.next_to_query();
+        let mut phantom_id = target.0;
+        phantom_id[15] ^= 1;
+        let phantom = EmberContact {
+            node_id: EmberNodeId(phantom_id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 4672),
+            noise_pub: [0xEE; 32],
+            ed25519_pub: [0xEE; 32],
+            last_seen: 0,
+            failed_queries: 0,
+        };
+        let mut answered = 0usize;
+        for (i, (contact, req_id)) in batch.into_iter().enumerate() {
+            let closer = if i == 0 { vec![phantom.clone()] } else { vec![] };
+            search.process_response(req_id, &contact.node_id, closer, vec![]);
+            answered += 1;
+        }
+
+        // Everyone else answers honestly with nothing closer, and the phantom
+        // never answers at all.
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for (contact, req_id) in batch {
+                if contact.node_id == phantom.node_id {
+                    search.mark_failed(req_id);
+                } else {
+                    search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                    answered += 1;
+                }
+            }
+        }
+
+        assert!(
+            answered > MIN_RESPONSES_TO_CONVERGE,
+            "the pin must not be able to end the walk at the convergence floor: \
+             only {answered} peers were asked"
+        );
+        // The phantom holds one of the K shortlist slots, so exhausting the walk
+        // means every other entry answered.
+        assert_eq!(
+            answered,
+            K_BUCKET_SIZE - 1,
+            "the walk must fall back to exhausting its shortlist"
+        );
+        assert!(search.complete, "and it must still terminate");
     }
 
     /// The same rule must not touch FIND_VALUE. There, one more node asked is

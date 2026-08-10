@@ -54,7 +54,13 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { updater, checkForUpdates, installUpdate, restartToUpdate } from '$lib/stores/updater';
+  import {
+    updater,
+    checkForUpdates,
+    installUpdate,
+    restartToUpdate,
+    runStagedInstaller,
+  } from '$lib/stores/updater';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
@@ -2591,13 +2597,21 @@
                 <button class="action-btn primary" onclick={() => void restartToUpdate()}>
                   {m.updater_restart_now()}
                 </button>
+              {:else if $updater.phase === 'stalled' && $updater.installerReady}
+                <!-- Without this the phase was a dead end here: checking for
+                     updates finds the same version, which deliberately keeps the
+                     staged offer rather than re-downloading it, so this card
+                     showed the generic hint and no way to act on it. -->
+                <button class="action-btn primary" onclick={() => void runStagedInstaller()}>
+                  {m.updater_stalled_run()}
+                </button>
               {/if}
             </div>
 
             <div
               class="about-update-status"
               class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
-              class:error={$updater.phase === 'error'}
+              class:error={$updater.phase === 'error' || $updater.phase === 'stalled'}
               class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
             >
               {#if $updater.phase === 'uptodate'}
@@ -2615,6 +2629,12 @@
                 <span class="hint">{m.updater_installing()}</span>
               {:else if $updater.phase === 'ready'}
                 <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+              {:else if $updater.phase === 'stalled'}
+                <span class="feedback error">
+                  {$updater.installerReady
+                    ? m.updater_stalled_body({ version: $updater.version ?? '' })
+                    : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
+                </span>
               {:else if $updater.phase === 'error'}
                 <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? '' })}</span>
               {:else}

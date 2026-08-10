@@ -82,6 +82,11 @@ struct PendingUpdate {
     /// UI-facing metadata retained with the installable artifact so a later
     /// empty/failed re-check can still rehydrate the Install affordance.
     info: UpdateInfo,
+    /// The signed manifest this update came from and its detached signature,
+    /// both verbatim. Carried this far only so that staging an installer for
+    /// later recovery can keep them — see [`UpdateHandoff::manifest`].
+    manifest: String,
+    manifest_signature: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -683,18 +688,48 @@ fn state_path(app: &AppHandle) -> Result<PathBuf> {
 /// that dead end into something recoverable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateHandoff {
-    /// Version the saved installer installs.
+    /// Version the saved installer installs, for logs and the UI only.
+    ///
+    /// Not trusted for any decision. This file sits in the data directory, so
+    /// anything running as the user can rewrite it, and every question that
+    /// matters — which version, which security epoch, `exe` or `msi` — is
+    /// re-derived from [`Self::manifest`] instead. Trusting the field here would
+    /// have been a downgrade path: the artifact signature proves only that we
+    /// signed those *bytes*, so pairing an old release's installer with a
+    /// rewritten version high enough to clear the rollback floor would have got
+    /// an old, signed Ember installed on demand.
     version: String,
+    /// Also display-only, and re-derived from the manifest — see
+    /// [`Self::version`].
     security_epoch: u64,
     /// Version we were running when we handed off, so a launch can tell
     /// "the installer never ran" from "it ran and this is the new build".
     from_version: String,
-    /// `exe` or `msi`. The file name on disk is derived from this and the
-    /// version, never read back from the marker, so a tampered marker cannot
-    /// point us at an executable somewhere else.
+    /// `exe` or `msi`, display-only for the same reason as [`Self::version`].
+    /// The file name on disk is derived from the *manifest's* version and URL,
+    /// never read back from this marker, so a tampered marker cannot point us at
+    /// an executable somewhere else.
     kind: String,
+    /// Which platform entry of the manifest was staged. Untrusted, and used only
+    /// to look that entry up: whatever it selects, the hash and signature acted
+    /// on are the manifest's, and the version acted on is the one that same
+    /// signed document declares.
     sha256: String,
     signature: String,
+    /// The signed `latest.json` this update came from, verbatim, with its
+    /// detached signature. Our own signing key over a document that pairs a
+    /// version with each artifact's hash is the only thing here that binds
+    /// "these bytes" to "this version" — a replayed older manifest is authentic
+    /// but names its own older version, which the newer-than-running check then
+    /// refuses.
+    ///
+    /// Defaulted so a marker written before this field existed still parses, and
+    /// is then discarded by `verified_handoff_claim` with a log line that says why
+    /// rather than one claiming the file is corrupt.
+    #[serde(default)]
+    manifest: String,
+    #[serde(default)]
+    manifest_signature: String,
     attempted_at: i64,
 }
 
@@ -762,6 +797,8 @@ fn save_handoff(
     platform: &SignedPlatform,
     version: &str,
     security_epoch: u64,
+    manifest: &str,
+    manifest_signature: &str,
     artifact: &[u8],
 ) -> Result<()> {
     let kind = installer_kind(&platform.url);
@@ -787,6 +824,8 @@ fn save_handoff(
         kind: kind.to_string(),
         sha256: platform.sha256.clone(),
         signature: platform.signature.clone(),
+        manifest: manifest.to_string(),
+        manifest_signature: manifest_signature.to_string(),
         attempted_at: chrono::Utc::now().timestamp(),
     };
     let bytes = serde_json::to_vec(&record).context("failed to serialize the hand-off record")?;
@@ -804,12 +843,101 @@ fn clear_handoff(app: &AppHandle) {
     }
 }
 
+/// What a staged installer actually is, according to the signed document it came
+/// from rather than the local record that points at it.
+struct HandoffClaim {
+    version: Version,
+    security_epoch: u64,
+    /// `exe` or `msi`, from the manifest's own URL for this artifact.
+    kind: &'static str,
+    /// The manifest's hash and signature for the artifact, which are what the
+    /// staged bytes get checked against.
+    sha256: String,
+    signature: String,
+}
+
+/// Re-establish what the staged installer claims to be, from our own signature
+/// over the manifest it came with.
+///
+/// Nothing in [`UpdateHandoff`] is trustworthy on its own: it is a JSON file in
+/// the data directory, so anything running as the user can rewrite it. The
+/// artifact signature does not close that gap either, because it attests to
+/// *bytes* and says nothing about which version they are — so an old, genuinely
+/// signed Ember installer paired with a rewritten `version` high enough to clear
+/// the rollback floor would have been offered to the user and run.
+///
+/// The manifest is the missing half. It is signed as a whole with the same key,
+/// and it pairs a version with each artifact's hash, so a hash that appears in it
+/// can only be claimed as the version that document declares. Replaying a genuine
+/// older manifest is possible and harmless: it names its own older version, which
+/// the newer-than-running check then refuses.
+///
+/// Note which check carries that weight. The rollback floor is itself an
+/// unauthenticated file in the same directory, so against an attacker who can
+/// write there it is not a defence at all — "strictly newer than the running
+/// build" is, because the running version is the binary's own. What remains is
+/// that such an attacker can make Ember install some genuinely published release
+/// newer than the one running, which is a great deal less than the any-signed-
+/// installer-as-any-version they had before, and is bounded by what we ourselves
+/// have released.
+fn verified_handoff_claim(record: &UpdateHandoff) -> Result<HandoffClaim> {
+    if record.manifest.is_empty() || record.manifest_signature.is_empty() {
+        bail!("the staged update predates manifest binding and cannot be re-verified");
+    }
+    let config = embedded_updater_config()?;
+    verify_minisign(
+        record.manifest.as_bytes(),
+        record.manifest_signature.as_bytes(),
+        &config.public_key,
+    )
+    .context("the staged update's manifest is not signed by this build's updater key")?;
+    claim_from_signed_manifest(
+        &record.manifest,
+        &record.sha256,
+        &record.signature,
+        &config.public_key,
+    )
+}
+
+/// The claim a manifest supports, once its signature has already been checked.
+///
+/// Split from [`verified_handoff_claim`] so the step that matters — that the
+/// version comes from the signed document and not from the marker beside it — can
+/// be tested without the signing key.
+fn claim_from_signed_manifest(
+    manifest: &str,
+    sha256: &str,
+    signature: &str,
+    public_key: &str,
+) -> Result<HandoffClaim> {
+    let raw: serde_json::Value =
+        serde_json::from_str(manifest).context("the staged update's manifest is not JSON")?;
+    let (manifest, _, version) = validate_manifest(raw, public_key)?;
+
+    // Locate the artifact the marker points at. The marker chooses which entry,
+    // but every value acted on afterwards comes from the entry itself, so the
+    // worst it can do is select another platform's build of the same version.
+    let platform = manifest
+        .platforms
+        .values()
+        .find(|platform| platform.sha256 == sha256 && platform.signature == signature)
+        .context("the staged installer is not an artifact of its own signed manifest")?;
+
+    Ok(HandoffClaim {
+        version,
+        security_epoch: manifest.security_epoch,
+        kind: installer_kind(&platform.url),
+        sha256: platform.sha256.clone(),
+        signature: platform.signature.clone(),
+    })
+}
+
 /// The staged version, expressed as the rollback identity the anti-rollback
 /// floor is compared against.
-fn handoff_rollback_state(record: &UpdateHandoff) -> RollbackState {
+fn handoff_rollback_state(claim: &HandoffClaim) -> RollbackState {
     RollbackState {
-        security_epoch: record.security_epoch,
-        highest_version: record.version.clone(),
+        security_epoch: claim.security_epoch,
+        highest_version: claim.version.to_string(),
     }
 }
 
@@ -820,8 +948,54 @@ fn handoff_rollback_state(record: &UpdateHandoff) -> RollbackState {
 /// being genuinely the bytes we verified says nothing about whether that version
 /// is still one we are willing to install. A signed observation of a newer epoch
 /// between the failed hand-off and now is exactly the case the floor exists for.
-fn handoff_meets_floor(app: &AppHandle, record: &UpdateHandoff) -> Result<bool> {
-    pending_meets_persisted_floor(&state_path(app)?, &handoff_rollback_state(record))
+/// `None` when there is no floor on disk to compare against.
+///
+/// The distinction matters because the two answers deserve opposite treatment. A
+/// staged build genuinely below a recorded floor is finished — delete it. A
+/// *missing* floor file is not evidence of anything: it means the state file was
+/// never written or has since been removed, which is exactly the ambiguous case
+/// where destroying the staged bytes is the wrong move, and the same reason a
+/// corrupt floor file is already left alone. `pending_meets_persisted_floor`
+/// folds both into `false` because on the online path there is always another
+/// download to fall back on; here there is not.
+fn handoff_meets_floor(app: &AppHandle, claim: &HandoffClaim) -> Result<Option<bool>> {
+    let path = state_path(app)?;
+    if load_rollback_state(&path)?.is_none() {
+        return Ok(None);
+    }
+    pending_meets_persisted_floor(&path, &handoff_rollback_state(claim)).map(Some)
+}
+
+/// Whether running the staged installer would move this machine forward.
+///
+/// The floor alone does not answer this. It tracks the highest version we have
+/// *observed advertised*, which a manually installed build never touches — so
+/// with a 1.5.3 installer staged and 1.5.4 since installed by hand, the floor
+/// still reads 1.5.3, the staged copy sits exactly at it, and offering to run it
+/// would silently downgrade the machine. Equality is the ordinary success case,
+/// where the installer did run and this is the new build.
+///
+/// Decided by [`should_offer_update`], the same comparator the online path uses,
+/// so the epoch keeps its meaning here. Comparing bare versions instead would
+/// have withdrawn recovery from the one release that needs it most: an emergency
+/// epoch bump exists precisely to authorize a *lower* version number, and a
+/// version-only test reads that as a downgrade and deletes the staged installer.
+fn handoff_is_an_upgrade(app: &AppHandle, claim: &HandoffClaim) -> bool {
+    staged_claim_is_an_upgrade(
+        claim.security_epoch,
+        &claim.version,
+        &app.package_info().version.to_string(),
+    )
+}
+
+fn staged_claim_is_an_upgrade(staged_epoch: u64, staged: &Version, running: &str) -> bool {
+    match Version::parse(running) {
+        Ok(running) => should_offer_update(CURRENT_SECURITY_EPOCH, &running, staged_epoch, staged),
+        // A running version we cannot parse is not a version we can compare
+        // against, and guessing in the permissive direction is how downgrades
+        // happen.
+        Err(_) => false,
+    }
 }
 
 /// Re-check the staged installer against the hash and signature it was
@@ -830,15 +1004,15 @@ fn handoff_meets_floor(app: &AppHandle, record: &UpdateHandoff) -> Result<bool> 
 /// The bytes have been sitting on disk since the failed attempt, so they are
 /// treated exactly like bytes off the network: nothing is executed on the
 /// strength of having written it earlier.
-fn verified_installer_path(app: &AppHandle, record: &UpdateHandoff) -> Result<PathBuf> {
-    let path = pending_dir(app)?.join(installer_name(&record.version, &record.kind));
+fn verified_installer_path(app: &AppHandle, claim: &HandoffClaim) -> Result<PathBuf> {
+    let path = pending_dir(app)?.join(installer_name(&claim.version.to_string(), claim.kind));
     let bytes = std::fs::read(&path).context("the staged installer is no longer present")?;
     let actual = hex::encode(Sha256::digest(&bytes));
-    if actual != record.sha256 {
+    if actual != claim.sha256 {
         bail!("the staged installer no longer matches its signed hash");
     }
     let config = embedded_updater_config()?;
-    verify_minisign(&bytes, record.signature.as_bytes(), &config.public_key)?;
+    verify_minisign(&bytes, claim.signature.as_bytes(), &config.public_key)?;
     Ok(path)
 }
 
@@ -1084,6 +1258,13 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         notes: manifest.notes,
         date: manifest.pub_date,
     };
+    // Both were verified above: the manifest against its detached signature, the
+    // signature against the embedded key. They are UTF-8 by construction — the
+    // manifest parsed as JSON and `parse_signature` requires text.
+    let manifest_text = String::from_utf8(manifest_response.bytes)
+        .context("signed updater manifest is not UTF-8")?;
+    let manifest_signature = String::from_utf8(signature_response.bytes)
+        .context("signed updater signature is not UTF-8")?;
     Ok(Some((
         info.clone(),
         PendingUpdate {
@@ -1092,6 +1273,8 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
             rollback_path,
             candidate_state,
             info,
+            manifest: manifest_text,
+            manifest_signature,
         },
     )))
 }
@@ -1252,6 +1435,8 @@ pub async fn secure_updater_install(
         &update.platform,
         &update.info.version,
         update.info.security_epoch,
+        &update.manifest,
+        &update.manifest_signature,
         &artifact,
     ) {
         tracing::warn!("Could not stage the update hand-off record: {error:#}");
@@ -1313,10 +1498,20 @@ pub async fn secure_updater_install(
 
 /// Whether the last hand-off to an installer failed to produce the new version.
 ///
-/// Called on startup. Three outcomes: no record at all, a record whose version
-/// is the one now running (the update worked — clean it up and say nothing), or
-/// a record for a version we are still not running, which is reported so the UI
-/// can offer the staged installer again.
+/// Called on startup, and reports at most one thing: a staged installer for a
+/// release strictly newer than the running build, which the UI can offer again.
+///
+/// Everything else returns `None`. A record that cannot be re-verified against
+/// its signed manifest, one that is no longer an upgrade (the ordinary success
+/// case — the installer ran and this is the new build), and one below the recorded
+/// security floor are all cleaned up silently. A record whose floor cannot be read
+/// is left alone deliberately: see [`handoff_meets_floor`].
+///
+/// The retention window is still judged from the marker's own `attempted_at`,
+/// which is not authenticated — there is no signed timestamp to replace it with.
+/// The only thing a rewritten one buys is keeping an offer alive that every other
+/// check here already has to pass, or discarding it early, which the attacker
+/// could do by deleting the file anyway.
 #[tauri::command]
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
@@ -1334,10 +1529,26 @@ pub async fn secure_updater_handoff_status(
         }
     };
 
-    if record.version == app.package_info().version.to_string() {
+    let claim = match verified_handoff_claim(&record) {
+        Ok(claim) => claim,
+        Err(error) => {
+            // Either the marker was tampered with or it refers to bytes its own
+            // manifest does not contain. Nothing here can be offered, and keeping
+            // it would make every launch repeat the same work.
+            tracing::warn!("Discarding an unverifiable update hand-off record: {error:#}");
+            clear_handoff(&app);
+            return Ok(None);
+        }
+    };
+
+    // Anything not strictly newer than what is running has nothing to offer:
+    // equality is the ordinary success case, and older means the machine moved on
+    // without us. Both are reasons to clean up rather than to prompt.
+    if !handoff_is_an_upgrade(&app, &claim) {
         tracing::info!(
-            "Update to {} completed; clearing the staged installer",
-            record.version
+            "Clearing the staged installer for {}: {} is running",
+            claim.version,
+            app.package_info().version
         );
         clear_handoff(&app);
         return Ok(None);
@@ -1354,39 +1565,59 @@ pub async fn secure_updater_handoff_status(
     // A staged build that has fallen below the signed security floor can never
     // be run, so there is nothing to offer and no reason to keep its bytes. Say
     // nothing and let the ordinary check surface whatever superseded it.
-    match handoff_meets_floor(&app, &record) {
-        Ok(true) => {}
-        Ok(false) => {
+    match handoff_meets_floor(&app, &claim) {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
             tracing::info!(
                 "Discarding the staged installer for {}: it is below the signed security floor",
-                record.version
+                claim.version
             );
             clear_handoff(&app);
             return Ok(None);
         }
+        // No floor, or one we could not read: say nothing and keep the bytes. The
+        // launch path refuses on the same evidence, so nothing can be run until a
+        // check writes a floor again — at which point this offer becomes usable
+        // rather than having been thrown away.
+        Ok(None) => {
+            tracing::warn!(
+                "Not offering the staged installer for {}: no security floor is recorded yet",
+                claim.version
+            );
+            return Ok(None);
+        }
         Err(error) => {
-            tracing::warn!("Could not check the staged installer against the security floor: {error:#}");
-            clear_handoff(&app);
+            tracing::warn!(
+                "Could not check the staged installer against the security floor: {error:#}"
+            );
             return Ok(None);
         }
     }
 
-    let installer_ready = match verified_installer_path(&app, &record) {
+    // Report the stall either way. Staged bytes that have since been quarantined
+    // or truncated mean there is nothing to relaunch, but that is still the
+    // explanation for why Ember closed itself and nothing happened — the notice
+    // says so and points at checking for updates instead, which is a recovery the
+    // user can actually carry out.
+    let installer_ready = match verified_installer_path(&app, &claim) {
         Ok(_) => true,
         Err(error) => {
-            tracing::warn!("Staged installer for {} is unusable: {error:#}", record.version);
+            tracing::warn!(
+                "Staged installer for {} is unusable: {error:#}",
+                claim.version
+            );
             false
         }
     };
     tracing::warn!(
         "Update to {} was handed to an installer {age}s ago but {} is still running; \
          the installer did not complete (staged copy usable: {installer_ready})",
-        record.version,
+        claim.version,
         record.from_version,
     );
     Ok(Some(UpdateHandoffReport {
-        version: record.version,
-        security_epoch: record.security_epoch,
+        version: claim.version.to_string(),
+        security_epoch: claim.security_epoch,
         attempted_at: record.attempted_at,
         installer_ready,
     }))
@@ -1405,18 +1636,47 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     else {
         return Err("There is no staged installer to run.".to_string());
     };
-    // Anti-rollback first, exactly as the install path does it. Verified bytes
-    // are not the same question as a permitted version.
-    if !handoff_meets_floor(&app, &record)
-        .map_err(|error| public_failure("installer launch", error))?
-    {
+    // Re-establish what this actually is before deciding anything about it. The
+    // record's own fields are not evidence — see `verified_handoff_claim`.
+    let claim = verified_handoff_claim(&record).map_err(|error| {
+        tracing::warn!("Refusing to run the staged installer: {error:#}");
+        clear_handoff(&app);
+        "The staged installer could not be verified against its signed manifest. Check for updates again."
+            .to_string()
+    })?;
+    // Anti-rollback next, exactly as the install path does it. Verified bytes are
+    // not the same question as a permitted version, and a permitted version is
+    // not the same question as a newer one.
+    if !handoff_is_an_upgrade(&app, &claim) {
         clear_handoff(&app);
         return Err(
-            "The staged update is older than the signed security floor. Check for updates again."
-                .to_string(),
+            "The staged update is not newer than the version already installed.".to_string(),
         );
     }
-    let installer = verified_installer_path(&app, &record).map_err(|error| {
+    match handoff_meets_floor(&app, &claim)
+        .map_err(|error| public_failure("installer launch", error))?
+    {
+        Some(true) => {}
+        Some(false) => {
+            clear_handoff(&app);
+            return Err(
+                "The staged update is older than the signed security floor. Check for updates again."
+                    .to_string(),
+            );
+        }
+        // Refuse, but keep the bytes: a floor we cannot read is not evidence of a
+        // rollback. See `handoff_meets_floor`.
+        None => {
+            return Err(
+                "Ember has no record of the current update security level yet. Check for updates first."
+                    .to_string(),
+            );
+        }
+    }
+    // A first pass before tearing the network stack down, so a staged copy that
+    // has already gone does not cost the user their session for nothing. It is not
+    // the check that authorises the launch.
+    verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
         "The staged installer is missing or no longer matches its signature. Check for updates again."
             .to_string()
@@ -1436,8 +1696,26 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
         );
     }
 
-    let spawned = if record.kind == "msi" {
-        std::process::Command::new("msiexec")
+    // Re-verify here, with nothing between this and the spawn. Shutting down takes
+    // seconds — long enough for anything running as the user to overwrite the file
+    // in the window after a check — and this is the one path that then executes it,
+    // typically behind an elevation prompt the user is already expecting to see.
+    // Verifying before the flush and trusting it afterwards would make the
+    // "nothing is executed on the strength of having written it earlier" rule
+    // hold only for the first few seconds.
+    let installer = verified_installer_path(&app, &claim).map_err(|error| {
+        tracing::warn!("Refusing to run the staged installer: {error:#}");
+        "The staged installer changed while Ember was closing down. Check for updates again."
+            .to_string()
+    })?;
+
+    let spawned = if claim.kind == "msi" {
+        // Absolute, because `CreateProcessW` searches this process's own directory
+        // and the working directory before the system one, so a bare name is a
+        // planted-binary hazard under the same local-write attacker this whole
+        // path is being careful about.
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        std::process::Command::new(PathBuf::from(system_root).join(r"System32\msiexec.exe"))
             .arg("/i")
             .arg(&installer)
             .spawn()
@@ -1449,7 +1727,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
         Ok(_) => {
             // The marker stays: only a launch that finds itself running the new
             // version clears it, so a second silent failure still reports.
-            tracing::info!("Launched the staged installer for {}", record.version);
+            tracing::info!("Launched the staged installer for {}", claim.version);
             std::process::exit(0);
         }
         Err(error) => {
@@ -1505,6 +1783,93 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
     fn signed_payload_verification_rejects_tampering() {
         verify_minisign(b"test", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).unwrap();
         assert!(verify_minisign(b"tampered", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).is_err());
+    }
+
+    /// A staged installer with the version its own signed manifest declares.
+    ///
+    /// At the running epoch, so the version is what decides comparisons here. A
+    /// higher epoch would legitimately authorize a lower version, which is a
+    /// different property and has its own case in
+    /// `a_staged_installer_must_be_newer_than_the_running_build`.
+    fn staged_manifest(version: &str, sha256: &str) -> String {
+        format!(
+            r#"{{"version":"{version}","security_epoch":{epoch},"platforms":{{"windows-x86_64":{{"target":"windows-x86_64","url":"https://example.com/Ember_{version}_x64-setup.exe","signature":{signature},"sha256":"{sha256}","size":4096}}}}}}"#,
+            epoch = CURRENT_SECURITY_EPOCH,
+            signature = serde_json::to_string(TEST_SIGNATURE).unwrap(),
+        )
+    }
+
+    /// The hand-off marker is a JSON file in the data directory, so anything
+    /// running as the user can rewrite it, and the artifact signature attests to
+    /// bytes rather than to a version. Believing the marker's own `version` was
+    /// therefore a downgrade path: pair an old release's genuinely signed
+    /// installer with a version high enough to clear the rollback floor and Ember
+    /// would offer to run it. The version has to come from the signed document
+    /// that pairs it with that artifact's hash.
+    #[test]
+    fn a_rewritten_marker_cannot_promote_an_old_installer() {
+        let sha256 = "a".repeat(64);
+        let manifest = staged_manifest("1.4.0", &sha256);
+
+        let claim =
+            claim_from_signed_manifest(&manifest, &sha256, TEST_SIGNATURE, TEST_PUBLIC_KEY).unwrap();
+        assert_eq!(
+            claim.version,
+            Version::parse("1.4.0").unwrap(),
+            "the version must come from the manifest, whatever the marker claims"
+        );
+        assert_eq!(claim.security_epoch, CURRENT_SECURITY_EPOCH);
+        assert_eq!(claim.kind, "exe");
+
+        // And with that version established, the checks downstream refuse it.
+        assert!(!staged_claim_is_an_upgrade(
+            claim.security_epoch,
+            &claim.version,
+            "1.5.3"
+        ));
+
+        // A marker naming a hash the manifest does not contain is refused here.
+        // Note this is not what stops a *new* manifest being paired with an old
+        // installer — for that the attacker would name a real entry of the new
+        // manifest, and it is `verified_installer_path` hashing the bytes on disk
+        // against that entry which refuses them.
+        let elsewhere = "b".repeat(64);
+        assert!(
+            claim_from_signed_manifest(&manifest, &elsewhere, TEST_SIGNATURE, TEST_PUBLIC_KEY)
+                .is_err(),
+            "an artifact absent from its own manifest cannot be claimed"
+        );
+    }
+
+    /// The floor tracks the highest version ever *advertised*, which a manually
+    /// installed build never touches — so a staged 1.5.3 sits exactly at the floor
+    /// on a machine already running 1.5.4, and offering it would downgrade.
+    ///
+    /// The epoch has to keep its meaning here too. An emergency epoch bump exists
+    /// to authorize a *lower* version number, so a version-only comparison would
+    /// read that release as a downgrade and delete the staged installer for the one
+    /// update most worth recovering.
+    #[test]
+    fn a_staged_installer_must_be_newer_than_the_running_build() {
+        let staged = Version::parse("1.5.3").unwrap();
+        let epoch = CURRENT_SECURITY_EPOCH;
+        assert!(staged_claim_is_an_upgrade(epoch, &staged, "1.5.2"));
+        assert!(
+            !staged_claim_is_an_upgrade(epoch, &staged, "1.5.3"),
+            "equality is the success case: the installer ran"
+        );
+        assert!(
+            !staged_claim_is_an_upgrade(epoch, &staged, "1.5.4"),
+            "and older than what is installed must never be offered"
+        );
+        assert!(
+            !staged_claim_is_an_upgrade(epoch, &staged, "not-a-version"),
+            "an unparseable running version cannot be compared, so refuse"
+        );
+        assert!(
+            staged_claim_is_an_upgrade(epoch + 1, &Version::parse("1.4.0").unwrap(), "1.5.3"),
+            "an epoch bump authorizes a lower version, and recovery must honour it"
+        );
     }
 
     #[test]

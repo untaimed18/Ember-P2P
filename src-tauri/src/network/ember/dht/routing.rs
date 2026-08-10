@@ -854,11 +854,19 @@ impl RoutingTable {
             .collect()
     }
 
-    /// Get a contact by node ID, if it exists in the routing table.
+    /// Get a contact by node ID, from the bucket or its replacement cache.
     ///
-    /// Exercised only by this module's tests; the engine reaches contacts
-    /// through `find_closest` on the hot paths.
-    #[allow(dead_code)]
+    /// `None` therefore means the table is not holding this node anywhere — evicted
+    /// as stale, faulted out on missed pings, or dropped by an IP-filter reload —
+    /// which is what makes this the right way to resolve a remembered node ID before
+    /// addressing it. Publishing does that on every republish, so this is a hot path.
+    ///
+    /// The replacement cache has to be included or the answer is misleading in the
+    /// commonest case. The nodes a lookup returns are all close to the key, so they
+    /// share one bucket index relative to us, and on any warm node that bucket is
+    /// already full — `add_contact` files them in the replacement cache. Searching
+    /// only `contacts` reported almost every remembered target as gone, which is not
+    /// what "gone" is supposed to mean here.
     pub fn get_contact(&self, node_id: &EmberNodeId) -> Option<&EmberContact> {
         let bucket_idx = match self.local_id.bucket_index(node_id) {
             Some(idx) => idx,
@@ -867,9 +875,11 @@ impl RoutingTable {
         if bucket_idx >= ID_BITS {
             return None;
         }
-        self.buckets[bucket_idx]
-            .find(&node_id)
-            .map(|pos| &self.buckets[bucket_idx].contacts[pos])
+        let bucket = &self.buckets[bucket_idx];
+        bucket
+            .find(node_id)
+            .map(|pos| &bucket.contacts[pos])
+            .or_else(|| bucket.find_in_cache(node_id).map(|pos| &bucket.replacement_cache[pos]))
     }
 
     /// Pick non-empty bucket indices to refresh, stalest first, capped at
@@ -1158,9 +1168,18 @@ mod tests {
 
         // Evicting a distinct-subnet live contact must promote the eligible
         // entry (0x95), skipping the subnet-saturated newest (0x94).
+        //
+        // Asked of the bucket rather than through `get_contact`, which also answers
+        // from the replacement cache: 0x94 is still legitimately cached here, so the
+        // question is whether it was promoted to a live slot, not whether the table
+        // holds it at all.
         assert!(rt.evict_and_replace(&make_id(0x83)));
-        assert!(rt.get_contact(&make_id(0x95)).is_some());
-        assert!(rt.get_contact(&make_id(0x94)).is_none());
+        let bucket = &rt.buckets[local.bucket_index(&make_id(0x95)).expect("a bucket")];
+        assert!(bucket.find(&make_id(0x95)).is_some(), "the eligible entry is promoted");
+        assert!(
+            bucket.find(&make_id(0x94)).is_none(),
+            "the subnet-saturated one stays in the cache"
+        );
         assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
     }
 

@@ -10,6 +10,31 @@ use super::{scale, EmberNodeId};
 
 /// Maximum records per key (anti-spam).
 const MAX_RECORDS_PER_KEY: usize = 300;
+/// Maximum records one publisher may hold under a single key.
+///
+/// About 15% of the key, matching the ratio KAD enforces (150 of 1000 entries
+/// per sender), so no single identity can crowd a keyword out on its own.
+///
+/// Enforced only by refusal. An earlier attempt at this displaced whichever
+/// publisher held the most slots when a key was full, which reads as fairness
+/// and is in fact an eviction primitive: publisher identity is a free keypair,
+/// so an arrival with no slots always outranked an established publisher and
+/// evicted one of its records. A few hundred keypairs stripped a healthy keyword
+/// to one record per honest publisher, after which every holder had one, nobody
+/// outranked anybody, and the key admitted no one ever again. Before that change
+/// a full key merely refused newcomers, which at least left incumbents intact.
+///
+/// The lesson is worth keeping: while identity is free, a per-publisher rule can
+/// only ever *withhold* capacity, never move it. Filling an empty key with seven
+/// identities is still possible, here as in KAD; bounding that needs something
+/// scarcer than a keypair, such as address diversity or proof of work.
+///
+/// Applies to our own records too, since `store_own_record` goes through the same
+/// path: a user sharing more than 45 files under one word serves at most 45 of them
+/// from their *own* store. That costs nothing in discoverability — every record is
+/// still published to the nodes closest to the key, which is where searchers look —
+/// and it is the same allowance we grant everyone else.
+const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 45;
 /// Maximum total keys stored.
 const MAX_KEYS: usize = 50_000;
 /// Ceiling on resident record bytes.
@@ -66,11 +91,14 @@ const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
 
 /// One record on its way to or from disk.
 ///
-/// Everything here is either signed by the publisher or re-derived on load, so
-/// a tampered file cannot introduce a record: [`DhtStore::restore`] feeds each
-/// one back through the ordinary validating store path, which re-checks the
-/// signature and recomputes expiry from `created_at`. A record already past its
-/// TTL is simply refused, so the file cleans itself up.
+/// Only `data` and `signature` are load-bearing on the way back in. Everything
+/// else is written for the older builds that read this file and is re-derived
+/// from the signed body by [`DhtStore::restore`] — the key it is filed under, the
+/// publisher, and the creation time its expiry is computed from — because none of
+/// these fields is covered by the signature, so believing them would let anything
+/// that can write here file a genuine record under the wrong key or with a life
+/// it was never granted. A record already past its TTL is refused, so the file
+/// cleans itself up.
 #[derive(Debug, Clone)]
 pub struct PersistedRecord {
     pub key: [u8; 16],
@@ -577,9 +605,34 @@ impl DhtStore {
         // but it would break replication. A storer legitimately re-publishes
         // many different publishers' records to the nodes closest to a key,
         // so "one sender introducing many publishers" is normal Kademlia
-        // behaviour rather than an attack signature. Publisher spam is bounded
-        // instead by MAX_RECORDS_PER_KEY, the byte budget, the per-IP source
-        // cap below, and the per-peer STORE rate limit.
+        // behaviour rather than an attack signature. What is bounded instead is
+        // how much of a key any one *author* may hold
+        // (MAX_RECORDS_PER_PUBLISHER_PER_KEY below), alongside
+        // MAX_RECORDS_PER_KEY, the byte budget, the per-IP source cap below, and
+        // the per-peer STORE rate limit.
+
+        // Reclaim this key's lapsed records before any cap counts them. All three
+        // caps below count what is resident, and a record past its `expires_at` is
+        // already invisible to `get_live` while still holding its slot until a
+        // sweep removes it. The periodic sweep runs every five minutes
+        // (`expire_records` on the cleanup timer), so without this a key at its
+        // per-key cap — or a source key at its per-IP cap, which is as low as three
+        // — refused genuine records for up to that long after the records blocking
+        // them had died. Placed above the per-IP check for exactly that reason.
+        //
+        // Safe to run after the dedupe branch above rather than before it: a record
+        // this one could dedupe against cannot itself be lapsed, because
+        // `store_attributed` has already refused anything whose age exceeds its TTL.
+        let mut reclaimed = 0usize;
+        records.retain(|r| {
+            if r.expires_at <= now {
+                reclaimed += record_cost(r.data.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(reclaimed);
 
         // Per-IP cap on source records, mirroring KAD's MAX_SOURCES_PER_IP.
         // A source record names an address to download from, so without this
@@ -611,73 +664,36 @@ impl DhtStore {
             }
         }
 
-        if records.len() >= MAX_RECORDS_PER_KEY {
-            // The key is full. Refusing outright handed it to whoever filled it
-            // first, and filling it is cheap: records dedupe on (publisher,
-            // file), so one identity can take all MAX_RECORDS_PER_KEY slots
-            // under a popular word by varying the file hash, then hold them
-            // indefinitely by republishing. Every other publisher's records for
-            // that word became unstorable, which is to say undiscoverable.
-            //
-            // Capping how many slots one *sender* may introduce would break
-            // replication, for the reason in the note above. But the *author*
-            // of each record is signed, and charging slots to the author is
-            // both safe for replication — a storer's re-STORE is charged to the
-            // original publisher, not to the storer — and exactly the fairness
-            // wanted here.
-            //
-            // So displace the publisher holding the most slots, but only while
-            // it holds more than this newcomer would after being admitted. That
-            // is max-min fairness by water-filling: a publisher may use as much
-            // of a key as nobody else is asking for, every admission strictly
-            // reduces the imbalance, and N publishers converge on an even split
-            // with no per-publisher quota to pick or tune. A publisher that is
-            // already the heaviest cannot displace anyone, so the flood above
-            // stops at its fair share instead of the whole key.
-            let mut held: HashMap<[u8; 32], usize> = HashMap::new();
-            for r in records.iter() {
-                *held.entry(r.publisher_key).or_insert(0) += 1;
-            }
-            let mine = held.get(&publisher_key).copied().unwrap_or(0);
-            // Ties break on the key bytes so the choice is deterministic
-            // rather than dependent on HashMap iteration order.
-            let heaviest = held
-                .iter()
-                .max_by_key(|(pk, count)| (**count, **pk))
-                .map(|(pk, count)| (*pk, *count));
-            let Some((heaviest_key, heaviest_count)) = heaviest else {
-                return false;
-            };
-            if heaviest_count <= mine + 1 {
-                debug!(
-                    "Key {} is full and publisher {} is already at its share, rejecting",
-                    hex::encode(key),
-                    hex::encode(publisher_key),
-                );
-                return false;
-            }
-            // Within that publisher's slots give up whatever expires soonest:
-            // it is worth the least to the network, matching the ranking
-            // `enforce_byte_budget` uses.
-            let Some(victim) = records
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.publisher_key == heaviest_key)
-                .min_by_key(|(_, r)| r.expires_at)
-                .map(|(i, _)| i)
-            else {
-                return false;
-            };
-            let evicted = records.remove(victim);
-            self.bytes = self
-                .bytes
-                .saturating_sub(record_cost(evicted.data.len()));
+        // What one publisher may hold under this key. Records dedupe on
+        // (publisher, file), so without this a single identity takes every slot
+        // under a popular word by varying the file hash and holds them by
+        // republishing, leaving every other publisher's records for that word
+        // unstorable and so undiscoverable.
+        //
+        // Charged to the record's signed *author*, not to the peer that sent it.
+        // That distinction is what makes the cap safe for replication: a storer
+        // relaying fifty publishers' records charges each to its own author, so
+        // each stays under its own allowance, whereas a per-sender cap would
+        // refuse honest replication outright.
+        let mine = records
+            .iter()
+            .filter(|r| r.publisher_key == publisher_key)
+            .count();
+        if mine >= MAX_RECORDS_PER_PUBLISHER_PER_KEY {
             debug!(
-                "Key {} full: displaced a record from publisher {} ({heaviest_count} slots) for {}",
+                "Key {} already holds {mine} record(s) from publisher {}, rejecting",
                 hex::encode(key),
-                hex::encode(heaviest_key),
                 hex::encode(publisher_key),
             );
+            return false;
+        }
+
+        if records.len() >= MAX_RECORDS_PER_KEY {
+            debug!(
+                "Key {} has {MAX_RECORDS_PER_KEY} records, rejecting",
+                hex::encode(key)
+            );
+            return false;
         }
 
         self.bytes += record_cost(record.data.len());
@@ -854,6 +870,18 @@ impl DhtStore {
                 if record.expires_at <= now {
                     continue;
                 }
+                // Source records are deliberately not carried over. Each one names
+                // an address to download from, and the live path binds that claim
+                // to the peer it arrived from — matching the sender's address for
+                // a reachable source, or attributing the sending peer's address
+                // for a firewalled one that cannot be checked directly. Neither
+                // binding can be reproduced from a file, so persisting them would
+                // mean restoring an address claim nothing vouches for. Their
+                // publisher re-announces every two hours regardless, so the most
+                // this costs is a short gap in our own copy.
+                if record.data.first() == Some(&RECORD_TYPE_SOURCE) {
+                    continue;
+                }
                 out.push(PersistedRecord {
                     key,
                     data: record.data.clone(),
@@ -869,21 +897,52 @@ impl DhtStore {
 
     /// Feed persisted records back in through the ordinary store path.
     ///
-    /// Returns how many were accepted. Everything the live path enforces still
-    /// applies — signature, TTL from the signed creation time, per-key and
-    /// per-IP caps, the byte budget — so a file that was edited, truncated, or
-    /// simply left too long cannot put anything in the store that a peer could
-    /// not have sent us legitimately.
+    /// Returns how many were accepted. The signature, the TTL derived from the
+    /// signed creation time, the per-publisher and per-key caps and the byte and
+    /// key budgets all apply exactly as they do to a record off the wire, and the
+    /// key a record is filed under is re-derived from its own signed body rather
+    /// than trusted from the file — so anything that can write to the data
+    /// directory still cannot place a record under a key its publisher never
+    /// signed for.
+    ///
+    /// Two checks from the live path do not apply here, for different reasons. The
+    /// source-record address bind is handled by not persisting the records that
+    /// need it (see [`Self::persistable`]). The proximity gate — are we among the
+    /// closest to this key — is waived instead: having held the key last session is
+    /// the answer, and at restore time no eviction pressure exists to abuse anyway,
+    /// since it runs against an empty store with far fewer records than the key
+    /// budget.
     pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
         let mut accepted = 0usize;
         for record in records {
+            if record.data.first() == Some(&RECORD_TYPE_SOURCE) {
+                continue;
+            }
+            // Take the key, the author and the creation time from the record's own
+            // signed body, never from the fields beside it in the file. Nothing
+            // signs those, so trusting them let anything able to write here file a
+            // genuine record under an unrelated key, or hand it a life its
+            // publisher never granted — and a raised creation time also pinned the
+            // newer-copy guard above against that publisher's real republishes for
+            // as long as the skew allowance.
+            //
+            // A few records legitimately carry a file `created_at` later than their
+            // signed timestamp, because the zero-digest republish branch above
+            // advances it while keeping the older signed body. Those restore with
+            // the shorter life the signature actually supports, which is what every
+            // other node in the network already computes for them.
+            let Some((key, publisher_key, created_at)) =
+                signed_identity_from_record_data(&record.data)
+            else {
+                continue;
+            };
             if self.store_attributed(
-                record.key,
+                key,
                 record.data,
                 record.signature,
-                record.publisher_key,
-                record.created_at,
-                record.attributed_ip,
+                publisher_key,
+                created_at,
+                None,
             ) {
                 accepted += 1;
             }
@@ -1050,6 +1109,36 @@ fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The key, author and creation time a record body declares, at the fixed
+/// offsets `SignedRecord::from_wire` reads them from. `None` for a body too short
+/// to be a record at all.
+///
+/// Deliberately does not verify, and does not need to: the only caller
+/// ([`DhtStore::restore`]) hands the same bytes straight to `store_attributed`,
+/// which verifies the signature over exactly this range — so if these fields are
+/// wrong the record is refused a moment later, and if it is accepted they were
+/// signed. Going through `from_wire` for this instead cost a second Ed25519
+/// verification per record on the synchronous startup path, doubling the work the
+/// persisted-record ceiling was sized against.
+fn signed_identity_from_record_data(data: &[u8]) -> Option<([u8; 16], [u8; 32], i64)> {
+    // Both length checks `from_wire` applies, so a body it would call malformed is
+    // not admitted here either. The second one is easy to leave out and matters:
+    // without it a signed body claiming a longer name than it carries is stored,
+    // costing a slot and a `FIND_VALUE` answer that every reader then rejects,
+    // since they all re-parse through `from_wire`.
+    if data.len() < 115 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes([data[113], data[114]]) as usize;
+    if data.len() < 115 + name_len {
+        return None;
+    }
+    let key: [u8; 16] = data[1..17].try_into().ok()?;
+    let publisher_key: [u8; 32] = data[73..105].try_into().ok()?;
+    let created_at = i64::from_le_bytes(data[105..113].try_into().ok()?);
+    Some((key, publisher_key, created_at))
+}
+
 /// Verify an Ed25519 signature over `data` with `publisher_key`.
 /// Returns false on any failure (malformed key, malformed sig, or
 /// signature mismatch). Uses the same strict verify as frame / record
@@ -1106,9 +1195,10 @@ mod tests {
         store
     }
 
-    /// Fill one keyword key with `count` records from a single publisher, one
+    /// Offer `count` records for one keyword key from a single publisher, one
     /// per invented file hash — what a flooder does to claim a whole word.
-    /// Returns the key they landed on.
+    /// Returns the key they landed on. Refusals are expected once the
+    /// per-publisher share is reached, so nothing here asserts admission.
     fn fill_keyword_key(store: &mut DhtStore, sk: &SigningKey, count: usize) -> [u8; 16] {
         use super::super::publish::SignedRecord;
 
@@ -1119,13 +1209,13 @@ mod tests {
             file[1] = (i & 0xFF) as u8;
             let rec = SignedRecord::keyword("ubuntu", file, [0u8; 32], 100, "spam.iso", sk);
             key = rec.keyword_hash;
-            assert!(store.store(
+            store.store(
                 key,
                 rec.data.clone(),
                 rec.signature,
                 rec.publisher_key,
                 rec.timestamp,
-            ));
+            );
         }
         key
     }
@@ -1308,19 +1398,24 @@ mod tests {
         assert_eq!(store.total_records(), 2, "a republish is not a new record");
     }
 
-    /// Records dedupe on (publisher, file), so one identity can take every
-    /// slot under a popular word just by varying the file hash, and hold them
-    /// by republishing. While a full key was refused outright, that handed the
-    /// word to whoever filled it first and made every other publisher's files
-    /// for it unstorable, which is to say undiscoverable.
+    /// Records dedupe on (publisher, file), so one identity can offer a record
+    /// per invented file under a popular word. Without a per-publisher bound it
+    /// took every slot and held them by republishing, leaving every other
+    /// publisher's files for that word unstorable, which is to say
+    /// undiscoverable.
     #[test]
-    fn one_publisher_cannot_lock_everyone_out_of_a_keyword() {
+    fn one_publisher_cannot_take_more_than_its_share_of_a_keyword() {
         use super::super::publish::SignedRecord;
 
         let mut store = DhtStore::new();
         let spammer = SigningKey::generate(&mut OsRng);
+        // Offer a record for the whole key; only the share may be admitted.
         let key = fill_keyword_key(&mut store, &spammer, MAX_RECORDS_PER_KEY);
-        assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+        assert_eq!(
+            store.get(&key).map(|r| r.len()),
+            Some(MAX_RECORDS_PER_PUBLISHER_PER_KEY),
+            "one identity is held to its share however many files it offers"
+        );
 
         let honest = SigningKey::generate(&mut OsRng);
         let good = SignedRecord::keyword("ubuntu", [0xEE; 16], [0u8; 32], 4096, "real.iso", &honest);
@@ -1332,79 +1427,166 @@ mod tests {
                 good.publisher_key,
                 good.timestamp,
             ),
-            "an honest publisher must still reach a key somebody else filled"
-        );
-
-        let records = store.get(&key).unwrap();
-        assert_eq!(
-            records.len(),
-            MAX_RECORDS_PER_KEY,
-            "admitting the newcomer must not grow the key past its cap"
-        );
-        assert!(
-            records.iter().any(|r| r.publisher_key == good.publisher_key),
-            "the newcomer's record is the one that was admitted"
+            "the rest of the key stays available to everybody else"
         );
     }
 
-    /// Displacing the heaviest publisher only while it holds more than the
-    /// arrival would is max-min fairness by water-filling: the split evens out
-    /// on its own, and once it has, neither side can take from the other. The
-    /// flood therefore settles at a fair share instead of the whole key, with
-    /// no per-publisher quota to pick.
+    /// A record past its TTL is already invisible to `get_live`, but it keeps its
+    /// slot until a sweep removes it — and the sweep only runs every five minutes.
+    /// Every cap counts resident records, so a key holding nothing but dead records
+    /// used to refuse genuine ones for the rest of that interval. The per-IP source
+    /// cap is the sharpest case, at three.
     #[test]
-    fn a_contested_keyword_settles_on_an_even_split() {
-        use super::super::publish::SignedRecord;
+    fn a_key_full_of_dead_records_still_admits_a_live_one() {
+        use super::super::publish::{source_key, SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
 
         let mut store = DhtStore::new();
-        let spammer = SigningKey::generate(&mut OsRng);
-        let key = fill_keyword_key(&mut store, &spammer, MAX_RECORDS_PER_KEY);
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let contact = SourceContact {
+            ip,
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [7u8; 32],
+        };
+        let file = [0xD1u8; 16];
+        let key = source_key(&file);
 
-        let honest = SigningKey::generate(&mut OsRng);
-        let honest_pk = honest.verifying_key().to_bytes();
-        let mut admitted = 0usize;
-        for i in 0..MAX_RECORDS_PER_KEY {
-            let mut file = [0xC0u8; 16];
-            file[0] = (i >> 8) as u8;
-            file[1] = (i & 0xFF) as u8;
-            let rec = SignedRecord::keyword("ubuntu", file, [0u8; 32], 4096, "real.iso", &honest);
-            if store.store(
+        // Fill the address's whole source allowance, from distinct publishers so
+        // only the per-IP cap is in play.
+        let max_per_ip = store.scale.max_sources_per_ip();
+        for p in 0..max_per_ip {
+            let sk = SigningKey::from_bytes(&[p as u8 + 1; 32]);
+            let rec = SignedRecord::source(file, [0u8; 32], 100, "iso", contact, &sk);
+            assert!(store.store_attributed(
                 key,
                 rec.data.clone(),
                 rec.signature,
                 rec.publisher_key,
                 rec.timestamp,
-            ) {
-                admitted += 1;
+                Some(ip),
+            ));
+        }
+        let newcomer = SigningKey::from_bytes(&[0xF0; 32]);
+        let blocked = SignedRecord::source(file, [0u8; 32], 100, "iso", contact, &newcomer);
+        assert!(
+            !store.store_attributed(
+                key,
+                blocked.data.clone(),
+                blocked.signature,
+                blocked.publisher_key,
+                blocked.timestamp,
+                Some(ip),
+            ),
+            "the allowance really is spent while those records are alive"
+        );
+
+        // Kill them all, without sweeping — exactly the state the store is in
+        // between periodic sweeps.
+        let bytes_before = store.byte_len();
+        for record in store.entries.get_mut(&key).expect("the key").iter_mut() {
+            record.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(
+            store.get_live(&key).is_empty(),
+            "they are already invisible to readers"
+        );
+
+        assert!(
+            store.store_attributed(
+                key,
+                blocked.data.clone(),
+                blocked.signature,
+                blocked.publisher_key,
+                blocked.timestamp,
+                Some(ip),
+            ),
+            "a dead record must not keep a live one out until the next sweep"
+        );
+        assert_eq!(
+            store.get_live(&key).len(),
+            1,
+            "and the dead ones are gone rather than merely hidden"
+        );
+        assert!(
+            store.byte_len() < bytes_before,
+            "reclaiming them has to give their bytes back too"
+        );
+    }
+
+    /// The regression this replaced: the share used to be enforced by
+    /// displacing whichever publisher held the most slots, which is an eviction
+    /// primitive rather than fairness. Publisher identity is a free keypair, so
+    /// an arrival holding nothing always outranked an established publisher and
+    /// took one of its records; a few hundred keypairs stripped a healthy
+    /// keyword bare and then locked it, because once every holder had one slot
+    /// nobody outranked anybody and the key admitted no one. A full key must
+    /// refuse, never displace.
+    #[test]
+    fn a_full_keyword_never_evicts_an_incumbent() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        let mut key = [0u8; 16];
+        let mut incumbents: Vec<[u8; 32]> = Vec::new();
+        // Fill the key legitimately: enough distinct publishers, each within
+        // its share, to reach the per-key cap.
+        'fill: for p in 0..16u8 {
+            let sk = SigningKey::from_bytes(&[p.wrapping_add(1); 32]);
+            for i in 0..MAX_RECORDS_PER_PUBLISHER_PER_KEY {
+                let mut file = [0u8; 16];
+                file[0] = p;
+                file[1] = i as u8;
+                let rec = SignedRecord::keyword("ubuntu", file, [0u8; 32], 100, "real.iso", &sk);
+                key = rec.keyword_hash;
+                if !store.store(
+                    key,
+                    rec.data.clone(),
+                    rec.signature,
+                    rec.publisher_key,
+                    rec.timestamp,
+                ) {
+                    break 'fill;
+                }
+                incumbents.push(rec.publisher_key);
             }
         }
-
-        let records = store.get(&key).unwrap();
-        let held_by_honest = records
-            .iter()
-            .filter(|r| r.publisher_key == honest_pk)
-            .count();
         assert_eq!(
-            admitted,
-            MAX_RECORDS_PER_KEY / 2,
-            "the contest converges rather than running to either extreme"
+            store.get(&key).map(|r| r.len()),
+            Some(MAX_RECORDS_PER_KEY),
+            "the key must be legitimately full for this test to mean anything"
         );
-        assert_eq!(held_by_honest, MAX_RECORDS_PER_KEY / 2);
-        assert_eq!(records.len(), MAX_RECORDS_PER_KEY, "the key stays full");
+        let before = store.get(&key).unwrap().len();
 
-        // With the key evenly split, the original flooder cannot buy back a
-        // slot either: it is no longer holding more than the arrival would.
-        let more = SignedRecord::keyword("ubuntu", [0x5A; 16], [0u8; 32], 100, "spam.iso", &spammer);
-        assert!(
-            !store.store(
-                key,
-                more.data.clone(),
-                more.signature,
-                more.publisher_key,
-                more.timestamp,
-            ),
-            "a publisher at its share must not displace anyone"
-        );
+        // A Sybil flood: a fresh identity per record, each holding nothing, so
+        // each would have outranked every incumbent under the old rule.
+        for s in 0..64u16 {
+            let mut seed = [0xA0u8; 32];
+            seed[0] = (s >> 8) as u8;
+            seed[1] = (s & 0xFF) as u8;
+            let sk = SigningKey::from_bytes(&seed);
+            let rec = SignedRecord::keyword("ubuntu", [0xC7; 16], [0u8; 32], 100, "spam.iso", &sk);
+            assert!(
+                !store.store(
+                    key,
+                    rec.data.clone(),
+                    rec.signature,
+                    rec.publisher_key,
+                    rec.timestamp,
+                ),
+                "a full key must refuse a newcomer rather than evict for it"
+            );
+        }
+
+        let after = store.get(&key).unwrap();
+        assert_eq!(after.len(), before, "no record was displaced");
+        for publisher in &incumbents {
+            assert!(
+                after.iter().any(|r| &r.publisher_key == publisher),
+                "every incumbent publisher still holds records"
+            );
+        }
     }
 
     /// A source record names an address to download from. Without a per-IP
@@ -1888,15 +2070,61 @@ mod tests {
             "the edited record must be refused and the others kept"
         );
 
-        // Expiry is recomputed from the signed creation time rather than from
-        // when we happen to read the file, so a stale save cannot revive records
-        // that died while we were closed.
+        // Nor is the key trusted. Rewriting it in the file must not file a
+        // validly signed record under an unrelated word — the record goes where
+        // its own signed body says, which is the binding the live path gets from
+        // `accept_record`.
+        let mut misfiled = saved.clone();
+        for record in &mut misfiled {
+            record.key = [0x99; 16];
+        }
+        let mut elsewhere = DhtStore::new();
+        assert_eq!(elsewhere.restore(misfiled), 3);
+        assert!(
+            elsewhere.get_live(&[0x99; 16]).is_empty(),
+            "nothing may land under the key the file claimed"
+        );
+        assert_eq!(
+            elsewhere.get_live(&key).len(),
+            3,
+            "the records land under the key their publisher signed"
+        );
+
+        // Expiry is recomputed from the signed creation time rather than from when
+        // we happen to read the file, so a stale save cannot revive records that
+        // died while we were closed. Aged by rewriting the timestamp inside the
+        // signed body and re-signing, because that is the only copy that counts.
         let mut aged = saved.clone();
         for record in &mut aged {
-            record.created_at -= KEYWORD_RECORD_TTL.as_secs() as i64 + 60;
+            let old = i64::from_le_bytes(record.data[105..113].try_into().unwrap())
+                - KEYWORD_RECORD_TTL.as_secs() as i64
+                - 60;
+            record.data[105..113].copy_from_slice(&old.to_le_bytes());
+            record.signature = crate::network::ember::crypto::sign(&sk, &record.data);
+            record.created_at = old;
         }
         let mut later = DhtStore::new();
         assert_eq!(later.restore(aged), 0, "expired records must not come back");
+
+        // And the file's own copy of the creation time buys nothing. It is not
+        // covered by the signature, so believing it let anything able to write here
+        // hand a long-dead record a fresh full life — and pin the newer-copy guard
+        // against the publisher's real republishes while it lasted.
+        let mut backdated = saved.clone();
+        for record in &mut backdated {
+            let real = i64::from_le_bytes(record.data[105..113].try_into().unwrap());
+            let stale = real - KEYWORD_RECORD_TTL.as_secs() as i64 - 60;
+            record.data[105..113].copy_from_slice(&stale.to_le_bytes());
+            record.signature = crate::network::ember::crypto::sign(&sk, &record.data);
+            // The file claims they are current; only the body says otherwise.
+            record.created_at = chrono::Utc::now().timestamp();
+        }
+        let mut fooled = DhtStore::new();
+        assert_eq!(
+            fooled.restore(backdated),
+            0,
+            "the file's creation time must not be able to revive a record"
+        );
     }
 
     #[test]

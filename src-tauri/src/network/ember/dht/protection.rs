@@ -17,30 +17,40 @@ use super::messages::{
 /// Sliding window for per-IP message counts.
 const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// Max DHT frames accepted from one IP per [MSG_WINDOW].
+///
+/// The sustained rate this permits is about twice the number, because
+/// [`WindowCounter`] measures over a trailing half window — see
+/// [`MAX_LOOKUPS_PER_WINDOW`], which explains the arithmetic. Every limit in this
+/// file reads the same way.
 const MAX_MSGS_PER_WINDOW: u32 = 40;
 
 /// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE`).
 const LOOKUP_WINDOW: Duration = Duration::from_secs(10);
-/// Lookup queries accepted from one peer per [`LOOKUP_WINDOW`].
+/// Lookup queries accepted from one address per [`LOOKUP_WINDOW`].
 ///
 /// The frame cap above is one number for every message type, and answering a
 /// lookup is far from the cheapest thing a frame can ask for: a `FIND_VALUE`
 /// costs a store lookup, and both kinds cost a signature over a reply that can
-/// be a hundred times the size of the question. At the flat cap one peer could
-/// ask forty times a second indefinitely. KAD, which has no session to hide
+/// be a hundred times the size of the question. At the flat cap one peer could ask
+/// eighty times a second indefinitely — forty by the constant, doubled by the
+/// half-window rule below. KAD, which has no session to hide
 /// behind, holds keyword searches to five per fifteen seconds; Ember can afford
 /// to be looser because a query only counts once its sender has completed a
-/// Noise handshake, so it cannot be spoofed and the sender pays for its own
-/// traffic.
+/// Noise handshake, so its source address cannot be forged.
 ///
-/// Six a second sustained is still far above anything honest. The bound to
-/// respect is a peer running many searches at once: each of its walks queries us
-/// at most once per hop, and its own concurrency is capped
-/// (`MAX_ACTIVE_SEARCHES`), so even a peer searching flat out stays well inside
-/// this over a ten-second window.
+/// Two things about the effective rate, both easy to get wrong from the numbers
+/// alone. [`WindowCounter`] enforces its limit over a trailing *half* window, so
+/// this admits roughly twelve a second sustained rather than six. And the budget
+/// is keyed on the address, not the peer's identity: the caller only resolves an
+/// identity for STORE frames, because doing it for every datagram would put a
+/// routing-table scan in front of the gate that exists to make junk cheap to
+/// reject. Peers behind one NAT therefore share this allowance, which is
+/// tolerable for a query but would not be for a STORE — hence the split.
 const MAX_LOOKUPS_PER_WINDOW: u32 = 60;
 /// Sliding window for STORE floods. The per-peer budget within it is adaptive
-/// — see [`super::scale::NetworkScale::max_stores_per_minute`].
+/// — see [`super::scale::NetworkScale::max_stores_per_minute`], and read it as
+/// roughly double per minute sustained, for the half-window reason in
+/// [`MAX_LOOKUPS_PER_WINDOW`].
 const STORE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_IP_ENTRIES: usize = 10_000;
 
@@ -123,8 +133,9 @@ pub enum StoreBudgetKey {
 pub struct DhtProtection {
     msg_counters: HashMap<IpAddr, WindowCounter>,
     store_counters: HashMap<StoreBudgetKey, WindowCounter>,
-    /// Lookup budgets, keyed like the store budgets so peers behind one NAT do
-    /// not spend each other's.
+    /// Lookup budgets. Shares `StoreBudgetKey` so an identity can be used if a
+    /// caller ever supplies one, but in practice this is address-keyed — see
+    /// [`MAX_LOOKUPS_PER_WINDOW`].
     lookup_counters: HashMap<StoreBudgetKey, WindowCounter>,
     dropped_rate: u64,
     /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
@@ -318,33 +329,67 @@ mod tests {
     /// One flat frame cap treated a `FIND_VALUE` — a store lookup plus a signed
     /// reply many times the size of the question — as costing the same as a
     /// `PING`, so one peer could ask forty times a second indefinitely.
+    ///
+    /// Note what this deliberately does *not* claim. An earlier version of this
+    /// test passed an identity and asserted that moving address bought nothing,
+    /// which production never does: the caller resolves an identity for STORE
+    /// frames only, so lookups are address-keyed. Asserting the stronger property
+    /// made the test certify a guarantee the code does not provide, which is
+    /// worse than having no test at all.
     #[test]
-    fn lookups_are_capped_tighter_than_the_flat_frame_rate() {
-        let mut p = DhtProtection::new();
-        let id = Some([3u8; 16]);
-        // Vary the address so the per-IP frame cap never fires first. The
-        // lookup budget follows the identity, so moving address buys nothing.
-        let addr = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i));
-
-        for i in 0..MAX_LOOKUPS_PER_WINDOW {
-            assert!(p.allow_message(addr(i), MSG_FIND_VALUE, id, 1));
-        }
+    fn lookups_get_a_tighter_budget_than_the_flat_frame_rate() {
+        // The relationship the cap exists for: over one window, far fewer
+        // lookups than the flat frame cap would allow.
         assert!(
-            !p.allow_message(addr(9_999), MSG_FIND_VALUE, id, 1),
-            "the budget is spent, and a fresh address does not restore it"
-        );
-        assert!(
-            !p.allow_message(addr(9_998), MSG_FIND_NODE, id, 1),
-            "both lookup kinds draw on the same budget"
-        );
-        // Cheap traffic from the same peer is unaffected.
-        assert!(p.allow_message(addr(9_997), MSG_PING, id, 1));
-
-        assert!(
-            MAX_LOOKUPS_PER_WINDOW
-                < MAX_MSGS_PER_WINDOW * LOOKUP_WINDOW.as_secs().max(1) as u32,
+            MAX_LOOKUPS_PER_WINDOW < MAX_MSGS_PER_WINDOW * LOOKUP_WINDOW.as_secs().max(1) as u32,
             "the lookup cap has to be tighter than the flat frame cap to mean anything"
         );
+
+        // Driven against the counter with an injected clock, because the lookup cap
+        // cannot be reached through `allow_message` in real time: the 40-per-second
+        // frame cap refuses first, so a tight loop only ever demonstrates *that*
+        // limit. An earlier version of this test did exactly that and would have
+        // stayed green with the whole lookup budget deleted.
+        let mut counter = WindowCounter::default();
+        let t0 = Instant::now();
+        let mut allowed = 0u32;
+        // Ten seconds of steady lookups, paced so the frame cap is irrelevant.
+        for tick in 0..LOOKUP_WINDOW.as_secs() * 20 {
+            let now = t0 + Duration::from_millis(tick * 50);
+            if counter.allow(now, LOOKUP_WINDOW, MAX_LOOKUPS_PER_WINDOW) {
+                allowed += 1;
+            }
+        }
+        assert!(
+            allowed < MAX_LOOKUPS_PER_WINDOW * 2,
+            "the window must refuse a sustained flood: {allowed} admitted"
+        );
+        assert!(
+            allowed >= MAX_LOOKUPS_PER_WINDOW,
+            "and must not refuse an honest burst either: only {allowed} admitted"
+        );
+
+        // Then the wiring: a lookup frame is charged to this budget, both kinds
+        // share it, and it is address-keyed because the caller supplies no identity.
+        let mut p = DhtProtection::new();
+        let noisy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let quiet = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        assert!(p.allow_message(noisy, MSG_FIND_VALUE, None, 1));
+        assert!(p.allow_message(noisy, MSG_FIND_NODE, None, 1));
+        assert_eq!(
+            p.lookup_counters.len(),
+            1,
+            "both lookup kinds draw on one budget per address"
+        );
+        assert!(p.allow_message(quiet, MSG_FIND_NODE, None, 1));
+        assert_eq!(
+            p.lookup_counters.len(),
+            2,
+            "and a different address gets its own"
+        );
+        // A cheap frame is not charged to it at all.
+        assert!(p.allow_message(quiet, MSG_PING, None, 1));
+        assert_eq!(p.lookup_counters.len(), 2);
     }
 
     /// Two instances behind one NAT must not eat each other's STORE budget.

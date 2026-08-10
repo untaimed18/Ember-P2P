@@ -47,6 +47,15 @@ export interface UpdaterState {
    *  its signed hash, so offering to run it again is worth doing. When false
    *  the notice explains the situation without a button that cannot work. */
   installerReady: boolean;
+  /** This notice describes a hand-off that failed rather than an update on
+   *  offer, whatever phase it has since moved through.
+   *
+   *  Needed because {@link dismissNotice} must not record a dismissal for one:
+   *  doing so silences the ordinary "x.y.z is available" card for a version the
+   *  user never declined. Keying that on `phase === 'stalled'` was not enough —
+   *  a failed run leaves the phase at `error` with a "Later" button still
+   *  showing, which put the leak straight back. */
+  fromHandoff: boolean;
 }
 
 interface UpdateHandoffReport {
@@ -85,6 +94,7 @@ const INITIAL: UpdaterState = {
   error: null,
   dismissed: false,
   installerReady: false,
+  fromHandoff: false,
 };
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
@@ -207,7 +217,7 @@ let pending = false;
 // `downloadAndInstall` concurrently, so a double-click on "Install" could
 // otherwise corrupt the download / surface a spurious error.
 let installInFlight = false;
-let retryAction: 'check' | 'install' | 'relaunch' = 'check';
+let retryAction: 'check' | 'install' | 'relaunch' | 'staged' = 'check';
 
 /** True while `checkForUpdates` is awaiting the plugin `check()` call. */
 let checkInFlight = false;
@@ -256,10 +266,17 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   try {
     const result = await invoke<SecureUpdateCheckResult>('secure_updater_check');
     const found = result.update;
-    if (found && staged && found.version === staged.version) {
+    if (found && staged && staged.installerReady && found.version === staged.version) {
       // The check found the same version we already have staged and verified on
       // disk. Offering "Install" here would re-download it and repeat the silent
       // hand-off that just failed, so keep the recovery offer instead.
+      //
+      // Only while the staged copy is actually usable, though. Preferring an
+      // unusable one shut the door: the recovery notice offers "Run installer"
+      // and Settings offers nothing, so every check returned to a notice with no
+      // action and the release stayed unreachable until the marker aged out
+      // weeks later. Falling through re-offers it as an ordinary download, which
+      // replaces the staged copy anyway.
       pending = true;
       restoreStaged(staged);
       return true;
@@ -285,6 +302,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         // Only meaningful for `stalled`; a fresh update replaces any staged
         // installer rather than offering the old one.
         installerReady: false,
+        fromHandoff: false,
       });
       return true;
     }
@@ -422,6 +440,7 @@ function restoreStaged(staged: StagedSnapshot): void {
     securityEpoch: staged.securityEpoch,
     installerReady: staged.installerReady,
     dismissed: staged.dismissed,
+    fromHandoff: true,
   });
 }
 
@@ -448,6 +467,7 @@ export async function checkUpdateHandoff(): Promise<boolean> {
       version: report.version,
       securityEpoch: normalizeSecurityEpoch(report.securityEpoch),
       installerReady: report.installerReady,
+      fromHandoff: true,
     });
     return true;
   } catch {
@@ -471,7 +491,20 @@ export async function runStagedInstaller(): Promise<void> {
   try {
     await invoke('secure_updater_run_saved_installer');
   } catch (e) {
-    retryAction = 'install';
+    // `install` would have been wrong here: nothing was checked this session, so
+    // `pending` is false and Retry fell through to a fresh check — which offers
+    // the same version again and re-downloads the installer already sitting
+    // verified on disk. Retrying the staged copy is both cheaper and what the
+    // user asked for.
+    //
+    // But only while there still is one. If the launch failed because the file
+    // was quarantined or no longer matches its signature, retrying it would fail
+    // identically every time and leave no route back to a fresh download, so ask
+    // the backend which case this is.
+    const stillStaged = await invoke<UpdateHandoffReport | null>(
+      'secure_updater_handoff_status',
+    ).catch(() => null);
+    retryAction = stillStaged?.installerReady ? 'staged' : 'check';
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
   } finally {
     installInFlight = false;
@@ -492,6 +525,8 @@ export async function restartToUpdate(): Promise<void> {
 export async function retryUpdate(): Promise<void> {
   if (retryAction === 'relaunch') {
     await restartToUpdate();
+  } else if (retryAction === 'staged') {
+    await runStagedInstaller();
   } else if (retryAction === 'install' && pending) {
     await installUpdate();
   } else {
@@ -499,10 +534,24 @@ export async function retryUpdate(): Promise<void> {
   }
 }
 
-/** Hide the banner for the current epoch/version without cancelling anything. */
+/**
+ * Hide the banner without cancelling anything.
+ *
+ * A dismissal is normally remembered for the `(epoch, version)` it names, so the
+ * same offer does not reappear on every check. A hand-off notice deliberately
+ * does not record one: it reports that an install we already started failed, not
+ * an offer, and persisting it under that identity would also silence the ordinary
+ * "1.5.3 is available" card for the same version — permanently, and for a version
+ * the user never declined. The staged copy expires after weeks, after which the
+ * ordinary path is the only route to that release, so it has to stay available.
+ *
+ * Gated on {@link UpdaterState.fromHandoff} rather than on the phase, because a
+ * failed run leaves the phase at `error` with the "Later" button still on screen
+ * — which is where the same leak came back.
+ */
 export function dismissNotice(): void {
   updater.update((s) => {
-    if (s.version && s.securityEpoch !== null) {
+    if (!s.fromHandoff && s.version && s.securityEpoch !== null) {
       recordDismissedUpdate(s.securityEpoch, s.version);
     }
     return { ...s, dismissed: true };

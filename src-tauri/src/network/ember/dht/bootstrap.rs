@@ -213,6 +213,12 @@ const STORE_EMBER_VERSION: u8 = 1;
 /// datagram to have arrived over the wire in the first place, so anything larger
 /// on disk is corruption or tampering.
 const MAX_PERSISTED_RECORD_BYTES: usize = 4096;
+/// Records `load_store` will parse from one file, whatever its header claims.
+///
+/// Taken from the ceiling the save path writes under rather than restated, so the
+/// two cannot drift apart and start discarding records a file we wrote really did
+/// contain.
+const MAX_PERSISTED_RECORDS: usize = crate::network::EMBER_PERSIST_MAX_RECORDS;
 
 /// Persist the local record store to `store_ember.dat`.
 ///
@@ -226,11 +232,37 @@ const MAX_PERSISTED_RECORD_BYTES: usize = 4096;
 ///   for each record:
 ///     key(16) + created_at(i64 LE) + publisher_key(32) + signature(64) +
 ///     ip_present(1) + ip(4, only when present) + data_len(u32 LE) + data
-pub fn save_store(path: &Path, records: &[super::store::PersistedRecord]) -> anyhow::Result<()> {
+pub fn save_store(
+    path: &Path,
+    records: &[super::store::PersistedRecord],
+    store_was_loaded: bool,
+) -> anyhow::Result<()> {
     if records.is_empty() {
-        // Nothing to say, and an empty file would only cost the next launch the
-        // store it could have kept.
+        // Nothing resident. Whether that is worth acting on depends entirely on
+        // whether this session ever managed to read the file, which is why the
+        // caller has to say so rather than have it inferred here.
+        //
+        // Deleting unconditionally destroyed the one copy at the worst moment: a
+        // corrupt or locked file, or one written by a build this cannot read,
+        // leaves the store empty, and the old code then removed the file it had
+        // failed to load. Keeping it unconditionally is no better in the other
+        // direction — an all-lapsed file can never make the store non-empty again,
+        // so nothing would ever rewrite it, and every launch would pay a signature
+        // check per record to reject all of them, forever.
+        if !store_was_loaded {
+            if path.exists() {
+                info!(
+                    "Skipping Ember store save: this session never loaded {}",
+                    path.display()
+                );
+            }
+            return Ok(());
+        }
         if path.exists() {
+            info!(
+                "Removing {}: the store it held is gone or entirely lapsed",
+                path.display()
+            );
             let _ = std::fs::remove_file(path);
         }
         return Ok(());
@@ -288,9 +320,21 @@ pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedReco
         anyhow::bail!("Unsupported store_ember.dat version {version}");
     }
 
-    let count = cursor.read_u32::<LittleEndian>()? as usize;
-    // The declared count sizes nothing up front: a forged header must not be
-    // able to ask for an allocation the file cannot possibly fill.
+    // The declared count sizes nothing up front — a forged header must not be able
+    // to ask for an allocation the file cannot possibly fill — and it is also
+    // capped, because the loop it bounds is what decides how many records the
+    // caller then verifies. A file crafted with millions of small records would
+    // otherwise turn one launch into millions of signature checks on the startup
+    // path. Anything past the ceiling this build writes is content we would refuse
+    // to store anyway.
+    let declared = cursor.read_u32::<LittleEndian>()? as usize;
+    if declared > MAX_PERSISTED_RECORDS {
+        warn!(
+            "store_ember.dat declares {declared} records, more than this build writes; \
+             reading the first {MAX_PERSISTED_RECORDS}"
+        );
+    }
+    let count = declared.min(MAX_PERSISTED_RECORDS);
     let mut out: Vec<super::store::PersistedRecord> = Vec::new();
     for _ in 0..count {
         let mut key = [0u8; 16];
