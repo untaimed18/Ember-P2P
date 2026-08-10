@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
 import * as m from '$lib/paraglide/messages';
@@ -246,10 +246,24 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   if (installInFlight || checkInFlight) return false;
   checkInFlight = true;
   recordCheckedNow();
+  // A staged installer waiting after a failed hand-off has to survive this
+  // check. Every exit below either replaces the whole store or resets it to
+  // INITIAL, so without capturing it first the `stalled` notice — and the only
+  // button that runs the already-downloaded installer — was destroyed a couple
+  // of seconds after startup by the routine silent check.
+  const staged = takeStagedSnapshot();
   updater.update((s) => ({ ...s, phase: 'checking', error: null }));
   try {
     const result = await invoke<SecureUpdateCheckResult>('secure_updater_check');
     const found = result.update;
+    if (found && staged && found.version === staged.version) {
+      // The check found the same version we already have staged and verified on
+      // disk. Offering "Install" here would re-download it and repeat the silent
+      // hand-off that just failed, so keep the recovery offer instead.
+      pending = true;
+      restoreStaged(staged);
+      return true;
+    }
     if (found) {
       // Native retention is authoritative: empty re-checks and check errors that
       // still keep a verified artifact re-offer UpdateInfo so Install survives
@@ -284,6 +298,12 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
       }));
       return false;
     }
+    // Finding nothing new says nothing about the staged installer: it is for a
+    // version we are still not running, and it is still sitting there.
+    if (staged) {
+      restoreStaged(staged);
+      return false;
+    }
     updater.set({ ...INITIAL, phase: opts.silent ? 'idle' : 'uptodate' });
     return false;
   } catch (e) {
@@ -292,7 +312,11 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     // the Install affordance rather than offering a possibly-cleared artifact.
     // A later successful check rehydrates from pendingRetained + update metadata.
     await disposePending();
-    if (opts.silent) {
+    if (staged) {
+      // A check that could not complete is no reason to withdraw the recovery
+      // offer either.
+      restoreStaged(staged);
+    } else if (opts.silent) {
       updater.set({ ...INITIAL, phase: 'idle' });
     } else {
       updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
@@ -361,6 +385,44 @@ export async function installUpdate(): Promise<void> {
   } finally {
     installInFlight = false;
   }
+}
+
+/** A `stalled` notice captured so a check cannot lose it. */
+interface StagedSnapshot {
+  version: string;
+  securityEpoch: number | null;
+  installerReady: boolean;
+  dismissed: boolean;
+}
+
+/**
+ * Snapshot the staged-installer offer, if one is showing.
+ *
+ * Read before a check mutates the store, and put back by {@link restoreStaged}
+ * on any path that would otherwise drop it. Returns null unless the store is
+ * actually in `stalled` with a version, so ordinary checks are unaffected.
+ */
+function takeStagedSnapshot(): StagedSnapshot | null {
+  const s = get(updater);
+  if (s.phase !== 'stalled' || s.version === null) return null;
+  return {
+    version: s.version,
+    securityEpoch: s.securityEpoch,
+    installerReady: s.installerReady,
+    dismissed: s.dismissed,
+  };
+}
+
+/** Put a captured staged-installer offer back, exactly as it was. */
+function restoreStaged(staged: StagedSnapshot): void {
+  updater.set({
+    ...INITIAL,
+    phase: 'stalled',
+    version: staged.version,
+    securityEpoch: staged.securityEpoch,
+    installerReady: staged.installerReady,
+    dismissed: staged.dismissed,
+  });
 }
 
 /**

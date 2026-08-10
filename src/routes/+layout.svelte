@@ -380,9 +380,10 @@
           // Ember close. This is the first opportunity to tell them. Runs
           // regardless of the auto-check preference and of the cadence — it
           // reports on something they already asked for — and it resolves to
-          // nothing in the normal case where the update landed. Scheduled
-          // ahead of the check above so a stalled hand-off is not immediately
-          // overwritten by an "update available" for the same version.
+          // nothing in the normal case where the update landed. Running first
+          // is only so the notice appears promptly; what actually stops the
+          // check below from overwriting it is `takeStagedSnapshot` in the
+          // store, since ordering alone would not survive a later check.
           if (!import.meta.env.DEV) {
             handoffCheckTimer = window.setTimeout(() => {
               if (mounted) void checkUpdateHandoff();

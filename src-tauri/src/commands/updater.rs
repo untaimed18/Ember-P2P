@@ -804,6 +804,26 @@ fn clear_handoff(app: &AppHandle) {
     }
 }
 
+/// The staged version, expressed as the rollback identity the anti-rollback
+/// floor is compared against.
+fn handoff_rollback_state(record: &UpdateHandoff) -> RollbackState {
+    RollbackState {
+        security_epoch: record.security_epoch,
+        highest_version: record.version.clone(),
+    }
+}
+
+/// Whether the staged version is still allowed by the persisted security floor.
+///
+/// The install path refuses a verified artifact that has fallen below the floor,
+/// and running the staged copy has to refuse it for the same reason: the bytes
+/// being genuinely the bytes we verified says nothing about whether that version
+/// is still one we are willing to install. A signed observation of a newer epoch
+/// between the failed hand-off and now is exactly the case the floor exists for.
+fn handoff_meets_floor(app: &AppHandle, record: &UpdateHandoff) -> Result<bool> {
+    pending_meets_persisted_floor(&state_path(app)?, &handoff_rollback_state(record))
+}
+
 /// Re-check the staged installer against the hash and signature it was
 /// originally verified with, and return its path.
 ///
@@ -1331,6 +1351,26 @@ pub async fn secure_updater_handoff_status(
         return Ok(None);
     }
 
+    // A staged build that has fallen below the signed security floor can never
+    // be run, so there is nothing to offer and no reason to keep its bytes. Say
+    // nothing and let the ordinary check surface whatever superseded it.
+    match handoff_meets_floor(&app, &record) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                "Discarding the staged installer for {}: it is below the signed security floor",
+                record.version
+            );
+            clear_handoff(&app);
+            return Ok(None);
+        }
+        Err(error) => {
+            tracing::warn!("Could not check the staged installer against the security floor: {error:#}");
+            clear_handoff(&app);
+            return Ok(None);
+        }
+    }
+
     let installer_ready = match verified_installer_path(&app, &record) {
         Ok(_) => true,
         Err(error) => {
@@ -1365,6 +1405,17 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     else {
         return Err("There is no staged installer to run.".to_string());
     };
+    // Anti-rollback first, exactly as the install path does it. Verified bytes
+    // are not the same question as a permitted version.
+    if !handoff_meets_floor(&app, &record)
+        .map_err(|error| public_failure("installer launch", error))?
+    {
+        clear_handoff(&app);
+        return Err(
+            "The staged update is older than the signed security floor. Check for updates again."
+                .to_string(),
+        );
+    }
     let installer = verified_installer_path(&app, &record).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
         "The staged installer is missing or no longer matches its signature. Check for updates again."
