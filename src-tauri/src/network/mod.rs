@@ -44507,7 +44507,18 @@ async fn handle_upload_event(
             };
             let (speed, upload_time_ms) = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_progress(&event.transfer_id, capped_uploaded, 0);
+                // Raw, not `capped_uploaded`. `update_progress` already caps
+                // what it stores for display (`transferred.min(total_size)`,
+                // progress at 100%), but it also builds its rolling speed window
+                // from the value it is handed. An upload's `uploaded` is
+                // cumulative wire bytes, so a peer that re-requests data pushes
+                // it past the file size — routinely, and by tens of megabytes on
+                // a long session. Handing over the capped figure pinned every
+                // later sample at exactly `total_size`, so the window saw a delta
+                // of zero and reported no speed, the byte counter stopped moving,
+                // and the row read "whole file sent, nothing happening" while the
+                // peer was still pulling at full rate for another half hour.
+                mgr.update_progress(&event.transfer_id, uploaded, 0);
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
                 let ut = t

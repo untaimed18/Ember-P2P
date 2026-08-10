@@ -1671,7 +1671,18 @@
   function ulStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
-        if (t.total_size > 0 && t.transferred >= t.total_size) return m.transfers_dl_status_complete();
+        // Deliberately no byte-count "Complete" branch. `transferred` is
+        // cumulative wire bytes for an upload, so it reaches `total_size` while
+        // the peer may still need data — a re-request after AICH recovery counts
+        // twice — and it also reaches it in sessions that can never finish,
+        // because a peer that already held some parts elsewhere never asks for
+        // full coverage. Calling either state "Complete" told the user the
+        // session was over while it was still open and holding a slot, so the
+        // row looked stuck until the peer finally went away. The backend drops
+        // the row the instant a session genuinely completes (see
+        // `isUploadFinished` and the `transfer-complete` handler in
+        // `stores/transfers.ts`), so a row that is still here is still running.
+        // What the peer actually holds is in the parts bar and its tooltip.
         return m.transfers_ul_status_transferring();
       case 'completed': return m.transfers_dl_status_complete();
       case 'failed': {
@@ -2750,7 +2761,9 @@
   function ulStatusTooltip(t: Transfer): string {
     switch (t.status) {
       case 'active':
-        if (t.total_size > 0 && t.transferred >= t.total_size) return m.transfers_ul_tooltip_completed();
+        // Same reason as `ulStatusLabel`: a cumulative byte counter reaching
+        // the file size does not mean the session finished, so this must not
+        // claim it did.
         return m.transfers_ul_tooltip_active();
       case 'completed': return m.transfers_ul_tooltip_completed();
       case 'failed': {
