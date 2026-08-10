@@ -12,6 +12,7 @@
     installUpdate,
     restartToUpdate,
     retryUpdate,
+    runStagedInstaller,
     dismissNotice,
   } from '$lib/stores/updater';
 
@@ -24,6 +25,7 @@
     (!$updater.dismissed &&
       ($updater.phase === 'available' ||
         $updater.phase === 'ready' ||
+        $updater.phase === 'stalled' ||
         ($updater.phase === 'error' && $updater.version !== null))) ||
       $updater.phase === 'downloading' ||
       $updater.phase === 'installing',
@@ -73,6 +75,8 @@
       <div class="notice-title">
         {#if $updater.phase === 'ready'}
           {m.updater_ready_title()}
+        {:else if $updater.phase === 'stalled'}
+          {m.updater_stalled_title()}
         {:else if $updater.phase === 'error'}
           {m.updater_error_title()}
         {:else}
@@ -87,6 +91,10 @@
     <p class="notice-body">
       {#if $updater.phase === 'ready'}
         {m.updater_ready_body({ version: $updater.version ?? '' })}
+      {:else if $updater.phase === 'stalled'}
+        {$updater.installerReady
+          ? m.updater_stalled_body({ version: $updater.version ?? '' })
+          : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
       {:else if $updater.phase === 'installing'}
         {m.updater_installing()}
       {:else if $updater.phase === 'downloading'}
@@ -118,6 +126,16 @@
         {#if $updater.phase === 'ready'}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
           <button class="primary" onclick={() => void restartToUpdate()}>{m.updater_restart_now()}</button>
+        {:else if $updater.phase === 'stalled'}
+          <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
+          {#if $updater.installerReady}
+            <!-- Runs the staged installer interactively. The first attempt was
+                 the silent one; if something blocks this binary the user needs
+                 to see the prompt rather than have it happen behind them. -->
+            <button class="primary" onclick={() => void runStagedInstaller()}>{m.updater_stalled_run()}</button>
+          {:else}
+            <button class="primary" onclick={() => void retryUpdate()}>{m.updater_retry()}</button>
+          {/if}
         {:else if $updater.phase === 'error'}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
           <button class="primary" onclick={() => void retryUpdate()}>{m.updater_retry()}</button>

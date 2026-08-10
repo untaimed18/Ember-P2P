@@ -26,7 +26,7 @@
     takePendingCloseRequest,
     takePendingEmberDefaultOnNotice,
   } from '$lib/api/settings';
-  import { checkForUpdates, isUpdateCheckDue } from '$lib/stores/updater';
+  import { checkForUpdates, checkUpdateHandoff, isUpdateCheckDue } from '$lib/stores/updater';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
@@ -184,6 +184,7 @@
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
     let updateCheckTimer: number | undefined;
+    let handoffCheckTimer: number | undefined;
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
@@ -373,6 +374,20 @@
               if (mounted) void checkForUpdates({ silent: true });
             }, 4000);
           }
+          // Before any of that: did the last install actually happen? A
+          // hand-off to the installer ends this process, so if the installer
+          // never ran there was nobody left to say so and the user just saw
+          // Ember close. This is the first opportunity to tell them. Runs
+          // regardless of the auto-check preference and of the cadence — it
+          // reports on something they already asked for — and it resolves to
+          // nothing in the normal case where the update landed. Scheduled
+          // ahead of the check above so a stalled hand-off is not immediately
+          // overwritten by an "update available" for the same version.
+          if (!import.meta.env.DEV) {
+            handoffCheckTimer = window.setTimeout(() => {
+              if (mounted) void checkUpdateHandoff();
+            }, 1500);
+          }
         } else {
           cleanupNetworkStore();
           cleanupTransferStore();
@@ -395,6 +410,7 @@
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
+      if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();

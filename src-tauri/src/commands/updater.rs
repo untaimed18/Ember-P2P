@@ -37,6 +37,16 @@ const METADATA_DEADLINE: Duration = Duration::from_secs(60);
 const ARTIFACT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CURRENT_SECURITY_EPOCH: u64 = 1;
 const STATE_FILE: &str = "updater-security-state.json";
+/// Records that we handed a verified installer to the OS and expected not to
+/// come back. See [`save_handoff`].
+const HANDOFF_FILE: &str = "update-handoff.json";
+/// Where the verified installer is kept so a failed hand-off leaves something
+/// the user can still run.
+const PENDING_DIR: &str = "updates";
+/// A hand-off this old is forgotten rather than reported. Long enough that
+/// someone who leaves Ember closed for weeks still gets told, short enough that
+/// a stale marker and its 15 MB installer do not live on the disk forever.
+const HANDOFF_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 
 /// Manifest or signature asset is absent at the configured endpoint. Treated as
 /// "no update available" rather than a hard check failure — common when a
@@ -661,6 +671,157 @@ fn state_path(app: &AppHandle) -> Result<PathBuf> {
         .join(STATE_FILE))
 }
 
+/// What we handed to the OS, so a launch that finds itself still running the old
+/// version can say so and offer the installer again.
+///
+/// Installing ends in `std::process::exit(0)` inside the updater plugin, which
+/// means the moment the installer is spawned nothing of ours is left to notice
+/// whether it actually ran. Windows or an antivirus refusing to execute a
+/// freshly written, unsigned installer therefore looked exactly like a
+/// successful update from inside Ember: the app closed and nothing happened.
+/// Recording the attempt, and keeping the verified bytes on disk, is what turns
+/// that dead end into something recoverable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateHandoff {
+    /// Version the saved installer installs.
+    version: String,
+    security_epoch: u64,
+    /// Version we were running when we handed off, so a launch can tell
+    /// "the installer never ran" from "it ran and this is the new build".
+    from_version: String,
+    /// `exe` or `msi`. The file name on disk is derived from this and the
+    /// version, never read back from the marker, so a tampered marker cannot
+    /// point us at an executable somewhere else.
+    kind: String,
+    sha256: String,
+    signature: String,
+    attempted_at: i64,
+}
+
+/// A hand-off that did not result in the new version running.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateHandoffReport {
+    pub version: String,
+    pub security_epoch: u64,
+    pub attempted_at: i64,
+    /// The saved installer is still present and still matches the hash and
+    /// signature it was verified against, so it can be launched again.
+    pub installer_ready: bool,
+}
+
+fn handoff_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(crate::storage::paths::ensure_data_dir_with_app(app)
+        .context("failed to resolve updater state directory")?
+        .join(HANDOFF_FILE))
+}
+
+fn pending_dir(app: &AppHandle) -> Result<PathBuf> {
+    Ok(crate::storage::paths::ensure_data_dir_with_app(app)
+        .context("failed to resolve updater state directory")?
+        .join(PENDING_DIR))
+}
+
+/// The installer's name on disk, built from values we control rather than from
+/// anything the marker file says, so the path can only ever land inside
+/// [`PENDING_DIR`].
+fn installer_name(version: &str, kind: &str) -> String {
+    let safe_version: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        .collect();
+    let safe_kind = if kind == "msi" { "msi" } else { "exe" };
+    format!("Ember_{safe_version}_update.{safe_kind}")
+}
+
+/// `exe` unless the signed URL clearly names an MSI.
+fn installer_kind(url: &Url) -> &'static str {
+    if url.path().to_ascii_lowercase().ends_with(".msi") {
+        "msi"
+    } else {
+        "exe"
+    }
+}
+
+fn read_handoff(path: &Path) -> Result<Option<UpdateHandoff>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .context("update hand-off record is corrupt"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("failed to read the update hand-off record"),
+    }
+}
+
+/// Persist the verified installer and the record of handing it over.
+///
+/// Best-effort by design: the caller carries on installing if this fails, since
+/// a missing safety net is not a reason to refuse an update the user asked for.
+fn save_handoff(
+    app: &AppHandle,
+    platform: &SignedPlatform,
+    version: &str,
+    security_epoch: u64,
+    artifact: &[u8],
+) -> Result<()> {
+    let kind = installer_kind(&platform.url);
+    let dir = pending_dir(app)?;
+    std::fs::create_dir_all(&dir).context("failed to create the update staging directory")?;
+
+    // Only ever one saved installer: whatever a previous attempt left behind is
+    // either already installed or superseded by this one.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    let path = dir.join(installer_name(version, kind));
+    crate::security::atomic_write(&path, artifact, true)
+        .context("failed to stage the verified installer")?;
+
+    let record = UpdateHandoff {
+        version: version.to_string(),
+        security_epoch,
+        from_version: app.package_info().version.to_string(),
+        kind: kind.to_string(),
+        sha256: platform.sha256.clone(),
+        signature: platform.signature.clone(),
+        attempted_at: chrono::Utc::now().timestamp(),
+    };
+    let bytes = serde_json::to_vec(&record).context("failed to serialize the hand-off record")?;
+    crate::security::atomic_write(&handoff_path(app)?, &bytes, true)
+        .context("failed to persist the hand-off record")
+}
+
+/// Forget a hand-off and delete the installer it refers to.
+fn clear_handoff(app: &AppHandle) {
+    if let Ok(path) = handoff_path(app) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(dir) = pending_dir(app) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Re-check the staged installer against the hash and signature it was
+/// originally verified with, and return its path.
+///
+/// The bytes have been sitting on disk since the failed attempt, so they are
+/// treated exactly like bytes off the network: nothing is executed on the
+/// strength of having written it earlier.
+fn verified_installer_path(app: &AppHandle, record: &UpdateHandoff) -> Result<PathBuf> {
+    let path = pending_dir(app)?.join(installer_name(&record.version, &record.kind));
+    let bytes = std::fs::read(&path).context("the staged installer is no longer present")?;
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if actual != record.sha256 {
+        bail!("the staged installer no longer matches its signed hash");
+    }
+    let config = embedded_updater_config()?;
+    verify_minisign(&bytes, record.signature.as_bytes(), &config.public_key)?;
+    Ok(path)
+}
+
 fn load_rollback_state(path: &Path) -> Result<Option<RollbackState>> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1061,6 +1222,20 @@ pub async fn secure_updater_install(
     let artifact = download_artifact(&update.platform, &config.public_key, &on_event)
         .await
         .map_err(|error| public_failure("install", error))?;
+    // Record the attempt and keep the verified bytes before handing them over.
+    // `install` does not come back on success, so this is the only chance to
+    // leave behind anything that a later launch could act on. A failure here is
+    // logged and ignored: losing the safety net is not a reason to refuse the
+    // update itself.
+    if let Err(error) = save_handoff(
+        &app,
+        &update.platform,
+        &update.info.version,
+        update.info.security_epoch,
+        &artifact,
+    ) {
+        tracing::warn!("Could not stage the update hand-off record: {error:#}");
+    }
     // Re-read after the long download as well. Another process may have
     // observed a newer signed floor while this process was downloading.
     if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
@@ -1114,6 +1289,123 @@ pub async fn secure_updater_install(
     }
     pending.take();
     Ok(())
+}
+
+/// Whether the last hand-off to an installer failed to produce the new version.
+///
+/// Called on startup. Three outcomes: no record at all, a record whose version
+/// is the one now running (the update worked — clean it up and say nothing), or
+/// a record for a version we are still not running, which is reported so the UI
+/// can offer the staged installer again.
+#[tauri::command]
+pub async fn secure_updater_handoff_status(
+    app: AppHandle,
+) -> Result<Option<UpdateHandoffReport>, String> {
+    let path = handoff_path(&app).map_err(|error| public_failure("hand-off check", error))?;
+    let record = match read_handoff(&path) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            // An unreadable marker is not worth surfacing, and keeping it would
+            // make every launch retry the same parse.
+            tracing::warn!("Discarding an unreadable update hand-off record: {error:#}");
+            clear_handoff(&app);
+            return Ok(None);
+        }
+    };
+
+    if record.version == app.package_info().version.to_string() {
+        tracing::info!(
+            "Update to {} completed; clearing the staged installer",
+            record.version
+        );
+        clear_handoff(&app);
+        return Ok(None);
+    }
+
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(record.attempted_at);
+    if age > HANDOFF_MAX_AGE_SECS || age < 0 {
+        clear_handoff(&app);
+        return Ok(None);
+    }
+
+    let installer_ready = match verified_installer_path(&app, &record) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!("Staged installer for {} is unusable: {error:#}", record.version);
+            false
+        }
+    };
+    tracing::warn!(
+        "Update to {} was handed to an installer {age}s ago but {} is still running; \
+         the installer did not complete (staged copy usable: {installer_ready})",
+        record.version,
+        record.from_version,
+    );
+    Ok(Some(UpdateHandoffReport {
+        version: record.version,
+        security_epoch: record.security_epoch,
+        attempted_at: record.attempted_at,
+        installer_ready,
+    }))
+}
+
+/// Launch the staged installer again after a hand-off that never ran.
+///
+/// Deliberately interactive: no silent or passive flags. The first attempt was
+/// the invisible one, and if something is going to refuse this binary the user
+/// should be able to see it happen and answer whatever prompt appears.
+#[tauri::command]
+pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), String> {
+    let path = handoff_path(&app).map_err(|error| public_failure("installer launch", error))?;
+    let Some(record) = read_handoff(&path)
+        .map_err(|error| public_failure("installer launch", error))?
+    else {
+        return Err("There is no staged installer to run.".to_string());
+    };
+    let installer = verified_installer_path(&app, &record).map_err(|error| {
+        tracing::warn!("Refusing to run the staged installer: {error:#}");
+        "The staged installer is missing or no longer matches its signature. Check for updates again."
+            .to_string()
+    })?;
+
+    // Same reasoning as the install path: the installer replaces files this
+    // process has open, so flush and stop everything we own first.
+    if timeout(
+        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
+        crate::run_graceful_shutdown(&app, crate::SHUTDOWN_WAIT),
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!(
+            "Graceful shutdown did not complete before the installer launch deadline; proceeding with a possibly truncated flush"
+        );
+    }
+
+    let spawned = if record.kind == "msi" {
+        std::process::Command::new("msiexec")
+            .arg("/i")
+            .arg(&installer)
+            .spawn()
+    } else {
+        std::process::Command::new(&installer).spawn()
+    };
+
+    match spawned {
+        Ok(_) => {
+            // The marker stays: only a launch that finds itself running the new
+            // version clears it, so a second silent failure still reports.
+            tracing::info!("Launched the staged installer for {}", record.version);
+            std::process::exit(0);
+        }
+        Err(error) => {
+            tracing::warn!("Could not launch the staged installer: {error}");
+            Err("Windows would not start the installer. It is saved in Ember's data folder under \"updates\" if you want to run it yourself.".to_string())
+        }
+    }
 }
 
 #[cfg(test)]

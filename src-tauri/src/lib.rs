@@ -1734,6 +1734,8 @@ pub fn run() {
             commands::deeplink::open_pending_collection,
             commands::updater::secure_updater_check,
             commands::updater::secure_updater_install,
+            commands::updater::secure_updater_handoff_status,
+            commands::updater::secure_updater_run_saved_installer,
         ])
         .on_window_event(|window, event| {
             // Title-bar X handler. Decides whether to fully exit, hide to

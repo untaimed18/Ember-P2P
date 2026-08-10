@@ -16,6 +16,13 @@ export type UpdaterPhase =
   | 'installing'
   | 'ready' // installed on disk, waiting for the user to relaunch
   | 'uptodate' // last manual check confirmed we're current
+  // A previous session downloaded an update, verified it, closed Ember and
+  // handed it to the OS — and here we are still running the old version, so the
+  // installer never completed. Installing ends in `exit(0)` inside the updater
+  // plugin, so nothing of ours was still alive to notice at the time; this is
+  // the first moment we can tell the user, and the verified installer is still
+  // on disk to offer them.
+  | 'stalled'
   | 'error';
 
 export interface UpdaterState {
@@ -36,6 +43,17 @@ export interface UpdaterState {
   error: string | null;
   /** Set when the user dismisses the banner for this epoch/version identity. */
   dismissed: boolean;
+  /** `stalled` only: the staged installer is still present and still matches
+   *  its signed hash, so offering to run it again is worth doing. When false
+   *  the notice explains the situation without a button that cannot work. */
+  installerReady: boolean;
+}
+
+interface UpdateHandoffReport {
+  version: string;
+  securityEpoch: number;
+  attemptedAt: number;
+  installerReady: boolean;
 }
 
 interface SecureUpdateInfo {
@@ -66,6 +84,7 @@ const INITIAL: UpdaterState = {
   total: null,
   error: null,
   dismissed: false,
+  installerReady: false,
 };
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
@@ -249,6 +268,9 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         // Unknown/malformed epoch metadata must fail visible, never reuse a
         // potentially stale dismissal identity.
         dismissed: isUpdateDismissed(securityEpoch, found.version),
+        // Only meaningful for `stalled`; a fresh update replaces any staged
+        // installer rather than offering the old one.
+        installerReady: false,
       });
       return true;
     }
@@ -333,6 +355,59 @@ export async function installUpdate(): Promise<void> {
     // artifact hash/signature checks and installation. Keep retry state only
     // on the error path.
     await disposePending();
+  } catch (e) {
+    retryAction = 'install';
+    updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
+  } finally {
+    installInFlight = false;
+  }
+}
+
+/**
+ * Ask whether the last hand-off to an installer actually landed.
+ *
+ * Run once at startup, before any update check. A hand-off that worked reports
+ * nothing (the backend recognises its own version and cleans up); one that did
+ * not puts the notice into `stalled` so the user finds out at all — previously
+ * the app simply closed and nothing happened, with no trace in the UI.
+ *
+ * Never overwrites a live check/download already in progress, and never
+ * reports as an error: a missing or unreadable record just means there is
+ * nothing to say.
+ */
+export async function checkUpdateHandoff(): Promise<boolean> {
+  if (installInFlight || checkInFlight) return false;
+  try {
+    const report = await invoke<UpdateHandoffReport | null>('secure_updater_handoff_status');
+    if (!report) return false;
+    updater.set({
+      ...INITIAL,
+      phase: 'stalled',
+      version: report.version,
+      securityEpoch: normalizeSecurityEpoch(report.securityEpoch),
+      installerReady: report.installerReady,
+    });
+    return true;
+  } catch {
+    // Diagnostics only; a failure here must not block startup or nag the user.
+    return false;
+  }
+}
+
+/**
+ * Run the installer a failed hand-off left staged.
+ *
+ * On success this call does not return: the backend flushes state, launches the
+ * installer and exits, exactly as the original install would have. An error
+ * means Windows refused again, and the message says where the file is so the
+ * user can run it themselves.
+ */
+export async function runStagedInstaller(): Promise<void> {
+  if (installInFlight) return;
+  installInFlight = true;
+  updater.update((s) => ({ ...s, phase: 'installing', error: null }));
+  try {
+    await invoke('secure_updater_run_saved_installer');
   } catch (e) {
     retryAction = 'install';
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
