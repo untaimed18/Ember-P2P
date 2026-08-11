@@ -733,10 +733,16 @@
 
   let copyingAllLibraryLinks = $state(false);
 
+  // Read from `sortedFiles`, not `filteredFiles`: the button says it copies the
+  // current view, and the table renders the sorted list, so copying the filtered
+  // one handed back scan order instead of what the user was looking at. Same set
+  // either way, so the count beside the button is unchanged; only the order is.
+  // Deduping over the sorted list also keeps the topmost of a duplicate pair,
+  // which is the one the user can see.
   let filteredHashedFiles = $derived.by(() => {
     const seen = new Set<string>();
     const out: FileInfo[] = [];
-    for (const f of filteredFiles) {
+    for (const f of sortedFiles) {
       const h = f.hash?.trim();
       if (!h || seen.has(h)) continue;
       seen.add(h);
@@ -784,7 +790,7 @@
     error = null;
     try {
       const selected = await addSharedFolder();
-      if (!mounted || !selected) return;
+      if (!mounted || selected.length === 0) return;
       stoppedByUser = false;
       scanning = true;
       scanTruncated = false;
@@ -2199,31 +2205,6 @@
   let dndActive = $state(false);
   let dndHover = $state(false);
 
-  async function handleOsFolderDrop(paths: string[]) {
-    const uniquePaths = [...new Set(paths.filter((p) => typeof p === 'string' && p.length > 0))];
-    if (uniquePaths.length === 0) return;
-
-    // OS drag/drop paths are visible to the renderer and therefore are not
-    // filesystem authorization. Explain that, show the dropped name(s), then
-    // open the trusted native picker so the user explicitly confirms a folder
-    // without restoring raw-path IPC authority.
-    const displayNames = uniquePaths.map((p) => {
-      const trimmed = p.replace(/[\\/]+$/, '');
-      const parts = trimmed.split(/[/\\]/);
-      return parts[parts.length - 1] || trimmed;
-    });
-    const summary = displayNames.slice(0, 3).join(', ')
-      + (displayNames.length > 3 ? '…' : '');
-    const confirmed = await askConfirm(
-      uniquePaths.length === 1
-        ? m.library_drop_confirm_one({ name: displayNames[0] })
-        : m.library_drop_confirm_other({ count: uniquePaths.length, summary }),
-      m.library_drop_confirm_title(),
-    );
-    if (!confirmed || !mounted) return;
-    await handleAddFolder();
-  }
-
   // A collection opened from the OS is handed over in FIFO order. Consume it
   // in an effect so an already-mounted Library page presents later links too.
   // The handoff is marked complete only after the modal state is installed;
@@ -2312,6 +2293,7 @@
       let u2: (() => void) | null = null;
       let u3: (() => void) | null = null;
       let u4: (() => void) | null = null;
+      let u5: (() => void) | null = null;
       try {
         u1 = await listen<{ phase: string; count: number }>(
           'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
@@ -2358,14 +2340,27 @@
             );
           },
         );
-        if (destroyed) { u1(); u2(); u3(); u4(); return; }
-        unlisteners.push(u1, u2, u3, u4);
+        // Page-local half of a drag-drop share: put the scanning banner up and
+        // refresh the list. The toast and the dropped-file question live in the
+        // root layout, because the drop is handled window-wide and can land
+        // while the user is looking at another page entirely.
+        u5 = await listen<{ count?: number }>('shared-folders-added', (event) => {
+          if (!mounted) return;
+          if ((event.payload?.count ?? 0) <= 0) return;
+          stoppedByUser = false;
+          scanning = true;
+          scanTruncated = false;
+          void refresh();
+        });
+        if (destroyed) { u1(); u2(); u3(); u4(); u5(); return; }
+        unlisteners.push(u1, u2, u3, u4, u5);
       } catch (e) {
         console.warn('library: failed to register file-system event listeners', e);
         if (u1) u1();
         if (u2) u2();
         if (u3) u3();
         if (u4) u4();
+        if (u5) u5();
       }
     })();
 
@@ -2388,9 +2383,11 @@
             dndActive = false;
             dndHover = false;
           } else if (t === 'drop') {
+            // Overlay only. The drop itself is handled in Rust, from the OS
+            // event on the native window, so the paths the renderer can see
+            // here are deliberately ignored.
             dndActive = false;
             dndHover = false;
-            if (hasPaths) void handleOsFolderDrop(paths);
           }
         });
         if (destroyed) u(); else unlisteners.push(u);

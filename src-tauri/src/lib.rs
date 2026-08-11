@@ -723,6 +723,7 @@ pub fn run() {
                 network_tx,
                 db: db.clone(),
                 approved_roots: approved_roots.clone(),
+                pending_folder_drop: Arc::new(tokio::sync::Mutex::new(None)),
                 security_policy: security_policy.clone(),
                 identity: identity.clone(),
                 config: Arc::new(RwLock::new(config)),
@@ -1605,8 +1606,11 @@ pub fn run() {
             commands::transfers::stop_transfer,
             commands::transfers::open_file,
             commands::transfers::open_transfer_file_location,
+            commands::transfers::open_downloads_folder,
             commands::transfers::recover_archive,
             commands::sharing::pick_shared_folder,
+            commands::sharing::confirm_dropped_folders,
+            commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
             commands::sharing::get_shared_file_count,
@@ -1746,6 +1750,23 @@ pub fn run() {
             if window.label() != "main" {
                 return;
             }
+
+            // Files and folders dropped onto the window. Handled here rather
+            // than in the webview's own drag-drop event because that is what
+            // makes the paths usable at all: `add_shared_folder` is not an
+            // invokable command, so a path arriving from the renderer is not
+            // authorization, while one the OS delivered to this window is. The
+            // frontend still draws the drop overlay; it just no longer decides
+            // what was dropped.
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                let app_handle = window.app_handle().clone();
+                let paths = paths.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::sharing::share_dropped_paths(app_handle, paths).await;
+                });
+                return;
+            }
+
             let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
 
             let app_handle = window.app_handle();

@@ -1542,6 +1542,8 @@ npm run tauri build</code></pre>
         <h4>What&rsquo;s New</h4>
 
         <ul>
+          <li><strong>Drag folders onto Ember to share them.</strong> Dropping folders on the window used to name what you dropped and then open the folder picker anyway, so dropping five folders still meant choosing one of them by hand. They are shared as they land now, however many you drop at once, and the folder picker accepts more than one selection too. Dropping a file offers to share the folder holding it, since sharing here works a folder at a time. We still ask first in the two cases worth asking about: when a drop would include your user folder, which would offer your documents, desktop and pictures to other users, and when it carries far more folders than anyone means to share in one go</li>
+          <li><strong>The downloads list does more without leaving it.</strong> Right-clicking an empty part of the list opens the actions that apply to the whole list: pause, resume, stop or cancel everything, copy every download link, paste a link, clear finished rows, select all, and open your Downloads folder. Selecting rows also puts a Copy Link button next to Cancel, which reads Copy All Links once you have selected more than one</li>
           <li><strong>Ember search results appear as they are found.</strong> We used to hold everything a lookup gathered until the whole search finished, and an Ember lookup deliberately keeps asking further peers rather than stopping early, so on a cold start you watched Kad fill the list while Ember showed nothing until the very end. Results now arrive as they are found, the first one straight away and the rest in batches. A file both networks know about updates the row you already have instead of adding a second one</li>
           <li><strong>The Ember Network page shows when answers are being cut short.</strong> A peer replies to a keyword query with as many records as fit in one packet, which is about five, so a busy word can hold far more than anyone can see. There was no way to tell that apart from a quiet network. The page now counts the answers we had to trim and the records that did not fit</li>
           <li><strong>Four new figures for judging whether your node is healthy.</strong> An estimate of how many nodes are out there, how many of your contacts have actually answered you rather than just been mentioned by somebody else, how far behind republishing is, and how long it has been since any Ember packet arrived. Between them they separate still joining from joined and quiet from stuck</li>
@@ -1578,8 +1580,14 @@ npm run tauri build</code></pre>
           <li><strong>Your node paces itself by how big the network is.</strong> A node among two hundred peers and a node among two hundred thousand ran identical timers. Ember now estimates the size of the network from how tightly packed its neighbours are and scales what it checks and how often against it</li>
         </ul>
 
+        <h5>Library</h5>
+        <ul>
+          <li><strong>Copy All Links copies in the order you are looking at.</strong> The button took files in the order they were scanned rather than the order on screen, so sorting by name, size or folder changed the list in front of you and made no difference at all to what landed on the clipboard</li>
+        </ul>
+
         <h5>Transfers</h5>
         <ul>
+          <li><strong>Pause All and Resume All follow the filter box.</strong> Stop All and Cancel All already applied to the downloads you could actually see, but these two reached every download regardless. With a filter typed in, two commands sitting in the same menu meant different things by All, and the pair that reached rows you could not see was the dangerous half</li>
           <li><strong>A long upload stops freezing at 100%.</strong> An upload counts the bytes actually sent, and a peer that re-requests data pushes that past the size of the file, routinely and by tens of megabytes over a long session. We trimmed the figure to the file size before it reached the speed calculation, so from that moment every sample looked identical and the row froze: no speed, the counter stuck exactly at the file size, and a status of Complete. One session here carried on serving at over a megabyte a second for another half hour behind a row that said it had finished</li>
         </ul>
 

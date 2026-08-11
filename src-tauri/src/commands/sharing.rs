@@ -1739,7 +1739,7 @@ pub async fn pick_shared_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<String>, String> {
     if window.label() != "main" {
         return Err(coded(
             "sharing_picker_wrong_window",
@@ -1747,32 +1747,321 @@ pub async fn pick_shared_folder(
         ));
     }
     let picker_app = app.clone();
+    // Plural picker: adding several folders used to mean reopening this dialog
+    // once per folder, which is the same papercut dropping them was supposed to
+    // avoid. Every returned path is authorized the same way a single one was.
     let selected = tokio::task::spawn_blocking(move || {
         picker_app
             .dialog()
             .file()
-            .set_title("Choose a folder to share")
-            .blocking_pick_folder()
-            .map(|folder| {
-                folder.into_path().map_err(|error| {
-                    coded_ctx(
-                        "sharing_invalid_picker_path",
-                        "Invalid selected folder",
-                        error,
-                    )
-                })
+            .set_title("Choose folders to share")
+            .blocking_pick_folders()
+            .map(|folders| {
+                folders
+                    .into_iter()
+                    .map(|folder| {
+                        folder.into_path().map_err(|error| {
+                            coded_ctx(
+                                "sharing_invalid_picker_path",
+                                "Invalid selected folder",
+                                error,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
             })
             .transpose()
     })
     .await
     .map_err(|error| coded_ctx("sharing_picker_task_failed", "Folder picker failed", error))??;
 
-    let Some(path) = selected else {
-        return Ok(None);
+    let Some(paths) = selected else {
+        return Ok(Vec::new());
     };
-    let display_path = path.to_string_lossy().into_owned();
-    add_shared_folder(app, state, display_path.clone()).await?;
-    Ok(Some(display_path))
+    let mut added = Vec::with_capacity(paths.len());
+    let mut first_error: Option<String> = None;
+    for path in paths {
+        let display_path = path.to_string_lossy().into_owned();
+        // One bad folder must not discard the rest of the selection.
+        match add_shared_folder(app.clone(), state.clone(), display_path.clone()).await {
+            Ok(()) => added.push(display_path),
+            Err(error) => {
+                tracing::warn!("Selected folder {display_path} was not shared: {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    // Picking folders and being told nothing at all is worse than the single-add
+    // version this replaced, which propagated its error to the UI. Report only
+    // when *nothing* landed: on a partial success the folders that worked are
+    // visible in the library, and failing the whole call would hide them.
+    if added.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    Ok(added)
+}
+
+/// Paths a single drop may carry before it is refused outright. Generous for
+/// any deliberate gesture; a guard against a stray select-all, whose only cost
+/// otherwise is thousands of blocking `is_dir` calls for folders nobody meant
+/// to share.
+const MAX_DROPPED_PATHS: usize = 512;
+
+/// Folders a drop shares without asking. Beyond this the whole batch is put to
+/// the user, because dropping more folders than you meant to is the mistake the
+/// gesture makes easy and the number itself is the warning.
+const DROP_CONFIRM_FOLDER_COUNT: usize = 8;
+
+/// Report the outcome of a drag-drop share to the UI.
+///
+/// Both halves matter. Silence on success leaves the user guessing whether the
+/// drop registered; silence on failure is worse, because the gesture is the
+/// whole feature and a drop that shares nothing would look exactly like one the
+/// app never received. Unlike the picker there is no return value to carry
+/// either — the drop arrives on a window event, with no call to fail.
+fn emit_drop_result(app: &tauri::AppHandle, added: usize, failed: usize) {
+    if added > 0 {
+        let _ = app.emit(
+            "shared-folders-added",
+            serde_json::json!({ "count": added }),
+        );
+    }
+    if failed > 0 {
+        let _ = app.emit(
+            "shared-folders-add-failed",
+            serde_json::json!({ "count": failed }),
+        );
+    }
+}
+
+/// Share everything an OS drag-drop delivered to the native window.
+///
+/// Called from the window event handler, never over IPC. That distinction is
+/// the whole point: `add_shared_folder` is deliberately not an invokable
+/// command, so the renderer cannot name a folder to share, and the folder
+/// picker used to be the only way to authorize one. A drop reported by the OS
+/// to the native window has the same provenance — a compromised webview cannot
+/// synthesize one — so it can be honoured directly instead of being reduced to
+/// a prompt that reopens the picker, which is what it used to do.
+///
+/// Dropped directories are shared immediately. Dropped files cannot be: sharing
+/// here is folder-granular, so the only thing a file can mean is "share the
+/// folder holding it", which is a much larger action than the gesture implies
+/// and is therefore put to the user first.
+pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::PathBuf>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    // A drop is one gesture but its payload is whatever the file manager had
+    // selected, so it is attacker-free but not size-free: every path below costs
+    // a blocking `is_dir`, and a careless select-all can be tens of thousands.
+    // Refuse the whole thing rather than silently working on a prefix.
+    if paths.len() > MAX_DROPPED_PATHS {
+        tracing::warn!(
+            "Ignoring a drop of {} paths; the limit is {MAX_DROPPED_PATHS}",
+            paths.len()
+        );
+        let _ = app.emit(
+            "shared-folder-drop-rejected",
+            serde_json::json!({ "reason": "too_many", "limit": MAX_DROPPED_PATHS }),
+        );
+        return;
+    }
+
+    // Everything that would make sharing your whole profile a single careless
+    // drag. `add_shared_folder` already refuses a filesystem root, the sensitive
+    // system names, and Ember's own data directory, but a home directory is
+    // none of those: `C:\Users\you` has an ordinary name and a parent, and
+    // sharing it hands out Documents, Desktop and Pictures in one go.
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(std::path::PathBuf::from)
+        .and_then(|h| h.canonicalize().ok());
+
+    // Classify off the async runtime: `is_dir` on a disconnected network or
+    // removable path blocks for the OS timeout, and this runs on a user gesture.
+    let sorted = tokio::task::spawn_blocking(move || {
+        let mut folders: Vec<String> = Vec::new();
+        let mut broad: Vec<String> = Vec::new();
+        let mut parents: Vec<String> = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                // Compare canonically, or a drop of `C:\Users\you\..\you` walks
+                // straight past the check it is here to fail.
+                let covers_home = path
+                    .canonicalize()
+                    .ok()
+                    .zip(home.as_ref())
+                    .is_some_and(|(candidate, home)| home.starts_with(&candidate));
+                if covers_home {
+                    broad.push(path.to_string_lossy().into_owned());
+                } else {
+                    folders.push(path.to_string_lossy().into_owned());
+                }
+            } else if path.is_file() {
+                if let Some(parent) = path.parent() {
+                    parents.push(parent.to_string_lossy().into_owned());
+                }
+            }
+        }
+        for list in [&mut folders, &mut broad, &mut parents] {
+            list.sort();
+            list.dedup();
+        }
+        (folders, broad, parents)
+    })
+    .await;
+    let Ok((folders, broad, parents)) = sorted else {
+        return;
+    };
+
+    if folders.is_empty() && broad.is_empty() && parents.is_empty() {
+        // Every path vanished between the drop and the stat, or none of them was
+        // a file or a directory. Saying nothing is the one remaining way a drop
+        // can look exactly like one the app never received.
+        let _ = app.emit(
+            "shared-folder-drop-rejected",
+            serde_json::json!({ "reason": "nothing" }),
+        );
+        return;
+    }
+
+    // One prompt per drop, so decide up front what it is about. A large batch is
+    // questioned as a whole: sharing eight folders and asking about the ninth
+    // would be a strange way to warn someone that they dropped more than they
+    // meant to.
+    let bulk = folders.len() + broad.len() + parents.len() > DROP_CONFIRM_FOLDER_COUNT;
+    // Reason priority, not category priority: a batch that happens to include a
+    // folder covering your home directory is precisely the drop that must not be
+    // described merely as "9 folders". The count is the lesser of the two
+    // warnings, so it never gets to hide the other.
+    let reason = if !broad.is_empty() {
+        "broad"
+    } else if bulk {
+        "many"
+    } else {
+        "files"
+    };
+    let (share_now, confirm) = if bulk {
+        let mut all = folders;
+        all.extend(broad);
+        all.extend(parents);
+        all.sort();
+        all.dedup();
+        (Vec::new(), all)
+    } else {
+        let mut confirm = broad;
+        confirm.extend(parents);
+        confirm.sort();
+        confirm.dedup();
+        (folders, confirm)
+    };
+
+    let mut added = 0usize;
+    let mut failed = 0usize;
+    for folder in share_now {
+        match add_shared_folder(app.clone(), state.clone(), folder.clone()).await {
+            Ok(()) => added += 1,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!("Dropped folder {folder} was not shared: {error}");
+            }
+        }
+    }
+    emit_drop_result(&app, added, failed);
+
+    if confirm.is_empty() {
+        return;
+    }
+    queue_drop_confirmation(&app, &state, confirm, reason).await;
+}
+
+/// Park folders a drop cannot honour outright and ask the user about them.
+///
+/// The paths stay here while the question is outstanding; the frontend gets a
+/// token and display names only, and answers with the token. That is what keeps
+/// a dropped path authorization: it was authorization because the OS handed it
+/// to the native window, and a round trip through the renderer would make it
+/// something the renderer chose instead.
+async fn queue_drop_confirmation(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    folders: Vec<String>,
+    reason: &'static str,
+) {
+    let token = rand::random::<u64>();
+    let names: Vec<String> = folders
+        .iter()
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.clone())
+        })
+        .collect();
+    {
+        let mut pending = state.pending_folder_drop.lock().await;
+        // The reason rides on the event only: it decides the wording, and the
+        // answer is the same set of folders whatever prompted the question.
+        *pending = Some(crate::app_state::PendingFolderDrop { token, folders });
+    }
+    let _ = app.emit(
+        "shared-folder-drop-pending",
+        serde_json::json!({ "token": token, "folders": names, "reason": reason }),
+    );
+}
+
+/// Approve the folders a dropped file asked about, identified by the token the
+/// backend issued. Nothing here trusts a path from the renderer: a stale or
+/// invented token simply finds no pending drop.
+#[tauri::command]
+pub async fn confirm_dropped_folders(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    token: u64,
+) -> Result<usize, String> {
+    let folders = {
+        let mut pending = state.pending_folder_drop.lock().await;
+        match pending.as_ref() {
+            // Taken, not peeked: one answer per prompt, so a replayed
+            // confirmation cannot re-share after the user removed the folder.
+            Some(p) if p.token == token => pending.take().map(|p| p.folders).unwrap_or_default(),
+            _ => return Ok(0),
+        }
+    };
+    let mut added = 0usize;
+    let mut failed = 0usize;
+    for folder in folders {
+        match add_shared_folder(app.clone(), state.clone(), folder.clone()).await {
+            Ok(()) => added += 1,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!("Dropped file's folder {folder} was not shared: {error}");
+            }
+        }
+    }
+    emit_drop_result(&app, added, failed);
+    Ok(added)
+}
+
+/// Discard a pending dropped-file prompt the user declined, so a later
+/// confirmation cannot resurrect it.
+#[tauri::command]
+pub async fn dismiss_dropped_folders(
+    state: tauri::State<'_, AppState>,
+    token: u64,
+) -> Result<(), String> {
+    let mut pending = state.pending_folder_drop.lock().await;
+    if pending.as_ref().is_some_and(|p| p.token == token) {
+        *pending = None;
+    }
+    Ok(())
 }
 
 #[tauri::command]

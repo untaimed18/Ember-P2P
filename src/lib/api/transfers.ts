@@ -163,6 +163,13 @@ export async function openTransferFileLocation(transferId: string): Promise<void
   return invoke('open_transfer_file_location', { transferId });
 }
 
+/** Open the Downloads directory itself, for the downloads-pane background menu.
+ *  Unlike `openTransferFileLocation` this needs no transfer, so it still works
+ *  when the list is empty. */
+export async function openDownloadsFolder(): Promise<void> {
+  return invoke('open_downloads_folder');
+}
+
 export async function recoverArchive(transferId: string): Promise<string> {
   return invoke('recover_archive', { transferId });
 }

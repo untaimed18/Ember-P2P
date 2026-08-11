@@ -1,9 +1,25 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
-/** Open the backend-owned native picker and add the selected folder. */
-export async function addSharedFolder(): Promise<string | null> {
+/** Open the backend-owned native picker and add every selected folder.
+ *  Returns the folders actually added, which is empty when the user cancels. */
+export async function addSharedFolder(): Promise<string[]> {
   return invoke('pick_shared_folder');
+}
+
+/** Approve the folders a dropped file asked about.
+ *
+ *  Takes only the token the backend issued with the prompt — the paths never
+ *  leave the backend, because a dropped path is authorization by virtue of the
+ *  OS handing it to the native window, and routing it through the renderer
+ *  would throw that away. Returns how many folders were shared. */
+export async function confirmDroppedFolders(token: number): Promise<number> {
+  return invoke('confirm_dropped_folders', { token });
+}
+
+/** Discard a dropped-file prompt the user declined. */
+export async function dismissDroppedFolders(token: number): Promise<void> {
+  return invoke('dismiss_dropped_folders', { token });
 }
 
 export async function removeSharedFolder(path: string): Promise<void> {

@@ -1266,6 +1266,47 @@ pub async fn open_transfer_file_location(
     Ok(())
 }
 
+/// Open the Downloads directory itself in the user's file manager.
+///
+/// Distinct from [`open_transfer_file_location`], which reveals one file: this
+/// is the pane-level action, so it has no transfer to resolve from and has to
+/// work when the list is empty — which is exactly when someone reaches for it.
+///
+/// The directory is created if it is missing. A profile that has never finished
+/// a download has no `Downloads/` yet, because it is created when the first file
+/// lands there, and refusing to open a folder we are about to create ourselves
+/// would be a confusing answer to a reasonable request.
+#[tauri::command]
+pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let dl_folder = {
+        let cfg = state.config.read().await;
+        cfg.settings.download_folder.clone()
+    };
+    // Same blocking-pool treatment as the reveal path: creating and launching a
+    // directory that lives on a network or cloud-synced volume can block for
+    // seconds, and stalling the async runtime freezes unrelated IPC.
+    tokio::task::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from(&dl_folder).join("Downloads");
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            coded_ctx(
+                "transfers_downloads_folder_unavailable",
+                "Could not open the Downloads folder",
+                e,
+            )
+        })?;
+        crate::security::filesystem::open_with_default_app(&dir).map_err(|e| {
+            coded_ctx(
+                "transfers_open_explorer_failed",
+                "Failed to open the Downloads folder",
+                e,
+            )
+        })
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn open_file(
     state: tauri::State<'_, AppState>,

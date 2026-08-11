@@ -6,12 +6,12 @@
   import { networkStats } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority, pauseAllTransfers, resumeAllTransfers,
+    clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
-    getTransferSources, openFile, openTransferFileLocation, recoverArchive, startDownload,
+    getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
-  import { findSources, parseEd2kLink, formatEd2kLink } from '$lib/api/search';
+  import { findSources, parseEd2kLink, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
@@ -1742,6 +1742,7 @@
     e.preventDefault();
     closeColumnMenu();
     closeKnownCtx();
+    closePaneCtx();
     ctxPrioritySub = false;
     ctxCategorySub = false;
     const margin = 8;
@@ -1753,19 +1754,44 @@
     e.preventDefault();
     closeCtx();
     closeColumnMenu();
+    closePaneCtx();
     const margin = 8;
     const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 220 - margin));
     const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 180 - margin));
     knownCtxMenu = { x, y, client };
   }
+  /// Background menu for the downloads pane, distinct from the per-row one.
+  /// It acts on the whole visible list, and it is the only place two of these
+  /// actions can live at all — pasting a link and opening the Downloads folder
+  /// need no row, and are most wanted when the list is empty.
+  let paneCtxMenu: { x: number; y: number } | null = $state(null);
+
+  function onDownloadsPaneCtx(e: MouseEvent) {
+    // The header and the rows already own their right-click, and neither
+    // stops propagation, so this has to bow out for both rather than opening a
+    // second menu on top of theirs.
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('thead') || target?.closest('tbody tr')) return;
+    e.preventDefault();
+    closeCtx();
+    closeKnownCtx();
+    closeColumnMenu();
+    const margin = 8;
+    const x = Math.max(margin, Math.min(e.clientX, window.innerWidth - 240 - margin));
+    const y = Math.max(margin, Math.min(e.clientY, window.innerHeight - 340 - margin));
+    paneCtxMenu = { x, y };
+  }
+
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
+  function closePaneCtx() { paneCtxMenu = null; }
 
   function onDocClick() {
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
+    closePaneCtx();
     // Match ctx/column menus: native <details> stays open on outside click.
     document
       .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
@@ -1904,11 +1930,83 @@
   }
 
   // --- Bulk actions ---
+  //
+  // Scoped through `globalDownloadTargets` like Stop All and Cancel All, rather
+  // than the whole-manager `pause_all_transfers` / `resume_all_transfers` these
+  // used to call. With the filter box narrowed, two commands sitting in the same
+  // menu meant different things by "All", and the one that reached rows the user
+  // could not see is the dangerous half of that pair. The batch commands do the
+  // same per-transfer work as the global ones, including queue promotion and
+  // status persistence.
   async function handlePauseAll() {
-    try { await pauseAllTransfers(); } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ids = globalDownloadTargets().filter((t) => canPause(t)).map((t) => t.id);
+    if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
+    try {
+      await pauseTransfersBatch(ids);
+    } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
   async function handleResumeAll() {
-    try { await resumeAllTransfers(); } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
+    if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
+    try {
+      await resumeTransfersBatch(ids);
+    } catch (e: unknown) { transferError = toErrorMsg(e); }
+  }
+
+  /** Downloads in the visible list that have a hash to build a link from. */
+  let linkableVisibleDownloads = $derived.by(() => linkableOf(filteredActiveDownloads));
+  /** Same, over the current selection, for the footer buttons' disabled state. */
+  let linkableSelectedCount = $derived(linkableOf(selectedBatchTransfers).length);
+
+  let copyingAllDownloadLinks = $state(false);
+
+  /** Downloads from `list` that carry a hash, deduped by it. */
+  function linkableOf(list: Transfer[]): Transfer[] {
+    const seen = new Set<string>();
+    const out: Transfer[] = [];
+    for (const t of list) {
+      const h = t.file_hash?.trim();
+      if (!h || seen.has(h.toLowerCase())) continue;
+      seen.add(h.toLowerCase());
+      out.push(t);
+    }
+    return out;
+  }
+
+  /// Copy eD2K links for whichever downloads the caller names. Shared by the
+  /// pane background menu (the whole visible list) and both selection footers
+  /// (one row, or the current multi-selection), so the dedupe, clipboard
+  /// fallback and reporting behave identically wherever it is invoked from.
+  async function copyDownloadLinks(list: Transfer[]) {
+    if (copyingAllDownloadLinks) return;
+    const targets = linkableOf(list);
+    if (targets.length === 0) { showInfo(m.transfers_copy_all_none()); return; }
+    copyingAllDownloadLinks = true;
+    try {
+      const text = await formatEd2kLinks(
+        targets.map((t) => ({ name: t.file_name, size: t.total_size, hash: t.file_hash })),
+      );
+      // No chunking here, unlike the Library: the backend refuses a single
+      // `format_ed2k_links` call over 50,000 entries, and a download list that
+      // large is not reachable.
+      if (!(await copyToClipboard(text))) {
+        transferError = m.transfers_copy_failed();
+        return;
+      }
+      showInfo(
+        targets.length === 1
+          ? m.transfers_copied_links_one()
+          : m.transfers_copied_links_other({ count: targets.length }),
+      );
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    } finally {
+      copyingAllDownloadLinks = false;
+    }
+  }
+
+  async function handleOpenDownloadsFolder() {
+    try { await openDownloadsFolder(); } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
 
   // Header-level "Paste link" — same flow as the row context-menu's
@@ -2482,6 +2580,7 @@
     event.preventDefault();
     event.stopPropagation();
     closeCtx();
+    closePaneCtx();
     const margin = 8;
     columnMenu = {
       table,
@@ -2945,6 +3044,7 @@
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
     if (ctxMenu) { closeCtx(); e.preventDefault(); }
+    else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); }
     else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
     else {
@@ -2961,7 +3061,7 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -3067,7 +3167,8 @@
         </details>
       </div>
     </div>
-    <div class="pane-content scroll-shadows">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="pane-content scroll-shadows" oncontextmenu={onDownloadsPaneCtx}>
       <table
         class="transfer-table dl-table"
         bind:this={downloadTableEl}
@@ -3410,6 +3511,7 @@
           <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
           <button class="tb-btn danger-outline" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_all_links()}>{m.transfers_copy_all_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
               {m.transfers_batch_remove({ count: selectedFinishedCount })}
@@ -3432,6 +3534,10 @@
           <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
           <button class="tb-btn" disabled={isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
           <button class="tb-btn" disabled={!canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {#if selectedTransfer}
+            {@const copyOne = selectedTransfer}
+            <button class="tb-btn" disabled={copyingAllDownloadLinks || !copyOne.file_hash?.trim()} onclick={() => void copyDownloadLinks([copyOne])} title={m.transfers_ctx_copy_link()}>{m.transfers_copy_link_btn()}</button>
+          {/if}
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
             <button class="tb-btn" onclick={() => removeTransfersBatch([finishedId])} title={m.transfers_batch_remove_title()}>
@@ -4181,6 +4287,29 @@
 {/if}
 
 <!-- Context Menu -->
+{#if paneCtxMenu}
+  <!-- Downloads pane background menu. Every "All" here is the visible, filtered
+       list, matching `globalDownloadTargets` — an "all" that reaches rows the
+       user cannot see is how people lose downloads they meant to keep. -->
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="context-menu" style="left: {paneCtxMenu.x}px; top: {paneCtxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
+    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handlePauseAll(); }}>{m.transfers_pause_all()}</button>
+    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleResumeAll(); }}>{m.transfers_resume_all()}</button>
+    <button class="ctx-item" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); void handleStopAll(); }}>{m.transfers_stop_all()}</button>
+    <button class="ctx-item danger" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
+    <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void handlePasteLinkFromHeader(); }}>{m.transfers_ctx_paste_link()}</button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
+      {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
+    </button>
+    <button class="ctx-item" disabled={!hasCompletedDl} onclick={() => { closePaneCtx(); confirmClearCompleted = true; }}>{m.transfers_clear_completed()}</button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+  </div>
+{/if}
+
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;" onclick={(e) => e.stopPropagation()}>

@@ -31,7 +31,9 @@
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
-  import { addToast, clearAllToasts, toastError, toastWarning } from '$lib/stores/toast';
+  import { addToast, clearAllToasts, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
@@ -56,6 +58,40 @@
   let showWizard = $state(false);
   let wizardSettings: AppSettings | null = $state(null);
   let showCloseDialog = $state(false);
+  /// A dropped file's containing folder(s), awaiting an answer. `token` is all
+  /// the backend accepts back — it holds the paths itself, because a dropped
+  /// path is authorization only by virtue of the OS handing it to the native
+  /// window, and routing it through here would throw that away.
+  let dropPrompt = $state<{
+    open: boolean;
+    token: number;
+    folders: string[];
+    reason: 'files' | 'broad' | 'many';
+  }>({
+    open: false,
+    token: 0,
+    folders: [],
+    reason: 'files',
+  });
+  /// The prompt says what is actually true of the drop. "Broad" is the one that
+  /// matters: sharing a folder that contains your home directory hands out
+  /// Documents, Desktop and Pictures at once, and it is the mistake a single
+  /// careless drag from a file manager's sidebar makes easiest.
+  let dropPromptMessage = $derived.by(() => {
+    const folders = dropPrompt.folders;
+    const summary = folders.slice(0, 3).join(', ') + (folders.length > 3 ? '…' : '');
+    if (dropPrompt.reason === 'many') {
+      return m.library_drop_many_confirm({ count: folders.length, summary });
+    }
+    if (dropPrompt.reason === 'broad') {
+      return folders.length === 1
+        ? m.library_drop_broad_confirm_one({ folder: folders[0] })
+        : m.library_drop_broad_confirm_other({ count: folders.length, summary });
+    }
+    return folders.length === 1
+      ? m.library_drop_parent_confirm_one({ folder: folders[0] })
+      : m.library_drop_parent_confirm_other({ count: folders.length, summary });
+  });
   let policyResetReason = $state<string | null>(null);
   let policyResetPending = $state(false);
   let policyResetError = $state('');
@@ -189,6 +225,10 @@
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
+    let unlistenFoldersAdded: UnlistenFn | null = null;
+    let unlistenFoldersFailed: UnlistenFn | null = null;
+    let unlistenDropPending: UnlistenFn | null = null;
+    let unlistenDropRejected: UnlistenFn | null = null;
 
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
@@ -256,6 +296,66 @@
     )
       .then((fn) => { if (mounted) unlistenPolicyReset = fn; else fn(); })
       .catch((e) => console.error('Failed to register security-policy listener:', e));
+
+    // Drag-drop sharing is handled by the backend from the OS event on the
+    // window, so it fires wherever the user happens to be. Its acknowledgement
+    // and its one question therefore belong here rather than on the Library
+    // page: registered there, dropping a folder from any other page shared it
+    // with no confirmation shown, and dropping a *file* asked nothing and so
+    // did nothing at all.
+    listen<{ count?: number }>('shared-folders-added', (event) => {
+      if (!mounted) return;
+      const count = event.payload?.count ?? 0;
+      if (count <= 0) return;
+      toastSuccess(
+        count === 1 ? m.library_folders_shared_one() : m.library_folders_shared_other({ count }),
+      );
+    })
+      .then((fn) => { if (mounted) unlistenFoldersAdded = fn; else fn(); })
+      .catch((e) => console.error('Failed to register shared-folders-added listener:', e));
+
+    // A drop that shared nothing has to say so: it is indistinguishable from a
+    // drop the app never received otherwise, and the gesture is the feature.
+    listen<{ count?: number }>('shared-folders-add-failed', (event) => {
+      if (!mounted) return;
+      const count = event.payload?.count ?? 0;
+      if (count <= 0) return;
+      toastWarning(
+        count === 1
+          ? m.library_folders_share_failed_one()
+          : m.library_folders_share_failed_other({ count }),
+      );
+    })
+      .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
+      .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    listen<{ token?: number; folders?: string[]; reason?: string }>(
+      'shared-folder-drop-pending',
+      (event) => {
+        if (!mounted) return;
+        const token = event.payload?.token;
+        const folders = event.payload?.folders ?? [];
+        if (typeof token !== 'number' || folders.length === 0) return;
+        const raw = event.payload?.reason;
+        // Unknown reasons fall back to the narrowest wording rather than the
+        // scariest, so a future backend value cannot mislabel an ordinary drop.
+        const reason = raw === 'broad' || raw === 'many' ? raw : 'files';
+        dropPrompt = { open: true, token, folders, reason };
+      },
+    )
+      .then((fn) => { if (mounted) unlistenDropPending = fn; else fn(); })
+      .catch((e) => console.error('Failed to register drop-pending listener:', e));
+
+    listen<{ reason?: string; limit?: number }>('shared-folder-drop-rejected', (event) => {
+      if (!mounted) return;
+      toastWarning(
+        event.payload?.reason === 'too_many'
+          ? m.library_drop_too_many({ limit: event.payload?.limit ?? 0 })
+          : m.library_drop_nothing(),
+      );
+    })
+      .then((fn) => { if (mounted) unlistenDropRejected = fn; else fn(); })
+      .catch((e) => console.error('Failed to register drop-rejected listener:', e));
 
     void getSecurityPolicyState()
       .then((status) => {
@@ -427,6 +527,10 @@
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
       if (unlistenPolicyReset) unlistenPolicyReset();
+      if (unlistenFoldersAdded) unlistenFoldersAdded();
+      if (unlistenFoldersFailed) unlistenFoldersFailed();
+      if (unlistenDropPending) unlistenDropPending();
+      if (unlistenDropRejected) unlistenDropRejected();
     };
   });
 </script>
@@ -509,6 +613,26 @@
   onhide={handleCloseToTray}
   onexit={handleCloseExit}
   oncancel={handleCloseCancel}
+/>
+
+<ConfirmDialog
+  bind:open={dropPrompt.open}
+  title={dropPrompt.reason === 'broad'
+    ? m.library_drop_broad_confirm_title()
+    : dropPrompt.reason === 'many'
+      ? m.library_drop_many_confirm_title()
+      : m.library_drop_parent_confirm_title()}
+  message={dropPromptMessage}
+  danger={dropPrompt.reason === 'broad'}
+  isolateMessage
+  onconfirm={() => {
+    const token = dropPrompt.token;
+    void confirmDroppedFolders(token).catch((e) =>
+      toastError(translateError(e, m.error_operation_failed())),
+    );
+  }}
+  oncancel={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
+  ondismiss={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
 />
 
 {#if policyResetReason}

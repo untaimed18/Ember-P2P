@@ -24,6 +24,20 @@ pub struct PendingDeepLink {
     pub payload: String,
 }
 
+/// Folders captured from an OS drag-drop that need an answer before they are
+/// shared — currently only the "you dropped files, share the folder holding
+/// them?" case.
+///
+/// The paths live here rather than travelling to the frontend because of where
+/// they came from: the OS delivered them to the native window, which is what
+/// makes them authorization at all, and the equal of what the folder picker
+/// returns. A confirmation therefore echoes back `token`, never a path, so the
+/// renderer can approve the drop the user actually made and nothing else.
+pub struct PendingFolderDrop {
+    pub token: u64,
+    pub folders: Vec<String>,
+}
+
 /// Live shared-folder list visible to the upload server's security check.
 pub type SharedFolderList = Arc<RwLock<Vec<String>>>;
 
@@ -36,6 +50,10 @@ pub struct AppState {
     /// Handle-bound approved filesystem roots used by every destructive or
     /// executable filesystem action.
     pub approved_roots: Arc<crate::security::filesystem::ApprovedRootRegistry>,
+    /// Awaiting the user's answer to a dropped-file share prompt. Single-slot:
+    /// a second drop before the first is answered supersedes it, which is what
+    /// the user means by dropping again.
+    pub pending_folder_drop: Arc<tokio::sync::Mutex<Option<PendingFolderDrop>>>,
     /// Network/upload startup remains closed while security policy recovery
     /// requires explicit user acknowledgement.
     pub security_policy: Arc<crate::security::policy::SecurityPolicyGate>,
