@@ -76,6 +76,13 @@ pub struct DhtInbound {
     pub find_value_received: bool,
     /// True when that `FIND_VALUE` was answered with `FOUND_VALUE` (hit).
     pub find_value_hit: bool,
+    /// Live matching records that did not fit the `FOUND_VALUE` datagram.
+    ///
+    /// Non-zero means this node holds more under the key than one answer can
+    /// ever carry, and the same front-of-list records are the only ones it
+    /// serves. Without this the shortfall is indistinguishable from a small
+    /// network, which is the evidence needed before paying for pagination.
+    pub find_value_withheld: u16,
     /// The frame was a `STORE_ACK`; the `request_id` it answered (so the
     /// caller can resolve the matching publish query).
     pub store_ack_request_id: Option<u32>,
@@ -1029,13 +1036,14 @@ impl EmberDht {
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
-                if let Some((primary, blobs)) = intersect_find_value_records(&self.store, &keys) {
+                if let Some(reply) = intersect_find_value_records(&self.store, &keys) {
                     out.find_value_hit = true;
+                    out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
                     let fv = messages::build_found_value(
                         self.local_id,
                         msg.request_id,
-                        primary,
-                        blobs,
+                        reply.key,
+                        reply.blobs,
                     );
                     out.responses
                         .push(messages::encode_message(&fv, &self.signing_key, true));
@@ -1113,10 +1121,7 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 /// as defense-in-depth. When we *do* hold one or more secondaries, we
 /// filter by `file_hash` intersection. Empty intersection → `None`
 /// (`FOUND_NODE`). Single-key queries serve all live primary records.
-fn intersect_find_value_records(
-    store: &DhtStore,
-    keys: &[[u8; 16]],
-) -> Option<([u8; 16], Vec<Vec<u8>>)> {
+fn intersect_find_value_records(store: &DhtStore, keys: &[[u8; 16]]) -> Option<FoundValueReply> {
     let (primary, filtered) = intersect_live_records(store, keys)?;
 
     // Pack records until the reply would stop fitting a datagram. A key can
@@ -1144,7 +1149,20 @@ fn intersect_find_value_records(
     if blobs.is_empty() {
         return None;
     }
-    Some((primary, blobs))
+    let withheld = filtered.len() - blobs.len();
+    Some(FoundValueReply {
+        key: primary,
+        blobs,
+        withheld,
+    })
+}
+
+/// A `FOUND_VALUE` answer plus what the datagram had no room for.
+struct FoundValueReply {
+    key: [u8; 16],
+    blobs: Vec<Vec<u8>>,
+    /// Live matching records left unserved by this reply.
+    withheld: usize,
 }
 
 /// `record_data || signature`, the shape a `FOUND_VALUE` blob and a locally
@@ -1900,6 +1918,62 @@ mod tests {
         assert_eq!(parsed.file_name, "ubuntu.iso");
         assert_eq!(parsed.file_size, 4096);
         assert_eq!(parsed.keyword_hash, key);
+    }
+
+    /// A node holding more records under one keyword than a datagram can carry
+    /// serves the front of the list and drops the rest. How often that happens
+    /// is what separates "few results because the network is small" from "few
+    /// results because every answer is capped", so the shortfall has to leave
+    /// the engine rather than staying a local variable.
+    #[test]
+    fn a_truncated_found_value_reports_what_it_could_not_carry() {
+        let mut a = dht(20); // publisher / searcher
+        let mut b = dht(21); // storer
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(20, 4672);
+        let b_addr = addr(21, 4672);
+
+        const PUBLISHED: usize = 20;
+        let mut key = [0u8; 16];
+        for i in 0..PUBLISHED {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i as u8;
+            let record = a.build_keyword_record(
+                "ubuntu",
+                file_hash,
+                [0u8; 32],
+                4096,
+                &format!("ubuntu-server-22.04.{i:02}-amd64-live.iso"),
+            );
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record,
+                "record {i} should be accepted"
+            );
+        }
+        assert_eq!(b.store_stats(), (1, PUBLISHED));
+
+        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(on_b.find_value_hit);
+        assert!(
+            on_b.find_value_withheld > 0,
+            "20 records of this size cannot fit one datagram"
+        );
+
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
+        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        assert!(
+            blobs.len() < PUBLISHED,
+            "the reply is bounded by what one datagram carries"
+        );
+        assert_eq!(
+            blobs.len() + on_b.find_value_withheld as usize,
+            PUBLISHED,
+            "every live record is either served or counted as withheld"
+        );
     }
 
     #[test]

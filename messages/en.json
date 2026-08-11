@@ -104,6 +104,7 @@
   "ember_stat_search_rounds": "Search rounds",
   "ember_stat_find_values_sent": "FIND_VALUE sent",
   "ember_stat_serve_hit_miss": "Serve hits / misses",
+  "ember_stat_serve_truncated": "Truncated answers / withheld records",
   "ember_stat_buddy_pub_fwd": "Buddy publish / forward",
   "ember_stat_malformed": "Malformed frames",
   "ember_stat_observed_votes": "Observed-IP votes",

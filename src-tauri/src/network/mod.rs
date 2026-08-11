@@ -10391,6 +10391,11 @@ struct EmberKeywordSearch {
     max_size: Option<u64>,
     file_extension: Option<String>,
     min_availability: Option<u32>,
+    /// How many of the search's gathered records have already been handed to
+    /// the emit pipeline. A cursor rather than a flag because
+    /// `IterativeSearch::results` is append-only and deduped before push, so
+    /// everything past this index is new.
+    last_streamed_count: usize,
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).
@@ -10403,6 +10408,10 @@ struct EmberKeywordResultBatch {
     file_extension: Option<String>,
     min_availability: Option<u32>,
     results: Vec<SearchResult>,
+    /// The last batch this lookup will produce, so the emit sweep knows which
+    /// one clears `ember_pending`. Intermediate batches must not, or
+    /// `search-complete` fires while the walk is still going.
+    final_batch: bool,
 }
 
 /// Maximum concurrent pending Ember pings tracked in `NetworkState`.
@@ -10450,7 +10459,19 @@ const EMBER_CONTACT_PING_SECS: i64 = ember::dht::CONTACT_TIMEOUT_SECS;
 
 /// Locally-stored records are re-published (replicated) to the current
 /// closest nodes at least this often, so they survive node churn.
-const EMBER_RECORD_REPUBLISH_SECS: u64 = 3600;
+///
+/// Two hours rather than one. This is storer-side replication, and what it can
+/// buy is narrower than the old cadence assumed: expiry is derived from the
+/// publisher's *signed* creation timestamp and a storer re-sends the identical
+/// bytes, so every recipient computes the same absolute death time and no
+/// amount of re-sending extends a record's life. What it does buy is churn
+/// coverage — copies reaching nodes that joined since the publisher's last
+/// round — which is worth paying for, but not twice over: at
+/// `EMBER_MAINT_MAX_REPUBLISH` records per cycle to 20 replicas, hourly made
+/// this the single largest traffic item on the overlay, roughly double its
+/// entire publish load. Each record already has 20 replicas and lives at most
+/// 24 hours.
+const EMBER_RECORD_REPUBLISH_SECS: u64 = 7200;
 
 /// Per-maintenance-cycle fan-out caps, so one tick can't flood the
 /// network with refreshes, pings, or republishes.
@@ -30673,13 +30694,90 @@ pub async fn start_network(
                     }
                 }
 
-                // 7) Emit keyword search results gathered by completed Ember
-                //    DHT keyword lookups (slice 10). Completion is detected
-                //    synchronously in `maybe_finish_ember_search`; emitting
-                //    needs the async enrich pipeline + app_handle, so batches
-                //    are buffered and drained here. Each batch clears its
-                //    request's `ember_pending` and re-checks `search-complete`
-                //    after emitting, so results always precede completion.
+                // 7) Stream keyword hits out of lookups that are still walking.
+                //    `FIND_VALUE` is deliberately excluded from early
+                //    convergence, so a lookup on a cold table can run most of
+                //    the 60-second cap; buffering until it converged meant the
+                //    user watched KAD rows land with nothing from Ember until
+                //    the very end. Cadence matches the KAD path: the first
+                //    record goes out at once, then every 20.
+                if !state.ember_keyword_searches.is_empty() {
+                    let search_ids: Vec<u32> =
+                        state.ember_keyword_searches.keys().copied().collect();
+                    for search_id in search_ids {
+                        let Some(gathered) =
+                            state.ember_search.get(search_id).map(|s| s.results.len())
+                        else {
+                            continue;
+                        };
+                        let Some(cursor) = state
+                            .ember_keyword_searches
+                            .get(&search_id)
+                            .map(|kw| kw.last_streamed_count)
+                        else {
+                            continue;
+                        };
+                        let threshold = if cursor == 0 { 1 } else { 20 };
+                        if gathered < cursor + threshold {
+                            continue;
+                        }
+                        let Some(records) = state.ember_search.get(search_id).map(|s| {
+                            s.results[cursor..]
+                                .iter()
+                                .map(|r| r.data.clone())
+                                .collect::<Vec<_>>()
+                        }) else {
+                            continue;
+                        };
+                        let Some(kw) = state.ember_keyword_searches.get_mut(&search_id) else {
+                            continue;
+                        };
+                        // Advanced even when the rows below all fail the query
+                        // filter: those records have been considered, and not
+                        // moving the cursor would re-examine them every tick.
+                        kw.last_streamed_count = gathered;
+                        let batch = EmberKeywordResultBatch {
+                            request_id: kw.request_id,
+                            results: build_ember_keyword_results(
+                                &records,
+                                &kw.keywords,
+                                kw.query_expr.as_ref(),
+                            ),
+                            keywords: kw.keywords.clone(),
+                            file_type_filter: kw.file_type_filter.clone(),
+                            min_size: kw.min_size,
+                            max_size: kw.max_size,
+                            file_extension: kw.file_extension.clone(),
+                            min_availability: kw.min_availability,
+                            final_batch: false,
+                        };
+                        if batch.results.is_empty() {
+                            continue;
+                        }
+                        // Same digest seeding the completion path does, so a
+                        // streamed row establishes the mapping just as one
+                        // emitted at the end would.
+                        for r in &batch.results {
+                            let digest = parse_ember_file_hash(&r.file.ember_file_hash);
+                            if digest != [0u8; 32] {
+                                if let Ok(bytes) = hex::decode(r.file.hash.trim()) {
+                                    if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                                        state.ember_content_hashes.entry(ed2k).or_insert(digest);
+                                    }
+                                }
+                            }
+                        }
+                        state.ember_pending_keyword_results.push(batch);
+                    }
+                }
+
+                // 8) Emit keyword search results gathered by Ember DHT keyword
+                //    lookups (slice 10) — the streamed batches queued above and
+                //    the closing one queued by `maybe_finish_ember_search`.
+                //    Emitting needs the async enrich pipeline + app_handle, so
+                //    batches are buffered and drained here. Only the final
+                //    batch clears its request's `ember_pending` and re-checks
+                //    `search-complete`, so results always precede completion.
                 if !state.ember_pending_keyword_results.is_empty() {
                     let batches = std::mem::take(&mut state.ember_pending_keyword_results);
                     for batch in batches {
@@ -30691,10 +30789,19 @@ pub async fn start_network(
                             max_size,
                             file_extension,
                             min_availability,
-                            results,
+                            mut results,
+                            final_batch,
                         } = batch;
+                        // A hash KAD or a server already streamed arrives as an
+                        // availability update rather than a second row for the
+                        // same file.
+                        let resights = dedup_streamed_batch(
+                            &mut state.active_search_request,
+                            request_id,
+                            &mut results,
+                        );
                         if !results.is_empty() {
-                            enrich_and_emit_search_results(
+                            let emitted = enrich_and_emit_search_results(
                                 &app_handle,
                                 &spam_filter,
                                 &comment_manager,
@@ -30710,13 +30817,36 @@ pub async fn start_network(
                                 None,
                             )
                             .await;
-                        }
-                        if let Some(active) = state.active_search_request.as_mut() {
-                            if active.request_id == request_id {
-                                active.ember_pending = false;
+                            if let Some(active) = state.active_search_request.as_mut() {
+                                if active.request_id == request_id {
+                                    mark_streamed_hashes(active, &emitted);
+                                }
                             }
                         }
-                        maybe_finish_active_search(&mut state, &app_handle, request_id);
+                        if !resights.is_empty() {
+                            if let Some(active) = state.active_search_request.as_mut() {
+                                if active.request_id == request_id {
+                                    // Ember origins never advance the ed2k stop
+                                    // counter, so nothing is skipped here.
+                                    let no_skip = HashSet::new();
+                                    emit_search_resight_updates(
+                                        &app_handle,
+                                        request_id,
+                                        resights,
+                                        active,
+                                        &no_skip,
+                                    );
+                                }
+                            }
+                        }
+                        if final_batch {
+                            if let Some(active) = state.active_search_request.as_mut() {
+                                if active.request_id == request_id {
+                                    active.ember_pending = false;
+                                }
+                            }
+                            maybe_finish_active_search(&mut state, &app_handle, request_id);
+                        }
                     }
                 }
                 }).catch_unwind().await;
@@ -33533,8 +33663,14 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // emit on the next sweep tick (which has the enrich pipeline
                 // + app_handle). Always queued -- even when empty -- so the
                 // sweep clears `ember_pending` and `search-complete` fires.
+                //
+                // Only the tail the streaming sweep has not already sent. The
+                // rest reached the UI while the walk was still running, and
+                // re-emitting them here would turn every streamed row into a
+                // duplicate at completion.
+                let fresh = records.get(kw.last_streamed_count..).unwrap_or(&[]);
                 let results =
-                    build_ember_keyword_results(&records, &kw.keywords, kw.query_expr.as_ref());
+                    build_ember_keyword_results(fresh, &kw.keywords, kw.query_expr.as_ref());
                 // The rows only ever carry a corroborated digest now, so this can
                 // seed straight from them. Still `or_insert`, so a search hit fills
                 // a gap and never displaces what the UI, known.met or a local hash
@@ -33560,6 +33696,7 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                         file_extension: kw.file_extension,
                         min_availability: kw.min_availability,
                         results,
+                        final_batch: true,
                     });
             }
         }
@@ -35556,6 +35693,16 @@ async fn handle_ember_dht_message(
                 .ember_diagnostics
                 .ember_dht_find_value_hits
                 .saturating_add(1);
+            if inbound.find_value_withheld > 0 {
+                state.ember_diagnostics.ember_dht_found_value_truncated = state
+                    .ember_diagnostics
+                    .ember_dht_found_value_truncated
+                    .saturating_add(1);
+                state.ember_diagnostics.ember_dht_found_value_withheld = state
+                    .ember_diagnostics
+                    .ember_dht_found_value_withheld
+                    .saturating_add(u32::from(inbound.find_value_withheld));
+            }
         } else {
             state.ember_diagnostics.ember_dht_find_value_misses = state
                 .ember_diagnostics
@@ -39188,6 +39335,7 @@ async fn handle_command_inner(
                                 max_size: active_request.max_size,
                                 file_extension: active_request.file_extension.clone(),
                                 min_availability: active_request.min_availability,
+                                last_streamed_count: 0,
                             },
                         );
                         active_request.ember_pending = true;

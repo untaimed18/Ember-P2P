@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "Cycles de recherche",
   "ember_stat_find_values_sent": "FIND_VALUE envoyés",
   "ember_stat_serve_hit_miss": "Réponses trouvées / manquées",
+  "ember_stat_serve_truncated": "Réponses tronquées / enregistrements omis",
   "ember_stat_buddy_pub_fwd": "Publication / retransmission compagnon",
   "ember_stat_malformed": "Trames malformées",
   "ember_stat_observed_votes": "Votes d'IP observée",

@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "搜索轮次",
   "ember_stat_find_values_sent": "已发送 FIND_VALUE",
   "ember_stat_serve_hit_miss": "服务命中 / 未命中",
+  "ember_stat_serve_truncated": "被截断的回复 / 未发送记录",
   "ember_stat_buddy_pub_fwd": "伙伴发布 / 转发",
   "ember_stat_malformed": "格式错误的帧",
   "ember_stat_observed_votes": "观测 IP 投票",

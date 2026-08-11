@@ -4,8 +4,8 @@ Status: **protocol slices complete** and the overlay is **on by default**
 (`ember_native_enabled`, with a one-shot migration for profiles created
 before the default flipped). Keyword/source publish, iterative search,
 join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
-BLAKE3 integrity digests, network-size-adaptive abuse limits, and
-diagnostics are live on `develop`.
+BLAKE3 integrity digests, network-size-adaptive abuse limits, streamed
+search results, and diagnostics are live on `develop`.
 
 Start at [Planned next](#planned-next--from-the-kad-comparison-aug-2026) — it is
 the current plan, ordered by leverage and backed by a constant-for-constant
@@ -138,6 +138,12 @@ Everything here was verified in the code, not inferred from comments. Four
 silent-breakage bugs and five performance defects found by the same comparison
 were fixed before 1.5.3 and are not repeated here.
 
+**Shipped in 1.5.3:** item 3 (streaming) in full, item 6 (the republish cadence)
+in full, and the truncation counter that items 1 and 8 both depend on. Their
+sections below are kept rather than deleted, because each records why the change
+was made and what to watch now that it is live. Items 1, 2, 4, 5 and 7 are
+untouched and remain in this order.
+
 ### 1. The serving ceiling — do this first
 
 A peer answers a keyword query with **about five records**, and always the same
@@ -159,8 +165,13 @@ Two ways forward, and the cheap one is worth doing on its own:
   this is the breaking change that section warns about) and multiplies query
   traffic on hot keywords.
 
-Add a truncation counter first, so there is evidence of how often the cap
-actually binds before paying for pagination.
+The truncation counter this was waiting on **shipped in 1.5.3**: an inbound
+`FIND_VALUE` we answer now reports how many live matching records the datagram
+could not carry, surfaced on the Ember page as truncated answers over withheld
+records. Read it before paying for pagination. Truncation near zero means the
+ceiling is theoretical on the network as it currently is and item 2 is the
+better buy; a high withheld-per-truncated ratio is the case that justifies the
+wire change, because it says the records exist and nothing can reach them.
 
 ### 2. Per-publisher keyword capacity — blocked on 1
 
@@ -176,16 +187,26 @@ before item 1: if a peer only ever serves ~5 records per reply, the extra stored
 records have no way to reach a searcher, and the only certain effect is more
 storer-replication traffic.
 
-### 3. Stream search results as they arrive
+### 3. Stream search results as they arrive — done in 1.5.3
 
-Ember buffers everything and emits on completion; `FIND_VALUE` is deliberately
-excluded from early convergence, so on a cold table a user can wait most of the
-60-second cap while KAD hits are already on screen. KAD streams the first result
-immediately, then every 20, with progress events. The pattern is right there in
-the KAD path to copy. No extra network traffic; the work is threading
-`dedup_streamed_batch` / `mark_streamed_hashes` into the Ember emit so a hash KAD
-already streamed arrives as an availability update rather than a duplicate row,
-and making sure `ember_pending` still clears exactly once.
+Ember used to buffer everything and emit on completion; `FIND_VALUE` is
+deliberately excluded from early convergence, so on a cold table a user waited
+most of the 60-second cap while KAD hits were already on screen.
+
+The Ember keyword search now carries a cursor into the search's append-only
+result list, and the 1-second sweep emits everything past it on the same cadence
+the KAD path uses: the first record immediately, then every 20. Records seeded
+from the local store therefore reach the UI on the first tick. Batches run
+through `dedup_streamed_batch` / `mark_streamed_hashes`, so a hash KAD already
+streamed arrives as an availability update rather than a duplicate row, and only
+the batch flagged final clears `ember_pending` — the completion batch is still
+queued when it is empty, so that happens exactly once.
+
+Worth knowing when reading this code: the timeout backstop that reaps an expired
+keyword search runs earlier in the same sweep than both the streaming step and
+the emit step, and it removes the search from `ember_keyword_searches`. That
+ordering is what stops a reaped search from being streamed after its
+`search-complete`, and it is not obvious from either site alone.
 
 ### 4. Firewalled sources are discoverable but not dialable
 
@@ -216,16 +237,24 @@ timestamp persisted for Ember specifically; do not borrow KAD's
 
 ### 6. Storer-side replication costs more than it buys
 
-At 200 records per cycle to 20 replicas this is roughly **48,000 frames an hour**
-— Ember's single largest traffic item, about double its entire publish load.
+**Halved in 1.5.3**: `EMBER_RECORD_REPUBLISH_SECS` is now 7200.
 
-It cannot extend a record's lifetime. Expiry is derived from the publisher's
-*signed* creation timestamp, and a storer re-sends the identical bytes, so every
-recipient computes the same absolute death time. What it buys is churn coverage:
-copies reach nodes that joined since the publisher's last round. That is real,
-but it is not what the cadence was justified on. Halving it
-(`EMBER_RECORD_REPUBLISH_SECS` 3600 → 7200) would save ~24,000 frames an hour at
-little cost, given each record already has 20 replicas and lives at most 24 h.
+At 200 records per cycle to 20 replicas, hourly was roughly **48,000 frames an
+hour** — Ember's single largest traffic item, about double its entire publish
+load. Two-hourly saves about half of that.
+
+The reasoning matters more than the number, because it is the argument against
+ever putting the cadence back. Replication cannot extend a record's lifetime:
+expiry is derived from the publisher's *signed* creation timestamp, and a storer
+re-sends the identical bytes, so every recipient computes the same absolute death
+time. What it buys is churn coverage, copies reaching nodes that joined since the
+publisher's last round, and two hours buys that as well as one given each record
+already has 20 replicas and lives at most 24 h. A shorter cadence would have to
+be justified on churn coverage measured, not on record survival.
+
+Still missing is any view of what this node republishes on others' behalf. The
+publish side logs a cycle heartbeat; this, the larger of the two traffic items,
+has no equivalent.
 
 ### 7. Contact encoding wastes 18% of every response
 
@@ -237,12 +266,12 @@ change, so bundle it with item 1's version bump.
 
 ### 8. Observability gaps
 
-The diagnostic surface is already better than KAD's. Four things are missing that
-matter specifically for judging health after a long unattended run:
+The diagnostic surface is already better than KAD's. Three things are still
+missing that matter specifically for judging health after a long unattended run:
 
-- **Nothing reports a truncated `FOUND_VALUE`.** Without it there is no way to
-  tell "few results because the network is small" from "few results because every
-  node caps every reply at five." Prerequisite for item 1.
+- ~~**Nothing reports a truncated `FOUND_VALUE`.**~~ Shipped in 1.5.3, as
+  `ember_dht_found_value_truncated` and `ember_dht_found_value_withheld`. This
+  was the prerequisite for item 1; see there for how to read it.
 - **Store rejections have no cause breakdown.** Only the key-cap rejection is
   counted; per-publisher, per-key and per-IP refusals are `debug!` only.
 - **No search outcome quality.** Hits and misses are counted, but not nodes

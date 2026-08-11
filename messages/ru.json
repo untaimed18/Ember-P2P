@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "Раунды поиска",
   "ember_stat_find_values_sent": "Отправлено FIND_VALUE",
   "ember_stat_serve_hit_miss": "Попадания / промахи обслуживания",
+  "ember_stat_serve_truncated": "Усечённые ответы / пропущенные записи",
   "ember_stat_buddy_pub_fwd": "Публикация / пересылка Buddy",
   "ember_stat_malformed": "Некорректные кадры",
   "ember_stat_observed_votes": "Голоса за наблюдаемый IP",

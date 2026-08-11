@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "Rodadas de busca",
   "ember_stat_find_values_sent": "FIND_VALUE enviados",
   "ember_stat_serve_hit_miss": "Acertos / erros ao servir",
+  "ember_stat_serve_truncated": "Respostas truncadas / registros omitidos",
   "ember_stat_buddy_pub_fwd": "Publicação / encaminhamento de buddy",
   "ember_stat_malformed": "Quadros malformados",
   "ember_stat_observed_votes": "Votos de IP observado",

@@ -875,7 +875,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
-      <h3>Get Ember 1.5.2</h3>
+      <h3>Get Ember 1.5.3</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
@@ -1107,6 +1107,7 @@
       <li><strong>Bootstrap depends on eMule</strong> &mdash; A first run with KAD off and no servers cannot join, as described above.</li>
       <li><strong>Version mismatches are silent</strong> &mdash; Incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never appear in each other&rsquo;s routing tables.</li>
       <li><strong>Multi-keyword recall is approximate</strong> &mdash; See the note above.</li>
+      <li><strong>A busy keyword shows only a slice of what is out there</strong> &mdash; Each peer answers a keyword query with about as many records as fit in one packet, roughly five, and there is no way yet to ask it for the next page, so recall under a common word is bounded by how many peers the search walks. The same ceiling applies to publishing: one person may hold at most 45 entries under any single word across the whole network, so if you share 200 files that share a common word, not all of them are findable under it. 1.5.3 adds counters for how often this is actually biting, which is what decides whether we spend a protocol change on it.</li>
       <li><strong>Gossip is unverified until it answers</strong> &mdash; A peer another node told us about is a lead, not a fact, until it replies directly. Admission caps bound the damage, but there is no reputation scoring on gossip itself.</li>
       <li><strong>Content still moves over eD2K</strong> &mdash; The native Ember transfer path is written but not switched on, so the eMule wire is still doing the actual file transfer.</li>
       <li><strong>Some paths are not yet exercised end to end</strong> &mdash; Notably publishing while firewalled through a buddy relay, and a cold join from an empty contact file with no KAD.</li>
@@ -1530,6 +1531,71 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-5-3">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.3" target="_blank" rel="noopener">Ember v1.5.3</a></h3>
+        <time class="release-date" datetime="2026-08-10">August 10, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.3" target="_blank" rel="noopener"><code>v1.5.3</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+
+        <ul>
+          <li><strong>Ember search results appear as they are found.</strong> We used to hold everything a lookup gathered until the whole search finished, and an Ember lookup deliberately keeps asking further peers rather than stopping early, so on a cold start you watched Kad fill the list while Ember showed nothing until the very end. Results now arrive as they are found, the first one straight away and the rest in batches. A file both networks know about updates the row you already have instead of adding a second one</li>
+          <li><strong>The Ember Network page shows when answers are being cut short.</strong> A peer replies to a keyword query with as many records as fit in one packet, which is about five, so a busy word can hold far more than anyone can see. There was no way to tell that apart from a quiet network. The page now counts the answers we had to trim and the records that did not fit</li>
+          <li><strong>Four new figures for judging whether your node is healthy.</strong> An estimate of how many nodes are out there, how many of your contacts have actually answered you rather than just been mentioned by somebody else, how far behind republishing is, and how long it has been since any Ember packet arrived. Between them they separate still joining from joined and quiet from stuck</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <p>We compared Ember&rsquo;s network against our own Kad implementation, constant for constant, and audited every change made since 1.5.2. Most of what follows is the result. The theme is silent failure: several of these switched a feature off completely and reported nothing.</p>
+
+        <h5>Before you upgrade</h5>
+        <ul>
+          <li><strong>Nothing to do.</strong> We didn&rsquo;t touch the library database, so you can move between 1.5.0, 1.5.1, 1.5.2 and 1.5.3 in either direction. 1.5.3 also speaks the same Ember network protocol as 1.5.2, so the two find each other normally while everyone upgrades</li>
+        </ul>
+
+        <h5>Publishing and search</h5>
+        <ul>
+          <li><strong>Your files stop quietly leaving search.</strong> Keyword publishing could switch itself off entirely, and did so after every restart on a well-connected node. Sources kept publishing the whole time, so your files stayed downloadable by anyone who already had the link while their keyword records expired and they disappeared from search. Nothing reported it, because from the inside it looked like there was nothing due</li>
+          <li><strong>Searching your own library returns all of it.</strong> When Ember read your own node&rsquo;s index it applied the limit that exists only because a reply has to fit in one packet, so it offered about five of your files. That bit hardest on a small network, where your node holds much of the index and the local read is most of the search</li>
+          <li><strong>A search result can&rsquo;t leave a download impossible to finish.</strong> In 1.5.2 we made a content hash learned from the network need two publishers to agree before we hold a file to it, and covered the path that finds sources. A hash arriving with a search result took a different route and kept the old rule, so one wrong value still meant a download that failed its final check, reopened every part, and started again forever</li>
+          <li><strong>A popular word can&rsquo;t be taken over and locked.</strong> When a keyword filled up we displaced whichever publisher held the most entries, which reads as fairness until you notice that a publisher identity is a free keypair: an arrival holding nothing always outranked an established publisher, so a few hundred keys could strip a word bare and then keep it. A full word now turns new records away, and no single publisher may hold more than 45 of its 300 entries</li>
+          <li><strong>A full word frees up the moment its records expire.</strong> Every limit counts records that are still resident and the tidy-up only ran every five minutes, so a word at its limit turned away genuine records for that long after the records blocking it had already died</li>
+        </ul>
+
+        <h5>The Ember Network</h5>
+        <ul>
+          <li><strong>What you store for other people survives a restart.</strong> We dropped all of it on exit. Replication refills it within the hour and publishers re-announce on their own schedules, so nothing was lost for good, but on a young network, and especially when an update restarts many nodes at once, that leaves a window where content is simply missing. The saved file isn&rsquo;t trusted: every record goes back in through the ordinary checks</li>
+          <li><strong>Publishing addresses peers that are still there.</strong> We cached whole contacts for four hours and never rechecked them, so a publish kept talking to peers the routing table had already dropped. We now look up who is closest at the time we publish</li>
+          <li><strong>A contact that never existed can&rsquo;t end a lookup early.</strong> Contacts arrive unverified, so a peer could answer with an invented address one bit away from what we were looking for, pin the front of the queue, and make every later answer look like no progress. A lookup now only counts a peer that has actually replied</li>
+          <li><strong>Half the background traffic is gone.</strong> Records held on other publishers&rsquo; behalf were re-sent to twenty peers every hour, which was the single largest thing Ember put on the wire, about double everything else it sends. Re-sending cannot extend a record&rsquo;s life, because expiry is computed from the publisher&rsquo;s signed timestamp and every copy is identical. What it genuinely buys is reaching nodes that joined recently, and two hours buys that just as well</li>
+          <li><strong>Changing address doesn&rsquo;t leave people dialling your old one.</strong> Source records carry the address to connect to and were only refreshed on a two-hour cycle, so a DHCP lease change or an ISP reconnect left every record we had placed pointing downloaders at whoever holds that address now</li>
+          <li><strong>Source records expire on their own clock.</strong> They borrowed the keyword record&rsquo;s twenty-four hours. A source names a peer to download from, so it stops being true the moment that peer leaves, while a keyword record stays true whoever is online. Six hours survives two missed refreshes and clears a departed peer four times sooner</li>
+          <li><strong>A node with Kad switched off can tell whether its port is open.</strong> Only Kad&rsquo;s probe could establish it, so an Ember-only node marked every source record it published as firewalled for as long as it ran. That is the safe direction, but it relays connections that never needed relaying and hides exactly the open nodes that make the best relays for everyone else</li>
+          <li><strong>A spoofed address can&rsquo;t get a real peer&rsquo;s session dropped.</strong> When we had to shed a session both rules picked the wrong one: a peer pushed aside while it was busy looks idle, so it always seemed the right one to drop. Refreshing a peer&rsquo;s liveness also outlived its session by half, so every scheduled check found a dead session and paid for a fresh handshake</li>
+          <li><strong>Your node paces itself by how big the network is.</strong> A node among two hundred peers and a node among two hundred thousand ran identical timers. Ember now estimates the size of the network from how tightly packed its neighbours are and scales what it checks and how often against it</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>A long upload stops freezing at 100%.</strong> An upload counts the bytes actually sent, and a peer that re-requests data pushes that past the size of the file, routinely and by tens of megabytes over a long session. We trimmed the figure to the file size before it reached the speed calculation, so from that moment every sample looked identical and the row froze: no speed, the counter stuck exactly at the file size, and a status of Complete. One session here carried on serving at over a megabyte a second for another half hour behind a row that said it had finished</li>
+        </ul>
+
+        <h5>Updating</h5>
+        <ul>
+          <li><strong>Ember tells you when an update handed off to an installer that never ran.</strong> Installing ends by launching the installer and exiting, so nothing of ours is left to see whether it started. Our installer isn&rsquo;t Authenticode-signed yet, which makes every release an unknown program to SmartScreen, and a refusal there is indistinguishable from success from inside Ember: the app closes and nothing happens. The verified installer is now kept on disk and the attempt recorded, so the next launch can see the update didn&rsquo;t land, say so, and offer to run it</li>
+          <li><strong>That offer survives the routine update check.</strong> The check a few seconds after startup wiped the notice, then found the staged version again and offered to download the very same bytes and repeat the hand-off that had just failed, so the feature disabled itself in the exact situation it was built for</li>
+          <li><strong>A staged installer is still held to the rollback floor.</strong> Rechecking the signature answers whether these are the bytes we verified, which is a different question from whether that version is still one we will install. A staged build now has to beat the running one, and anything below the floor is deleted rather than offered</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.2...v1.5.3" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.2...v1.5.3</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-5-2">
       <div class="release-header">

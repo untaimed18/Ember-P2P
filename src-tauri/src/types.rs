@@ -734,6 +734,17 @@ pub struct EmberDiagnostics {
     /// Inbound FIND_VALUE answered with FOUND_NODE (miss / continue walk).
     #[serde(default)]
     pub ember_dht_find_value_misses: u32,
+    /// Inbound FIND_VALUE answers that could not carry every matching record
+    /// this node holds, because one datagram fits only about five. The same
+    /// front-of-list records are served every time, so a publisher behind them
+    /// is invisible here no matter how often it is asked for.
+    #[serde(default)]
+    pub ember_dht_found_value_truncated: u32,
+    /// Records left out of those answers. Read against
+    /// `ember_dht_found_value_truncated`: how often the cap binds versus how
+    /// much it costs when it does.
+    #[serde(default)]
+    pub ember_dht_found_value_withheld: u32,
     /// Outbound STORE_ACK receipts (successful remote stores) this session.
     #[serde(default)]
     pub ember_dht_stores_acked: u32,

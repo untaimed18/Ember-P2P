@@ -369,6 +369,14 @@ export interface EmberDiagnostics {
   ember_dht_find_value_hits: number;
   /** Inbound FIND_VALUE answered with FOUND_NODE. */
   ember_dht_find_value_misses: number;
+  /**
+   * Inbound FIND_VALUE answers that could not carry every matching record this
+   * node holds. One datagram fits about five, and always the same five, so a
+   * publisher behind them is never served from here.
+   */
+  ember_dht_found_value_truncated?: number;
+  /** Records left out of those answers. */
+  ember_dht_found_value_withheld?: number;
   /** Outbound STORE_ACK receipts this session. */
   ember_dht_stores_acked: number;
   /** Outbound STORE targets that failed/timed out. */

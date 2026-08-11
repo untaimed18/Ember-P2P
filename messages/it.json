@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "Cicli di ricerca",
   "ember_stat_find_values_sent": "FIND_VALUE inviati",
   "ember_stat_serve_hit_miss": "Risposte riuscite / non riuscite",
+  "ember_stat_serve_truncated": "Risposte troncate / record omessi",
   "ember_stat_buddy_pub_fwd": "Buddy: pubblicazione / inoltro",
   "ember_stat_malformed": "Frame malformati",
   "ember_stat_observed_votes": "Voti sull'IP osservato",

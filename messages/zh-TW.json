@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "搜尋輪次",
   "ember_stat_find_values_sent": "已傳送 FIND_VALUE",
   "ember_stat_serve_hit_miss": "服務命中 / 未命中",
+  "ember_stat_serve_truncated": "被截斷的回覆 / 未傳送記錄",
   "ember_stat_buddy_pub_fwd": "夥伴釋出 / 轉發",
   "ember_stat_malformed": "格式錯誤的幀",
   "ember_stat_observed_votes": "觀測 IP 投票",

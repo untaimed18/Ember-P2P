@@ -101,6 +101,7 @@
   "ember_stat_search_rounds": "Suchrunden",
   "ember_stat_find_values_sent": "FIND_VALUE gesendet",
   "ember_stat_serve_hit_miss": "Bedientreffer / Fehltreffer",
+  "ember_stat_serve_truncated": "Gekürzte Antworten / ausgelassene Einträge",
   "ember_stat_buddy_pub_fwd": "Buddy-Veröffentlichung / -Weiterleitung",
   "ember_stat_malformed": "Fehlerhafte Frames",
   "ember_stat_observed_votes": "Beobachtete-IP-Stimmen",
