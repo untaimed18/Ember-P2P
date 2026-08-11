@@ -309,6 +309,20 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     await disposePending();
     if (result.error && !opts.silent) {
       retryAction = 'check';
+      // A check that failed says nothing about the staged installer either, and
+      // the recovery offer is worth more to the user than the error text.
+      // `secure_updater_check` reports failures in-band rather than rejecting,
+      // so an ordinary offline check lands here, not in the `catch` below that
+      // already restores. Falling through to `error` was therefore the common
+      // way to lose the offer: `takeStagedSnapshot` only reads the `stalled`
+      // phase, so once the phase changes the "Run installer" button cannot come
+      // back for the rest of the run, and the staged bytes are only reachable
+      // by digging through the data folder by hand. The `stalled` notice does
+      // not render `error`, so there is nothing to be gained by carrying it.
+      if (staged) {
+        restoreStaged(staged);
+        return false;
+      }
       updater.update((s) => ({
         ...s,
         phase: 'error',

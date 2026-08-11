@@ -633,6 +633,17 @@ impl SearchManager {
             if data.len() < 17 + 64 || data[1..17] != search.target.0 {
                 continue;
             }
+            // Register the blob exactly as the wire path does. A record we hold
+            // is one the peers closest to this key are also likely to hold, so
+            // without this every seeded record could take a second slot when a
+            // peer returns the identical bytes. That was near-free when the
+            // local read inherited the datagram packer's limit of about five
+            // records; at `MAX_LOCAL_SEED_RESULTS` it is up to half the result
+            // budget, and filling `MAX_SEARCH_RESULTS` with copies ends the walk
+            // before the closer hops are reached.
+            if !search.seen_results.insert(*blake3::hash(&data).as_bytes()) {
+                continue;
+            }
             search.results.push(SearchResultRecord {
                 data,
                 from_node: local_id,

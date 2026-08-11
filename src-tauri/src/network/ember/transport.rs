@@ -77,6 +77,25 @@ const _: () = assert!(
 /// Maximum concurrent sessions before we start evicting oldest.
 const MAX_SESSIONS: usize = 4096;
 
+/// How long an inbound XX handshake may hold our outbound traffic for a peer we
+/// can name before we stop waiting and dial that identity ourselves.
+///
+/// A responder-side pending is created by an XX msg1, which is unauthenticated,
+/// so an off-path attacker can mint one by forging a peer's source address.
+/// Queuing behind it indefinitely is what made that worth doing: every caller
+/// treats `Queued` as sent, so one forged packet per pending sweep silently
+/// swallowed everything we sent that peer until its contact was faulted out of
+/// the routing table.
+///
+/// A grace window rather than superseding immediately, because the honest race
+/// is real: a peer opening XX with us exactly as we go to dial it completes one
+/// round trip after our msg2, well inside this, and queuing is the behaviour
+/// that delivers both sides' first message. Past it the handshake is not
+/// progressing, and dialling costs the attacker its hold — once our own
+/// `IkInitiator` is pending, `handle_xx_msg1` refuses further inbound msg1s from
+/// that address, so the stall cannot be renewed.
+const XX_RESPONDER_QUEUE_GRACE: Duration = Duration::from_secs(3);
+
 /// Caps on sessions displaced by another claimant at the same address and kept
 /// until their own frame proves them. See
 /// [`EmberTransport::trim_shadow_sessions`] for why the per-address bound is the
@@ -1029,6 +1048,28 @@ impl EmberTransport {
             };
         }
 
+        // A responder-side pending is not ours — see `XX_RESPONDER_QUEUE_GRACE`.
+        // Once it has sat unfinished past the grace window, stop queuing behind
+        // it and dial the identity the caller named instead. This is the
+        // priority rule the module already applies in the other direction:
+        // `handle_xx_msg1` refuses an inbound msg1 that would clobber a
+        // handshake *we* started. Nothing better can be done for a caller that
+        // named no key, so those still queue.
+        let stalled_inbound_handshake = remote_noise_pub.is_some()
+            && matches!(
+                self.pending.get(&peer),
+                Some(PendingHandshake::XxResponderMsg2 { created, .. })
+                    if created.elapsed() >= XX_RESPONDER_QUEUE_GRACE
+            );
+        if stalled_inbound_handshake {
+            debug!(
+                "Inbound XX handshake for {peer} has not completed in {:?}; dialling \
+                 the identity we were asked for instead of queuing behind it",
+                XX_RESPONDER_QUEUE_GRACE
+            );
+            self.pending.remove(&peer);
+        }
+
         // Queue behind in-progress handshake
         if let Some(pending) = self.pending.get_mut(&peer) {
             match pending {
@@ -1081,7 +1122,7 @@ impl EmberTransport {
         // so `sessions` could grow past `MAX_SESSIONS` by as many promotions as
         // there were shadows.
         if !self.sessions.contains_key(&addr) && self.sessions.len() >= MAX_SESSIONS {
-            self.evict_oldest_session();
+            self.evict_one_session();
         }
         // This handshake supersedes any shadow for the same key: leaving an older
         // one there would let frames from the earlier handshake promote it back
@@ -1579,7 +1620,7 @@ impl EmberTransport {
         };
 
         if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_oldest_session();
+            self.evict_one_session();
         }
         let mut session = NoiseSession::new(transport, remote_noise_pub, true);
         // Clear any stale pending handshake for this address (e.g. an
@@ -1829,7 +1870,7 @@ impl EmberTransport {
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_oldest_session();
+            self.evict_one_session();
         }
         self.install_session(from, session);
         trace!("IK handshake completed (initiator) with {from}");
@@ -2247,7 +2288,7 @@ impl EmberTransport {
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_oldest_session();
+            self.evict_one_session();
         }
         self.install_session(from, session);
         trace!("XX handshake completed (initiator) with {from}");
@@ -2359,7 +2400,7 @@ impl EmberTransport {
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_oldest_session();
+            self.evict_one_session();
         }
         self.install_session(from, session);
         trace!(
@@ -2501,14 +2542,41 @@ impl EmberTransport {
 
     // ── Eviction helpers ──
 
-    fn evict_oldest_session(&mut self) {
-        if let Some(oldest) = self
+    /// Free one session slot when the table is full.
+    ///
+    /// Deliberately not the globally least-recently-active session, which is
+    /// what this used to take. `handle_ik_init` installs a session before the
+    /// source address is proven, and nothing rate-limits inbound handshakes
+    /// because the frame limiter only runs after decryption — so a spoofer
+    /// working through forged source addresses could fill the table and shed
+    /// every established peer, because its own entries are always the freshest
+    /// and the honest ones therefore always the least recently active. The peers
+    /// do not find out: their side of the session is still live, so everything
+    /// they send arrives with nothing to decrypt it. That is the same targeted
+    /// eviction primitive [`Self::trim_shadow_sessions`] rejects for the shadow
+    /// map, and the rule here now matches it.
+    ///
+    /// A session that has answered a return-routability probe is proof of a real
+    /// peer at a real address, so those are shed only when there is nothing else
+    /// to take. Among the unproven ones the newest goes first, which makes a
+    /// flood cannibalise its own entries rather than the peers it arrived among.
+    /// Ties break on a per-process salted hash of the address, so the order
+    /// cannot be aimed by choosing source addresses.
+    fn evict_one_session(&mut self) {
+        let victim = self
             .sessions
             .iter()
-            .min_by_key(|(_, s)| s.last_activity)
+            .filter(|(_, s)| !s.addr_validated)
+            .max_by_key(|(addr, s)| (s.established, self.salted_addr_rank(addr)))
             .map(|(k, _)| *k)
-        {
-            self.sessions.remove(&oldest);
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .min_by_key(|(addr, s)| (s.last_activity, self.salted_addr_rank(addr)))
+                    .map(|(k, _)| *k)
+            });
+        if let Some(victim) = victim {
+            self.sessions.remove(&victim);
         }
     }
 
@@ -4122,11 +4190,71 @@ mod tests {
         );
     }
 
+    /// An inbound XX handshake is created by an unauthenticated msg1, so an
+    /// off-path attacker can mint one at a victim's address by forging the
+    /// source. Left holding our outbound traffic it is a blackhole rather than a
+    /// delay: every caller treats `Queued` as sent, so the frames die with the
+    /// pending and the peer is faulted for never answering. Past the grace
+    /// window we dial the identity we were asked for instead, which also takes
+    /// the slot back — `handle_xx_msg1` refuses an inbound msg1 once one of our
+    /// own handshakes is pending, so the stall cannot be renewed.
+    #[test]
+    fn a_stalled_inbound_xx_handshake_does_not_hold_our_traffic() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init_packet = match alice.prepare_outgoing(bob_addr, None, b"first msg from alice") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        match bob.process_incoming(&init_packet, alice_addr) {
+            IncomingResult::HandshakeResponse { .. } => {}
+            other => panic!(
+                "expected HandshakeResponse after Bob sees msg1, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // Alice's msg3 never arrives — the msg1 was forged and the real Alice
+        // has no handshake in flight to finish.
+        match bob.pending.get_mut(&alice_addr) {
+            Some(PendingHandshake::XxResponderMsg2 { created, .. }) => {
+                *created = Instant::now() - XX_RESPONDER_QUEUE_GRACE - Duration::from_secs(1);
+            }
+            _ => panic!("Bob should be holding a responder-side pending"),
+        }
+
+        match bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"a query bob needs answered") {
+            OutgoingResult::HandshakeStarted { .. } => {}
+            other => panic!(
+                "a stalled inbound handshake must not swallow our traffic, got {}",
+                variant_name(&other)
+            ),
+        }
+        assert!(
+            matches!(
+                bob.pending.get(&alice_addr),
+                Some(PendingHandshake::IkInitiator { .. })
+            ),
+            "our own dial must own the slot afterwards, so the stall cannot be renewed"
+        );
+    }
+
     /// Regression: Bob (XX responder) calls `prepare_outgoing` while
     /// still in `XxResponderMsg2` (waiting for Alice's msg3). The
     /// payload must be queued and flushed as a transport packet once
     /// the handshake completes — not silently dropped (the previous
     /// behavior, which made dev-panel pings hang during this race).
+    ///
+    /// The grace window in `XX_RESPONDER_QUEUE_GRACE` exists to keep this case
+    /// working: the honest race completes one round trip after msg2, and queuing
+    /// is what delivers both sides' first message.
     #[test]
     fn xx_responder_flushes_payload_queued_during_msg2_window() {
         let (alice_priv, alice_pub) = make_keypair();

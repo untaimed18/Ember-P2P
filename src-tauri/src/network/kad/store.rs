@@ -20,6 +20,17 @@ const MAX_TOTAL_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 /// keyword publishing at least a quarter of the cap, inside which its own
 /// budgets and eviction still apply.
 const MAX_SOURCE_RETAINED_BYTES: usize = MAX_TOTAL_RETAINED_BYTES / 2;
+/// Share of [`MAX_TOTAL_ENTRIES`] that source records may occupy.
+///
+/// The byte share above fences the dimension that does not bind. A source entry
+/// is a handful of small tags, so 50,000 of them is roughly 17 MB: the shared
+/// *count* cap is reached with the source byte share still half empty, and at
+/// that point every keyword and notes publish is refused. Eviction cannot save
+/// them either, because `evict_keyword_bytes` only sheds keyword entries and
+/// source records are never evicted at all — so the store-wide lockout the byte
+/// share was added to prevent stayed reachable through the count instead, for
+/// the five hours a source record lives.
+const MAX_SOURCE_TOTAL_ENTRIES: usize = MAX_TOTAL_ENTRIES / 2;
 const MAX_NOTES_RETAINED_BYTES: usize = MAX_TOTAL_RETAINED_BYTES / 8;
 const MAX_RETAINED_BYTES_PER_KEY: usize = 4 * 1024 * 1024;
 const MAX_RETAINED_BYTES_PER_PUBLISHER_PER_KEY: usize = 2 * 1024 * 1024;
@@ -802,6 +813,7 @@ impl DhtStore {
             .values()
             .map(|bucket| retained_bytes(bucket))
             .sum();
+        let source_count_all: usize = self.source_entries.values().map(Vec::len).sum();
 
         let bucket = self.source_entries.entry(*target).or_default();
         let now = chrono::Utc::now().timestamp();
@@ -812,12 +824,15 @@ impl DhtStore {
         let removed = len_before - bucket.len();
         let pruned_bytes = bytes_before.saturating_sub(retained_bytes(bucket));
         let source_bytes_now = source_bytes_all.saturating_sub(pruned_bytes);
+        let source_count_now = source_count_all.saturating_sub(removed);
         self.total_count = self.total_count.saturating_sub(removed);
         self.total_retained_bytes = self.total_retained_bytes.saturating_sub(pruned_bytes);
         let existing_pos = bucket.iter().position(|entry| entry.id == sender_id);
 
         if existing_pos.is_none()
-            && (self.total_count >= MAX_TOTAL_ENTRIES || bucket.len() >= MAX_ENTRIES_PER_KEY)
+            && (self.total_count >= MAX_TOTAL_ENTRIES
+                || source_count_now >= MAX_SOURCE_TOTAL_ENTRIES
+                || bucket.len() >= MAX_ENTRIES_PER_KEY)
         {
             // Don't leave behind an empty `target -> Vec::new()` key for a
             // brand-new target that got rejected outright by the global/
