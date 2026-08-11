@@ -5873,8 +5873,25 @@ mod tests {
         size: u64,
         name: &str,
     ) -> Vec<u8> {
+        ember_kw_blob_with_digest(sk, keyword, file_hash, [0u8; 32], size, name)
+    }
+
+    /// The same, carrying a content digest, for the corroboration rules.
+    fn ember_kw_blob_with_digest(
+        sk: &ed25519_dalek::SigningKey,
+        keyword: &str,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        size: u64,
+        name: &str,
+    ) -> Vec<u8> {
         let rec = ember::dht::publish::SignedRecord::keyword(
-            keyword, file_hash, [0u8; 32], size, name, sk,
+            keyword,
+            file_hash,
+            ember_file_hash,
+            size,
+            name,
+            sk,
         );
         let mut blob = rec.data.clone();
         blob.extend_from_slice(&rec.signature);
@@ -6406,6 +6423,107 @@ mod tests {
             ember_keyword_files_per_tick(usize::MAX / 2, ROOMY_TABLE),
             EMBER_KEYWORD_PUBLISH_MAX_PER_TICK
         );
+    }
+
+    /// A digest a transfer will *enforce* has to be corroborated, because getting
+    /// it wrong is unrecoverable: the content check fails at completion and reopens
+    /// every part, on every retry, forever. The source path already required two
+    /// agreeing publishers; the keyword path took the digest straight off the
+    /// displayed row, which is a plurality with no minimum. So one publisher naming
+    /// a popular eD2K hash with a junk BLAKE3 could make that file permanently
+    /// un-completable for anyone who searched for it.
+    #[test]
+    fn one_publisher_cannot_seed_a_digest_a_transfer_will_enforce() {
+        use ed25519_dalek::SigningKey;
+
+        let liar = SigningKey::from_bytes(&[0x11; 32]);
+        let honest_a = SigningKey::from_bytes(&[0x22; 32]);
+        let honest_b = SigningKey::from_bytes(&[0x33; 32]);
+        let poisoned = [0xAAu8; 16];
+        let agreed = [0xBBu8; 16];
+        let junk = [0x99u8; 32];
+        let real = [0x77u8; 32];
+
+        let blobs = vec![
+            // One publisher, one claim: displayable, never enforceable.
+            ember_kw_blob_with_digest(&liar, "ubuntu", poisoned, junk, 100, "ubuntu.iso"),
+            // Two publishers agreeing: enforceable.
+            ember_kw_blob_with_digest(&honest_a, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
+            ember_kw_blob_with_digest(&honest_b, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
+        ];
+        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()], None);
+
+        assert_eq!(results.len(), 2, "both files are still shown");
+        let shown = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(poisoned))
+            .expect("the single-publisher file is displayed");
+        // Empty, not the claim. This field is what the search page hands to
+        // `start_download`, which writes it into the enforced map — so carrying an
+        // uncorroborated digest here is the poisoning path, however the search
+        // code itself seeds that map.
+        assert!(
+            shown.file.ember_file_hash.is_empty(),
+            "an uncorroborated digest must not ride the row into the download path"
+        );
+
+        let agreed_row = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(agreed))
+            .expect("the corroborated file is displayed");
+        assert_eq!(
+            agreed_row.file.ember_file_hash,
+            hex::encode(real),
+            "a digest two publishers agree on is carried"
+        );
+    }
+
+    /// The backpressure gate compares a queue counted in *(record x replica)*
+    /// entries against a budget counted in records, so the two have to be brought
+    /// into the same unit. They were not, and the gate was therefore up to
+    /// `K_EMBER_REPLICAS` times too strict — on a twenty-contact table it called a
+    /// backlog at six records.
+    ///
+    /// That silently switched keyword publishing off. Source selection runs first
+    /// and leaves its fan-out queued; keyword selection runs second behind the same
+    /// gate and returned without doing anything, on every tick, for any library
+    /// past a few hundred files after a restart. Sources kept flowing, so the files
+    /// stayed downloadable by hash while leaving search entirely.
+    #[test]
+    fn the_backpressure_gate_counts_queue_entries_not_records() {
+        for contacts in [1usize, 5, K_EMBER_REPLICAS, K_EMBER_REPLICAS * 4] {
+            let threshold = ember_publish_backpressure_threshold(contacts);
+            let deliverable = ember_deliverable_records_per_tick(contacts);
+
+            // The gate itself, either side of its threshold.
+            assert!(
+                !ember_publish_queue_is_backed_up_at(threshold - 1, contacts),
+                "a tick's own fan-out is not a backlog at {contacts} contacts"
+            );
+            assert!(
+                ember_publish_queue_is_backed_up_at(threshold, contacts),
+                "and the threshold itself does read as one"
+            );
+
+            // The old gate compared against the record count directly, which at
+            // any real table size trips while a single tick's fan-out is still in
+            // the queue.
+            if contacts > 1 {
+                assert!(
+                    threshold > deliverable,
+                    "at {contacts} contacts a record occupies several queue entries, \
+                     so comparing against {deliverable} alone trips far too early"
+                );
+                assert!(
+                    !ember_publish_queue_is_backed_up_at(deliverable, contacts),
+                    "one tick of records must not read as a backlog"
+                );
+            }
+
+            // And it can never grow past what the queue itself will hold, or it
+            // stops being a gate at all.
+            assert!(threshold <= EMBER_BATCH_QUEUE_MAX / 2);
+        }
     }
 
     /// The keyword budget used to ignore what the flush could carry. On a small
@@ -9927,6 +10045,10 @@ struct EmberFlushStats {
     records_sent: usize,
     records_carried: usize,
     records_dropped: usize,
+    /// Replication records the flush could not carry and put back on the
+    /// republish schedule. Counted apart from `records_dropped` so that number
+    /// stays what it says it is: work thrown away.
+    records_rearmed: usize,
 }
 
 /// One `STORE_BATCH` awaiting its ack, in the order its records were packed
@@ -10108,24 +10230,24 @@ impl EmberBatchPublisher {
     }
 
     /// Put records the flush could not send back under their destination,
-    /// newest work behind them, returning how many had to be dropped because
+    /// newest work behind them, returning the ones that had to be dropped because
     /// the destination is already holding its limit.
+    ///
+    /// Whole records rather than bare references, because the caller has to be
+    /// able to re-arm a dropped *replication* record, and that needs the signature
+    /// the reference does not carry.
     fn carry_over(
         &mut self,
         node_id: ember::dht::EmberNodeId,
         contact: &ember::dht::EmberContact,
         mut tail: Vec<EmberQueuedRecord>,
-    ) -> Vec<EmberRecordRef> {
+    ) -> Vec<EmberQueuedRecord> {
         let entry = self
             .queued
             .entry(node_id)
             .or_insert_with(|| (contact.clone(), Vec::new()));
         let room = EMBER_MAX_CARRY_OVER_PER_PEER.saturating_sub(entry.1.len());
-        let dropped: Vec<EmberRecordRef> = tail
-            .split_off(tail.len().min(room))
-            .into_iter()
-            .map(|q| q.reference)
-            .collect();
+        let dropped: Vec<EmberQueuedRecord> = tail.split_off(tail.len().min(room));
         self.queued_count += tail.len();
         // Ahead of anything queued since, so the oldest work still goes first.
         let held = std::mem::replace(&mut entry.1, tail);
@@ -10386,6 +10508,21 @@ fn ember_maint_ping_budget(verified: usize, contacts: usize) -> usize {
 const EMBER_MAINT_MAX_REPUBLISH: usize = 200;
 /// Contact-list exchanges per maintenance cycle (`ANNOUNCE_PEER`).
 const EMBER_MAINT_MAX_ANNOUNCE: usize = 2;
+/// The same, while the table is still too thin to run a lookup on.
+///
+/// `ANNOUNCE_PEER` is the cheapest frame in the stack and the highest-yield one
+/// when cold — a single round trip returns a contact list — and it was being
+/// rationed hardest exactly when it was worth most, at two per minute whether the
+/// table held four hundred contacts or none. Joining took minutes against KAD's
+/// seconds, mostly for want of this.
+///
+/// Self-limiting: the wider budget applies only below
+/// [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts, so it stops of its own
+/// accord as soon as the table is usable. Half the starved liveness ping budget,
+/// which is a rate the code already treats as acceptable on a node that is trying
+/// to join — and an announce is answered with a contact list, so it buys more per
+/// datagram than a ping does.
+const EMBER_MAINT_MAX_ANNOUNCE_STARVED: usize = 16;
 
 /// KAD-bridge bootstrap (slice 13). While the Ember DHT routing table holds
 /// fewer than this many *verified* contacts, the maintenance loop folds in
@@ -10418,7 +10555,15 @@ const EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS: i64 = 600;
 
 /// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
 /// peer cache can't burst the DHT with handshakes in one tick.
-const EMBER_KAD_BRIDGE_MAX_PINGS: usize = 8;
+///
+/// Matched to [`EMBER_MAINT_MAX_PINGS_STARVED`] rather than left at eight. The
+/// bridge only runs below [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts,
+/// which is exactly the state the starved liveness budget was widened for and for
+/// the same reason: a bridge ping is one small frame, and it is the only way a
+/// KAD-learned lead becomes an Ember contact. Converting them at a quarter of the
+/// rate the node is already willing to ping at made the join needlessly slow, and
+/// the bridge switching itself off at k contacts bounds the whole thing anyway.
+const EMBER_KAD_BRIDGE_MAX_PINGS: usize = EMBER_MAINT_MAX_PINGS_STARVED;
 
 /// How many contacts `nodes_ember.dat` keeps. Matching KAD's 200: enough to
 /// rejoin from cold even if most have churned, without persisting the whole
@@ -10514,7 +10659,16 @@ fn ember_deliverable_records_per_tick(contacts: usize) -> usize {
 /// budgeting on an estimate keeps selection O(1) per file rather than tokenising
 /// the library every tick. Erring high is the safe direction: underestimating
 /// produces a queue the flush cannot drain.
-const EMBER_KEYWORDS_PER_FILE_ESTIMATE: usize = 4;
+///
+/// Four was an under-estimate of about half, which is the unsafe direction. That
+/// function splits on nineteen separators plus whitespace, keeps every deduplicated
+/// token of three bytes or more, and has no upper bound — a name in the ordinary
+/// `Some.Movie.Title.2021.1080p.BluRay.x264-GROUP.mkv` shape yields eight, and
+/// scene names commonly run six to ten. So each tick queued roughly twice what the
+/// flush could carry, the surplus was held over and eventually dropped, and every
+/// dropped record had already cost a signature and a clone and charged its file a
+/// publish attempt.
+const EMBER_KEYWORDS_PER_FILE_ESTIMATE: usize = 8;
 
 /// How many ticks a backlog of due source records should take to drain.
 ///
@@ -21897,13 +22051,14 @@ pub async fn start_network(
                             "Ember publish cycle: contacts={contacts} ({verified} verified), \
                              due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \
                              in-flight={in_flight}, sent={} in {} frame(s), held over={}, \
-                             dropped={}, acked={}, failed={}",
+                             dropped={}, re-armed={}, acked={}, failed={}",
                             pass.due,
                             pass.selected,
                             pass.flush.records_sent,
                             pass.flush.frames_sent,
                             pass.flush.records_carried,
                             pass.flush.records_dropped,
+                            pass.flush.records_rearmed,
                             state.ember_diagnostics.ember_dht_stores_acked,
                             state.ember_diagnostics.ember_dht_stores_failed,
                         );
@@ -33380,9 +33535,10 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // sweep clears `ember_pending` and `search-complete` fires.
                 let results =
                     build_ember_keyword_results(&records, &kw.keywords, kw.query_expr.as_ref());
-                // Publisher-majority already, but still a DHT claim: only fill
-                // a gap, so a search hit cannot displace the digest a running
-                // download was given by the UI / known.met / a local hash.
+                // The rows only ever carry a corroborated digest now, so this can
+                // seed straight from them. Still `or_insert`, so a search hit fills
+                // a gap and never displaces what the UI, known.met or a local hash
+                // already established.
                 for r in &results {
                     let digest = parse_ember_file_hash(&r.file.ember_file_hash);
                     if digest != [0u8; 32] {
@@ -33502,6 +33658,8 @@ fn parse_ember_source_records(
 /// keyword records. Multi-keyword queries already ask peers to intersect
 /// by `file_hash` on the wire; this still applies a filename substring AND
 /// as defense-in-depth (and for peers that only held the primary key).
+/// Rows for a keyword hit. Each row's `ember_file_hash` is either a digest at
+/// least two publishers agree on, or empty — see the note where it is set.
 fn build_ember_keyword_results(
     blobs: &[Vec<u8>],
     keywords: &[String],
@@ -33622,6 +33780,24 @@ fn build_ember_keyword_results(
         }
     }
 
+    // The digest on the row has to be corroborated, because this field is not the
+    // display string it looks like — the search page hands `file.ember_file_hash`
+    // straight to `start_download`, which writes it into the map a transfer
+    // *enforces* at completion. A wrong value there is unrecoverable: the content
+    // check fails at the end and reopens every part, on every retry.
+    //
+    // Carrying a plurality-of-one here and corroborating only where the search
+    // path seeded the map was therefore no defence at all: one publisher naming a
+    // popular eD2K hash with a junk BLAKE3 still reached the enforced map the
+    // moment anybody clicked download on that row, and by a plain overwrite that
+    // could displace an already-corroborated digest. Leaving it empty when no two
+    // publishers agree costs nothing — the transfer then verifies against ed2k and
+    // AICH, which is the documented safe fallback.
+    for (_, (result, votes)) in dedup.iter_mut() {
+        result.file.ember_file_hash = corroborated_ember_digest(votes)
+            .map(hex::encode)
+            .unwrap_or_default();
+    }
     dedup.into_values().map(|(sr, _)| sr).collect()
 }
 
@@ -33801,12 +33977,32 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                 .ember_batch_publish
                 .carry_over(node_id, &contact, tail);
             stats.records_carried += held - dropped.len();
-            stats.records_dropped += dropped.len();
             // A record we gave up on must stop counting against its file, or
             // the file sits marked as pending a placement that will never come
             // and `skip-pending` selection never offers it again.
-            for reference in dropped {
-                untrack_ember_record_pending(state.publish_schedule(), reference);
+            //
+            // Replication is the exception, and it needs the opposite treatment.
+            // `take_republish_batch` stamped the record as republished when it
+            // handed it over, before anything had been sent, so a drop here does
+            // not merely fail to place it — it costs the record a full republish
+            // interval of silence for something we still hold and still owe the
+            // network. `untrack_ember_record_pending` cannot do this itself: it
+            // deliberately ignores replication, which has no per-file schedule to
+            // untrack, and it never sees the signature this needs.
+            //
+            // Counted as rescheduled rather than dropped, so the heartbeat's
+            // `dropped` stays what it claims to be: work that was thrown away.
+            for queued in dropped {
+                if queued.reference.kind == EmberPublishKind::Replication {
+                    state.ember_dht.mark_republish_due(
+                        &queued.record.key,
+                        &queued.record.record_signature,
+                    );
+                    stats.records_rearmed += 1;
+                } else {
+                    untrack_ember_record_pending(state.publish_schedule(), queued.reference);
+                    stats.records_dropped += 1;
+                }
             }
         }
         stats.records_dropped += unsendable.len();
@@ -33819,6 +34015,7 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
     window.frames_sent += stats.frames_sent;
     window.records_sent += stats.records_sent;
     window.records_dropped += stats.records_dropped;
+    window.records_rearmed += stats.records_rearmed;
     // Not cumulative: this is the depth still waiting, not a rate.
     window.records_carried = stats.records_carried;
 }
@@ -33956,9 +34153,48 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
 /// backlog closer to [`EMBER_MAX_CARRY_OVER_PER_PEER`], where it is dropped and
 /// the files return to the due pool having cost a signature and a clone each.
 /// Waiting a tick for the drain to catch up is strictly better.
+///
+/// Both sides have to be counted in the same unit, and getting that wrong was
+/// silently switching keyword publishing off. `queued_count` counts one entry per
+/// *(record x replica)* — `enqueue` increments it inside the fan-out loop —
+/// whereas `ember_deliverable_records_per_tick` counts distinct records. Comparing
+/// them directly made the gate up to `K_EMBER_REPLICAS` times too strict: on a
+/// twenty-contact table it declared a backlog at six real records.
+///
+/// The consequence was invisible in the worst way. Source selection runs first
+/// each tick and leaves its ordinary fan-out queued, so keyword selection — which
+/// runs second behind the same gate — returned without doing anything. On a
+/// twenty-contact table the old threshold was 120 queue entries, i.e. six records,
+/// which one tick of source publishing exceeds at only a few dozen due files; and
+/// since the source schedule is in-memory, every restart makes the whole library
+/// due at once. Sources kept publishing, so files stayed downloadable by hash
+/// while their keyword records expired and the files quietly left search.
 fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
-    state.ember_batch_publish.queued_count
-        >= ember_deliverable_records_per_tick(state.ember_dht.contact_count())
+    ember_publish_queue_is_backed_up_at(
+        state.ember_batch_publish.queued_count,
+        state.ember_dht.contact_count(),
+    )
+}
+
+/// The queue depth, in entries, at which selection should wait a tick.
+fn ember_publish_backpressure_threshold(contacts: usize) -> usize {
+    // What one tick's worth of records actually occupies in the queue.
+    let fan_out = contacts.min(K_EMBER_REPLICAS).max(1);
+    // Capped at half the queue, or the gate stops existing on a table above about
+    // seventy contacts: the threshold grows with the table while the queue does
+    // not, so past that point only `enqueue`'s hard ceiling pushes back — and it
+    // pushes back by refusing records mid-tick, after their signature and clone
+    // have already been paid for. Half leaves room for the tick in flight.
+    ember_deliverable_records_per_tick(contacts)
+        .saturating_mul(fan_out)
+        .min(EMBER_BATCH_QUEUE_MAX / 2)
+}
+
+/// Split from the `NetworkState` reader so the rule can be tested directly. The
+/// previous test built the arithmetic a second time and never called the gate,
+/// which meant it asserted only that its own expression was self-consistent.
+fn ember_publish_queue_is_backed_up_at(queued_count: usize, contacts: usize) -> bool {
+    queued_count >= ember_publish_backpressure_threshold(contacts)
 }
 
 /// Whether a library file may be advertised on the Ember DHT.
@@ -35074,7 +35310,17 @@ async fn run_ember_maintenance(
             .copied()
             .unwrap_or(0)
     });
-    announce_targets.truncate(EMBER_MAINT_MAX_ANNOUNCE);
+    //    Widened while the table is still too thin to run a lookup on: this is
+    //    the cheapest way there is to learn contacts, and rationing it during a
+    //    cold start was most of the reason joining took minutes. See
+    //    [`EMBER_MAINT_MAX_ANNOUNCE_STARVED`].
+    let announce_budget =
+        if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+            EMBER_MAINT_MAX_ANNOUNCE_STARVED
+        } else {
+            EMBER_MAINT_MAX_ANNOUNCE
+        };
+    announce_targets.truncate(announce_budget);
     for contact in announce_targets {
         state
             .ember_announced_at

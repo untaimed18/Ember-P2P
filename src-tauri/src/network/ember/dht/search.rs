@@ -15,6 +15,18 @@ const SEARCH_TIMEOUT_SECS: u64 = 60;
 /// Maximum results returned from a single search.
 const MAX_SEARCH_RESULTS: usize = 300;
 
+/// How much of that budget our own store may fill before the walk begins.
+///
+/// Half, so the network always has room. The local seed used to be limited to
+/// whatever fitted one datagram — about five records — purely as a side effect of
+/// sharing the wire packer, and lifting that (correctly: nothing is being sent)
+/// exposed the real hazard. A node that stores a popular key could seed all 300
+/// results, and `check_complete` ends a `FIND_VALUE` the moment the budget is
+/// full, so the first remote reply would finish the search and nothing remote
+/// would ever be merged — the node would answer every search from its own store
+/// alone.
+const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
+
 /// How many times one node may be queried within a single search.
 ///
 /// A timeout is not proof a node is gone — it may have been mid-handshake,
@@ -610,7 +622,7 @@ impl SearchManager {
         };
         let mut added = 0;
         for data in records {
-            if search.results.len() >= MAX_SEARCH_RESULTS {
+            if search.results.len() >= MAX_LOCAL_SEED_RESULTS {
                 break;
             }
             // The same key binding the wire path applies to FOUND_VALUE

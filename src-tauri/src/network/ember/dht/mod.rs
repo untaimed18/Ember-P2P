@@ -39,10 +39,10 @@ pub const MAX_CONTACTS_PER_RESPONSE: usize = 20;
 pub const CONTACT_TIMEOUT_SECS: i64 = 600;
 pub const MAX_FAILED_QUERIES: u8 = 3;
 
-/// Subnet diversity limit within one bucket. The global limit is not a
-/// constant: it scales with table occupancy, so see
-/// [`scale::NetworkScale::max_contacts_per_subnet_global`].
-pub const MAX_PER_SUBNET_PER_BUCKET: usize = 3;
+// The subnet diversity limits, per bucket and global, both scale with table
+// occupancy — see `scale::NetworkScale::max_contacts_per_subnet_per_bucket` and
+// its global sibling. The per-bucket one used to be a fixed 3 here, which
+// silently cancelled the wider allowance the small-network tiers grant.
 
 /// 16-byte node ID derived from BLAKE3(Ed25519 public key).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

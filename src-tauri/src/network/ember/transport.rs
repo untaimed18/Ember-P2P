@@ -51,7 +51,28 @@ const CONTROL_KIND_EXCHANGE_REQUEST: u8 = 3;
 const CONTROL_KIND_EXCHANGE_DATA: u8 = 4;
 
 /// Sessions idle longer than this are evicted.
-const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+///
+/// Has to outlive the DHT's liveness-ping interval (`CONTACT_TIMEOUT_SECS`, 600 s),
+/// and did not: at 300 s every scheduled ping was *guaranteed* to find its session
+/// already evicted and pay a fresh handshake. That is two round trips and five
+/// datagrams where one and two would do, and it lands on far more than pings —
+/// every hop past the first in any lookup is a first contact, so the same tax was
+/// on the critical path of essentially every search.
+///
+/// 900 s leaves the ping comfortably inside the window with room for a late tick.
+/// Erring long is cheap: an idle session costs a little memory against a bounded
+/// `MAX_SESSIONS` with LRU eviction, and if the peer's NAT mapping has lapsed the
+/// cost is one timed-out query before we re-handshake — while the ping that keeps
+/// the session alive refreshes that mapping anyway.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(900);
+
+// Enforced rather than merely documented: the ordering is the whole point, and
+// the two constants live in different modules where nothing would otherwise
+// notice one of them moving.
+const _: () = assert!(
+    SESSION_TIMEOUT.as_secs() > super::dht::CONTACT_TIMEOUT_SECS as u64,
+    "a session must outlive the liveness ping interval, or every ping re-handshakes"
+);
 
 /// Maximum concurrent sessions before we start evicting oldest.
 const MAX_SESSIONS: usize = 4096;

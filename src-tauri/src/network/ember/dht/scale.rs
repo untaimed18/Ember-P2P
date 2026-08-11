@@ -78,6 +78,33 @@ impl NetworkScale {
         }
     }
 
+    /// The same limit within one bucket. Converges on 3, which is what this was
+    /// fixed at before.
+    ///
+    /// Scaling it matters more than the number suggests, because on a small
+    /// network this is the limit that actually binds — and while it was fixed it
+    /// quietly cancelled the generosity of the tier above. Node IDs are uniform,
+    /// so bucket occupancy is geometric: about half of all contacts fall in the
+    /// last bucket and a quarter in the one before. Four or five peers sharing a
+    /// /24 — a handful of instances on one ISP, or several behind one CGNAT, which
+    /// is exactly what a young network looks like — could never reach the
+    /// eight-per-IP Bootstrap allowance, because half of them collided in one
+    /// bucket and were pushed to the replacement cache.
+    /// The curve is deliberately shallow. `Established` needs 80 verified
+    /// contacts, so a node on a young network sits in `Small` more or less
+    /// permanently and *that* is the value which decides eclipse resistance in
+    /// practice, not the 3 at the far end. Tightening also never evicts contacts
+    /// admitted under a looser tier, so whatever a cold start allows, an adversary
+    /// present at that moment keeps for the life of the process — in the bucket
+    /// that matters most, since geometric occupancy puts half of everyone there.
+    pub fn max_contacts_per_subnet_per_bucket(&self) -> usize {
+        match self {
+            NetworkScale::Bootstrap => 5,
+            NetworkScale::Small => 4,
+            NetworkScale::Established => 3,
+        }
+    }
+
 
     /// Source records allowed under one key from a single IP, mirroring KAD's
     /// `MAX_SOURCES_PER_IP`.
@@ -129,6 +156,10 @@ mod tests {
                 looser.max_contacts_per_subnet_global()
                     >= tighter.max_contacts_per_subnet_global()
             );
+            assert!(
+                looser.max_contacts_per_subnet_per_bucket()
+                    >= tighter.max_contacts_per_subnet_per_bucket()
+            );
             assert!(looser.max_sources_per_ip() >= tighter.max_sources_per_ip());
             assert!(looser.max_stores_per_minute() >= tighter.max_stores_per_minute());
         }
@@ -153,5 +184,21 @@ mod tests {
         let boot = NetworkScale::from_contacts(1);
         assert!(boot.max_contacts_per_ip() >= 4);
         assert!(boot.max_contacts_per_subnet_global() >= K_BUCKET_SIZE);
+        // The per-bucket limit has to move with the others or it becomes the one
+        // that binds and the tier buys nothing. Node IDs are uniform, so about half
+        // of everyone we meet lands in the same bucket — a per-IP allowance of
+        // eight is unreachable if only three of them may share a bucket.
+        assert!(
+            boot.max_contacts_per_subnet_per_bucket()
+                > NetworkScale::Established.max_contacts_per_subnet_per_bucket(),
+            "the per-bucket subnet cap must not cancel the per-IP allowance"
+        );
+        // But not so loose that a cold-start adversary can hold a large share of
+        // one bucket for the life of the process — tightening never evicts what an
+        // earlier tier admitted.
+        assert!(
+            boot.max_contacts_per_subnet_per_bucket() <= K_BUCKET_SIZE / 4,
+            "a single /24 must not be able to hold a quarter of a bucket"
+        );
     }
 }

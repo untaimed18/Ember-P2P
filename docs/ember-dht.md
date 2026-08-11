@@ -7,6 +7,11 @@ join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
 BLAKE3 integrity digests, network-size-adaptive abuse limits, and
 diagnostics are live on `develop`.
 
+Start at [Planned next](#planned-next--from-the-kad-comparison-aug-2026) — it is
+the current plan, ordered by leverage and backed by a constant-for-constant
+comparison against this repo's KAD stack. The sections after it are older
+standing work that the comparison did not change.
+
 Code: [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/).
 
 ---
@@ -101,6 +106,13 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 - Multi-keyword search uses sparse DHT intersection (missing secondary
   keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
+- A peer serves roughly five records per keyword query and there is no
+  pagination, so recall is bounded by nodes-walked × 5 and a late publisher
+  under a popular word may not be served at all. See
+  [Planned next, item 1](#1-the-serving-ceiling--do-this-first).
+- One publisher may hold 45 records under any one keyword, network-wide, so a
+  user sharing many files with a word in common will not have all of them
+  findable under it.
 - Gossip contacts are unverified until the node hears from them directly
   (same as Kademlia). Admission is bounded by the diversity caps in
   [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), but there is
@@ -109,6 +121,147 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 - BLAKE3 verify runs when an expected digest is available (search hit, DHT
   source record, known.met / library). Deep links without a digest still
   complete and hash for future share.
+
+---
+
+## Planned next — from the KAD comparison (Aug 2026)
+
+Ember was compared against this repo's own KAD stack, constant for constant, to
+answer whether it matches or exceeds it operationally. On design it already
+does: twice the replicas (20 vs 10), three times the TTL margin on sources where
+KAD has none, a replacement cache KAD lacks entirely, storer-side replication
+KAD lacks entirely, a store that survives restart, roughly half the round trips
+per lookup (α=5 against KAD's 1 for `FindNode`), and a much richer diagnostic
+surface. The items below are where it does not, in leverage order.
+
+Everything here was verified in the code, not inferred from comments. Four
+silent-breakage bugs and five performance defects found by the same comparison
+were fixed before 1.5.3 and are not repeated here.
+
+### 1. The serving ceiling — do this first
+
+A peer answers a keyword query with **about five records**, and always the same
+five. `MAX_FOUND_VALUE_RECORD_BYTES` is 1235, a keyword blob for a 40-character
+filename costs 221, and `get_live` returns insertion order while the packer
+fills from the front. So the oldest five records under a word are the only ones
+that node will ever serve, and a publisher who arrives late under a popular
+keyword is permanently invisible there. There is no `start_position` in the wire
+protocol. KAD pages 200 entries at a time and a searcher walks up to three pages
+per peer — 600 against Ember's 5.
+
+Two ways forward, and the cheap one is worth doing on its own:
+
+- **Rotate the served window per key**, so successive queries surface different
+  records. No wire change. Needs thought about how a moving set interacts with
+  the blob-hash dedup in `search.rs`.
+- **Add `start_position` to `FIND_VALUE`/`FOUND_VALUE`.** The real fix, and what
+  KAD does. Costs an `EMBER_DHT_VERSION` bump (see "Wire versioning" above —
+  this is the breaking change that section warns about) and multiplies query
+  traffic on hot keywords.
+
+Add a truncation counter first, so there is evidence of how often the cap
+actually binds before paying for pagination.
+
+### 2. Per-publisher keyword capacity — blocked on 1
+
+`MAX_RECORDS_PER_PUBLISHER_PER_KEY` is 45 of `MAX_RECORDS_PER_KEY` 300. KAD's
+equivalent is 150 of 1000. Both are 15%, but the absolute number is what a user
+feels: every storer applies the same cap to the same publisher key, so the
+ceiling is network-wide, not per-node. **A user sharing 200 files that share a
+common word gets 45 of them findable under that word, anywhere** — 30% of what
+KAD serves.
+
+Raising both to KAD's numbers keeps the ratio and triples capacity. Do not do it
+before item 1: if a peer only ever serves ~5 records per reply, the extra stored
+records have no way to reach a searcher, and the only certain effect is more
+storer-replication traffic.
+
+### 3. Stream search results as they arrive
+
+Ember buffers everything and emits on completion; `FIND_VALUE` is deliberately
+excluded from early convergence, so on a cold table a user can wait most of the
+60-second cap while KAD hits are already on screen. KAD streams the first result
+immediately, then every 20, with progress events. The pattern is right there in
+the KAD path to copy. No extra network traffic; the work is threading
+`dedup_streamed_batch` / `mark_streamed_hashes` into the Ember emit so a hash KAD
+already streamed arrives as an availability update rather than a duplicate row,
+and making sure `ember_pending` still clears exactly once.
+
+### 4. Firewalled sources are discoverable but not dialable
+
+This is the largest genuine functional gap against KAD. The publish side is
+complete — a firewalled node sets `SOURCE_FLAG_FIREWALLED`, asks HighID contacts
+to `PROXY_STORE`, and storers attribute the record to the forwarder. The consume
+side has nothing: `SourceContact` carries no buddy address or buddy hash, so
+there is no Ember equivalent of KAD's `TAG_BUDDYHASH` plus
+`KADEMLIA_CALLBACK_REQ`. Such peers only work today because they are usually also
+on eD2K/KAD.
+
+A protocol addition: a buddy field in the source record and a callback message.
+Sizeable, and it should follow item 1 so both wire changes land in one version
+bump.
+
+### 5. Persist the Ember source publish schedule
+
+`ember_source_publish_at` is keyed on `Instant`, so every restart marks the whole
+library as never-published and slams the backlog-drain term to its ceiling.
+
+Deliberately **not** done for 1.5.3. The failure modes are asymmetric: getting
+persistence wrong means skipping publishes that were due, which is silent
+non-publishing — the exact class of bug 1.5.3 exists to remove — whereas
+republishing too eagerly costs only traffic, and is correct anyway whenever the
+node was down longer than the 6-hour source TTL. Worth doing properly, with a
+timestamp persisted for Ember specifically; do not borrow KAD's
+`last_source_publish`, which answers a different question.
+
+### 6. Storer-side replication costs more than it buys
+
+At 200 records per cycle to 20 replicas this is roughly **48,000 frames an hour**
+— Ember's single largest traffic item, about double its entire publish load.
+
+It cannot extend a record's lifetime. Expiry is derived from the publisher's
+*signed* creation timestamp, and a storer re-sends the identical bytes, so every
+recipient computes the same absolute death time. What it buys is churn coverage:
+copies reach nodes that joined since the publisher's last round. That is real,
+but it is not what the cadence was justified on. Halving it
+(`EMBER_RECORD_REPUBLISH_SECS` 3600 → 7200) would save ~24,000 frames an hour at
+little cost, given each record already has 20 replicas and lives at most 24 h.
+
+### 7. Contact encoding wastes 18% of every response
+
+Each wire contact carries both `node_id` (16 bytes) and `ed25519_pub` (32), but
+the ID *is* BLAKE3 of that key and the receiver re-derives and checks it anyway.
+Dropping it takes a contact from 87 to 71 bytes: **17 contacts per `FOUND_NODE`
+instead of 14**, which also buys a fraction of a hop. Free, but it is a wire
+change, so bundle it with item 1's version bump.
+
+### 8. Observability gaps
+
+The diagnostic surface is already better than KAD's. Four things are missing that
+matter specifically for judging health after a long unattended run:
+
+- **Nothing reports a truncated `FOUND_VALUE`.** Without it there is no way to
+  tell "few results because the network is small" from "few results because every
+  node caps every reply at five." Prerequisite for item 1.
+- **Store rejections have no cause breakdown.** Only the key-cap rejection is
+  counted; per-publisher, per-key and per-IP refusals are `debug!` only.
+- **No search outcome quality.** Hits and misses are counted, but not nodes
+  answered, time taken, or results returned.
+- **Every counter resets on restart.** A persisted daily high-water of verified
+  contacts would answer "is this growing?" — the actual question — in a way no
+  instantaneous gauge can.
+
+### Outside the DHT
+
+- **Transport session keying.** Sessions are keyed by address alone, so the
+  shadow-session map can protect an established peer from a key-churning spoofer
+  but cannot protect a peer whose *first* contact arrives at an address whose
+  shadow allowance is already full. Keying by `(address, static key)` removes the
+  need to rank indistinguishable claimants at all. Named in `install_session`.
+- **Updater recovery only protects 1.5.3 onward.** The 1.5.2 → 1.5.3 hop runs
+  1.5.2's updater, so if a hand-off fails silently again the user still sees
+  nothing and must install by hand. The root cause of the original failure was
+  never established; the recovery path is a mitigation for the symptom.
 
 ---
 
@@ -137,7 +290,9 @@ settled.
   `Ember publish cycle` heartbeat each minute — due, selected, awaiting
   placement, queued, in flight, sent, held over, dropped, acked, failed — which
   is what says whether selected work is reaching the wire. There is no
-  equivalent view of what this node is republishing on others' behalf.
+  equivalent view of what this node is republishing on others' behalf, and
+  that is the larger of the two traffic items (see
+  [Planned next, item 6](#6-storer-side-replication-costs-more-than-it-buys)).
 
 ### Integrity and downloads
 
@@ -178,5 +333,9 @@ settled.
 
 Protocol constants live in
 [`dht/mod.rs`](../src-tauri/src/network/ember/dht/mod.rs): 128-bit node IDs
-(BLAKE3 of the Ed25519 public key), k = 20, α = 5, 20 contacts per
-response.
+(BLAKE3 of the Ed25519 public key), k = 20, α = 5.
+
+`MAX_CONTACTS_PER_RESPONSE` is 20 but is not reachable: `encode_contact_list`
+trims by bytes, and at 87 bytes per IPv4 contact (16 id + 7 address + 32 Noise
+key + 32 Ed25519 key) only 14 fit the 1253-byte payload budget. A `FOUND_NODE`
+therefore never carries a full k-bucket. See "Contact encoding" below.

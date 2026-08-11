@@ -5,7 +5,7 @@ use tracing::{debug, info, trace};
 
 use crate::network::kad::ip_filter;
 
-use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_PER_SUBNET_PER_BUCKET};
+use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
 
 /// A single routing-table bucket with a replacement cache.
 struct Bucket {
@@ -317,6 +317,7 @@ impl RoutingTable {
         let scale = self.scale();
         let max_per_ip = scale.max_contacts_per_ip();
         let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
 
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
@@ -338,7 +339,7 @@ impl RoutingTable {
             let old_ip = existing.addr.ip();
             if contact.addr != existing.addr {
                 if subnet != old_subnet {
-                    if bucket.subnet_count(subnet) >= MAX_PER_SUBNET_PER_BUCKET {
+                    if bucket.subnet_count(subnet) >= max_subnet_bucket {
                         bucket.contacts.insert(pos, existing);
                         return AddResult::Rejected;
                     }
@@ -378,7 +379,7 @@ impl RoutingTable {
         }
 
         // Subnet diversity check: per-bucket
-        if bucket.subnet_count(subnet) >= MAX_PER_SUBNET_PER_BUCKET {
+        if bucket.subnet_count(subnet) >= max_subnet_bucket {
             trace!(
                 "Rejected contact {} (subnet limit per bucket)",
                 contact.node_id
@@ -503,6 +504,7 @@ impl RoutingTable {
         let scale = self.scale();
         let max_per_ip = scale.max_contacts_per_ip();
         let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
         let bucket = &self.buckets[bucket_idx];
         let mut chosen: Option<usize> = None;
         for i in (0..bucket.replacement_cache.len()).rev() {
@@ -519,7 +521,7 @@ impl RoutingTable {
             if !self.admits_addr(&candidate.addr) {
                 continue;
             }
-            let per_bucket_ok = bucket.subnet_count(cand_subnet) < MAX_PER_SUBNET_PER_BUCKET;
+            let per_bucket_ok = bucket.subnet_count(cand_subnet) < max_subnet_bucket;
             let global_ok = self
                 .global_subnet_count
                 .get(&cand_subnet)
@@ -774,6 +776,17 @@ impl RoutingTable {
             }
         }
 
+        // Distance, and only distance. Preferring healthier contacts here was
+        // tried and reverted: it cannot help, because `IterativeSearch::new`
+        // re-sorts the seeds by distance and walks that order, so this function
+        // never decided which peer is asked first. What it does decide is which
+        // contacts make the list at all when more than `count` are verified — and
+        // both callers treat that list as a target set, not a queue. Dropping a
+        // close contact with one transient strike in favour of a healthier but
+        // farther one therefore aims publishes at nodes that may refuse them:
+        // `store_proximity_ok` on the storer side is strictly distance-based. A
+        // non-zero `failed_queries` is normal mid-refresh anyway (see
+        // `remove_stale`), and three strikes evicts outright.
         verified.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
         let mut out: Vec<EmberContact> = verified
             .into_iter()
@@ -927,6 +940,7 @@ impl RoutingTable {
     fn add_to_cache(&mut self, bucket_idx: usize, contact: EmberContact) {
         let scale = self.scale();
         let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
         let max_per_ip = scale.max_contacts_per_ip();
 
         // Don't add duplicates to cache
@@ -952,7 +966,7 @@ impl RoutingTable {
             let bucket = &self.buckets[bucket_idx];
             let ineligible = bucket.replacement_cache.iter().position(|c| {
                 let s = c.subnet_key();
-                bucket.subnet_count(s) >= MAX_PER_SUBNET_PER_BUCKET
+                bucket.subnet_count(s) >= max_subnet_bucket
                     || self.global_subnet_count.get(&s).copied().unwrap_or(0) >= max_subnet_global
                     || self
                         .global_ip_count
@@ -1151,15 +1165,21 @@ mod tests {
     fn evict_promotes_subnet_eligible_replacement() {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
-        // 3 contacts in subnet 80.1.1.x — hits MAX_PER_SUBNET_PER_BUCKET (3).
-        rt.add_contact(contact_at(0x80, 80, 1, 1, 1));
-        rt.add_contact(contact_at(0x81, 80, 1, 1, 2));
-        rt.add_contact(contact_at(0x82, 80, 1, 1, 3));
+        // Saturate one subnet within the bucket. The limit is tier-dependent, so
+        // it is read from the tier a full bucket lands in rather than hardcoded.
+        let saturated = scale::NetworkScale::from_contacts(K_BUCKET_SIZE)
+            .max_contacts_per_subnet_per_bucket();
+        assert!(saturated < K_BUCKET_SIZE, "the subnet must not fill the bucket");
+        for k in 0..saturated as u8 {
+            rt.add_contact(contact_at(0x80 + k, 80, 1, 1, k + 1));
+        }
         // Fill the rest of the 20-slot bucket with distinct subnets.
-        for k in 0..(K_BUCKET_SIZE as u8 - 3) {
-            rt.add_contact(contact_at(0x83 + k, 80, 10 + k, 1, 1));
+        for k in 0..(K_BUCKET_SIZE - saturated) as u8 {
+            rt.add_contact(contact_at(0x80 + saturated as u8 + k, 80, 10 + k, 1, 1));
         }
         assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
+        // The victim below has to be one of the distinct-subnet contacts.
+        let victim = make_id(0x80 + saturated as u8);
 
         // Cache a fresh-subnet contact, then an over-limit subnet-A contact so
         // the over-limit one is the *newest* cache entry.
@@ -1173,7 +1193,7 @@ mod tests {
         // from the replacement cache: 0x94 is still legitimately cached here, so the
         // question is whether it was promoted to a live slot, not whether the table
         // holds it at all.
-        assert!(rt.evict_and_replace(&make_id(0x83)));
+        assert!(rt.evict_and_replace(&victim));
         let bucket = &rt.buckets[local.bucket_index(&make_id(0x95)).expect("a bucket")];
         assert!(bucket.find(&make_id(0x95)).is_some(), "the eligible entry is promoted");
         assert!(
@@ -1390,6 +1410,34 @@ mod tests {
 
         // And a zero request stays empty rather than returning the whole table.
         assert!(rt.find_closest_prefer_verified(&make_id(0x10), 0).is_empty());
+    }
+
+    /// Ranking these by health was tried and reverted; this pins the ordering so
+    /// it is not tried again by accident. The seeds are a *target set*, and both
+    /// callers use them as one — the search re-sorts by distance before walking,
+    /// and publishing needs the genuinely closest nodes because the storer's own
+    /// `store_proximity_ok` gate is distance-based and will refuse a record from a
+    /// publisher that aimed it further out.
+    #[test]
+    fn seeds_are_ordered_by_distance_even_when_a_close_contact_has_missed() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // The nearest contact to the target is one strike down; a healthy one sits
+        // further away.
+        rt.add_contact(make_contact(0x11, 4672));
+        rt.add_contact(make_contact(0x40, 4672));
+        assert!(!rt.mark_failed(&make_id(0x11)), "one strike, not evicted");
+        assert_eq!(rt.verified_len(), 2, "both are still in the table");
+
+        let targets = rt.find_closest_prefer_verified(&make_id(0x10), 2);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0].node_id,
+            make_id(0x11),
+            "the closest contact leads, transient strike or not"
+        );
+        assert_eq!(targets[1].node_id, make_id(0x40));
     }
 
     /// Unproven entries must not hold slots against contacts that have

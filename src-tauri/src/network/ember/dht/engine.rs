@@ -600,8 +600,24 @@ impl EmberDht {
         let mut keys = Vec::with_capacity(1 + extra_keys.len());
         keys.push(*key);
         keys.extend_from_slice(extra_keys);
-        intersect_find_value_records(&self.store, &keys)
-            .map(|(_key, blobs)| blobs)
+        // Deliberately not `intersect_find_value_records`: that packs to what one
+        // datagram can carry, which for typical filenames is about five records.
+        // Nothing is being sent here — this is our own store being read to seed a
+        // local search — so applying a wire limit to it simply threw away most of
+        // the answer, and did so worst on a small network, where this node holds
+        // much of the index.
+        //
+        // How much of a search's result budget this may actually occupy is the
+        // searcher's call, not ours: see `MAX_LOCAL_SEED_RESULTS`. The cap here is
+        // only so one enormous key cannot hand the caller an unbounded vector.
+        intersect_live_records(&self.store, &keys)
+            .map(|(_key, records)| {
+                records
+                    .into_iter()
+                    .take(messages::MAX_FOUND_VALUE_RECORDS)
+                    .map(record_blob)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1101,6 +1117,55 @@ fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
 ) -> Option<([u8; 16], Vec<Vec<u8>>)> {
+    let (primary, filtered) = intersect_live_records(store, keys)?;
+
+    // Pack records until the reply would stop fitting a datagram. A key can
+    // legitimately hold far more records than one response can carry, and an
+    // oversized reply is dropped undecrypted by the receiver, so the node
+    // holding the most records for a popular key would otherwise be the one
+    // node that can never answer for it. A partial answer is always better:
+    // the searcher merges results across the peers it walks.
+    let mut used = 0usize;
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for r in &filtered {
+        if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
+            break;
+        }
+        let cost = 2 + r.data.len() + 64;
+        if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
+            // Records vary in size, so keep scanning for a smaller one that
+            // still fits rather than stopping at the first oversized record.
+            continue;
+        }
+        used += cost;
+        blobs.push(record_blob(r));
+    }
+
+    if blobs.is_empty() {
+        return None;
+    }
+    Some((primary, blobs))
+}
+
+/// `record_data || signature`, the shape a `FOUND_VALUE` blob and a locally
+/// seeded record both take.
+fn record_blob(record: &super::store::DhtRecord) -> Vec<u8> {
+    let mut b = Vec::with_capacity(record.data.len() + 64);
+    b.extend_from_slice(&record.data);
+    b.extend_from_slice(&record.signature);
+    b
+}
+
+/// The live records under `keys[0]` whose file hash also appears under every
+/// other key, with no packing applied.
+///
+/// Split out from [`intersect_find_value_records`] so a caller reading its own
+/// store does not inherit a limit that exists only because a reply has to fit in
+/// one datagram — see [`EmberDht::local_records`].
+fn intersect_live_records<'a>(
+    store: &'a DhtStore,
+    keys: &[[u8; 16]],
+) -> Option<([u8; 16], Vec<&'a super::store::DhtRecord>)> {
     let primary = *keys.first()?;
     let primary_recs = store.get_live(&primary);
     if primary_recs.is_empty() {
@@ -1140,36 +1205,7 @@ fn intersect_find_value_records(
     if filtered.is_empty() {
         return None;
     }
-
-    // Pack records until the reply would stop fitting a datagram. A key can
-    // legitimately hold far more records than one response can carry, and an
-    // oversized reply is dropped undecrypted by the receiver, so the node
-    // holding the most records for a popular key would otherwise be the one
-    // node that can never answer for it. A partial answer is always better:
-    // the searcher merges results across the peers it walks.
-    let mut used = 0usize;
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    for r in &filtered {
-        if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
-            break;
-        }
-        let cost = 2 + r.data.len() + 64;
-        if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
-            // Records vary in size, so keep scanning for a smaller one that
-            // still fits rather than stopping at the first oversized record.
-            continue;
-        }
-        used += cost;
-        let mut b = Vec::with_capacity(r.data.len() + 64);
-        b.extend_from_slice(&r.data);
-        b.extend_from_slice(&r.signature);
-        blobs.push(b);
-    }
-
-    if blobs.is_empty() {
-        return None;
-    }
-    Some((primary, blobs))
+    Some((primary, filtered))
 }
 
 #[cfg(test)]
@@ -1777,6 +1813,21 @@ mod tests {
         assert!(
             blobs.len() < 80,
             "the reply must be trimmed, not carry all 80"
+        );
+
+        // But that trimming belongs to the wire. Reading our own store for a local
+        // search is not sending anything, and applying the datagram budget to it
+        // threw away most of the answer — worst on a small network, where this node
+        // holds much of the index and the local read *is* the search.
+        let local = b.local_records(&key, &[]);
+        assert_eq!(
+            local.len(),
+            80,
+            "a local read must return everything the store holds, not one datagram's worth"
+        );
+        assert!(
+            local.len() > blobs.len() * 4,
+            "and the gap between the two is the whole point of the split"
         );
     }
 
