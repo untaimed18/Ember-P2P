@@ -9395,10 +9395,17 @@ struct NetworkState {
     /// none to read). Only the shutdown save consults it, to tell an empty store
     /// from a file it never got to open — see `bootstrap::save_store`.
     ember_store_loaded: bool,
-    /// First stranger address to reach us unsolicited since the last reset. A
-    /// second one, from a different host, is what actually concludes our UDP port
-    /// is open — see the reachability rule in `handle_ember_dht_inbound`.
-    ember_reach_witness: Option<IpAddr>,
+    /// First stranger address to reach us unsolicited since the last reset, and
+    /// when. A second one, from a different host and inside
+    /// [`EMBER_UDP_REACHABLE_TTL_SECS`] of it, is what actually concludes our UDP
+    /// port is open — see the reachability rule in `handle_ember_dht_inbound`.
+    ///
+    /// Timestamped because the pair has to be corroboration rather than a
+    /// coincidence: the rule exists precisely because the list of paths that dial
+    /// peers we hold no contact for is known to be incomplete, so an unaged first
+    /// witness plus one uncovered dial hours later would be enough to conclude a
+    /// filtered port is open.
+    ember_reach_witness: Option<(IpAddr, i64)>,
     /// Unix time a peer we had never contacted reached us on our own UDP port,
     /// which is the only Ember-native evidence that the port is open to the
     /// internet. `None` until that happens.
@@ -35630,8 +35637,17 @@ async fn handle_ember_dht_message(
         && !state.flood_protection.has_recent_ip(from.ip())
         && !crate::security::is_private_ip(from.ip());
     if unsolicited {
-        match state.ember_reach_witness {
-            Some(first) if first != from.ip() => {
+        // A witness older than the conclusion's own TTL is not evidence any more,
+        // so it is replaced rather than paired with. Two sightings hours apart
+        // would otherwise satisfy a rule whose whole point is that one uncovered
+        // dial must not be mistaken for proof: the enumeration of paths that dial
+        // strangers is known to be incomplete, so over a long enough session two
+        // of them are ordinary rather than corroborating.
+        let witness = state
+            .ember_reach_witness
+            .filter(|(_, at)| now.saturating_sub(*at) < EMBER_UDP_REACHABLE_TTL_SECS);
+        match witness {
+            Some((first, _)) if first != from.ip() => {
                 if state.ember_udp_reachable_at.is_none() {
                     info!(
                         "Ember DHT: strangers at {first} and {} both reached us unsolicited, \
@@ -35642,7 +35658,7 @@ async fn handle_ember_dht_message(
                 state.ember_udp_reachable_at = Some(now);
             }
             Some(_) => {}
-            None => state.ember_reach_witness = Some(from.ip()),
+            None => state.ember_reach_witness = Some((from.ip(), now)),
         }
     }
 

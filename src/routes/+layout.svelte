@@ -381,9 +381,11 @@
           // regardless of the auto-check preference and of the cadence — it
           // reports on something they already asked for — and it resolves to
           // nothing in the normal case where the update landed. Running first
-          // is only so the notice appears promptly; what actually stops the
-          // check below from overwriting it is `takeStagedSnapshot` in the
-          // store, since ordering alone would not survive a later check.
+          // is only so the notice appears promptly. Two things in the store stop
+          // the check above from overwriting the result, because ordering these
+          // timers cannot: an in-flight guard, for the case where this call
+          // overruns the 2.5 s gap and the check starts before there is anything
+          // to capture, and `takeStagedSnapshot`, for every check after that.
           if (!import.meta.env.DEV) {
             handoffCheckTimer = window.setTimeout(() => {
               if (mounted) void checkUpdateHandoff();

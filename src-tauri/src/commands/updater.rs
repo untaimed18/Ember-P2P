@@ -1698,11 +1698,21 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
 
     // Re-verify here, with nothing between this and the spawn. Shutting down takes
     // seconds — long enough for anything running as the user to overwrite the file
-    // in the window after a check — and this is the one path that then executes it,
-    // typically behind an elevation prompt the user is already expecting to see.
+    // in the window after a check — and this is the one path that then executes it.
     // Verifying before the flush and trusting it afterwards would make the
     // "nothing is executed on the strength of having written it earlier" rule
     // hold only for the first few seconds.
+    //
+    // No elevation is involved, and the spawn below could not produce it if it
+    // were: `Command::spawn` is `CreateProcessW`, which never shows the UAC
+    // consent dialog and simply fails with ERROR_ELEVATION_REQUIRED against a
+    // binary whose manifest asks for admin. That is fine only because
+    // `bundle.windows.nsis.installMode` is unset, so NSIS defaults to
+    // `currentUser` and emits `RequestExecutionLevel user`. Setting it to
+    // `perMachine` or `both` would break this path — and only this path, since
+    // the updater plugin's own install uses `ShellExecuteW` — so that change has
+    // to come with a switch to `ShellExecuteW` here. The MSI branch is unaffected
+    // either way: `msiexec` elevates through the Windows Installer service.
     let installer = verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
         "The staged installer changed while Ember was closing down. Check for updates again."
@@ -1732,7 +1742,12 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
         }
         Err(error) => {
             tracing::warn!("Could not launch the staged installer: {error}");
-            Err("Windows would not start the installer. It is saved in Ember's data folder under \"updates\" if you want to run it yourself.".to_string())
+            // The teardown above already stopped Ember's network services, so the
+            // window is still up but nothing is transferring. Saying only where
+            // the file is would send the user off to run it by hand from an app
+            // that looks healthy and is not; the install path spells the same
+            // thing out for the same reason.
+            Err("Windows would not start the installer. It is saved in Ember's data folder under \"updates\" if you want to run it yourself. Ember stopped its network services for the update; restart Ember to resume transfers.".to_string())
         }
     }
 }

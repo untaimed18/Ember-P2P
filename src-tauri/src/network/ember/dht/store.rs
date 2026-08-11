@@ -822,6 +822,17 @@ impl DhtStore {
                 if r.data.first() == Some(&RECORD_TYPE_SOURCE) {
                     continue;
                 }
+                // A lapsed record is not worth a replica set of frames. Expiry is
+                // derived from the publisher's signed creation time and we re-send
+                // the identical bytes, so every recipient computes the same death
+                // time and refuses it. Records stay resident until the five-minute
+                // sweep collects them, and the maintenance tick that republishes
+                // runs on its own schedule, so one that dies between sweeps would
+                // otherwise be fanned out once for nothing. `persistable` skips
+                // them on the same reasoning.
+                if r.expires_at <= now {
+                    continue;
+                }
                 let due =
                     force || r.republish_due || now.duration_since(r.last_republished) >= interval;
                 if due {
@@ -962,6 +973,9 @@ impl DhtStore {
             .values()
             .flat_map(|records| records.iter())
             .filter(|r| r.data.first() != Some(&RECORD_TYPE_SOURCE))
+            // Counted on the same terms the batch selects on, or the gauge
+            // reports work that will never be done.
+            .filter(|r| r.expires_at > now)
             .filter(|r| r.republish_due || now.duration_since(r.last_republished) >= interval)
             .count()
     }

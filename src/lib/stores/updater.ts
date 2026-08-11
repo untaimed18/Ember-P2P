@@ -222,6 +222,20 @@ let retryAction: 'check' | 'install' | 'relaunch' | 'staged' = 'check';
 /** True while `checkForUpdates` is awaiting the plugin `check()` call. */
 let checkInFlight = false;
 
+/**
+ * True while `checkUpdateHandoff` is awaiting the backend.
+ *
+ * The two run on independent startup timers 2.5 s apart, and the hand-off status
+ * call is not cheap: it reads, hashes and signature-checks the whole staged
+ * installer, on a freshly written unsigned executable — exactly the file an
+ * antivirus stops to scan, on exactly the machines this feature exists for. If
+ * it overruns that gap the check starts first, `takeStagedSnapshot` finds the
+ * store still `idle` and captures nothing, and the hand-off's `stalled` result is
+ * then overwritten by the check — reinstating the regression the snapshot was
+ * added to fix. Ordering the timers cannot fix that; only a guard can.
+ */
+let handoffInFlight = false;
+
 async function disposePending(): Promise<void> {
   pending = false;
 }
@@ -253,7 +267,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // mid-way through streaming, aborting it. A check during install is a no-op.
   // Also skip when another check is already in flight — a second entry would
   // dispose the first check's result (or the currently-available pending).
-  if (installInFlight || checkInFlight) return false;
+  if (installInFlight || checkInFlight || handoffInFlight) return false;
   checkInFlight = true;
   recordCheckedNow();
   // A staged installer waiting after a failed hand-off has to survive this
@@ -471,7 +485,8 @@ function restoreStaged(staged: StagedSnapshot): void {
  * nothing to say.
  */
 export async function checkUpdateHandoff(): Promise<boolean> {
-  if (installInFlight || checkInFlight) return false;
+  if (installInFlight || checkInFlight || handoffInFlight) return false;
+  handoffInFlight = true;
   try {
     const report = await invoke<UpdateHandoffReport | null>('secure_updater_handoff_status');
     if (!report) return false;
@@ -487,6 +502,8 @@ export async function checkUpdateHandoff(): Promise<boolean> {
   } catch {
     // Diagnostics only; a failure here must not block startup or nag the user.
     return false;
+  } finally {
+    handoffInFlight = false;
   }
 }
 

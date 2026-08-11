@@ -425,6 +425,19 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                     if self.pending_offset >= self.pending.len() {
                         self.pending.clear();
                         self.pending_offset = 0;
+                        // `pending_plaintext` describes the ciphertext in
+                        // `pending` and must not outlive it. The retry
+                        // reconciliation in `poll_write` is gated on `pending`
+                        // being non-empty, so a stale prefix left here can never
+                        // be recognised again: a caller that retries the buffer
+                        // whose write returned `Pending` — which the `AsyncWrite`
+                        // contract entitles it to do, since those bytes were
+                        // never reported consumed — would have it encrypted a
+                        // second time and put on the wire twice, with the
+                        // keystream advanced. That decrypts cleanly at the peer,
+                        // so nothing looks wrong until the eD2K framing has
+                        // drifted and the connection is finished.
+                        self.pending_plaintext.clear();
                     } else {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
