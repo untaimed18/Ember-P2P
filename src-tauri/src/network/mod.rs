@@ -33664,13 +33664,21 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // + app_handle). Always queued -- even when empty -- so the
                 // sweep clears `ember_pending` and `search-complete` fires.
                 //
-                // Only the tail the streaming sweep has not already sent. The
-                // rest reached the UI while the walk was still running, and
-                // re-emitting them here would turn every streamed row into a
-                // duplicate at completion.
-                let fresh = records.get(kw.last_streamed_count..).unwrap_or(&[]);
+                // Deliberately every record, not just the tail the streaming
+                // sweep has yet to send. `build_ember_keyword_results`
+                // aggregates across the records it is handed: `availability` is
+                // the number of distinct publishers, and a row only carries an
+                // `ember_file_hash` once two publishers agree on one. Handing it
+                // one batch at a time computes both per batch, so a file whose
+                // publishers arrived in different batches is under-counted and
+                // loses its digest — which silently drops the BLAKE3 check the
+                // corroboration rule exists to guarantee.
+                //
+                // Re-emitting a streamed row is not a duplicate: `dedup_streamed_batch`
+                // in the emit sweep turns any hash already streamed into an
+                // availability update carrying these corrected values.
                 let results =
-                    build_ember_keyword_results(fresh, &kw.keywords, kw.query_expr.as_ref());
+                    build_ember_keyword_results(&records, &kw.keywords, kw.query_expr.as_ref());
                 // The rows only ever carry a corroborated digest now, so this can
                 // seed straight from them. Still `or_insert`, so a search hit fills
                 // a gap and never displaces what the UI, known.met or a local hash
