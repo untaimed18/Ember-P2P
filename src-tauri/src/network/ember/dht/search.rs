@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use tracing::{debug, trace, warn};
 
+use super::publish::SignedRecord;
 use super::routing::RoutingTable;
 use super::{EmberContact, EmberNodeId, ALPHA, K_BUCKET_SIZE};
 
@@ -26,6 +27,21 @@ const MAX_SEARCH_RESULTS: usize = 300;
 /// would ever be merged — the node would answer every search from its own store
 /// alone.
 const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
+
+/// Blobs one node may offer a single search, whether or not they are kept.
+///
+/// `check_complete` ends a `FIND_VALUE` the moment the result budget is full,
+/// so whoever fills it decides when the walk stops. A datagram carries at most
+/// a few dozen records and a node is asked [`MAX_QUERY_ATTEMPTS`] times, which
+/// puts an honest contribution well under a quarter of the budget — while a
+/// flooder now needs four distinct nodes on the shortlist to crowd the walk
+/// out early, instead of managing it alone.
+///
+/// Charged per blob *offered*, not per blob accepted. Counting only what
+/// survives verification would leave junk free: it costs a slot in the dedup
+/// set and a signature check either way, and a peer that sends nothing but
+/// junk would never reach its own limit.
+const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 
 /// How many times one node may be queried within a single search.
 ///
@@ -164,6 +180,9 @@ pub struct IterativeSearch {
     /// [`MAX_SEARCH_RESULTS`] with copies of a handful of files and completed
     /// the search, hiding everything the later hops would have found.
     seen_results: HashSet<[u8; 32]>,
+    /// Blobs each node has offered, against [`MAX_RESULTS_PER_NODE`]. Bounded
+    /// by the number of nodes that answer, which the shortlist bounds.
+    offered_results: HashMap<EmberNodeId, usize>,
     /// Nodes with a query currently outstanding or permanently given up on.
     /// A node that failed but has attempts left is removed, which is what
     /// makes it eligible to be picked again.
@@ -218,6 +237,7 @@ impl IterativeSearch {
             shortlist,
             results: Vec::new(),
             seen_results: HashSet::new(),
+            offered_results: HashMap::new(),
             queried: HashSet::new(),
             attempts: HashMap::new(),
             started_at: Instant::now(),
@@ -319,10 +339,32 @@ impl IterativeSearch {
                     continue;
                 }
             }
+            // No single peer gets to fill the budget. See
+            // [`MAX_RESULTS_PER_NODE`]: the walk ends when the budget is full,
+            // so without this the node that answers first also decides how far
+            // the search gets to go.
+            let offered = self.offered_results.entry(*from_id).or_insert(0);
+            if *offered >= MAX_RESULTS_PER_NODE {
+                continue;
+            }
+            *offered += 1;
             // Dedup before the cap, not after: counting copies against
             // `MAX_SEARCH_RESULTS` is what let a well-replicated record end
             // the search before the closer hops were reached.
             if !self.seen_results.insert(*blake3::hash(&data).as_bytes()) {
+                continue;
+            }
+            // Check the signature before the blob takes a slot. Consumers
+            // re-parse through `from_value_blob` and drop anything forged, so
+            // a junk blob was never going to reach the caller — but until it
+            // was checked here it still cost a result slot, and filling those
+            // slots is what ends the walk. Unsigned bytes carrying the right
+            // sixteen at `[1..17]` were enough, which is free to produce.
+            if !SignedRecord::value_blob_is_authentic(&data) {
+                debug!(
+                    "Search {}: dropping FOUND_VALUE blob with no valid publisher signature",
+                    self.id
+                );
                 continue;
             }
             if self.results.len() < MAX_SEARCH_RESULTS {
@@ -807,6 +849,7 @@ pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_id(byte: u8) -> EmberNodeId {
@@ -826,14 +869,44 @@ mod tests {
         }
     }
 
-    /// A FOUND_VALUE blob shaped the way `process_response` validates it:
-    /// record type, the queried keyword hash at [1..17], a body, then the
-    /// 64-byte publisher signature.
-    fn value_blob(target: EmberNodeId, filler: u8) -> Vec<u8> {
+    /// A FOUND_VALUE blob — `record_data || 64-byte publisher signature` —
+    /// for `keyword`, made a distinct record by `filler`.
+    ///
+    /// Genuinely signed rather than merely shaped right: `process_response`
+    /// verifies every blob before it takes a result slot, so a hand-rolled one
+    /// exercises the rejection path and nothing else.
+    fn signed_value_blob(keyword: &str, filler: u16) -> Vec<u8> {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut file_hash = [0u8; 16];
+        file_hash[..2].copy_from_slice(&filler.to_le_bytes());
+        let rec = SignedRecord::keyword(keyword, file_hash, [0u8; 32], 100, "file.iso", &sk);
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    /// The key records for `keyword` land under, and therefore the target a
+    /// search has to walk to in order to find them.
+    fn keyword_target(keyword: &str) -> EmberNodeId {
+        EmberNodeId(keyword_hash(keyword))
+    }
+
+    /// A blob with the right sixteen bytes at `[1..17]` and noise behind them
+    /// — what costs an attacker nothing to produce.
+    fn unsigned_value_blob(target: EmberNodeId, filler: u8) -> Vec<u8> {
         let mut blob = vec![0x01u8];
         blob.extend_from_slice(&target.0);
-        blob.extend_from_slice(&[filler; 16]);
-        blob.extend_from_slice(&[filler; 64]);
+        blob.extend_from_slice(&[filler; 160]);
+        blob
+    }
+
+    /// A blob whose framing is impeccable and whose signature is not: a real
+    /// record with one bit of the signature flipped. The framing checks let
+    /// this through, so only the verification can turn it away.
+    fn forged_value_blob(keyword: &str, filler: u16) -> Vec<u8> {
+        let mut blob = signed_value_blob(keyword, filler);
+        let last = blob.len() - 1;
+        blob[last] ^= 0xFF;
         blob
     }
 
@@ -981,7 +1054,7 @@ mod tests {
     /// against the result cap let one popular record end the search.
     #[test]
     fn the_same_record_from_two_peers_is_kept_once() {
-        let target = make_id(0x01);
+        let target = keyword_target("ubuntu");
         let mut rt = RoutingTable::new(make_id(0x00), false);
         let a = make_contact(0xF0);
         let b = make_contact(0xE0);
@@ -993,8 +1066,8 @@ mod tests {
         let search = sm.get_mut(sid).unwrap();
         let batch = search.next_to_query();
 
-        let shared = value_blob(target, 0x11);
-        let only_b = value_blob(target, 0x22);
+        let shared = signed_value_blob("ubuntu", 0x11);
+        let only_b = signed_value_blob("ubuntu", 0x22);
         for (contact, req_id) in batch {
             let records = if contact.node_id == b.node_id {
                 vec![shared.clone(), only_b.clone()]
@@ -1017,7 +1090,7 @@ mod tests {
     /// same blob twice in one response must not get two slots either.
     #[test]
     fn one_peer_repeating_itself_gains_nothing() {
-        let target = make_id(0x01);
+        let target = keyword_target("ubuntu");
         let mut rt = RoutingTable::new(make_id(0x00), false);
         let peer = make_contact(0xF0);
         rt.add_contact(peer.clone());
@@ -1027,10 +1100,74 @@ mod tests {
         let search = sm.get_mut(sid).unwrap();
         let (_, req_id) = search.next_to_query().remove(0);
 
-        let blob = value_blob(target, 0x33);
+        let blob = signed_value_blob("ubuntu", 0x33);
         search.process_response(req_id, &peer.node_id, vec![], vec![blob.clone(); 50]);
 
         assert_eq!(search.results.len(), 1);
+    }
+
+    /// Taking a result slot has to cost a signature. A slot is what ends a
+    /// `FIND_VALUE` walk, and bytes carrying the queried key and nothing else
+    /// are free to produce — which used to be enough to take one.
+    #[test]
+    fn only_signed_records_take_a_result_slot() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let (_, req_id) = search.next_to_query().remove(0);
+
+        let genuine = signed_value_blob("ubuntu", 0x01);
+        let mut offered: Vec<Vec<u8>> = (0..20).map(|i| unsigned_value_blob(target, i)).collect();
+        offered.extend((0..20).map(|i| forged_value_blob("ubuntu", 0x40 + i)));
+        offered.push(genuine.clone());
+
+        search.process_response(req_id, &peer.node_id, vec![], offered);
+
+        assert_eq!(search.results.len(), 1, "only the signed record survives");
+        assert_eq!(search.results[0].data, genuine);
+    }
+
+    /// Filling the result budget ends the walk, so no one peer may fill it.
+    /// Otherwise whoever answers first decides how far the search goes, and
+    /// the closer hops it existed to reach are never asked.
+    #[test]
+    fn one_peer_cannot_fill_the_result_budget() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let flooder = make_contact(0xF0);
+        rt.add_contact(flooder.clone());
+        rt.add_contact(make_contact(0xE0));
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+        let (_, req_id) = batch
+            .iter()
+            .find(|(c, _)| c.node_id == flooder.node_id)
+            .expect("the flooder is queried");
+
+        // Every one of them genuinely signed and distinct, so the per-node cap
+        // is the only thing left that can turn any of them away — and there
+        // are more than the whole budget, so without it this one answer would
+        // both fill the results and end the walk.
+        let flood: Vec<Vec<u8>> = (0..(MAX_SEARCH_RESULTS as u16 + 20))
+            .map(|i| signed_value_blob("ubuntu", i))
+            .collect();
+        assert!(flood.len() > MAX_SEARCH_RESULTS);
+
+        search.process_response(*req_id, &flooder.node_id, vec![], flood);
+
+        assert_eq!(search.results.len(), MAX_RESULTS_PER_NODE);
+        assert!(
+            !search.complete,
+            "one peer's answer must not end the walk while another is outstanding"
+        );
     }
 
     /// A timeout is not proof a node is gone. Giving up on the first miss
@@ -1293,7 +1430,7 @@ mod tests {
         let mut rt = RoutingTable::new(local, false);
         rt.add_contact(make_contact(0x80));
 
-        let target = make_id(0xFF);
+        let target = keyword_target("ubuntu");
         let mut sm = SearchManager::new();
         let search_id = sm
             .start_find_value(target, vec![], &rt)
@@ -1303,17 +1440,15 @@ mod tests {
         let batch = search.next_to_query();
         let (_, req_id) = &batch[0];
 
-        // Blobs are `record_data || 64-byte sig` with keyword_hash at [1..17].
-        let mut matching = vec![0u8; 17 + 64];
-        matching[1..17].copy_from_slice(&target.0);
+        let matching = signed_value_blob("ubuntu", 0x01);
         // A second, genuinely different record under the same key — two
         // publishers, or one publisher with two files. Distinct content
         // matters: identical blobs are deduplicated, so repeating one here
         // would test the dedup rather than the keyword binding this covers.
-        let mut other_matching = matching.clone();
-        other_matching[17] = 0xAB;
-        let mut mismatched = matching.clone();
-        mismatched[1] ^= 0xFF;
+        let other_matching = signed_value_blob("ubuntu", 0x02);
+        // Signed just as properly, but filed under another word, so it is the
+        // key binding alone that turns it away.
+        let mismatched = signed_value_blob("debian", 0x03);
 
         search.process_response(
             *req_id,

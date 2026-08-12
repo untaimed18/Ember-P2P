@@ -213,6 +213,37 @@ const XX_COOKIE_ROTATION: Duration = Duration::from_secs(15);
 const XX_UNVALIDATED_MSG2_PER_SEC: u32 = 16;
 const XX_UNVALIDATED_MSG2_BURST: u32 = 64;
 
+/// Sustained ceiling on inbound IK initiations we will run Noise for, in
+/// packets per second, plus the burst allowed above it.
+///
+/// IK answers are already de-amplifying and withhold the embedded payload
+/// until the address proves routable, so what is rationed here is not
+/// reflected bytes but our own CPU: every initiation with a fresh ephemeral
+/// costs a responder build and an X25519 exchange, and none of it is deduped,
+/// because a new ephemeral is a new replay digest. An IK init needs no
+/// return-routability, so the source address can be spoofed and the work
+/// bought for the price of a datagram.
+///
+/// Far looser than the XX budget above, because this is the *primary* path —
+/// every peer that knows our static key arrives on it — where XX is the
+/// fallback taken only when the key is unknown. Sixty-four a second is orders
+/// of magnitude above real first-contact rates (a few dozen a *minute* on a
+/// busy node, mostly sessions re-forming after an idle timeout) and still
+/// bounds the flood case to a few milliseconds of CPU per second. The burst
+/// covers the one legitimate spike there is: coming online and being dialled
+/// by everyone who already held our contact.
+///
+/// Unlike the XX budget, a token is spent on every initiation we look at,
+/// including one that turns out to be malformed. That is deliberate but it is
+/// not free: the work being rationed *is* the read that decides whether the
+/// packet was genuine, so there is no point at which we know it was junk and
+/// have not already paid. The cost is that a flood of garbage can empty the
+/// bucket and leave honest first contact to retry — the usual bargain, and
+/// the better half of it, since the alternative is spending the CPU and
+/// degrading every established session along with it.
+const IK_HANDSHAKE_PER_SEC: u32 = 64;
+const IK_HANDSHAKE_BURST: u32 = 256;
+
 /// Largest Ember UDP datagram we will parse. Valid Noise handshake and
 /// transport packets are far smaller than this; the cap prevents an oversized
 /// UDP datagram from driving proportional allocation during handshake parsing.
@@ -639,6 +670,13 @@ pub struct EmberTransport {
     /// address spends the same tokens.
     xx_msg2_tokens: u32,
     xx_msg2_refilled_at: Instant,
+    /// The same, for the Noise work an inbound IK initiation costs. A separate
+    /// bucket rather than a shared one: the two ration different things — XX
+    /// rations bytes we reflect, IK rations CPU we spend — and sharing would
+    /// let a flood on either path close the other, which is the whole network
+    /// for a peer that only knows one of them.
+    ik_tokens: u32,
+    ik_refilled_at: Instant,
 }
 
 /// An application payload that arrived inside a Noise_IK message 1 from an
@@ -689,7 +727,33 @@ impl EmberTransport {
             cookie_rotated_at: Instant::now(),
             xx_msg2_tokens: XX_UNVALIDATED_MSG2_BURST,
             xx_msg2_refilled_at: Instant::now(),
+            ik_tokens: IK_HANDSHAKE_BURST,
+            ik_refilled_at: Instant::now(),
         }
+    }
+
+    /// Whether we may run the Noise responder for one fresh IK initiation,
+    /// charging it if so.
+    ///
+    /// Charged on take, unlike [`Self::xx_msg2_budget_available`] and its
+    /// separate spend: there the token pays for a packet that may still not be
+    /// sent, here it pays for the crypto we are about to do either way.
+    fn take_ik_handshake_token(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.ik_refilled_at);
+        let earned = (elapsed.as_millis() as u64 * u64::from(IK_HANDSHAKE_PER_SEC)) / 1000;
+        // Sub-token intervals leave the clock alone so the remainder carries;
+        // see `refill_xx_msg2_budget`.
+        if earned > 0 {
+            let refilled = u64::from(self.ik_tokens).saturating_add(earned);
+            self.ik_tokens = refilled.min(u64::from(IK_HANDSHAKE_BURST)) as u32;
+            self.ik_refilled_at = now;
+        }
+        if self.ik_tokens == 0 {
+            return false;
+        }
+        self.ik_tokens -= 1;
+        true
     }
 
     /// Accrue msg2 budget for the time since the last refill.
@@ -844,6 +908,18 @@ impl EmberTransport {
         if let Some(entry) = self.recent_handshakes.get_mut(&digest) {
             entry.response = Some(response);
         }
+    }
+
+    /// Drop the digest [`Self::check_handshake_replay`] recorded for an
+    /// initiation we then declined to process at all.
+    ///
+    /// The cache exists to answer a retransmit with whatever we sent the first
+    /// time, and an entry with no response answers it with silence — right for
+    /// an initiation that genuinely produced nothing, wrong for one we refused
+    /// on a budget, which would turn a single dropped packet into a whole
+    /// replay window of them for a peer that is only retrying.
+    fn forget_handshake(&mut self, digest: &[u8; 32]) {
+        self.recent_handshakes.remove(digest);
     }
 
     /// Check if a raw UDP packet is an Ember-encrypted packet.
@@ -1526,6 +1602,17 @@ impl EmberTransport {
                 };
             }
         };
+        // Everything above this point is a hash and a map lookup; everything
+        // below is a responder build and an X25519 exchange. See
+        // [`IK_HANDSHAKE_PER_SEC`] for why that asymmetry needs a ceiling and
+        // why this one sits so far above honest traffic. A retransmit was
+        // already answered from the replay cache without reaching here, so a
+        // drop costs a peer one attempt, not a handshake.
+        if !self.take_ik_handshake_token() {
+            trace!("Dropping IK init from {from}: over the handshake budget");
+            self.forget_handshake(&handshake_digest);
+            return IncomingResult::Rejected;
+        }
         let params = match NOISE_PATTERN_IK.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -3380,6 +3467,56 @@ mod tests {
             IncomingResult::HandshakeComplete { .. } => {}
             _ => panic!("expected the responder to complete on msg3"),
         }
+    }
+
+    /// Every IK initiation with an unseen ephemeral costs a responder build
+    /// and an X25519 exchange, nothing dedupes a flood of them, and the source
+    /// address needs to prove nothing first. The budget is what keeps that
+    /// from being unbounded remote CPU.
+    #[test]
+    fn an_ik_flood_is_capped_by_the_handshake_budget() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+        let peer_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+
+        let (peer_priv, peer_pub) = make_keypair();
+        let mut peer = EmberTransport::new(peer_priv, peer_pub);
+        let init = match peer.prepare_outgoing(bob_addr, Some(&bob_pub), b"request") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        // Drained directly rather than by sending a burst's worth of real
+        // initiations: that loop takes long enough to earn tokens back while
+        // it runs, so where it landed would be a matter of how fast the
+        // machine is.
+        while bob.take_ik_handshake_token() {}
+
+        assert!(
+            matches!(
+                bob.process_incoming(&init, peer_addr),
+                IncomingResult::Rejected
+            ),
+            "an initiation over the budget must be dropped before any Noise work"
+        );
+        assert!(
+            bob.recent_handshakes.is_empty(),
+            "a refused initiation must leave no replay-cache entry, or the peer's \
+             retransmit is answered with silence for the whole replay window"
+        );
+
+        // The control: the same packet, delivered to the same identity with a
+        // full bucket, is an ordinary first contact. So it was the budget that
+        // refused it above and nothing about the packet.
+        let mut rested = EmberTransport::new(bob_priv, bob_pub);
+        assert!(
+            !matches!(
+                rested.process_incoming(&init, peer_addr),
+                IncomingResult::Rejected
+            ),
+            "the initiation itself is well-formed"
+        );
     }
 
     /// "Newest unproven claimant wins" is what keeps a spoofed session from

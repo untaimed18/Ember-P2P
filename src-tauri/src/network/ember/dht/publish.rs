@@ -212,6 +212,39 @@ impl SignedRecord {
         Self::from_wire(data, signature)
     }
 
+    /// Whether `blob` carries a signature its embedded publisher key really
+    /// made, without building the record.
+    ///
+    /// [`Self::from_value_blob`] answers the same question, but allocates a
+    /// `String` for the name and copies the body to do it. A search asks this
+    /// of every blob a peer offers and keeps none of the parsed fields, so it
+    /// takes the verdict alone; whoever consumes the result parses properly.
+    ///
+    /// The framing checks mirror [`Self::from_wire`] on purpose: a blob that
+    /// would be refused there has to be refused here too, or it wins a result
+    /// slot only to be dropped at the far end.
+    pub fn value_blob_is_authentic(blob: &[u8]) -> bool {
+        if blob.len() < 115 + 64 {
+            return false;
+        }
+        let (data, sig_bytes) = blob.split_at(blob.len() - 64);
+        let name_len = u16::from_le_bytes([data[113], data[114]]) as usize;
+        if data.len() < 115 + name_len {
+            return false;
+        }
+        if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
+            return false;
+        }
+        let (Ok(signature), Ok(publisher_key)) = (
+            <[u8; 64]>::try_from(sig_bytes),
+            <[u8; 32]>::try_from(&data[73..105]),
+        ) else {
+            return false;
+        };
+        crypto::verifying_key_from_bytes(&publisher_key)
+            .is_some_and(|pk| crypto::verify(&pk, data, &signature))
+    }
+
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
