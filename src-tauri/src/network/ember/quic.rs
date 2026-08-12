@@ -230,9 +230,15 @@ fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 /// whatever field is *structurally* in that position, full stop.
 fn extract_ember_ed25519_pubkey(cert_der: &[u8]) -> Option<[u8; 32]> {
     use x509_cert::der::Decode;
+    // RFC 8410 id-Ed25519, spelled against `x509-cert`'s own `const-oid`
+    // rather than reused from `ed25519_dalek::pkcs8::ALGORITHM_OID`: the two
+    // crates sit on different `const-oid` majors, so their `ObjectIdentifier`
+    // types are not comparable even though the value is identical.
+    const ID_ED25519: x509_cert::der::asn1::ObjectIdentifier =
+        x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.101.112");
     let cert = x509_cert::Certificate::from_der(cert_der).ok()?;
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    if spki.algorithm.oid != ed25519_dalek::pkcs8::ALGORITHM_OID {
+    let spki = cert.tbs_certificate().subject_public_key_info();
+    if spki.algorithm.oid != ID_ED25519 {
         return None;
     }
     let raw = spki.subject_public_key.raw_bytes();

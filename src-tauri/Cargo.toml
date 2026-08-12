@@ -94,7 +94,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # decoy match earlier in a self-crafted certificate), whereas a real
 # ASN.1/DER parser walks the actual certificate structure and cannot
 # be fooled that way.
-x509-cert = { version = "0.2", default-features = false }
+x509-cert = { version = "0.3", default-features = false }
 strsim = "0.11"
 zip = "8"
 fs2 = "0.4"
@@ -107,7 +107,7 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 # Unicode tables we don't need (we match ASCII-only client-software
 # strings) — saves ~250 KiB binary and ~50 ms startup compile time.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
-lofty = "0.24"
+lofty = "0.25"
 # Friend-chat E2E encryption (`network::ember::crypto`): converts our
 # existing Ed25519 identity keys to X25519 for ECDH, then HKDF-stretches
 # the shared secret into an AEAD key. Pinned to the same `curve25519-dalek`
@@ -134,6 +134,18 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
+
+# Ed25519 verification runs ~100x slower unoptimized, and startup re-verifies
+# every record restored from `store_ember.dat`. At a few thousand records that
+# pushes the network event loop past the 15s `SharedFilesChangedAck` budget in
+# `reconcile_shared_files`, so a dev run logs a reconciliation failure that a
+# release build never sees. Optimizing only these crates leaves our own code at
+# `opt-level = 0` and fully debuggable.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 strip = true
