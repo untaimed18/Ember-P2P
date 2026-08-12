@@ -36,7 +36,7 @@
     { key: 'type',        label: () => m.library_col_type(),        width: 70,  minWidth: 56,  sortField: 'extension' },
     { key: 'priority',    label: () => m.library_col_priority(),    width: 72,  minWidth: 60,  sortField: 'priority' },
     { key: 'transferred', label: () => m.library_col_transferred(), width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
-    { key: 'sources',     label: () => m.library_col_peers(),       width: 60,  minWidth: 50,  sortField: 'complete_sources' },
+    { key: 'sources',     label: () => m.library_col_peers(),       width: 118, minWidth: 84,  sortField: 'complete_sources' },
     { key: 'shared',      label: () => m.library_col_shared(),      width: 132, minWidth: 96 },
     { key: 'hash',        label: () => m.library_col_file_id(),     width: 120, minWidth: 80,  sortField: 'hash' },
     { key: 'requests',    label: () => m.library_col_requests(),    width: 70,  minWidth: 50,  sortField: 'requests' },
@@ -568,7 +568,7 @@
             ondrop={(e) => onDrop(e, col.key)}
             ondragend={onDragEnd}
           >
-            <span class="header-content">
+            <span class="header-content" title={col.label()}>
               {col.label()}{col.sortField ? arrow(col.sortField) : ''}
             </span>
             <button
