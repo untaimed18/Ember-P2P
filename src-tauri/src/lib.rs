@@ -192,9 +192,19 @@ pub(crate) async fn run_graceful_shutdown(
     }
     if flag.load(std::sync::atomic::Ordering::Acquire) {
         info!("Network shutdown complete");
-    } else {
+    } else if shutdown_sent {
         tracing::error!(
             "Shutdown deadline reached before authoritative network writers completed; result is truncated"
+        );
+    } else {
+        // Distinct from the deadline case: no deadline was ever awaited because
+        // the command never reached the network task, so it ran no save
+        // sequence at all. Reporting this as a timeout sent anyone reading the
+        // log looking for a slow writer instead of a full command channel.
+        tracing::error!(
+            "Network shutdown was never enqueued (command channel stayed full for {}s); \
+             no authoritative network writes ran this teardown",
+            SHUTDOWN_SEND_WAIT.as_secs()
         );
     }
 
@@ -1709,7 +1719,7 @@ pub fn run() {
             commands::security::set_block_private_ips,
             commands::security::download_and_load_ipfilter,
             commands::security::update_ipfilter_from_url,
-            commands::security::import_ipfilter_file,
+            commands::security::pick_and_import_ipfilter_file,
             commands::security::get_antileech_patterns,
             commands::security::set_antileech_patterns,
             commands::security::set_antileech_enabled,

@@ -10,6 +10,7 @@ use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::kad::ip_filter::{count_valid_entries, IpFilter, IpFilterStats};
 use crate::network::NetworkCommand;
+use tauri_plugin_dialog::DialogExt;
 
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
@@ -639,8 +640,8 @@ pub async fn download_and_load_ipfilter(
 /// Download and load an ipfilter from a user-supplied URL.
 ///
 /// Distinct from `download_and_load_ipfilter`, which fetches from a
-/// hard-coded default URL, and from `import_ipfilter_file`, which
-/// reads a local path. This is the only IPC path that accepts a
+/// hard-coded default URL, and from `pick_and_import_ipfilter_file`, which
+/// reads a locally picked file. This is the only IPC path that accepts a
 /// user-provided URL — useful for corporate / third-party ipfilter
 /// distributions that aren't covered by the bundled default.
 ///
@@ -769,27 +770,51 @@ pub async fn update_ipfilter_from_url(
     })
 }
 
+/// Native picker path for the IP filter, mirroring `pick_and_load_collection`.
+///
+/// Selecting a file in the OS dialog *is* the user's authorization. A path
+/// arriving from the renderer is not, and the previous `import_ipfilter_file`
+/// command accepted one: a compromised webview could name any readable
+/// `.dat`/`.txt`/`.gz`/`.zip`/`.p2p`/`.p2b` outside Ember's approved roots and
+/// learn from the returned entry count whether it parsed as IP ranges. The
+/// dialog runs here in the core, so no path crosses IPC inbound.
+///
+/// `Ok(None)` means the user dismissed the picker.
 #[tauri::command]
-pub async fn import_ipfilter_file(
+pub async fn pick_and_import_ipfilter_file(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    file_path: String,
+) -> Result<Option<IpFilterApplyResult>, String> {
+    let picker = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .add_filter("IP Filter", &["dat", "txt", "gz", "zip", "p2p", "p2b"])
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("security_invalid_path", "Invalid path", e))
+            })
+    })
+    .await
+    .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))?;
+    let Some(path) = selected.transpose()? else {
+        return Ok(None);
+    };
+    import_ipfilter_at_path(app, state, path).await.map(Some)
+}
+
+/// The shared import body. Deliberately not a `#[tauri::command]`: the picker
+/// above owns authorization, and the extension/system-directory checks below
+/// are a sanity pass on what the dialog returned, not a substitute for it.
+async fn import_ipfilter_at_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_path: std::path::PathBuf,
 ) -> Result<IpFilterApplyResult, String> {
-    // Match the cap used by `add_shared_folder` / `validate_settings`
-    // so a degenerate frontend caller can't pass a multi-megabyte
-    // string into IPC. The blocking canonicalize / read paths below
-    // would still cope, but bounding here avoids ferrying a giant
-    // string across thread boundaries unnecessarily.
-    const MAX_PATH_LEN: usize = 4 * 1024;
-    if file_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx(
-            "security_file_path_too_long",
-            "File path exceeds maximum length",
-            format!("{MAX_PATH_LEN} bytes"),
-        ));
-    }
     let path = tokio::task::spawn_blocking(move || {
-        let path = std::path::PathBuf::from(&file_path);
+        let path = file_path;
         if !path.exists() {
             return Err(coded("security_file_does_not_exist", "File does not exist"));
         }

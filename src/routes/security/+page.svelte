@@ -7,7 +7,7 @@
     setBlockPrivateIps,
     downloadAndLoadIpfilter,
     updateIpfilterFromUrl,
-    importIpfilterFile,
+    pickAndImportIpfilterFile,
     type IpFilterStats,
     type IpFilterEntry,
     type IpFilterApplyResult,
@@ -313,14 +313,12 @@
     importing = true;
     error = null;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: 'IP Filter', extensions: ['dat', 'txt'] }],
-      });
-      if (selected) {
-        const result = await importIpfilterFile(selected as string);
-        if (unmounted) return;
+      // The picker runs in the Rust core rather than here, so the chosen path
+      // never travels over IPC — selecting a file in the OS dialog is what
+      // authorizes the read. `null` means the user dismissed it.
+      const result = await pickAndImportIpfilterFile();
+      if (unmounted) return;
+      if (result) {
         flash(ipFilterApplyMessage(result));
         await syncIpFilterSettingsCache();
         await loadStats();

@@ -1585,6 +1585,50 @@ async fn handle_epx_sources(
                 );
                 continue;
             }
+            // A firewalled peer cannot accept a dial from us. `SourceAdmission`
+            // keeps it only because *it* can reach us ("reachable ourselves, so
+            // the peer can dial us"), and the address it declares is precisely
+            // the one the DHT's anti-reflection bind exempts — see the
+            // `SOURCE_FLAG_FIREWALLED` arm of `accept_record` in
+            // `dht/engine.rs`, where a firewalled contact is stored without
+            // having to match the sender's observed IP. So nothing vouches for
+            // it, and handing it to a worker meant we dialled whatever host the
+            // record named: useless against a genuinely firewalled peer, and a
+            // way to aim a swarm of downloaders at a third party when the record
+            // was forged.
+            //
+            // Keep the row — the peer stays visible, counts as a source, and is
+            // reseeded on pause/resume — but park it out of the dial rotation
+            // (`LowToLowIp` is what `time_until_reask` treats as never-dial) and
+            // let the punch/relay broker hand the worker an established stream
+            // instead, which is what `maybe_publish_ember_sources` says the flag
+            // is for. A peer whose flag is stale because it since gained a
+            // forwarded port is reachable again on its next republish, and can
+            // dial us meanwhile.
+            if flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
+                let mut stored_new = false;
+                for transfer_id in &matching_ids {
+                    let pfs = state
+                        .per_file_sources
+                        .entry(transfer_id.clone())
+                        .or_insert_with(|| ed2k::sources::PerFileSourceList::new(*file_hash));
+                    if pfs.add_source_full(ip, port, udp_port) {
+                        stored_new = true;
+                    }
+                    pfs.set_low_to_low(ip, port, None);
+                }
+                if stored_new {
+                    state.ember_payload_dirty = true;
+                    // Counted against the per-event ceiling like an injection,
+                    // so a flood of firewalled entries cannot buy unlimited work.
+                    total_sources_this_event += 1;
+                    *per_hash_persisted.entry(hex::encode(file_hash)).or_default() += 1;
+                }
+                debug!(
+                    "EPX source {ip}:{port} is firewalled; kept as a parked source rather than dialled ({label})"
+                );
+                continue;
+            }
             // Only reuse connect_options / user_hash already known from
             // SourceManager. Never invent obfuscation (`0x02`) from the
             // unauthenticated EPX `SOURCE_FLAG_OBFUSCATION` bit alone —
@@ -3999,6 +4043,7 @@ async fn release_friend_connect_sources(
     // `maybe_escalate_to_friend_transfer` parked it as `FriendConnect`, so
     // without this the drawer would re-read that stale row on refresh and go on
     // showing a connect-back that is no longer coming.
+    let mut released_bytes = Vec::with_capacity(released.len());
     {
         let mut mgr = transfer_manager.write().await;
         let existing = mgr.get_source_details(transfer_id);
@@ -4029,9 +4074,10 @@ async fn release_friend_connect_sources(
                     user_hash: None,
                 },
             );
+            released_bytes.push((*ip, *port, transferred));
         }
     }
-    for (ip, port) in released {
+    for (ip, port, transferred) in released_bytes {
         let _ = app_handle.emit(
             "transfer-source-detail",
             serde_json::json!({
@@ -4041,7 +4087,11 @@ async fn release_friend_connect_sources(
                 "status": "failed",
                 "queue_rank": null,
                 "speed": 0,
-                "transferred": 0,
+                // The same value the stored row keeps, for the reason spelled
+                // out in `maybe_escalate_to_friend_transfer`: the drawer takes
+                // this event as truth, so sending 0 undid the preservation
+                // immediately above and blanked the byte count until a refetch.
+                "transferred": transferred,
                 "client_software": "",
                 "peer_name": "",
                 "available_parts": null,
@@ -9436,6 +9486,14 @@ struct NetworkState {
     /// `MAX_EMBER_UDP_EPX_RATE_ENTRIES` with LRU-by-window-start eviction,
     /// mirroring `known_ember_peers`.
     ember_udp_epx_rate: HashMap<SocketAddr, (u32, std::time::Instant)>,
+    /// The same budget applied to inbound `ExchangeRequest`, which is the frame
+    /// that makes us *build and send* an EPX payload. Only the receive side was
+    /// bounded, so an authenticated peer could drive an unlimited number of
+    /// multi-kilobyte replies out of us with tiny requests. Kept as its own map
+    /// rather than sharing `ember_udp_epx_rate` so the two directions of one
+    /// exchange cannot eat each other's allowance — a peer legitimately sends us
+    /// data and asks for ours inside the same window.
+    ember_udp_epx_req_rate: HashMap<SocketAddr, (u32, std::time::Instant)>,
     /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
@@ -13828,6 +13886,7 @@ pub async fn start_network(
         ember_udp_reachable_at: None,
         ember_kad_bridge_attempted: HashMap::new(),
         ember_udp_epx_rate: HashMap::new(),
+        ember_udp_epx_req_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
@@ -14269,6 +14328,18 @@ pub async fn start_network(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
 
+    // Bind a separate UDP socket for ed2k server status pings.
+    // Servers respond on their TCP port + 4; we can use any local port.
+    //
+    // Bound here, ahead of the upload listener, because this is the last
+    // fallible step in startup and it used to sit *after* that listener was
+    // spawned. The listener is detached with no `JoinHandle`, so a bind failure
+    // returned `Err` from `start_network` and surfaced a fatal network error
+    // while the TCP listener stayed bound and accepting, with no event loop
+    // left to coordinate it.
+    let mut server_udp =
+        ServerUdpSocket::from_socket(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+
     // Defer auto-connect until the event loop is running (and, when needed,
     // until server.met bootstrap finishes). Starting the TCP login before the
     // upload listener / command loop are up made splash IPC wait and raced
@@ -14416,11 +14487,6 @@ pub async fn start_network(
     }
 
     let mut udp_buf = vec![0u8; 65535];
-
-    // Bind a separate UDP socket for ed2k server status pings.
-    // Servers respond on their TCP port + 4; we can use any local port.
-    let mut server_udp =
-        ServerUdpSocket::from_socket(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
     let mut server_udp_ping_idx: usize = 0;
 
     // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
@@ -20979,24 +21045,39 @@ pub async fn start_network(
                     // each responding node during lookup (eMule behavior), but this
                     // final sweep catches any contacts that were discovered but not
                     // yet directly queried.
-                    if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                    //
+                    // Only the completing *FindBuddy* search may decide the hunt's
+                    // outcome. Every search type shares this completion path, and a
+                    // publish or source lookup finishing left the locals below at
+                    // their defaults — which `already_sent == 0` then read as "the
+                    // buddy search reached nobody" and reported as a failure. With
+                    // the publish timer at 2s and a source search per download,
+                    // some unrelated search almost always completes inside a buddy
+                    // walk, so a firewalled node aborted its own hunt, ignored the
+                    // FindBuddyRes that followed (only honoured in `FindingBuddy`),
+                    // and escalated its retry cooldown toward ten minutes.
+                    let completing_is_find_buddy = state
+                        .search_manager
+                        .get(&sid)
+                        .is_some_and(|search| matches!(search.search_type, SearchType::FindBuddy));
+                    if completing_is_find_buddy
+                        && state.buddy_manager.state() == BuddyState::FindingBuddy
+                    {
                         let mut already_sent = 0usize;
                         let mut contacts_to_send = Vec::new();
                         let mut target = KadId::zero();
                         if let Some(search) = state.search_manager.get_mut(&sid) {
-                            if matches!(search.search_type, SearchType::FindBuddy) {
-                                target = search.target;
-                                already_sent = search.find_buddy_requests_sent();
-                                let candidates: Vec<KadContact> = search
-                                    .closest
-                                    .iter()
-                                    .filter(|c| !search.responded_during_lookup.contains(&c.id))
-                                    .cloned()
-                                    .collect();
-                                for contact in candidates {
-                                    if search.reserve_find_buddy_request(contact.id) {
-                                        contacts_to_send.push(contact);
-                                    }
+                            target = search.target;
+                            already_sent = search.find_buddy_requests_sent();
+                            let candidates: Vec<KadContact> = search
+                                .closest
+                                .iter()
+                                .filter(|c| !search.responded_during_lookup.contains(&c.id))
+                                .cloned()
+                                .collect();
+                            for contact in candidates {
+                                if search.reserve_find_buddy_request(contact.id) {
+                                    contacts_to_send.push(contact);
                                 }
                             }
                         }
@@ -27245,14 +27326,16 @@ pub async fn start_network(
                     }
                 }
 
-                // Timeout pending server search after 30 seconds. This
-                // counter ticks once per second (this loop iteration), so
-                // the threshold must be 29, not 15 — the previous value
-                // cut the server leg off after ~15s, half of the
-                // documented/intended duration.
+                // Timeout pending server search after 30 seconds. This arm is
+                // the `server_timer` tick, which runs every 2s — not once per
+                // second — so 30s is 15 ticks and the threshold is 14. An
+                // earlier change raised it from 15 to 29 on the belief that
+                // the cadence was 1 Hz, which doubled the real wait to ~60s
+                // and left a silent server leg holding the search for a full
+                // minute before local results were returned.
                 if state.pending_server_search.is_some() {
                     state.server_search_age += 1;
-                    if state.server_search_age > 29 {
+                    if state.server_search_age > 14 {
                         if let Some(mut pending) = state.pending_server_search.take() {
                             let request_id = pending.request_id;
                             info!("Server search timed out, returning {} local results", pending.results.len());
@@ -33303,6 +33386,14 @@ async fn handle_ember_control_message(
             if !state.ember_transport.peer_is_ik_authenticated(&from) {
                 debug!(
                     "ember-udp: refusing EPX exchange request from unauthenticated XX session {from}"
+                );
+                return;
+            }
+            if !check_and_record_udp_epx_rate(&mut state.ember_udp_epx_req_rate, from) {
+                debug!(
+                    "ember-udp: rate-limiting EPX ExchangeRequest from {from} ({} per {:?} window)",
+                    ember::MAX_EPX_PACKETS_PER_CONNECTION,
+                    EPX_UDP_RATE_WINDOW,
                 );
                 return;
             }
@@ -41600,8 +41691,9 @@ async fn handle_command_inner(
                 let mut staged_bytes = None;
                 let mut imported_p2b = false;
                 let parse_path = if path != load_path {
-                    // Defense in depth: `import_ipfilter_file` (the only
-                    // caller that can supply an arbitrary local path)
+                    // Defense in depth: `pick_and_import_ipfilter_file` (the
+                    // only caller that can supply an arbitrary local path,
+                    // and only one the user picked in the OS dialog)
                     // enforces this same limit before sending this
                     // command, but a `path` != `default_path` can in
                     // principle reach this handler from any future
@@ -44346,6 +44438,20 @@ async fn handle_command_inner(
                 return;
             }
 
+            // Same in-flight guard `FindFriendAndConnect` applies. Without it a
+            // retry pressed while the first attempt is still running dogpiles
+            // the rendezvous and races two `connect_friend_with_fallback` dials
+            // at one identity — and `outbound_session_tasks` holds a single
+            // entry per target, so the insert below would overwrite the running
+            // attempt's marker and leave the cleanup sweep able to see only one
+            // of the two. A search is already underway, which is what the user
+            // asked for, so this reports success rather than an error.
+            if state.outbound_session_tasks.contains_key(&target_hash) {
+                info!("RetryFriendSearch: {} already has a search in flight", hash_hex);
+                let _ = tx.send(Ok(()));
+                return;
+            }
+
             state
                 .outbound_session_tasks
                 .insert(target_hash, std::time::Instant::now());
@@ -44964,10 +45070,19 @@ async fn handle_download_event(
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(&transfer_id).map(|t| t.status.clone())
             };
+            // `Completed` belongs here for the same reason the upload path
+            // returns early when `fail()` finds nothing: once the row has moved
+            // to `completed`, `mgr.fail` cannot touch it, but the DB write and
+            // `transfer-failed` emit below still would — so a late or duplicate
+            // failure from a worker that raced completion persisted "failed" for
+            // a download whose bytes were verified and whose file was moved.
             if matches!(
                 current_status,
                 Some(
-                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
+                    TransferStatus::Paused
+                        | TransferStatus::Stopped
+                        | TransferStatus::Insufficient
+                        | TransferStatus::Completed
                 )
             ) {
                 return;

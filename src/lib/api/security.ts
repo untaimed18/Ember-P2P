@@ -71,7 +71,7 @@ export async function downloadAndLoadIpfilter(): Promise<IpFilterApplyResult> {
  * Download and load an ipfilter from a user-supplied URL.
  *
  * Complements `downloadAndLoadIpfilter` (fixed default URL) and
- * `importIpfilterFile` (local path). Used for corporate / alternate
+ * `pickAndImportIpfilterFile` (local file). Used for corporate / alternate
  * ipfilter distributions that aren't covered by the bundled default.
  * The backend validates the URL (DNS resolved, public-IP only, host
  * pinned), caps the response at 50 MiB, auto-extracts zip archives,
@@ -84,8 +84,15 @@ export async function updateIpfilterFromUrl(url: string): Promise<IpFilterApplyR
   return invoke('update_ipfilter_from_url', { url });
 }
 
-export async function importIpfilterFile(filePath: string): Promise<IpFilterApplyResult> {
-  return invoke('import_ipfilter_file', { filePath });
+/**
+ * Opens a native picker in the Rust core and imports the chosen IP filter.
+ *
+ * The dialog deliberately lives in the backend: choosing a file there is the
+ * user's authorization, whereas a path sent over IPC is not. Resolves to `null`
+ * when the user dismisses the picker.
+ */
+export async function pickAndImportIpfilterFile(): Promise<IpFilterApplyResult | null> {
+  return invoke('pick_and_import_ipfilter_file');
 }
 
 // ----- Anti-leech client filter ------------------------------------

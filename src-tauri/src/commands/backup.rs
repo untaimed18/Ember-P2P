@@ -1346,6 +1346,13 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
     crate::security::restrict_file_permissions(&backup_dir);
 
     let mut applied = 0usize;
+    // Names swapped in so far, so a failure part-way can put them back. Applying
+    // per-file and pressing on left the profile holding a mix of restored and
+    // original files — a restored `identity.json` beside the original `ember.db`
+    // orphans exactly the credits this feature exists to carry over — and the
+    // staging directory was removed regardless, so nothing was left to retry.
+    let mut applied_names: Vec<String> = Vec::new();
+    let mut failure: Option<String> = None;
     for name in &pending.files {
         if backup_file(name).is_none() {
             tracing::warn!("Ignoring unexpected staged file {name}");
@@ -1359,10 +1366,8 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         let mut displaced = false;
         if live.exists() {
             if let Err(e) = std::fs::rename(&live, backup_dir.join(name)) {
-                tracing::error!(
-                    "Restore skipped for {name}: could not move the current file aside ({e})"
-                );
-                continue;
+                failure = Some(format!("could not move the current {name} aside ({e})"));
+                break;
             }
             displaced = true;
         }
@@ -1387,6 +1392,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             Ok(()) => {
                 crate::security::restrict_file_permissions(&live);
                 applied += 1;
+                applied_names.push(name.clone());
             }
             Err(e) => {
                 tracing::error!("Failed to restore {name}: {e}");
@@ -1407,8 +1413,40 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
                         ),
                     }
                 }
+                failure = Some(format!("could not put the restored {name} in place ({e})"));
+                break;
             }
         }
+    }
+
+    if let Some(reason) = failure {
+        // Undo the swaps that did land, newest first, so the profile goes back to
+        // being internally consistent rather than a mix of two backups. Staging
+        // and its marker are deliberately left in place: the restore can then be
+        // retried on the next launch, or discarded from Settings > Backup if the
+        // cause is permanent. Removing staging here is what previously turned a
+        // mid-restore failure into an unrecoverable one.
+        for name in applied_names.iter().rev() {
+            let live = data_dir.join(name);
+            let saved = backup_dir.join(name);
+            if !saved.exists() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&live);
+            if let Err(e) = std::fs::rename(&saved, &live) {
+                tracing::error!(
+                    "Rollback failed for {name} ({e}); recover it from {}",
+                    backup_dir.display()
+                );
+            }
+        }
+        tracing::error!(
+            "Staged restore aborted: {reason}. Rolled back {} already-swapped file(s); the staged \
+             copy is kept for the next launch and the previous files remain in {}",
+            applied_names.len(),
+            backup_dir.display()
+        );
+        return Ok(None);
     }
 
     let _ = std::fs::remove_dir_all(&staging);

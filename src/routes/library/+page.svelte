@@ -1944,7 +1944,12 @@
 
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
-    const f = ctxMenu.file;
+    // Re-resolve by path rather than using the row as it looked when the menu
+    // opened. A `shared-files-changed` or `refresh()` in between can land a new
+    // hash on that path — hashing finishing is the common case. Path-keyed
+    // actions were unaffected either way, but copy_link, send_to_friend and
+    // republish would carry the ed2k identity the file no longer has.
+    const f = fileByPath.get(ctxMenu.file.path) ?? ctxMenu.file;
     closeCtx();
     try {
       switch (action) {

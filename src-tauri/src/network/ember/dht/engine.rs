@@ -315,11 +315,22 @@ impl EmberDht {
                 .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
             self.store_sig_swept_at = Some(now_inst);
         }
+        // A replay only counts as one if we still hold what it stands for. This
+        // cache is keyed on the signature alone and is cleared by TTL or size
+        // pressure — never by eviction — so a record the byte budget or a
+        // key-cap displacement had already dropped still classified as a
+        // replay, and `STORE_BATCH` set its accepted bit on the strength of
+        // "we already hold this exact record". The publisher then retired a
+        // file counting a replica that was gone.
         let is_replay = self
             .store_sig_seen
             .get(&sig_key)
-            .map(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
-            .unwrap_or(false);
+            .is_some_and(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
+            && self
+                .store
+                .get_live(&key)
+                .iter()
+                .any(|held| held.signature == record_signature);
         if is_replay {
             return StoreOutcome::Replay;
         }

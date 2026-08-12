@@ -1929,10 +1929,16 @@ impl Database {
         let records = stmt
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
-                if hash_blob.len() < 16 {
+                // Exactly 16, not "at least 16", for the reason `load_ember_credits`
+                // spells out for its 32-byte key: a longer blob silently truncated
+                // to the first 16 bytes would alias two distinct user hashes onto a
+                // single credit account. Short blobs were already refused; long ones
+                // are now refused too, so the row is skipped rather than merged into
+                // the wrong account.
+                if hash_blob.len() != 16 {
                     return Err(rusqlite::Error::InvalidColumnType(
                         0,
-                        "user_hash too short".into(),
+                        format!("user_hash must be 16 bytes, got {}", hash_blob.len()),
                         rusqlite::types::Type::Blob,
                     ));
                 }

@@ -2595,6 +2595,39 @@ mod tests {
         ));
     }
 
+    /// Parking must remove a source from the dial rotation while keeping the
+    /// row. The Ember DHT/EPX ingest depends on exactly this pair of properties
+    /// for a peer advertising `SOURCE_FLAG_FIREWALLED`: its declared address is
+    /// the one `accept_record`'s anti-reflection bind deliberately exempts, so
+    /// it must never be dialled, but it stays a visible, reseedable source that
+    /// the punch/relay broker can still deliver as an established stream.
+    #[test]
+    fn a_parked_low_to_low_source_is_never_offered_for_a_dial() {
+        let hash = [0x58; 16];
+        let dialable = Ipv4Addr::new(7, 7, 7, 7);
+        let parked = Ipv4Addr::new(8, 8, 8, 8);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(dialable, 4662, 0));
+        assert!(pfs.add_source_full(parked, 4662, 0));
+
+        pfs.set_low_to_low(parked, 4662, None);
+
+        let ready = pfs.sources_ready_for_reask();
+        assert!(
+            ready.contains(&(dialable, 4662)),
+            "an ordinary source stays dialable"
+        );
+        assert!(
+            !ready.contains(&(parked, 4662)),
+            "a parked firewalled source must not be dialled"
+        );
+        assert_eq!(
+            pfs.sources.len(),
+            2,
+            "parking keeps the row rather than dropping the peer"
+        );
+    }
+
     #[test]
     fn link_lowid_callback_stamps_single_row_and_dedups_count() {
         // A LowID source learned from a server (hash unknown) plus the live

@@ -650,8 +650,6 @@
   let allDownloads = $derived(downloadPartition.all);
   let activeDownloads = $derived(downloadPartition.active);
   let completedDownloads = $derived(downloadPartition.completed);
-  let hasCompletedDl = $derived(downloadPartition.anyCompleted);
-
   // Lower-cased hashes of files we're still downloading (have a `.part` for).
   // An upload whose hash is in this set is the eMule-style partial-file share:
   // we're serving the already-finished, verified parts of a file we haven't
@@ -2219,6 +2217,14 @@
     return transferFilter.trim() ? filteredActiveDownloads : activeDownloads;
   }
 
+  /** Rows "Clear completed" applies to, scoped the same way. It was the one
+   *  bulk action left that reached the whole manager: with the filter narrowed
+   *  it cleared every finished download, including rows the current view never
+   *  showed. */
+  function clearCompletedTargets(): Transfer[] {
+    return transferFilter.trim() ? filteredCompletedDownloads : completedDownloads;
+  }
+
   async function handleStopAll() {
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
@@ -3160,7 +3166,7 @@
               <button type="button" role="menuitem" onclick={(e) => { handleStopAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_stop_all()}</button>
               <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
             {/if}
-            {#if hasCompletedDl}
+            {#if clearCompletedTargets().length > 0}
               <button type="button" role="menuitem" onclick={(e) => { confirmClearCompleted = true; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
           </div>
@@ -4304,7 +4310,7 @@
     <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
       {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
     </button>
-    <button class="ctx-item" disabled={!hasCompletedDl} onclick={() => { closePaneCtx(); confirmClearCompleted = true; }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); confirmClearCompleted = true; }}>{m.transfers_clear_completed()}</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
   </div>
@@ -4488,7 +4494,7 @@
   title={m.transfers_clear_completed()}
   message={m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) speedHistory.delete(id); return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->

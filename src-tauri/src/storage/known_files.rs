@@ -1138,7 +1138,15 @@ pub fn migrate_aich_v2(data_dir: &Path) {
     }
 
     let known_met = data_dir.join("known.met");
-    if known_met.exists() {
+    // No catalog yet means there is nothing to migrate *and* nothing to record:
+    // writing the marker here retired the migration for a `known.met` that
+    // arrives later, which is exactly what happens when someone launches this
+    // build once and then copies an older profile in. Returning without the
+    // marker costs two `exists()` calls per startup until a catalog appears.
+    if !known_met.exists() {
+        return;
+    }
+    {
         let mut list = KnownFileList::load(&known_met);
         let cleared = list.clear_stale_multipart_aich();
         if cleared > 0 {
