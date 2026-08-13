@@ -1,5 +1,10 @@
 # Ember DHT — remaining work and future improvements
 
+The protocol specification (wire version 2, as implemented) is
+[ember-dht-specification.pdf](ember-dht-specification.pdf). This file is the
+standing work log: what is left, what was compared against KAD, and what is
+explicitly not planned.
+
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
 load). Keyword/source publish, iterative search,

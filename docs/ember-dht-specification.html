@@ -1,0 +1,1906 @@
+<!DOCTYPE html>
+<!--
+  EmberDHT Protocol Specification (print source).
+  Rebuild the PDF with:  scripts/build-ember-dht-spec.sh
+  Requires WeasyPrint (pip install weasyprint).
+-->
+<html lang="en">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EmberDHT Protocol Specification — Wire Version 2</title>
+<meta name="author" content="Ember">
+<meta name="description" content="Protocol specification for EmberDHT, Ember's native encrypted Kademlia overlay. Wire version 2, as implemented in Ember 1.5.4.">
+<meta name="keywords" content="EmberDHT, Kademlia, Noise, DHT, eMule, P2P">
+<style>
+@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Regular.ttf"); font-weight: 400; }
+@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Italic.ttf"); font-weight: 400; font-style: italic; }
+@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Medium.ttf"); font-weight: 500; }
+@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-SemiBold.ttf"); font-weight: 600; }
+@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Bold.ttf"); font-weight: 700; }
+@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"); font-weight: 400; }
+@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Medium.ttf"); font-weight: 500; }
+@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf"); font-weight: 700; }
+
+:root {
+  --ink: #1c1917;
+  --muted: #57534e;
+  --faint: #a8a29e;
+  --paper: #faf7f2;
+  --rule: #e7e0d6;
+  --ember: #c2410c;
+  --ember-deep: #9a3412;
+  --ember-soft: #fff7ed;
+  --ember-line: #fed7aa;
+  --teal: #0f766e;
+  --teal-soft: #f0fdfa;
+  --warn: #b45309;
+  --warn-soft: #fffbeb;
+  --code-bg: #1c1917;
+  --code-fg: #f5f0e8;
+}
+
+* { box-sizing: border-box; }
+
+html { font-size: 10.2pt; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: white;
+  font-family: Inter, "Liberation Sans", sans-serif;
+  font-weight: 400;
+  line-height: 1.48;
+}
+
+/* ── Page model ── */
+@page {
+  size: A4;
+  margin: 18mm 16mm 20mm 16mm;
+  @top-left {
+    content: "EmberDHT Protocol Specification";
+    font-family: Inter, sans-serif;
+    font-size: 8pt;
+    font-weight: 500;
+    color: #a8a29e;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  @top-right {
+    content: "Wire version 2  ·  Ember 1.5.4";
+    font-family: Inter, sans-serif;
+    font-size: 8pt;
+    color: #a8a29e;
+  }
+  @bottom-left {
+    content: "ember-p2p  ·  GPL-3.0  ·  August 2026";
+    font-family: Inter, sans-serif;
+    font-size: 8pt;
+    color: #a8a29e;
+  }
+  @bottom-right {
+    content: counter(page);
+    font-family: Inter, sans-serif;
+    font-size: 9pt;
+    font-weight: 600;
+    color: #c2410c;
+  }
+}
+
+@page :first {
+  margin: 0;
+  @top-left { content: none; }
+  @top-right { content: none; }
+  @bottom-left { content: none; }
+  @bottom-right { content: none; }
+}
+
+@page toc {
+  @top-left { content: none; }
+  @top-right { content: none; }
+}
+
+.cover { page: cover; page-break-after: always; }
+.toc-page { page: toc; page-break-after: always; }
+
+h1, h2, h3, h4 { page-break-after: avoid; }
+h2 { page-break-before: always; }
+h2.nobreak { page-break-before: auto; bookmark-level: none; }
+figure, .callout, .wire, .stack, .params, table.data { page-break-inside: avoid; }
+table.data.plain { page-break-inside: auto; }
+thead { display: table-header-group; }
+
+/* ── Cover ── */
+.cover {
+  background: #1a1612;
+  color: #faf7f2;
+  min-height: 297mm;
+  position: relative;
+  overflow: hidden;
+}
+
+.cover-inner {
+  padding: 28mm 22mm 20mm 22mm;
+  position: relative;
+  z-index: 2;
+  min-height: 297mm;
+  display: flex;
+  flex-direction: column;
+}
+
+.cover-kicker {
+  font-size: 9pt;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: #fb923c;
+  margin-bottom: 14mm;
+}
+
+.cover h1.brand {
+  font-size: 42pt;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 4mm 0;
+  line-height: 0.95;
+  color: white;
+}
+
+.cover .subtitle {
+  font-size: 18pt;
+  font-weight: 500;
+  color: #fed7aa;
+  margin: 0 0 12mm 0;
+  letter-spacing: -0.01em;
+}
+
+.cover-meta {
+  display: flex;
+  gap: 14mm;
+  margin-bottom: 16mm;
+  font-size: 9.5pt;
+  color: #d6d3d1;
+}
+
+.cover-meta strong {
+  display: block;
+  color: #fb923c;
+  font-size: 8pt;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 1.5mm;
+}
+
+.cover-abstract {
+  max-width: 148mm;
+  font-size: 10.5pt;
+  line-height: 1.55;
+  color: #e7e5e4;
+  border-left: 3px solid #c2410c;
+  padding-left: 6mm;
+  margin-top: auto;
+}
+
+.cover-foot {
+  margin-top: 14mm;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  font-size: 8.5pt;
+  color: #a8a29e;
+}
+
+.cover-glow {
+  position: absolute;
+  right: -40mm;
+  top: -20mm;
+  width: 180mm;
+  height: 180mm;
+  background: radial-gradient(circle at 40% 40%, rgba(234,88,12,0.38), rgba(234,88,12,0.08) 42%, transparent 70%);
+  z-index: 1;
+}
+
+.cover-glow2 {
+  position: absolute;
+  left: -30mm;
+  bottom: 20mm;
+  width: 120mm;
+  height: 120mm;
+  background: radial-gradient(circle at 50% 50%, rgba(180,83,9,0.22), transparent 70%);
+  z-index: 1;
+}
+
+/* ── TOC ── */
+.toc-page { padding-top: 2mm; }
+.toc-page h1 {
+  font-size: 22pt;
+  margin: 0 0 8mm 0;
+  letter-spacing: -0.02em;
+}
+.toc { width: 100%; border-collapse: collapse; }
+.toc td { padding: 2.1mm 0; vertical-align: baseline; }
+.toc .num {
+  width: 14mm;
+  font-family: JetBrains Mono, monospace;
+  font-size: 9pt;
+  font-weight: 500;
+  color: var(--ember);
+}
+.toc .title { font-weight: 500; }
+.toc .dots {
+  border-bottom: 1px dotted #d6d3d1;
+  height: 1em;
+}
+.toc .page {
+  width: 12mm;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ember);
+  font-size: 9.5pt;
+  font-weight: 600;
+}
+.toc a { color: inherit; }
+.toc .page a::after {
+  content: target-counter(attr(href), page);
+}
+.toc tr.part td {
+  padding-top: 4.2mm;
+  font-size: 8pt;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ember);
+  border-bottom: none;
+}
+
+/* ── Body typography ── */
+h1.sec {
+  font-size: 20pt;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 2mm 0;
+  color: var(--ink);
+  bookmark-level: 1;
+}
+h2 {
+  font-size: 13.5pt;
+  font-weight: 600;
+  margin: 8mm 0 3mm 0;
+  padding-bottom: 1.5mm;
+  border-bottom: 1.5px solid var(--ember);
+  color: var(--ink);
+  letter-spacing: -0.01em;
+  bookmark-level: 1;
+}
+h3 {
+  font-size: 11pt;
+  font-weight: 600;
+  margin: 5.5mm 0 2mm 0;
+  color: var(--ember-deep);
+  bookmark-level: 2;
+}
+.sec-lead {
+  color: var(--muted);
+  font-size: 10.5pt;
+  margin: 0 0 7mm 0;
+  max-width: 165mm;
+}
+p { margin: 0 0 3.2mm 0; }
+p.lede { font-size: 11pt; color: #44403c; }
+
+ul, ol { margin: 0 0 3.5mm 0; padding-left: 5.5mm; }
+li { margin-bottom: 1.4mm; }
+li > ul, li > ol { margin-top: 1.2mm; margin-bottom: 0; }
+
+strong { font-weight: 600; }
+em { font-style: italic; }
+code, .mono {
+  font-family: "JetBrains Mono", "Liberation Mono", monospace;
+  font-size: 0.86em;
+  font-weight: 500;
+}
+p code, li code, td code, .callout code {
+  background: #f5f0e8;
+  padding: 0.05em 0.35em;
+  border-radius: 2px;
+  font-size: 0.84em;
+}
+
+a { color: var(--ember-deep); text-decoration: none; }
+
+/* ── Tables ── */
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9pt;
+  margin: 0 0 5mm 0;
+}
+table.data th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 7.6pt;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ember-deep);
+  background: var(--ember-soft);
+  border-bottom: 1.5px solid var(--ember);
+  padding: 2.2mm 2.6mm;
+}
+table.data td {
+  padding: 2mm 2.6mm;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+table.data tr:nth-child(even) td { background: #fcfaf7; }
+table.data td:first-child { font-family: "JetBrains Mono", monospace; font-size: 8.2pt; font-weight: 500; }
+table.data.plain td:first-child { font-family: Inter, sans-serif; font-size: 9pt; font-weight: 500; }
+
+/* ── Callouts ── */
+.callout {
+  border-radius: 3px;
+  padding: 3.2mm 4mm;
+  margin: 0 0 4.5mm 0;
+  font-size: 9.3pt;
+  line-height: 1.45;
+}
+.callout .label {
+  font-size: 7.4pt;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  display: block;
+  margin-bottom: 1mm;
+}
+.callout.note { background: var(--ember-soft); border-left: 3px solid var(--ember); }
+.callout.note .label { color: var(--ember); }
+.callout.secure { background: var(--teal-soft); border-left: 3px solid var(--teal); }
+.callout.secure .label { color: var(--teal); }
+.callout.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); }
+.callout.warn .label { color: var(--warn); }
+
+/* ── Wire diagrams ── */
+.wire {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 7.6pt;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border-radius: 4px;
+  padding: 3.5mm 4mm;
+  margin: 0 0 4.5mm 0;
+  line-height: 1.55;
+}
+.wire .cap {
+  font-family: Inter, sans-serif;
+  font-size: 7.4pt;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #fb923c;
+  margin-bottom: 2mm;
+}
+.wire .c-orange { color: #fdba74; }
+.wire .c-teal { color: #5eead4; }
+.wire .c-muted { color: #a8a29e; }
+.wire .c-white { color: #fff; }
+.wire .c-green { color: #86efac; }
+.wire .c-red { color: #fca5a5; }
+
+.bytes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  margin: 0 0 4mm 0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 7.4pt;
+}
+.bytes .cell {
+  border: 0.4pt solid #d6d3d1;
+  padding: 1.6mm 1.2mm;
+  text-align: center;
+  min-width: 14mm;
+  background: #fff;
+}
+.bytes .cell .sz {
+  display: block;
+  font-size: 6.4pt;
+  color: var(--faint);
+  font-family: Inter, sans-serif;
+  letter-spacing: 0.04em;
+  margin-top: 0.6mm;
+}
+.bytes .cell.k { background: #fff7ed; border-color: #fdba74; }
+.bytes .cell.n { background: #f0fdfa; border-color: #5eead4; }
+.bytes .cell.s { background: #f5f3ff; border-color: #c4b5fd; }
+.bytes .cell.h { background: #1c1917; color: #fed7aa; border-color: #1c1917; }
+
+/* ── Stack / architecture ── */
+.stack {
+  margin: 0 0 5mm 0;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.stack .row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--rule);
+}
+.stack .row:last-child { border-bottom: none; }
+.stack .lab {
+  width: 32mm;
+  background: #1c1917;
+  color: #fed7aa;
+  font-size: 7.4pt;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 2.6mm 3mm;
+  display: flex;
+  align-items: center;
+}
+.stack .body {
+  flex: 1;
+  padding: 2.4mm 3.5mm;
+  font-size: 9pt;
+  background: #fff;
+}
+.stack .body strong { color: var(--ember-deep); }
+
+.params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.5mm;
+  margin: 0 0 5mm 0;
+}
+.param {
+  flex: 1 1 36mm;
+  min-width: 36mm;
+  background: var(--ember-soft);
+  border-radius: 3px;
+  padding: 2.8mm 3.2mm;
+}
+.param .k {
+  font-size: 7.2pt;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ember);
+  margin-bottom: 0.8mm;
+}
+.param .v {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11pt;
+  font-weight: 600;
+  color: var(--ink);
+}
+.param .d { font-size: 8pt; color: var(--muted); margin-top: 0.6mm; }
+
+.cmp {
+  display: flex;
+  gap: 4mm;
+  margin: 0 0 5mm 0;
+}
+.cmp .col {
+  flex: 1;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 3mm 3.5mm;
+  font-size: 9pt;
+}
+.cmp .col h4 {
+  margin: 0 0 2mm 0;
+  font-size: 9pt;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cmp .col.ember { border-top: 3px solid var(--ember); }
+.cmp .col.kad { border-top: 3px solid #57534e; }
+.cmp ul { margin: 0; padding-left: 4.5mm; }
+
+.flow {
+  margin: 0 0 5mm 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+.flow li {
+  position: relative;
+  padding: 2.4mm 0 2.4mm 12mm;
+  border-bottom: 1px solid var(--rule);
+  margin: 0;
+}
+.flow li:last-child { border-bottom: none; }
+.flow li::before {
+  counter-increment: step;
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 2.6mm;
+  width: 8mm;
+  height: 8mm;
+  background: var(--ember);
+  color: white;
+  border-radius: 50%;
+  font-size: 8pt;
+  font-weight: 700;
+  text-align: center;
+  line-height: 8mm;
+}
+
+.two {
+  display: flex;
+  gap: 5mm;
+  margin: 0 0 4mm 0;
+}
+.two > div { flex: 1; }
+
+.caption {
+  font-size: 8pt;
+  color: var(--muted);
+  font-style: italic;
+  margin: -2mm 0 4.5mm 0;
+}
+
+.eq {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9.5pt;
+  background: #f5f0e8;
+  padding: 3mm 4mm;
+  border-radius: 3px;
+  margin: 0 0 4.5mm 0;
+  text-align: center;
+  letter-spacing: 0.01em;
+}
+
+footer.doc-end {
+  margin-top: 12mm;
+  padding-top: 4mm;
+  border-top: 2px solid var(--ember);
+  font-size: 8.5pt;
+  color: var(--muted);
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════ COVER ══════════════════════════════════════════════ -->
+<section class="cover">
+  <div class="cover-glow"></div>
+  <div class="cover-glow2"></div>
+  <div class="cover-inner">
+    <div class="cover-kicker">Ember Network  ·  Technical Specification</div>
+    <h1 class="brand">EmberDHT</h1>
+    <p class="subtitle">Protocol Specification</p>
+    <div class="cover-meta">
+      <div><strong>Wire version</strong>2  (min 2)</div>
+      <div><strong>Software</strong>Ember 1.5.4</div>
+      <div><strong>Transport</strong>Noise_IK / Noise_XX</div>
+      <div><strong>Date</strong>August 2026</div>
+    </div>
+    <div class="cover-abstract">
+      EmberDHT is Ember’s native Kademlia overlay: a signed, encrypted, server-less
+      distributed hash table that Ember nodes run among themselves, in parallel with
+      the eMule KAD network and eD2K servers. This document specifies the identity
+      model, Noise transport, wire frames, routing table, record formats, lookup
+      and publish algorithms, bootstrap paths, and abuse limits as implemented in
+      Ember 1.5.4. It is written from the code, not from comments.
+    </div>
+    <div class="cover-foot">
+      <div>Canonical implementation: <span class="mono">src-tauri/src/network/ember/</span></div>
+      <div>License: GNU GPL v3</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════ TOC ══════════════════════════════════════════════ -->
+<section class="toc-page">
+  <h1>Contents</h1>
+  <table class="toc">
+    <tr class="part"><td colspan="3">Foundations</td></tr>
+    <tr><td class="num">1</td><td class="title"><a href="#sec-1">Introduction</a></td><td class="page"><a href="#sec-1"></a></td></tr>
+    <tr><td class="num">2</td><td class="title"><a href="#sec-2">Architecture</a></td><td class="page"><a href="#sec-2"></a></td></tr>
+    <tr><td class="num">3</td><td class="title"><a href="#sec-3">Identity and cryptography</a></td><td class="page"><a href="#sec-3"></a></td></tr>
+    <tr><td class="num">4</td><td class="title"><a href="#sec-4">Transport</a></td><td class="page"><a href="#sec-4"></a></td></tr>
+    <tr class="part"><td colspan="3">Overlay</td></tr>
+    <tr><td class="num">5</td><td class="title"><a href="#sec-5">Kademlia parameters and routing</a></td><td class="page"><a href="#sec-5"></a></td></tr>
+    <tr><td class="num">6</td><td class="title"><a href="#sec-6">Wire protocol</a></td><td class="page"><a href="#sec-6"></a></td></tr>
+    <tr><td class="num">7</td><td class="title"><a href="#sec-7">Records: keywords and sources</a></td><td class="page"><a href="#sec-7"></a></td></tr>
+    <tr><td class="num">8</td><td class="title"><a href="#sec-8">Iterative lookup and search</a></td><td class="page"><a href="#sec-8"></a></td></tr>
+    <tr><td class="num">9</td><td class="title"><a href="#sec-9">Publish and replication</a></td><td class="page"><a href="#sec-9"></a></td></tr>
+    <tr class="part"><td colspan="3">Operation</td></tr>
+    <tr><td class="num">10</td><td class="title"><a href="#sec-10">Bootstrap and joining</a></td><td class="page"><a href="#sec-10"></a></td></tr>
+    <tr><td class="num">11</td><td class="title"><a href="#sec-11">NAT, observed address, and firewalled peers</a></td><td class="page"><a href="#sec-11"></a></td></tr>
+    <tr><td class="num">12</td><td class="title"><a href="#sec-12">Abuse resistance</a></td><td class="page"><a href="#sec-12"></a></td></tr>
+    <tr><td class="num">13</td><td class="title"><a href="#sec-13">Maintenance</a></td><td class="page"><a href="#sec-13"></a></td></tr>
+    <tr><td class="num">14</td><td class="title"><a href="#sec-14">Persistence</a></td><td class="page"><a href="#sec-14"></a></td></tr>
+    <tr class="part"><td colspan="3">Reference</td></tr>
+    <tr><td class="num">15</td><td class="title"><a href="#sec-15">Comparison with eMule KAD</a></td><td class="page"><a href="#sec-15"></a></td></tr>
+    <tr><td class="num">16</td><td class="title"><a href="#sec-16">Current limits and planned work</a></td><td class="page"><a href="#sec-16"></a></td></tr>
+    <tr><td class="num">A</td><td class="title"><a href="#sec-a">Constant tables</a></td><td class="page"><a href="#sec-a"></a></td></tr>
+    <tr><td class="num">B</td><td class="title"><a href="#sec-b">Code map</a></td><td class="page"><a href="#sec-b"></a></td></tr>
+  </table>
+  <p style="margin-top:8mm;font-size:9pt;color:#57534e;">
+    This specification describes the protocol as shipped in Ember 1.5.4
+    (<code>EMBER_DHT_VERSION = 2</code>). Remaining work, including the dormant
+    native transfer path, is called out where it affects interoperability.
+    Design notes that are not yet wire-stable live in <code>docs/ember-dht.md</code>.
+  </p>
+</section>
+
+<!-- ══════════════════════════════════════════════ 1 ══════════════════════════════════════════════ -->
+<h2 id="sec-1" class="nobreak" style="page-break-before:always;border-bottom:none;font-size:9pt;letter-spacing:0.2em;text-transform:uppercase;color:#c2410c;margin-bottom:1mm;">Section 1</h2>
+<h1 class="sec">Introduction</h1>
+<p class="sec-lead">What EmberDHT is, what it is not, and the constraints that shaped it.</p>
+
+<p class="lede">
+  Ember is a modern eMule-compatible P2P client. Beside speaking KAD and eD2K,
+  every Ember node also runs <strong>EmberDHT</strong>: its own encrypted Kademlia
+  overlay, used to find other Ember nodes, publish shared files, and resolve
+  download sources without a directory server, tracker, or shipped seed list.
+</p>
+
+<h3>1.1 Purpose</h3>
+<p>
+  EmberDHT answers three questions among Ember-capable peers:
+</p>
+<ol>
+  <li><strong>Who is on the overlay?</strong> — routing-table contacts bound to Ed25519 / X25519 keypairs.</li>
+  <li><strong>Which files exist under a name?</strong> — keyword records, findable by search.</li>
+  <li><strong>Who can serve this file?</strong> — source records keyed on the eD2K file hash.</li>
+</ol>
+<p>
+  Content still moves over the eMule client-to-client wire. EmberDHT discovers
+  the source; eD2K transfers the bytes. A 256&nbsp;KiB chunk protocol with a BLAKE3
+  hash tree exists in <code>ember/transfer.rs</code> but is not yet wired in.
+</p>
+
+<h3>1.2 Relationship to KAD and eD2K</h3>
+<p>
+  EmberDHT is a <em>second network</em>, not a replacement. It is always on
+  (<code>ember_native_enabled</code>). The settings switch remains visible but cannot
+  be turned off. The overlay rides the same UDP socket as KAD (port 4672 by
+  default) and is demultiplexed by a two-byte magic, so one forwarded port
+  serves both stacks.
+</p>
+<p>
+  KAD and eD2K are also how a cold Ember node <em>finds</em> the overlay. There
+  is no Ember bootstrap server. Join paths are the KAD rendezvous key, peers
+  noticed in ordinary KAD traffic, Ember-capable eD2K sessions, gossip, and a
+  persisted contact file. The Friends rendezvous server has no role in DHT
+  bootstrap: a server-hosted pool would hand the operator an identity-to-IP
+  roster of every participant.
+</p>
+
+<h3>1.3 Design principles</h3>
+<ul>
+  <li><strong>Cryptographic identity.</strong> A node ID is not chosen; it is
+      <code>BLAKE3(Ed25519 public key)[..16]</code>. Gossip that claims an ID
+      without the matching key is discarded.</li>
+  <li><strong>Signed everything.</strong> Every DHT frame is Ed25519-signed over
+      its header and payload. Every stored record is signed by its publisher.
+      A <code>DhtMessage</code> only exists in verified form.</li>
+  <li><strong>Encrypted transport.</strong> After the magic bytes, the datagram
+      is Noise (ChaCha20-Poly1305, BLAKE2s). Cleartext DHT never leaves the host.</li>
+  <li><strong>No central roster.</strong> Seed lists, DNS SRV, and rendezvous-hosted
+      bootstrap pools are explicitly not planned.</li>
+  <li><strong>Fit the datagram.</strong> Replies are packed to an unfragmented
+      1400-byte budget. An oversized reply that the peer drops before decryption
+      looks like success to the sender and silence to the receiver.</li>
+  <li><strong>Tighten, never loosen.</strong> Abuse limits start permissive on a
+      near-empty table and converge on KAD-strict values as verified contacts grow.
+      Tightening refuses new admissions; it never evicts what an earlier tier allowed.</li>
+</ul>
+
+<h3>1.4 Document conventions</h3>
+<p>
+  Integers on the DHT frame header and most payload lengths are
+  <strong>little-endian</strong>. Socket ports in contact addresses are
+  <strong>big-endian</strong>. Byte strings are concatenated in the order shown.
+  Hexadecimal constants use a <code>0x</code> prefix. Time constants are wall-clock
+  seconds unless noted as <code>Instant</code> (process-monotonic).
+</p>
+<div class="callout note">
+  <span class="label">Normative source</span>
+  Where this document and a comment disagree, the constants and encoders in
+  <code>src-tauri/src/network/ember/</code> win. Protocol constants live in
+  <code>dht/mod.rs</code> and <code>dht/messages.rs</code>; publish/search drivers
+  and maintenance live in <code>network/mod.rs</code>.
+</div>
+
+<!-- ══════════════════════════════════════════════ 2 ══════════════════════════════════════════════ -->
+<h2 id="sec-2">2. Architecture</h2>
+<p>
+  Ember frames share the KAD UDP socket. The network task demultiplexes on
+  magic, decrypts through the Noise session table, then offers the plaintext
+  to the control decoder first and the DHT decoder second. The two namespaces
+  cannot alias: control version <code>0xC1</code> sits far outside the DHT
+  version range.
+</p>
+
+<div class="stack">
+  <div class="row"><div class="lab">Application</div><div class="body">Search UI · Library publish badges · Ember Network page · status-bar gauges</div></div>
+  <div class="row"><div class="lab">Drivers</div><div class="body"><strong>Publish / search / maintenance</strong> in <code>network/mod.rs</code> — keyword &amp; source cycles, KAD bridge, rendezvous lookup, streaming results</div></div>
+  <div class="row"><div class="lab">DHT engine</div><div class="body"><strong>IO-free protocol core</strong> — routing table, store, iterative search, signed frame build/parse. Transport-agnostic: it consumes decrypted bytes and returns frames to encrypt.</div></div>
+  <div class="row"><div class="lab">Records</div><div class="body">Keyword (<code>0x01</code>) and source (<code>0x02</code>) blobs, Ed25519-signed by the publisher, stored under 16-byte BLAKE3 keys</div></div>
+  <div class="row"><div class="lab">Transport</div><div class="body"><strong>Noise_IK</strong> when the peer’s static X25519 is known · <strong>Noise_XX</strong> for first contact with a stateless retry cookie · ChaCha20-Poly1305 · BLAKE2s</div></div>
+  <div class="row"><div class="lab">UDP</div><div class="body">Shared KAD socket · magic <code>0xEB 0x3E</code> · default port <strong>4672</strong> · max datagram 4096 B, replies packed to 1400 B</div></div>
+</div>
+<p class="caption">Figure 1. EmberDHT stack. The engine is deliberately free of sockets so the protocol is unit-testable without a live network.</p>
+
+<h3>2.1 What the overlay does and does not do</h3>
+<table class="data plain">
+  <thead><tr><th>Does</th><th>Does not</th></tr></thead>
+  <tbody>
+    <tr><td>Find Ember nodes and keep a verified routing table</td><td>Move file bytes (that is still eD2K c2c)</td></tr>
+    <tr><td>Publish and look up keyword and source records</td><td>Replace KAD or eD2K; it runs beside them</td></tr>
+    <tr><td>Carry BLAKE3 integrity digests on records</td><td>Host a bootstrap roster or seed list</td></tr>
+    <tr><td>Let firewalled nodes publish via buddy <code>PROXY_STORE</code></td><td>Let a searcher callback a firewalled source (consume side is unfinished)</td></tr>
+    <tr><td>Refuse incompatible wire versions at the version byte</td><td>Negotiate an upgrade or tell the user why a peer was dropped</td></tr>
+  </tbody>
+</table>
+
+<h3>2.2 Always on</h3>
+<p>
+  Profiles that still had the overlay off are turned on at load. Publishing
+  starts once the node has contacts. A fresh node can sit at zero contacts for
+  a minute or two while the first maintenance cycle runs the KAD bridge; the
+  Ember Network page reports <strong>Connecting</strong> for that window rather
+  than a fault.
+</p>
+
+<!-- ══════════════════════════════════════════════ 3 ══════════════════════════════════════════════ -->
+<h2 id="sec-3">3. Identity and cryptography</h2>
+
+<h3>3.1 Keypairs</h3>
+<p>Every Ember node holds two static keypairs, generated once and persisted:</p>
+<table class="data">
+  <thead><tr><th>Key</th><th>Algorithm</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>Ed25519</td><td>ed25519-dalek, strict verification</td><td>Node identity, frame signatures, record signatures, node ID derivation</td></tr>
+    <tr><td>X25519</td><td>static Noise key</td><td>Transport session (IK when known, XX when not)</td></tr>
+  </tbody>
+</table>
+
+<h3>3.2 Node ID</h3>
+<div class="eq">node_id[16] = BLAKE3(ed25519_public_key[32])[0..16]</div>
+<p>
+  The 128-bit ID is compatible with Ember’s existing <code>ember_hash</code>
+  field and is cryptographically bound to the signing key. A peer-supplied
+  <code>node_id</code> in a contact list is never trusted: the receiver
+  re-derives it from the Ed25519 bytes and refuses the contact if the key is
+  not a valid curve point or the ID does not match. This is the primary
+  defence against routing-table poisoning.
+</p>
+<div class="callout secure">
+  <span class="label">Proof of possession</span>
+  The BLAKE3 binding is an <em>offline consistency check</em>, not proof the
+  peer holds the private key. Anyone who observed a legitimate public key on
+  the wire can replay the pair. Frame and record signatures are the
+  proof-of-possession for DHT work. Friend-level privileges use a separate
+  challenge-response over a fresh nonce and are out of scope here.
+</div>
+
+<h3>3.3 Frame signature</h3>
+<p>
+  <code>encode_message</code> serializes version, type, request id, sender id,
+  optional public key, payload length, and payload, then appends a 64-byte
+  Ed25519 signature over every preceding byte. <code>decode_message</code>
+  verifies that signature and the <code>sender_id == BLAKE3(pubkey)[..16]</code>
+  binding <em>before</em> constructing a <code>DhtMessage</code>. An invalid
+  frame never becomes a message object.
+</p>
+
+<h3>3.4 Record signature</h3>
+<p>
+  A stored record is a publisher-signed blob. The signature covers the record
+  body (type, hashes, size, publisher key, timestamp, name, and for sources
+  the contact block). Storers re-send the identical bytes; they do not
+  re-sign. Expiry is computed from the <em>signed</em> creation timestamp, so
+  replication cannot extend a record’s life.
+</p>
+
+<!-- ══════════════════════════════════════════════ 4 ══════════════════════════════════════════════ -->
+<h2 id="sec-4">4. Transport</h2>
+<p>
+  Ember UDP payloads are told apart from KAD/eD2K by magic
+  <code>0xEB 0x3E</code>. Everything after the magic is encrypted. Patterns:
+</p>
+<ul>
+  <li><code>Noise_IK_25519_ChaChaPoly_BLAKE2s</code> — peer’s static X25519 is already known (routing-table contact, previous session).</li>
+  <li><code>Noise_XX_25519_ChaChaPoly_BLAKE2s</code> — first contact, including the eD2K-bridge path where no static key is known.</li>
+</ul>
+
+<h3>4.1 Packet types</h3>
+<table class="data">
+  <thead><tr><th>Type</th><th>Name</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>0x01</td><td>PKT_IK_INIT</td><td>IK handshake, initiator → responder</td></tr>
+    <tr><td>0x02</td><td>PKT_IK_RESP</td><td>IK handshake, responder → initiator</td></tr>
+    <tr><td>0x03</td><td>PKT_XX_MSG1</td><td>XX handshake message 1</td></tr>
+    <tr><td>0x04</td><td>PKT_XX_MSG2</td><td>XX handshake message 2</td></tr>
+    <tr><td>0x05</td><td>PKT_XX_MSG3</td><td>XX handshake message 3</td></tr>
+    <tr><td>0x06</td><td>PKT_XX_COOKIE</td><td>Stateless retry cookie (return-routability)</td></tr>
+    <tr><td>0x10</td><td>PKT_TRANSPORT</td><td>AEAD payload (DHT or control)</td></tr>
+  </tbody>
+</table>
+
+<div class="bytes">
+  <div class="cell h">0xEB 0x3E<span class="sz">magic 2</span></div>
+  <div class="cell k">type<span class="sz">1 byte</span></div>
+  <div class="cell n">Noise body<span class="sz">handshake or AEAD</span></div>
+</div>
+<p class="caption">Figure 2. Outer UDP layout. Transport packets add an 8-byte nonce and 16-byte Poly1305 tag around the inner frame (27 bytes of transport overhead including magic and type).</p>
+
+<h3>4.2 Return-routability cookie</h3>
+<p>
+  An unauthenticated XX msg1 can be forged off-path. The responder sends a
+  <strong>stateless retry cookie</strong> (<code>PKT_XX_COOKIE</code>) once the
+  unvalidated-handshake budget is spent, so a peer that does not know this
+  packet type still completes first contact whenever the node is not under a
+  flood. The cookie is only useful to a source address that can receive a UDP
+  reply.
+</p>
+<p>
+  Inbound XX handshakes may briefly queue outbound traffic for that peer
+  (honest simultaneous-open). After a 3-second grace the node dials the
+  identity itself; once an IK initiator is pending, further inbound msg1s from
+  that address are refused so a forged handshake cannot be renewed.
+</p>
+
+<h3>4.3 Session lifecycle</h3>
+<table class="data">
+  <thead><tr><th>Limit</th><th>Value</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>Must outlive the 600 s liveness-ping interval; 300 s forced a fresh handshake on every ping</td></tr>
+    <tr><td>MAX_SESSIONS</td><td>4096</td><td>LRU eviction when full</td></tr>
+    <tr><td>Pending handshakes</td><td>512</td><td>Caps unauthenticated work</td></tr>
+    <tr><td>MAX_EMBER_DATAGRAM_BYTES</td><td>4096</td><td>Hard drop before decryption; sender sees a “successful” send</td></tr>
+  </tbody>
+</table>
+<p>
+  Sessions are currently keyed by address alone. A shadow-session map can
+  protect an established peer from a key-churning spoofer at the same address,
+  but cannot protect a peer whose <em>first</em> contact arrives at an address
+  whose shadow allowance is already full. Keying by <code>(address, static key)</code>
+  is listed as future transport work.
+</p>
+
+<h3>4.4 Inner namespace: control vs DHT</h3>
+<p>
+  Control frames and DHT frames share one decrypted byte stream. The payload
+  is offered to the control decoder first. Control version is <code>0xC1</code>
+  so it can never collide with <code>EMBER_DHT_VERSION</code> (which counts up
+  from 1). A historical bug: control version 1 made
+  <code>CONTROL_KIND_EXCHANGE_DATA</code> (4) alias <code>MSG_FOUND_NODE</code> (4),
+  and every iterative lookup stalled after its first hop.
+</p>
+<table class="data">
+  <thead><tr><th>Kind</th><th>Value</th><th>Body</th></tr></thead>
+  <tbody>
+    <tr><td>CONTROL_VERSION</td><td>0xC1</td><td>Leading byte of every control frame</td></tr>
+    <tr><td>PING / PONG</td><td>1 / 2</td><td>Transport keepalive (not DHT PING)</td></tr>
+    <tr><td>EXCHANGE_REQUEST</td><td>3</td><td>Empty; ask for UDP EPX payload</td></tr>
+    <tr><td>EXCHANGE_DATA</td><td>4</td><td>EPX wire payload, packed to the datagram budget</td></tr>
+  </tbody>
+</table>
+<div class="callout note">
+  <span class="label">EPX is not EmberDHT</span>
+  Ember Peer Exchange (opcode <code>0xF0</code> on the eMule extended protocol)
+  is a separate mechanism: source lists exchanged with peers you are already
+  transferring with. It works with the overlay switched off. This specification
+  covers the DHT overlay only.
+</div>
+
+<h3>4.5 Size budgets</h3>
+<p>
+  A receiver drops anything over 4096 bytes before decryption. Replies whose
+  size we choose are packed to <code>MAX_UNFRAGMENTED_DATAGRAM = 1400</code>,
+  matching the spirit of KAD’s <code>UDP_KAD_MAXFRAGMENT</code> (1420). Fragmented
+  UDP is dropped by a fair number of consumer NATs; a shorter answer that
+  arrives beats a complete one that does not.
+</p>
+<div class="eq">
+  MAX_UNFRAGMENTED_PAYLOAD = 1400 − 27 − 120 = 1253 bytes
+</div>
+<p class="caption">
+  27 = transport overhead (magic + type + nonce + tag). 120 = frame overhead
+  (22-byte header + 32-byte public key + 2-byte length + 64-byte signature).
+  <code>FOUND_VALUE</code> record blobs then have 1253 − 16 − 2 = 1235 bytes after
+  the key and count — about five typical keyword records per reply.
+</p>
+
+<!-- ══════════════════════════════════════════════ 5 ══════════════════════════════════════════════ -->
+<h2 id="sec-5">5. Kademlia parameters and routing</h2>
+<p>
+  EmberDHT is a 128-bit XOR-metric Kademlia with a replacement cache, verified
+  contacts, and network-size-adaptive diversity caps.
+</p>
+
+<div class="params">
+  <div class="param"><div class="k">Node ID</div><div class="v">128 bit</div><div class="d">BLAKE3 of Ed25519 pubkey</div></div>
+  <div class="param"><div class="k">k (bucket size)</div><div class="v">20</div><div class="d">KAD uses 10</div></div>
+  <div class="param"><div class="k">α (concurrency)</div><div class="v">5</div><div class="d">KAD FindNode uses 1</div></div>
+  <div class="param"><div class="k">Buckets</div><div class="v">128</div><div class="d">One per ID bit</div></div>
+  <div class="param"><div class="k">Contact timeout</div><div class="v">600 s</div><div class="d">Then liveness ping</div></div>
+  <div class="param"><div class="k">Failed queries</div><div class="v">3</div><div class="d">Then evict</div></div>
+</div>
+
+<h3>5.1 Distance and buckets</h3>
+<div class="eq">distance(a, b) = a XOR b &nbsp;&nbsp;·&nbsp;&nbsp; bucket = index of highest set bit of distance (0…127)</div>
+<p>
+  Bucket 127 holds contacts in the opposite half of the keyspace; bucket 0 holds
+  the nearest neighbours. Node IDs are uniform, so occupancy is geometric:
+  about half of all contacts fall in the last bucket and a quarter in the one
+  before. Diversity caps are designed around that, not around a flat table.
+</p>
+
+<h3>5.2 Contact</h3>
+<p>A routing-table contact is:</p>
+<table class="data">
+  <thead><tr><th>Field</th><th>Size</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>node_id</td><td>16</td><td>Re-derived from ed25519_pub on ingest</td></tr>
+    <tr><td>addr</td><td>IPv4 or IPv6 + port</td><td>Port 0 is not admitted</td></tr>
+    <tr><td>noise_pub</td><td>32</td><td>X25519 static key for IK</td></tr>
+    <tr><td>ed25519_pub</td><td>32</td><td>Signing / identity key</td></tr>
+    <tr><td>last_seen</td><td>i64 unix</td><td><code>&gt; 0</code> means verified</td></tr>
+    <tr><td>failed_queries</td><td>u8</td><td>Consecutive unanswered queries</td></tr>
+  </tbody>
+</table>
+<p>
+  <strong>Verified</strong> means we have heard a signed frame from the contact
+  directly. Gossip from <code>FOUND_NODE</code> / <code>PEER_LIST</code> /
+  <code>ANNOUNCE_PEER</code> and entries loaded from disk arrive with
+  <code>last_seen = 0</code>. They are kept as leads but are not preferred for
+  seeding lookups, answering peers, persisting, or computing network scale.
+</p>
+
+<h3>5.3 Replacement cache</h3>
+<p>
+  Each bucket holds up to k contacts plus a k-entry replacement cache. When
+  the bucket is full, a new contact is cached and the caller is asked to ping
+  the oldest live entry. If that ping fails, <code>evict_and_replace</code>
+  swaps in the newest cache entry. KAD in this codebase has no replacement
+  cache.
+</p>
+
+<h3>5.4 Admission</h3>
+<p>A contact is refused if any of the following hold:</p>
+<ul>
+  <li>Port is 0, or the address is filtered by the user’s <code>ipfilter.dat</code>.</li>
+  <li>Private / LAN / CGNAT addresses while “block private IPs” is on (same preference as KAD; toggling it on evicts already-admitted matches).</li>
+  <li>The per-IP or per-subnet diversity cap for the current <code>NetworkScale</code> is full (see §12).</li>
+  <li>The Ed25519 key is not a valid curve point, or <code>BLAKE3(key)[..16]</code> disagrees with the advertised ID.</li>
+</ul>
+
+<h3>5.5 Store proximity</h3>
+<p>
+  A node accepts a STORE only if it is among the k closest contacts it knows
+  of to the key — or if it knows fewer than k contacts, in which case it is
+  among the k closest by definition. Distance is XOR against the local ID
+  compared to the k-th closest contact. Gossip does not count: letting
+  unverified leads into the comparison would let an attacker push the node
+  out of its own neighbourhood.
+</p>
+<div class="callout warn">
+  <span class="label">Small-network trap</span>
+  A previous check used “closer than our furthest contact in any bucket,”
+  which on a small network made every node trivially among the k closest to
+  everything — until the table filled, at which point replication silently
+  halved. The k-closest rule is what the code uses now.
+</div>
+
+<!-- ══════════════════════════════════════════════ 6 ══════════════════════════════════════════════ -->
+<h2 id="sec-6">6. Wire protocol</h2>
+
+<h3>6.1 Versioning</h3>
+<table class="data">
+  <thead><tr><th>Constant</th><th>Value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>EMBER_DHT_VERSION</td><td>2</td><td>Wire version this build speaks</td></tr>
+    <tr><td>EMBER_DHT_MIN_VERSION</td><td>2</td><td>Oldest version this build can parse</td></tr>
+  </tbody>
+</table>
+<p>
+  Version 0 is invalid. A frame outside <code>[MIN, VERSION]</code> is refused
+  at the version byte rather than becoming a malformed-payload counter that
+  reads like packet loss. Version was bumped to 2 because batched store, its
+  ack, contact-list trimming, and payload limits all changed shape while the
+  byte still read 1 — two peers announced the same version and then misparsed
+  each other.
+</p>
+<p>
+  A future change that only <em>adds</em> to the format can lower
+  <code>MIN_VERSION</code> instead of raising both. Incompatible peers currently
+  fail cleanly but silently: neither is told why, and they never fold each
+  other into a routing table. There is no upgrade prompt.
+</p>
+
+<h3>6.2 Frame layout</h3>
+<div class="wire">
+  <div class="cap">Signed DHT frame (after Noise decryption)</div>
+  <span class="c-orange">version</span>     u8     this build: 2<br>
+  <span class="c-orange">msg_type</span>    u8     see table below<br>
+  <span class="c-teal">request_id</span>  u32 LE  correlation; 0 is reserved<br>
+  <span class="c-teal">sender_id</span>   16 B    BLAKE3(sender Ed25519)[..16]<br>
+  <span class="c-green">sender_pub</span>  32 B    optional; present when include_pub_key<br>
+  <span class="c-muted">payload_len</span> u16 LE  ≤ MAX_DELIVERABLE_PAYLOAD<br>
+  <span class="c-white">payload</span>     N B    message-specific<br>
+  <span class="c-red">signature</span>   64 B    Ed25519 over every preceding byte
+</div>
+<p>
+  Public key is included on frames built for first contact (the engine’s
+  builders pass <code>include_pub_key = true</code>) so a peer who has never
+  seen us can verify the signature and learn our identity. Inside an
+  established Noise session the decoder may be told the key is omitted; the
+  session already authenticated the static key.
+</p>
+<p>
+  Header without public key is 22 bytes: version + type + request id + sender
+  id. Request id 0 is skipped by the allocator so it can never collide with
+  “unset.”
+</p>
+
+<h3>6.3 Message catalog</h3>
+<table class="data">
+  <thead><tr><th>ID</th><th>Name</th><th>Direction</th><th>Payload</th></tr></thead>
+  <tbody>
+    <tr><td>0x01</td><td>PING</td><td>→</td><td>empty</td></tr>
+    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr</td></tr>
+    <tr><td>0x03</td><td>FIND_NODE</td><td>→</td><td>target node ID (16)</td></tr>
+    <tr><td>0x04</td><td>FOUND_NODE</td><td>←</td><td>contact list</td></tr>
+    <tr><td>0x05</td><td>STORE_RECORD</td><td>→</td><td>key + record + record signature</td></tr>
+    <tr><td>0x06</td><td>STORE_ACK</td><td>←</td><td>key (16)</td></tr>
+    <tr><td>0x07</td><td>FIND_VALUE</td><td>→</td><td>1…8 keys</td></tr>
+    <tr><td>0x08</td><td>FOUND_VALUE</td><td>←</td><td>key + records (or FOUND_NODE on miss)</td></tr>
+    <tr><td>0x09</td><td>ANNOUNCE_PEER</td><td>→</td><td>contact list (gossip dump)</td></tr>
+    <tr><td>0x0A</td><td>PEER_LIST</td><td>←</td><td>contact list</td></tr>
+    <tr><td>0x0B</td><td>PROXY_STORE</td><td>→</td><td>same body as STORE_RECORD</td></tr>
+    <tr><td>0x0C</td><td>PROXY_STORE_ACK</td><td>←</td><td>key (16) — buddy accepted, not a DHT STORE_ACK</td></tr>
+    <tr><td>0x0D</td><td>STORE_BATCH</td><td>→</td><td>up to 64 records for one destination</td></tr>
+    <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
+  </tbody>
+</table>
+
+<h3>6.4 Contact list encoding</h3>
+<p>
+  Used by <code>FOUND_NODE</code>, <code>ANNOUNCE_PEER</code>, and
+  <code>PEER_LIST</code>. Contacts are already ordered closest-first; the
+  encoder trims the tail to stay inside the unfragmented payload budget.
+</p>
+<div class="wire">
+  <div class="cap">Contact list</div>
+  count     u8     ≤ 20, then for each contact:<br>
+  node_id   16 B<br>
+  addr      1 + 4 or 16 + 2 BE &nbsp; <span class="c-muted">0x04 = IPv4, 0x06 = IPv6</span><br>
+  noise_pub 32 B<br>
+  ed25519   32 B
+</div>
+<p>
+  An IPv4 contact is 16 + 7 + 32 + 32 = <strong>87 bytes</strong>. At 1253 bytes
+  of payload, only <strong>14 IPv4 contacts</strong> fit, so a
+  <code>FOUND_NODE</code> never carries a full k-bucket of 20.
+  <code>MAX_CONTACTS_PER_RESPONSE</code> is 20 but is not reachable on IPv4.
+  Dropping the redundant <code>node_id</code> (the receiver re-derives it) would
+  take a contact from 87 to 71 bytes and yield 17 contacts per reply — a
+  planned wire change, bundled with the next version bump.
+</p>
+<p>
+  The asker is excluded from a <code>FOUND_NODE</code> reply: they were just
+  added to our table, their distance to themselves is zero, and leaving them
+  in spent a slot of a size-capped response on the one contact they already have.
+</p>
+
+<h3>6.5 PING / PONG</h3>
+<p>
+  <code>PING</code> is empty. <code>PONG</code> may carry the sender’s observed
+  address (the address we received the ping from). An empty PONG payload
+  decodes as “no observation” for backward compatibility. Observed-IP voting
+  is specified in §11.
+</p>
+
+<h3>6.6 FIND_NODE / FOUND_NODE</h3>
+<div class="wire">
+  <div class="cap">FIND_NODE payload</div>
+  target    16 B   node ID we want neighbours of
+</div>
+<p>
+  The responder returns the closest contacts it has, excluding the asker,
+  packed as a contact list. Iterative use is specified in §8.
+</p>
+
+<h3>6.7 STORE_RECORD / STORE_ACK / PROXY_STORE</h3>
+<div class="wire">
+  <div class="cap">STORE_RECORD and PROXY_STORE payload</div>
+  key               16 B<br>
+  record_len        u16 LE   ≤ MAX_STORE_RECORD_BYTES<br>
+  record            N B      publisher-signed body<br>
+  record_signature  64 B     Ed25519 over <span class="c-white">record</span> only
+</div>
+<p>
+  <code>STORE_ACK</code> and <code>PROXY_STORE_ACK</code> carry the 16-byte key.
+  <code>PROXY_STORE</code> asks a HighID buddy to fan the same publisher-signed
+  source record out as ordinary <code>STORE_RECORD</code>s. The buddy’s ack
+  means “I accepted the proxy request,” not “the DHT stored it.” HighID
+  sources must not ride <code>PROXY_STORE</code> — that would bypass the
+  anti-reflection bind (§12.3).
+</p>
+
+<h3>6.8 STORE_BATCH / STORE_BATCH_ACK</h3>
+<p>
+  Publishing a large library one datagram per (record, target) puts frame
+  count in proportion to records, saturates the link, and trips the
+  receiver’s per-peer rate limit. Records destined for the same peer travel
+  together, so frame count scales with the number of peers.
+</p>
+<div class="wire">
+  <div class="cap">STORE_BATCH payload</div>
+  count     u8     ≤ 64, then for each record:<br>
+  key       16 B<br>
+  rec_len   u16 LE<br>
+  record    N B<br>
+  rec_sig   64 B<br>
+  <span class="c-muted">trailing bytes are a framing error — the whole batch is refused</span>
+</div>
+<div class="wire">
+  <div class="cap">STORE_BATCH_ACK payload</div>
+  accepted  u64 LE   bit i set ⇒ record i was stored
+</div>
+<p>
+  Acceptance is per record: the storer re-evaluates proximity and capacity.
+  A count alone forced the publisher to treat “some landed” as “all landed”
+  and retire files that were never stored. The datagram budget caps a real
+  batch at roughly twenty minimum-size records; 64 is a decode-side bound
+  matching the width of the ack bitmap.
+</p>
+
+<h3>6.9 FIND_VALUE / FOUND_VALUE</h3>
+<div class="wire">
+  <div class="cap">FIND_VALUE payload</div>
+  count     u8      1…8<br>
+  keys      16 B × count
+</div>
+<div class="wire">
+  <div class="cap">FOUND_VALUE payload</div>
+  key            16 B    the key this reply is for<br>
+  record_count   u16 LE  ≤ 300<br>
+  for each: len  u16 LE + blob (record body ‖ 64-byte publisher signature)
+</div>
+<p>
+  The searcher walks the primary (longest) keyword key. Additional keys ride
+  along so a peer that holds records can intersect on <code>file_hash</code>
+  locally. On a miss the responder sends <code>FOUND_NODE</code> with closer
+  contacts, as in classic Kademlia.
+</p>
+<p>
+  Record blobs in the reply are packed from a rotating window per key
+  (§8.4), into the 1235-byte record budget. A declared count the buffer
+  cannot satisfy is a framing error — the whole frame is refused, so a peer
+  cannot smuggle a truncated payload.
+</p>
+
+<!-- ══════════════════════════════════════════════ 7 ══════════════════════════════════════════════ -->
+<h2 id="sec-7">7. Records: keywords and sources</h2>
+<p>
+  Two record types share a header. The DHT key is not a free field: it is
+  bound to content (<code>keyword_hash</code> or <code>BLAKE3(file_hash)[..16]</code>)
+  and a STORE under the wrong key is rejected.
+</p>
+
+<div class="eq">
+  header = type[1] ‖ keyword_or_source_key[16] ‖ file_hash[16] ‖ ember_file_hash[32]
+  ‖ file_size[u64 LE] ‖ publisher_key[32] ‖ timestamp[i64 LE] ‖ name_len[u16 LE]
+</div>
+<p>Then: UTF-8 file name (<code>name_len</code> bytes), then for source records only the contact block.</p>
+
+<table class="data">
+  <thead><tr><th>Type</th><th>Value</th><th>DHT key</th><th>TTL</th></tr></thead>
+  <tbody>
+    <tr><td>RECORD_TYPE_KEYWORD</td><td>0x01</td><td>BLAKE3(lowercase keyword)[..16]</td><td>24 h</td></tr>
+    <tr><td>RECORD_TYPE_SOURCE</td><td>0x02</td><td>BLAKE3(eD2K file_hash)[..16]</td><td>6 h</td></tr>
+  </tbody>
+</table>
+
+<h3>7.1 Keyword hash</h3>
+<div class="eq">keyword_hash(s) = BLAKE3(s.to_lowercase().as_bytes())[0..16]</div>
+<p>
+  Tokens shorter than 2 characters are dropped. Multi-word queries are split
+  on whitespace, lowercased, sorted by length descending (most selective
+  first), and de-duplicated. The first hash is the primary walk key; up to
+  seven more ride on <code>FIND_VALUE</code> for peer-side intersection.
+  Stemming is not performed.
+</p>
+
+<h3>7.2 Source contact block</h3>
+<p>Appended after the file name on source records and covered by the publisher signature:</p>
+<table class="data">
+  <thead><tr><th>Field</th><th>Size</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>ip</td><td>4</td><td>IPv4, the address downloaders should dial</td></tr>
+    <tr><td>tcp_port</td><td>2 LE</td><td>eD2K client-to-client</td></tr>
+    <tr><td>udp_port</td><td>2 LE</td><td>Ember / KAD UDP</td></tr>
+    <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable</td></tr>
+    <tr><td>noise_pub</td><td>32</td><td>Stashed for future native (Noise) dialing</td></tr>
+  </tbody>
+</table>
+<p>
+  A downloader uses <code>ip + tcp_port</code> over the existing eD2K path.
+  <code>SourceContact</code> carries no buddy address or buddy hash, so a
+  firewalled source is discoverable but not Ember-dialable; those peers work
+  today because they are usually also on eD2K/KAD.
+</p>
+
+<h3>7.3 Ember file hash</h3>
+<p>
+  <code>ember_file_hash</code> is a 32-byte BLAKE3 digest of the file (the
+  hash-tree root specified for the dormant native transfer: BLAKE3 of each
+  256&nbsp;KiB chunk, then BLAKE3 of the concatenated chunk hashes). Search
+  hits, DHT source records, and <code>known.met</code> / library entries can
+  carry it. A download verifies against it whenever one is available. Deep
+  links without a digest still complete and are hashed for future sharing.
+</p>
+
+<h3>7.4 Why two TTLs</h3>
+<p>
+  A source record names an address to download from, so it stops being true
+  the moment that peer goes offline. A keyword record only says a file exists
+  under a word, which stays true whoever is online. Sharing one 24-hour TTL
+  meant a departed peer kept being handed to downloaders for the rest of the
+  day. Publishers re-announce sources every 2 hours, so 6 hours survives two
+  missed republishes while clearing a departed peer four times sooner than
+  a 24-hour source TTL would.
+</p>
+<p>
+  Clock skew tolerance on the signed timestamp is <strong>1 hour</strong> into
+  the future; older than TTL is expired. A replayed older copy cannot replace
+  a newer one: <code>created_at</code> is kept and compared.
+</p>
+
+<h3>7.5 Store capacity</h3>
+<table class="data">
+  <thead><tr><th>Cap</th><th>Value</th><th>Behaviour when hit</th></tr></thead>
+  <tbody>
+    <tr><td>MAX_RECORDS_PER_KEY</td><td>300</td><td>Refuse the newcomer (do not evict incumbents)</td></tr>
+    <tr><td>MAX_RECORDS_PER_PUBLISHER_PER_KEY</td><td>45</td><td>Refuse; ~15% of the key, matching KAD’s ratio (150 of 1000)</td></tr>
+    <tr><td>MAX_KEYS</td><td>50,000</td><td>Refuse new keys</td></tr>
+    <tr><td>MAX_STORE_BYTES</td><td>48 MiB</td><td>Evict least valuable (furthest from our ID, then nearest expiry)</td></tr>
+    <tr><td>Sources per IP (adaptive)</td><td>8 / 5 / 3</td><td>See NetworkScale; firewalled sources attributed to the forwarder</td></tr>
+  </tbody>
+</table>
+<div class="callout warn">
+  <span class="label">Identity is free</span>
+  A per-publisher rule can only ever <em>withhold</em> capacity, never move it.
+  An earlier attempt displaced whichever publisher held the most slots when a
+  key was full. Publisher identity is a free keypair, so an arrival with no
+  slots always outranked an established publisher. A few hundred keypairs
+  stripped a healthy keyword to one record per honest publisher, after which
+  the key admitted no one ever again. Filling an empty key with seven
+  identities is still possible; bounding that needs something scarcer than a
+  keypair.
+</div>
+<p>
+  The 45-record publisher cap is network-wide in effect: every storer applies
+  the same cap to the same publisher key. A user sharing 200 files that share
+  a common word gets 45 of them findable under that word, anywhere — and the
+  same allowance applies to their own local store.
+</p>
+
+<h3>7.6 What a FOUND_VALUE blob is</h3>
+<p>
+  On the wire, each record in <code>FOUND_VALUE</code> is
+  <code>record_body ‖ signature[64]</code>. The searcher verifies the publisher
+  signature, checks that <code>keyword_hash</code> matches the queried key, and
+  drops junk. Charging the per-node result budget on blobs <em>offered</em>,
+  not only those accepted, so a peer that sends nothing but junk still hits
+  its own limit.
+</p>
+
+<!-- ══════════════════════════════════════════════ 8 ══════════════════════════════════════════════ -->
+<h2 id="sec-8">8. Iterative lookup and search</h2>
+
+<h3>8.1 Shortlist walk</h3>
+<p>
+  Both <code>FIND_NODE</code> and <code>FIND_VALUE</code> use an iterative
+  shortlist, α = 5 outstanding queries, up to k = 20 closest contacts as the
+  frontier.
+</p>
+<ul class="flow">
+  <li>Seed the shortlist from the routing table (verified contacts preferred). Local store may pre-fill FIND_VALUE results, capped at half the result budget so a well-stocked node cannot finish the search from itself alone.</li>
+  <li>Query up to α pending contacts. A node may be asked twice in one search (one loss is not proof it is gone); a third miss marks it failed.</li>
+  <li>On FOUND_NODE, merge closer contacts. On FOUND_VALUE, verify blobs and merge records. Those two outcomes are independent: treating “no closer node” as “query not accepted” used to stall every value lookup until timeout.</li>
+  <li>FIND_NODE converges after α consecutive responses that bring nothing closer, but only once at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
+</ul>
+
+<table class="data">
+  <thead><tr><th>Limit</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>MAX_ACTIVE_SEARCHES</td><td>64</td></tr>
+    <tr><td>SEARCH_TIMEOUT_SECS</td><td>60</td></tr>
+    <tr><td>MAX_SEARCH_RESULTS</td><td>300</td></tr>
+    <tr><td>MAX_LOCAL_SEED_RESULTS</td><td>150 (half the budget)</td></tr>
+    <tr><td>MAX_RESULTS_PER_NODE</td><td>75 (quarter of the budget)</td></tr>
+    <tr><td>MAX_QUERY_ATTEMPTS</td><td>2</td></tr>
+    <tr><td>Queued-query timeout (cold handshake)</td><td>12 s</td></tr>
+  </tbody>
+</table>
+<p>
+  The 12-second queued-query timeout covers a Noise_XX 2-RTT setup plus the
+  query round trip. Charging a first-contact hop the ordinary budget failed
+  the contact before it could answer — and on a cold table every contact is a
+  first contact.
+</p>
+
+<h3>8.2 Multi-keyword search</h3>
+<p>
+  Intersection is <strong>sparse</strong>: missing secondary keys are skipped,
+  plus a filename match at emit time. It is not a strict worldwide AND of
+  every keyword. Tokens of length 1 are ignored. Successive queries rotate
+  which window a storer serves (§8.4).
+</p>
+<p>
+  The Search page exposes an <strong>Ember Only</strong> method. <strong>Global</strong>
+  queries Ember alongside KAD and servers, merging into one de-duplicated
+  list. With KAD and eD2K both offline, Global falls back to Ember alone.
+  Downloads also resolve sources on EmberDHT in addition to KAD and servers.
+</p>
+
+<h3>8.3 Streaming results</h3>
+<p>
+  Ember used to buffer everything and emit on completion, so on a cold table
+  a user waited most of the 60-second cap while KAD hits were already on
+  screen. As of 1.5.3 the keyword search carries a cursor into an append-only
+  result list. A 1-second sweep emits everything past it on the same cadence
+  as KAD: the first record immediately, then every 20. Locally seeded records
+  therefore reach the UI on the first tick.
+</p>
+<p>
+  Batches run through hash de-duplication against what KAD already streamed,
+  so a hash KAD found arrives as an availability update rather than a
+  duplicate row. Only the batch flagged final clears <code>ember_pending</code>,
+  and the completion batch is still queued when empty so that happens exactly
+  once. The timeout backstop that reaps an expired search runs <em>before</em>
+  the streaming and emit steps in the same sweep, which is what stops a reaped
+  search from being streamed after its <code>search-complete</code>.
+</p>
+
+<h3>8.4 Serving window</h3>
+<p>
+  A peer answers a keyword query with whatever fits the 1235-byte record
+  budget — typically about five records. Packing used to fill from the front
+  of insertion order, so the oldest five were the only ones that node would
+  ever serve.
+</p>
+<p>
+  Successive <code>FIND_VALUE</code>s now rotate the served window per key.
+  The cursor advances by how many records the reply actually carried, and
+  only when the reply withholds some — if everything fits, rotation is a
+  no-op. Blob-hash de-duplication on the searcher is content-based, so
+  rotating windows can only gather more. Local seeding does not inherit this
+  packing.
+</p>
+<p>
+  Truncation is counted: <code>ember_dht_found_value_truncated</code> and
+  <code>ember_dht_found_value_withheld</code>. Truncation near zero means the
+  ceiling is theoretical on the current network. A high withheld-per-truncated
+  ratio is the case that justifies adding <code>start_position</code> to the
+  wire (a version bump).
+</p>
+
+<!-- ══════════════════════════════════════════════ 9 ══════════════════════════════════════════════ -->
+<h2 id="sec-9">9. Publish and replication</h2>
+
+<h3>9.1 Publisher cycle</h3>
+<p>
+  Shared files are published as keyword records (one per token of length ≥ 2)
+  and one source record, and republished on a cycle to stay alive. Publishing
+  starts once the node has contacts. The Library marks a file with an
+  <strong>Ember</strong> badge once a source record is placed — that is the
+  point at which other Ember users can actually fetch it.
+</p>
+<table class="data">
+  <thead><tr><th>Cycle</th><th>Interval</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Source republish</td><td>2 h</td><td>Persisted in known.met as FT_EMBER_SOURCE_PUBLISH (0xE4)</td></tr>
+    <tr><td>Keyword republish</td><td>12 h</td><td>Session-only schedule (not persisted)</td></tr>
+    <tr><td>Rendezvous advertise</td><td>5 h</td><td>Only while reachable and already publishing something</td></tr>
+    <tr><td>Publish timeout</td><td>30 s</td><td>Wait for STORE_ACK</td></tr>
+    <tr><td>MIN_STORE_NODES</td><td>5</td><td>Minimum replicas the publisher aims for</td></tr>
+    <tr><td>MAX_ACTIVE_PUBLISHES</td><td>128</td><td>In-flight publish operations</td></tr>
+  </tbody>
+</table>
+<p>
+  Keyword publish rate per maintenance tick scales with library size, clamped
+  between 2 and 96 records per tick, aiming to finish a full pass inside the
+  12-hour cycle at an estimate of 8 keywords per file. Source publish is
+  similarly paced so a large library is not slammed in one tick after a restart.
+</p>
+<p>
+  The last successful source-publish is written to <code>known.met</code>. On
+  start, a stamp still inside the 2-hour interval is hydrated back to an
+  <code>Instant</code>; a stamp older than the interval, or one that cannot be
+  represented because the process has not been up that long, is omitted and
+  the file is due immediately — republish-too-eager, the safe direction.
+  Previously the schedule was keyed on <code>Instant</code> alone, so every
+  restart marked the whole library as never-published.
+</p>
+
+<h3>9.2 Storer-side replication</h3>
+<p>
+  Nodes that hold a record re-send the identical signed bytes to the current
+  closest nodes every <strong>2 hours</strong> (<code>EMBER_RECORD_REPUBLISH_SECS = 7200</code>),
+  up to 200 records per 60-second maintenance tick, using <code>STORE_BATCH</code>
+  where possible.
+</p>
+<p>
+  Replication <strong>cannot extend a record’s lifetime</strong>. Expiry is
+  derived from the publisher’s signed creation timestamp; every recipient
+  computes the same absolute death time. What it buys is churn coverage:
+  copies reaching nodes that joined since the publisher’s last round. Each
+  record already has up to 20 replicas and lives at most 24 hours (6 for
+  sources). Hourly replication was Ember’s single largest traffic item —
+  roughly 48,000 frames an hour at 200 records × 20 replicas — about double
+  the entire publish load. Two-hourly halves that.
+</p>
+<p>
+  Firewalled source records are not republished by storers: their declared
+  address is unverified, and repeating it would amplify a lie. A
+  <code>republish_due</code> flag, rather than an old <code>Instant</code>,
+  marks records whose previous attempt never made it onto the wire —
+  <code>Instant::now() − 24h</code> is not representable on a machine that has
+  been up for less than a day, and the saturating fallback stamped the record
+  as <em>just</em> republished.
+</p>
+<p>
+  Each maintenance cycle logs an <code>Ember publish cycle</code> heartbeat
+  and an <code>Ember replication cycle</code> heartbeat (due, selected, queued,
+  re-armed, leftover backlog).
+</p>
+
+<!-- ══════════════════════════════════════════════ 10 ══════════════════════════════════════════════ -->
+<h2 id="sec-10">10. Bootstrap and joining</h2>
+<p>
+  There is no central bootstrap and no shipped address list. A cold node gets
+  in through the following, in rough order of who arrives first.
+</p>
+
+<ul class="flow">
+  <li><strong>The KAD rendezvous key.</strong> Ember nodes advertise themselves under one fixed KAD key as an ordinary source record carrying their Noise pubkey tag. A node with a near-empty table runs a plain source lookup there. Re-advertised every 5 hours (matching KAD’s source TTL) and only while the node is reachable and already publishing something — a leecher never generates publish traffic purely to list itself. Lookups are spaced 10 minutes apart and stop once the table reaches one k-bucket of verified contacts. Seed string: <code>ember-dht-rendezvous-v1</code>, hashed with MD4 into a KAD ID. The derivation is versioned so the key space can be sharded later without a flag day.</li>
+  <li><strong>The KAD bridge.</strong> Ember peers noticed in ordinary KAD traffic are DHT-pinged so their signed PONG folds them into the routing table. Capped per maintenance cycle; quiet above 20 verified contacts.</li>
+  <li><strong>eD2K client-to-client sessions.</strong> Peers that advertise the Ember capability bit over a normal eD2K transfer are cached with their UDP port and bridged via Noise_XX when no static key is known. This is the path for a client running with no KAD at all.</li>
+  <li><strong>DHT gossip and <code>nodes_ember.dat</code>.</strong> FOUND_NODE / PEER_LIST / ANNOUNCE_PEER, plus up to 200 persisted contacts, once the node has been online before. Persisted contacts load as unverified leads.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="label">Cold join without eMule</span>
+  Every path except <code>nodes_ember.dat</code> presupposes either a live KAD
+  connection or an eD2K transfer with an Ember-capable peer. A first-run user
+  with KAD off and no servers has no way in. Ember rides eMule’s bootstrap by
+  design. Seed lists are deliberately not planned. For a local two-node test
+  where neither side can reach KAD, the harness command
+  <code>add_ember_dht_contact</code> is the only way to introduce two nodes
+  directly.
+</div>
+
+<h3>10.1 Explicitly not planned</h3>
+<ul>
+  <li>Hardcoded <code>seeds.txt</code> or DNS SRV seed lists.</li>
+  <li>A rendezvous-hosted bootstrap pool — it leaks an identity-to-IP roster of every participant to whoever runs the server. The pool, its endpoint, and the pinned key it verified were deleted because the server and client never agreed on the envelope format.</li>
+</ul>
+<p>
+  The Friends rendezvous server is still used for friend NAT traversal and
+  relay. That is a different protocol and a different trust boundary.
+</p>
+
+<!-- ══════════════════════════════════════════════ 11 ══════════════════════════════════════════════ -->
+<h2 id="sec-11">11. NAT, observed address, and firewalled peers</h2>
+
+<h3>11.1 Observed-IP voting</h3>
+<p>
+  A <code>PONG</code> may echo the address the ping was received from. Votes
+  are counted per reporter <code>/24</code>, expire after 15 minutes, and
+  require <strong>3 distinct public nets</strong> before the address is
+  confirmed. Private/loopback reporters and private reported addresses are
+  ignored so LAN Sybils cannot vote. At most 64 distinct reported addresses
+  are tracked; the least-recently-updated is dropped.
+</p>
+<p>
+  Without expiry the three-vote threshold was cumulative over the whole
+  process lifetime, so a stale address stayed qualified indefinitely and a
+  genuine address change could not displace it.
+</p>
+
+<h3>11.2 Firewalled publishing</h3>
+<p>
+  A LowID / firewalled node sets <code>SOURCE_FLAG_FIREWALLED</code> on its
+  source record and asks HighID contacts to <code>PROXY_STORE</code>. Storers
+  attribute the record to the forwarder for the per-IP source cap, because the
+  declared address is unverified and an attacker could otherwise invent a new
+  address per record — each getting a fresh quota.
+</p>
+<p>
+  The consume side has nothing equivalent to KAD’s <code>TAG_BUDDYHASH</code>
+  plus <code>KADEMLIA_CALLBACK_REQ</code>. Firewalled Ember sources are
+  discoverable but not Ember-dialable. They work today because they are
+  usually also on eD2K/KAD. A buddy field in the source record and a callback
+  message are planned as part of the next wire version bump.
+</p>
+<p>
+  LowID publishing through buddy <code>PROXY_STORE</code> is implemented but
+  not yet exercised end to end on a live network.
+</p>
+
+<!-- ══════════════════════════════════════════════ 12 ══════════════════════════════════════════════ -->
+<h2 id="sec-12">12. Abuse resistance</h2>
+
+<h3>12.1 NetworkScale</h3>
+<p>
+  Every anti-abuse limit has the same tension: strict values keep one host
+  from occupying the table or the store, but on a small network a legitimate
+  peer looks a lot like an attacker. Limits are derived from
+  <strong>verified</strong> contacts — gossip is cheap and proves nothing.
+  Counting leads would let anyone who can talk at us drive the limits to
+  their strict tier while we had reached almost nobody.
+</p>
+<table class="data">
+  <thead>
+    <tr><th>Tier</th><th>Verified contacts</th><th>Per IP</th><th>/24 global</th><th>/24 per bucket</th><th>Sources/IP</th><th>Stores/min</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Bootstrap</td><td>&lt; 10</td><td>8</td><td>20</td><td>5</td><td>8</td><td>300</td></tr>
+    <tr><td>Small</td><td>10…79</td><td>4</td><td>16</td><td>4</td><td>5</td><td>200</td></tr>
+    <tr><td>Established</td><td>≥ 80</td><td>2</td><td>10</td><td>3</td><td>3</td><td>120</td></tr>
+  </tbody>
+</table>
+<p>
+  Established per-IP is 2 rather than KAD’s 1 because two genuine instances
+  behind one NAT is ordinary, and unlike KAD, Ember can tell them apart
+  cryptographically. Established per-subnet matches KAD (10 global, and the
+  per-bucket cap converges on 3). Store rate is counted in
+  <strong>records</strong>, not frames: every record costs two signature
+  verifications whether it arrives alone or batched. Charging per frame let
+  one dense batch buy many times the admitted work of a well-behaved publisher.
+</p>
+<p>
+  Tightening never evicts contacts admitted under a looser tier, so whatever
+  a cold start allows, an adversary present at that moment keeps for the life
+  of the process — in the bucket that matters most, since geometric occupancy
+  puts half of everyone there. The Bootstrap per-bucket cap is therefore kept
+  ≤ k/4.
+</p>
+
+<h3>12.2 Frame rate limits</h3>
+<p>
+  Applied after the Noise session is up. A two-bucket sliding window
+  approximates a trailing window so a sender cannot straddle a reset and
+  spend twice the limit. Effective sustained rate is about twice the named
+  constant because the window is enforced over a trailing half.
+</p>
+<table class="data">
+  <thead><tr><th>Budget</th><th>Window</th><th>Named cap</th><th>Keyed on</th></tr></thead>
+  <tbody>
+    <tr><td>All DHT frames</td><td>1 s</td><td>40</td><td>IP</td></tr>
+    <tr><td>FIND_NODE / FIND_VALUE</td><td>10 s</td><td>60</td><td>IP (shared behind NAT)</td></tr>
+    <tr><td>STORE records</td><td>60 s</td><td>NetworkScale</td><td>Verified node ID when known</td></tr>
+  </tbody>
+</table>
+<p>
+  Lookup budgets stay on the address because resolving identity for every
+  datagram would put a routing-table scan in front of the gate that exists to
+  make junk cheap to reject. STORE budgets use the verified node ID so peers
+  sharing a NAT do not throttle each other.
+</p>
+
+<h3>12.3 Anti-reflection</h3>
+<p>
+  HighID / direct source records must claim the observed Noise sender IP.
+  Otherwise a peer could point downloaders at a third-party victim (and Ember
+  would be a traffic reflector). Firewalled sources are exempt: they may be
+  stored by a HighID buddy, or from a NAT mapping that differs from the STUN
+  hint. Authorship is still bound by the publisher Ed25519 signature.
+</p>
+<p>
+  Return-routability is required before a node spends anything substantial on
+  a request (the XX cookie is the handshake-level form of the same idea).
+</p>
+
+<h3>12.4 STORE signature replay</h3>
+<p>
+  Identical STORE frames (same publisher signature) collapse for 60 seconds
+  so a retransmit storm cannot re-verify the same blob forever. A replay only
+  counts if the store still holds that signature: the cache is never cleared
+  by eviction, and treating a displaced record as a replay made
+  <code>STORE_BATCH</code> set the accepted bit for a replica that was gone,
+  after which the publisher retired the file.
+</p>
+<p>
+  Cache size 50,000; swept at most once per TTL. An unconditional size check
+  meant a single 64-record batch could walk a 25,000-entry map 64 times.
+</p>
+
+<h3>12.5 Other gates</h3>
+<ul>
+  <li>Private IPs and user range filter on routing-table admission.</li>
+  <li>No reputation scoring on gossip itself — admission is bounded by diversity caps, and a lead that never answers a liveness ping faults out after 3 failed queries.</li>
+  <li>Store refusals are counted by cause: verify, signature, timestamp, anti-reflection IP, per-IP cap, publisher cap, per-key cap, proximity.</li>
+</ul>
+
+<!-- ══════════════════════════════════════════════ 13 ══════════════════════════════════════════════ -->
+<h2 id="sec-13">13. Maintenance</h2>
+<p>
+  A 60-second tick drives bucket refresh, liveness pings, gossip, publisher
+  cycles, and storer replication. Each task is internally gated on a longer
+  interval, so the cadence itself is cheap.
+</p>
+<table class="data">
+  <thead><tr><th>Task</th><th>Interval / budget</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Tick</td><td>60 s</td><td>EMBER_MAINT_INTERVAL</td></tr>
+    <tr><td>Bucket refresh</td><td>idle &gt; 3600 s, max 3 FIND_NODE / tick</td><td>Random target in the idle bucket</td></tr>
+    <tr><td>Liveness ping</td><td>unheard &gt; 600 s</td><td>8/tick steady; 32/tick while verified &lt; 20. Scales to cover the table inside the stale window, capped at 32. 8 s ping timeout.</td></tr>
+    <tr><td>Lead ping reserve</td><td>1 in 4 of the budget</td><td>When verified contacts could spend the whole budget, keep promoting gossip</td></tr>
+    <tr><td>ANNOUNCE_PEER</td><td>2/tick; 16/tick while starved</td><td>Highest-yield cold frame; self-limits above 20 verified</td></tr>
+    <tr><td>Storer republish</td><td>2 h, 200 records/tick</td><td>STORE_BATCH to current closest</td></tr>
+    <tr><td>KAD bridge</td><td>while verified &lt; 20</td><td>Same ping budget as starved liveness</td></tr>
+    <tr><td>Rendezvous lookup</td><td>every 10 min while verified &lt; 20</td><td>Stops at one k-bucket</td></tr>
+  </tbody>
+</table>
+<p>
+  A ping is the only way an unverified lead becomes usable, so the starved
+  budget is also the join rate. Eight a minute is a sensible steady-state
+  trickle and a poor join. Verification is cheap — one small frame each.
+</p>
+
+<!-- ══════════════════════════════════════════════ 14 ══════════════════════════════════════════════ -->
+<h2 id="sec-14">14. Persistence</h2>
+
+<h3>14.1 nodes_ember.dat</h3>
+<div class="wire">
+  <div class="cap">nodes_ember.dat  ·  magic EMB3 (0x454D4233 LE)  ·  version 1</div>
+  magic(4) ‖ version(1) ‖ count(u16 LE) ‖<br>
+  for each: node_id(16) ‖ addr_type(1) ‖ ip(4 or 16) ‖ port(2 BE) ‖
+  noise_pub(32) ‖ ed25519_pub(32) ‖ last_seen(i64 LE)
+</div>
+<ul>
+  <li>Up to 200 contacts. Written atomically (tmp + write + sync + rename + dir-sync).</li>
+  <li>An empty table never overwrites an existing file — a momentary empty table would otherwise leave the next launch with no way back in.</li>
+  <li>On load, <code>last_seen</code> is discarded and set to 0. Restoring it would make every entry look verified the moment it loads, so the staleness purge would delete the whole bootstrap set before a single ping went out. Zero also sorts them first for liveness probing.</li>
+  <li>Node ID is re-derived from the persisted Ed25519 key; corrupt keys are dropped.</li>
+</ul>
+
+<h3>14.2 store_ember.dat</h3>
+<div class="wire">
+  <div class="cap">store_ember.dat  ·  magic EMS1 (0x454D5331 LE)  ·  version 1</div>
+  magic(4) ‖ version(1) ‖ count(u32 LE) ‖<br>
+  for each: key(16) ‖ created_at(i64 LE) ‖ publisher_key(32) ‖ signature(64) ‖
+  ip_present(1) ‖ ip(4, optional) ‖ data_len(u32 LE) ‖ data
+</div>
+<ul>
+  <li>Up to 20,000 records. Written on shutdown only — a periodic write of several megabytes was a disk hitch every few minutes. Abnormal exit falls back to replication refilling the store within the hour.</li>
+  <li>Only <code>data</code> and <code>signature</code> are load-bearing on the way back in. Key, publisher, and expiry are re-derived from the signed body. Believing the unsigned fields would let anything that can write the file file a genuine record under the wrong key or with a life it was never granted.</li>
+  <li>Records already past TTL are refused, so the file cleans itself up. Bodies larger than 4096 bytes are corruption.</li>
+</ul>
+
+<h3>14.3 Other durable state</h3>
+<table class="data">
+  <thead><tr><th>Location</th><th>What</th></tr></thead>
+  <tbody>
+    <tr><td>known.met tag 0xE4</td><td>Last successful Ember source-publish per file</td></tr>
+    <tr><td>ember_dht_highwater.json</td><td>Daily and all-time high-water of verified contacts</td></tr>
+  </tbody>
+</table>
+
+<!-- ══════════════════════════════════════════════ 15 ══════════════════════════════════════════════ -->
+<h2 id="sec-15">15. Comparison with eMule KAD</h2>
+<p>
+  EmberDHT was compared against this repository’s own KAD stack, constant for
+  constant. On design it already matches or exceeds KAD operationally in the
+  rows below. Remaining gaps are in §16.
+</p>
+<div class="cmp">
+  <div class="col ember">
+    <h4>EmberDHT</h4>
+    <ul>
+      <li>k = 20 replicas</li>
+      <li>α = 5 concurrent FindNode</li>
+      <li>Source TTL 6 h vs 2 h republish (3× margin)</li>
+      <li>Keyword TTL 24 h</li>
+      <li>Replacement cache</li>
+      <li>Storer-side replication</li>
+      <li>Store survives restart</li>
+      <li>Ed25519-signed frames and records</li>
+      <li>Noise transport</li>
+      <li>Adaptive abuse limits</li>
+      <li>Rich diagnostics (truncation, reject causes, search quality, high-water)</li>
+    </ul>
+  </div>
+  <div class="col kad">
+    <h4>KAD (this repo)</h4>
+    <ul>
+      <li>k = 10 replicas</li>
+      <li>α = 1 for FindNode</li>
+      <li>Source TTL 5 h vs 5 h republish (no margin)</li>
+      <li>No replacement cache</li>
+      <li>No storer-side replication</li>
+      <li>No signed overlay identity</li>
+      <li>Cleartext UDP (obfuscation optional)</li>
+      <li>Fixed caps (1 contact/IP, 10/subnet, 3 sources/IP)</li>
+      <li>150 of 1000 records per sender per key</li>
+      <li>Buddy hash + callback for firewalled consume</li>
+      <li>FIND_VALUE pagination (start position)</li>
+    </ul>
+  </div>
+</div>
+<p>
+  Roughly half the round trips per lookup come from α = 5 against KAD’s 1 for
+  <code>FindNode</code>. Replica count is double. The diagnostic surface is
+  already richer. The largest genuine functional gap is firewalled consume
+  (§11.2). The largest product gap is that bytes still move over eD2K.
+</p>
+
+<!-- ══════════════════════════════════════════════ 16 ══════════════════════════════════════════════ -->
+<h2 id="sec-16">16. Current limits and planned work</h2>
+
+<h3>16.1 Known limits (user-facing)</h3>
+<ul>
+  <li><strong>Content still moves over eD2K.</strong> Native 256&nbsp;KiB chunks and a BLAKE3 hash tree exist but nothing imports them.</li>
+  <li><strong>Bootstrap depends on eMule</strong> except for a previously persisted contact file.</li>
+  <li><strong>Version mismatches are silent</strong> — clean refusal, no upgrade prompt.</li>
+  <li><strong>Multi-keyword search is approximate</strong> — sparse intersection plus filename match, not a worldwide AND.</li>
+  <li><strong>Serving ceiling ~5 records per reply</strong> — mitigated by window rotation; pagination waits on a version bump.</li>
+  <li><strong>45 records per publisher per keyword, network-wide.</strong></li>
+  <li><strong>No reputation scoring on gossip</strong> — Sybil pressure is rate-limited, not scored.</li>
+  <li><strong>Firewalled sources are not Ember-dialable.</strong></li>
+  <li><strong>Not yet exercised end to end:</strong> LowID PROXY_STORE, cold join from an empty contact file with no KAD, republish across a full record TTL on a large library.</li>
+</ul>
+
+<h3>16.2 Planned wire changes (one version bump)</h3>
+<p>These wait on <code>EMBER_DHT_VERSION</code> 3 so they can land together:</p>
+<ol>
+  <li><strong><code>start_position</code> on FIND_VALUE / FOUND_VALUE</strong> — real pagination. Justified if truncation counters show withheld records on the live network after rotation.</li>
+  <li><strong>Buddy field + callback message</strong> — firewalled consume, the largest functional gap against KAD.</li>
+  <li><strong>Drop <code>node_id</code> from wire contacts</strong> — 87 → 71 bytes, 14 → 17 contacts per FOUND_NODE. The ID is BLAKE3 of the key and is re-derived anyway.</li>
+</ol>
+<p>
+  Raising <code>MAX_RECORDS_PER_PUBLISHER_PER_KEY</code> toward KAD’s 150 is
+  blocked on pagination: if a peer only ever serves ~5 records per reply, extra
+  stored records have no way to reach a searcher, and the only certain effect
+  is more storer-replication traffic.
+</p>
+
+<h3>16.3 Future, non-blocking</h3>
+<ul>
+  <li>Rendezvous-key health monitoring; shard the rendezvous key space once one KAD bucket’s 1000-entry cap is in sight.</li>
+  <li>Richer keyword indexing (stemming) if recall lags KAD on real libraries.</li>
+  <li>Score gossip under Sybil pressure, beyond per-IP and per-subnet caps.</li>
+  <li>Transport sessions keyed by <code>(address, static key)</code>.</li>
+  <li>Surface BLAKE3 verify pass/fail in the transfer UI; wire the native transfer path.</li>
+  <li>Longer fuzz / property tests and overnight soak jobs.</li>
+</ul>
+
+<h3>16.4 Dormant native transfer</h3>
+<p>
+  <code>ember/transfer.rs</code> specifies a stream of
+  <code>REQUEST_CHUNKS</code>, <code>CHUNK_DATA</code>, <code>FILE_INFO</code>,
+  and <code>TRANSFER_COMPLETE</code> over 256&nbsp;KiB chunks with a BLAKE3 hash
+  tree whose root is the Ember file hash already carried on DHT records.
+  Nothing in the tree imports this module. Wiring it is the largest remaining
+  piece if the goal is a network that does not need the eMule wire at all.
+</p>
+
+<!-- ══════════════════════════════════════════════ A ══════════════════════════════════════════════ -->
+<h2 id="sec-a">Appendix A. Constant tables</h2>
+<p class="sec-lead" style="margin-top:-2mm;">Values as compiled in Ember 1.5.4. Source files in parentheses.</p>
+
+<h3>A.1 Overlay</h3>
+<table class="data">
+  <thead><tr><th>Constant</th><th>Value</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td>EMBER_DHT_VERSION / MIN</td><td>2 / 2</td><td>dht/mod.rs</td></tr>
+    <tr><td>K_BUCKET_SIZE</td><td>20</td><td>dht/mod.rs</td></tr>
+    <tr><td>ALPHA</td><td>5</td><td>dht/mod.rs</td></tr>
+    <tr><td>ID_BITS</td><td>128</td><td>dht/mod.rs</td></tr>
+    <tr><td>MAX_CONTACTS_PER_RESPONSE</td><td>20 (14 IPv4 fit)</td><td>dht/mod.rs</td></tr>
+    <tr><td>CONTACT_TIMEOUT_SECS</td><td>600</td><td>dht/mod.rs</td></tr>
+    <tr><td>MAX_FAILED_QUERIES</td><td>3</td><td>dht/mod.rs</td></tr>
+    <tr><td>EMBER_MAGIC</td><td>0xEB 0x3E</td><td>transport.rs</td></tr>
+    <tr><td>CONTROL_VERSION</td><td>0xC1</td><td>transport.rs</td></tr>
+  </tbody>
+</table>
+
+<h3>A.2 Datagrams and payloads</h3>
+<table class="data">
+  <thead><tr><th>Constant</th><th>Value</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td>MAX_EMBER_DATAGRAM_BYTES</td><td>4096</td><td>transport.rs</td></tr>
+    <tr><td>MAX_UNFRAGMENTED_DATAGRAM</td><td>1400</td><td>dht/messages.rs</td></tr>
+    <tr><td>FRAME_OVERHEAD</td><td>120</td><td>dht/messages.rs</td></tr>
+    <tr><td>TRANSPORT_OVERHEAD</td><td>27</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_UNFRAGMENTED_PAYLOAD</td><td>1253</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_FOUND_VALUE_RECORD_BYTES</td><td>1235</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_FIND_VALUE_KEYS</td><td>8</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_STORE_BATCH_RECORDS</td><td>64</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_FOUND_VALUE_RECORDS</td><td>300</td><td>dht/messages.rs</td></tr>
+  </tbody>
+</table>
+
+<h3>A.3 Time and maintenance</h3>
+<table class="data">
+  <thead><tr><th>Constant</th><th>Value</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td>EMBER_MAINT_INTERVAL</td><td>60 s</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_BUCKET_REFRESH_SECS</td><td>3600</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_RECORD_REPUBLISH_SECS</td><td>7200</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SOURCE_REPUBLISH</td><td>2 h</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_KEYWORD_REPUBLISH</td><td>12 h</td><td>network/mod.rs</td></tr>
+    <tr><td>KEYWORD_RECORD_TTL</td><td>24 h</td><td>dht/store.rs</td></tr>
+    <tr><td>SOURCE_RECORD_TTL</td><td>6 h</td><td>dht/store.rs</td></tr>
+    <tr><td>CLOCK_SKEW_TOLERANCE</td><td>1 h</td><td>dht/store.rs</td></tr>
+    <tr><td>EMBER_RENDEZVOUS_REPUBLISH_SECS</td><td>5 h</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL</td><td>10 min</td><td>network/mod.rs</td></tr>
+    <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>transport.rs</td></tr>
+    <tr><td>STORE_SIG_REPLAY_TTL</td><td>60 s</td><td>dht/engine.rs</td></tr>
+    <tr><td>MIN_OBSERVED_IP_VOTES</td><td>3 / 15 min</td><td>dht/observed.rs</td></tr>
+  </tbody>
+</table>
+
+<h3>A.4 Persistence and identity files</h3>
+<table class="data">
+  <thead><tr><th>Constant</th><th>Value</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td>EMBER_PERSIST_MAX_CONTACTS</td><td>200</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_PERSIST_MAX_RECORDS</td><td>20,000</td><td>network/mod.rs</td></tr>
+    <tr><td>NODES_EMBER_MAGIC</td><td>EMB3</td><td>dht/bootstrap.rs</td></tr>
+    <tr><td>STORE_EMBER_MAGIC</td><td>EMS1</td><td>dht/bootstrap.rs</td></tr>
+    <tr><td>FT_EMBER_SOURCE_PUBLISH</td><td>0xE4</td><td>known.met</td></tr>
+    <tr><td>EMBER_RENDEZVOUS_SEED</td><td>ember-dht-rendezvous-v1</td><td>kad/publish.rs</td></tr>
+  </tbody>
+</table>
+
+<!-- ══════════════════════════════════════════════ B ══════════════════════════════════════════════ -->
+<h2 id="sec-b">Appendix B. Code map</h2>
+<table class="data plain">
+  <thead><tr><th>Area</th><th>Location</th></tr></thead>
+  <tbody>
+    <tr><td>DHT engine, routing, store, search, publish, wire</td><td><code>src-tauri/src/network/ember/dht/</code></td></tr>
+    <tr><td>Protocol constants (k, α, version, IDs)</td><td><code>dht/mod.rs</code></td></tr>
+    <tr><td>Frame encode/decode, message types, size budgets</td><td><code>dht/messages.rs</code></td></tr>
+    <tr><td>IO-free inbound handling, proximity, PROXY_STORE</td><td><code>dht/engine.rs</code></td></tr>
+    <tr><td>128-bucket table, replacement cache, admission</td><td><code>dht/routing.rs</code></td></tr>
+    <tr><td>Signed records, capacity, TTL, serve cursor</td><td><code>dht/store.rs</code></td></tr>
+    <tr><td>Iterative lookup, keyword hashing</td><td><code>dht/search.rs</code></td></tr>
+    <tr><td>Keyword/source record builders</td><td><code>dht/publish.rs</code></td></tr>
+    <tr><td>Adaptive abuse limits</td><td><code>dht/scale.rs</code></td></tr>
+    <tr><td>Per-IP / per-peer rate limits</td><td><code>dht/protection.rs</code></td></tr>
+    <tr><td>Observed-IP voting</td><td><code>dht/observed.rs</code></td></tr>
+    <tr><td>nodes_ember.dat / store_ember.dat</td><td><code>dht/bootstrap.rs</code></td></tr>
+    <tr><td>Noise transport, magic, sessions</td><td><code>ember/transport.rs</code></td></tr>
+    <tr><td>Node ID, sign/verify, hash binding</td><td><code>ember/crypto.rs</code></td></tr>
+    <tr><td>Dormant native transfer</td><td><code>ember/transfer.rs</code></td></tr>
+    <tr><td>Publish/search drivers, maintenance, KAD bridge</td><td><code>network/mod.rs</code></td></tr>
+    <tr><td>Rendezvous KAD key</td><td><code>kad/publish.rs</code> · <code>ember_rendezvous_key()</code></td></tr>
+    <tr><td>User-facing status</td><td>Ember Network page (<code>/ember</code>), status bar</td></tr>
+    <tr><td>Settings</td><td>Settings → Network · <code>ember_native_enabled</code> (always on)</td></tr>
+    <tr><td>Dev harness</td><td><code>add_ember_dht_contact</code>, <code>ember_dht_ping_peer</code>, <code>ember_dht_find_node</code>, <code>ember_dht_iterative_find_node</code>, <code>ember_dht_publish_keyword</code>, <code>ember_dht_find_value</code>, <code>ember_dht_run_maintenance</code></td></tr>
+    <tr><td>Standing work log</td><td><code>docs/ember-dht.md</code></td></tr>
+  </tbody>
+</table>
+
+<footer class="doc-end">
+  <p>
+    EmberDHT Protocol Specification · Wire version 2 · Ember 1.5.4 · August 2026.
+    Derived from the canonical implementation in the ember-p2p repository.
+    Licensed under the GNU General Public License, version 3.
+  </p>
+  <p>
+    This document describes behaviour as implemented. It is not a promise that
+    the wire will remain unchanged: version 3 is reserved for pagination,
+    firewalled consume, and contact-list compaction. Implementers targeting
+    interoperability should treat <code>EMBER_DHT_MIN_VERSION..=EMBER_DHT_VERSION</code>
+    as the only supported range.
+  </p>
+</footer>
+
+</body>
+</html>
