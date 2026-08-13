@@ -4774,7 +4774,7 @@ async fn download_parts_from_source(
                     Err(e) => debug!("Failed to parse early EPX from source {}: {e}", _src_idx),
                 }
             }
-            (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
+            (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                 if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                     let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                     // `verified = true` iff either:
@@ -5504,7 +5504,7 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        if super::LEGACY_FRIEND_AUTH_ENABLED
+        if hello_caps.is_ember
             && proto == OP_EMULEPROT
             && opcode == OP_EMBER_FRIEND_REQ
         {
@@ -7934,7 +7934,7 @@ async fn download_parts_from_source(
                         }
                     }
                     (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                        if super::LEGACY_FRIEND_AUTH_ENABLED && hello_caps.is_ember =>
+                        if hello_caps.is_ember =>
                     {
                         if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                             let nick = crate::security::normalize_inbound_friend_nickname(&payload);

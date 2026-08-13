@@ -389,7 +389,28 @@ export async function initTransferStore() {
       if (!narrowed) return;
       const t = { ...event.payload, status: narrowed };
       transfers.update((list) => {
-        if (list.some((x) => x.id === t.id)) return list;
+        const idx = list.findIndex((x) => x.id === t.id);
+        if (idx >= 0) {
+          const existing = list[idx];
+          const next = {
+            ...existing,
+            ember_hash: t.ember_hash ?? existing.ember_hash,
+            user_hash: t.user_hash ?? existing.user_hash,
+            client_software: t.client_software || existing.client_software,
+            peer_name: t.peer_name || existing.peer_name,
+          };
+          if (
+            next.ember_hash === existing.ember_hash
+            && next.user_hash === existing.user_hash
+            && next.client_software === existing.client_software
+            && next.peer_name === existing.peer_name
+          ) {
+            return list;
+          }
+          const copy = list.slice();
+          copy[idx] = next;
+          return copy;
+        }
         return [...list, t];
       });
     });

@@ -1743,6 +1743,7 @@ impl Database {
                         client_software: String::new(),
                         country_code: None,
                         user_hash: None,
+                        ember_hash: None,
                         expected_aich,
                         completed_path: None,
                         up_part_status: None,

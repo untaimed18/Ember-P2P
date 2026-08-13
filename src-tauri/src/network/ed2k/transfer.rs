@@ -441,9 +441,7 @@ pub enum DownloadEvent {
         tcp_port: u16,
         udp_port: u16,
     },
-    /// Legacy parser-only friend request. The network dispatcher drops this
-    /// variant; secure v2 requests arrive as `UploadEventKind` instead.
-    #[allow(dead_code)]
+    /// Incoming friend request from an Ember peer on a download connection.
     EmberFriendRequest {
         ember_hash: [u8; 16],
         nickname: String,
@@ -1761,7 +1759,7 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if super::LEGACY_FRIEND_AUTH_ENABLED => {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = crate::security::normalize_inbound_friend_nickname(&pl);
                         // `verified` requires PoP (Ed25519 challenge-
@@ -2480,7 +2478,7 @@ impl Ed2kDownload {
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                    if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
+                    if peer_is_ember =>
                 {
                     if let Some(eh) = peer_ember_hash {
                         let nick = crate::security::normalize_inbound_friend_nickname(&payload);
@@ -4268,7 +4266,7 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                            if super::LEGACY_FRIEND_AUTH_ENABLED && peer_is_ember =>
+                            if peer_is_ember =>
                         {
                             if let Some(eh) = peer_ember_hash {
                                 let nick =

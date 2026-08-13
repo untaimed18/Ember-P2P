@@ -260,6 +260,7 @@
     // Priming the tab counts only needs the list, not a badge sweep — this
     // runs on every visit to /transfers whether or not the tab is opened.
     refreshKnownClients(false);
+    void refreshFriendHashes();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
@@ -753,6 +754,14 @@
   let knownClients: KnownClient[] = $state([]);
   let uploadQueueLoaded = $state(false);
   let knownClientsLoaded = $state(false);
+
+  /** Friends are keyed by Ember identity, not the eD2K `user_hash`. */
+  function emberHashForUpload(t: Transfer): string | undefined {
+    if (t.ember_hash) return t.ember_hash;
+    const uh = t.user_hash?.toLowerCase();
+    if (!uh) return undefined;
+    return knownClients.find((kc) => kc.user_hash.toLowerCase() === uh)?.ember_hash ?? undefined;
+  }
   let queuePollHandle: ReturnType<typeof setInterval> | null = null;
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   let knownVisibilityHandler: (() => void) | null = null;
@@ -1909,9 +1918,11 @@
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
         case 'add_friend': {
-          if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
-          await addFriend(t.user_hash, t.peer_name || undefined);
-          showInfo(m.transfers_added_friend({ name: t.peer_name || t.user_hash.slice(0, 8) + '\u2026' }));
+          const emberHash = emberHashForUpload(t);
+          if (!emberHash) { transferError = m.transfers_no_ember_hash(); break; }
+          await addFriend(emberHash, t.peer_name || undefined);
+          await refreshFriendHashes();
+          showInfo(m.transfers_added_friend({ name: t.peer_name || emberHash.slice(0, 8) + '\u2026' }));
           break;
         }
         case 'ban_user': {
@@ -4395,8 +4406,9 @@
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
     {:else}
+      {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
       <!-- Upload context menu -->
-      {#if ctxTransfer.user_hash && ctxTransfer.client_software?.startsWith('Ember')}
+      {#if uploadFriendHash && ctxTransfer.client_software?.startsWith('Ember') && !friendHashSet.has(uploadFriendHash.toLowerCase())}
         <button class="ctx-item" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
         <div class="ctx-sep"></div>
       {/if}

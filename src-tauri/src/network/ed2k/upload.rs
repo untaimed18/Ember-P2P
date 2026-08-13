@@ -1280,6 +1280,17 @@ pub enum UploadEventKind {
         /// Seconds this peer spent in the upload queue before the slot was
         /// granted (eMule "Waited" column). Surfaced as `Transfer.wait_time`.
         wait_seconds: u64,
+        /// Ember identity when this peer completed `OP_EMBER_HELLO`. Friends
+        /// are keyed by this, not the eD2K `user_hash`.
+        ember_hash: Option<String>,
+    },
+    /// Fills Ember identity on an upload row that started before
+    /// `OP_EMBER_HELLO`. Classic Ember file sockets learn the hash in the
+    /// dispatcher, after [`Started`] may already have been emitted.
+    Identity {
+        ember_hash: Option<String>,
+        client_software: String,
+        peer_name: String,
     },
     Progress {
         uploaded: u64,
@@ -5547,11 +5558,11 @@ impl UploadHandler {
         // `OP_EMBER_AUTH_RESPONSE` below.
 
         // Tracks whether we've already shipped our outbound
-        // `OP_EMBER_FRIEND_REQ` on this session. Send only after Ed25519
-        // PoP succeeds (AUTH_RESPONSE OK) — shipping it earlier lets an
-        // attacker who knows a candidate ember_hash probe whether that
-        // hash is on our friend list.
+        // `OP_EMBER_FRIEND_REQ` on this session. Noise-authenticated
+        // sessions send immediately below; classic Ember file sockets
+        // send after HELLO (or when the user adds the peer mid-session).
         let mut friend_request_sent = false;
+        let mut identity_emitted = false;
         if is_friend && !hello_caps.is_ember {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
         }
@@ -5772,6 +5783,7 @@ impl UploadHandler {
                                 None
                             },
                             wait_seconds: 0,
+                            ember_hash: peer_ember_hash.map(hex::encode),
                         },
                     })
                     .await;
@@ -5898,48 +5910,68 @@ impl UploadHandler {
         // underlying cause.
         let session_result: anyhow::Result<()> = async {
         loop {
-            if secure_v2_authenticated {
-                if let Some(eh) = peer_ember_hash {
-                    let live_member = self.friend_hashes.read().await.contains(&eh);
-                    if is_friend && !live_member {
+            if let Some(eh) = peer_ember_hash {
+                let live_member = self.friend_hashes.read().await.contains(&eh);
+                if is_friend && !live_member {
+                    is_friend = false;
+                    is_ember_friend = false;
+                    if secure_v2_authenticated {
                         // Membership is the live authorization source.  Do not
                         // let a session-local flag or queued priority snapshot
                         // survive friend removal.
-                        is_friend = false;
-                        is_ember_friend = false;
                         info!("Friend {} removed; closing secure v2 stream", hex::encode(eh));
                         break;
                     }
-                    if !is_friend && live_member {
-                        // A secure friend request may be accepted while this
-                        // authenticated stream is still open.  Promote it only
-                        // after the shared membership set reflects that user
-                        // action.
-                        is_friend = true;
-                        is_ember_friend = true;
-                        if !owns_ember_slot {
-                            if let Some(handle) = ember_session_handle.as_ref().cloned() {
-                                let mut sessions = self.ember_sessions.write().await;
-                                match sessions.get(&eh) {
-                                    Some(existing)
-                                        if existing.is_fresh()
-                                            && existing.is_secure_v2()
-                                            && existing.peer_ember_pubkey()
-                                                == handle.peer_ember_pubkey() =>
-                                    {
-                                        owns_ember_slot = false;
-                                    }
-                                    Some(other) => {
-                                        other.close();
-                                        sessions.insert(eh, handle);
-                                        owns_ember_slot = true;
-                                    }
-                                    None => {
-                                        sessions.insert(eh, handle);
-                                        owns_ember_slot = true;
-                                    }
+                }
+                if !is_friend && live_member {
+                    // Add Friend from the uploads pane (or Friends page) can
+                    // land while this downloader's socket is still open.
+                    // Promote membership, then ship `OP_EMBER_FRIEND_REQ` on
+                    // this live connection — FindFriendAndConnect cannot
+                    // carry the request when the peer is firewalled, and
+                    // classic Ember file sockets are not in `ember_sessions`
+                    // until they are already friends.
+                    is_friend = true;
+                    is_ember_friend = hello_caps.is_ember;
+                    if secure_v2_authenticated && !owns_ember_slot {
+                        if let Some(handle) = ember_session_handle.as_ref().cloned() {
+                            let mut sessions = self.ember_sessions.write().await;
+                            match sessions.get(&eh) {
+                                Some(existing)
+                                    if existing.is_fresh()
+                                        && existing.is_secure_v2()
+                                        && existing.peer_ember_pubkey()
+                                            == handle.peer_ember_pubkey() =>
+                                {
+                                    owns_ember_slot = false;
+                                }
+                                Some(other) => {
+                                    other.close();
+                                    sessions.insert(eh, handle);
+                                    owns_ember_slot = true;
+                                }
+                                None => {
+                                    sessions.insert(eh, handle);
+                                    owns_ember_slot = true;
                                 }
                             }
+                        }
+                    }
+                    if hello_caps.is_ember && !friend_request_sent {
+                        info!(
+                            "Sending friend request to Ember peer {peer_addr} (mid-session add)"
+                        );
+                        let nickname = self.nickname_snapshot().await;
+                        if write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMBER_FRIEND_REQ,
+                            nickname.as_bytes(),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            friend_request_sent = true;
                         }
                     }
                 }
@@ -6317,6 +6349,7 @@ impl UploadHandler {
                                                         country_code: ul_country_code.clone(),
                                                         user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
                                                         wait_seconds: queue_wait_at_grant,
+                                                        ember_hash: peer_ember_hash.map(hex::encode),
                                                     },
                                                 })
                                                 .await;
@@ -7383,6 +7416,7 @@ impl UploadHandler {
                                 country_code: ul_country_code.clone(),
                                 user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
                                 wait_seconds: queue_wait_at_grant,
+                                ember_hash: peer_ember_hash.map(hex::encode),
                             },
                         }).await;
                     }
@@ -7504,6 +7538,7 @@ impl UploadHandler {
                                         country_code: ul_country_code.clone(),
                                         user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
                                         wait_seconds: queue_wait_at_grant,
+                                        ember_hash: peer_ember_hash.map(hex::encode),
                                     },
                                 }).await;
                             }
@@ -9556,38 +9591,39 @@ impl UploadHandler {
                             }
                         }
 
-                        // Deferred friend-request emit. The early
-                        // gate above the dispatcher fires before any
-                        // `OP_EMBER_HELLO` has been processed and so
-                        // sees `peer_ember_hash = None` /
-                        // `is_friend = false` for every Ember peer
-                        // that hasn't pre-loaded an obfuscation-layer
-                        // ember_hash — which is the common case
-                        // because we deliberately stripped Ember
-                        // identity from the public Hello/EmuleInfo
-                        // (anti-leecher-mod queue-ban avoidance). On
-                        // those sessions the original code would
-                        // never send `OP_EMBER_FRIEND_REQ`, so a
-                        // friend who already has us in their list
-                        // could initiate a download from us, see our
-                        // upload's friend request flow silently no-op,
-                        // and never get the reciprocal acceptance
-                        // prompt — exactly the asymmetric "they see
-                        // me but I never see them" bug users hit.
-                        //
-                        // Re-evaluating `is_friend` /
-                        // `is_ember_friend` here also keeps the
-                        // `is_ember_friend`-gated CHAT_MSG /
-                        // BROWSE_REQ / BROWSE_RES / KEEPALIVE arms
-                        // honest and lets the AUTH_RESPONSE arm
-                        // actually claim `owns_ember_slot` for this
-                        // friend — both of which were previously
-                        // dead code on the same Ember sessions.
-                        //
-                        // `friend_request_sent` ensures we only ever
-                        // emit one request per session; OP_EMBER_HELLO
-                        // arrives at most twice (HELLO + HELLOANSWER)
-                        // so the guard is what stops the duplicate.
+                        // Classic Ember file sockets learn identity here,
+                        // after `Started` may already have been emitted
+                        // (AddUpNextClient push-grant). Patch the upload
+                        // row so the UI's Add Friend action can use the
+                        // Ember hash rather than the eD2K user hash.
+                        if !identity_emitted {
+                            if let (Some(tid), Some(eh)) =
+                                (transfer_id.as_ref(), peer_ember_hash)
+                            {
+                                let _ = self
+                                    .upload_event_tx
+                                    .send(UploadEvent {
+                                        transfer_id: tid.clone(),
+                                        kind: UploadEventKind::Identity {
+                                            ember_hash: Some(hex::encode(eh)),
+                                            client_software: ul_client_software.clone(),
+                                            peer_name: ul_peer_name.clone(),
+                                        },
+                                    })
+                                    .await;
+                                identity_emitted = true;
+                            }
+                        }
+
+                        // The early gate above the dispatcher fires before
+                        // `OP_EMBER_HELLO`, so classic sessions see
+                        // `peer_ember_hash = None` / `is_friend = false`
+                        // there. Re-evaluate membership now that the hash
+                        // is known. `LEGACY_FRIEND_AUTH_ENABLED` is off, so
+                        // AUTH_RESPONSE will never send the request —
+                        // ship it here (and on mid-session promotion in
+                        // the outer loop). `friend_request_sent` stops the
+                        // HELLO + HELLOANSWER duplicate.
                         if !is_friend {
                             if let Some(eh) = peer_ember_hash {
                                 if self.friend_hashes.read().await.contains(&eh) {
@@ -9596,8 +9632,23 @@ impl UploadHandler {
                                 }
                             }
                         }
-                        // FRIEND_REQ is deferred until AUTH_RESPONSE PoP
-                        // (membership oracle otherwise).
+                        if is_friend && hello_caps.is_ember && !friend_request_sent {
+                            info!(
+                                "Sending friend request to Ember peer {peer_addr}"
+                            );
+                            let nickname = self.nickname_snapshot().await;
+                            if write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_FRIEND_REQ,
+                                nickname.as_bytes(),
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                friend_request_sent = true;
+                            }
+                        }
                     }
                 }
 
@@ -9632,7 +9683,9 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if secure_v2_authenticated => {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
+                    if hello_caps.is_ember || secure_v2_authenticated =>
+                {
                     // L21: refuse a friend request whose claimed
                     // sender hash matches our own. PoP from a remote
                     // peer can never succeed for our own identity, so

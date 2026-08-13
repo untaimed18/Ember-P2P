@@ -114,6 +114,8 @@ export interface Transfer {
   client_software?: string;
   country_code?: string;
   user_hash?: string;
+  /** Ember identity of an uploading peer. Friends are keyed by this, not `user_hash`. */
+  ember_hash?: string;
   expected_aich?: string;
   /** Upload-direction only: hex bitmap of ED2K parts fully served to this
    *  peer during the current session (byte index = part / 8, bit = part % 8,

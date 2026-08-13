@@ -17336,11 +17336,34 @@ pub async fn start_network(
                     continue;
                 }
 
-                if let DownloadEvent::EmberFriendRequest { ember_hash, .. } = event {
-                    debug!(
-                        "Dropping unbound friend request from generic download connection for {}",
-                        hex::encode(ember_hash)
-                    );
+                if let DownloadEvent::EmberFriendRequest {
+                    ember_hash,
+                    nickname,
+                    peer_ip,
+                    peer_port,
+                    verified,
+                } = event
+                {
+                    // File-transfer sockets (the downloader's side of an
+                    // upload) are how Add Friend on the uploads pane
+                    // delivers `OP_EMBER_FRIEND_REQ` when the peer is
+                    // firewalled and FindFriendAndConnect cannot dial
+                    // back. `verified` is PoP/Noise; unverified rows
+                    // still queue for approval with the unverified badge.
+                    process_inbound_friend_request(
+                        &db,
+                        &app_handle,
+                        &mut state.online_friends,
+                        &mutual_friend_hashes,
+                        settings.friend_require_approval,
+                        ember_hash,
+                        None,
+                        &nickname,
+                        &peer_ip,
+                        peer_port,
+                        verified,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -18313,27 +18336,20 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, pubkey, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
-                    if verified {
-                        process_inbound_friend_request(
-                            &db,
-                            &app_handle,
-                            &mut state.online_friends,
-                            &mutual_friend_hashes,
-                            settings.friend_require_approval,
-                            req_hash,
-                            pubkey,
-                            nickname,
-                            peer_ip,
-                            peer_port,
-                            true,
-                        )
-                        .await;
-                    } else {
-                        debug!(
-                            "Dropping unverified friend request outside secure-stream v2 for {}",
-                            hex::encode(req_hash)
-                        );
-                    }
+                    process_inbound_friend_request(
+                        &db,
+                        &app_handle,
+                        &mut state.online_friends,
+                        &mutual_friend_hashes,
+                        settings.friend_require_approval,
+                        req_hash,
+                        pubkey,
+                        nickname,
+                        peer_ip,
+                        peer_port,
+                        verified,
+                    )
+                    .await;
                 }
 
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
@@ -40710,6 +40726,7 @@ async fn handle_command_inner(
                                 client_software: String::new(),
                                 country_code: None,
                                 user_hash: None,
+                                ember_hash: None,
                                 expected_aich: expected_for_db,
                                 completed_path: None,
                                 up_part_status: None,
@@ -45520,6 +45537,7 @@ async fn handle_upload_event(
             country_code,
             user_hash,
             wait_seconds,
+            ember_hash,
         } => {
             let transfer = Transfer {
                 id: event.transfer_id.clone(),
@@ -45559,6 +45577,7 @@ async fn handle_upload_event(
                 client_software,
                 country_code,
                 user_hash,
+                ember_hash,
                 expected_aich: None,
                 completed_path: None,
                 up_part_status: None,
@@ -45571,6 +45590,30 @@ async fn handle_upload_event(
                 mgr.enqueue(transfer.clone());
             }
             let _ = app_handle.emit("transfer-started", &transfer);
+        }
+        UploadEventKind::Identity {
+            ember_hash,
+            client_software,
+            peer_name,
+        } => {
+            let snapshot = {
+                let mut mgr = transfer_manager.write().await;
+                mgr.active.get_mut(&event.transfer_id).map(|t| {
+                    if ember_hash.is_some() {
+                        t.ember_hash = ember_hash;
+                    }
+                    if !client_software.is_empty() {
+                        t.client_software = client_software;
+                    }
+                    if !peer_name.is_empty() {
+                        t.peer_name = peer_name;
+                    }
+                    t.clone()
+                })
+            };
+            if let Some(transfer) = snapshot {
+                let _ = app_handle.emit("transfer-started", &transfer);
+            }
         }
         UploadEventKind::Progress {
             uploaded,

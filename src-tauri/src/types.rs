@@ -213,6 +213,10 @@ pub struct Transfer {
     /// ED2K user hash of the peer (uploads only, 32 hex chars)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_hash: Option<String>,
+    /// Ember identity of the peer (uploads only). Friends are keyed by this,
+    /// not [`user_hash`]; the uploads-pane Add Friend action must use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ember_hash: Option<String>,
     /// Optional trusted AICH master supplied by an ed2k link/collection.
     /// This is local verification policy only and does not alter ordinary
     /// MD4-only eMule transfers.
