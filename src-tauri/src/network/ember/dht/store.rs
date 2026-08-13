@@ -265,11 +265,6 @@ impl DhtStore {
         }
     }
 
-    /// Cumulative count of records refused for want of a free key slot.
-    pub fn key_cap_rejections(&self) -> u64 {
-        self.key_cap_rejections
-    }
-
     /// Cumulative store refusals broken down by cause.
     pub fn reject_stats(&self) -> StoreRejectStats {
         StoreRejectStats {
@@ -1327,7 +1322,7 @@ mod tests {
         assert_eq!(store.key_count(), 8, "the cap still holds");
         assert!(store.get(&near).is_some(), "and the close key is present");
         assert_eq!(
-            store.key_cap_rejections(),
+            store.reject_stats().key_cap,
             0,
             "displacing is not a rejection"
         );
@@ -1350,7 +1345,7 @@ mod tests {
 
         assert_eq!(store.key_count(), 8);
         assert!(store.get(&far).is_none());
-        assert_eq!(store.key_cap_rejections(), 1);
+        assert_eq!(store.reject_stats().key_cap, 1);
     }
 
     /// The refusal above has to stay cheap. A flood aimed at distant keys is
@@ -1370,7 +1365,7 @@ mod tests {
         }
 
         assert_eq!(store.key_count(), 8, "nothing was displaced");
-        assert_eq!(store.key_cap_rejections(), 64);
+        assert_eq!(store.reject_stats().key_cap, 64);
         assert!(
             store.furthest_key_distance.is_some(),
             "the bound must be cached, or every refusal costs a full scan"
