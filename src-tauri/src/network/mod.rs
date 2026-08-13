@@ -13301,6 +13301,10 @@ fn antileech_reset_defaults(
 ///
 /// Returns the active search `request_id` if an in-flight Ember search leg
 /// was cancelled so the caller can emit `search-complete`.
+///
+/// Kept for the (now unreachable) disable path: the overlay is always on
+/// and settings can no longer flip it off.
+#[allow(dead_code)]
 fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     // Encrypted sessions + their control-ping waiters.
     state.ember_transport.cleanup_all();
@@ -13396,8 +13400,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
 fn apply_network_settings(
     state: &mut NetworkState,
     settings: &mut AppSettings,
-    new_settings: AppSettings,
-    app_handle: &tauri::AppHandle,
+    mut new_settings: AppSettings,
+    _app_handle: &tauri::AppHandle,
 ) {
     let stun_was_enabled = state.stun_keepalive_enabled;
     state.stun_keepalive_enabled = new_settings.stun_keepalive_enabled;
@@ -13505,11 +13509,8 @@ fn apply_network_settings(
             .ember_dht
             .set_block_private_ips(new_settings.block_private_ips);
     }
-    if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-        if let Some(request_id) = ember_disable_cleanup(state) {
-            maybe_finish_active_search(state, app_handle, request_id);
-        }
-    }
+    // Overlay is always on; ignore any payload that tries to disable it.
+    new_settings.ember_native_enabled = true;
     info!(
         "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
         new_settings.obfuscation_enabled,

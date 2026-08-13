@@ -103,10 +103,10 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "pending_share_states",
     "pending_file_priorities",
     "shared_folder_scan_cursors",
-    // Clearing this from the renderer would re-run the Ember default-on
-    // migration on the next load and turn the network back on behind a user
-    // who had deliberately switched it off.
+    // Historical one-shot marker; the overlay is now always on, but the
+    // renderer still must not clear it (it would re-run the migration).
     "ember_default_on_migrated",
+    "ember_native_enabled",
 ];
 
 fn merge_renderer_settings(
@@ -841,6 +841,9 @@ pub async fn update_settings(
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
+    // Ember overlay is always on. The Settings / Ember-page switches stay
+    // visible but disabled, so a crafted or stale payload cannot turn it off.
+    settings.ember_native_enabled = true;
     // L20: strip bidi/zero-width/control formatters from the
     // local user's own nickname before it's stored or sent on the
     // wire (Hello/EmuleInfo/HelloAnswer all carry it). Without

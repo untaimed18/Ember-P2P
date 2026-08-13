@@ -77,10 +77,11 @@ fn paths_likely_equal(a: &Path, b: &Path) -> bool {
 /// default at the time, not because the user chose it. The overlay bootstraps
 /// from other clients rather than a central pool, so it is only useful when
 /// ordinary profiles take part — hence the flip. `ember_default_on_migrated`
-/// is what keeps it one-shot: once set, turning the network off is remembered
-/// across restarts.
+/// is what keeps it one-shot.
 ///
 /// Skipped entirely on a fresh install, where the default already applies.
+/// After this runs, [`force_ember_always_on`] still turns the overlay on for
+/// any profile that had it off.
 ///
 /// Returns `(config_needs_saving, told_the_user_we_turned_it_on)`. The second
 /// flag drives a startup notice: joining the overlay publishes source records
@@ -97,13 +98,22 @@ fn migrate_ember_default_on(settings: &mut AppSettings, config_existed: bool) ->
         settings.ember_native_enabled = true;
         turned_on = true;
         info!(
-            "Joining the Ember Network for this profile: it is on by default from this \
-             version and the stored value predates that default. It can be turned off \
-             under Settings > Network."
+            "Joining the Ember Network for this profile: it is always on from this \
+             version and the stored value predates that default."
         );
     }
     settings.ember_default_on_migrated = true;
     (true, turned_on)
+}
+
+/// The overlay cannot be turned off. Flip any stored `false` so a profile that
+/// had it disabled (or a hand-edited config) still joins.
+fn force_ember_always_on(settings: &mut AppSettings) -> bool {
+    if settings.ember_native_enabled {
+        return false;
+    }
+    settings.ember_native_enabled = true;
+    true
 }
 
 pub struct AppConfig {
@@ -214,8 +224,12 @@ impl AppConfig {
             config_changed = true;
         }
 
-        let (ember_migrated, ember_default_on_applied) =
+        let (ember_migrated, mut ember_default_on_applied) =
             migrate_ember_default_on(&mut settings, config_existed);
+        if force_ember_always_on(&mut settings) {
+            ember_default_on_applied = true;
+            config_changed = true;
+        }
         config_changed |= ember_migrated;
 
         // Migrate: old configs pointed download_folder directly at the user's
@@ -354,11 +368,11 @@ mod ember_default_on_tests {
         assert!(!notify);
     }
 
-    /// The whole point of the marker: the flip happens once, so switching the
-    /// network off survives the next restart instead of being undone by the
-    /// same migration running again.
+    /// The whole point of the old marker was that switching off survived
+    /// the next restart. That choice is no longer honoured: the overlay
+    /// is always on, so a stored `false` is turned back on.
     #[test]
-    fn turning_the_network_off_afterwards_is_remembered() {
+    fn turning_the_network_off_is_no_longer_honoured() {
         let mut settings = AppSettings {
             ember_native_enabled: false,
             ember_default_on_migrated: true,
@@ -368,6 +382,15 @@ mod ember_default_on_tests {
         assert!(!changed);
         assert!(!notify);
         assert!(!settings.ember_native_enabled);
+        assert!(force_ember_always_on(&mut settings));
+        assert!(settings.ember_native_enabled);
+    }
+
+    #[test]
+    fn already_on_is_left_alone_by_the_always_on_lock() {
+        let mut settings = AppSettings::default();
+        assert!(settings.ember_native_enabled);
+        assert!(!force_ember_always_on(&mut settings));
     }
 
     /// A fresh install already has the default applied, so the migration must

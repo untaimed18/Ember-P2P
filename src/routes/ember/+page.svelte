@@ -8,14 +8,12 @@
    * contact / search / store snapshots, so the common case costs one
    * command per tick instead of four.
    *
-   * The toggle persists through `update_settings` and the backend applies
-   * it live, though a node that starts with an empty routing table only
-   * fills it once the maintenance tick runs the KAD bridge — there is no
-   * central pool to fetch from.
+   * The overlay is always on. The power switch stays on the page so the
+   * control is familiar, but it is disabled: a node that starts with an
+   * empty routing table only fills it once the maintenance tick runs the
+   * KAD bridge — there is no central pool to fetch from.
    */
-  import { onMount, untrack } from 'svelte';
-  import { getSettings, updateSettings } from '$lib/api/settings';
-  import { setAppSettings } from '$lib/stores/settings';
+  import { onMount } from 'svelte';
   import {
     getEmberDiagnostics,
     getEmberDhtContacts,
@@ -23,35 +21,21 @@
     getEmberDhtStore,
   } from '$lib/api/ember';
   import type {
-    AppSettings,
     EmberDiagnostics,
     EmberDhtContact,
     EmberDhtSearchEntry,
     EmberDhtStoreEntry,
   } from '$lib/types';
-  import { translateError } from '$lib/i18n';
   import { formatDurationSecs } from '$lib/utils';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import * as m from '$lib/paraglide/messages';
 
-  let settings = $state<AppSettings | null>(null);
   let diag = $state<EmberDiagnostics | null>(null);
   let contacts = $state<EmberDhtContact[]>([]);
   let searches = $state<EmberDhtSearchEntry[]>([]);
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
-  let loadError = $state<string | null>(null);
-  let toggleError = $state<string | null>(null);
   let detailsOpen = $state(false);
-
-  // `enabled` is the toggle's bound value; `lastAppliedEnabled` is the
-  // last value we successfully persisted. The `$effect` below applies a
-  // change only when the two diverge (i.e. the user moved the switch),
-  // which keeps the initial load and the failure-revert from re-entering
-  // the save path. Mirrors the antileech toggle pattern in Settings.
-  let enabled = $state(false);
-  let lastAppliedEnabled = $state<boolean | null>(null);
-  let applying = $state(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unmounted = false;
@@ -84,12 +68,10 @@
       diag = await getEmberDiagnostics();
       diagFailures = 0;
       diagStale = false;
-      reconcileToggle();
       recomputeJoinState();
     } catch {
-      // Tolerate transient blips (keep the previous snapshot; the toggle
-      // still works), but surface a banner once the service has been
-      // unreachable for several polls in a row.
+      // Tolerate transient blips (keep the previous snapshot), but surface
+      // a banner once the service has been unreachable for several polls.
       diagFailures += 1;
       if (diagFailures >= DIAG_FAILURE_THRESHOLD) diagStale = true;
     } finally {
@@ -151,26 +133,10 @@
     return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
   }
 
-  // Keep the switch honest with the backend's *actual* state. Ember can
-  // also be flipped from the Settings page, and the backend can refuse or
-  // revert a change; when we're not mid-apply and the user has no pending
-  // move (switch matches last-applied), adopt whatever the live
-  // diagnostics report so the control never lies about reality.
-  function reconcileToggle() {
-    if (applying || !diag) return;
-    if (enabled !== lastAppliedEnabled) return;
-    const live = !!diag.ember_native_enabled;
-    if (live !== enabled) {
-      enabled = live;
-      lastAppliedEnabled = live;
-      if (settings) settings = { ...settings, ember_native_enabled: live };
-    }
-  }
-
   // Drive the join-progress timer off each diagnostics snapshot (a plain
   // function, not a reactive `$effect`, so there's no write-read feedback
   // loop on `joinTimedOut`). While active with zero contacts we run a
-  // one-shot timer; finding a contact — or turning Ember off — resets it.
+  // one-shot timer; finding a contact resets it.
   function recomputeJoinState() {
     const active = !!diag?.ember_native_enabled;
     const contacts = diag?.ember_dht_contacts ?? 0;
@@ -186,37 +152,6 @@
       joinTimer = setTimeout(() => { joinTimedOut = true; joinTimer = null; }, JOINING_TIMEOUT_MS);
     }
   }
-
-  async function applyToggle(want: boolean) {
-    if (!settings) return;
-    applying = true;
-    toggleError = null;
-    try {
-      const next: AppSettings = { ...settings, ember_native_enabled: want };
-      const result = await updateSettings(next);
-      settings = result.settings;
-      // Mirror the canonical save into the process-wide cache: consumers
-      // outside this page (the /search method gate and readiness strip) read
-      // it, and nothing else refreshes it after app boot.
-      setAppSettings(result.settings);
-      lastAppliedEnabled = want;
-      await refreshDiag();
-    } catch (e) {
-      toggleError = m.ember_toggle_failed({ error: translateError(e) });
-      // Roll the switch back to the persisted value.
-      enabled = lastAppliedEnabled ?? false;
-    } finally {
-      applying = false;
-    }
-  }
-
-  // Fire `applyToggle` only on a real user-driven change.
-  $effect(() => {
-    const want = enabled;
-    if (lastAppliedEnabled === null) return;
-    if (want === lastAppliedEnabled) return;
-    untrack(() => { void applyToggle(want); });
-  });
 
   let copiedKey = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -416,13 +351,6 @@
   ]);
 
   onMount(() => {
-    getSettings()
-      .then((s) => {
-        settings = s;
-        enabled = s.ember_native_enabled;
-        lastAppliedEnabled = s.ember_native_enabled;
-      })
-      .catch((e) => { loadError = m.ember_load_failed({ error: translateError(e) }); });
     refreshDiag();
     // Skip the poll while the window is hidden, like every other poll in the
     // app, and catch up on the way back so a restored window is not showing
@@ -464,11 +392,7 @@
 
 <div class="page-content">
   <div class="ember-inner">
-  {#if loadError}
-    <div class="banner banner-error" role="alert">{loadError}</div>
-  {/if}
-
-  <!-- Status + power switch -->
+  <!-- Status + power switch (always on; the control stays visible but locked) -->
   <section class="hero" class:state-off={heroState === 'off' || heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
     <div class="hero-main">
@@ -489,16 +413,26 @@
     <div class="hero-toggle">
       <span class="toggle-caption">{m.ember_enable_label()}</span>
       <ToggleSwitch
-        bind:checked={enabled}
-        disabled={applying || settings === null}
+        checked={true}
+        disabled
         ariaLabel={m.ember_enable_label()}
       />
     </div>
   </section>
 
-  {#if toggleError}
-    <div class="banner banner-error" role="alert">{toggleError}</div>
-  {/if}
+  <div class="beta-lock" role="status">
+    <span class="beta-lock-icon" aria-hidden="true">
+      <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4" y="9" width="12" height="8" rx="1.6"/>
+        <path d="M7 9V6.6a3 3 0 0 1 6 0V9"/>
+      </svg>
+    </span>
+    <div class="beta-lock-text">
+      <strong>{m.ember_beta_lock_title()}</strong>
+      <p>{m.ember_beta_lock_body()}</p>
+    </div>
+    <span class="badge-beta">{m.ember_experimental()}</span>
+  </div>
 
   {#if diagStale}
     <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
@@ -924,6 +858,53 @@
     font-weight: 500;
     color: var(--text-muted);
     white-space: nowrap;
+  }
+
+  .beta-lock {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 16px;
+    background: color-mix(in srgb, var(--ember-color, #c2185b) 8%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--ember-color, #c2185b) 24%, var(--border));
+    border-radius: var(--radius-lg, 10px);
+  }
+
+  .beta-lock-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    color: var(--ember-color, #c2185b);
+    background: color-mix(in srgb, var(--ember-color, #c2185b) 14%, transparent);
+  }
+
+  .beta-lock-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .beta-lock-text strong {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
+  }
+
+  .beta-lock-text p {
+    margin: 2px 0 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  .beta-lock .badge-beta {
+    margin-top: 4px;
+    flex-shrink: 0;
   }
 
   .hint {
@@ -1382,6 +1363,12 @@
       flex-direction: row;
       justify-content: space-between;
       width: 100%;
+    }
+    .beta-lock {
+      flex-wrap: wrap;
+    }
+    .beta-lock .badge-beta {
+      margin-left: 44px;
     }
     .stat-grid {
       grid-template-columns: 1fr 1fr;

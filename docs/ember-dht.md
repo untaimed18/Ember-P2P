@@ -1,8 +1,8 @@
 # Ember DHT — remaining work and future improvements
 
-Status: **protocol slices complete** and the overlay is **on by default**
-(`ember_native_enabled`, with a one-shot migration for profiles created
-before the default flipped). Keyword/source publish, iterative search,
+Status: **protocol slices complete** and the overlay is **always on**
+(`ember_native_enabled`; profiles that still had it off are turned on at
+load). Keyword/source publish, iterative search,
 join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
 BLAKE3 integrity digests, network-size-adaptive abuse limits, streamed
 search results, and diagnostics are live on `develop`.
@@ -366,7 +366,7 @@ settled.
 | Network loop / publish / search drivers | `src-tauri/src/network/mod.rs` |
 | Adaptive abuse limits | `src-tauri/src/network/ember/dht/scale.rs` |
 | Dormant native transfer | `src-tauri/src/network/ember/transfer.rs` |
-| Settings toggle | Settings → Network (`ember_native_enabled`, on by default) |
+| Settings toggle | Settings → Network (`ember_native_enabled`, always on; switch is visible but disabled) |
 | User-facing status | `/ember` (Ember Network page) |
 | Library publish badges | `shared_ember` on `FileInfo` → Library "Shared" column |
 

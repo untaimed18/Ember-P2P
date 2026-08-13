@@ -695,8 +695,9 @@ export interface AppSettings {
   /** Rendezvous server URL for Ember friend discovery */
   rendezvous_url: string;
   /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
-   *  On by default: the DHT bootstraps from other clients rather than a
-   *  central pool, so it only works when ordinary profiles take part. */
+   *  Always on: the DHT bootstraps from other clients rather than a
+   *  central pool, so it only works when ordinary profiles take part.
+   *  The Settings / Ember-page switches are shown but cannot turn this off. */
   ember_native_enabled: boolean;
   /** Whether this node carries relay traffic for other peers. Relaying is what
    *  lets two firewalled peers reach each other, so it defaults on, but it

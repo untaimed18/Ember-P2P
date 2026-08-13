@@ -908,7 +908,7 @@ impl Default for NetworkStats {
             public_udp_port: 0,
             public_tcp_port: 0,
             tcp_mapping_hold_ok: false,
-            ember_native_enabled: false,
+            ember_native_enabled: true,
             ember_dht_contacts: 0,
         }
     }
@@ -1096,28 +1096,26 @@ pub struct AppSettings {
     /// Join the Ember-native Noise-encrypted overlay — the UDP transport and
     /// the Kademlia DHT — alongside the existing eMule KAD/eD2K stack.
     ///
-    /// **On by default.** The DHT has no central bootstrap: a node finds its
+    /// **Always on.** The DHT has no central bootstrap: a node finds its
     /// first contacts through the KAD bridge, peer exchange, DHT gossip, and
     /// its persisted contact file, so the overlay only works when ordinary
-    /// clients take part in it. When off, Ember-magic UDP packets are dropped
-    /// and the network task behaves exactly as it did before the overlay
-    /// existed.
+    /// clients take part in it. The Settings and Ember-page switches stay
+    /// visible but cannot turn this off.
     ///
-    /// Turning this off is a supported choice and is remembered; see
-    /// [`Self::ember_default_on_migrated`] for how upgrades are handled.
+    /// See [`Self::ember_default_on_migrated`] for how upgrades from the
+    /// opt-in era are handled.
     #[serde(default = "default_true")]
     pub ember_native_enabled: bool,
     /// One-shot marker for the upgrade that made [`Self::ember_native_enabled`]
-    /// default to on.
+    /// default to on (and later, always on).
     ///
     /// Every config written while the overlay was opt-in stores an explicit
     /// `false` that records the old default rather than a preference, so the
-    /// loader flips those once and sets this. Because it is only consulted
-    /// once, a user who turns the network off afterwards keeps that choice
-    /// across restarts.
+    /// loader flips those once and sets this. A later stored `false` is also
+    /// turned back on: the overlay can no longer be disabled.
     ///
     /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`): letting the
-    /// renderer clear it would re-run the migration and override the user.
+    /// renderer clear it would re-run the migration.
     #[serde(default)]
     pub ember_default_on_migrated: bool,
     /// Whether this node will carry relay traffic for other peers.

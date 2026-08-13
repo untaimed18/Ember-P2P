@@ -20,7 +20,7 @@ Ember is a ground-up rewrite of the eMule concept using modern technologies:
 
 The Ember Network is Ember's own encrypted peer-to-peer overlay: a second network Ember nodes run between themselves, in parallel with KAD and eD2K. Nodes find each other directly, publish the files they share, and resolve download sources over their own Kademlia DHT. There is no directory server, no tracker, and no shipped seed list.
 
-It is **on by default** (`ember_native_enabled`, with a one-shot migration for profiles created before the default flipped). The toggle lives on the **Ember Network** page and in **Settings → Network**, and the backend applies it live — no restart. Code lives in [`src-tauri/src/network/ember/`](src-tauri/src/network/ember/) with the DHT under [`dht/`](src-tauri/src/network/ember/dht/); design notes and remaining work are in [docs/ember-dht.md](docs/ember-dht.md).
+It is **always on** (`ember_native_enabled`). The switch on the **Ember Network** page and in **Settings → Network** stays visible but cannot be turned off. Code lives in [`src-tauri/src/network/ember/`](src-tauri/src/network/ember/) with the DHT under [`dht/`](src-tauri/src/network/ember/dht/); design notes and remaining work are in [docs/ember-dht.md](docs/ember-dht.md).
 
 > **Beta.** The overlay is on by default and in daily use, but see [Current limits](#current-limits) before relying on it.
 
