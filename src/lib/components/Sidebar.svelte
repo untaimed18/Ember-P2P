@@ -4,7 +4,6 @@
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
-  import { networkStats } from '$lib/stores/network';
   import { friendRequests } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
@@ -317,17 +316,6 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'kad'}
-            <span
-              class="nav-dot {$networkStats.status}"
-              title={
-                $networkStats.status === 'connected' ? m.network_status_connected() :
-                $networkStats.status === 'connecting' ? m.network_status_connecting() :
-                $networkStats.status === 'disconnected' ? m.network_status_disconnected() :
-                m.network_status_unknown()
-              }
-            ></span>
-          {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
@@ -648,15 +636,6 @@
     display: none;
   }
 
-  .sidebar.collapsed .nav-dot {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    margin: 0;
-    width: 6px;
-    height: 6px;
-  }
-
   .sidebar.collapsed .nav-badge {
     position: absolute;
     top: 2px;
@@ -754,13 +733,11 @@
     flex-shrink: 0;
   }
 
-  /* Pending friend requests use the warning hue so they read as
-     "needs your attention" rather than just "running activity" — the
-     same visual rule as the connecting-state KAD dot. The accent
-     badge stays for transfer counts (steady-state work). */
+  /* Pending friend requests use the same orange as the transfers
+     upload chip so both sidebar counts read as one family. */
   .nav-badge.nav-badge-attention {
-    background: var(--warning);
-    color: var(--on-warning);
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
   }
 
   /* Transfers nav item: split the single count into direction-coded activity
@@ -816,57 +793,5 @@
 
   .sidebar.collapsed .nav-badge-collapsed {
     display: inline-flex;
-  }
-
-  .nav-dot {
-    margin-left: auto;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: var(--text-muted);
-    position: relative;
-    transition: background-color var(--transition-normal) ease, box-shadow var(--transition-normal) ease;
-  }
-
-  .nav-dot.connected {
-    background: var(--status-connected);
-    box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent),
-      0 0 6px color-mix(in srgb, var(--status-connected) 28%, transparent);
-  }
-
-  .nav-dot.connecting {
-    background: var(--status-connecting);
-    box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent),
-      0 0 6px color-mix(in srgb, var(--status-connecting) 30%, transparent);
-    animation: nav-dot-pulse 1.5s ease-in-out infinite;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .nav-dot.connecting {
-      animation: none;
-    }
-  }
-
-  .nav-dot.disconnected {
-    background: var(--status-disconnected);
-    box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--status-disconnected) 16%, transparent),
-      0 0 5px color-mix(in srgb, var(--status-disconnected) 24%, transparent);
-  }
-
-  @keyframes nav-dot-pulse {
-    0%, 100% {
-      box-shadow:
-        0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent),
-        0 0 6px color-mix(in srgb, var(--status-connecting) 30%, transparent);
-    }
-    50% {
-      box-shadow:
-        0 0 0 4px color-mix(in srgb, var(--status-connecting) 8%, transparent),
-        0 0 10px color-mix(in srgb, var(--status-connecting) 22%, transparent);
-    }
   }
 </style>

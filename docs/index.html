@@ -5,54 +5,94 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ember — Decentralized P2P File Sharing</title>
   <meta name="description" content="Ember is a modern, open-source P2P file sharing application built on the eMule KAD network, with its own encrypted server-less Ember Network overlay. No spyware, no ads, no nonsense.">
-  <meta name="theme-color" content="#f5f6fa">
+  <meta name="theme-color" content="#f4f5f8">
   <link rel="icon" type="image/png" href="favicon.png">
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
     :root {
-      --bg-primary: #f5f6fa;
+      --bg-primary: #f4f5f8;
       --bg-secondary: #ffffff;
       --bg-tertiary: #e8ecf4;
-      --bg-surface: #f0f2f8;
+      --bg-surface: #eef0f6;
       --bg-hover: #eceef5;
 
-      --text-primary: #1a1c24;
-      --text-secondary: #4a5068;
-      --text-muted: #8890a8;
+      --text-primary: #16181f;
+      --text-secondary: #3d4358;
+      --text-muted: #6f7690;
 
       --accent: #1a73e8;
-      --accent-hover: #1565d8;
+      --accent-hover: #1557c0;
       --accent-dim: #d2e3fc;
-      --accent-glow: rgba(26, 115, 232, 0.08);
+      --accent-glow: rgba(26, 115, 232, 0.09);
+      --ember: #c45c26;
 
-      --success: #34a853;
+      --success: #1e8e3e;
       --warning: #ea8600;
       --danger: #d93025;
 
-      --border: #dadce0;
+      --border: #d8dce6;
       --border-light: #c4c9d4;
 
-      --radius: 8px;
-      --sidebar-w: 260px;
-      --header-h: 56px;
+      --radius: 10px;
+      --sidebar-w: 248px;
+      --header-h: 58px;
 
-      --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
-      --shadow-md: 0 2px 8px rgba(0,0,0,0.08);
+      --shadow-sm: 0 1px 2px rgba(22, 24, 31, 0.05);
+      --shadow-md: 0 4px 16px rgba(22, 24, 31, 0.06);
+      --shadow-lg: 0 10px 28px rgba(22, 24, 31, 0.08);
+      --focus: 0 0 0 3px rgba(26, 115, 232, 0.28);
     }
 
-    html { scroll-behavior: smooth; scroll-padding-top: calc(var(--header-h) + 20px); }
+    html { scroll-behavior: smooth; scroll-padding-top: calc(var(--header-h) + 20px); color-scheme: light; }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
       background: var(--bg-primary);
       color: var(--text-primary);
       line-height: 1.7;
       -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
 
-    a { color: var(--accent); text-decoration: none; transition: color 0.2s; }
+    ::selection {
+      background: var(--accent-dim);
+      color: var(--text-primary);
+    }
+
+    a { color: var(--accent); text-decoration: none; transition: color 0.15s ease; }
     a:hover { color: var(--accent-hover); }
+    .main p a, .main li a, .faq-a a, .callout a {
+      text-underline-offset: 3px;
+    }
+    .main p a:hover, .main li a:hover, .faq-a a:hover, .callout a:hover {
+      text-decoration: underline;
+    }
+
+    :focus { outline: none; }
+    :focus-visible {
+      outline: none;
+      box-shadow: var(--focus);
+      border-radius: 6px;
+    }
+
+    .skip-link {
+      position: absolute;
+      top: -48px;
+      left: 16px;
+      z-index: 400;
+      background: var(--accent);
+      color: #fff;
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .skip-link:focus, .skip-link:focus-visible {
+      top: 10px;
+      color: #fff;
+      box-shadow: var(--focus);
+    }
 
     code {
       background: var(--bg-tertiary);
@@ -84,15 +124,21 @@
       right: 0;
       z-index: 200;
       height: var(--header-h);
-      background: rgba(255, 255, 255, 0.92);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
-      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.86);
+      backdrop-filter: blur(16px) saturate(1.2);
+      -webkit-backdrop-filter: blur(16px) saturate(1.2);
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    }
+    .site-header.scrolled {
+      border-bottom-color: var(--border);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.6), var(--shadow-sm);
+      background: rgba(255, 255, 255, 0.94);
     }
     .header-inner {
       max-width: 100%;
       margin: 0 auto;
-      padding: 0 24px;
+      padding: 0 22px;
       display: flex;
       align-items: center;
       height: 100%;
@@ -110,8 +156,9 @@
     .brand-icon {
       width: 30px;
       height: 30px;
-      border-radius: 6px;
+      border-radius: 7px;
       overflow: hidden;
+      box-shadow: 0 1px 2px rgba(22, 24, 31, 0.12);
     }
     .brand-icon img {
       width: 100%;
@@ -119,23 +166,44 @@
       display: block;
     }
     .brand-text {
-      font-size: 18px;
+      font-size: 17px;
       font-weight: 700;
-      letter-spacing: 1.5px;
+      letter-spacing: 0.12em;
     }
     .header-nav {
       display: flex;
       align-items: center;
-      gap: 24px;
+      gap: 2px;
       margin-left: auto;
     }
     .header-nav a {
       color: var(--text-secondary);
-      font-size: 14px;
+      font-size: 13.5px;
       font-weight: 500;
-      transition: color 0.2s;
+      padding: 6px 10px;
+      border-radius: 7px;
+      transition: color 0.15s ease, background 0.15s ease;
     }
-    .header-nav a:hover { color: var(--text-primary); }
+    .header-nav a:hover { color: var(--text-primary); background: var(--bg-hover); }
+    .header-cta {
+      display: inline-flex;
+      align-items: center;
+      margin-left: 6px;
+      padding: 7px 14px;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff !important;
+      font-size: 13.5px;
+      font-weight: 600;
+      box-shadow: 0 1px 2px rgba(26, 115, 232, 0.25);
+      transition: background 0.15s ease, box-shadow 0.15s ease;
+      flex-shrink: 0;
+    }
+    .header-cta:hover {
+      background: var(--accent-hover);
+      color: #fff !important;
+      box-shadow: 0 2px 8px rgba(26, 115, 232, 0.28);
+    }
     .header-nav .gh-link {
       display: inline-flex;
       align-items: center;
@@ -149,8 +217,10 @@
       border: none;
       color: var(--text-secondary);
       cursor: pointer;
-      padding: 4px;
+      padding: 6px;
+      border-radius: 8px;
     }
+    .mobile-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
 
     /* ---- LAYOUT ---- */
     .layout {
@@ -166,44 +236,75 @@
       left: 0;
       width: var(--sidebar-w);
       height: calc(100vh - var(--header-h));
-      overflow-y: auto;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
       background: var(--bg-secondary);
       border-right: 1px solid var(--border);
-      padding: 20px 0;
       z-index: 100;
     }
-    .sidebar::-webkit-scrollbar { width: 4px; }
-    .sidebar::-webkit-scrollbar-track { background: transparent; }
-    .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    .sidebar-label {
+      flex-shrink: 0;
+      padding: 16px 16px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .sidebar-nav {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 10px 20px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+    .sidebar-nav::-webkit-scrollbar { width: 6px; }
+    .sidebar-nav::-webkit-scrollbar-track { background: transparent; }
+    .sidebar-nav::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 6px;
+      border: 2px solid var(--bg-secondary);
+    }
+    .sidebar-nav::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
 
-    .toc-section { margin-bottom: 6px; }
+    .toc-section { padding: 4px 0 8px; }
+    .toc-section:first-child { padding-top: 0; }
+    .toc-section:first-child .toc-heading { padding-top: 0; }
+    .toc-section + .toc-section {
+      border-top: 1px solid var(--border);
+      margin-top: 4px;
+      padding-top: 8px;
+    }
     .toc-heading {
       display: block;
-      padding: 8px 20px 4px;
+      padding: 6px 8px 5px;
       font-size: 11px;
       font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 1.2px;
+      letter-spacing: 0.08em;
       color: var(--text-muted);
     }
     .toc-link {
       display: block;
-      padding: 5px 20px 5px 24px;
+      padding: 6px 10px;
       font-size: 13.5px;
+      line-height: 1.35;
       color: var(--text-secondary);
-      border-left: 2px solid transparent;
-      transition: all 0.15s;
+      border-radius: 7px;
+      transition: color 0.15s ease, background 0.15s ease;
     }
     .toc-link:hover { color: var(--text-primary); background: var(--bg-hover); }
     .toc-link.active {
       color: var(--accent);
-      border-left-color: var(--accent);
       background: var(--accent-glow);
-      font-weight: 500;
+      font-weight: 600;
     }
+    .toc-link.active:hover { color: var(--accent); background: var(--accent-glow); }
     .toc-child {
-      padding-left: 36px;
-      font-size: 12.5px;
+      padding-left: 20px;
+      font-size: 13px;
+      color: var(--text-muted);
     }
 
     /* ---- MAIN ---- */
@@ -211,25 +312,54 @@
       margin-left: var(--sidebar-w);
       flex: 1;
       min-width: 0;
-      max-width: 880px;
-      padding: 36px 48px 80px;
+      max-width: 820px;
+      padding: 40px 48px 96px;
     }
 
     /* ---- CONTENT STYLES ---- */
     .main h1 {
-      font-size: 34px;
-      font-weight: 800;
-      margin-bottom: 8px;
-      letter-spacing: 0.3px;
+      font-size: 40px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      letter-spacing: -0.5px;
+      line-height: 1.15;
       color: var(--text-primary);
     }
-    .main h2 {
-      font-size: 24px;
+    .eyebrow {
+      display: inline-block;
+      font-size: 12px;
       font-weight: 700;
-      margin-top: 52px;
-      margin-bottom: 16px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ember);
+      margin-bottom: 10px;
+    }
+    .lede {
+      font-size: 18px !important;
+      line-height: 1.55 !important;
+      color: var(--text-secondary);
+      max-width: 42em;
+    }
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 4px 0 22px;
+    }
+    .section-lead {
+      margin-top: -6px;
+      margin-bottom: 18px;
+      color: var(--text-muted);
+      font-size: 15px;
+    }
+    .main h2 {
+      font-size: 23px;
+      font-weight: 700;
+      margin-top: 48px;
+      margin-bottom: 14px;
       padding-bottom: 8px;
       border-bottom: 1px solid var(--border);
+      letter-spacing: -0.2px;
       color: var(--text-primary);
     }
     .main h3 {
@@ -250,10 +380,6 @@
       margin-bottom: 14px;
       color: var(--text-secondary);
     }
-    .main > p:first-of-type {
-      font-size: 17px;
-      line-height: 1.7;
-    }
 
     .main ul, .main ol {
       margin: 8px 0 16px 24px;
@@ -266,8 +392,9 @@
     .main hr {
       border: none;
       border-top: 1px solid var(--border);
-      margin: 40px 0;
+      margin: 36px 0;
     }
+    .main hr + section > h2 { margin-top: 8px; }
 
     /* ---- HIGHLIGHT CARDS ---- */
     .highlight-grid {
@@ -279,14 +406,15 @@
     .hl-card {
       background: var(--bg-secondary);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 20px 18px;
-      transition: border-color 0.2s, box-shadow 0.2s;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
       box-shadow: var(--shadow-sm);
     }
     .hl-card:hover {
-      border-color: var(--accent);
-      box-shadow: 0 2px 12px rgba(26, 115, 232, 0.1);
+      border-color: #c9cedb;
+      box-shadow: var(--shadow-md);
+      transform: translateY(-1px);
     }
     .hl-card h4 {
       font-size: 15px;
@@ -306,7 +434,7 @@
       justify-content: center;
       width: 36px;
       height: 36px;
-      border-radius: 8px;
+      border-radius: 9px;
       background: var(--accent-dim);
       margin-bottom: 10px;
       font-size: 18px;
@@ -365,44 +493,71 @@
 
     /* ---- DOWNLOAD SECTION ---- */
     .download-box {
-      background: var(--bg-secondary);
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(180deg, #ffffff 0%, #f7f8fc 100%);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 32px;
+      border-radius: 14px;
+      padding: 36px 32px 32px;
       text-align: center;
       margin: 24px 0;
       box-shadow: var(--shadow-md);
+    }
+    .download-box::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--ember), var(--accent));
+    }
+    .download-box img {
+      border-radius: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 6px 18px rgba(22, 24, 31, 0.12);
     }
     .download-box h3 {
       margin-top: 0;
       font-size: 22px;
     }
+    .download-box p {
+      max-width: 36em;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .download-meta {
+      display: block;
+      margin-top: -6px;
+      margin-bottom: 4px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
     .btn {
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      padding: 12px 28px;
-      border-radius: var(--radius);
+      padding: 12px 24px;
+      border-radius: 9px;
       font-size: 15px;
       font-weight: 600;
       cursor: pointer;
       border: none;
-      transition: all 0.2s;
+      transition: background 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, color 0.15s ease;
       text-decoration: none;
     }
     .btn-primary {
       background: var(--accent);
       color: #fff;
-      box-shadow: 0 2px 8px rgba(26, 115, 232, 0.25);
+      box-shadow: 0 1px 2px rgba(26, 115, 232, 0.25);
     }
     .btn-primary:hover {
       background: var(--accent-hover);
       color: #fff;
-      box-shadow: 0 4px 16px rgba(26, 115, 232, 0.3);
-      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(26, 115, 232, 0.28);
     }
     .btn-secondary {
-      background: var(--bg-surface);
+      background: var(--bg-secondary);
       color: var(--text-primary);
       border: 1px solid var(--border);
     }
@@ -423,40 +578,48 @@
     /* ---- PROMISE ROW ---- */
     .promise-row {
       display: flex;
-      gap: 28px;
+      gap: 8px 20px;
       flex-wrap: wrap;
-      margin: 20px 0;
+      margin: 4px 0 22px;
     }
     .promise-item {
       display: flex;
       align-items: center;
       gap: 7px;
-      font-size: 14px;
+      font-size: 13.5px;
       font-weight: 600;
       color: var(--success);
+      background: rgba(30, 142, 62, 0.07);
+      border: 1px solid rgba(30, 142, 62, 0.14);
+      padding: 5px 11px 5px 8px;
+      border-radius: 999px;
     }
 
     /* ---- FAQ ---- */
     .faq-item {
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       overflow: hidden;
       box-shadow: var(--shadow-sm);
+      background: var(--bg-secondary);
     }
     .faq-q {
       width: 100%;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 13px 16px;
+      gap: 16px;
+      padding: 14px 16px;
       background: var(--bg-secondary);
       border: none;
       color: var(--text-primary);
-      font-size: 14px;
+      font-size: 14.5px;
       font-weight: 600;
       cursor: pointer;
       text-align: left;
+      font-family: inherit;
+      line-height: 1.4;
       transition: background 0.15s;
     }
     .faq-q:hover { background: var(--bg-hover); }
@@ -465,12 +628,13 @@
       flex-shrink: 0;
       color: var(--text-muted);
     }
-    .faq-item.open .faq-chevron { transform: rotate(180deg); }
+    .faq-item.open .faq-chevron,
+    .faq-q[aria-expanded="true"] .faq-chevron { transform: rotate(180deg); }
     .faq-a {
       display: none;
-      padding: 0 16px 14px;
+      padding: 0 16px 16px;
       background: var(--bg-secondary);
-      font-size: 13.5px;
+      font-size: 14px;
       color: var(--text-secondary);
       line-height: 1.7;
     }
@@ -513,9 +677,9 @@
       position: fixed;
       bottom: 28px;
       right: 28px;
-      width: 38px;
-      height: 38px;
-      border-radius: 8px;
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
       background: var(--bg-secondary);
       border: 1px solid var(--border);
       color: var(--text-muted);
@@ -523,7 +687,7 @@
       display: none;
       align-items: center;
       justify-content: center;
-      transition: all 0.2s;
+      transition: border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
       z-index: 50;
       box-shadow: var(--shadow-md);
     }
@@ -533,7 +697,7 @@
     /* ---- FOOTER ---- */
     .site-footer {
       margin-left: var(--sidebar-w);
-      padding: 24px 48px;
+      padding: 28px 48px 32px;
       border-top: 1px solid var(--border);
       display: flex;
       align-items: center;
@@ -542,6 +706,7 @@
       gap: 12px;
       font-size: 13px;
       color: var(--text-muted);
+      background: var(--bg-secondary);
     }
     .site-footer a { color: var(--text-secondary); }
     .site-footer a:hover { color: var(--text-primary); }
@@ -551,7 +716,7 @@
     .release {
       background: var(--bg-secondary);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 22px 24px 18px;
       margin: 20px 0 28px;
       box-shadow: var(--shadow-sm);
@@ -660,20 +825,28 @@
       .highlight-grid { grid-template-columns: 1fr; }
       .mobile-toggle { display: block; }
       .header-nav { display: none; }
+      .header-cta { margin-left: auto; }
       .overlay {
         position: fixed;
         inset: 0;
         top: var(--header-h);
-        background: rgba(0,0,0,0.25);
+        background: rgba(22, 24, 31, 0.32);
         z-index: 250;
         display: none;
       }
       .overlay.open { display: block; }
     }
     @media (max-width: 600px) {
-      .promise-row { flex-direction: column; gap: 10px; }
-      .main h1 { font-size: 26px; }
+      .promise-row { flex-direction: row; gap: 8px; }
+      .main h1 { font-size: 30px; }
       .main h2 { font-size: 20px; }
+      .lede { font-size: 16px !important; }
+      .download-box { padding: 28px 18px 24px; }
+      .hero-actions .btn { width: 100%; justify-content: center; }
+    }
+
+    @media (max-width: 400px) {
+      .brand-text { display: none; }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -686,20 +859,20 @@
   </style>
 </head>
 <body>
+<a href="#top" class="skip-link">Skip to content</a>
 
 <!-- Header -->
 <header class="site-header">
   <div class="header-inner">
-    <button class="mobile-toggle" onclick="toggleSidebar()" aria-label="Toggle navigation">
+    <button class="mobile-toggle" type="button" onclick="toggleSidebar()" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7h18M3 12h18M3 17h18"/></svg>
     </button>
-    <a href="#" class="brand">
-      <span class="brand-icon"><img src="favicon.png" alt="Ember icon"></span>
+    <a href="#introduction" class="brand">
+      <span class="brand-icon"><img src="favicon.png" alt=""></span>
       <span class="brand-text">EMBER</span>
     </a>
-    <nav class="header-nav">
+    <nav class="header-nav" aria-label="Primary">
       <a href="#highlights">Features</a>
-      <a href="#download">Download</a>
       <a href="#releases">Releases</a>
       <a href="#epx">EPX</a>
       <a href="#friends">Friends</a>
@@ -709,6 +882,7 @@
         GitHub
       </a>
     </nav>
+    <a href="#download" class="header-cta">Download</a>
   </div>
 </header>
 
@@ -716,7 +890,9 @@
 <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
 
 <!-- Sidebar -->
-<aside class="sidebar" id="sidebar">
+<aside class="sidebar" id="sidebar" aria-label="On this page">
+  <div class="sidebar-label">On this page</div>
+  <nav class="sidebar-nav">
 
   <div class="toc-section">
     <span class="toc-heading">Overview</span>
@@ -773,6 +949,7 @@
     <a href="#support" class="toc-link">Report an Issue</a>
   </div>
 
+  </nav>
 </aside>
 
 <!-- Main Content -->
@@ -781,8 +958,16 @@
 
   <!-- Introduction -->
   <section id="introduction">
+    <p class="eyebrow">Open-source P2P for Windows</p>
     <h1>Ember</h1>
-    <p>A modern, open-source P2P file sharing client built on the <strong>eMule KAD network</strong>. Ground-up rewrite with Rust &amp; Tauri for speed, safety, and simplicity.</p>
+    <p class="lede">A modern, open-source P2P file sharing client built on the <strong>eMule KAD network</strong>. Ground-up rewrite with Rust &amp; Tauri for speed, safety, and simplicity.</p>
+    <div class="hero-actions">
+      <a href="#download" class="btn btn-primary">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download Ember
+      </a>
+      <a href="#getting-started" class="btn btn-secondary">Get started</a>
+    </div>
 
     <div class="promise-row">
       <div class="promise-item">
@@ -813,6 +998,7 @@
   <!-- Highlights -->
   <section id="highlights">
     <h2>Highlights</h2>
+    <p class="section-lead">The same eMule network, with a modern app around it.</p>
     <div class="highlight-grid">
       <div class="hl-card">
         <div class="hl-icon">&#x1F9F1;</div>
@@ -874,9 +1060,10 @@
     <h2>Download &amp; Installation</h2>
 
     <div class="download-box">
-      <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
+      <img src="icon.png" alt="" width="80" height="80">
       <h3>Get Ember 1.5.3</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
+      <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -1403,9 +1590,10 @@ npm run tauri build</code></pre>
   <!-- FAQ -->
   <section id="faq">
     <h2>FAQ</h2>
+    <p class="section-lead">Answers to the questions people ask most. Click a question to expand it.</p>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Is Ember compatible with regular eMule clients?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1413,7 +1601,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         How do I move Ember to a new PC without losing my credits?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1421,7 +1609,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         What is the Ember Network, and do I need to set it up?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1429,7 +1617,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         If the Ember Network is decentralized, why do I still need KAD or a server?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1437,7 +1625,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         My Ember Network page says &ldquo;Connecting&rdquo; or &ldquo;No peers found&rdquo; &mdash; is it broken?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1445,7 +1633,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         What is EPX and do I need it?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1453,7 +1641,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Is ED2K Low ID the same as KAD Firewalled?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1461,7 +1649,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         How do I get High ID?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1469,7 +1657,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         How do Friends work? Can I add non-Ember users?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1477,7 +1665,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Is friend chat end-to-end encrypted?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1485,7 +1673,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         What are credits and how do they work?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1493,7 +1681,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Does Ember work on macOS or Linux?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1501,7 +1689,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         How does Ember update itself?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1509,7 +1697,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Is Ember open source?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -1517,7 +1705,7 @@ npm run tauri build</code></pre>
     </div>
 
     <div class="faq-item">
-      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
         Is Ember a fork of eMule?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
@@ -2822,22 +3010,43 @@ npm run tauri build</code></pre>
 </footer>
 
 <!-- Back to Top -->
-<button class="back-to-top" id="backToTop" onclick="window.scrollTo({top:0})" aria-label="Back to top">
+<button class="back-to-top" id="backToTop" type="button" onclick="window.scrollTo({top:0})" aria-label="Back to top">
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="18 15 12 9 6 15"/></svg>
 </button>
 
 <script>
 (function() {
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('overlay');
+  var menuBtn = document.querySelector('.mobile-toggle');
+  var header = document.querySelector('.site-header');
+
+  function setSidebar(open) {
+    sidebar.classList.toggle('open', open);
+    overlay.classList.toggle('open', open);
+    if (menuBtn) {
+      menuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      menuBtn.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+    }
+  }
+
   window.toggleSidebar = function() {
-    document.getElementById('sidebar').classList.toggle('open');
-    document.getElementById('overlay').classList.toggle('open');
+    setSidebar(!sidebar.classList.contains('open'));
+  };
+
+  window.toggleFaq = function(btn) {
+    var item = btn.parentElement;
+    var open = !item.classList.contains('open');
+    item.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   };
 
   document.querySelectorAll('.toc-link').forEach(function(link) {
-    link.addEventListener('click', function() {
-      document.getElementById('sidebar').classList.remove('open');
-      document.getElementById('overlay').classList.remove('open');
-    });
+    link.addEventListener('click', function() { setSidebar(false); });
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') setSidebar(false);
   });
 
   var tocLinks = document.querySelectorAll('.toc-link');
@@ -2850,6 +3059,7 @@ npm run tauri build</code></pre>
     }
   });
 
+  var lastActive = null;
   function updateActive() {
     var scrollY = window.scrollY + 80;
     var active = null;
@@ -2859,23 +3069,32 @@ npm run tauri build</code></pre>
         break;
       }
     }
+    if (active === lastActive) return;
+    lastActive = active;
     tocLinks.forEach(function(l) { l.classList.remove('active'); });
-    if (active) active.classList.add('active');
+    if (active) {
+      active.classList.add('active');
+      if (typeof active.scrollIntoView === 'function') {
+        active.scrollIntoView({ block: 'nearest' });
+      }
+    }
   }
 
   var btt = document.getElementById('backToTop');
-  function updateBTT() {
+  function updateChrome() {
+    if (window.scrollY > 8) header.classList.add('scrolled');
+    else header.classList.remove('scrolled');
     if (window.scrollY > 400) btt.classList.add('visible');
     else btt.classList.remove('visible');
   }
 
   window.addEventListener('scroll', function() {
     updateActive();
-    updateBTT();
+    updateChrome();
   }, { passive: true });
 
   updateActive();
-  updateBTT();
+  updateChrome();
 })();
 </script>
 
