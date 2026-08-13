@@ -14,12 +14,22 @@ use tracing::{debug, info};
 /// quiet. This is the *primary* signal for NAT type — if every entry
 /// here fails, hole-punch falls back to the HighID-derived heuristic
 /// in `mod.rs`.
+///
+/// Providers alternate rather than being grouped. Two readings only say
+/// something about the NAT when they come from *different* reflector
+/// addresses (see [`probe_nat_with_replies`]), and the three
+/// `stunN.l.google.com` names all resolve to a single anycast address —
+/// listing them consecutively meant the first two successes were routinely
+/// the same host answering twice. The keep-alive in
+/// [`super::mapping_keepalive`] walks this same list round-robin, so the
+/// order also decides whether *its* consecutive cycles compare distinct
+/// vantage points.
 pub(crate) const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
-    "stun1.l.google.com:19302",
-    "stun2.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "global.stun.twilio.com:3478",
+    "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
 ];
 
 pub(crate) const STUN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -177,6 +187,10 @@ pub struct FriendNatContext {
     pub nat_type: NatType,
     pub external_addr: Option<SocketAddr>,
     pub quic_endpoint: Option<Arc<quinn::Endpoint>>,
+    /// Public UDP port of `quic_endpoint`'s socket, discovered by STUN when it
+    /// was created. `None` falls back to the bound port, which is only the
+    /// same thing when the NAT preserves ports.
+    pub quic_public_port: Option<u16>,
 }
 
 pub type SharedFriendNatContext = Arc<std::sync::RwLock<FriendNatContext>>;
@@ -193,13 +207,41 @@ pub(crate) async fn probe_nat_with_replies(
     local_socket: Arc<UdpSocket>,
     mut replies: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
 ) -> NatInfo {
-    let mut results = Vec::new();
+    // `(reflector, mapped)` pairs, holding at most one entry per reflector
+    // *address*.
+    let mut results: Vec<(SocketAddr, SocketAddr)> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
     for server_str in DEFAULT_STUN_SERVERS.iter() {
-        match try_stun_server_with_replies(&local_socket, &mut replies, server_str).await {
+        let server_addr = match resolve_stun_server(server_str).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("STUN server {server_str} failed: {e}");
+                failures.push(format!("{server_str}: {e}"));
+                continue;
+            }
+        };
+        // A symmetric NAT re-maps per destination, so a second reading from a
+        // reflector we already queried proves nothing — it is the same
+        // destination and therefore the same mapping. Several entries in
+        // `DEFAULT_STUN_SERVERS` are aliases for one anycast address, so
+        // without this the probe could finish with two readings that could
+        // never disagree and classify a symmetric NAT as a cone.
+        if results
+            .iter()
+            .any(|(prev, _)| prev.ip() == server_addr.ip())
+        {
+            debug!(
+                "STUN server {server_str} skipped: {} already probed",
+                server_addr.ip()
+            );
+            continue;
+        }
+        match try_stun_server_with_replies(&local_socket, &mut replies, server_str, server_addr)
+            .await
+        {
             Ok(addr) => {
-                results.push(addr);
+                results.push((server_addr, addr));
                 if results.len() >= 2 {
                     break;
                 }
@@ -211,12 +253,41 @@ pub(crate) async fn probe_nat_with_replies(
         }
     }
 
-    build_nat_info_from_results(&local_socket, results, failures)
+    let local_ip = local_probe_ip(&local_socket, results.first().map(|(server, _)| *server));
+    build_nat_info_from_results(local_ip, results, failures)
+}
+
+/// Our own address on the interface that reaches `reflector`, for the "no NAT
+/// at all" comparison in [`build_nat_info_from_results`].
+///
+/// The KAD socket this probe borrows is bound to `0.0.0.0`, so its
+/// `local_addr()` only ever reports the wildcard — which never equals a
+/// STUN-mapped address, so the `Open` arm could not be reached on any host.
+/// Connecting a throwaway UDP socket sends nothing; it just asks the routing
+/// table which source address would be used.
+fn local_probe_ip(local_socket: &UdpSocket, reflector: Option<SocketAddr>) -> Option<IpAddr> {
+    match local_socket.local_addr() {
+        Ok(addr) if !addr.ip().is_unspecified() => return Some(addr.ip()),
+        _ => {}
+    }
+    let reflector = reflector?;
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    probe.connect(reflector).ok()?;
+    let addr = probe.local_addr().ok()?;
+    (!addr.ip().is_unspecified()).then_some(addr.ip())
+}
+
+async fn resolve_stun_server(server: &str) -> Result<SocketAddr, String> {
+    tokio::net::lookup_host(server)
+        .await
+        .map_err(|e| format!("DNS resolve {server}: {e}"))?
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| format!("No IPv4 address for {server}"))
 }
 
 fn build_nat_info_from_results(
-    local_socket: &UdpSocket,
-    results: Vec<SocketAddr>,
+    local_ip: Option<IpAddr>,
+    results: Vec<(SocketAddr, SocketAddr)>,
     failures: Vec<String>,
 ) -> NatInfo {
     if results.is_empty() {
@@ -243,48 +314,47 @@ fn build_nat_info_from_results(
         };
     }
 
-    let external_addr = results[0];
-    let local_addr = local_socket.local_addr().ok();
+    let external_addr = results[0].1;
 
-    let nat_type = if let Some(local) = local_addr {
-        if local.ip() == external_addr.ip()
-            && !local.ip().is_loopback()
-            && !local.ip().is_unspecified()
-        {
-            NatType::Open
-        } else if results.len() >= 2 && results[0].port() != results[1].port() {
-            info!(
-                "NAT probe: symmetric NAT detected (ports {} vs {})",
-                results[0].port(),
-                results[1].port()
-            );
-            NatType::Symmetric
-        } else if results.len() >= 2 {
-            // Deliberate simplification: comparing the mapped port across
-            // two independent STUN servers can only distinguish Symmetric
-            // NAT (port changes per destination) from "some cone type"
-            // (port stays consistent) — it can't tell Full Cone,
-            // Restricted Cone, and Port-Restricted Cone apart, since that
-            // requires a STUN CHANGE-REQUEST test (asking a server to
-            // reply from a different IP/port) which this prober doesn't
-            // send. `PortRestricted` is used as the conservative default
-            // for "consistent port, filtering unknown" — the punch gate
-            // only rejects `Symmetric`, so this is treated the same as the
-            // friendlier cone types and hole-punch strategy selection
-            // isn't affected by not producing `FullCone`/`RestrictedCone`.
-            info!(
-                "NAT probe: port-restricted or better NAT (consistent port {})",
-                external_addr.port()
-            );
-            NatType::PortRestricted
-        } else {
-            info!(
-                "NAT probe: only 1 STUN reply (mapped {}), leaving NAT type Unknown",
-                external_addr,
-            );
-            NatType::Unknown
-        }
+    // Every entry in `results` came from a distinct reflector address, so a
+    // second entry is a genuinely independent vantage point.
+    let nat_type = if local_ip
+        .is_some_and(|ip| ip == external_addr.ip() && !ip.is_loopback() && !ip.is_unspecified())
+    {
+        info!("NAT probe: local address {external_addr} is the mapped address — no NAT");
+        NatType::Open
+    } else if results.len() >= 2 && results[0].1.port() != results[1].1.port() {
+        info!(
+            "NAT probe: symmetric NAT detected (ports {} vs {})",
+            results[0].1.port(),
+            results[1].1.port()
+        );
+        NatType::Symmetric
+    } else if results.len() >= 2 {
+        // Deliberate simplification: comparing the mapped port across
+        // two independent STUN servers can only distinguish Symmetric
+        // NAT (port changes per destination) from "some cone type"
+        // (port stays consistent) — it can't tell Full Cone,
+        // Restricted Cone, and Port-Restricted Cone apart, since that
+        // requires a STUN CHANGE-REQUEST test (asking a server to
+        // reply from a different IP/port) which this prober doesn't
+        // send. `PortRestricted` is used as the conservative default
+        // for "consistent port, filtering unknown" — the punch gate
+        // only rejects `Symmetric`, so this is treated the same as the
+        // friendlier cone types and hole-punch strategy selection
+        // isn't affected by not producing `FullCone`/`RestrictedCone`.
+        info!(
+            "NAT probe: port-restricted or better NAT (consistent port {} from {} and {})",
+            external_addr.port(),
+            results[0].0.ip(),
+            results[1].0.ip()
+        );
+        NatType::PortRestricted
     } else {
+        info!(
+            "NAT probe: only 1 usable STUN reply (mapped {}), leaving NAT type Unknown",
+            external_addr,
+        );
         NatType::Unknown
     };
 
@@ -309,13 +379,8 @@ async fn try_stun_server_with_replies(
     socket: &UdpSocket,
     replies: &mut mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     server: &str,
+    server_addr: SocketAddr,
 ) -> Result<SocketAddr, String> {
-    let server_addr: SocketAddr = tokio::net::lookup_host(server)
-        .await
-        .map_err(|e| format!("DNS resolve {server}: {e}"))?
-        .find(|a| a.is_ipv4())
-        .ok_or_else(|| format!("No IPv4 address for {server}"))?;
-
     let txn_id: [u8; 12] = rand::random();
     let request = build_binding_request(&txn_id);
 
@@ -490,6 +555,109 @@ mod tests {
         assert!(!NatType::Symmetric.can_punch_with(&NatType::Symmetric));
         assert!(!NatType::Symmetric.can_punch_with(&NatType::PortRestricted));
         assert!(!NatType::PortRestricted.can_punch_with(&NatType::Symmetric));
+    }
+
+    fn reading(server: &str, mapped: &str) -> (SocketAddr, SocketAddr) {
+        (server.parse().unwrap(), mapped.parse().unwrap())
+    }
+
+    /// The reflector list is walked in order and the probe stops after two
+    /// readings, so grouping one provider's aliases at the front made the two
+    /// readings come from a single address — which cannot disagree, and so
+    /// could never expose a symmetric NAT.
+    #[test]
+    fn default_stun_servers_lead_with_distinct_providers() {
+        let provider = |server: &str| {
+            if server.contains(".l.google.com") {
+                "google"
+            } else if server.contains("cloudflare") {
+                "cloudflare"
+            } else {
+                "other"
+            }
+        };
+        assert!(DEFAULT_STUN_SERVERS.len() >= 2);
+        assert_ne!(
+            provider(DEFAULT_STUN_SERVERS[0]),
+            provider(DEFAULT_STUN_SERVERS[1]),
+        );
+    }
+
+    #[test]
+    fn two_reflectors_disagreeing_on_port_is_symmetric() {
+        let info = build_nat_info_from_results(
+            Some("192.168.1.5".parse().unwrap()),
+            vec![
+                reading("74.125.250.129:19302", "1.2.3.4:5000"),
+                reading("162.159.207.0:3478", "1.2.3.4:6000"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::Symmetric);
+        assert_eq!(info.external_addr, Some("1.2.3.4:5000".parse().unwrap()));
+    }
+
+    #[test]
+    fn two_reflectors_agreeing_on_port_is_port_restricted() {
+        let info = build_nat_info_from_results(
+            Some("192.168.1.5".parse().unwrap()),
+            vec![
+                reading("74.125.250.129:19302", "1.2.3.4:5000"),
+                reading("162.159.207.0:3478", "1.2.3.4:5000"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::PortRestricted);
+    }
+
+    /// One vantage point says nothing about per-destination re-mapping, so the
+    /// type stays `Unknown` and the address is still reported.
+    #[test]
+    fn a_single_reflector_leaves_the_type_unknown() {
+        let info = build_nat_info_from_results(
+            Some("192.168.1.5".parse().unwrap()),
+            vec![reading("74.125.250.129:19302", "1.2.3.4:5000")],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::Unknown);
+        assert_eq!(info.external_addr, Some("1.2.3.4:5000".parse().unwrap()));
+    }
+
+    /// A host whose own interface address is the mapped address has no NAT in
+    /// front of it. The probe socket is bound to `0.0.0.0`, so this only works
+    /// because the caller resolves the real outbound address first.
+    #[test]
+    fn mapped_address_equal_to_the_local_address_is_open() {
+        let info = build_nat_info_from_results(
+            Some("1.2.3.4".parse().unwrap()),
+            vec![reading("74.125.250.129:19302", "1.2.3.4:5000")],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::Open);
+    }
+
+    #[test]
+    fn a_wildcard_local_address_does_not_classify_as_open() {
+        let info = build_nat_info_from_results(
+            None,
+            vec![
+                reading("74.125.250.129:19302", "1.2.3.4:5000"),
+                reading("162.159.207.0:3478", "1.2.3.4:5000"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::PortRestricted);
+    }
+
+    #[test]
+    fn no_replies_leaves_everything_unknown() {
+        let info = build_nat_info_from_results(
+            Some("192.168.1.5".parse().unwrap()),
+            Vec::new(),
+            vec!["stun.example:timeout".to_string()],
+        );
+        assert_eq!(info.nat_type, NatType::Unknown);
+        assert_eq!(info.external_addr, None);
     }
 
     #[test]

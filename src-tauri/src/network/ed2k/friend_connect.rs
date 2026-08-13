@@ -793,9 +793,14 @@ pub async fn connect_friend_with_fallback(
     // stale by a wide margin — most importantly, `external_addr`/`nat_type`
     // may have still been `Unknown`/`None` (probe not yet finished) at spawn
     // time but resolved by now. See `FriendNatContext`'s doc comment.
-    let (our_nat_type, our_external_addr, quic_endpoint) = {
+    let (our_nat_type, our_external_addr, quic_endpoint, our_quic_public_port) = {
         let ctx = nat_ctx.read().unwrap_or_else(|p| p.into_inner());
-        (ctx.nat_type, ctx.external_addr, ctx.quic_endpoint.clone())
+        (
+            ctx.nat_type,
+            ctx.external_addr,
+            ctx.quic_endpoint.clone(),
+            ctx.quic_public_port,
+        )
     };
 
     if let (Some(endpoint), Some(ext_addr), Some(punch_secret)) = (
@@ -807,6 +812,7 @@ pub async fn connect_friend_with_fallback(
             match punch_friend(
                 &rendezvous_url,
                 endpoint,
+                our_quic_public_port,
                 our_ember_hash,
                 expected_ember_hash,
                 ext_addr,
@@ -926,24 +932,31 @@ pub async fn connect_friend_with_fallback(
 /// here: each side's normal reconnect attempt already plays both parts,
 /// since [`connect_friend_with_fallback`] is exactly what runs whenever
 /// either side's retry loop wakes up for this friend.
+#[allow(clippy::too_many_arguments)]
 async fn punch_friend(
     rendezvous_url: &str,
     endpoint: &quinn::Endpoint,
+    our_quic_public_port: Option<u16>,
     our_ember_hash: [u8; 16],
     friend_ember_hash: [u8; 16],
     our_external_addr: SocketAddr,
     our_nat_type: crate::network::ember::nat::NatType,
     secret_key: &[u8; 32],
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-    // Register the port our QUIC endpoint is actually bound to, not
+    // Register a port on the QUIC endpoint's own socket, not
     // `our_external_addr.port()` — that address comes from the KAD UDP
     // STUN probe (a *different* socket than the QUIC endpoint the friend
     // will actually dial), so advertising it here would misdirect the
     // friend's `punch_quic` connect at a socket we're not listening on.
-    let advertise_port = endpoint
-        .local_addr()
-        .map(|a| a.port())
-        .unwrap_or_else(|_| our_external_addr.port());
+    //
+    // Prefer that socket's own STUN reading: a NAT that re-maps ports (CGNAT)
+    // gives it a public port unrelated to the bound one, and the friend dials
+    // from outside the NAT. The bound port is the fallback, correct whenever
+    // the NAT preserves ports or UPnP forwarded it.
+    let advertise_port = our_quic_public_port
+        .filter(|port| *port != 0)
+        .or_else(|| endpoint.local_addr().map(|a| a.port()).ok())
+        .unwrap_or_else(|| our_external_addr.port());
     // Bind the exact observed/canonical external IP into the signed register
     // payload — port alone is insufficient after the rendezvous IP-binding change.
     crate::network::ember::relay::register_punch_with_ip(

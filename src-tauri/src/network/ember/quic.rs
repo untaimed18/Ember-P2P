@@ -417,6 +417,79 @@ impl rustls::server::danger::ClientCertVerifier for EmberClientCertVerifier {
     }
 }
 
+/// Total time [`stun_public_port`] may spend, DNS included. This runs inline
+/// on the network loop while the endpoint is being created, so it is budgeted
+/// to stay well under one UDP batch rather than to be thorough: a miss costs
+/// only the bound port as fallback, which is what we advertised before.
+const QUIC_STUN_BUDGET: Duration = Duration::from_millis(1000);
+/// Per-reflector wait inside that budget. Generous next to a typical STUN
+/// round trip, and small enough that a dead reflector still leaves room to
+/// try the next one.
+const QUIC_STUN_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Discover the public UDP endpoint of the QUIC socket with a STUN Binding
+/// transaction, run before quinn takes ownership of it.
+///
+/// Hole-punch registrations advertise a port a *friend* will dial from the
+/// outside, so it has to be the port the NAT mapped this socket to. The KAD
+/// socket's STUN result cannot stand in for it: NAT mappings are per-socket,
+/// so on a re-mapping (CGNAT) NAT the two sockets get different public ports,
+/// and the friend's inbound packets land on a port nothing is listening on.
+/// Advertising the bound port is only correct when the NAT preserves ports or
+/// UPnP forwarded it.
+///
+/// This is the one moment the question can be asked. Quinn owns the socket
+/// from `Endpoint::new` onwards and never surfaces a datagram it can't parse
+/// as QUIC, so a later probe would send a request whose reply we could not
+/// read. Consequently the answer is a snapshot: a NAT that drops the mapping
+/// while idle can move the port afterwards, and the punch then falls back to
+/// the same relay path it uses today.
+async fn stun_public_port(socket: &tokio::net::UdpSocket) -> Option<u16> {
+    let probe = async {
+        let mut buf = [0u8; 512];
+        for server in super::nat::DEFAULT_STUN_SERVERS.iter() {
+            let Ok(mut addrs) = tokio::net::lookup_host(server).await else {
+                continue;
+            };
+            let Some(server_addr) = addrs.find(|a| a.is_ipv4()) else {
+                continue;
+            };
+            let txn_id: [u8; 12] = rand::random();
+            if socket
+                .send_to(&super::nat::build_binding_request(&txn_id), server_addr)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let deadline = tokio::time::Instant::now() + QUIC_STUN_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+                    // A conformant server answers from the address it was
+                    // queried on; anything else is another service's traffic.
+                    Ok(Ok((len, from))) if from == server_addr => {
+                        if let Ok(mapped) = super::nat::parse_binding_response(&buf[..len], &txn_id)
+                        {
+                            return Some(mapped.port());
+                        }
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+        }
+        None
+    };
+    tokio::time::timeout(QUIC_STUN_BUDGET, probe)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Create a QUIC endpoint that can both accept incoming connections (relay server)
 /// and make outgoing ones (hole-punch/relay client). Binds to `0.0.0.0:{bind_port}`
 /// on UDP — this coexists with any TCP listener on the same port number, but
@@ -427,11 +500,17 @@ impl rustls::server::danger::ClientCertVerifier for EmberClientCertVerifier {
 /// returned endpoint to learn the *actual* bound port — callers that advertise
 /// the QUIC port (e.g. rendezvous registration) must use that value, not the
 /// originally-requested one.
-pub fn build_server_client_endpoint(
+///
+/// With `probe_public_port` set, the returned `Option<u16>` is the socket's
+/// STUN-discovered public port (see [`stun_public_port`]) — what a peer must
+/// dial to reach this endpoint from outside the NAT. `None` means the probe
+/// was skipped or got no answer, and callers should advertise the bound port.
+pub async fn build_server_client_endpoint(
     cert_der: &[u8],
     key_der: &[u8],
     bind_port: u16,
-) -> anyhow::Result<Endpoint> {
+    probe_public_port: bool,
+) -> anyhow::Result<(Endpoint, Option<u16>)> {
     let server_config = build_server_config(cert_der, key_der)?;
     let client_config = build_client_config(cert_der, key_der, None)?;
 
@@ -460,6 +539,32 @@ pub fn build_server_client_endpoint(
                 continue;
             }
         };
+        // Borrow the socket for the STUN transaction and hand it straight back:
+        // quinn wants a `std` socket, and once it has one nothing else can read
+        // from it. A conversion failure is treated like a bind failure so the
+        // next candidate port is still tried.
+        let (socket, public_port) = if probe_public_port {
+            let tokio_socket = match socket
+                .set_nonblocking(true)
+                .and_then(|()| tokio::net::UdpSocket::from_std(socket))
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
+                    continue;
+                }
+            };
+            let public_port = stun_public_port(&tokio_socket).await;
+            match tokio_socket.into_std() {
+                Ok(s) => (s, public_port),
+                Err(e) => {
+                    last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
+                    continue;
+                }
+            }
+        } else {
+            (socket, None)
+        };
         match Endpoint::new(
             EndpointConfig::default(),
             Some(server_config.clone()),
@@ -479,7 +584,19 @@ pub fn build_server_client_endpoint(
                     // (rendezvous, friend presence, …) needs to read it back.
                     info!("QUIC requested port {bind_port} unavailable; bound on {local} instead",);
                 }
-                return Ok(endpoint);
+                match public_port {
+                    Some(port) if port != local.port() => info!(
+                        "QUIC endpoint public UDP port is {port} (NAT re-maps local {})",
+                        local.port()
+                    ),
+                    Some(_) => info!("QUIC endpoint public UDP port matches local {}", local.port()),
+                    None if probe_public_port => info!(
+                        "QUIC endpoint public UDP port unknown (STUN got no reply); advertising local {}",
+                        local.port()
+                    ),
+                    None => {}
+                }
+                return Ok((endpoint, public_port));
             }
             Err(e) => {
                 last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
@@ -580,8 +697,12 @@ mod tests {
         let (s_cert, s_key) = generate_self_signed_cert(&server_key).unwrap();
         let (c_cert, c_key) = generate_self_signed_cert(&client_key).unwrap();
 
-        let server = build_server_client_endpoint(&s_cert, &s_key, 0).unwrap();
-        let client = build_server_client_endpoint(&c_cert, &c_key, 0).unwrap();
+        let (server, _) = build_server_client_endpoint(&s_cert, &s_key, 0, false)
+            .await
+            .unwrap();
+        let (client, _) = build_server_client_endpoint(&c_cert, &c_key, 0, false)
+            .await
+            .unwrap();
         // The endpoint binds to 0.0.0.0:<port>; quinn refuses to *connect* to an
         // unspecified address, so dial the loopback with the OS-assigned port.
         let server_addr = SocketAddr::new(

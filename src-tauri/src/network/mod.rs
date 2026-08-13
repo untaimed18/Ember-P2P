@@ -339,6 +339,22 @@ fn advertised_udp_port(state: &NetworkState) -> u16 {
         .unwrap_or(state.udp_port)
 }
 
+/// The QUIC port a *peer* should dial: the public port STUN found for the QUIC
+/// socket at bind time, falling back to the bound port.
+///
+/// The two differ only on a NAT that re-maps ports (CGNAT), and only the public
+/// one is reachable there. This is deliberately not `advertised_udp_port`: that
+/// tracks the KAD socket, and NAT mappings are per-socket, so its public port
+/// says nothing about where QUIC can be reached. `None` means no QUIC endpoint
+/// is bound yet.
+fn advertised_quic_port(state: &NetworkState) -> Option<u16> {
+    state
+        .quic_public_port
+        .filter(|p| *p != 0)
+        .or(state.quic_port)
+        .filter(|p| *p != 0)
+}
+
 /// Whether STUN keep-alive should actively refresh/advertise mappings.
 /// Symmetric / unstable remapping (typical VPN) must not override Settings ports.
 fn mapping_probe_allowed_by_activity(
@@ -1393,7 +1409,9 @@ fn sign_local_relay_attestation(
         return None;
     }
     let relay_ip = state.external_ip?;
-    let relay_port = state.quic_port?;
+    // Peers dial this over QUIC from outside, so it must be the public port,
+    // not the bound one (see `advertised_quic_port`).
+    let relay_port = advertised_quic_port(state)?;
     state
         .connection_broker
         .as_ref()
@@ -2456,7 +2474,7 @@ async fn request_friend_transfer(
     let transport = friend_xfer_transport_choice(
         state.firewalled,
         advertised_tcp_port(state),
-        state.quic_port,
+        advertised_quic_port(state),
         state.nat_info.nat_type,
         state.nat_info.external_addr,
         state.rendezvous_registered,
@@ -2852,7 +2870,7 @@ async fn friend_transfer_request_status(
     let can_punch = friend_xfer_transport_choice(
         true, // ignore our own TCP reachability: the friend asked for a punch
         0,
-        state.quic_port,
+        advertised_quic_port(state),
         state.nat_info.nat_type,
         state.nat_info.external_addr,
         state.rendezvous_registered,
@@ -9045,6 +9063,15 @@ struct NetworkState {
     /// reachability (rendezvous registration / heartbeat) must read
     /// from here, not from `settings.tcp_port`.
     quic_port: Option<u16>,
+    /// Public UDP port of the QUIC socket, discovered by a STUN transaction
+    /// run on that socket before quinn took ownership of it. `None` when the
+    /// probe found nothing, in which case `quic_port` is the best guess.
+    ///
+    /// Separate from `quic_port` because a re-mapping NAT gives them different
+    /// values, and every consumer wants one specific side of that: UPnP maps
+    /// the *bound* port, while anything a peer dials needs the *public* one
+    /// (read it through `advertised_quic_port`).
+    quic_public_port: Option<u16>,
     upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     ip_filter: IpFilter,
@@ -13764,6 +13791,7 @@ pub async fn start_network(
         tcp_port,
         udp_port,
         quic_port: None,
+        quic_public_port: None,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
@@ -21737,13 +21765,18 @@ pub async fn start_network(
                                     &cert_der,
                                     &key_der,
                                     state.tcp_port,
-                                ) {
-                                    Ok(ep) => {
+                                    true,
+                                ).await {
+                                    Ok((ep, public_port)) => {
                                         let bound_port = ep
                                             .local_addr()
                                             .map(|a| a.port())
                                             .unwrap_or(state.tcp_port);
                                         state.quic_port = Some(bound_port);
+                                        // Only the socket's own STUN reading can
+                                        // say where a peer reaches QUIC; see
+                                        // `advertised_quic_port`.
+                                        state.quic_public_port = public_port;
                                         let ep_arc = std::sync::Arc::new(ep);
                                         broker.set_quic_endpoint(ep_arc.clone());
                                         tracing::info!(
@@ -21806,8 +21839,9 @@ pub async fn start_network(
                         // dial spawned before this point would otherwise
                         // have captured `quic_endpoint: None` forever.
                         if let Some(ep) = broker.quic_endpoint() {
-                            state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner()).quic_endpoint =
-                                Some(ep.clone());
+                            let mut ctx = state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner());
+                            ctx.quic_endpoint = Some(ep.clone());
+                            ctx.quic_public_port = state.quic_public_port;
                         }
                         state.connection_broker = Some(broker);
                         state.broker_event_rx = Some(broker_rx);
@@ -22369,10 +22403,12 @@ pub async fn start_network(
                             // the payload value carried in the signed v2 punch record,
                             // not the lookup key, and the initiator's
                             // `punch_quic` call connects over QUIC — so it must
-                            // land on our actual bound QUIC socket, not the
+                            // land on our actual QUIC socket, not the
                             // NAT-probed KAD UDP port `nat_info.external_addr`
-                            // reflects.
-                            let advertised_quic_port = state.quic_port.unwrap_or(state.tcp_port);
+                            // reflects. Behind a re-mapping NAT the bound port
+                            // isn't reachable either, hence the public one.
+                            let advertised_quic_port =
+                                advertised_quic_port(&state).unwrap_or(state.tcp_port);
                             let rv_url = settings.rendezvous_url.clone();
                             let our_nat_type = state.nat_info.nat_type;
                             let our_ext_addr = state.nat_info.external_addr;
@@ -29670,6 +29706,20 @@ pub async fn start_network(
                         // keep-alive confirmation defeats the dedicated
                         // NAT-type probe (and therefore auto-suspend).
                         state.nat_info.external_addr = Some(mapped);
+                        // Friend dials read the address from here, and the
+                        // hole-punch is skipped outright while it is `None`.
+                        // The re-mapped branch of `apply_udp_mapping_keepalive`
+                        // publishes it, but the 1:1 branch — the common
+                        // outcome, and one that lands within seconds of
+                        // startup — used to leave friends waiting for the
+                        // dedicated probe to finish before punch was possible.
+                        {
+                            let mut ctx = state
+                                .friend_nat_context
+                                .write()
+                                .unwrap_or_else(|p| p.into_inner());
+                            ctx.external_addr = Some(mapped);
+                        }
                     }
                 }
                 if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
