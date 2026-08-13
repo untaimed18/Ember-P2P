@@ -48,6 +48,9 @@ const FT_EMBER_FILE_HASH: u8 = 0xE2;
 // above. See the note in the friends-only commit about keeping the two
 // branches on the same id before either ships.
 const FT_EMBER_FRIENDS_ONLY: u8 = 0xE3;
+/// Last successful Ember DHT *source* publish, unix seconds. Distinct from
+/// KAD's `FT_KADLASTPUBLISHSRC`: that tag answers a different schedule.
+const FT_EMBER_SOURCE_PUBLISH: u8 = 0xE4;
 
 const TAG_STRING: u8 = 0x02;
 const TAG_UINT32: u8 = 0x03;
@@ -88,6 +91,10 @@ pub struct KnownFileRecord {
     /// Last known complete-source ("Peers") count, refreshed roughly every
     /// 60s by the source-count sync while connected. See `FT_EMBER_SOURCES`.
     pub complete_sources: u32,
+    /// Last time an Ember DHT source record for this file was acknowledged
+    /// by a storer, unix seconds. See `FT_EMBER_SOURCE_PUBLISH`. Zero means
+    /// never published (or a known.met written before this field existed).
+    pub last_ember_source_publish: u32,
 }
 
 /// Per-physical-path metadata for a content-level known.met record. known.met
@@ -351,6 +358,7 @@ impl KnownFileList {
             is_shared: true,
             friends_only: false,
             complete_sources: 0,
+            last_ember_source_publish: 0,
         };
 
         for _ in 0..tag_count {
@@ -418,6 +426,7 @@ impl KnownFileList {
                         FT_EMBER_UNSHARED => record.is_shared = v == 0,
                         FT_EMBER_FRIENDS_ONLY => record.friends_only = v != 0,
                         FT_EMBER_SOURCES => record.complete_sources = v,
+                        FT_EMBER_SOURCE_PUBLISH => record.last_ember_source_publish = v,
                         _ => {}
                     }
                 }
@@ -551,6 +560,22 @@ impl KnownFileList {
         self.files.get_mut(hash)
     }
 
+    /// Every known-file record, for hydrating session state from disk.
+    pub fn iter_records(&self) -> impl Iterator<Item = &KnownFileRecord> {
+        self.files.values()
+    }
+
+    /// Persist an Ember source-publish timestamp without replacing the rest
+    /// of the record. No-op when the hash is unknown or the value is unchanged.
+    pub fn set_last_ember_source_publish(&mut self, hash: &[u8; 16], unix: u32) {
+        if let Some(record) = self.files.get_mut(hash) {
+            if record.last_ember_source_publish != unix {
+                record.last_ember_source_publish = unix;
+                self.touch_dirty();
+            }
+        }
+    }
+
     /// Manually flag the in-memory list as dirty so the next save will
     /// flush even when no `add_or_update` happened (used by callers
     /// that mutate a record via `find_by_hash_mut`).
@@ -676,6 +701,9 @@ impl KnownFileList {
             existing.is_shared = record.is_shared;
             existing.friends_only = record.friends_only;
             existing.complete_sources = record.complete_sources;
+            if record.last_ember_source_publish > 0 {
+                existing.last_ember_source_publish = record.last_ember_source_publish;
+            }
             existing.last_publish_src = record.last_publish_src;
             existing.last_shared = record.last_shared;
             if existing.file_path.is_empty()
@@ -838,6 +866,14 @@ impl KnownFileList {
             }
             if record.complete_sources > 0 {
                 write_u32_tag(&mut tags, FT_EMBER_SOURCES, record.complete_sources)?;
+                tag_count += 1;
+            }
+            if record.last_ember_source_publish > 0 {
+                write_u32_tag(
+                    &mut tags,
+                    FT_EMBER_SOURCE_PUBLISH,
+                    record.last_ember_source_publish,
+                )?;
                 tag_count += 1;
             }
 
@@ -1343,6 +1379,7 @@ mod tests {
             is_shared: true,
             friends_only: false,
             complete_sources: 0,
+            last_ember_source_publish: 0,
         }
     }
 
@@ -1754,6 +1791,55 @@ mod tests {
             loaded.find_by_hash(&hash).unwrap().complete_sources,
             7,
             "complete_sources must survive a save/load round trip"
+        );
+    }
+
+    /// Ember's source-publish schedule must not borrow KAD's last-publish
+    /// tag: a restart that treated every file as never-published would slam
+    /// the backlog-drain term to its ceiling.
+    #[test]
+    fn last_ember_source_publish_roundtrips_through_save_and_load() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.last_ember_source_publish = 1_700_000_123;
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_source_publish_roundtrip_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        kf.save(&path).expect("save known.met");
+
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
+
+        assert_eq!(
+            loaded.find_by_hash(&hash).unwrap().last_ember_source_publish,
+            1_700_000_123,
+            "last_ember_source_publish must survive a save/load round trip"
+        );
+        assert_eq!(
+            loaded.find_by_hash(&hash).unwrap().last_publish_src,
+            0,
+            "the Ember tag must not be read as KAD's last_publish_src"
+        );
+    }
+
+    #[test]
+    fn last_ember_source_publish_defaults_zero_when_tag_absent() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+        assert_eq!(
+            kf.find_by_hash(&hash).unwrap().last_ember_source_publish,
+            0
         );
     }
 

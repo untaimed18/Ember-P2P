@@ -365,12 +365,26 @@
       : '\u2014',
   );
 
+  let searchQualityLabel = $derived.by(() => {
+    const outcomes = diag?.ember_dht_search_outcomes ?? 0;
+    if (outcomes <= 0) return '\u2014';
+    const nodes = Math.round((diag?.ember_dht_search_nodes_answered ?? 0) / outcomes);
+    const ms = Math.round((diag?.ember_dht_search_elapsed_ms_sum ?? 0) / outcomes);
+    const records = Math.round((diag?.ember_dht_search_records_sum ?? 0) / outcomes);
+    return `${nodes} / ${ms}ms / ${records}`;
+  });
+
+  let storeRejectsLabel = $derived(
+    `${diag?.ember_dht_store_reject_verify ?? 0}/${diag?.ember_dht_store_reject_signature ?? 0}/${diag?.ember_dht_store_reject_timestamp ?? 0}/${diag?.ember_dht_store_reject_source_ip ?? 0}/${diag?.ember_dht_store_reject_source_ip_cap ?? 0}/${diag?.ember_dht_store_reject_publisher_cap ?? 0}/${diag?.ember_dht_store_reject_per_key_cap ?? 0}/${diag?.ember_dht_store_reject_proximity ?? 0}`,
+  );
+
   // `id` exists so the `{#each}` below is keyed on something stable. Keying
   // on the label would put a translator in a position to crash the page:
   // two of these strings colliding in one locale is a duplicate-key error.
   let metrics = $derived([
     { id: 'contacts', k: m.ember_stat_contacts(), v: String(peerCount) },
     { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: `${diag?.ember_dht_verified_contacts ?? 0}/${peerCount}` },
+    { id: 'verified-peak', k: m.ember_stat_verified_peak(), v: `${diag?.ember_dht_verified_highwater_today ?? 0}/${diag?.ember_dht_verified_highwater ?? 0}` },
     { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
     { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
     { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: String(diag?.ember_dht_republish_backlog ?? 0) },
@@ -383,6 +397,7 @@
     { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
     { id: 'searches', k: m.ember_stat_active_searches(), v: String(diag?.ember_dht_active_searches ?? 0) },
     { id: 'search-hits', k: m.ember_stat_search_hit_miss(), v: `${diag?.ember_dht_search_hits ?? 0}/${diag?.ember_dht_search_misses ?? 0}` },
+    { id: 'search-quality', k: m.ember_stat_search_quality(), v: searchQualityLabel },
     { id: 'store-acks', k: m.ember_stat_store_ack_fail(), v: `${diag?.ember_dht_stores_acked ?? 0}/${diag?.ember_dht_stores_failed ?? 0}` },
     { id: 'replication', k: m.ember_stat_avg_replication(), v: String(diag?.ember_dht_avg_replication ?? 0) },
     { id: 'search-rounds', k: m.ember_stat_search_rounds(), v: String(diag?.ember_dht_search_rounds ?? 0) },
@@ -397,6 +412,7 @@
     { id: 'epx-sources', k: m.ember_stat_epx_sources(), v: `${diag?.epx_sources_offered ?? 0}/${diag?.epx_sources_filtered ?? 0}` },
     { id: 'epx-udp-oversized', k: m.ember_stat_epx_udp_oversized(), v: String(diag?.epx_udp_oversized_skipped ?? 0) },
     { id: 'store-key-cap', k: m.ember_stat_store_key_cap(), v: String(diag?.ember_dht_store_key_cap_rejections ?? 0) },
+    { id: 'store-rejects', k: m.ember_stat_store_rejects(), v: storeRejectsLabel },
   ]);
 
   onMount(() => {

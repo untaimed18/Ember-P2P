@@ -24,7 +24,7 @@ use tracing::trace;
 use super::messages::{self, DhtPayload};
 use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_SOURCE};
 use super::routing::{AddResult, RoutingTable};
-use super::store::{DhtStore, DhtStoreEntry};
+use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
 use crate::network::ember::crypto;
 use crate::network::ember::SOURCE_FLAG_FIREWALLED;
@@ -79,9 +79,10 @@ pub struct DhtInbound {
     /// Live matching records that did not fit the `FOUND_VALUE` datagram.
     ///
     /// Non-zero means this node holds more under the key than one answer can
-    /// ever carry, and the same front-of-list records are the only ones it
-    /// serves. Without this the shortfall is indistinguishable from a small
-    /// network, which is the evidence needed before paying for pagination.
+    /// carry. Successive queries rotate which window is served, so a publisher
+    /// behind the first handful is no longer permanently invisible here. The
+    /// withheld count is still the evidence needed before paying for
+    /// pagination.
     pub find_value_withheld: u16,
     /// The frame was a `STORE_ACK`; the `request_id` it answered (so the
     /// caller can resolve the matching publish query).
@@ -148,6 +149,16 @@ pub struct EmberDht {
     /// When `store_sig_seen` was last swept, so the scan runs on a schedule
     /// rather than once per record of every oversized batch.
     store_sig_swept_at: Option<Instant>,
+    /// Inbound STORE records refused before they reached the store: the
+    /// publisher signature did not parse, or the DHT key did not match the
+    /// record's own content key.
+    store_reject_verify: u64,
+    /// Source records whose declared IP did not match the Noise sender
+    /// (anti-reflection), excluding firewalled sources.
+    store_reject_source_ip: u64,
+    /// STORE records for keys this node is not close enough to hold, once
+    /// the routing table is large enough to be selective.
+    store_reject_proximity: u64,
 }
 
 impl EmberDht {
@@ -172,6 +183,9 @@ impl EmberDht {
             next_request_id: 1,
             store_sig_seen: HashMap::new(),
             store_sig_swept_at: None,
+            store_reject_verify: 0,
+            store_reject_source_ip: 0,
+            store_reject_proximity: 0,
         }
     }
 
@@ -278,6 +292,7 @@ impl EmberDht {
         // `DhtStore::store` checks it again (defence in depth) and enforces
         // capacity.
         let Some(parsed) = SignedRecord::from_wire(&record, record_signature) else {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         };
 
@@ -294,6 +309,10 @@ impl EmberDht {
             Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
             None => parsed.record_type != RECORD_TYPE_SOURCE,
         };
+        if !source_ip_ok {
+            self.store_reject_source_ip = self.store_reject_source_ip.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
 
         // Slice 14: collapse identical STORE frames (same publisher
         // signature) for a short window so a retransmit storm can't re-verify
@@ -347,18 +366,22 @@ impl EmberDht {
             _ => None,
         };
 
-        if key == parsed.keyword_hash
-            && source_ip_ok
-            && self.store_proximity_ok(&key)
-            && self.store.store_attributed(
-                key,
-                record,
-                record_signature,
-                parsed.publisher_key,
-                parsed.timestamp,
-                attributed_ip,
-            )
-        {
+        if key != parsed.keyword_hash {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+        if !self.store_proximity_ok(&key) {
+            self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+        if self.store.store_attributed(
+            key,
+            record,
+            record_signature,
+            parsed.publisher_key,
+            parsed.timestamp,
+            attributed_ip,
+        ) {
             // At capacity, make room rather than stopping: silently declining to
             // record a signature turns off replay collapse for exactly the
             // publishers arriving during a flood, which is when it earns its
@@ -686,10 +709,21 @@ impl EmberDht {
         (self.store.key_count(), self.store.total_records())
     }
 
-    /// Cumulative records the local store refused because it is already
-    /// holding its maximum number of distinct keys.
-    pub fn store_key_cap_rejections(&self) -> u64 {
-        self.store.key_cap_rejections()
+    /// Store refusals counted on the local store (signature, timestamp, caps).
+    pub fn store_reject_stats(&self) -> StoreRejectStats {
+        self.store.reject_stats()
+    }
+
+    pub fn store_reject_verify(&self) -> u64 {
+        self.store_reject_verify
+    }
+
+    pub fn store_reject_source_ip(&self) -> u64 {
+        self.store_reject_source_ip
+    }
+
+    pub fn store_reject_proximity(&self) -> u64 {
+        self.store_reject_proximity
     }
 
     /// Local store stats `(distinct_keys, total_records)` restricted to
@@ -1047,7 +1081,7 @@ impl EmberDht {
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
-                if let Some(reply) = intersect_find_value_records(&self.store, &keys) {
+                if let Some(reply) = intersect_find_value_records(&mut self.store, &keys) {
                     out.find_value_hit = true;
                     out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
                     let fv = messages::build_found_value(
@@ -1132,7 +1166,7 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 /// as defense-in-depth. When we *do* hold one or more secondaries, we
 /// filter by `file_hash` intersection. Empty intersection → `None`
 /// (`FOUND_NODE`). Single-key queries serve all live primary records.
-fn intersect_find_value_records(store: &DhtStore, keys: &[[u8; 16]]) -> Option<FoundValueReply> {
+fn intersect_find_value_records(store: &mut DhtStore, keys: &[[u8; 16]]) -> Option<FoundValueReply> {
     let (primary, filtered) = intersect_live_records(store, keys)?;
 
     // Pack records until the reply would stop fitting a datagram. A key can
@@ -1141,12 +1175,20 @@ fn intersect_find_value_records(store: &DhtStore, keys: &[[u8; 16]]) -> Option<F
     // holding the most records for a popular key would otherwise be the one
     // node that can never answer for it. A partial answer is always better:
     // the searcher merges results across the peers it walks.
+    //
+    // Start at this key's serve cursor so successive queries surface a
+    // different window rather than the same oldest handful every time. The
+    // cursor only advances when the reply actually withholds records — if
+    // everything fits, rotation is a no-op.
+    let n = filtered.len();
+    let start = store.serve_start(&primary, n);
     let mut used = 0usize;
     let mut blobs: Vec<Vec<u8>> = Vec::new();
-    for r in &filtered {
+    for i in 0..n {
         if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
             break;
         }
+        let r = filtered[(start + i) % n];
         let cost = 2 + r.data.len() + 64;
         if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
             // Records vary in size, so keep scanning for a smaller one that
@@ -1160,7 +1202,10 @@ fn intersect_find_value_records(store: &DhtStore, keys: &[[u8; 16]]) -> Option<F
     if blobs.is_empty() {
         return None;
     }
-    let withheld = filtered.len() - blobs.len();
+    let withheld = n - blobs.len();
+    if withheld > 0 {
+        store.advance_serve_cursor(&primary, blobs.len(), n);
+    }
     Some(FoundValueReply {
         key: primary,
         blobs,
@@ -1932,7 +1977,7 @@ mod tests {
     }
 
     /// A node holding more records under one keyword than a datagram can carry
-    /// serves the front of the list and drops the rest. How often that happens
+    /// serves a window and reports how many it left out. How often that happens
     /// is what separates "few results because the network is small" from "few
     /// results because every answer is capped", so the shortfall has to leave
     /// the engine rather than staying a local variable.
@@ -1985,6 +2030,95 @@ mod tests {
             PUBLISHED,
             "every live record is either served or counted as withheld"
         );
+    }
+
+    /// Successive FIND_VALUEs on an oversized key must rotate the served
+    /// window. Without that, the oldest handful is the only set this node
+    /// ever returns, and a late publisher under a popular word is invisible
+    /// here no matter how often it is asked for.
+    #[test]
+    fn successive_find_values_rotate_the_served_window() {
+        let mut a = dht(22);
+        let mut b = dht(23);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(22, 4672);
+        let b_addr = addr(23, 4672);
+
+        const PUBLISHED: usize = 20;
+        let mut key = [0u8; 16];
+        let mut published: Vec<[u8; 16]> = Vec::new();
+        for i in 0..PUBLISHED {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i as u8;
+            published.push(file_hash);
+            let record = a.build_keyword_record(
+                "ubuntu",
+                file_hash,
+                [0u8; 32],
+                4096,
+                &format!("ubuntu-server-22.04.{i:02}-amd64-live.iso"),
+            );
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record,
+                "record {i} should be accepted"
+            );
+        }
+
+        fn hashes_from_blobs(blobs: &[Vec<u8>]) -> Vec<[u8; 16]> {
+            blobs
+                .iter()
+                .filter_map(|blob| file_hash_from_record_data(blob))
+                .collect()
+        }
+
+        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let first = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(first.find_value_hit);
+        assert!(first.find_value_withheld > 0);
+        let first_blobs = a
+            .handle_message(&first.responses[0], b_addr, b_noise, 1002)
+            .found_value
+            .expect("FOUND_VALUE")
+            .1;
+        let first_hashes = hashes_from_blobs(&first_blobs);
+
+        let second = b.handle_message(&find_bytes, a_addr, a_noise, 1003);
+        assert!(second.find_value_hit);
+        let second_blobs = a
+            .handle_message(&second.responses[0], b_addr, b_noise, 1004)
+            .found_value
+            .expect("FOUND_VALUE")
+            .1;
+        let second_hashes = hashes_from_blobs(&second_blobs);
+
+        assert_ne!(
+            first_hashes, second_hashes,
+            "a truncated key must not serve the same window twice in a row"
+        );
+
+        let mut seen: HashSet<[u8; 16]> = HashSet::new();
+        seen.extend(first_hashes);
+        seen.extend(second_hashes);
+        for round in 0..8 {
+            let reply = b.handle_message(&find_bytes, a_addr, a_noise, 1100 + round);
+            let blobs = a
+                .handle_message(&reply.responses[0], b_addr, b_noise, 1200 + round)
+                .found_value
+                .expect("FOUND_VALUE")
+                .1;
+            seen.extend(hashes_from_blobs(&blobs));
+        }
+        assert_eq!(
+            seen.len(),
+            PUBLISHED,
+            "rotating windows together must cover every live record, got {seen:?}"
+        );
+        for hash in &published {
+            assert!(seen.contains(hash), "missing {}", hex::encode(hash));
+        }
     }
 
     #[test]

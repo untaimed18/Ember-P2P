@@ -118,6 +118,17 @@ pub struct DhtStoreEntry {
     pub source_records: u32,
 }
 
+/// Cumulative store refusals, broken down by the cap or check that fired.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreRejectStats {
+    pub signature: u64,
+    pub timestamp: u64,
+    pub key_cap: u64,
+    pub source_ip_cap: u64,
+    pub publisher_cap: u64,
+    pub per_key_cap: u64,
+}
+
 /// A signed record stored in the DHT.
 #[derive(Debug, Clone)]
 pub struct DhtRecord {
@@ -192,6 +203,22 @@ pub struct DhtStore {
     key_budget: usize,
     /// Records refused for want of a free key slot, after eviction was tried.
     key_cap_rejections: u64,
+    /// Signature did not verify against the claimed publisher key.
+    signature_rejections: u64,
+    /// Creation timestamp too far in the future, or already past TTL.
+    timestamp_rejections: u64,
+    /// Per-IP source-record cap (`max_sources_per_ip`).
+    source_ip_cap_rejections: u64,
+    /// One publisher already holds `MAX_RECORDS_PER_PUBLISHER_PER_KEY` here.
+    publisher_cap_rejections: u64,
+    /// The key already holds `MAX_RECORDS_PER_KEY` live records.
+    per_key_cap_rejections: u64,
+    /// Per-key offset into the live list for the next `FOUND_VALUE` window.
+    ///
+    /// A popular key holds more records than one datagram can carry. Serving
+    /// from the front every time would hide every record behind that window.
+    /// The cursor rotates only when a reply actually withholds records.
+    serve_cursor: HashMap<[u8; 16], usize>,
     /// Upper bound on the XOR distance of the furthest key currently held,
     /// or `None` when unknown.
     ///
@@ -228,6 +255,12 @@ impl DhtStore {
             byte_budget: MAX_STORE_BYTES,
             key_budget: MAX_KEYS,
             key_cap_rejections: 0,
+            signature_rejections: 0,
+            timestamp_rejections: 0,
+            source_ip_cap_rejections: 0,
+            publisher_cap_rejections: 0,
+            per_key_cap_rejections: 0,
+            serve_cursor: HashMap::new(),
             furthest_key_distance: None,
         }
     }
@@ -235,6 +268,37 @@ impl DhtStore {
     /// Cumulative count of records refused for want of a free key slot.
     pub fn key_cap_rejections(&self) -> u64 {
         self.key_cap_rejections
+    }
+
+    /// Cumulative store refusals broken down by cause.
+    pub fn reject_stats(&self) -> StoreRejectStats {
+        StoreRejectStats {
+            signature: self.signature_rejections,
+            timestamp: self.timestamp_rejections,
+            key_cap: self.key_cap_rejections,
+            source_ip_cap: self.source_ip_cap_rejections,
+            publisher_cap: self.publisher_cap_rejections,
+            per_key_cap: self.per_key_cap_rejections,
+        }
+    }
+
+    /// Where the next packed `FOUND_VALUE` window for `key` should start,
+    /// modulo the current live length.
+    pub(crate) fn serve_start(&self, key: &[u8; 16], n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        self.serve_cursor.get(key).copied().unwrap_or(0) % n
+    }
+
+    /// Advance the served window after a truncated reply. `packed` is how
+    /// many records this answer actually carried.
+    pub(crate) fn advance_serve_cursor(&mut self, key: &[u8; 16], packed: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let start = self.serve_start(key, n);
+        self.serve_cursor.insert(*key, (start + packed) % n);
     }
 
     /// Track how permissive the abuse limits should currently be.
@@ -277,6 +341,7 @@ impl DhtStore {
                 self.bytes = self.bytes.saturating_sub(record_cost(record.data.len()));
             }
         }
+        self.serve_cursor.remove(key);
     }
 
     /// Make room for a key we do not yet hold. Returns whether there is space.
@@ -432,6 +497,7 @@ impl DhtStore {
             }
             if records.is_empty() {
                 self.entries.remove(&key);
+                self.serve_cursor.remove(&key);
             }
             if self.bytes <= target {
                 break 'keys;
@@ -487,6 +553,7 @@ impl DhtStore {
         attributed_ip: Option<std::net::Ipv4Addr>,
     ) -> bool {
         if !verify_record_signature(&data, &signature, &publisher_key) {
+            self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
                 "DHT store: signature verification failed for key {} from publisher {}",
                 hex::encode(key),
@@ -499,6 +566,7 @@ impl DhtStore {
         let ttl_secs = record_ttl(&data).as_secs() as i64;
         let now_unix = chrono::Utc::now().timestamp();
         if created_at > now_unix + CLOCK_SKEW_TOLERANCE_SECS {
+            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
             debug!(
                 "DHT store: rejecting record for key {} dated {}s in the future",
                 hex::encode(key),
@@ -508,6 +576,7 @@ impl DhtStore {
         }
         let age = now_unix.saturating_sub(created_at).max(0);
         if age >= ttl_secs {
+            self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
             debug!(
                 "DHT store: rejecting record for key {} already past TTL (age {age}s)",
                 hex::encode(key),
@@ -656,6 +725,7 @@ impl DhtStore {
                 })
                 .count();
             if same_ip >= max_per_ip {
+                self.source_ip_cap_rejections = self.source_ip_cap_rejections.saturating_add(1);
                 debug!(
                     "Key {} already has {same_ip} source record(s) attributed to {ip}, rejecting",
                     hex::encode(key)
@@ -680,6 +750,7 @@ impl DhtStore {
             .filter(|r| r.publisher_key == publisher_key)
             .count();
         if mine >= MAX_RECORDS_PER_PUBLISHER_PER_KEY {
+            self.publisher_cap_rejections = self.publisher_cap_rejections.saturating_add(1);
             debug!(
                 "Key {} already holds {mine} record(s) from publisher {}, rejecting",
                 hex::encode(key),
@@ -689,6 +760,7 @@ impl DhtStore {
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
+            self.per_key_cap_rejections = self.per_key_cap_rejections.saturating_add(1);
             debug!(
                 "Key {} has {MAX_RECORDS_PER_KEY} records, rejecting",
                 hex::encode(key)
@@ -744,6 +816,8 @@ impl DhtStore {
             !records.is_empty()
         });
         self.bytes = self.bytes.saturating_sub(freed);
+        self.serve_cursor
+            .retain(|k, _| self.entries.contains_key(k));
 
         if total_removed > 0 {
             debug!("Expired {total_removed} DHT records");
@@ -1430,6 +1504,10 @@ mod tests {
             Some(MAX_RECORDS_PER_PUBLISHER_PER_KEY),
             "one identity is held to its share however many files it offers"
         );
+        assert!(
+            store.reject_stats().publisher_cap > 0,
+            "refusals past the publisher share must be counted, not only logged"
+        );
 
         let honest = SigningKey::generate(&mut OsRng);
         let good = SignedRecord::keyword("ubuntu", [0xEE; 16], [0u8; 32], 4096, "real.iso", &honest);
@@ -1882,6 +1960,7 @@ mod tests {
         // bogus signature for `data`
         assert!(!store.store(key, vec![42], [0u8; 64], pk, now_ts()));
         assert_eq!(store.total_records(), 0);
+        assert_eq!(store.reject_stats().signature, 1);
     }
 
     #[test]
@@ -1894,6 +1973,7 @@ mod tests {
         // sign with sk but claim a different publisher_key
         assert!(!store.store(key, data, sig, [0xCC; 32], now_ts()));
         assert_eq!(store.total_records(), 0);
+        assert_eq!(store.reject_stats().signature, 1);
     }
 
     #[test]
@@ -1998,6 +2078,7 @@ mod tests {
         let stale_ts = now_ts() - (24 * 3600 + 60);
         assert!(!store.store([1u8; 16], d.clone(), sign(&sk, &d), pk, stale_ts));
         assert_eq!(store.total_records(), 0);
+        assert_eq!(store.reject_stats().timestamp, 1);
     }
 
     #[test]
@@ -2008,6 +2089,7 @@ mod tests {
         let future_ts = now_ts() + (CLOCK_SKEW_TOLERANCE_SECS + 60);
         assert!(!store.store([1u8; 16], d.clone(), sign(&sk, &d), pk, future_ts));
         assert_eq!(store.total_records(), 0);
+        assert_eq!(store.reject_stats().timestamp, 1);
     }
 
     #[test]

@@ -422,6 +422,34 @@ export interface EmberDiagnostics {
    * number of distinct keys. This cap has no eviction path.
    */
   ember_dht_store_key_cap_rejections?: number;
+  /** STORE frames whose publisher signature did not parse, or whose DHT key did not match. */
+  ember_dht_store_reject_verify?: number;
+  /** STORE frames refused because the Ed25519 signature did not verify. */
+  ember_dht_store_reject_signature?: number;
+  /** STORE frames refused because the signed creation time was implausible. */
+  ember_dht_store_reject_timestamp?: number;
+  /** Source records refused by the per-IP cap. */
+  ember_dht_store_reject_source_ip_cap?: number;
+  /** Records refused because one publisher already holds its share of the key. */
+  ember_dht_store_reject_publisher_cap?: number;
+  /** Records refused because the key already holds its maximum. */
+  ember_dht_store_reject_per_key_cap?: number;
+  /** Source records whose declared IP did not match the Noise sender. */
+  ember_dht_store_reject_source_ip?: number;
+  /** STORE records for keys this node is not close enough to hold. */
+  ember_dht_store_reject_proximity?: number;
+  /** Completed FIND_VALUE searches this session (hits, misses, and timeouts). */
+  ember_dht_search_outcomes?: number;
+  /** Sum of shortlist nodes that answered across those searches. */
+  ember_dht_search_nodes_answered?: number;
+  /** Sum of FIND_VALUE durations in milliseconds. */
+  ember_dht_search_elapsed_ms_sum?: number;
+  /** Sum of verified records gathered across those searches. */
+  ember_dht_search_records_sum?: number;
+  /** Highest verified-contact count seen today (UTC). */
+  ember_dht_verified_highwater_today?: number;
+  /** Highest verified-contact count ever recorded on this node. */
+  ember_dht_verified_highwater?: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set

@@ -2341,6 +2341,7 @@ pub async fn ember_dht_run_maintenance(
             records_republished,
             announces_sent,
             kad_bridge_pings_sent,
+            ..
         }) => Ok(EmberDhtMaintenanceResult {
             success: true,
             buckets_refreshed,

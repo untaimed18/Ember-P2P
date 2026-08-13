@@ -107,8 +107,9 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
   keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
 - A peer serves roughly five records per keyword query and there is no
-  pagination, so recall is bounded by nodes-walked × 5 and a late publisher
-  under a popular word may not be served at all. See
+  pagination, so recall is bounded by nodes-walked × 5. Successive queries
+  rotate which window is served, so a late publisher is no longer stuck
+  behind the oldest handful on that node. See
   [Planned next, item 1](#1-the-serving-ceiling--do-this-first).
 - One publisher may hold 45 records under any one keyword, network-wide, so a
   user sharing many files with a word in common will not have all of them
@@ -141,29 +142,35 @@ were fixed before 1.5.3 and are not repeated here.
 **Shipped in 1.5.3:** item 3 (streaming) in full, item 6 (the republish cadence)
 in full, and the truncation counter that items 1 and 8 both depend on. Their
 sections below are kept rather than deleted, because each records why the change
-was made and what to watch now that it is live. Items 1, 2, 4, 5 and 7 are
-untouched and remain in this order.
+was made and what to watch now that it is live.
+
+**Shipped after 1.5.3 (no wire change):** item 1's cheap path (rotate the served
+window), item 5 (persist the Ember source publish schedule), item 6's leftover
+replication heartbeat, and item 8's store-rejection causes, search-quality
+averages, and persisted verified-contact high-water. Pagination, firewalled
+consume, and dropping `node_id` still wait on a version bump. Item 2 remains
+blocked on measuring whether truncation still binds after rotation.
+
+Items 4 and 7 are untouched and remain in this order.
 
 ### 1. The serving ceiling — do this first
 
-A peer answers a keyword query with **about five records**, and always the same
-five. `MAX_FOUND_VALUE_RECORD_BYTES` is 1235, a keyword blob for a 40-character
-filename costs 221, and `get_live` returns insertion order while the packer
-fills from the front. So the oldest five records under a word are the only ones
-that node will ever serve, and a publisher who arrives late under a popular
-keyword is permanently invisible there. There is no `start_position` in the wire
-protocol. KAD pages 200 entries at a time and a searcher walks up to three pages
-per peer — 600 against Ember's 5.
+A peer answers a keyword query with **about five records**. `MAX_FOUND_VALUE_RECORD_BYTES`
+is 1235, a keyword blob for a 40-character filename costs 221, and packing used
+to fill from the front of insertion order, so the oldest five were the only ones
+that node would ever serve.
 
-Two ways forward, and the cheap one is worth doing on its own:
+**Cheap path, shipped:** successive `FIND_VALUE`s rotate the served window per
+key. The cursor advances by how many records the reply actually carried, and
+only when the reply withholds some — if everything fits, rotation is a no-op.
+`local_records` (seeding our own search) does not inherit this packing. Blob-hash
+dedup in `search.rs` is content-based, so rotating windows can only gather more.
 
-- **Rotate the served window per key**, so successive queries surface different
-  records. No wire change. Needs thought about how a moving set interacts with
-  the blob-hash dedup in `search.rs`.
-- **Add `start_position` to `FIND_VALUE`/`FOUND_VALUE`.** The real fix, and what
-  KAD does. Costs an `EMBER_DHT_VERSION` bump (see "Wire versioning" above —
-  this is the breaking change that section warns about) and multiplies query
-  traffic on hot keywords.
+Still missing, and what KAD does:
+
+- **Add `start_position` to `FIND_VALUE`/`FOUND_VALUE`.** The real fix. Costs an
+  `EMBER_DHT_VERSION` bump (see "Wire versioning" above — this is the breaking
+  change that section warns about) and multiplies query traffic on hot keywords.
 
 The truncation counter this was waiting on **shipped in 1.5.3**: an inbound
 `FIND_VALUE` we answer now reports how many live matching records the datagram
@@ -222,18 +229,19 @@ A protocol addition: a buddy field in the source record and a callback message.
 Sizeable, and it should follow item 1 so both wire changes land in one version
 bump.
 
-### 5. Persist the Ember source publish schedule
+### 5. Persist the Ember source publish schedule — done
 
-`ember_source_publish_at` is keyed on `Instant`, so every restart marks the whole
-library as never-published and slams the backlog-drain term to its ceiling.
+`ember_source_publish_at` is keyed on `Instant`, so every restart used to mark
+the whole library as never-published and slam the backlog-drain term to its
+ceiling.
 
-Deliberately **not** done for 1.5.3. The failure modes are asymmetric: getting
-persistence wrong means skipping publishes that were due, which is silent
-non-publishing — the exact class of bug 1.5.3 exists to remove — whereas
-republishing too eagerly costs only traffic, and is correct anyway whenever the
-node was down longer than the 6-hour source TTL. Worth doing properly, with a
-timestamp persisted for Ember specifically; do not borrow KAD's
-`last_source_publish`, which answers a different question.
+The last successful source-publish is now written to known.met as
+`FT_EMBER_SOURCE_PUBLISH` (0xE4), distinct from KAD's `last_source_publish`.
+On start, a stamp still inside `EMBER_SOURCE_REPUBLISH` (2h) is hydrated back
+to an `Instant`; a stamp older than the interval, or one that cannot be
+represented because the process has not been up that long, is omitted and the
+file is due immediately — republish-too-eager, the safe direction. Keyword
+schedule is still session-only.
 
 ### 6. Storer-side replication costs more than it buys
 
@@ -252,9 +260,12 @@ publisher's last round, and two hours buys that as well as one given each record
 already has 20 replicas and lives at most 24 h. A shorter cadence would have to
 be justified on churn coverage measured, not on record survival.
 
-Still missing is any view of what this node republishes on others' behalf. The
+Still missing was any view of what this node republishes on others' behalf. The
 publish side logs a cycle heartbeat; this, the larger of the two traffic items,
-has no equivalent.
+had no equivalent. **Shipped:** each maintenance cycle now logs an
+`Ember replication cycle` heartbeat — due, selected, queued, re-armed, leftover
+backlog — on the same cadence as the 60s maintenance tick. The two-hourly
+republish interval is unchanged.
 
 ### 7. Contact encoding wastes 18% of every response
 
@@ -272,13 +283,15 @@ missing that matter specifically for judging health after a long unattended run:
 - ~~**Nothing reports a truncated `FOUND_VALUE`.**~~ Shipped in 1.5.3, as
   `ember_dht_found_value_truncated` and `ember_dht_found_value_withheld`. This
   was the prerequisite for item 1; see there for how to read it.
-- **Store rejections have no cause breakdown.** Only the key-cap rejection is
-  counted; per-publisher, per-key and per-IP refusals are `debug!` only.
-- **No search outcome quality.** Hits and misses are counted, but not nodes
-  answered, time taken, or results returned.
-- **Every counter resets on restart.** A persisted daily high-water of verified
-  contacts would answer "is this growing?" — the actual question — in a way no
-  instantaneous gauge can.
+- ~~**Store rejections have no cause breakdown.**~~ Counted: verify, signature,
+  timestamp, anti-reflection IP, per-IP cap, publisher cap, per-key cap,
+  proximity, plus the existing key-cap counter.
+- ~~**No search outcome quality.**~~ Completed `FIND_VALUE`s (including
+  timeouts) accumulate nodes answered, elapsed milliseconds, and records
+  returned; the Ember page shows the averages.
+- ~~**Every counter resets on restart.**~~ A persisted daily and all-time
+  high-water of verified contacts (`ember_dht_highwater.json`) answers "is this
+  growing?" across restarts.
 
 ### Outside the DHT
 
@@ -315,12 +328,9 @@ settled.
   recall lags KAD on real libraries.
 - Clearer search UI when Ember is joining (empty table) versus
   enabled-but-quiet.
-- Storer-side replication telemetry. The publish side now logs an
-  `Ember publish cycle` heartbeat each minute — due, selected, awaiting
-  placement, queued, in flight, sent, held over, dropped, acked, failed — which
-  is what says whether selected work is reaching the wire. There is no
-  equivalent view of what this node is republishing on others' behalf, and
-  that is the larger of the two traffic items (see
+- Storer-side replication telemetry. The publish side logs an
+  `Ember publish cycle` heartbeat each minute; maintenance now logs an
+  `Ember replication cycle` heartbeat as well (see
   [Planned next, item 6](#6-storer-side-replication-costs-more-than-it-buys)).
 
 ### Integrity and downloads

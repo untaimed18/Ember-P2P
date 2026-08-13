@@ -573,7 +573,7 @@ impl IterativeSearch {
     }
 
     /// Shortlist entries that have answered us.
-    fn responded_count(&self) -> usize {
+    pub fn responded_count(&self) -> usize {
         self.shortlist
             .iter()
             .filter(|e| e.state == NodeState::Responded)
@@ -710,21 +710,25 @@ impl SearchManager {
         self.searches.remove(&search_id)
     }
 
-    /// Clean up timed-out searches. Returns IDs of removed searches.
-    pub fn cleanup_expired(&mut self) -> Vec<u32> {
+    /// Clean up timed-out searches. Returns the searches that were removed
+    /// so the caller can record outcome quality before dropping them.
+    pub fn cleanup_expired(&mut self) -> Vec<IterativeSearch> {
         let expired: Vec<u32> = self
             .searches
             .iter()
             .filter(|(_, s)| s.started_at.elapsed().as_secs() > SEARCH_TIMEOUT_SECS * 2)
             .map(|(id, _)| *id)
             .collect();
+        let mut removed = Vec::with_capacity(expired.len());
         for id in &expired {
-            self.searches.remove(id);
+            if let Some(search) = self.searches.remove(id) {
+                removed.push(search);
+            }
         }
-        if !expired.is_empty() {
-            debug!("Cleaned up {} expired searches", expired.len());
+        if !removed.is_empty() {
+            debug!("Cleaned up {} expired searches", removed.len());
         }
-        expired
+        removed
     }
 
     /// Number of active searches.

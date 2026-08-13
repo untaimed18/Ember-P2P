@@ -6324,6 +6324,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ember_source_publish_instant_treats_never_and_expired_as_due() {
+        let now = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(2 * 3600);
+        let now_unix = 1_700_000_000i64;
+        assert!(ember_source_publish_instant(0, now_unix, now, interval).is_none());
+        assert!(ember_source_publish_instant(
+            (now_unix as u32).saturating_sub(interval.as_secs() as u32),
+            now_unix,
+            now,
+            interval,
+        )
+        .is_none());
+        assert!(ember_source_publish_instant(
+            (now_unix as u32).saturating_sub(interval.as_secs() as u32 + 60),
+            now_unix,
+            now,
+            interval,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn ember_source_publish_instant_keeps_a_stamp_still_inside_the_interval() {
+        let now = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(2 * 3600);
+        let now_unix = 1_700_000_000i64;
+        let last = (now_unix as u32).saturating_sub(60);
+        let at = ember_source_publish_instant(last, now_unix, now, interval)
+            .expect("a one-minute-old stamp must still be scheduled");
+        let elapsed = now.duration_since(at).as_secs();
+        assert!(
+            elapsed <= 60 + 2,
+            "hydrated Instant should be ~60s ago, got {elapsed}s"
+        );
+    }
+
+    #[test]
+    fn note_ember_verified_contacts_tracks_daily_and_alltime_peaks() {
+        let mut hw = EmberVerifiedHighwater {
+            day: chrono::Utc::now().date_naive().to_string(),
+            daily: 3,
+            alltime: 10,
+        };
+        assert!(note_ember_verified_contacts(&mut hw, 12));
+        assert_eq!(hw.daily, 12);
+        assert_eq!(hw.alltime, 12);
+        assert!(!note_ember_verified_contacts(&mut hw, 8));
+        assert_eq!(hw.daily, 12);
+        assert_eq!(hw.alltime, 12);
+    }
+
     /// A ping is the only way a lead becomes usable, so the ping budget is also
     /// the join rate. The steady-state trickle made a cold join take many
     /// minutes, during which publishes had one target and lookups one seed.
@@ -8153,11 +8205,30 @@ pub struct EmberMaintenanceResult {
     pub liveness_pings_sent: usize,
     /// Locally-stored records re-published to the closest nodes.
     pub records_republished: usize,
+    /// Records due for replication at the start of this cycle.
+    pub republish_due: usize,
+    /// How many of those the per-cycle budget selected.
+    pub republish_selected: usize,
+    /// Selected records the batch queue refused, put back on the schedule.
+    pub republish_rearmed: usize,
     /// `ANNOUNCE_PEER` contact-list exchanges started this cycle.
     pub announces_sent: usize,
     /// KAD-bridge bootstrap `PING`s sent to KAD-learned Ember peers (slice
     /// 13). Non-zero only while the table is still sparse.
     pub kad_bridge_pings_sent: usize,
+}
+
+/// Persisted peak of verified Ember DHT contacts, so a restart does not
+/// erase the only number that answers "is this table growing?".
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct EmberVerifiedHighwater {
+    /// UTC calendar day `daily` belongs to (`YYYY-MM-DD`).
+    #[serde(default)]
+    day: String,
+    #[serde(default)]
+    daily: u32,
+    #[serde(default)]
+    alltime: u32,
 }
 
 /// Returned by the network task when an iterative `FIND_VALUE` lookup has
@@ -9525,6 +9596,10 @@ struct NetworkState {
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
     ember_diagnostics: EmberDiagnostics,
+    /// Peak verified-contact counts, loaded from `ember_dht_highwater.json`
+    /// so a restart does not reset the only long-run health signal.
+    ember_verified_highwater: EmberVerifiedHighwater,
+    ember_verified_highwater_dirty: bool,
     /// Shared anti-leech client-software filter. Held here so the
     /// settings command path can hot-swap the pattern list without the
     /// upload listener needing to re-subscribe; the upload server
@@ -9731,6 +9806,9 @@ struct NetworkState {
     /// elapsed, mirroring KAD's per-file source-publish schedule but driven
     /// independently of KAD connectivity so it works on a KAD-less network.
     ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// Unix-second copy of the source-publish stamps, written to known.met
+    /// so a restart does not treat the whole library as never-published.
+    ember_source_publish_unix: HashMap<[u8; 16], u32>,
     /// Last time we (re)published Ember DHT *keyword* records for each
     /// shared file, keyed by its 16-byte eD2K hash (slice 8). The publish
     /// tick republishes a file's keywords only after
@@ -9972,11 +10050,134 @@ fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordR
                 .ember_diagnostics
                 .ember_dht_sources_published
                 .saturating_add(1);
+            let unix = chrono::Utc::now().timestamp().max(0) as u32;
+            state
+                .ember_source_publish_unix
+                .insert(reference.file_hash, unix);
         }
         // Replication has no local schedule; the ack is already counted by
         // the acked-records diagnostic.
         EmberPublishKind::Replication => {}
     }
+}
+
+/// Convert a persisted Ember source-publish unix timestamp into the
+/// in-session `Instant` the republish scheduler uses.
+///
+/// `Instant` counts from boot, so a stamp older than this process has been
+/// up cannot be represented. Omitting it treats the file as due immediately
+/// — republish-too-eager, the safe direction. Stamping `now` instead would
+/// skip a remaining wait, which is silent non-publishing.
+fn ember_source_publish_instant(
+    last_unix: u32,
+    now_unix: i64,
+    now_inst: std::time::Instant,
+    interval: std::time::Duration,
+) -> Option<std::time::Instant> {
+    if last_unix == 0 {
+        return None;
+    }
+    let elapsed = (now_unix.max(0) as u64).saturating_sub(last_unix as u64);
+    if elapsed >= interval.as_secs() {
+        return None;
+    }
+    now_inst.checked_sub(std::time::Duration::from_secs(elapsed))
+}
+
+fn hydrate_ember_source_publish_schedule(
+    known_files: &KnownFileList,
+    dest: &mut HashMap<[u8; 16], std::time::Instant>,
+    unix_dest: &mut HashMap<[u8; 16], u32>,
+) {
+    let now_unix = chrono::Utc::now().timestamp();
+    let now_inst = std::time::Instant::now();
+    for record in known_files.iter_records() {
+        if record.last_ember_source_publish == 0 {
+            continue;
+        }
+        unix_dest
+            .entry(record.file_hash)
+            .or_insert(record.last_ember_source_publish);
+        if dest.contains_key(&record.file_hash) {
+            continue;
+        }
+        if let Some(at) = ember_source_publish_instant(
+            record.last_ember_source_publish,
+            now_unix,
+            now_inst,
+            EMBER_SOURCE_REPUBLISH,
+        ) {
+            dest.insert(record.file_hash, at);
+        }
+    }
+}
+
+fn sync_ember_source_publish_to_known(
+    unix_map: &HashMap<[u8; 16], u32>,
+    known_files: &mut KnownFileList,
+) {
+    for (hash, ts) in unix_map {
+        known_files.set_last_ember_source_publish(hash, *ts);
+    }
+}
+
+fn ember_highwater_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("ember_dht_highwater.json")
+}
+
+fn load_ember_verified_highwater(path: &std::path::Path) -> EmberVerifiedHighwater {
+    let Ok(bytes) = std::fs::read(path) else {
+        return EmberVerifiedHighwater::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_ember_verified_highwater(path: &std::path::Path, hw: &EmberVerifiedHighwater) {
+    let Ok(bytes) = serde_json::to_vec(hw) else {
+        return;
+    };
+    if let Err(e) = crate::security::atomic_write(path, &bytes, true) {
+        debug!("Failed to persist Ember verified-contact high-water: {e}");
+    }
+}
+
+/// Raise today's / all-time verified-contact peaks. Returns whether the
+/// persisted copy needs rewriting.
+fn note_ember_verified_contacts(hw: &mut EmberVerifiedHighwater, verified: u32) -> bool {
+    let today = chrono::Utc::now().date_naive().to_string();
+    let mut dirty = false;
+    if hw.day != today {
+        hw.day = today;
+        hw.daily = verified;
+        dirty = true;
+    } else if verified > hw.daily {
+        hw.daily = verified;
+        dirty = true;
+    }
+    if verified > hw.alltime {
+        hw.alltime = verified;
+        dirty = true;
+    }
+    dirty
+}
+
+fn record_ember_find_value_quality(
+    diag: &mut EmberDiagnostics,
+    search: &ember::dht::search::IterativeSearch,
+) {
+    if search.search_type != ember::dht::search::SearchType::FindValue {
+        return;
+    }
+    diag.ember_dht_search_outcomes = diag.ember_dht_search_outcomes.saturating_add(1);
+    diag.ember_dht_search_nodes_answered = diag
+        .ember_dht_search_nodes_answered
+        .saturating_add(search.responded_count() as u64);
+    diag.ember_dht_search_elapsed_ms_sum = diag
+        .ember_dht_search_elapsed_ms_sum
+        .saturating_add(search.started_at.elapsed().as_millis() as u64);
+    diag.ember_dht_search_records_sum = diag
+        .ember_dht_search_records_sum
+        .saturating_add(search.results.len() as u64);
 }
 
 /// Charge one failed publish round against a file and, once it has gone
@@ -13916,6 +14117,8 @@ pub async fn start_network(
         ember_udp_epx_rate: HashMap::new(),
         ember_udp_epx_req_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
+        ember_verified_highwater: EmberVerifiedHighwater::default(),
+        ember_verified_highwater_dirty: false,
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
         callback_row_pending_since: HashMap::new(),
@@ -13985,6 +14188,7 @@ pub async fn start_network(
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
+        ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_published_sources: HashSet::new(),
         ember_keyword_searches: HashMap::new(),
@@ -14016,6 +14220,9 @@ pub async fn start_network(
     } else {
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
+
+    state.ember_verified_highwater =
+        load_ember_verified_highwater(&ember_highwater_path(&data_dir));
 
     // Carry the record store across the restart too. Every record is re-verified
     // and re-dated on the way in, so anything that expired while we were closed
@@ -15187,6 +15394,11 @@ pub async fn start_network(
                         state.routing_table.evict_filtered_contacts();
                         state.ember_dht.evict_filtered_contacts();
                         known_files.absorb_missing_from(loads.known_files);
+                        hydrate_ember_source_publish_schedule(
+                            &known_files,
+                            &mut state.ember_source_publish_at,
+                            &mut state.ember_source_publish_unix,
+                        );
                         state.aich_hash_sets = loads.aich_hash_sets;
                         for (k, v) in loads.aich_root_map {
                             if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
@@ -16496,6 +16708,10 @@ pub async fn start_network(
                                     complete_sources: existing
                                         .as_ref()
                                         .map(|record| record.complete_sources)
+                                        .unwrap_or(0),
+                                    last_ember_source_publish: existing
+                                        .as_ref()
+                                        .map(|record| record.last_ember_source_publish)
                                         .unwrap_or(0),
                                 };
                                 let completed_friends_only = record.friends_only;
@@ -30173,6 +30389,10 @@ pub async fn start_network(
                         "known.met save exceeded watchdog timeout; retaining serialized ownership and suppressing overlapping retries"
                     );
                 }
+                sync_ember_source_publish_to_known(
+                    &state.ember_source_publish_unix,
+                    &mut known_files,
+                );
                 if known_files.is_dirty() && !known_met_save_in_flight {
                     let ownership = state
                         .known_met_save_lock
@@ -30620,7 +30840,9 @@ pub async fn start_network(
                 //    no Tauri command hangs past the overall timeout. A
                 //    given id is either a node- or value-lookup; draining
                 //    both maps resolves whichever waiter exists.
-                for search_id in state.ember_search.cleanup_expired() {
+                for search in state.ember_search.cleanup_expired() {
+                    record_ember_find_value_quality(&mut state.ember_diagnostics, &search);
+                    let search_id = search.id;
                     if let Some(tx) = state.ember_dht_pending_lookups.remove(&search_id) {
                         let _ = tx.send(Vec::new());
                     }
@@ -32062,6 +32284,16 @@ pub async fn start_network(
         }
     }
 
+    if state.ember_verified_highwater_dirty
+        || state.ember_verified_highwater.alltime > 0
+        || state.ember_verified_highwater.daily > 0
+    {
+        save_ember_verified_highwater(
+            &ember_highwater_path(&state.data_dir),
+            &state.ember_verified_highwater,
+        );
+    }
+
     // Persist the record store so the next session starts holding what this one
     // held. Shutdown only, deliberately: the store can be several megabytes and
     // writing that every few minutes is the disk hitch the peer-list save was
@@ -32221,6 +32453,10 @@ pub async fn start_network(
     }
 
     let known_path = state.data_dir.join("known.met");
+    sync_ember_source_publish_to_known(
+        &state.ember_source_publish_unix,
+        &mut known_files,
+    );
     match tokio::time::timeout_at(
         shutdown_phase_deadline(
             shutdown_deadline,
@@ -33766,6 +34002,9 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
             }
         }
         ember::dht::search::SearchType::FindValue => {
+            if let Some(search) = state.ember_search.get(search_id) {
+                record_ember_find_value_quality(&mut state.ember_diagnostics, search);
+            }
             let records = state
                 .ember_search
                 .get(search_id)
@@ -35537,11 +35776,14 @@ async fn run_ember_maintenance(
     //    would be refused a slot outright and the rest would arrive as a
     //    burst far past what a peer accepts per second — the records would be
     //    dropped, unacked, and retried forever.
+    let republish_interval = std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS);
+    result.republish_due = state.ember_dht.republish_backlog(republish_interval);
     let republish_batch = state.ember_dht.take_republish_batch(
-        std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS),
+        republish_interval,
         EMBER_MAINT_MAX_REPUBLISH,
         force,
     );
+    result.republish_selected = republish_batch.len();
     for (data, signature) in republish_batch {
         let record = match ember::dht::publish::SignedRecord::from_wire(&data, signature) {
             Some(r) => r,
@@ -35583,6 +35825,7 @@ async fn run_ember_maintenance(
             state
                 .ember_dht
                 .mark_republish_due(&record.keyword_hash, &record.signature);
+            result.republish_rearmed += 1;
         }
     }
     flush_ember_batch_publish(socket, state).await;
@@ -35657,6 +35900,32 @@ async fn run_ember_maintenance(
             result.announces_sent += 1;
         }
     }
+
+    let verified_now = state.ember_dht.routing().verified_len() as u32;
+    if note_ember_verified_contacts(&mut state.ember_verified_highwater, verified_now) {
+        state.ember_verified_highwater_dirty = true;
+    }
+    if state.ember_verified_highwater_dirty {
+        save_ember_verified_highwater(
+            &ember_highwater_path(&state.data_dir),
+            &state.ember_verified_highwater,
+        );
+        state.ember_verified_highwater_dirty = false;
+    }
+
+    info!(
+        "Ember replication cycle: due={}, selected={}, queued={}, re-armed={}, \
+         backlog={}, contacts={} ({} verified)",
+        result.republish_due,
+        result.republish_selected,
+        result.records_republished,
+        result.republish_rearmed,
+        state
+            .ember_dht
+            .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS)),
+        state.ember_dht.contact_count(),
+        state.ember_dht.routing().verified_len(),
+    );
 
     result
 }
@@ -35811,8 +36080,21 @@ async fn handle_ember_dht_message(
     }
 
     // Cumulative on the store itself, so this mirrors rather than accumulates.
-    state.ember_diagnostics.ember_dht_store_key_cap_rejections =
-        state.ember_dht.store_key_cap_rejections() as u32;
+    let store_rejects = state.ember_dht.store_reject_stats();
+    state.ember_diagnostics.ember_dht_store_key_cap_rejections = store_rejects.key_cap as u32;
+    state.ember_diagnostics.ember_dht_store_reject_signature = store_rejects.signature as u32;
+    state.ember_diagnostics.ember_dht_store_reject_timestamp = store_rejects.timestamp as u32;
+    state.ember_diagnostics.ember_dht_store_reject_source_ip_cap =
+        store_rejects.source_ip_cap as u32;
+    state.ember_diagnostics.ember_dht_store_reject_publisher_cap =
+        store_rejects.publisher_cap as u32;
+    state.ember_diagnostics.ember_dht_store_reject_per_key_cap = store_rejects.per_key_cap as u32;
+    state.ember_diagnostics.ember_dht_store_reject_verify =
+        state.ember_dht.store_reject_verify() as u32;
+    state.ember_diagnostics.ember_dht_store_reject_source_ip =
+        state.ember_dht.store_reject_source_ip() as u32;
+    state.ember_diagnostics.ember_dht_store_reject_proximity =
+        state.ember_dht.store_reject_proximity() as u32;
 
     if let Some(err) = inbound.error {
         state.ember_diagnostics.ember_dht_malformed = state
@@ -40905,6 +41187,14 @@ async fn handle_command_inner(
             diag.local_ed25519_public_key = hex::encode(state.ember_dht.ed25519_public_key());
             diag.ember_dht_contacts = state.ember_dht.contact_count() as u32;
             diag.ember_dht_verified_contacts = state.ember_dht.routing().verified_len() as u32;
+            if note_ember_verified_contacts(
+                &mut state.ember_verified_highwater,
+                diag.ember_dht_verified_contacts,
+            ) {
+                state.ember_verified_highwater_dirty = true;
+            }
+            diag.ember_dht_verified_highwater_today = state.ember_verified_highwater.daily;
+            diag.ember_dht_verified_highwater = state.ember_verified_highwater.alltime;
             diag.ember_dht_estimated_nodes = state
                 .ember_dht
                 .routing()
@@ -43267,6 +43557,10 @@ async fn handle_command_inner(
                                 friends_only: f.friends_only
                                     || existing.as_ref().is_some_and(|r| r.friends_only),
                                 complete_sources: sources,
+                                last_ember_source_publish: existing
+                                    .as_ref()
+                                    .map(|r| r.last_ember_source_publish)
+                                    .unwrap_or(0),
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
                             // drop publish timers so the next tick advertises

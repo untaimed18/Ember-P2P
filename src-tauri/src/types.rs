@@ -735,9 +735,9 @@ pub struct EmberDiagnostics {
     #[serde(default)]
     pub ember_dht_find_value_misses: u32,
     /// Inbound FIND_VALUE answers that could not carry every matching record
-    /// this node holds, because one datagram fits only about five. The same
-    /// front-of-list records are served every time, so a publisher behind them
-    /// is invisible here no matter how often it is asked for.
+    /// this node holds, because one datagram fits only about five. Successive
+    /// queries rotate which window is served, so a publisher behind the first
+    /// handful is no longer permanently invisible here.
     #[serde(default)]
     pub ember_dht_found_value_truncated: u32,
     /// Records left out of those answers. Read against
@@ -803,6 +803,51 @@ pub struct EmberDiagnostics {
     /// genuinely closest to — are being turned away.
     #[serde(default)]
     pub ember_dht_store_key_cap_rejections: u32,
+    /// STORE frames whose publisher signature did not parse, or whose DHT
+    /// key did not match the record's own content key.
+    #[serde(default)]
+    pub ember_dht_store_reject_verify: u32,
+    /// STORE frames refused because the Ed25519 signature did not verify.
+    #[serde(default)]
+    pub ember_dht_store_reject_signature: u32,
+    /// STORE frames refused because the signed creation time was too far
+    /// in the future or already past TTL.
+    #[serde(default)]
+    pub ember_dht_store_reject_timestamp: u32,
+    /// Source records refused by the per-IP cap.
+    #[serde(default)]
+    pub ember_dht_store_reject_source_ip_cap: u32,
+    /// Records refused because one publisher already holds its share of the key.
+    #[serde(default)]
+    pub ember_dht_store_reject_publisher_cap: u32,
+    /// Records refused because the key already holds `MAX_RECORDS_PER_KEY`.
+    #[serde(default)]
+    pub ember_dht_store_reject_per_key_cap: u32,
+    /// Source records whose declared IP did not match the Noise sender.
+    #[serde(default)]
+    pub ember_dht_store_reject_source_ip: u32,
+    /// STORE records for keys this node is not close enough to hold.
+    #[serde(default)]
+    pub ember_dht_store_reject_proximity: u32,
+    /// Completed FIND_VALUE searches this session (hits, misses, and timeouts).
+    /// Denominator for the search-quality averages below.
+    #[serde(default)]
+    pub ember_dht_search_outcomes: u32,
+    /// Sum of shortlist nodes that answered across those searches.
+    #[serde(default)]
+    pub ember_dht_search_nodes_answered: u64,
+    /// Sum of FIND_VALUE durations in milliseconds.
+    #[serde(default)]
+    pub ember_dht_search_elapsed_ms_sum: u64,
+    /// Sum of verified records gathered across those searches.
+    #[serde(default)]
+    pub ember_dht_search_records_sum: u64,
+    /// Highest verified-contact count seen today (UTC), persisted across restart.
+    #[serde(default)]
+    pub ember_dht_verified_highwater_today: u32,
+    /// Highest verified-contact count ever recorded on this node.
+    #[serde(default)]
+    pub ember_dht_verified_highwater: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

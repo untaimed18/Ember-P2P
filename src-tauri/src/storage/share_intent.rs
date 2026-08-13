@@ -363,6 +363,7 @@ mod tests {
             is_shared: false,
             friends_only: false,
             complete_sources: 0,
+            last_ember_source_publish: 0,
         });
         known.save(&base.join("known.met")).unwrap();
 
