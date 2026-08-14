@@ -151,6 +151,14 @@ averages, and persisted verified-contact high-water. Pagination, firewalled
 consume, and dropping `node_id` still wait on a version bump. Item 2 remains
 blocked on measuring whether truncation still binds after rotation.
 
+**Shipped in 1.5.5 (no wire change):** Ember BLAKE3 pin mismatch is a permanent
+download failure with a visible fail badge (it used to reopen every part and
+re-queue the search); keyword-publish stamps persist across restart like source
+stamps; transport sessions are keyed on `(address, static key)`; Connected /
+Search readiness use verified contacts so gossip does not look like a join.
+The anti-leech filter matches the software label plus the mod tag (outside
+the DHT).
+
 Items 4 and 7 are untouched and remain in this order.
 
 ### 1. The serving ceiling — do this first
@@ -329,8 +337,11 @@ settled.
 
 - Richer keyword indexing (stemming, more than space-split tokens) if
   recall lags KAD on real libraries.
-- Clearer search UI when Ember is joining (empty table) versus
-  enabled-but-quiet.
+- ~~Clearer search UI when Ember is joining (empty table) versus
+  enabled-but-quiet.~~ Search, the Ember page, and the status bar wait for
+  a verified contact; gossip-only no longer looks connected. After the
+  join timeout with still-zero verified peers, Search shows the muted
+  no-peers hint.
 - Storer-side replication telemetry. The publish side logs an
   `Ember publish cycle` heartbeat each minute; maintenance now logs an
   `Ember replication cycle` heartbeat as well (see
@@ -338,7 +349,10 @@ settled.
 
 ### Integrity and downloads
 
-- Surface BLAKE3 verify pass/fail in the transfer UI.
+- ~~Surface BLAKE3 verify pass/fail in the transfer UI.~~ Pass is the Ember
+  badge on a completed row (`ember_verified`). Fail is a permanent download
+  failure with a red Ember badge; a mismatch no longer reopens parts that
+  already matched the ed2k hash, and the download is not re-queued.
 - ~~Seed `emberFileHash` from more UI entry points when the digest is
   already known.~~ ed2k `eh=` links, friend-browse trailers, file-offer
   trailers, paste/deep-link, library copy, and friend accept all pass it

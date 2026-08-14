@@ -244,6 +244,8 @@ export interface NetworkStats {
   ember_native_enabled: boolean;
   /** Live Ember DHT routing-table contacts for the status-bar peer count. */
   ember_dht_contacts: number;
+  /** Contacts that have answered us. Used for connected vs still-joining. */
+  ember_dht_verified_contacts?: number;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via

@@ -60,13 +60,13 @@
 
   function emberDhtStatus(stats: typeof $networkStats): 'connected' | 'connecting' | 'disconnected' {
     if (!stats.ember_native_enabled) return 'disconnected';
-    return stats.ember_dht_contacts > 0 ? 'connected' : 'connecting';
+    return (stats.ember_dht_verified_contacts ?? 0) > 0 ? 'connected' : 'connecting';
   }
 
   function emberDhtTitle(stats: typeof $networkStats): string {
     const status = emberDhtStatus(stats);
     if (status === 'connected') {
-      const peers = stats.ember_dht_contacts;
+      const peers = stats.ember_dht_verified_contacts ?? 0;
       return peers === 1
         ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
         : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });

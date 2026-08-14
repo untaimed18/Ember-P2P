@@ -17099,7 +17099,10 @@ pub async fn start_network(
 
                     // eMule-style: downloads never auto-fail. Re-queue for source
                     // retry unless the user explicitly cancelled — or the local
-                    // disk is full (Insufficient), which is transfer-level.
+                    // disk is full (Insufficient), which is transfer-level —
+                    // or the Ember BLAKE3 pin missed. That last one is also
+                    // transfer-level: the ed2k parts already matched, so
+                    // searching more sources cannot change the digest.
                     // Prefer is_user_cancel_error for source-failure classification;
                     // also honour an already-cancelled control (cancel race).
                     let is_user_cancel = ed2k::transfer::is_user_cancel_error(error) || {
@@ -17108,7 +17111,14 @@ pub async fn start_network(
                     };
                     let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
                         || ed2k::transfer::is_disk_full_error(error);
-                    if is_disk_full && !is_user_cancel {
+                    let is_ember_pin_fail = ed2k::transfer::is_ember_blake3_mismatch(error)
+                        || ed2k::transfer::is_ember_blake3_mismatch(&failure_summary);
+                    if is_ember_pin_fail && !is_user_cancel {
+                        state.pending_downloads.remove(transfer_id);
+                        info!(
+                            "Ember BLAKE3 pin failed for {transfer_id} — not re-queuing"
+                        );
+                    } else if is_disk_full && !is_user_cancel {
                         let file_name = {
                             let mgr = transfer_manager.read().await;
                             mgr.get_transfer(transfer_id)
@@ -41355,6 +41365,8 @@ async fn handle_command_inner(
             // EmberDHT status-bar gauges — same sources as GetEmberDiagnostics.
             state.stats.ember_native_enabled = settings.ember_native_enabled;
             state.stats.ember_dht_contacts = state.ember_dht.contact_count() as u32;
+            state.stats.ember_dht_verified_contacts =
+                state.ember_dht.routing().verified_len() as u32;
             let _ = tx.send(state.stats.clone());
         }
 
@@ -45574,7 +45586,10 @@ async fn handle_download_event(
 
             let _ = app_handle.emit(
                 "transfer-complete",
-                serde_json::json!({ "id": transfer_id }),
+                serde_json::json!({
+                    "id": transfer_id,
+                    "ember_verified": ember_verified,
+                }),
             );
 
             // Defensive cleanup: remove any leftover .part / .part.met files

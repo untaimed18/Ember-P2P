@@ -134,11 +134,11 @@
 
   // Drive the join-progress timer off each diagnostics snapshot (a plain
   // function, not a reactive `$effect`, so there's no write-read feedback
-  // loop on `joinTimedOut`). While active with zero contacts we run a
-  // one-shot timer; finding a contact resets it.
+  // loop on `joinTimedOut`). While active with zero verified contacts we
+  // run a one-shot timer; a peer that has actually answered resets it.
   function recomputeJoinState() {
     const active = !!diag?.ember_native_enabled;
-    const contacts = diag?.ember_dht_contacts ?? 0;
+    const contacts = diag?.ember_dht_verified_contacts ?? 0;
     if (!active || contacts > 0) {
       if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
       activeSince = null;
@@ -169,9 +169,10 @@
 
   let isActive = $derived(!!diag?.ember_native_enabled);
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
+  let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
   let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
-  let joining = $derived(isActive && peerCount === 0 && !joinTimedOut);
-  let isConnected = $derived(isActive && peerCount > 0);
+  let joining = $derived(isActive && verifiedCount === 0 && !joinTimedOut);
+  let isConnected = $derived(isActive && verifiedCount > 0);
 
   type HeroState = 'loading' | 'off' | 'connecting' | 'connected' | 'no_peers';
   let heroState: HeroState = $derived(

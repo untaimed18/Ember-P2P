@@ -761,7 +761,7 @@
       }
       getEmberDiagnostics()
         .then((d) => {
-          emberContacts = d.ember_dht_contacts ?? 0;
+          emberContacts = d.ember_dht_verified_contacts ?? 0;
         })
         .catch(() => {});
     };

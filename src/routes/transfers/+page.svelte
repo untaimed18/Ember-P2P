@@ -1564,7 +1564,13 @@
   });
 
   // --- eMule-style status labels ---
+  function isEmberHashMismatch(t: Transfer): boolean {
+    const reason = (t.failure_reason || '').toLowerCase();
+    return reason.includes('ember content hash mismatch') || reason.includes('ember blake3');
+  }
+
   function failureBadgeLabel(t: Transfer): string {
+    if (isEmberHashMismatch(t)) return m.transfers_ember_mismatch_label();
     if (t.failure_kind === 'download_timeout') return m.transfers_failure_timeout();
     if (t.failure_kind === 'permanent') return m.transfers_failure_permanent_error();
     if (t.failure_stage === 'queue_wait') return m.transfers_failure_queue_wait();
@@ -2869,9 +2875,11 @@
       case 'verifying': return m.transfers_dl_tooltip_verifying();
       case 'completing': return m.transfers_dl_tooltip_completing();
       case 'completed': return m.transfers_dl_tooltip_completed();
-      case 'failed': return t.failure_reason
-        ? m.transfers_dl_tooltip_failed_reason({ reason: t.failure_reason })
-        : m.transfers_dl_tooltip_failed();
+      case 'failed':
+        if (isEmberHashMismatch(t)) return m.transfers_ember_mismatch_title();
+        return t.failure_reason
+          ? m.transfers_dl_tooltip_failed_reason({ reason: t.failure_reason })
+          : m.transfers_dl_tooltip_failed();
       case 'hashing': return m.transfers_dl_tooltip_hashing();
       case 'insufficient': return m.transfers_dl_tooltip_insufficient();
       case 'noneneeded': return m.transfers_dl_tooltip_noneneeded();
@@ -3306,6 +3314,8 @@
                     <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
                     {#if t.status === 'completed' && t.ember_verified}
                       <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
+                    {:else if t.status === 'failed' && isEmberHashMismatch(t)}
+                      <span class="ember-mismatch-badge" title={m.transfers_ember_mismatch_title()}>{m.transfers_ember_mismatch_badge()}</span>
                     {/if}
                   </td>
                 {:else if column.key === 'remaining'}
@@ -3469,6 +3479,8 @@
                       <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
                       {#if t.status === 'completed' && t.ember_verified}
                         <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
+                      {:else if t.status === 'failed' && isEmberHashMismatch(t)}
+                        <span class="ember-mismatch-badge" title={m.transfers_ember_mismatch_title()}>{m.transfers_ember_mismatch_badge()}</span>
                       {/if}
                       <!--
                         L10: surface failure_kind / failure_stage in the
@@ -5298,6 +5310,19 @@
     color: var(--success);
     background: color-mix(in srgb, var(--success) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--success) 34%, transparent);
+  }
+  .ember-mismatch-badge {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1.4;
+    vertical-align: middle;
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent);
   }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */

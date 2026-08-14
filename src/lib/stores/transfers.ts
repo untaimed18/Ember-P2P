@@ -205,6 +205,10 @@ interface TransferEventPayload {
   active_sources?: number;
   queued_sources?: number;
   peer_id?: string;
+  /** Set on `transfer-complete` when this completion actually re-checked
+   *  the Ember BLAKE3 pin. Absent/false means no pin was known, or the
+   *  event predates that field. */
+  ember_verified?: boolean;
   /** Backend tags upload-direction terminal events so the store can
    *  vanish the row on completion (matches eMule UX where finished
    *  upload sessions disappear from the active list). Falls back to
@@ -486,7 +490,7 @@ export async function initTransferStore() {
     });
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
-      const { id, direction } = event.payload;
+      const { id, direction, ember_verified } = event.payload;
       // Row is terminal from here on — reversible-state tracking no longer
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
@@ -525,6 +529,7 @@ export async function initTransferStore() {
             progress: 100,
             transferred: t.total_size,
             completed_size: t.total_size,
+            ember_verified: ember_verified === true || t.ember_verified,
           };
         });
       });

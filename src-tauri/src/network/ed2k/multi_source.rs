@@ -3489,6 +3489,7 @@ impl MultiSourceDownload {
             let verify_root = self.download_dir.clone();
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
+            let mut ember_pin_failed = false;
             let verified_result = match tokio::task::spawn_blocking(move || {
                 use std::io::{Read, Seek, SeekFrom};
                 let allowed = vec![verify_root.to_string_lossy().into_owned()];
@@ -3546,10 +3547,19 @@ impl MultiSourceDownload {
                     None
                 }
                 Ok(Err(e)) => {
-                    warn!(
-                        "Multi-source download hash verification failed for {}: {e}",
-                        self.file_name
-                    );
+                    let msg = e.to_string();
+                    if super::transfer::is_ember_blake3_mismatch(&msg) {
+                        ember_pin_failed = true;
+                        warn!(
+                            "Ember BLAKE3 pin failed for {}: {msg} — not retrying parts",
+                            self.file_name
+                        );
+                    } else {
+                        warn!(
+                            "Multi-source download hash verification failed for {}: {e}",
+                            self.file_name
+                        );
+                    }
                     None
                 }
                 Err(e) => {
@@ -3561,7 +3571,15 @@ impl MultiSourceDownload {
                 }
             };
 
-            if let Some((verified_identity, actual_aich)) = verified_result {
+            if ember_pin_failed {
+                let _ = event_tx
+                    .send(DownloadEvent::Failed {
+                        transfer_id: self.transfer_id.clone(),
+                        error: super::transfer::EMBER_BLAKE3_MISMATCH_MSG.to_string(),
+                        failure_kind: super::transfer::SourceFailureKind::Permanent,
+                    })
+                    .await;
+            } else if let Some((verified_identity, actual_aich)) = verified_result {
                 if let Some(expected_aich) = self.expected_aich_master {
                     let computed = actual_aich.ok_or_else(|| {
                         anyhow::anyhow!("AICH verification did not produce a root")

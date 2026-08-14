@@ -507,11 +507,17 @@ pub struct NetworkStats {
     /// Live Ember DHT routing-table contacts — status-bar EmberDHT peer count.
     #[serde(default)]
     pub ember_dht_contacts: u32,
+    /// Of [`ember_dht_contacts`], those that have answered us. The status bar
+    /// and search readiness use this so gossip-only leads do not look like a
+    /// joined overlay.
+    #[serde(default)]
+    pub ember_dht_verified_contacts: u32,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
 /// via `get_ember_diagnostics`; status-bar gauges (`ember_native_enabled`,
-/// `ember_dht_contacts`) also live on `NetworkStats` for the hot poll path.
+/// `ember_dht_contacts`, `ember_dht_verified_contacts`) also live on
+/// `NetworkStats` for the hot poll path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmberDiagnostics {
     /// Source-exchange events accepted from a connected Ember peer this session.
@@ -940,6 +946,7 @@ impl Default for NetworkStats {
             tcp_mapping_hold_ok: false,
             ember_native_enabled: true,
             ember_dht_contacts: 0,
+            ember_dht_verified_contacts: 0,
         }
     }
 }

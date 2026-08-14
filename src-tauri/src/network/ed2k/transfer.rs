@@ -532,12 +532,28 @@ pub struct SourceExchangeEntry {
     pub crypt_options: u8,
 }
 
+/// True when completion refused the file because its Ember BLAKE3 pin did
+/// not match. Distinct from an ed2k/AICH mismatch: the MD4 parts can all
+/// be correct while the Ember digest is wrong, and retrying those parts
+/// cannot fix a bad pin.
+pub fn is_ember_blake3_mismatch(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("ember blake3 mismatch") || lower.contains("ember content hash mismatch")
+}
+
+/// Canned error for a terminal Ember pin failure. Kept as one string so the
+/// single-source and multi-source completion paths, plus the event-loop
+/// re-queue skip, all agree.
+pub const EMBER_BLAKE3_MISMATCH_MSG: &str =
+    "ember blake3 mismatch: content did not match the expected Ember hash";
+
 /// Classify an error string into transient vs permanent failure.
 pub fn classify_error(err: &str) -> SourceFailureKind {
     let lower = err.to_lowercase();
     if is_disk_full_error(err) {
         SourceFailureKind::InsufficientDisk
-    } else if lower.contains("does not have the file")
+    } else if is_ember_blake3_mismatch(err)
+        || lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
         || lower.contains("file not found")
         || lower.contains("hash mismatch")
@@ -583,6 +599,9 @@ pub(crate) fn summarize_error(error: &str, kind: &SourceFailureKind) -> String {
         || lower.contains("file not found")
     {
         return "Remote missing file".to_string();
+    }
+    if is_ember_blake3_mismatch(error) {
+        return "Ember content hash mismatch".to_string();
     }
     if lower.contains("hash mismatch") || lower.contains("hash verification failed") {
         return "Hash mismatch".to_string();
@@ -739,6 +758,24 @@ mod tests {
         assert_eq!(
             summarize_error("peer does not have the file", &kind),
             "Remote missing file"
+        );
+    }
+
+    #[test]
+    fn ember_blake3_mismatch_is_permanent_and_distinct() {
+        let raw = "ember blake3 mismatch: expected=aa got=bb";
+        let kind = classify_error(raw);
+        assert_eq!(kind, SourceFailureKind::Permanent);
+        assert_eq!(summarize_error(raw, &kind), "Ember content hash mismatch");
+        assert!(is_ember_blake3_mismatch(raw));
+        assert!(is_ember_blake3_mismatch(EMBER_BLAKE3_MISMATCH_MSG));
+        assert!(
+            is_ember_blake3_mismatch("Ember content hash mismatch"),
+            "the canned UI summary must also classify as an Ember pin failure"
+        );
+        assert!(
+            !is_ember_blake3_mismatch("Download hash mismatch for file: expected=x, got=y"),
+            "ed2k mismatch must not be classified as an Ember pin failure"
         );
     }
 
@@ -4811,6 +4848,7 @@ impl Ed2kDownload {
         let verify_root = self.download_dir.clone();
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
+        let mut ember_pin_failed = false;
         let verified_result = match tokio::task::spawn_blocking(move || {
             use std::io::{Read, Seek, SeekFrom};
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
@@ -4862,10 +4900,19 @@ impl Ed2kDownload {
                 None
             }
             Ok(Err(e)) => {
-                warn!(
-                    "Could not verify hash for {}: {e} — treating as failed",
-                    self.file_name
-                );
+                let msg = e.to_string();
+                if is_ember_blake3_mismatch(&msg) {
+                    ember_pin_failed = true;
+                    warn!(
+                        "Ember BLAKE3 pin failed for {}: {msg} — not retrying parts",
+                        self.file_name
+                    );
+                } else {
+                    warn!(
+                        "Could not verify hash for {}: {e} — treating as failed",
+                        self.file_name
+                    );
+                }
                 None
             }
             Err(e) => {
@@ -4878,6 +4925,9 @@ impl Ed2kDownload {
         };
 
         let Some((verified_identity, actual_aich)) = verified_result else {
+            if ember_pin_failed {
+                anyhow::bail!(EMBER_BLAKE3_MISMATCH_MSG);
+            }
             for i in 0..tracker.part_count {
                 tracker.mark_incomplete(i);
             }
