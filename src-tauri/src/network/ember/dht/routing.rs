@@ -343,15 +343,13 @@ impl RoutingTable {
                         bucket.contacts.insert(pos, existing);
                         return AddResult::Rejected;
                     }
-                    let global_count =
-                        self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
+                    let global_count = self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
                     if global_count >= max_subnet_global {
                         bucket.contacts.insert(pos, existing);
                         return AddResult::Rejected;
                     }
                 }
-                if ip != old_ip
-                    && self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip
+                if ip != old_ip && self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip
                 {
                     let bucket = &mut self.buckets[bucket_idx];
                     bucket.contacts.insert(pos, existing);
@@ -892,7 +890,11 @@ impl RoutingTable {
         bucket
             .find(node_id)
             .map(|pos| &bucket.contacts[pos])
-            .or_else(|| bucket.find_in_cache(node_id).map(|pos| &bucket.replacement_cache[pos]))
+            .or_else(|| {
+                bucket
+                    .find_in_cache(node_id)
+                    .map(|pos| &bucket.replacement_cache[pos])
+            })
     }
 
     /// Pick non-empty bucket indices to refresh, stalest first, capped at
@@ -968,12 +970,7 @@ impl RoutingTable {
                 let s = c.subnet_key();
                 bucket.subnet_count(s) >= max_subnet_bucket
                     || self.global_subnet_count.get(&s).copied().unwrap_or(0) >= max_subnet_global
-                    || self
-                        .global_ip_count
-                        .get(&c.addr.ip())
-                        .copied()
-                        .unwrap_or(0)
-                        >= max_per_ip
+                    || self.global_ip_count.get(&c.addr.ip()).copied().unwrap_or(0) >= max_per_ip
             });
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
@@ -985,7 +982,9 @@ impl RoutingTable {
                 }
             }
         }
-        self.buckets[bucket_idx].replacement_cache.push_back(contact);
+        self.buckets[bucket_idx]
+            .replacement_cache
+            .push_back(contact);
     }
 }
 
@@ -1167,9 +1166,12 @@ mod tests {
         let mut rt = RoutingTable::new(local, false);
         // Saturate one subnet within the bucket. The limit is tier-dependent, so
         // it is read from the tier a full bucket lands in rather than hardcoded.
-        let saturated = scale::NetworkScale::from_contacts(K_BUCKET_SIZE)
-            .max_contacts_per_subnet_per_bucket();
-        assert!(saturated < K_BUCKET_SIZE, "the subnet must not fill the bucket");
+        let saturated =
+            scale::NetworkScale::from_contacts(K_BUCKET_SIZE).max_contacts_per_subnet_per_bucket();
+        assert!(
+            saturated < K_BUCKET_SIZE,
+            "the subnet must not fill the bucket"
+        );
         for k in 0..saturated as u8 {
             rt.add_contact(contact_at(0x80 + k, 80, 1, 1, k + 1));
         }
@@ -1195,7 +1197,10 @@ mod tests {
         // holds it at all.
         assert!(rt.evict_and_replace(&victim));
         let bucket = &rt.buckets[local.bucket_index(&make_id(0x95)).expect("a bucket")];
-        assert!(bucket.find(&make_id(0x95)).is_some(), "the eligible entry is promoted");
+        assert!(
+            bucket.find(&make_id(0x95)).is_some(),
+            "the eligible entry is promoted"
+        );
         assert!(
             bucket.find(&make_id(0x94)).is_none(),
             "the subnet-saturated one stays in the cache"
@@ -1409,7 +1414,9 @@ mod tests {
         );
 
         // And a zero request stays empty rather than returning the whole table.
-        assert!(rt.find_closest_prefer_verified(&make_id(0x10), 0).is_empty());
+        assert!(rt
+            .find_closest_prefer_verified(&make_id(0x10), 0)
+            .is_empty());
     }
 
     /// Ranking these by health was tried and reverted; this pins the ordering so

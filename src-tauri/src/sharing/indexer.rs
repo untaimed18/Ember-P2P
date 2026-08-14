@@ -144,73 +144,75 @@ impl FileIndexer {
         // safe without dropping files between cursor pages.
         let mut pending: BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>> =
             BinaryHeap::new();
-        let enqueue_children =
-            |directory: &Path,
-             pending: &mut BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>>| {
-                let entries = match std::fs::read_dir(directory) {
-                    Ok(entries) => entries,
+        let enqueue_children = |directory: &Path,
+                                pending: &mut BinaryHeap<
+            Reverse<(String, std::path::PathBuf, bool)>,
+        >| {
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!(
+                        "Failed to read shared directory {}: {error}",
+                        directory.display()
+                    );
+                    return false;
+                }
+            };
+            let mut trimmed = false;
+            for entry in entries {
+                if pending.len() >= MAX_PENDING_FRONTIER {
+                    // Stop growing the frontier; the caller marks the page
+                    // `partial` so nothing is reconciled away against it.
+                    trimmed = true;
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
                     Err(error) => {
-                        warn!("Failed to read shared directory {}: {error}", directory.display());
-                        return false;
-                    }
-                };
-                let mut trimmed = false;
-                for entry in entries {
-                    if pending.len() >= MAX_PENDING_FRONTIER {
-                        // Stop growing the frontier; the caller marks the page
-                        // `partial` so nothing is reconciled away against it.
-                        trimmed = true;
-                        break;
-                    }
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            warn!("Failed to enumerate {}: {error}", directory.display());
-                            continue;
-                        }
-                    };
-                    let entry_path = entry.path();
-                    let file_type = match entry.file_type() {
-                        Ok(file_type) => file_type,
-                        Err(error) => {
-                            warn!("Failed to inspect {}: {error}", entry_path.display());
-                            continue;
-                        }
-                    };
-                    if file_type.is_symlink() {
+                        warn!("Failed to enumerate {}: {error}", directory.display());
                         continue;
                     }
-                    #[cfg(target_os = "windows")]
-                    {
-                        use std::os::windows::fs::MetadataExt;
-                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                        if let Ok(metadata) = entry.metadata() {
-                            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                                continue;
-                            }
-                        }
+                };
+                let entry_path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        warn!("Failed to inspect {}: {error}", entry_path.display());
+                        continue;
                     }
-                    if file_type.is_dir() {
-                        if crate::sharing::is_sensitive_dir_name(
-                            &entry.file_name().to_string_lossy(),
-                        ) {
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                    if let Ok(metadata) = entry.metadata() {
+                        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                             continue;
                         }
-                        if let Ok(canonical) = entry_path.canonicalize() {
-                            if canonical == data_canon || canonical.starts_with(&data_canon) {
-                                continue;
-                            }
-                        }
-                        let mut key = normalize_path_key(&entry_path.to_string_lossy());
-                        key.push(std::path::MAIN_SEPARATOR);
-                        pending.push(Reverse((key, entry_path, true)));
-                    } else if file_type.is_file() {
-                        let key = normalize_path_key(&entry_path.to_string_lossy());
-                        pending.push(Reverse((key, entry_path, false)));
                     }
                 }
-                trimmed
-            };
+                if file_type.is_dir() {
+                    if crate::sharing::is_sensitive_dir_name(&entry.file_name().to_string_lossy()) {
+                        continue;
+                    }
+                    if let Ok(canonical) = entry_path.canonicalize() {
+                        if canonical == data_canon || canonical.starts_with(&data_canon) {
+                            continue;
+                        }
+                    }
+                    let mut key = normalize_path_key(&entry_path.to_string_lossy());
+                    key.push(std::path::MAIN_SEPARATOR);
+                    pending.push(Reverse((key, entry_path, true)));
+                } else if file_type.is_file() {
+                    let key = normalize_path_key(&entry_path.to_string_lossy());
+                    pending.push(Reverse((key, entry_path, false)));
+                }
+            }
+            trimmed
+        };
         let mut frontier_trimmed = enqueue_children(path, &mut pending);
 
         while let Some(Reverse((_key, entry_path, is_directory))) = pending.pop() {

@@ -580,8 +580,7 @@ impl EmberDht {
             return None;
         }
         let request_id = self.next_request_id();
-        let msg =
-            messages::build_store_batch(self.local_id, request_id, records[..taken].to_vec());
+        let msg = messages::build_store_batch(self.local_id, request_id, records[..taken].to_vec());
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         Some((request_id, bytes, taken))
     }
@@ -826,16 +825,13 @@ impl EmberDht {
             .partition(|c| !c.is_verified());
 
         verified.sort_by_key(|c| c.last_seen); // stalest first
-        // Leads have no staleness to rank by, so prefer those we have not
-        // already failed against: a wall of dead gossip would otherwise hold
-        // the reserve until it faults out, keeping fresh leads unprobed.
+                                               // Leads have no staleness to rank by, so prefer those we have not
+                                               // already failed against: a wall of dead gossip would otherwise hold
+                                               // the reserve until it faults out, keeping fresh leads unprobed.
         leads.sort_by_key(|c| c.failed_queries);
 
         let lead_reserve = max.div_ceil(LEAD_PING_RESERVE_DIVISOR).min(leads.len());
-        let mut due: Vec<EmberContact> = verified
-            .into_iter()
-            .take(max - lead_reserve)
-            .collect();
+        let mut due: Vec<EmberContact> = verified.into_iter().take(max - lead_reserve).collect();
         due.extend(leads.into_iter().take(max - due.len()));
         due
     }
@@ -1027,8 +1023,7 @@ impl EmberDht {
                 // Always answer, even with nothing accepted: the publisher
                 // needs to tell "stored nothing" apart from "never arrived"
                 // so it can retry rather than assume the records are placed.
-                let ack =
-                    messages::build_store_batch_ack(self.local_id, msg.request_id, accepted);
+                let ack = messages::build_store_batch_ack(self.local_id, msg.request_id, accepted);
                 out.responses
                     .push(messages::encode_message(&ack, &self.signing_key, true));
             }
@@ -1052,11 +1047,10 @@ impl EmberDht {
                             .source_contact
                             .map(|sc| sc.flags & SOURCE_FLAG_FIREWALLED != 0)
                             .unwrap_or(false);
-                    let publisher_is_sender = crypto::node_id_from_ed25519_bytes(
-                        &parsed.publisher_key,
-                    )
-                    .map(|id| EmberNodeId(id) == msg.sender_id)
-                    .unwrap_or(false);
+                    let publisher_is_sender =
+                        crypto::node_id_from_ed25519_bytes(&parsed.publisher_key)
+                            .map(|id| EmberNodeId(id) == msg.sender_id)
+                            .unwrap_or(false);
                     if is_fw_source && key == parsed.keyword_hash && publisher_is_sender {
                         out.proxy_store_forward = Some((msg.request_id, parsed));
                     }
@@ -1069,10 +1063,12 @@ impl EmberDht {
                 out.announce_peer_received = true;
                 Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
                 let closest = self.closest_excluding(&msg.sender_id, msg.sender_id);
-                let peer_list =
-                    messages::build_peer_list(self.local_id, msg.request_id, closest);
-                out.responses
-                    .push(messages::encode_message(&peer_list, &self.signing_key, true));
+                let peer_list = messages::build_peer_list(self.local_id, msg.request_id, closest);
+                out.responses.push(messages::encode_message(
+                    &peer_list,
+                    &self.signing_key,
+                    true,
+                ));
             }
             DhtPayload::PeerList { contacts } => {
                 Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
@@ -1175,7 +1171,10 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 /// as defense-in-depth. When we *do* hold one or more secondaries, we
 /// filter by `file_hash` intersection. Empty intersection → `None`
 /// (`FOUND_NODE`). Single-key queries serve all live primary records.
-fn intersect_find_value_records(store: &mut DhtStore, keys: &[[u8; 16]]) -> Option<FoundValueReply> {
+fn intersect_find_value_records(
+    store: &mut DhtStore,
+    keys: &[[u8; 16]],
+) -> Option<FoundValueReply> {
     let (primary, filtered) = intersect_live_records(store, keys)?;
 
     // Pack records until the reply would stop fitting a datagram. A key can
@@ -1428,7 +1427,10 @@ mod tests {
         let key = record.keyword_hash;
 
         assert!(d.local_records(&key, &[]).is_empty(), "nothing stored yet");
-        assert!(d.store_own_record(&record), "we are responsible for this key");
+        assert!(
+            d.store_own_record(&record),
+            "we are responsible for this key"
+        );
 
         let held = d.local_records(&key, &[]);
         assert_eq!(held.len(), 1);
@@ -1717,8 +1719,7 @@ mod tests {
             let (rid, frame, taken) = a.build_store_batch(&remaining).expect("a batch");
             assert!(taken > 0, "each batch must make progress");
             assert!(
-                frame.len() + messages::TRANSPORT_OVERHEAD
-                    <= messages::MAX_UNFRAGMENTED_DATAGRAM,
+                frame.len() + messages::TRANSPORT_OVERHEAD <= messages::MAX_UNFRAGMENTED_DATAGRAM,
                 "a batch must not fragment"
             );
             frames += 1;
@@ -1781,9 +1782,7 @@ mod tests {
         let (_rid, frame, taken) = a.build_store_batch(&records).expect("a batch");
         assert!(taken < records.len(), "the batch must be split");
         assert!(taken > 0, "and must still make progress");
-        assert!(
-            frame.len() + messages::TRANSPORT_OVERHEAD <= messages::MAX_UNFRAGMENTED_DATAGRAM
-        );
+        assert!(frame.len() + messages::TRANSPORT_OVERHEAD <= messages::MAX_UNFRAGMENTED_DATAGRAM);
     }
 
     /// Responsibility is "am I among the k closest I know of", not a fixed
@@ -1830,7 +1829,9 @@ mod tests {
             let _ = d.add_contact(contact);
         }
         assert!(
-            d.routing.find_closest(&EmberNodeId([0xFF; 16]), K_BUCKET_SIZE).len()
+            d.routing
+                .find_closest(&EmberNodeId([0xFF; 16]), K_BUCKET_SIZE)
+                .len()
                 >= K_BUCKET_SIZE,
             "the table needs k contacts for proximity gating to engage"
         );
@@ -1927,7 +1928,10 @@ mod tests {
         let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
         let key = record.keyword_hash;
         let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
-        assert!(b.handle_message(&store_bytes, a_addr, a_noise, 1000).stored_record);
+        assert!(
+            b.handle_message(&store_bytes, a_addr, a_noise, 1000)
+                .stored_record
+        );
 
         let mut keys = vec![key];
         for i in 0..(messages::MAX_FIND_VALUE_KEYS as u8 + 4) {
@@ -2014,7 +2018,8 @@ mod tests {
             key = record.keyword_hash;
             let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
             assert!(
-                b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record,
+                b.handle_message(&bytes, a_addr, a_noise, 1000)
+                    .stored_record,
                 "record {i} should be accepted"
             );
         }
@@ -2071,7 +2076,8 @@ mod tests {
             key = record.keyword_hash;
             let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
             assert!(
-                b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record,
+                b.handle_message(&bytes, a_addr, a_noise, 1000)
+                    .stored_record,
                 "record {i} should be accepted"
             );
         }
@@ -2188,9 +2194,11 @@ mod tests {
         let b_addr = addr(34, 4672);
 
         let rec = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
-        let (_rid, store_bytes) =
-            a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
-        assert!(b.handle_message(&store_bytes, a_addr, a_noise, 1000).stored_record);
+        let (_rid, store_bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
+        assert!(
+            b.handle_message(&store_bytes, a_addr, a_noise, 1000)
+                .stored_record
+        );
 
         let secondary = a.build_keyword_record("server", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
         let (_frid, find_bytes) =
@@ -2306,11 +2314,9 @@ mod tests {
         let mut contact = source_contact_at(80);
         contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED
             | crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
-        let record =
-            publisher.build_source_record([3u8; 16], [0u8; 32], 42, "buddy.mkv", contact);
+        let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "buddy.mkv", contact);
         let key = record.keyword_hash;
-        let (_rid, frame) =
-            publisher.build_proxy_store(key, record.data.clone(), record.signature);
+        let (_rid, frame) = publisher.build_proxy_store(key, record.data.clone(), record.signature);
         let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
         assert!(
             on_buddy.proxy_store_forward.is_some(),
@@ -2338,13 +2344,11 @@ mod tests {
         let mut contact = source_contact_at(84);
         contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED
             | crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
-        let record =
-            publisher.build_source_record([5u8; 16], [0u8; 32], 7, "stolen.mkv", contact);
+        let record = publisher.build_source_record([5u8; 16], [0u8; 32], 7, "stolen.mkv", contact);
         let key = record.keyword_hash;
         // Impostor re-packs the publisher-signed record into its own
         // PROXY_STORE frame (sender_id = impostor ≠ publisher).
-        let (_rid, frame) =
-            impostor.build_proxy_store(key, record.data.clone(), record.signature);
+        let (_rid, frame) = impostor.build_proxy_store(key, record.data.clone(), record.signature);
         let on_buddy = buddy.handle_message(&frame, impostor_addr, impostor_noise, 2000);
         assert!(
             on_buddy.proxy_store_forward.is_none(),
@@ -2361,8 +2365,7 @@ mod tests {
 
         // HighID source must not ride PROXY_STORE (would bypass anti-reflection).
         let contact = source_contact_at(82);
-        let record =
-            publisher.build_source_record([4u8; 16], [0u8; 32], 1, "direct.mkv", contact);
+        let record = publisher.build_source_record([4u8; 16], [0u8; 32], 1, "direct.mkv", contact);
         let (_rid, frame) =
             publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
         let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);

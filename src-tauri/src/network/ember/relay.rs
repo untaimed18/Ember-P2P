@@ -854,9 +854,7 @@ pub fn verify_punch_register_proof(
             // open on a claimed legacy proof_version — require the IP-bound
             // signature over the dial endpoint.
             if info.proof_version != 4 {
-                return Err(
-                    "punch proof: v4 poll requires IP-bound proof_version 4".to_string(),
-                );
+                return Err("punch proof: v4 poll requires IP-bound proof_version 4".to_string());
             }
             verify_punch_proof_freshness(
                 info.register_ts,
@@ -1127,7 +1125,10 @@ mod dial_error_tests {
         assert!(RelayDialError::unreachable("handshake failed").relay_at_fault);
         assert!(!RelayDialError::refused("at capacity").relay_at_fault);
         // Carries its text through for logging either way.
-        assert_eq!(RelayDialError::refused("at capacity").to_string(), "at capacity");
+        assert_eq!(
+            RelayDialError::refused("at capacity").to_string(),
+            "at capacity"
+        );
     }
 }
 
@@ -1881,11 +1882,9 @@ pub async fn run_quic_accept_loop(
                 };
                 if let Some(reason) = reject_reason {
                     let reject = build_relay_reject(peer_session_id, reason);
-                    let _ = tokio::time::timeout(
-                        RELAY_CONTROL_TIMEOUT,
-                        init_send.write_all(&reject),
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout(RELAY_CONTROL_TIMEOUT, init_send.write_all(&reject))
+                            .await;
                     return;
                 }
 

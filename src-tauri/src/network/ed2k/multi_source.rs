@@ -5504,10 +5504,7 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        if hello_caps.is_ember
-            && proto == OP_EMULEPROT
-            && opcode == OP_EMBER_FRIEND_REQ
-        {
+        if hello_caps.is_ember && proto == OP_EMULEPROT && opcode == OP_EMBER_FRIEND_REQ {
             if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                 let nick = crate::security::normalize_inbound_friend_nickname(&_payload);
                 // PoP-only `verified` (see early-friend-request site
@@ -6655,8 +6652,7 @@ async fn download_parts_from_source(
                     .chunks(MAX_BLOCKS_PER_REQUEST)
                     .map(|c| c.to_vec())
                     .collect();
-                let needs_large_offsets =
-                    all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                let needs_large_offsets = all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
                 if needs_large_offsets && !peer_supports_large_files {
                     // Gating `needs_i64` on the peer's capability alone sent
                     // the 32-bit request anyway, and `build_request_parts`
@@ -7416,23 +7412,22 @@ async fn download_parts_from_source(
                         }
                     }
                     (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                        let (hash, start, compressed_total_size, compressed) = if opcode
-                            == OP_COMPRESSEDPART_I64
-                        {
-                            parse_compressed_part_i64(&payload)?
-                        } else {
-                            // Mirror the OP_SENDINGPART branch: accept 32-bit
-                            // frames for files of any size. eMule picks the
-                            // width from the requested block's end offset
-                            // (CreatePackedPackets keys on `uEndOffset >
-                            // UINT32_MAX`), so blocks below 4 GiB in a larger
-                            // file arrive as plain OP_COMPRESSEDPART. Nothing
-                            // truncates on our side — the 32-bit parser widens
-                            // u32 to u64 — and `pending_compressed.append`
-                            // only accepts a start that matches a block we
-                            // actually requested.
-                            parse_compressed_part_32(&payload)?
-                        };
+                        let (hash, start, compressed_total_size, compressed) =
+                            if opcode == OP_COMPRESSEDPART_I64 {
+                                parse_compressed_part_i64(&payload)?
+                            } else {
+                                // Mirror the OP_SENDINGPART branch: accept 32-bit
+                                // frames for files of any size. eMule picks the
+                                // width from the requested block's end offset
+                                // (CreatePackedPackets keys on `uEndOffset >
+                                // UINT32_MAX`), so blocks below 4 GiB in a larger
+                                // file arrive as plain OP_COMPRESSEDPART. Nothing
+                                // truncates on our side — the 32-bit parser widens
+                                // u32 to u64 — and `pending_compressed.append`
+                                // only accepts a start that matches a block we
+                                // actually requested.
+                                parse_compressed_part_32(&payload)?
+                            };
                         if hash != *file_hash {
                             anyhow::bail!(
                                 "source {} sent COMPRESSEDPART for wrong file: expected={} got={}",
@@ -7933,9 +7928,7 @@ async fn download_parts_from_source(
                             }
                         }
                     }
-                    (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                        if hello_caps.is_ember =>
-                    {
+                    (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                         if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                             let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                             // PoP-only `verified` (see early-friend-request
@@ -9029,10 +9022,7 @@ impl Drop for WireAvailabilityGuard {
 /// over during a long download, and every arrival used to append another row.
 /// The round's `HashSet` pass then hid the duplicates from the download while
 /// the vector — and the per-round scan over it — kept growing with the session.
-fn remember_injected_source(
-    injected: &mut Vec<DownloadSource>,
-    source: DownloadSource,
-) -> bool {
+fn remember_injected_source(injected: &mut Vec<DownloadSource>, source: DownloadSource) -> bool {
     if injected
         .iter()
         .any(|s| s.peer_ip == source.peer_ip && s.peer_port == source.peer_port)
@@ -9712,7 +9702,15 @@ pub(crate) type BrowseEntry = (String, u64, String, Option<String>, Option<Strin
 /// ignore the rest, so this stays compatible with EBR1.
 pub(crate) fn encode_browse_response_v1<'a, I>(entries: I) -> Vec<u8>
 where
-    I: IntoIterator<Item = (&'a [u8; 16], u64, &'a [u8], Option<&'a [u8; 20]>, Option<&'a [u8; 32]>)>,
+    I: IntoIterator<
+        Item = (
+            &'a [u8; 16],
+            u64,
+            &'a [u8],
+            Option<&'a [u8; 20]>,
+            Option<&'a [u8; 32]>,
+        ),
+    >,
 {
     let mut out = Vec::new();
     out.extend_from_slice(BROWSE_RESPONSE_V1_MAGIC);
@@ -9867,7 +9865,13 @@ mod browse_response_tests {
         let aich = [0xABu8; 20];
         let ember = [0xCDu8; 32];
         let encoded = encode_browse_response_v1([
-            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich), Some(&ember)),
+            (
+                &hash,
+                42u64,
+                b"song.mp3".as_slice(),
+                Some(&aich),
+                Some(&ember),
+            ),
             (&hash, 7u64, b"readme.txt".as_slice(), None, None),
         ]);
         assert!(encoded.starts_with(BROWSE_RESPONSE_V1_MAGIC));
@@ -9886,9 +9890,13 @@ mod browse_response_tests {
     fn browse_v1_without_ember_trailer_still_parses() {
         let hash = [0x11u8; 16];
         let aich = [0xABu8; 20];
-        let encoded = encode_browse_response_v1([
-            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich), Some(&[0xCDu8; 32])),
-        ]);
+        let encoded = encode_browse_response_v1([(
+            &hash,
+            42u64,
+            b"song.mp3".as_slice(),
+            Some(&aich),
+            Some(&[0xCDu8; 32]),
+        )]);
         let trailer = 32;
         let without_trailer = &encoded[..encoded.len() - trailer];
         let parsed = parse_browse_response(without_trailer);

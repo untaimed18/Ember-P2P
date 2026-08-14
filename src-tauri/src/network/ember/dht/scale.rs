@@ -105,7 +105,6 @@ impl NetworkScale {
         }
     }
 
-
     /// Source records allowed under one key from a single IP, mirroring KAD's
     /// `MAX_SOURCES_PER_IP`.
     pub fn max_sources_per_ip(&self) -> usize {
@@ -153,8 +152,7 @@ mod tests {
             let (looser, tighter) = pair;
             assert!(looser.max_contacts_per_ip() >= tighter.max_contacts_per_ip());
             assert!(
-                looser.max_contacts_per_subnet_global()
-                    >= tighter.max_contacts_per_subnet_global()
+                looser.max_contacts_per_subnet_global() >= tighter.max_contacts_per_subnet_global()
             );
             assert!(
                 looser.max_contacts_per_subnet_per_bucket()

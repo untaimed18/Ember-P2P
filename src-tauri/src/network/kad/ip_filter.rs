@@ -542,9 +542,7 @@ impl IpFilter {
             } else {
                 description
             };
-            bytes.extend_from_slice(
-                format!("{start} - {end} , 000 , {description}\n").as_bytes(),
-            );
+            bytes.extend_from_slice(format!("{start} - {end} , 000 , {description}\n").as_bytes());
         }
         bytes
     }

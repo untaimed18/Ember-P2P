@@ -314,25 +314,24 @@ impl Ed2kServerConnection {
         let mut last_error: Option<String> = None;
 
         for i in 0..50 {
-            let (opcode, payload) = match tokio::time::timeout_at(login_deadline, self.read_packet())
-                .await
-            {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
-                    info!(
-                        "Server read error on packet {i}: kind={:?} msg={e}",
-                        e.kind()
-                    );
-                    last_error = Some(format!("{} ({})", e, e.kind()));
-                    break;
-                }
-                Err(_) => {
-                    anyhow::bail!(
-                        "Login did not complete within {SERVER_LOGIN_TIMEOUT_SECS}s \
+            let (opcode, payload) =
+                match tokio::time::timeout_at(login_deadline, self.read_packet()).await {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        info!(
+                            "Server read error on packet {i}: kind={:?} msg={e}",
+                            e.kind()
+                        );
+                        last_error = Some(format!("{} ({})", e, e.kind()));
+                        break;
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "Login did not complete within {SERVER_LOGIN_TIMEOUT_SECS}s \
                          ({packets_read} packet(s) received, no IDCHANGE)"
-                    );
-                }
-            };
+                        );
+                    }
+                };
             packets_read += 1;
 
             match opcode {

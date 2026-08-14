@@ -152,13 +152,20 @@ impl StatsManager {
             self.add_overhead(OverheadCategory::Kad, OverheadDirection::Upload, kad_up);
         }
 
-        let freq_up = self.file_req_counters.upload_bytes.swap(0, Ordering::Relaxed);
+        let freq_up = self
+            .file_req_counters
+            .upload_bytes
+            .swap(0, Ordering::Relaxed);
         let freq_down = self
             .file_req_counters
             .download_bytes
             .swap(0, Ordering::Relaxed);
         if freq_up > 0 {
-            self.add_overhead(OverheadCategory::FileRequest, OverheadDirection::Upload, freq_up);
+            self.add_overhead(
+                OverheadCategory::FileRequest,
+                OverheadDirection::Upload,
+                freq_up,
+            );
         }
         if freq_down > 0 {
             self.add_overhead(

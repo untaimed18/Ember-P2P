@@ -1155,10 +1155,8 @@ fn source_ip_from_record_data(data: &[u8]) -> Option<std::net::Ipv4Addr> {
     if data.first() != Some(&RECORD_TYPE_SOURCE) || data.len() < RECORD_HEADER_LEN {
         return None;
     }
-    let name_len = u16::from_le_bytes([
-        data[RECORD_HEADER_LEN - 2],
-        data[RECORD_HEADER_LEN - 1],
-    ]) as usize;
+    let name_len =
+        u16::from_le_bytes([data[RECORD_HEADER_LEN - 2], data[RECORD_HEADER_LEN - 1]]) as usize;
     let off = RECORD_HEADER_LEN.checked_add(name_len)?;
     // The whole contact block, not just the four address bytes: a record
     // truncated mid-block is one `SignedRecord::from_wire` rejects outright,
@@ -1445,7 +1443,8 @@ mod tests {
         let mut store = DhtStore::new();
         let sk = SigningKey::generate(&mut OsRng);
 
-        let first = SignedRecord::keyword("ubuntu", [0xA1; 16], [0u8; 32], 100, "ubuntu-24.iso", &sk);
+        let first =
+            SignedRecord::keyword("ubuntu", [0xA1; 16], [0u8; 32], 100, "ubuntu-24.iso", &sk);
         let second =
             SignedRecord::keyword("ubuntu", [0xB2; 16], [0u8; 32], 200, "ubuntu-22.iso", &sk);
         assert_eq!(
@@ -1505,7 +1504,8 @@ mod tests {
         );
 
         let honest = SigningKey::generate(&mut OsRng);
-        let good = SignedRecord::keyword("ubuntu", [0xEE; 16], [0u8; 32], 4096, "real.iso", &honest);
+        let good =
+            SignedRecord::keyword("ubuntu", [0xEE; 16], [0u8; 32], 4096, "real.iso", &honest);
         assert!(
             store.store(
                 key,
@@ -1707,7 +1707,13 @@ mod tests {
                 },
                 &sk,
             );
-            if store.store(key, rec.data.clone(), rec.signature, rec.publisher_key, rec.timestamp) {
+            if store.store(
+                key,
+                rec.data.clone(),
+                rec.signature,
+                rec.publisher_key,
+                rec.timestamp,
+            ) {
                 accepted += 1;
             }
         }
@@ -1755,8 +1761,7 @@ mod tests {
         let mut store = DhtStore::new();
         let sk = SigningKey::generate(&mut OsRng);
         let old = SignedRecord::keyword("ubuntu", [1u8; 16], [7u8; 32], 10, "old.iso", &sk);
-        let mut newer =
-            SignedRecord::keyword("ubuntu", [1u8; 16], [8u8; 32], 10, "new.iso", &sk);
+        let mut newer = SignedRecord::keyword("ubuntu", [1u8; 16], [8u8; 32], 10, "new.iso", &sk);
         // Same publisher and file, published later.
         newer.timestamp = old.timestamp + 60;
 
@@ -1864,7 +1869,10 @@ mod tests {
             store.get_live(&key).len() == 1,
             "the last accepted record must survive its own insert"
         );
-        assert!(store.total_records() > 0, "eviction must not empty the store");
+        assert!(
+            store.total_records() > 0,
+            "eviction must not empty the store"
+        );
 
         // Expiring records returns their bytes to the budget.
         let before = store.byte_len();
@@ -1916,13 +1924,7 @@ mod tests {
             // Keyword records: source records are deliberately not relayed by
             // storers, so they would be skipped by this scan.
             let data = vec![super::super::publish::RECORD_TYPE_KEYWORD, i as u8, 0, 0];
-            assert!(store.store(
-                [i as u8; 16],
-                data.clone(),
-                sign(&sk, &data),
-                pk,
-                now_ts()
-            ));
+            assert!(store.store([i as u8; 16], data.clone(), sign(&sk, &data), pk, now_ts()));
         }
 
         // Batches of 3 with a zero interval, so everything is always due. A
@@ -2393,7 +2395,10 @@ mod tests {
         // Sanity: nothing crashes and returns zero for a key we hold nothing
         // foreign under.
         let (keys, records) = store.foreign_stats(&them_pk);
-        assert_eq!(keys, 1, "our own record is foreign from their point of view");
+        assert_eq!(
+            keys, 1,
+            "our own record is foreign from their point of view"
+        );
         assert_eq!(records, 1);
     }
 

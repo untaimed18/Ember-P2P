@@ -739,10 +739,7 @@ impl SearchState {
         // comparing it to the page size meant the offset never advanced and
         // `MAX_PAGES_PER_PEER` was unreachable — every peer contributed only its
         // first page however much more it held.
-        let page_received = self
-            .fetch_page_received
-            .entry(*from)
-            .or_insert(0);
+        let page_received = self.fetch_page_received.entry(*from).or_insert(0);
         *page_received = page_received.saturating_add(count);
         let page_complete = *page_received >= FETCH_PAGE_SIZE;
         if page_complete

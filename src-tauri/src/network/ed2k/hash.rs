@@ -384,7 +384,9 @@ pub fn format_ed2k_link_ext(
             link.push('|');
         }
     }
-    if let Some(digest) = ember_hex.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())) {
+    if let Some(digest) =
+        ember_hex.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         link.push_str("eh=");
         link.push_str(&digest.to_lowercase());
         link.push('|');
@@ -688,10 +690,7 @@ mod link_tests {
         assert!(parse_ed2k_link_strict(&conflicting).is_err());
 
         let repeated = format!("ed2k://|file|a.bin|9|{HASH}|eh={first}|eh={first}|/");
-        assert_eq!(
-            parse_ed2k_link_strict(&repeated).unwrap().4,
-            Some(first)
-        );
+        assert_eq!(parse_ed2k_link_strict(&repeated).unwrap().4, Some(first));
     }
 }
 

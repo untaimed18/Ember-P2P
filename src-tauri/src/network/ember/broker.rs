@@ -420,8 +420,7 @@ impl ConnectionBroker {
         else {
             return;
         };
-        self.relay_candidates[idx].failures =
-            self.relay_candidates[idx].failures.saturating_add(1);
+        self.relay_candidates[idx].failures = self.relay_candidates[idx].failures.saturating_add(1);
         let failures = self.relay_candidates[idx].failures;
         if failures >= Self::MAX_CANDIDATE_FAILURES {
             info!(
@@ -578,7 +577,13 @@ impl ConnectionBroker {
             // failed must not keep winning on "carried no sessions and seen
             // most recently", which is precisely how a fabricated entry used to
             // outrank a relay that demonstrably works.
-            .min_by_key(|c| (c.failures, c.relay_sessions, c.last_seen.elapsed().as_secs()))
+            .min_by_key(|c| {
+                (
+                    c.failures,
+                    c.relay_sessions,
+                    c.last_seen.elapsed().as_secs(),
+                )
+            })
     }
 
     /// Clean up expired attempts. Called periodically from the main loop.
@@ -824,13 +829,21 @@ mod tests {
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
 
         let expired = unix_now().saturating_sub(1);
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(9, 9, 9, 9), 4662, expired), None, None);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(9, 9, 9, 9), 4662, expired),
+            None,
+            None,
+        );
         assert_eq!(broker.relay_candidate_count(), 1);
         assert!(broker.pick_relay_candidate().is_none());
 
         // A fresh, unexpired candidate is still pickable.
         let fresh = unix_now() + 600;
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(8, 8, 8, 8), 4662, fresh), None, None);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(8, 8, 8, 8), 4662, fresh),
+            None,
+            None,
+        );
         let picked = broker.pick_relay_candidate();
         assert_eq!(picked.map(|c| c.ip), Some(Ipv4Addr::new(8, 8, 8, 8)));
     }
@@ -847,8 +860,16 @@ mod tests {
         let fresh = now + 600;
         let stale = now.saturating_sub(1);
 
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None, None);
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, stale), None, None);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh),
+            None,
+            None,
+        );
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(2, 2, 2, 2), 4663, stale),
+            None,
+            None,
+        );
 
         let offer = broker.gossipable_attestations(now);
         assert_eq!(offer.len(), 1);
@@ -865,7 +886,11 @@ mod tests {
         let fresh = now + 600;
 
         for i in 0..(crate::network::ember::MAX_RELAY_ATTESTATIONS as u8 + 5) {
-            broker.add_relay_candidate(attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh), None, None);
+            broker.add_relay_candidate(
+                attestation(Ipv4Addr::new(10, 0, 0, i), 4662, fresh),
+                None,
+                None,
+            );
         }
 
         assert_eq!(
@@ -936,15 +961,16 @@ mod tests {
         broker.add_relay_candidate(attestation(ip, 4662, unix_now() + 600), None, None);
 
         for _ in 0..(ConnectionBroker::MAX_CANDIDATE_FAILURES + 2) {
-            broker.attempt_low_to_low(
-                "t-local",
-                [9u8; 16],
-                Ipv4Addr::new(10, 0, 0, 1),
-                4662,
-                NatType::Symmetric,
-                Some("5.6.7.8:9999".parse().unwrap()),
-            )
-            .await;
+            broker
+                .attempt_low_to_low(
+                    "t-local",
+                    [9u8; 16],
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    4662,
+                    NatType::Symmetric,
+                    Some("5.6.7.8:9999".parse().unwrap()),
+                )
+                .await;
             broker
                 .relay_failed("t-local:10.0.0.1:4662", "no QUIC endpoint", false)
                 .await;
@@ -996,7 +1022,11 @@ mod tests {
         let hostile = [0xAAu8; 16];
 
         // Learned elsewhere — a swarm exchange, with no introducer recorded.
-        broker.add_relay_candidate(attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh), None, None);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, fresh),
+            None,
+            None,
+        );
 
         for i in 0..40u8 {
             broker.add_relay_candidate(

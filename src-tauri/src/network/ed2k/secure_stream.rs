@@ -628,7 +628,8 @@ mod tests {
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).await.unwrap();
         assert_eq!(
-            rest, &emule_like[1..],
+            rest,
+            &emule_like[1..],
             "the peek must leave the stream untouched"
         );
     }

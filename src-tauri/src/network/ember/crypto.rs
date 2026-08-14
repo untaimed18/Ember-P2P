@@ -335,10 +335,7 @@ pub fn derive_pairwise_presence_capability(
 /// can compute this without a DH. The owner registers it on every rendezvous
 /// heartbeat so a one-sided Add Friend can locate them before pairwise
 /// capabilities exist for both sides.
-pub fn derive_intro_presence_capability(
-    owner_ed25519_pubkey: &[u8; 32],
-    epoch: i64,
-) -> [u8; 32] {
+pub fn derive_intro_presence_capability(owner_ed25519_pubkey: &[u8; 32], epoch: i64) -> [u8; 32] {
     let context = format!("ember-intro-presence-v1:{epoch}");
     blake3::derive_key(&context, owner_ed25519_pubkey)
 }

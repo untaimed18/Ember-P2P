@@ -102,10 +102,7 @@ impl ObfuscatedServerStream {
     /// The byte is re-joined with the remaining five before decryption, so the
     /// RC4 keystream advances over exactly the same six bytes as a single
     /// read would have.
-    pub async fn read_packet_after_first_byte(
-        &mut self,
-        first: u8,
-    ) -> io::Result<(u8, Vec<u8>)> {
+    pub async fn read_packet_after_first_byte(&mut self, first: u8) -> io::Result<(u8, Vec<u8>)> {
         let mut enc_header = [0u8; 6];
         enc_header[0] = first;
         self.reader.read_exact(&mut enc_header[1..]).await?;

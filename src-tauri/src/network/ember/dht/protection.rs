@@ -208,11 +208,11 @@ impl DhtProtection {
             return false;
         }
 
-        let msg_ok = self
-            .msg_counters
-            .entry(ip)
-            .or_default()
-            .allow(now, MSG_WINDOW, MAX_MSGS_PER_WINDOW);
+        let msg_ok =
+            self.msg_counters
+                .entry(ip)
+                .or_default()
+                .allow(now, MSG_WINDOW, MAX_MSGS_PER_WINDOW);
         if !msg_ok {
             self.dropped_rate = self.dropped_rate.saturating_add(1);
             return false;
@@ -255,11 +255,11 @@ impl DhtProtection {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
             }
-            let lookup_ok = self
-                .lookup_counters
-                .entry(budget_key)
-                .or_default()
-                .allow(now, LOOKUP_WINDOW, MAX_LOOKUPS_PER_WINDOW);
+            let lookup_ok = self.lookup_counters.entry(budget_key).or_default().allow(
+                now,
+                LOOKUP_WINDOW,
+                MAX_LOOKUPS_PER_WINDOW,
+            );
             if !lookup_ok {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;

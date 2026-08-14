@@ -3769,10 +3769,7 @@ mod tests {
                 ],
             )
             .expect("seed stale queued");
-        assert!(locked
-            .expire_stale_queued_chat()
-            .expect("sweep")
-            .is_empty());
+        assert!(locked.expire_stale_queued_chat().expect("sweep").is_empty());
         assert_eq!(
             row_count(
                 &locked,

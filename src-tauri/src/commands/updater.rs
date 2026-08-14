@@ -1631,8 +1631,8 @@ pub async fn secure_updater_handoff_status(
 #[tauri::command]
 pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), String> {
     let path = handoff_path(&app).map_err(|error| public_failure("installer launch", error))?;
-    let Some(record) = read_handoff(&path)
-        .map_err(|error| public_failure("installer launch", error))?
+    let Some(record) =
+        read_handoff(&path).map_err(|error| public_failure("installer launch", error))?
     else {
         return Err("There is no staged installer to run.".to_string());
     };
@@ -1826,8 +1826,8 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         let sha256 = "a".repeat(64);
         let manifest = staged_manifest("1.4.0", &sha256);
 
-        let claim =
-            claim_from_signed_manifest(&manifest, &sha256, TEST_SIGNATURE, TEST_PUBLIC_KEY).unwrap();
+        let claim = claim_from_signed_manifest(&manifest, &sha256, TEST_SIGNATURE, TEST_PUBLIC_KEY)
+            .unwrap();
         assert_eq!(
             claim.version,
             Version::parse("1.4.0").unwrap(),
@@ -2065,10 +2065,12 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
 
     #[test]
     fn missing_updater_resource_is_detectable_through_anyhow() {
-        let error = anyhow::Error::new(UpdaterResourceMissing)
-            .context("failed to read updater signature");
+        let error =
+            anyhow::Error::new(UpdaterResourceMissing).context("failed to read updater signature");
         assert!(is_missing_updater_resource(&error));
-        assert!(!is_missing_updater_resource(&anyhow!("updater server returned HTTP 500")));
+        assert!(!is_missing_updater_resource(&anyhow!(
+            "updater server returned HTTP 500"
+        )));
     }
 
     #[test]

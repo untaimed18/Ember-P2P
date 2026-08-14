@@ -396,8 +396,12 @@ impl ApprovedRootRegistry {
         reapprovals: &[String],
         on_mismatch: IdentityMismatch,
     ) -> io::Result<()> {
-        let (_, next) =
-            self.build_next(configured_roots, explicit_additions, reapprovals, on_mismatch)?;
+        let (_, next) = self.build_next(
+            configured_roots,
+            explicit_additions,
+            reapprovals,
+            on_mismatch,
+        )?;
         self.persist_roots(&next)?;
         *self.roots.write() = next;
         Ok(())
@@ -634,7 +638,12 @@ pub fn initialize_approved_roots(
     // Startup revokes roots whose identity changed rather than refusing to run:
     // a folder that was deleted and recreated (or a re-imaged volume) otherwise
     // left the app unable to launch at all, with no in-app way to recover.
-    registry.update_roots_with_policy(configured_roots, &additions, &[], IdentityMismatch::Revoke)?;
+    registry.update_roots_with_policy(
+        configured_roots,
+        &additions,
+        &[],
+        IdentityMismatch::Revoke,
+    )?;
     *global_slot().write() = Some(registry.clone());
     Ok(registry)
 }
@@ -678,9 +687,7 @@ fn read_persisted_roots(state_path: &Path) -> io::Result<HashMap<String, Approve
         .collect())
 }
 
-fn read_root_transaction(
-    transaction_path: &Path,
-) -> io::Result<Option<PersistedRootTransaction>> {
+fn read_root_transaction(transaction_path: &Path) -> io::Result<Option<PersistedRootTransaction>> {
     let data = match std::fs::read(transaction_path) {
         Ok(data) => data,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -689,13 +696,12 @@ fn read_root_transaction(
     // `InvalidData`, matching `read_persisted_roots`: the caller quarantines on
     // that kind and only on that kind, so a parse failure has to be
     // distinguishable from the `std::fs::read` above failing environmentally.
-    let transaction: PersistedRootTransaction =
-        serde_json::from_slice(&data).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("parse approved-root transaction: {error}"),
-            )
-        })?;
+    let transaction: PersistedRootTransaction = serde_json::from_slice(&data).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse approved-root transaction: {error}"),
+        )
+    })?;
     if transaction.version != ROOT_STATE_VERSION
         || transaction.previous.version != ROOT_STATE_VERSION
         || transaction.next.version != ROOT_STATE_VERSION
@@ -2552,7 +2558,8 @@ mod tests {
         }
         std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
-        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let registry =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
         assert!(
             registry.verify_root(&root).is_ok(),
             "attribute drift must not look like a replaced directory"
@@ -2596,7 +2603,8 @@ mod tests {
         }
         std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
-        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let registry =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
         assert!(registry.verify_root(&root).is_err(), "must start revoked");
 
         registry
@@ -2608,7 +2616,8 @@ mod tests {
         assert!(registry.verify_root(&root).is_ok());
 
         // And it must be durable: the next launch has to find the record.
-        let reopened = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let reopened =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
         assert!(reopened.verify_root(&root).is_ok());
 
         *global_slot().write() = None;
@@ -2632,7 +2641,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let root_string = root.to_string_lossy().into_owned();
-        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let registry =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
         let before = std::fs::read(data.join("approved_roots.json")).unwrap();
 
         // Simulate the volume going away, then ask for a re-approval anyway.
@@ -2656,7 +2666,8 @@ mod tests {
         // original object rather than deleted, not that any directory at that
         // path now inherits the approval.
         std::fs::create_dir_all(&root).unwrap();
-        let reopened = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let reopened =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
         assert!(reopened.verify_root(&root).is_err());
 
         *global_slot().write() = None;
@@ -2724,7 +2735,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let root_string = root.to_string_lossy().into_owned();
-        let registry = initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
+        let registry =
+            initialize_approved_roots(&data, std::slice::from_ref(&root_string)).unwrap();
 
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(&root).unwrap();

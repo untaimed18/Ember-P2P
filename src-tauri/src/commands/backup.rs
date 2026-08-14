@@ -1098,7 +1098,12 @@ pub async fn preview_backup(
             // Report what a restore would actually apply. Listing an entry this
             // version discards would promise the user something the restore
             // then silently skips.
-            let restorable = || manifest.files.iter().filter(|f| !is_legacy_ignored(&f.name));
+            let restorable = || {
+                manifest
+                    .files
+                    .iter()
+                    .filter(|f| !is_legacy_ignored(&f.name))
+            };
             let total_bytes = restorable().map(|f| f.size).sum();
             Ok(BackupPreview {
                 app_version: manifest.app_version.clone(),

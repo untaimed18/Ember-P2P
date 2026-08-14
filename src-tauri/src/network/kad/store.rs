@@ -554,10 +554,10 @@ impl DhtStore {
                 // same budget key — was priced above, before any eviction, and
                 // eviction can only have moved those numbers down.
                 if self
-                        .total_retained_bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(entry_bytes)
-                        > MAX_TOTAL_RETAINED_BYTES
+                    .total_retained_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(entry_bytes)
+                    > MAX_TOTAL_RETAINED_BYTES
                 {
                     continue;
                 }

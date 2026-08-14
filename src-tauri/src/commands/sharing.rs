@@ -1510,11 +1510,8 @@ pub async fn add_shared_folder(
             let mut hash_task = tokio::task::spawn_blocking(move || {
                 FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
             });
-            let hash_result = tokio::time::timeout(
-                std::time::Duration::from_secs(300),
-                &mut hash_task,
-            )
-            .await;
+            let hash_result =
+                tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
 
             match hash_result {
                 Ok(Ok(Ok((
@@ -2984,11 +2981,8 @@ pub async fn reload_shared_files(
             let mut hash_task = tokio::task::spawn_blocking(move || {
                 FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
             });
-            let hash_result = tokio::time::timeout(
-                std::time::Duration::from_secs(300),
-                &mut hash_task,
-            )
-            .await;
+            let hash_result =
+                tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
 
             match hash_result {
                 Ok(Ok(Ok((

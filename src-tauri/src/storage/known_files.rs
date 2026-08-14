@@ -1854,7 +1854,10 @@ mod tests {
         let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
 
         assert_eq!(
-            loaded.find_by_hash(&hash).unwrap().last_ember_source_publish,
+            loaded
+                .find_by_hash(&hash)
+                .unwrap()
+                .last_ember_source_publish,
             1_700_000_123,
             "last_ember_source_publish must survive a save/load round trip"
         );
@@ -1888,12 +1891,18 @@ mod tests {
         let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
 
         assert_eq!(
-            loaded.find_by_hash(&hash).unwrap().last_ember_keyword_publish,
+            loaded
+                .find_by_hash(&hash)
+                .unwrap()
+                .last_ember_keyword_publish,
             1_700_000_456,
             "last_ember_keyword_publish must survive a save/load round trip"
         );
         assert_eq!(
-            loaded.find_by_hash(&hash).unwrap().last_ember_source_publish,
+            loaded
+                .find_by_hash(&hash)
+                .unwrap()
+                .last_ember_source_publish,
             0,
             "the keyword tag must not be read as the source-publish stamp"
         );
@@ -1905,10 +1914,7 @@ mod tests {
         let r = sample_record();
         let hash = r.file_hash;
         kf.add_or_update(r);
-        assert_eq!(
-            kf.find_by_hash(&hash).unwrap().last_ember_source_publish,
-            0
-        );
+        assert_eq!(kf.find_by_hash(&hash).unwrap().last_ember_source_publish, 0);
     }
 
     #[test]

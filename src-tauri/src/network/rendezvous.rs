@@ -1532,22 +1532,19 @@ pub async fn poll_friend_relay_tickets(
 
     let mut last_error = None;
     for attempt in 0..2 {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            async {
-                let resp = client(base_url)
-                    .await?
-                    .post(&url)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| format!("relay ticket poll: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("relay ticket poll: status {}", resp.status()));
-                }
-                parse_friend_relay_mailbox_response(resp, responder_ember_hash, secret_key).await
-            },
-        )
+        match tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let resp = client(base_url)
+                .await?
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("relay ticket poll: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("relay ticket poll: status {}", resp.status()));
+            }
+            parse_friend_relay_mailbox_response(resp, responder_ember_hash, secret_key).await
+        })
         .await
         {
             Ok(Ok(page)) => return Ok(page),

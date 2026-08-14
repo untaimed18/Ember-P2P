@@ -479,12 +479,7 @@ impl TransferManager {
     ///
     /// `unique_completed` is upload-only unique per-part coverage. Downloads
     /// pass `None` and derive `completed_size` / `progress` from `transferred`.
-    pub fn update_progress(
-        &mut self,
-        id: &str,
-        transferred: u64,
-        unique_completed: Option<u64>,
-    ) {
+    pub fn update_progress(&mut self, id: &str, transferred: u64, unique_completed: Option<u64>) {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
 

@@ -1686,7 +1686,8 @@ mod tests {
             r.ident_state = IdentState::Needed;
         }
         let bytes = cm.serialize();
-        let path = std::env::temp_dir().join(format!("ember-clients-needed-{}.met", unique_nanos()));
+        let path =
+            std::env::temp_dir().join(format!("ember-clients-needed-{}.met", unique_nanos()));
         std::fs::write(&path, &bytes).unwrap();
 
         let mut restored = CreditManager::new();
@@ -1734,9 +1735,7 @@ mod tests {
         ));
         std::fs::write(&path, &bytes).expect("write temp clients.met");
         let mut restored = CreditManager::new();
-        restored
-            .load_from_file(&path)
-            .expect("load v3 clients.met");
+        restored.load_from_file(&path).expect("load v3 clients.met");
         let _ = std::fs::remove_file(&path);
 
         assert!(
@@ -2473,9 +2472,7 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write temp clients.met");
 
         let mut loaded = CreditManager::new();
-        let n = loaded
-            .load_from_file(&path)
-            .expect("load v2 clients.met");
+        let n = loaded.load_from_file(&path).expect("load v2 clients.met");
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(n, 1, "only the ember-bound record should be persisted");

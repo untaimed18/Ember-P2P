@@ -802,8 +802,7 @@ mod tests {
             &[],
             &[make_attestation(1_700_000_600)],
         );
-        let datagram =
-            udp.len() + EXCHANGE_DATA_HEADER_SIZE + dht::messages::TRANSPORT_OVERHEAD;
+        let datagram = udp.len() + EXCHANGE_DATA_HEADER_SIZE + dht::messages::TRANSPORT_OVERHEAD;
         assert!(
             datagram <= transport::MAX_EMBER_DATAGRAM_BYTES,
             "framed datagram would be {datagram} bytes, over the transport cap"

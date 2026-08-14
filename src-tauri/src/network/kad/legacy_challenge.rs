@@ -166,7 +166,12 @@ mod legacy_challenge_tests {
         let challenge = KadId([0x22; 16]);
 
         assert!(!tracker.has_active(ip(1)));
-        tracker.add(contact, challenge, ip(1), LegacyChallengeTracker::OPCODE_REQ);
+        tracker.add(
+            contact,
+            challenge,
+            ip(1),
+            LegacyChallengeTracker::OPCODE_REQ,
+        );
         assert!(tracker.has_active(ip(1)));
 
         assert_eq!(
@@ -188,10 +193,19 @@ mod legacy_challenge_tests {
         let mut tracker = LegacyChallengeTracker::new();
         let contact = KadId([0x11; 16]);
         let challenge = KadId([0x22; 16]);
-        tracker.add(contact, challenge, ip(2), LegacyChallengeTracker::OPCODE_REQ);
+        tracker.add(
+            contact,
+            challenge,
+            ip(2),
+            LegacyChallengeTracker::OPCODE_REQ,
+        );
 
         assert_eq!(
-            tracker.take_match(&KadId([0x33; 16]), ip(2), LegacyChallengeTracker::OPCODE_REQ),
+            tracker.take_match(
+                &KadId([0x33; 16]),
+                ip(2),
+                LegacyChallengeTracker::OPCODE_REQ
+            ),
             None,
             "a wrong target must not verify the contact"
         );
@@ -218,7 +232,11 @@ mod legacy_challenge_tests {
             LegacyChallengeTracker::OPCODE_PING,
         );
         assert_eq!(
-            tracker.take_match(&KadId([0x99; 16]), ip(3), LegacyChallengeTracker::OPCODE_PING),
+            tracker.take_match(
+                &KadId([0x99; 16]),
+                ip(3),
+                LegacyChallengeTracker::OPCODE_PING
+            ),
             Some(contact)
         );
     }

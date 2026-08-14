@@ -2065,32 +2065,32 @@ pub async fn recover_archive(
     // partials it exists to salvage. Give verification its own allowance,
     // derived from the file size at a deliberately pessimistic floor throughput.
     const VERIFY_FLOOR_BYTES_PER_SEC: u64 = 20 * 1024 * 1024;
-    let verify_allowance = std::time::Duration::from_secs(
-        (file_size / VERIFY_FLOOR_BYTES_PER_SEC).clamp(30, 15 * 60),
-    );
+    let verify_allowance =
+        std::time::Duration::from_secs((file_size / VERIFY_FLOOR_BYTES_PER_SEC).clamp(30, 15 * 60));
     let job_timeout = verify_allowance
         + crate::network::ed2k::archive_recovery::RECOVERY_WALL_TIME
         + std::time::Duration::from_secs(10);
-    let recovery_result =
-        match tokio::time::timeout(job_timeout, &mut recovery).await {
-            Ok(result) => result,
-            Err(_) => {
-                // `spawn_blocking` cannot be aborted. Cancel the recovery-local
-                // flag and retain the semaphore permit in a reaper task until
-                // the worker exits, so a second recovery never overlaps this
-                // one and the live download control remains untouched.
-                recovery_cancel.store(true, std::sync::atomic::Ordering::Release);
-                tokio::spawn(async move {
-                    if let Err(error) = recovery.await {
-                        tracing::warn!("Timed-out archive recovery task failed while draining: {error}");
-                    }
-                });
-                return Err(coded(
-                    "transfers_recovery_timed_out",
-                    "Archive recovery timed out",
-                ));
-            }
-        };
+    let recovery_result = match tokio::time::timeout(job_timeout, &mut recovery).await {
+        Ok(result) => result,
+        Err(_) => {
+            // `spawn_blocking` cannot be aborted. Cancel the recovery-local
+            // flag and retain the semaphore permit in a reaper task until
+            // the worker exits, so a second recovery never overlaps this
+            // one and the live download control remains untouched.
+            recovery_cancel.store(true, std::sync::atomic::Ordering::Release);
+            tokio::spawn(async move {
+                if let Err(error) = recovery.await {
+                    tracing::warn!(
+                        "Timed-out archive recovery task failed while draining: {error}"
+                    );
+                }
+            });
+            return Err(coded(
+                "transfers_recovery_timed_out",
+                "Archive recovery timed out",
+            ));
+        }
+    };
     let result = recovery_result
         .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?;
     let result = match result {
@@ -2109,7 +2109,11 @@ pub async fn recover_archive(
             ));
         }
         Err(ArchiveRecoveryJobError::Recovery(error)) => {
-            return Err(coded_ctx("transfers_recovery_failed", "Recovery failed", error));
+            return Err(coded_ctx(
+                "transfers_recovery_failed",
+                "Recovery failed",
+                error,
+            ));
         }
     };
 

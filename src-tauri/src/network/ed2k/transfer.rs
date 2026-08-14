@@ -2477,9 +2477,7 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                    if peer_is_ember =>
-                {
+                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = crate::security::normalize_inbound_friend_nickname(&payload);
                         // Prefer the full PoP signal over the
@@ -3882,24 +3880,23 @@ impl Ed2kDownload {
                         }
                         (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
                         | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                            let (hash, start, compressed_total_size, compressed) = if opcode
-                                == OP_COMPRESSEDPART_I64
-                            {
-                                parse_compressed_part_i64(&payload)?
-                            } else {
-                                // Mirror the OP_SENDINGPART branch: accept
-                                // 32-bit frames for files of any size. eMule
-                                // picks the width from the requested block's
-                                // end offset (CreatePackedPackets keys on
-                                // `uEndOffset > UINT32_MAX`), so blocks below
-                                // 4 GiB in a larger file arrive as plain
-                                // OP_COMPRESSEDPART. Nothing truncates here —
-                                // the 32-bit parser widens u32 to u64 — and
-                                // `pending_compressed.append` only accepts a
-                                // start matching a block we actually
-                                // requested.
-                                parse_compressed_part_32(&payload)?
-                            };
+                            let (hash, start, compressed_total_size, compressed) =
+                                if opcode == OP_COMPRESSEDPART_I64 {
+                                    parse_compressed_part_i64(&payload)?
+                                } else {
+                                    // Mirror the OP_SENDINGPART branch: accept
+                                    // 32-bit frames for files of any size. eMule
+                                    // picks the width from the requested block's
+                                    // end offset (CreatePackedPackets keys on
+                                    // `uEndOffset > UINT32_MAX`), so blocks below
+                                    // 4 GiB in a larger file arrive as plain
+                                    // OP_COMPRESSEDPART. Nothing truncates here —
+                                    // the 32-bit parser widens u32 to u64 — and
+                                    // `pending_compressed.append` only accepts a
+                                    // start matching a block we actually
+                                    // requested.
+                                    parse_compressed_part_32(&payload)?
+                                };
                             if hash != self.file_hash {
                                 anyhow::bail!(
                                     "peer sent COMPRESSEDPART for wrong file: expected={} got={}",
@@ -4265,9 +4262,7 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        (OP_EMULEPROT, OP_EMBER_FRIEND_REQ)
-                            if peer_is_ember =>
-                        {
+                        (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                             if let Some(eh) = peer_ember_hash {
                                 let nick =
                                     crate::security::normalize_inbound_friend_nickname(&payload);

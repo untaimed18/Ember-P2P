@@ -1010,7 +1010,9 @@ impl EmberTransport {
     /// Check if we have an established session with a peer.
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
-        self.sessions.keys().any(|(session_addr, _)| session_addr == addr)
+        self.sessions
+            .keys()
+            .any(|(session_addr, _)| session_addr == addr)
     }
 
     pub fn peer_is_ik_authenticated(&self, addr: &SocketAddr) -> bool {
@@ -1237,7 +1239,6 @@ impl EmberTransport {
         }
     }
 
-
     /// Remove expired sessions and pending handshakes.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
@@ -1262,7 +1263,8 @@ impl EmberTransport {
     /// Remove an existing session for a peer (e.g., on disconnect).
     #[allow(dead_code)]
     pub fn remove_session(&mut self, addr: &SocketAddr) {
-        self.sessions.retain(|(session_addr, _), _| session_addr != addr);
+        self.sessions
+            .retain(|(session_addr, _), _| session_addr != addr);
         self.pending.remove(addr);
         self.deferred_ik.retain(|(deferred, _), _| deferred != addr);
     }
@@ -2933,7 +2935,11 @@ mod tests {
                 .rejected
         );
         let probe_answer = alice.dispatch_incoming(&handshake.responses[1], bob_addr);
-        assert_eq!(probe_answer.responses.len(), 1, "the probe must be answered");
+        assert_eq!(
+            probe_answer.responses.len(),
+            1,
+            "the probe must be answered"
+        );
 
         let outcome = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
         assert!(!outcome.rejected);

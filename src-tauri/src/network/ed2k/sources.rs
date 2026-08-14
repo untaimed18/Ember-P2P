@@ -2560,7 +2560,10 @@ mod tests {
         assert_eq!(pfs.source_user_hash_at(anonymous, 4663), None);
         // Right host, wrong port, and an address this file never tracked.
         assert_eq!(pfs.source_user_hash_at(known, 5555), None);
-        assert_eq!(pfs.source_user_hash_at(Ipv4Addr::new(10, 0, 0, 9), 4662), None);
+        assert_eq!(
+            pfs.source_user_hash_at(Ipv4Addr::new(10, 0, 0, 9), 4662),
+            None
+        );
     }
 
     /// Clearing must only affect a source still waiting. If the friend's

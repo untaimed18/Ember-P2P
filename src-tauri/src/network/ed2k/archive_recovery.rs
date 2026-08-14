@@ -1191,9 +1191,7 @@ mod tests {
         bytes.write_u16::<LittleEndian>(0).unwrap();
         bytes.write_u32::<LittleEndian>(crc).unwrap();
         bytes.write_u32::<LittleEndian>(data.len() as u32).unwrap();
-        bytes
-            .write_u32::<LittleEndian>(uncompressed_size)
-            .unwrap();
+        bytes.write_u32::<LittleEndian>(uncompressed_size).unwrap();
         bytes.write_u16::<LittleEndian>(name.len() as u16).unwrap();
         bytes.write_u16::<LittleEndian>(0).unwrap();
         bytes.extend_from_slice(name);

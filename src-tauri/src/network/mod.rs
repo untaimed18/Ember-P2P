@@ -1550,13 +1550,7 @@ async fn handle_epx_sources(
     // learned elsewhere. Sharing a swarm bounds who can try, not how much one
     // of them gets. A peer whose HELLO bound no identity stays uncharged and
     // is still held by the global cap alone.
-    admit_relay_attestations(
-        state,
-        relay_attestations,
-        now_unix,
-        from_ember_hash,
-        label,
-    );
+    admit_relay_attestations(state, relay_attestations, now_unix, from_ember_hash, label);
 
     for (file_hash, sources) in entries {
         total_sources_offered += sources.len();
@@ -1640,7 +1634,9 @@ async fn handle_epx_sources(
                     // Counted against the per-event ceiling like an injection,
                     // so a flood of firewalled entries cannot buy unlimited work.
                     total_sources_this_event += 1;
-                    *per_hash_persisted.entry(hex::encode(file_hash)).or_default() += 1;
+                    *per_hash_persisted
+                        .entry(hex::encode(file_hash))
+                        .or_default() += 1;
                 }
                 debug!(
                     "EPX source {ip}:{port} is firewalled; kept as a parked source rather than dialled ({label})"
@@ -6023,7 +6019,10 @@ mod tests {
         // An ack from a node we did not send to proves nothing and must not
         // consume the entry.
         assert!(pub_.note_ack(1, 0b1, other).is_empty());
-        assert!(pub_.in_flight.contains_key(&1), "entry survives a stray ack");
+        assert!(
+            pub_.in_flight.contains_key(&1),
+            "entry survives a stray ack"
+        );
 
         // An empty bitmap confirms nothing, but does resolve the request.
         pub_.in_flight.insert(
@@ -6171,7 +6170,11 @@ mod tests {
         untrack_ember_record_pending(sched.borrow(), one);
         untrack_ember_record_pending(sched.borrow(), two);
 
-        assert_eq!(sched.rounds_failed(one), 0, "a dropped round is not a failure");
+        assert_eq!(
+            sched.rounds_failed(one),
+            0,
+            "a dropped round is not a failure"
+        );
         assert!(
             !sched.unplaced.contains_key(&slot),
             "the file must leave the pending set or selection never offers it again"
@@ -6208,7 +6211,12 @@ mod tests {
 
         // A round's replica batches all time out together; that is one round.
         for _ in 0..5 {
-            charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, start);
+            charge_ember_publish_failure(
+                sched.borrow(),
+                reference.file_hash,
+                reference.kind,
+                start,
+            );
         }
         assert_eq!(sched.rounds_failed(reference), 1);
 
@@ -6298,7 +6306,9 @@ mod tests {
 
         // Confirmed placement releases it, and then the interval holds it back.
         untrack_ember_record_pending(sched.borrow(), reference);
-        sched.borrow().stamp(reference.file_hash, reference.kind, now);
+        sched
+            .borrow()
+            .stamp(reference.file_hash, reference.kind, now);
         assert_eq!(
             ember_publish_staleness(
                 &sched.unplaced,
@@ -6382,10 +6392,7 @@ mod tests {
     #[test]
     fn a_starved_table_gets_a_wider_ping_budget() {
         let starved = EMBER_PING_STARVED_BELOW;
-        assert_eq!(
-            ember_maint_ping_budget(0, 0),
-            EMBER_MAINT_MAX_PINGS_STARVED
-        );
+        assert_eq!(ember_maint_ping_budget(0, 0), EMBER_MAINT_MAX_PINGS_STARVED);
         assert_eq!(
             ember_maint_ping_budget(starved - 1, starved - 1),
             EMBER_MAINT_MAX_PINGS_STARVED
@@ -6493,7 +6500,11 @@ mod tests {
         let over = EMBER_MAX_CARRY_OVER_PER_PEER + 40;
         let tail: Vec<EmberQueuedRecord> = (0..over).map(|i| queued_record(i as u8)).collect();
         let dropped = pub_.carry_over(node, &contact, tail);
-        assert_eq!(dropped.len(), 40, "the excess is reported, not silently lost");
+        assert_eq!(
+            dropped.len(),
+            40,
+            "the excess is reported, not silently lost"
+        );
         assert_eq!(pub_.queued_count, EMBER_MAX_CARRY_OVER_PER_PEER);
         assert_eq!(
             pub_.queued[&node].1.len(),
@@ -6682,7 +6693,10 @@ mod tests {
         // Sources are one record per file, so they get the whole allowance.
         let tiny_src = ember_source_files_per_tick(50_000, 50_000, 1);
         assert!(tiny_src <= ember_deliverable_records_per_tick(1));
-        assert!(tiny_src > tiny, "a source file is cheaper than a keyword file");
+        assert!(
+            tiny_src > tiny,
+            "a source file is cheaper than a keyword file"
+        );
 
         // And a roomy table is not what binds: the same library gets more per
         // tick than it would on a table of one, because the records spread.
@@ -6791,8 +6805,11 @@ mod tests {
             ember_kw_blob(&sk, "ubuntuiso", hash_a, 1, "ubuntuiso server amd64"),
             ember_kw_blob(&sk, "ubuntuiso", hash_b, 1, "ubuntuiso desktop amd64"),
         ];
-        let results =
-            build_ember_keyword_results(&blobs, &["ubuntuiso".to_string(), "server".to_string()], None);
+        let results = build_ember_keyword_results(
+            &blobs,
+            &["ubuntuiso".to_string(), "server".to_string()],
+            None,
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file.hash, hex::encode(hash_a));
     }
@@ -6850,8 +6867,7 @@ mod tests {
 
         // A NOT query must drop the excluded file even though the excluded
         // term never appears in the flattened positive keywords.
-        let not_expr =
-            crate::search::query::parse("reloaded -documentary").expect("query parses");
+        let not_expr = crate::search::query::parse("reloaded -documentary").expect("query parses");
         let not_results =
             build_ember_keyword_results(&blobs, &["reloaded".to_string()], Some(&not_expr));
         assert_eq!(not_results.len(), 1, "NOT excludes the negated match");
@@ -6933,8 +6949,7 @@ mod tests {
         ];
         let mut diag = crate::types::EmberDiagnostics::default();
         let mut noise_keys = HashMap::new();
-        let mut content_hashes: HashMap<[u8; 16], [u8; 32]> =
-            HashMap::from([(file_hash, trusted)]);
+        let mut content_hashes: HashMap<[u8; 16], [u8; 32]> = HashMap::from([(file_hash, trusted)]);
         parse_ember_source_records(
             &blobs,
             file_hash,
@@ -7207,11 +7222,17 @@ mod tests {
         record_ember_keyless_peer(&mut keyless, b.0, b.1);
 
         // Freshest first, and the budget caps the batch.
-        assert_eq!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1), vec![b]);
+        assert_eq!(
+            xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1),
+            vec![b]
+        );
 
         let mut attempted = HashMap::new();
         attempted.insert(b, std::time::Instant::now());
-        assert_eq!(xx_bridge_candidates(&keyless, &keys, &attempted, 8), vec![a]);
+        assert_eq!(
+            xx_bridge_candidates(&keyless, &keys, &attempted, 8),
+            vec![a]
+        );
 
         // A spent budget means no work, which is how the IK pass reserves it.
         assert!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 0).is_empty());
@@ -10275,9 +10296,7 @@ fn charge_ember_publish_failure(
         .entry(slot)
         .or_insert(EmberPublishAttempts {
             rounds_failed: 0,
-            last_charged: now
-                .checked_sub(EMBER_BATCH_ACK_TIMEOUT)
-                .unwrap_or(now),
+            last_charged: now.checked_sub(EMBER_BATCH_ACK_TIMEOUT).unwrap_or(now),
         });
     if now.duration_since(attempts.last_charged) < EMBER_BATCH_ACK_TIMEOUT {
         return;
@@ -10337,10 +10356,7 @@ fn note_ember_rendezvous_lookup(state: &mut NetworkState, listed: usize) {
 /// disconnect — would otherwise leave this node believing it is listed as a
 /// bootstrap contact, and therefore undiscoverable, for a full republish
 /// interval.
-fn forget_rendezvous_publish(
-    state: &mut NetworkState,
-    removed: Option<&(KadId, KadMessage)>,
-) {
+fn forget_rendezvous_publish(state: &mut NetworkState, removed: Option<&(KadId, KadMessage)>) {
     if let Some((hash, _)) = removed {
         if *hash == kad::publish::ember_rendezvous_key() {
             state.ember_rendezvous_published_at = 0;
@@ -10438,10 +10454,7 @@ struct EmberBatchInFlight {
 /// destination puts the frame count in proportion to peers instead.
 #[derive(Default)]
 struct EmberBatchPublisher {
-    queued: HashMap<
-        ember::dht::EmberNodeId,
-        (ember::dht::EmberContact, Vec<EmberQueuedRecord>),
-    >,
+    queued: HashMap<ember::dht::EmberNodeId, (ember::dht::EmberContact, Vec<EmberQueuedRecord>)>,
     /// Running total across `queued`. A tick enqueues one entry per
     /// (record x replica) — thousands for a large library — so the cap check
     /// cannot afford to re-sum every destination on each call.
@@ -10628,9 +10641,15 @@ impl EmberBatchPublisher {
     }
 
     /// Records this peer may still be sent this minute.
-    fn record_allowance(&mut self, node_id: ember::dht::EmberNodeId, now: std::time::Instant) -> usize {
+    fn record_allowance(
+        &mut self,
+        node_id: ember::dht::EmberNodeId,
+        now: std::time::Instant,
+    ) -> usize {
         match self.sent_window.get(&node_id) {
-            Some((used, since)) if now.duration_since(*since) < std::time::Duration::from_secs(60) => {
+            Some((used, since))
+                if now.duration_since(*since) < std::time::Duration::from_secs(60) =>
+            {
                 EMBER_STORE_RECORDS_PER_PEER_PER_MIN.saturating_sub(*used) as usize
             }
             _ => EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize,
@@ -10656,8 +10675,9 @@ impl EmberBatchPublisher {
     /// Forget pacing state for peers we have not sent to in a while, so a long
     /// session's churn cannot grow the map without bound.
     fn prune_sent_window(&mut self, now: std::time::Instant) {
-        self.sent_window
-            .retain(|_, (_, since)| now.duration_since(*since) < std::time::Duration::from_secs(300));
+        self.sent_window.retain(|_, (_, since)| {
+            now.duration_since(*since) < std::time::Duration::from_secs(300)
+        });
     }
 
     fn clear(&mut self) {
@@ -10804,8 +10824,7 @@ const EMBER_SEARCH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// contact, so a fresh node's lookups failed almost everything they touched.
 /// Covers a Noise_XX 2-RTT setup plus the query round trip, and stays well
 /// inside the 60-second whole-search cap.
-const EMBER_SEARCH_QUEUED_QUERY_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(12);
+const EMBER_SEARCH_QUEUED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 // ── DHT maintenance (slice 6) ──
 
@@ -11083,15 +11102,15 @@ const EMBER_SOURCE_BACKLOG_DRAIN_TICKS: usize = 10;
 /// actually deliver — see [`ember_deliverable_records_per_tick`]. A source file
 /// is one record, so files and records are the same currency here.
 fn ember_source_files_per_tick(publishable: usize, due: usize, contacts: usize) -> usize {
-    let ticks_per_cycle = (EMBER_SOURCE_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs())
-        .max(1) as usize;
+    let ticks_per_cycle =
+        (EMBER_SOURCE_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     // Round up, then add ~25% headroom for ticks lost to an empty routing
     // table or a failed flush.
     let steady = publishable.div_ceil(ticks_per_cycle);
     let steady = steady + steady.div_ceil(4);
     let drain = due.div_ceil(EMBER_SOURCE_BACKLOG_DRAIN_TICKS);
-    let deliverable = ember_deliverable_records_per_tick(contacts)
-        .max(EMBER_SOURCE_PUBLISH_MIN_PER_TICK);
+    let deliverable =
+        ember_deliverable_records_per_tick(contacts).max(EMBER_SOURCE_PUBLISH_MIN_PER_TICK);
     steady
         .max(drain)
         .clamp(
@@ -11139,8 +11158,8 @@ const EMBER_KEYWORD_PUBLISH_MAX_PER_TICK: usize = 96;
 /// [`ember_deliverable_records_per_tick`]. Without that division a small table
 /// was asked for several hundred records a tick and could carry a few dozen.
 fn ember_keyword_files_per_tick(publishable: usize, contacts: usize) -> usize {
-    let ticks_per_cycle = (EMBER_KEYWORD_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs())
-        .max(1) as usize;
+    let ticks_per_cycle =
+        (EMBER_KEYWORD_REPUBLISH.as_secs() / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     // Round up, then add ~25% headroom.
     let per_tick = publishable.div_ceil(ticks_per_cycle);
     let with_headroom = per_tick + per_tick.div_ceil(4);
@@ -12663,7 +12682,11 @@ async fn try_start_pending_download_from_known_sources(
         trusted_aich_master: expected_aich_master
             .or_else(|| state.aich_root_map.get(&hash_bytes).copied()),
         expected_aich_master,
-        ember_file_hash: state.ember_content_hashes.get(&hash_bytes).copied().unwrap_or([0u8; 32]),
+        ember_file_hash: state
+            .ember_content_hashes
+            .get(&hash_bytes)
+            .copied()
+            .unwrap_or([0u8; 32]),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
@@ -13867,10 +13890,8 @@ pub async fn start_network(
     // Ember's table enforces the same admission policy as KAD's: both dial
     // from this one socket, so a blocked address must be refused whichever
     // stack learned it.
-    let mut ember_dht = ember::dht::engine::EmberDht::new(
-        identity.ed25519_secret_key,
-        settings.block_private_ips,
-    );
+    let mut ember_dht =
+        ember::dht::engine::EmberDht::new(identity.ed25519_secret_key, settings.block_private_ips);
     ember_dht.set_ip_filter(shared_ip_filter.clone());
     // Shared with StatsManager below so send_kad_packet can record wire
     // bytes without holding the manager.
@@ -13952,12 +13973,13 @@ pub async fn start_network(
 
     // AntiLeech client-software filter — eMule's `AntiLeech.dat`
     // equivalent. Loads from `<data_dir>/antileech.dat` (seeded with the
-    // built-in defaults the first time the file doesn't exist), then
-    // wraps in a `parking_lot::RwLock` so the upload server can hot-read
-    // on every handshake while the settings UI hot-swaps the pattern
-    // list. The filter is disabled by default — users have to opt in
-    // via Settings — to avoid surprising regressions for anyone who
-    // didn't ask for it. The defaults are conservative regardless.
+    // built-in defaults the first time the file doesn't exist; an
+    // unmodified pre-haystack factory file is migrated in place).
+    // Wrapped in a `parking_lot::RwLock` so the upload server can
+    // hot-read on every handshake while the settings UI hot-swaps the
+    // pattern list. The filter is disabled by default — users have to
+    // opt in via Settings — to avoid surprising regressions for anyone
+    // who didn't ask for it. The defaults are conservative regardless.
     let shared_antileech: crate::security::antileech::SharedAntiLeechFilter = {
         let initial = crate::security::antileech::load_or_seed_defaults(
             &data_dir,
@@ -32394,7 +32416,9 @@ pub async fn start_network(
 
     // Persist the Ember DHT routing table (slice 7) so the next session
     // can rejoin the DHT immediately.
-    let ember_contacts = state.ember_dht.bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+    let ember_contacts = state
+        .ember_dht
+        .bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
     if !ember_contacts.is_empty() {
         let ember_nodes_path = state.data_dir.join("nodes_ember.dat");
         // Wait out a periodic save that is still in flight, bounded by the shared
@@ -32409,7 +32433,8 @@ pub async fn start_network(
         .await
         {
             Ok(_ownership) => {
-                if let Err(e) = ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts)
+                if let Err(e) =
+                    ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts)
                 {
                     error!("Failed to save nodes_ember.dat on shutdown: {e}");
                 }
@@ -33853,7 +33878,9 @@ async fn handle_ember_control_message(
                 return;
             }
             if payload_arc.is_empty() {
-                debug!("ember-udp: no EPX payload built yet; skipping ExchangeData reply to {from}");
+                debug!(
+                    "ember-udp: no EPX payload built yet; skipping ExchangeData reply to {from}"
+                );
                 return;
             }
             let msg = EmberControlMessage::ExchangeData {
@@ -34354,8 +34381,7 @@ fn build_ember_keyword_results(
         .first()
         .map(|(h, _)| *h);
     // file_hash -> (result, publisher_key -> ember digest votes)
-    let mut dedup: HashMap<[u8; 16], (SearchResult, HashMap<[u8; 32], [u8; 32]>)> =
-        HashMap::new();
+    let mut dedup: HashMap<[u8; 16], (SearchResult, HashMap<[u8; 32], [u8; 32]>)> = HashMap::new();
 
     for blob in blobs {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
@@ -34388,7 +34414,9 @@ fn build_ember_keyword_results(
                 if rec.ember_file_hash != [0u8; 32] {
                     publisher_digests.insert(rec.publisher_key, rec.ember_file_hash);
                 } else {
-                    publisher_digests.entry(rec.publisher_key).or_insert([0u8; 32]);
+                    publisher_digests
+                        .entry(rec.publisher_key)
+                        .or_insert([0u8; 32]);
                 }
                 existing.availability = publisher_digests.len() as u32;
                 existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
@@ -34499,7 +34527,10 @@ fn majority_ember_digest_with_count(
             *counts.entry(*digest).or_insert(0) += 1;
         }
     }
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, n)| (d, n))
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(d, n)| (d, n))
 }
 
 /// Distinct publishers that must agree before a DHT-sourced digest is allowed
@@ -34666,10 +34697,9 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
             // `dropped` stays what it claims to be: work that was thrown away.
             for queued in dropped {
                 if queued.reference.kind == EmberPublishKind::Replication {
-                    state.ember_dht.mark_republish_due(
-                        &queued.record.key,
-                        &queued.record.record_signature,
-                    );
+                    state
+                        .ember_dht
+                        .mark_republish_due(&queued.record.key, &queued.record.record_signature);
                     stats.records_rearmed += 1;
                 } else {
                     untrack_ember_record_pending(state.publish_schedule(), queued.reference);
@@ -35219,8 +35249,8 @@ async fn maybe_publish_ember_sources(
             None => {
                 // No routable IPv4 yet — firewalled seeders can't satisfy
                 // anti-reflection, and HighID seeders have nothing to claim.
-                state.ember_diagnostics.ember_dht_udp_unreachable = firewalled_like
-                    || settings.ember_native_enabled;
+                state.ember_diagnostics.ember_dht_udp_unreachable =
+                    firewalled_like || settings.ember_native_enabled;
                 return;
             }
         },
@@ -35395,18 +35425,18 @@ async fn ask_ember_source_buddies(
             state
                 .ember_dht
                 .build_proxy_store(key, record.data.clone(), record.signature);
-        let sent = match state.ember_transport.prepare_outgoing(
-            buddy.addr,
-            Some(&buddy.noise_pub),
-            &frame,
-        ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                socket.send_to(&packet, buddy.addr).await.is_ok()
-            }
-            ember::transport::OutgoingResult::Queued => true,
-            ember::transport::OutgoingResult::Error(_) => false,
-        };
+        let sent =
+            match state
+                .ember_transport
+                .prepare_outgoing(buddy.addr, Some(&buddy.noise_pub), &frame)
+            {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    socket.send_to(&packet, buddy.addr).await.is_ok()
+                }
+                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Error(_) => false,
+            };
         if sent {
             state.ember_diagnostics.ember_dht_buddy_publishes = state
                 .ember_diagnostics
@@ -35918,11 +35948,10 @@ async fn run_ember_maintenance(
     //    dropped, unacked, and retried forever.
     let republish_interval = std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS);
     result.republish_due = state.ember_dht.republish_backlog(republish_interval);
-    let republish_batch = state.ember_dht.take_republish_batch(
-        republish_interval,
-        EMBER_MAINT_MAX_REPUBLISH,
-        force,
-    );
+    let republish_batch =
+        state
+            .ember_dht
+            .take_republish_batch(republish_interval, EMBER_MAINT_MAX_REPUBLISH, force);
     result.republish_selected = republish_batch.len();
     for (data, signature) in republish_batch {
         let record = match ember::dht::publish::SignedRecord::from_wire(&data, signature) {
@@ -36327,14 +36356,11 @@ async fn handle_ember_dht_message(
                 .ember_dht_buddy_forwards
                 .saturating_add(1);
             drive_ember_publish(socket, state, publish_id).await;
-            let ack_bytes = state
-                .ember_dht
-                .build_proxy_store_ack_frame(proxy_rid, key);
-            match state.ember_transport.prepare_outgoing(
-                from,
-                Some(&remote_noise_pub),
-                &ack_bytes,
-            ) {
+            let ack_bytes = state.ember_dht.build_proxy_store_ack_frame(proxy_rid, key);
+            match state
+                .ember_transport
+                .prepare_outgoing(from, Some(&remote_noise_pub), &ack_bytes)
+            {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
                     if let Err(e) = socket.send_to(&packet, from).await {
@@ -36452,9 +36478,7 @@ async fn handle_ember_dht_message(
                     .ember_diagnostics
                     .ember_dht_observed_votes
                     .saturating_add(1);
-                if let Some(confirmed) = state
-                    .ember_observed_votes
-                    .record_vote(observed, from.ip())
+                if let Some(confirmed) = state.ember_observed_votes.record_vote(observed, from.ip())
                 {
                     // Prefer STUN corroboration. If STUN has not produced an
                     // address yet (Ember-only / STUN failure), accept the
@@ -36975,8 +36999,7 @@ async fn handle_udp_packet_inner(
                     // of our files), demoting healthy sources on unrelated files
                     // and discarding queue ranks we had just learned. It also made
                     // a single unsolicited or source-spoofed datagram authoritative.
-                    let Some((file_hash, _)) =
-                        state.pending_udp_reasks.remove(&(v4, from.port()))
+                    let Some((file_hash, _)) = state.pending_udp_reasks.remove(&(v4, from.port()))
                     else {
                         debug!(
                             "Ignoring unsolicited UDP reask negative response (opcode 0x{opcode:02X}) from {from}"
@@ -39917,8 +39940,7 @@ async fn handle_command_inner(
                 let query = active_request.keywords.join(" ");
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {
-                    let extras: Vec<[u8; 16]> =
-                        hashed.iter().skip(1).map(|(h, _)| *h).collect();
+                    let extras: Vec<[u8; 16]> = hashed.iter().skip(1).map(|(h, _)| *h).collect();
                     if let Some(search_id) = state.ember_search.start_find_value(
                         ember::dht::EmberNodeId(*primary_hash),
                         extras.clone(),
@@ -40821,9 +40843,10 @@ async fn handle_command_inner(
                     let fname = file_name.clone();
                     let fhash = file_hash.clone();
                     let expected_for_db = expected_aich.clone();
-                    let ember_for_db = crate::security::parse_ember_file_hash(Some(&ember_file_hash))
-                        .ok()
-                        .flatten();
+                    let ember_for_db =
+                        crate::security::parse_ember_file_hash(Some(&ember_file_hash))
+                            .ok()
+                            .flatten();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
                             let _ = db_ref.update_transfer_status(&tid, "searching");
@@ -44176,7 +44199,8 @@ async fn handle_command_inner(
                             };
                             match sender.tx.try_send(packet) {
                                 Ok(()) => {
-                                    match mark_outbound_chat_delivered(db.clone(), pending_id).await {
+                                    match mark_outbound_chat_delivered(db.clone(), pending_id).await
+                                    {
                                         Ok(()) => {
                                             let _ = app_handle.emit(
                                                 "ember:chat-message",
@@ -44200,14 +44224,10 @@ async fn handle_command_inner(
                                     }
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    let _ = tx.send(Err(format!(
-                                        "ChatAlreadyQueued:{pending_id}"
-                                    )));
+                                    let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let _ = tx.send(Err(format!(
-                                        "ChatAlreadyQueued:{pending_id}"
-                                    )));
+                                    let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                 }
                             }
                         }
@@ -44218,19 +44238,22 @@ async fn handle_command_inner(
                     // sending a separate direct copy after connect races that
                     // flush and can duplicate the chat packet.
                     let queued_hash = hex::encode(friend_eh);
-                    let queued_id =
-                        match queue_outbound_chat_message(db.clone(), queued_hash, message.clone())
-                            .await
-                        {
-                            Ok(id) => id,
-                            Err(error) => {
-                                warn!(
+                    let queued_id = match queue_outbound_chat_message(
+                        db.clone(),
+                        queued_hash,
+                        message.clone(),
+                    )
+                    .await
+                    {
+                        Ok(id) => id,
+                        Err(error) => {
+                            warn!(
                                     "Refusing to auto-connect chat without a durable outbox row: {error}"
                                 );
-                                let _ = tx.send(Err(error));
-                                return;
-                            }
-                        };
+                            let _ = tx.send(Err(error));
+                            return;
+                        }
+                    };
                     let _ = tx.send(Err(format!("ChatAlreadyQueued:{queued_id}")));
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
                         debug!("Chat remains queued while an existing friend connection attempt finishes");
@@ -44971,7 +44994,10 @@ async fn handle_command_inner(
             // of the two. A search is already underway, which is what the user
             // asked for, so this reports success rather than an error.
             if state.outbound_session_tasks.contains_key(&target_hash) {
-                info!("RetryFriendSearch: {} already has a search in flight", hash_hex);
+                info!(
+                    "RetryFriendSearch: {} already has a search in flight",
+                    hash_hex
+                );
                 let _ = tx.send(Ok(()));
                 return;
             }

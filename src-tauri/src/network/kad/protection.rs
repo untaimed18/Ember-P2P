@@ -318,9 +318,7 @@ impl FloodProtection {
                 && !evict_idle(
                     &mut self.opcode_counters,
                     &mut self.opcode_order,
-                    |(_, t)| {
-                        now.saturating_duration_since(*t).as_secs() >= OPCODE_WINDOW_SECS
-                    },
+                    |(_, t)| now.saturating_duration_since(*t).as_secs() >= OPCODE_WINDOW_SECS,
                 )
             {
                 return true;

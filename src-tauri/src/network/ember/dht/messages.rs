@@ -553,11 +553,7 @@ pub fn build_proxy_store(
 }
 
 /// Build a PROXY_STORE_ACK (buddy accepted the proxy request).
-pub fn build_proxy_store_ack(
-    sender_id: EmberNodeId,
-    request_id: u32,
-    key: [u8; 16],
-) -> DhtMessage {
+pub fn build_proxy_store_ack(sender_id: EmberNodeId, request_id: u32, key: [u8; 16]) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_PROXY_STORE_ACK,
@@ -587,11 +583,7 @@ pub fn build_store_batch(
 }
 
 /// Build the reply to a STORE_BATCH, reporting which records were accepted.
-pub fn build_store_batch_ack(
-    sender_id: EmberNodeId,
-    request_id: u32,
-    accepted: u64,
-) -> DhtMessage {
+pub fn build_store_batch_ack(sender_id: EmberNodeId, request_id: u32, accepted: u64) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_STORE_BATCH_ACK,
@@ -900,9 +892,7 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             }
             let count = data[0] as usize;
             if count > MAX_STORE_BATCH_RECORDS {
-                anyhow::bail!(
-                    "STORE_BATCH count {count} exceeds max {MAX_STORE_BATCH_RECORDS}"
-                );
+                anyhow::bail!("STORE_BATCH count {count} exceeds max {MAX_STORE_BATCH_RECORDS}");
             }
             let mut records = Vec::with_capacity(count);
             let mut offset = 1usize;
@@ -913,8 +903,7 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 let mut key = [0u8; 16];
                 key.copy_from_slice(&data[offset..offset + 16]);
                 offset += 16;
-                let record_len =
-                    u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                let record_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
                 offset += 2;
                 if record_len > MAX_STORE_RECORD_BYTES {
                     anyhow::bail!(
@@ -1310,8 +1299,7 @@ mod tests {
         // payload_len is a u16 LE right after the pub key (header min + 32).
         let payload_len_off = HEADER_MIN_SIZE + 32;
         let oversized = (MAX_DHT_PAYLOAD as u16).saturating_add(1);
-        encoded[payload_len_off..payload_len_off + 2]
-            .copy_from_slice(&oversized.to_le_bytes());
+        encoded[payload_len_off..payload_len_off + 2].copy_from_slice(&oversized.to_le_bytes());
         // Truncate/extend so length checks past payload_len still run;
         // we only care that the max-payload gate fires first.
         assert!(decode_message(&encoded, true).is_err());
@@ -1429,9 +1417,7 @@ mod tests {
         let encoded = encode_message(&announce, &sk, true);
         let decoded = decode_message(&encoded, true).unwrap();
         match decoded.payload {
-            DhtPayload::AnnouncePeer {
-                contacts: got,
-            } => {
+            DhtPayload::AnnouncePeer { contacts: got } => {
                 assert_eq!(got.len(), 2);
                 assert_eq!(got[0].node_id, contacts[0].node_id);
                 assert_eq!(got[1].addr, contacts[1].addr);

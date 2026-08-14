@@ -459,7 +459,11 @@ impl IterativeSearch {
     pub fn mark_failed(&mut self, request_id: u32) -> Option<EmberNodeId> {
         let failed = self.pending_requests.remove(&request_id);
         if let Some(node_id) = failed {
-            let spent = self.attempts.get(&node_id).copied().unwrap_or(MAX_QUERY_ATTEMPTS);
+            let spent = self
+                .attempts
+                .get(&node_id)
+                .copied()
+                .unwrap_or(MAX_QUERY_ATTEMPTS);
             let retryable = spent < MAX_QUERY_ATTEMPTS;
             for entry in &mut self.shortlist {
                 if entry.contact.node_id == node_id {
@@ -997,7 +1001,11 @@ mod tests {
         };
         let mut answered = 0usize;
         for (i, (contact, req_id)) in batch.into_iter().enumerate() {
-            let closer = if i == 0 { vec![phantom.clone()] } else { vec![] };
+            let closer = if i == 0 {
+                vec![phantom.clone()]
+            } else {
+                vec![]
+            };
             search.process_response(req_id, &contact.node_id, closer, vec![]);
             answered += 1;
         }
