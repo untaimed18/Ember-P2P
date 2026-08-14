@@ -45163,7 +45163,7 @@ async fn handle_download_event(
             };
             let speed = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_progress(&transfer_id, capped_downloaded, 0);
+                mgr.update_progress(&transfer_id, capped_downloaded, None);
                 if let Some(t) = mgr.active.get(&transfer_id) {
                     t.speed
                 } else {
@@ -45212,6 +45212,7 @@ async fn handle_download_event(
                     progress,
                     speed,
                     uploaded: None,
+                    completed_size: None,
                     direction: None,
                     upload_time: None,
                     up_part_status: None,
@@ -45780,30 +45781,35 @@ async fn handle_upload_event(
         }
         UploadEventKind::Progress {
             uploaded,
+            unique_uploaded,
             total,
             part_status,
             part_count,
             peer_part_status,
         } => {
-            let capped_uploaded = if total > 0 {
-                uploaded.min(total)
+            // Unique coverage, not session wire bytes. Re-requests inflate
+            // `uploaded` past `total` while the peer still needs parts; the
+            // percentage and `completed_size` follow unique bytes so a
+            // small-file progress fill cannot read 100% while coverage is
+            // still short. The chunked parts-bar overlay is served-parts /
+            // part-count on the frontend.
+            let unique_capped = if total > 0 {
+                unique_uploaded.min(total)
             } else {
-                uploaded
+                unique_uploaded
+            };
+            let progress = if total > 0 {
+                ((unique_capped as f64 / total as f64) * 100.0).min(100.0)
+            } else {
+                0.0
             };
             let (speed, upload_time_ms) = {
                 let mut mgr = transfer_manager.write().await;
-                // Raw, not `capped_uploaded`. `update_progress` already caps
-                // what it stores for display (`transferred.min(total_size)`,
-                // progress at 100%), but it also builds its rolling speed window
-                // from the value it is handed. An upload's `uploaded` is
-                // cumulative wire bytes, so a peer that re-requests data pushes
-                // it past the file size — routinely, and by tens of megabytes on
-                // a long session. Handing over the capped figure pinned every
-                // later sample at exactly `total_size`, so the window saw a delta
-                // of zero and reported no speed, the byte counter stopped moving,
-                // and the row read "whole file sent, nothing happening" while the
-                // peer was still pulling at full rate for another half hour.
-                mgr.update_progress(&event.transfer_id, uploaded, 0);
+                // Raw session wire bytes, not unique coverage. Speed is
+                // bytes_delta over a rolling window; unique coverage can
+                // stall (peer re-requesting a part we already served)
+                // while the wire is still moving.
+                mgr.update_progress(&event.transfer_id, uploaded, Some(unique_capped));
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
                 let ut = t
@@ -45830,11 +45836,6 @@ async fn handle_upload_event(
                     .unwrap_or(0);
                 (speed, ut)
             };
-            let progress = if total > 0 {
-                ((capped_uploaded as f64 / total as f64) * 100.0).min(100.0)
-            } else {
-                0.0
-            };
             let _ = app_handle.emit(
                 "transfer-progress",
                 &crate::types::TransferProgressPayload {
@@ -45843,7 +45844,8 @@ async fn handle_upload_event(
                     total,
                     progress,
                     speed,
-                    uploaded: Some(capped_uploaded),
+                    uploaded: Some(uploaded),
+                    completed_size: Some(unique_capped),
                     direction: Some("upload"),
                     upload_time: Some(upload_time_ms),
                     up_part_status: part_status,

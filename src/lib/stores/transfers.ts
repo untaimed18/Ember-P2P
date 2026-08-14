@@ -8,6 +8,8 @@ interface ProgressPayload {
   id: string;
   downloaded: number;
   uploaded?: number;
+  /** Upload-direction only: unique per-part coverage this session. */
+  completed_size?: number;
   total: number;
   progress: number;
   speed: number;
@@ -66,6 +68,57 @@ function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): numbe
     return 0;
   }
   return Math.max(apiSpeed ?? 0, eventSpeed ?? 0);
+}
+
+function countServedPartBits(hex: string | undefined, partCount: number): number {
+  if (!hex || partCount <= 0) return 0;
+  let n = 0;
+  for (let i = 0; i < partCount; i++) {
+    const off = (i >> 3) * 2;
+    const byte = parseInt(hex.slice(off, off + 2), 16);
+    if (!Number.isNaN(byte) && (byte & (1 << (i & 7))) !== 0) n++;
+  }
+  return n;
+}
+
+/**
+ * Merge byte counters from a `list_transfers` snapshot with the live event
+ * row. Downloads keep `Math.max` so a stale poll cannot rewind the bar.
+ * Uploads use unique coverage for `progress` / `completed_size`; `Math.max`
+ * is still right (monotonic on a row) unless the event still holds the old
+ * wire-capped 100% while the parts bitmap is incomplete — then prefer API.
+ */
+function mergeProgressCounters(
+  apiItem: Transfer,
+  eventItem: Transfer,
+): { progress: number; transferred: number; completed_size: number } {
+  const transferred = Math.max(apiItem.transferred || 0, eventItem.transferred || 0);
+  const apiCompleted = apiItem.completed_size || 0;
+  const eventCompleted = eventItem.completed_size || 0;
+  const isUpload = apiItem.direction === 'upload' || eventItem.direction === 'upload';
+  if (!isUpload) {
+    return {
+      progress: Math.max(apiItem.progress, eventItem.progress),
+      transferred,
+      completed_size: Math.max(apiCompleted, eventCompleted),
+    };
+  }
+  const apiProgress = apiItem.progress || 0;
+  const eventProgress = eventItem.progress || 0;
+  const parts = eventItem.up_part_count ?? apiItem.up_part_count ?? 0;
+  const served = countServedPartBits(eventItem.up_part_status ?? apiItem.up_part_status, parts);
+  const eventLooksWireCapped =
+    eventProgress >= 100 &&
+    apiProgress < 100 &&
+    (parts > 0 ? served < parts : (apiItem.total_size > 0 && eventCompleted >= apiItem.total_size && apiCompleted < apiItem.total_size));
+  if (eventLooksWireCapped) {
+    return { progress: apiProgress, transferred, completed_size: apiCompleted };
+  }
+  return {
+    progress: Math.max(apiProgress, eventProgress),
+    transferred,
+    completed_size: Math.max(apiCompleted, eventCompleted),
+  };
 }
 
 /** Known backend Transfer statuses. Used to runtime-narrow event payloads
@@ -322,16 +375,22 @@ function flushProgress() {
       }
       const existing = list[idx];
       if (PROGRESS_SKIP_STATUSES.has(existing.status)) continue;
-      const rawTransferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
+      const isUpload = existing.direction === 'upload';
+      const rawTransferred = isUpload ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
       const transferred = Math.max(rawTransferred, existing.transferred || 0);
-      const completedSize = Math.max(transferred, existing.completed_size || 0);
+      // Uploads: `completed_size` is unique coverage, not session wire bytes.
+      // Merging it with `transferred` pinned the bar at 100% whenever
+      // re-requests reached file size while the parts bitmap was still sparse.
+      const completedSize = isUpload
+        ? (p.completed_size != null ? p.completed_size : existing.completed_size || 0)
+        : Math.max(transferred, existing.completed_size || 0);
       const bytesMoved = transferred > (existing.transferred || 0);
       const clearStaleHealth = bytesMoved || existing.health === 'stalled';
       list[idx] = {
         ...existing,
         transferred,
         completed_size: completedSize,
-        progress: Math.max(p.progress, existing.progress || 0),
+        progress: isUpload ? p.progress : Math.max(p.progress, existing.progress || 0),
         speed: p.speed,
         status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
         health: clearStaleHealth ? 'healthy' : existing.health,
@@ -729,9 +788,7 @@ export async function initTransferStore() {
             ...apiItem,
             status,
             speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
-            progress: Math.max(apiItem.progress, eventItem.progress),
-            transferred: Math.max(apiItem.transferred, eventItem.transferred),
-            completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
+            ...mergeProgressCounters(apiItem, eventItem),
             // Prefer API health: events often omit/stale-carry `health`, and a
             // prior `degraded` on the event row would otherwise stick forever.
             health: apiItem.health ?? eventItem.health,
@@ -986,10 +1043,8 @@ export function startTransferPoll() {
             return {
               ...apiItem,
               status,
-              progress: Math.max(apiItem.progress, eventItem.progress),
+              ...mergeProgressCounters(apiItem, eventItem),
               speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
-              transferred: Math.max(apiItem.transferred, eventItem.transferred),
-              completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
               // Prefer API health over a possibly-stale event value.
               health: apiItem.health ?? eventItem.health,
               health_reason: apiItem.health_reason ?? eventItem.health_reason,

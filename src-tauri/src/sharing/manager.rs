@@ -476,7 +476,15 @@ impl TransferManager {
     /// eMule-style rolling window speed calculation.
     /// Maintains a history of (cumulative_bytes, timestamp) samples and computes
     /// speed as bytes_delta * 1000 / time_delta_ms over the window.
-    pub fn update_progress(&mut self, id: &str, transferred: u64, _speed_hint: u64) {
+    ///
+    /// `unique_completed` is upload-only unique per-part coverage. Downloads
+    /// pass `None` and derive `completed_size` / `progress` from `transferred`.
+    pub fn update_progress(
+        &mut self,
+        id: &str,
+        transferred: u64,
+        unique_completed: Option<u64>,
+    ) {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
 
@@ -516,21 +524,42 @@ impl TransferManager {
                 0
             };
 
-            transfer.transferred = if transfer.total_size > 0 {
-                transferred.min(transfer.total_size)
+            // Uploads: `transferred` is cumulative session wire bytes
+            // (eMule GetTransferred) and routinely exceeds `total_size`
+            // when the peer re-requests overlapping blocks. Capping it
+            // made the UI claim the whole file had been sent while unique
+            // coverage — and the parts bar — was still halfway.
+            // `unique_completed` is that coverage and drives `completed_size`
+            // / `progress`. Downloads: cap at `total_size` so a coalesced
+            // tick cannot report more than the file.
+            let is_upload = transfer.direction == TransferDirection::Upload;
+            if is_upload {
+                transfer.transferred = transferred;
+                if let Some(unique) = unique_completed {
+                    let unique_capped = if transfer.total_size > 0 {
+                        unique.min(transfer.total_size)
+                    } else {
+                        unique
+                    };
+                    transfer.completed_size = unique_capped;
+                    if transfer.total_size > 0 {
+                        transfer.progress = ((unique_capped as f64 / transfer.total_size as f64)
+                            * 100.0)
+                            .min(100.0);
+                    }
+                }
+            } else if transfer.total_size > 0 {
+                transfer.transferred = transferred.min(transfer.total_size);
+                transfer.completed_size = transfer.transferred;
             } else {
-                transferred
-            };
-            transfer.completed_size = if transfer.total_size > 0 {
-                transferred.min(transfer.total_size)
-            } else {
-                transferred
-            };
+                transfer.transferred = transferred;
+                transfer.completed_size = transferred;
+            }
             transfer.speed = speed;
             transfer.last_received = Some(chrono::Utc::now().timestamp());
             Self::clear_failure_context(transfer);
             Self::clear_runtime_health(transfer);
-            if transfer.total_size > 0 {
+            if !is_upload && transfer.total_size > 0 {
                 transfer.progress =
                     ((transferred as f64 / transfer.total_size as f64) * 100.0).min(100.0);
             }

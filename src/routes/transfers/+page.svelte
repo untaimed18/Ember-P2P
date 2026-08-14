@@ -3760,32 +3760,23 @@
                             partStatus={t.up_part_status}
                             partCount={t.up_part_count}
                             peerPartStatus={t.up_peer_part_status}
-                            transferred={t.transferred}
+                            transferred={t.completed_size}
                             total={t.total_size}
                             color="var(--accent)"
                             title={uploadPartsTooltip(t)}
                           />
                         {:else}
                         <!--
-                          Feed the ProgressBar raw bytes rather than
-                          `t.progress`. `t.progress` is recomputed from
-                          `transferred / total_size` on every backend
-                          `update_progress`, but in practice the
-                          `transfer-progress` events for uploads arrive
-                          much more often than any downstream effect
-                          that re-derives progress, and we'd rather the
-                          bar animate continuously as bytes flow than
-                          freeze at 0% waiting for a progress sample
-                          with a non-zero value. The old
-                          `t.progress > 0` gate left the upload row
-                          showing only a dash for the entire session
-                          whenever the first few progress payloads
-                          rounded to 0.0% (tiny `uploaded / total_size`
-                          for the first block of a large file) — the
-                          "uploads appear and freeze until they
-                          complete" UX.
+                          Unique coverage (`completed_size`), not session
+                          wire bytes. `transferred` is cumulative and
+                          routinely reaches `total_size` while the peer
+                          still needs parts (re-requests after hash/AICH).
+                          Feeding those bytes filled this bar at 100% with
+                          the parts bar still half empty. `completed_size`
+                          is unique per-part coverage, the same metric that
+                          ends the session when it reaches file size.
                         -->
-                        <ProgressBar value={t.transferred} max={t.total_size} color="var(--accent)" />
+                        <ProgressBar value={t.completed_size} max={t.total_size} color="var(--accent)" />
                         {/if}
                       {:else}
                         <span class="no-bar">—</span>

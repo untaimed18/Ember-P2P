@@ -122,9 +122,13 @@ pub struct Transfer {
     pub progress: f64,
     pub speed: u64,
     pub total_size: u64,
-    /// Session transferred bytes (eMule: GetTransferred)
+    /// Session transferred bytes (eMule: GetTransferred). For uploads this
+    /// is cumulative wire bytes and may exceed [`total_size`] when the peer
+    /// re-requests blocks.
     pub transferred: u64,
-    /// Total completed size including resumed data (eMule: GetCompletedSize)
+    /// Unique completed size (eMule: GetCompletedSize). For downloads this
+    /// includes resumed data; for uploads it is unique per-part coverage
+    /// this session (re-requests do not inflate it).
     #[serde(default)]
     pub completed_size: u64,
     pub started_at: i64,
@@ -1606,8 +1610,15 @@ pub struct TransferProgressPayload<'a> {
     pub speed: u64,
     /// Only populated for upload-direction events so existing frontend
     /// consumers (`payload.uploaded ?? payload.downloaded`) keep working.
+    /// Session wire bytes; may exceed [`total`](Self::total) on uploads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<u64>,
+    /// Upload-direction only: unique per-part coverage this session.
+    /// Drives the small-file progress fill (files with too few ED2K parts
+    /// for the chunked bar). The chunked bar's overlay is served-parts /
+    /// part-count, not this figure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_size: Option<u64>,
     /// `"upload"` for upload progress events; omitted for downloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<&'static str>,

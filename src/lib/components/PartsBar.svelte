@@ -25,6 +25,10 @@
     partStatus?: string;
     partCount?: number;
     peerPartStatus?: string;
+    /** Unique coverage bytes. Unused while `partCount` is set — the overlay
+     *  is served-parts / part-count so it matches the filled segments.
+     *  Fallback when the bitmap is missing. */
+    transferred?: number;
     transferred?: number;
     total?: number;
     color?: string;
@@ -103,7 +107,17 @@
 
   let background = $derived(separator ? `${separator}, ${gradient}` : gradient);
 
-  let rawPct = $derived(total > 0 ? (transferred / total) * 100 : 0);
+  // Overlay matches the green segments (whole parts served this session),
+  // not unique-byte coverage and never session wire bytes. Unique bytes
+  // count partial parts the bar does not light; wire bytes reach file size
+  // while the bar is still half empty.
+  let rawPct = $derived(
+    count > 0
+      ? (servedCount / count) * 100
+      : total > 0
+        ? (transferred / total) * 100
+        : 0
+  );
   let pct = $derived(Math.min(100, Math.max(0, Number.isFinite(rawPct) ? rawPct : 0)));
 </script>
 

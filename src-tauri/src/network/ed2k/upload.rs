@@ -1258,6 +1258,26 @@ fn unique_served_bytes(served: &[u64], total_size: u64) -> u64 {
     sum
 }
 
+/// Progress tick for the upload row: session wire bytes (`uploaded`) plus
+/// unique per-part coverage so the UI percentage tracks how much of the
+/// file this peer has uniquely received, not re-requested wire bytes.
+fn upload_progress_kind(
+    uploaded: u64,
+    total_size: u64,
+    served: &[u64],
+    peer_part_status: Option<String>,
+) -> UploadEventKind {
+    let (part_status, part_count) = build_up_part_status(served, total_size);
+    UploadEventKind::Progress {
+        uploaded,
+        unique_uploaded: unique_served_bytes(served, total_size),
+        total: total_size,
+        part_status,
+        part_count,
+        peer_part_status,
+    }
+}
+
 /// Terminal upload kind for a session that moved at least one byte.
 /// Statistics "Completed Uploads" only increments when unique coverage
 /// reached the full file (not cumulative wire bytes, which re-requests inflate).
@@ -1294,6 +1314,10 @@ pub enum UploadEventKind {
     },
     Progress {
         uploaded: u64,
+        /// Unique per-part coverage this session (`unique_served_bytes`).
+        /// Drives the row's progress % and `completed_size`; `uploaded` is
+        /// cumulative wire bytes and can exceed `total`.
+        unique_uploaded: u64,
         total: u64,
         /// eMule-style served-parts bitmap and total part count, driving
         /// the chunked "Up Status" bar. See
@@ -8111,21 +8135,18 @@ impl UploadHandler {
                                         last_progress_emit =
                                             Some(std::time::Instant::now());
                                         last_progress_uploaded = uploaded;
-                                        let (part_status, part_count) =
-                                            build_up_part_status(&served_bytes_per_part, total_size);
                                         let peer_part = peer_part_status
                                             .as_ref()
                                             .filter(|(h, _)| Some(*h) == current_file_hash)
                                             .map(|(_, s)| s.clone());
                                         let _ = self.upload_event_tx.send(UploadEvent {
                                             transfer_id: tid.clone(),
-                                            kind: UploadEventKind::Progress {
+                                            kind: upload_progress_kind(
                                                 uploaded,
-                                                total: total_size,
-                                                part_status,
-                                                part_count,
-                                                peer_part_status: peer_part,
-                                            },
+                                                total_size,
+                                                &served_bytes_per_part,
+                                                peer_part,
+                                            ),
                                         }).await;
                                     }
                                 }
@@ -8217,21 +8238,18 @@ impl UploadHandler {
                                 if should_emit {
                                     last_progress_emit = Some(std::time::Instant::now());
                                     last_progress_uploaded = uploaded;
-                                    let (part_status, part_count) =
-                                        build_up_part_status(&served_bytes_per_part, total_size);
                                     let peer_part = peer_part_status
                                         .as_ref()
                                         .filter(|(h, _)| Some(*h) == current_file_hash)
                                         .map(|(_, s)| s.clone());
                                     let _ = self.upload_event_tx.send(UploadEvent {
                                         transfer_id: tid.clone(),
-                                        kind: UploadEventKind::Progress {
+                                        kind: upload_progress_kind(
                                             uploaded,
-                                            total: total_size,
-                                            part_status,
-                                            part_count,
-                                            peer_part_status: peer_part,
-                                        },
+                                            total_size,
+                                            &served_bytes_per_part,
+                                            peer_part,
+                                        ),
                                     }).await;
                                 }
                             }
@@ -8308,32 +8326,31 @@ impl UploadHandler {
                     }
 
                     // OP_REQUESTPARTS is the hot path. After the inner
-                    // offset loop, flush a final Progress event if the
-                    // throttle coalesced away the last update for this
-                    // batch — otherwise the UI can sit on a stale
-                    // `uploaded` value for up to `PROGRESS_EMIT_MIN_INTERVAL`
-                    // after a burst of blocks, which is exactly the
-                    // "row frozen while data is clearly moving" symptom
-                    // for short bursty sessions.
+                    // offset loop, `mark_served_parts` has run, so unique
+                    // coverage and the parts bitmap finally include this
+                    // batch. Mid-loop Progress ticks fire *before* that
+                    // tally update (so speed/`uploaded` stay live) and set
+                    // `last_progress_uploaded`, which used to skip this
+                    // flush — leaving the UI on the previous batch's unique
+                    // bytes (0% for a file sent in a single REQUESTPARTS).
+                    // Emit whenever this batch credited bytes, even if the
+                    // wire counter was already reported.
                     if let Some(tid) = &transfer_id {
-                        if uploaded != last_progress_uploaded {
+                        if batch_credited_bytes > 0 {
                             last_progress_emit = Some(std::time::Instant::now());
                             last_progress_uploaded = uploaded;
-                            let (part_status, part_count) =
-                                build_up_part_status(&served_bytes_per_part, total_size);
                             let peer_part = peer_part_status
                                 .as_ref()
                                 .filter(|(h, _)| Some(*h) == current_file_hash)
                                 .map(|(_, s)| s.clone());
                             let _ = self.upload_event_tx.send(UploadEvent {
                                 transfer_id: tid.clone(),
-                                kind: UploadEventKind::Progress {
+                                kind: upload_progress_kind(
                                     uploaded,
-                                    total: total_size,
-                                    part_status,
-                                    part_count,
-                                    peer_part_status: peer_part,
-                                },
+                                    total_size,
+                                    &served_bytes_per_part,
+                                    peer_part,
+                                ),
                             }).await;
                         }
                     }
@@ -10659,6 +10676,29 @@ fn is_connection_closed(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
     )
+}
+
+#[cfg(test)]
+mod unique_served_tests {
+    use super::*;
+
+    #[test]
+    fn unique_served_bytes_caps_each_part_so_rerequests_do_not_fill_the_file() {
+        let total = PARTSIZE + 1_000;
+        // First part served twice; last part only half-done.
+        let served = vec![PARTSIZE.saturating_mul(2), 500u64];
+        assert_eq!(unique_served_bytes(&served, total), PARTSIZE + 500);
+        assert!(
+            unique_served_bytes(&served, total) < total,
+            "re-requests must not make unique coverage look complete"
+        );
+    }
+
+    #[test]
+    fn unique_served_bytes_empty_or_unknown_size_is_zero() {
+        assert_eq!(unique_served_bytes(&[PARTSIZE], 0), 0);
+        assert_eq!(unique_served_bytes(&[], PARTSIZE), 0);
+    }
 }
 
 #[cfg(test)]

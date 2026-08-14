@@ -86,6 +86,8 @@ export interface Transfer {
   speed: number;
   total_size: number;
   transferred: number;
+  /** Unique completed size. Downloads include resumed data; uploads are
+   *  unique per-part coverage this session (re-requests do not inflate it). */
   completed_size: number;
   started_at: number;
   failure_reason?: string;
