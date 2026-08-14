@@ -704,6 +704,72 @@ pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
         })
 }
 
+/// Maximum links accepted from one paste. Past this a user is better served by
+/// the collection importer, which reads the same one-link-per-line text format
+/// from a file and is bounded by `MAX_COLLECTION_FILES` instead.
+const MAX_ED2K_PASTE_LINKS: usize = 256;
+/// Byte ceiling for the pasted blob, sized to hold `MAX_ED2K_PASTE_LINKS`
+/// links of 1 KiB each. Keeps a runaway paste away from the parser entirely.
+const MAX_ED2K_PASTE_BYTES: usize = MAX_ED2K_PASTE_LINKS * 1024;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ed2kLinkBatch {
+    /// Successfully parsed links, in the order they appeared.
+    pub links: Vec<Ed2kLinkInfo>,
+    /// Non-blank lines that did not parse as an ed2k file link.
+    pub invalid: usize,
+    /// Non-blank lines left unread because the cap was already reached.
+    pub skipped: usize,
+}
+
+/// Parse a pasted block of newline-separated ed2k links.
+///
+/// Split out from [`parse_ed2k_link`] because that one is deliberately strict
+/// about receiving exactly one link, and feeding it a multi-line paste used to
+/// *succeed*: the first link's fields parse, and every later line survives only
+/// as unrecognised `|`-segments that the tag loop skips in silence. A user who
+/// pasted ten links got one download and a success toast. Reporting the invalid
+/// and skipped counts here is what lets the caller say so out loud.
+#[tauri::command]
+pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
+    if text.len() > MAX_ED2K_PASTE_BYTES {
+        return Err(coded_ctx(
+            "search_ed2k_paste_too_large",
+            format!("Pasted text exceeds {MAX_ED2K_PASTE_BYTES} bytes"),
+            MAX_ED2K_PASTE_BYTES,
+        ));
+    }
+    let mut links = Vec::new();
+    let mut invalid = 0usize;
+    let mut skipped = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if links.len() >= MAX_ED2K_PASTE_LINKS {
+            skipped += 1;
+            continue;
+        }
+        match hash::parse_ed2k_link_strict(line) {
+            Ok((name, size, hash, aich, ember)) => links.push(Ed2kLinkInfo {
+                name,
+                size,
+                hash,
+                aich,
+                ember,
+            }),
+            Err(_) => invalid += 1,
+        }
+    }
+    Ok(Ed2kLinkBatch {
+        links,
+        invalid,
+        skipped,
+    })
+}
+
 /// Build an ed2k link with optional AICH and/or our own endpoint as a source,
 /// matching eMule's "copy link" submenu variants. `aich_hash` is the 40-char
 /// hex AICH root from the library row (re-encoded to base32 for `h=`). When
@@ -1160,4 +1226,74 @@ pub async fn remove_download_history_entry(
                 e,
             )
         })
+}
+
+#[cfg(test)]
+mod ed2k_paste_tests {
+    use super::*;
+
+    fn link(name: &str, size: u64, hash_byte: u8) -> String {
+        format!(
+            "ed2k://|file|{name}|{size}|{}|/",
+            hex::encode([hash_byte; 16])
+        )
+    }
+
+    #[test]
+    fn a_multi_line_paste_yields_every_link() {
+        let text = format!("{}\n{}\n{}", link("a.bin", 1, 0xAA), link("b.bin", 2, 0xBB), link("c.bin", 3, 0xCC));
+        let batch = parse_ed2k_links(text).expect("parse");
+        assert_eq!(batch.links.len(), 3);
+        assert_eq!(batch.invalid, 0);
+        assert_eq!(batch.skipped, 0);
+        assert_eq!(batch.links[0].name, "a.bin");
+        assert_eq!(batch.links[2].size, 3);
+    }
+
+    #[test]
+    fn blank_lines_and_crlf_are_not_counted_as_invalid() {
+        // Clipboard content from a Windows text editor arrives CRLF-delimited
+        // and usually has a trailing newline; neither is a malformed link.
+        let text = format!("{}\r\n\r\n{}\r\n", link("a.bin", 1, 0xAA), link("b.bin", 2, 0xBB));
+        let batch = parse_ed2k_links(text).expect("parse");
+        assert_eq!(batch.links.len(), 2);
+        assert_eq!(batch.invalid, 0);
+    }
+
+    #[test]
+    fn unparseable_lines_are_reported_rather_than_dropped() {
+        let text = format!("{}\nnot a link\ned2k://|file|broken|\n", link("a.bin", 1, 0xAA));
+        let batch = parse_ed2k_links(text).expect("parse");
+        assert_eq!(batch.links.len(), 1);
+        assert_eq!(batch.invalid, 2);
+    }
+
+    #[test]
+    fn links_past_the_cap_are_counted_as_skipped() {
+        let mut text = String::new();
+        for i in 0..(MAX_ED2K_PASTE_LINKS + 5) {
+            text.push_str(&link("a.bin", i as u64 + 1, 0xAA));
+            text.push('\n');
+        }
+        let batch = parse_ed2k_links(text).expect("parse");
+        assert_eq!(batch.links.len(), MAX_ED2K_PASTE_LINKS);
+        assert_eq!(batch.skipped, 5);
+        assert_eq!(batch.invalid, 0);
+    }
+
+    #[test]
+    fn an_oversized_paste_is_refused_before_parsing() {
+        let text = "e".repeat(MAX_ED2K_PASTE_BYTES + 1);
+        assert!(parse_ed2k_links(text).is_err());
+    }
+
+    #[test]
+    fn a_single_link_still_parses_the_same_as_the_singular_command() {
+        let one = link("a.bin", 42, 0xAA);
+        let batch = parse_ed2k_links(one.clone()).expect("batch");
+        let single = parse_ed2k_link(one).expect("single");
+        assert_eq!(batch.links.len(), 1);
+        assert_eq!(batch.links[0].hash, single.hash);
+        assert_eq!(batch.links[0].size, single.size);
+    }
 }

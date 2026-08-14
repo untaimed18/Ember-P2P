@@ -76,10 +76,34 @@ export async function buildEd2kLink(
   });
 }
 
-export async function parseEd2kLink(
-  link: string,
-): Promise<{ name: string; size: number; hash: string; aich?: string; ember?: string }> {
+export type Ed2kLinkInfo = {
+  name: string;
+  size: number;
+  hash: string;
+  aich?: string;
+  ember?: string;
+};
+
+export async function parseEd2kLink(link: string): Promise<Ed2kLinkInfo> {
   return invoke('parse_ed2k_link', { link });
+}
+
+export type Ed2kLinkBatch = {
+  links: Ed2kLinkInfo[];
+  /** Non-blank lines that were not a valid ed2k file link. */
+  invalid: number;
+  /** Non-blank lines left unread once the per-paste cap was reached. */
+  skipped: number;
+};
+
+/**
+ * Parse a pasted block of newline-separated ed2k links. Use this for anything
+ * that comes off the clipboard: `parseEd2kLink` accepts a multi-line blob and
+ * silently returns only the first link, because the later lines survive as
+ * `|`-segments its tag loop ignores.
+ */
+export async function parseEd2kLinks(text: string): Promise<Ed2kLinkBatch> {
+  return invoke('parse_ed2k_links', { text });
 }
 
 export async function findSources(fileHash: string, fileSize: number): Promise<[string, number][]> {

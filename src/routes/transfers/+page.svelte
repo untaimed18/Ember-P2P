@@ -11,7 +11,7 @@
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
-  import { findSources, parseEd2kLink, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
+  import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
@@ -1933,30 +1933,7 @@
           break;
         }
         case 'paste_link': {
-          const text = await navigator.clipboard.readText();
-          const trimmed = text.trim();
-          if (trimmed.length > MAX_PASTE_LEN) {
-            transferError = m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN });
-            break;
-          }
-          if (trimmed.toLowerCase().startsWith('ed2k://')) {
-            const info = await parseEd2kLink(trimmed);
-            const res = await startDownload(
-              info.hash,
-              info.name,
-              info.size,
-              '',
-              0,
-              undefined,
-              info.ember,
-              info.aich,
-            );
-            showInfo(res.already_queued
-              ? m.transfers_already_in_list({ name: info.name })
-              : m.transfers_queued_from_clipboard({ name: info.name }));
-          } else {
-            transferError = m.transfers_clipboard_not_ed2k();
-          }
+          await queuePastedLinks(await navigator.clipboard.readText());
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
@@ -2072,39 +2049,75 @@
   // the action is otherwise discoverable). Reads ed2k:// from the
   // clipboard and queues a download.
   //
-  // Length cap is generous (real ed2k:// links are well under 1 KiB
-  // even with an AICH root and source list) but bounded so a paste of
-  // megabytes doesn't reach the parser at all. Backend validation is
-  // still the real boundary; this is just defense-in-depth + UX.
-  const MAX_PASTE_LEN = 4096;
+  // Mirrors MAX_ED2K_PASTE_BYTES on the Rust side (256 links x 1 KiB), so a
+  // paste the backend would accept is never rejected here first. Backend
+  // validation is still the real boundary; this is defense-in-depth + UX.
+  const MAX_PASTE_LEN = 256 * 1024;
   let pasteLinkBusy = $state(false);
+
+  // Shared by the header button and the row context menu. Goes through
+  // `parseEd2kLinks` rather than `parseEd2kLink` because the singular parser
+  // accepts a multi-line blob and returns only the first link: the later lines
+  // survive as `|`-segments its tag loop skips, so pasting ten links used to
+  // queue one and report success.
+  async function queuePastedLinks(text: string) {
+    const trimmed = text.trim();
+    if (trimmed.length > MAX_PASTE_LEN) {
+      transferError = m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN });
+      return;
+    }
+    const batch = await parseEd2kLinks(trimmed);
+    if (batch.links.length === 0) {
+      transferError = m.transfers_clipboard_not_ed2k();
+      return;
+    }
+
+    let queued = 0;
+    let already = 0;
+    let failed = 0;
+    for (const info of batch.links) {
+      try {
+        const res = await startDownload(
+          info.hash,
+          info.name,
+          info.size,
+          '',
+          0,
+          undefined,
+          info.ember,
+          info.aich,
+        );
+        if (res.already_queued) already += 1;
+        else queued += 1;
+      } catch {
+        // One rejected link must not abandon the rest of the batch; it is
+        // counted alongside the unparseable lines in the summary below.
+        failed += 1;
+      }
+    }
+
+    // A single clean link keeps the by-name message it has always shown.
+    const ignored = batch.invalid + batch.skipped + failed;
+    if (batch.links.length === 1 && ignored === 0) {
+      const only = batch.links[0];
+      showInfo(already > 0
+        ? m.transfers_already_in_list({ name: only.name })
+        : m.transfers_queued_from_clipboard({ name: only.name }));
+      return;
+    }
+    showInfo(m.transfers_paste_summary({
+      total: queued + already + ignored,
+      queued,
+      already,
+      ignored,
+    }));
+  }
+
   async function handlePasteLinkFromHeader() {
     if (pasteLinkBusy) return;
     pasteLinkBusy = true;
     try {
-      const text = (await navigator.clipboard.readText()).trim();
-      if (text.length > MAX_PASTE_LEN) {
-        transferError = m.transfers_clipboard_too_long({ length: text.length, max: MAX_PASTE_LEN });
-        return;
-      }
-      if (!text.toLowerCase().startsWith('ed2k://')) {
-        transferError = m.transfers_clipboard_not_ed2k();
-        return;
-      }
-      const info = await parseEd2kLink(text);
-      const res = await startDownload(
-        info.hash,
-        info.name,
-        info.size,
-        '',
-        0,
-        undefined,
-        info.ember,
-        info.aich,
-      );
-      showInfo(res.already_queued
-        ? m.transfers_already_in_list({ name: info.name })
-        : m.transfers_queued_from_clipboard({ name: info.name }));
+      await queuePastedLinks(await navigator.clipboard.readText());
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     } finally {

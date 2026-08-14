@@ -1596,6 +1596,7 @@ pub fn run() {
             commands::search::format_ed2k_links,
             commands::search::build_ed2k_link,
             commands::search::parse_ed2k_link,
+            commands::search::parse_ed2k_links,
             commands::search::mark_spam,
             commands::search::mark_not_spam,
             commands::search::get_spam_stats,
