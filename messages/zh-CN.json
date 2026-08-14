@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "文件名",
   "transfers_col_size": "大小",
   "transfers_col_transferred": "已传输",
+  "transfers_col_transferred_upload_hint": "本次会话向该节点发送的总量。可能超过文件大小，因为哈希校验失败的节点会重新请求同一分块。",
   "transfers_col_completed": "已完成",
   "transfers_col_speed": "速度",
   "transfers_col_progress": "进度",

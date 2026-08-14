@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "Nome file",
   "transfers_col_size": "Dimensione",
   "transfers_col_transferred": "Trasferito",
+  "transfers_col_transferred_upload_hint": "Totale inviato a questo peer in questa sessione. Può superare la dimensione del file, perché un peer che fallisce un controllo hash richiede di nuovo la stessa parte.",
   "transfers_col_completed": "Completato",
   "transfers_col_speed": "Velocità",
   "transfers_col_progress": "Progresso",

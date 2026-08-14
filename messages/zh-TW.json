@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "檔名",
   "transfers_col_size": "大小",
   "transfers_col_transferred": "已傳輸",
+  "transfers_col_transferred_upload_hint": "本次工作階段向該節點傳送的總量。可能超過檔案大小，因為雜湊校驗失敗的節點會重新請求同一分塊。",
   "transfers_col_completed": "已完成",
   "transfers_col_speed": "速度",
   "transfers_col_progress": "進度",

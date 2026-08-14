@@ -1407,6 +1407,7 @@
   "transfers_col_file_name": "File Name",
   "transfers_col_size": "Size",
   "transfers_col_transferred": "Transferred",
+  "transfers_col_transferred_upload_hint": "Total sent to this peer during this session. Can exceed the file size, because a peer that fails a hash check asks for the same part again.",
   "transfers_col_completed": "Completed",
   "transfers_col_speed": "Speed",
   "transfers_col_progress": "Progress",
