@@ -121,6 +121,12 @@ export interface Transfer {
   expected_aich?: string;
   /** Optional Ember content BLAKE3 (64 hex) from `eh=` / browse / offer. */
   ember_file_hash?: string;
+  /** Downloads only: absolute path of the finished file on disk. Completion
+   *  moves the `.part` to `Downloads/<name>`, but the backend deduplicates
+   *  against an existing file by appending ` (n)` to the stem — so rebuilding
+   *  the path from `file_name` points at the wrong file after a collision.
+   *  Omitted from IPC until the download completes. */
+  completed_path?: string;
   /** Upload-direction only: hex bitmap of ED2K parts fully served to this
    *  peer during the current session (byte index = part / 8, bit = part % 8,
    *  LSB-first within each byte). Drives the chunked "Up Status" parts bar —
@@ -154,6 +160,13 @@ export interface SourceInfo {
   available_parts?: number;
   total_parts?: number;
   country_code?: string;
+  /** Stable peer identity (eD2k user hash). The backend field is a
+   *  `[u8; 16]`, which serde emits as a 16-element byte array — not the hex
+   *  string `Transfer.user_hash` carries. Absent while the identity is still
+   *  unknown. Used backend-side to coalesce the same peer appearing at both
+   *  its advertised listening port and the ephemeral port of an adopted
+   *  inbound connection. */
+  user_hash?: number[];
 }
 
 /** Media metadata for a search hit (eMule `FT_MEDIA_*` tags). */
@@ -642,7 +655,11 @@ export interface AntiLeechReplaceResult {
 
 export interface AppSettings {
   nickname: string;
-  shared_folders: string[];
+  /** Backend-owned: listed in `BACKEND_OWNED_SETTINGS_FIELDS`
+   *  (`src-tauri/src/commands/settings.rs`), so `update_settings` restores it
+   *  from the authoritative in-memory config and any value written here is
+   *  discarded. Change shared folders through the sharing commands. */
+  readonly shared_folders: string[];
   download_folder: string;
   max_upload_speed: number;
   max_download_speed: number;
@@ -699,8 +716,10 @@ export interface AppSettings {
    *  cleared. Defaults to true. */
   save_search_history: boolean;
   setup_complete: boolean;
-  /** Internal migration marker; preserve when round-tripping settings. */
-  default_shared_folder_seeded: boolean;
+  /** Internal migration marker; preserve when round-tripping settings.
+   *  Backend-owned via `BACKEND_OWNED_SETTINGS_FIELDS`
+   *  (`src-tauri/src/commands/settings.rs`) — a renderer write is discarded. */
+  readonly default_shared_folder_seeded: boolean;
   /** Monotonic optimistic-concurrency token for settings saves. */
   settings_revision: number;
   /** Require approval before granting friend-slot priority */
@@ -718,8 +737,10 @@ export interface AppSettings {
   /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
    *  Always on: the DHT bootstraps from other clients rather than a
    *  central pool, so it only works when ordinary profiles take part.
-   *  The Settings / Ember-page switches are shown but cannot turn this off. */
-  ember_native_enabled: boolean;
+   *  The Settings / Ember-page switches are shown but cannot turn this off —
+   *  which is enforced by `BACKEND_OWNED_SETTINGS_FIELDS`
+   *  (`src-tauri/src/commands/settings.rs`) restoring it on every save. */
+  readonly ember_native_enabled: boolean;
   /** Whether this node carries relay traffic for other peers. Relaying is what
    *  lets two firewalled peers reach each other, so it defaults on, but it
    *  spends this node's uplink on strangers and is therefore a choice. */

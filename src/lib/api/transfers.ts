@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { withTimeout } from '$lib/utils';
 import * as m from '$lib/paraglide/messages';
 import type {
   Transfer,
@@ -101,14 +102,19 @@ export async function getTransfers(): Promise<Transfer[]> {
 /** Snapshot of peers waiting in our upload queue (transfers/uploads pane,
  *  "Queued" tab). Polled on demand while the tab is visible. */
 export async function getUploadQueue(): Promise<UploadQueueClient[]> {
-  return invoke('get_upload_queue');
+  // Polled every 3 s while the tab is open, so it needs a deadline or a wedged
+  // backend leaves the caller's in-flight guard latched forever. Reads an
+  // in-memory queue snapshot; 8 s is generous.
+  return withTimeout(invoke<UploadQueueClient[]>('get_upload_queue'), 'get_upload_queue', 8_000);
 }
 
 /** Snapshot of every persistent SecIdent credit record (transfers/uploads
  *  pane, "Known Clients" tab). Lifetime view independent of which peers
  *  are connected right now. */
 export async function getKnownClients(): Promise<KnownClient[]> {
-  return invoke('get_known_clients');
+  // Also polled (8 s). Reads the persistent credit store, so allow more room
+  // than the queue snapshot above.
+  return withTimeout(invoke<KnownClient[]>('get_known_clients'), 'get_known_clients', 15_000);
 }
 
 export async function clearCompleted(): Promise<number> {

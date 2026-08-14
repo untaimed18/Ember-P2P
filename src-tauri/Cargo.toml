@@ -155,3 +155,10 @@ codegen-units = 1
 # killing the whole process. A single malformed network packet or corrupt
 # file should never take down a long-running P2P client.
 panic = "unwind"
+# Keep arithmetic overflow a panic in release builds, not a silent wrap.
+# Lengths, offsets and part counts are derived from attacker-controlled ed2k,
+# KAD and DHT frames and pass through hundreds of numeric casts and ceil
+# divisions; a wrapped value there becomes a bad seek or a truncated hash
+# comparison that is far harder to diagnose than a panic the unwinding above
+# already confines to the offending task.
+overflow-checks = true

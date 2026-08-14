@@ -49,7 +49,9 @@
 
     return () => {
       active = false;
-      void unlistenPromise.then((unlisten) => unlisten());
+      void unlistenPromise
+        .then((unlisten) => unlisten())
+        .catch((e) => console.error('Failed to unlisten shared-files-changed:', e));
     };
   });
 

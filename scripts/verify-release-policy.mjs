@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -209,44 +209,67 @@ export function verifyVersionAdvanced({
   return { version, latestTag: latest, checked: true };
 }
 
+/**
+ * Every workflow in the repository, newest-named last.
+ *
+ * Pinning and default permissions are properties of the whole Actions surface,
+ * not of the release workflow alone: a mutable `uses:` in a workflow that runs
+ * on pull requests hands the same supply-chain foothold to an attacker, on a
+ * machine that shares a repository with the signing job.
+ */
+function workflowFiles(root) {
+  return readdirSync(join(root, ".github", "workflows"))
+    .filter((name) => /\.ya?ml$/.test(name))
+    .sort()
+    .map((name) => ({
+      path: `.github/workflows/${name}`,
+      source: read(root, `.github/workflows/${name}`),
+    }));
+}
+
 export function verifyWorkflow({ root = scriptRoot } = {}) {
-  const workflow = read(root, ".github/workflows/release.yml");
   const errors = [];
-  const actionLines = [
-    ...workflow.matchAll(/^\s*uses:\s*([^@\s]+)@([^\s#]+)(?:\s+#\s*(.+))?$/gm),
-  ];
+  let actions = 0;
 
-  if (actionLines.length === 0) {
-    errors.push("release workflow has no actions to verify");
-  }
-  for (const [, action, ref, comment] of actionLines) {
-    if (!/^[0-9a-f]{40}$/.test(ref)) {
-      errors.push(
-        `${action} is not pinned to a full lowercase commit SHA (got ${ref})`,
-      );
+  for (const { path, source } of workflowFiles(root)) {
+    const actionLines = [
+      ...source.matchAll(/^\s*uses:\s*([^@\s]+)@([^\s#]+)(?:\s+#\s*(.+))?$/gm),
+    ];
+    if (actionLines.length === 0) {
+      errors.push(`${path} has no actions to verify`);
     }
-    if (!comment?.trim()) {
-      errors.push(
-        `${action}@${ref} is missing a human-readable version comment`,
-      );
+    actions += actionLines.length;
+    for (const [, action, ref, comment] of actionLines) {
+      if (!/^[0-9a-f]{40}$/.test(ref)) {
+        errors.push(
+          `${path}: ${action} is not pinned to a full lowercase commit SHA (got ${ref})`,
+        );
+      }
+      if (!comment?.trim()) {
+        errors.push(
+          `${path}: ${action}@${ref} is missing a human-readable version comment`,
+        );
+      }
+    }
+
+    const checkoutCount = actionLines.filter(
+      ([, action]) => action === "actions/checkout",
+    ).length;
+    const noCredentialCount = (
+      source.match(/^\s*persist-credentials:\s*false\s*$/gm) ?? []
+    ).length;
+    if (checkoutCount === 0 || noCredentialCount !== checkoutCount) {
+      errors.push(`${path}: every checkout must set persist-credentials: false`);
+    }
+
+    const jobsIndex = source.indexOf("\njobs:");
+    const topLevel = jobsIndex >= 0 ? source.slice(0, jobsIndex) : source;
+    if (!/permissions:\s*\r?\n\s{2}contents:\s*read\b/.test(topLevel)) {
+      errors.push(`${path}: top-level permissions must be contents: read`);
     }
   }
 
-  const checkoutCount = actionLines.filter(
-    ([, action]) => action === "actions/checkout",
-  ).length;
-  const noCredentialCount = (
-    workflow.match(/^\s*persist-credentials:\s*false\s*$/gm) ?? []
-  ).length;
-  if (checkoutCount === 0 || noCredentialCount !== checkoutCount) {
-    errors.push("every checkout must set persist-credentials: false");
-  }
-
-  const jobsIndex = workflow.indexOf("\njobs:");
-  const topLevel = jobsIndex >= 0 ? workflow.slice(0, jobsIndex) : workflow;
-  if (!/permissions:\s*\r?\n\s{2}contents:\s*read\b/.test(topLevel)) {
-    errors.push("top-level permissions must be contents: read");
-  }
+  const workflow = read(root, ".github/workflows/release.yml");
   for (const job of ["verify", "build", "sign-publish"]) {
     if (!new RegExp(`^  ${job}:\\s*$`, "m").test(workflow)) {
       errors.push(`missing ${job} job`);
@@ -283,7 +306,7 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
       `Release workflow policy failed:\n- ${errors.join("\n- ")}`,
     );
   }
-  return actionLines.length;
+  return actions;
 }
 
 export function verifySecurityEpoch({ root = scriptRoot } = {}) {

@@ -457,6 +457,14 @@ impl UpnpMappings {
         self.tcp_mapped || self.udp_mapped
     }
 
+    /// Whether the *TCP* mapping specifically is live. [`Self::is_mapped`]
+    /// is true when either protocol mapped, so it cannot answer "is our
+    /// listener reachable from outside", which is what decides the port we
+    /// advertise for connect-backs.
+    pub fn tcp_mapped(&self) -> bool {
+        self.tcp_mapped
+    }
+
     /// Whether a gateway is currently cached. Lets the caller distinguish
     /// "no IGD/UPnP router found (or it's unreachable)" from "gateway found
     /// but it refused the mapping" when surfacing a failure to the user —

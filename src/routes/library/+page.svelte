@@ -2276,8 +2276,30 @@
     // We only pull a final snapshot once, when the scan transitions to done.
     let scanPollFailures = 0;
     const SCAN_POLL_MAX_FAILURES = 5;
-    const scanPoll = setInterval(async () => {
-      if (!mounted || stoppedByUser) return;
+    // Guard against overlapping polls: `getScanStatus()` plus the `refresh()`
+    // a finished scan triggers can still be running when the next 3 s tick
+    // fires. Without this, two ticks run concurrently and the slower/older one
+    // can resolve last and clobber fresher state.
+    let scanPollBusy = false;
+    // Flipped by the visibilitychange handler below; the next tick consumes it
+    // so the first poll after we regain focus always runs, even though the
+    // ticks in between were skipped.
+    let scanPumpOnNextVisible = false;
+    const runScanPoll = async () => {
+      if (!mounted || stoppedByUser || scanPollBusy) return;
+      // Skip the IPC entirely while the window is hidden — the same gate the
+      // network, transfer and known-clients polls use. There is no banner to
+      // update off-screen, and the visibilitychange pump below catches us up
+      // on the way back.
+      if (
+        !scanPumpOnNextVisible &&
+        typeof document !== 'undefined' &&
+        document.visibilityState !== 'visible'
+      ) {
+        return;
+      }
+      scanPumpOnNextVisible = false;
+      scanPollBusy = true;
       try {
         const isScanning = await getScanStatus();
         if (!mounted) return;
@@ -2298,8 +2320,19 @@
           scanPollFailures = 0;
           console.warn('library: scan-status polling failed repeatedly; clearing scanning state');
         }
+      } finally {
+        scanPollBusy = false;
       }
-    }, 3000);
+    };
+    const scanPoll = setInterval(() => { void runScanPoll(); }, 3000);
+    const onScanVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      scanPumpOnNextVisible = true;
+      void runScanPoll();
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onScanVisibilityChange);
+    }
 
     const unlisteners: Array<() => void> = [];
     let destroyed = false;
@@ -2427,6 +2460,9 @@
       confirmResolver?.(false);
       confirmResolver = null;
       clearInterval(scanPoll);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onScanVisibilityChange);
+      }
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
       if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
       if (commentSaveTimer) {

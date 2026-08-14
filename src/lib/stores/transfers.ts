@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { Transfer } from '$lib/types';
 import { getTransfers } from '$lib/api/transfers';
+import { withTimeout } from '$lib/utils';
 
 interface ProgressPayload {
   id: string;
@@ -17,6 +18,12 @@ interface ProgressPayload {
   up_part_status?: string;
   up_part_count?: number;
   up_peer_part_status?: string;
+  /** `'upload'` on upload-direction events; omitted entirely for downloads
+   *  (`TransferProgressPayload::direction` is `Option<&'static str>` and is
+   *  skipped when `None`). The flush below identifies uploads from the
+   *  in-store row instead, but the field is on the wire and typing it keeps
+   *  the interface honest about what the backend actually sends. */
+  direction?: 'upload';
 }
 
 const STATUS_PRIORITY: Record<string, number> = {
@@ -809,9 +816,13 @@ export async function initTransferStore() {
         }
         return snapCompletedDownload(apiItem);
       });
+      // One id `Set` built up front rather than a linear `merged.some(...)`
+      // per row, mirroring the poll merge below.
+      const mergedIds = new Set(merged.map((t) => t.id));
       for (const t of current) {
-        if (!merged.some((m) => m.id === t.id)) {
+        if (!mergedIds.has(t.id)) {
           merged.push(t);
+          mergedIds.add(t.id);
         }
       }
       return merged;
@@ -856,6 +867,24 @@ function snapCompletedDownload(t: Transfer): Transfer {
  */
 const missingFromApiSince = new Map<string, number>();
 const ZOMBIE_GRACE_MS = 12_000;
+
+/**
+ * Drop every per-id bookkeeping entry for a transfer that has left the store.
+ * Several of these maps are only ever pruned from inside a loop over the rows
+ * still present, so a row removed by the UI (cancel, remove-from-list, clear
+ * completed) left its entries stranded until shutdown.
+ *
+ * The `recentlyRemoved*` tombstones are deliberately NOT cleared here: they
+ * exist precisely to outlive the row, so an already-in-flight poll can't
+ * resurrect it. They expire on their own TTL.
+ */
+export function forgetTransfer(id: string) {
+  pendingProgress.delete(id);
+  reversibleStateEnteredAt.delete(id);
+  reversibleStateLeftAt.delete(id);
+  sourceCountsUpdatedAt.delete(id);
+  missingFromApiSince.delete(id);
+}
 
 export function cleanupTransferStore() {
   storeEpoch++;
@@ -975,14 +1004,11 @@ export function startTransferPoll() {
     // transition landed (see `reversibleStateEnteredAt`), not just whether
     // the poll resolved before or after — it always resolves after.
     const pollStartedAt = Date.now();
-    let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const all = await Promise.race([
-        getTransfers(),
-        new Promise<never>((_, reject) => {
-          pollTimeout = setTimeout(() => reject('timeout'), 4000);
-        }),
-      ]);
+      // The deadline lives here rather than in the API wrapper: at a 3 s
+      // cadence a snapshot older than one tick has nothing left to reconcile,
+      // which is far tighter than would be right for a one-off caller.
+      const all = await withTimeout(getTransfers(), 'get_transfers', 4000);
       if (epoch !== storeEpoch) return;
       transfers.update((current) => {
         const now = Date.now();
@@ -1092,9 +1118,14 @@ export function startTransferPoll() {
           // event-only row whose transfer the backend dropped would linger
           // forever as a stuck "active" zombie.
           const firstMissing = missingFromApiSince.get(t.id) ?? now;
-          missingFromApiSince.set(t.id, firstMissing);
           if (now - firstMissing <= ZOMBIE_GRACE_MS) {
+            missingFromApiSince.set(t.id, firstMissing);
             merged.push(t);
+          } else {
+            // Dropping the row for good. This is the last pass that can see
+            // the id — it won't be in `current` next poll — so the timer has
+            // to go here or it survives until `cleanupTransferStore`.
+            forgetTransfer(t.id);
           }
         }
         return merged;
@@ -1102,8 +1133,6 @@ export function startTransferPoll() {
     } catch {
       // Ignore timeouts and errors
     } finally {
-      // Clear the race watchdog so the loser timer doesn't linger.
-      if (pollTimeout) clearTimeout(pollTimeout);
       busy = false;
     }
   };

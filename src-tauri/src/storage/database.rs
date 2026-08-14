@@ -5,7 +5,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::storage::paths;
@@ -1293,6 +1293,23 @@ impl Database {
         };
         if !valid_ident(table) || !valid_ident(column) || !valid_col_type(col_type) {
             anyhow::bail!("Invalid SQL identifier in migration: {table}.{column} {col_type}");
+        }
+        // The base tables are only created by the `version < 1` arm, so a
+        // database opened at a later version can legitimately be missing one
+        // (a pre-v1 install that never held a transfer, or a partial restore).
+        // Adding a column to a table that is not there must not abort the whole
+        // migration chain and with it every future open — the table, when it is
+        // eventually created, is created with the modern column set anyway.
+        let has_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                params![table],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_table {
+            debug!("Skipping column {table}.{column}: table does not exist");
+            return Ok(());
         }
         let has_column = conn
             .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))

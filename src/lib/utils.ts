@@ -185,14 +185,6 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   return `${timeStr} (${remainStr})`;
 }
 
-/**
- * Format a speed for the settings page where 0 means "Unlimited".
- */
-export function formatSpeedSetting(bytesPerSec: number): string {
-  if (bytesPerSec === 0) return 'Unlimited';
-  return formatSpeed(bytesPerSec);
-}
-
 /** Format a percentage with smart decimal handling. */
 export function formatPercent(value: number, decimals = 1): string {
   if (!Number.isFinite(value) || value <= 0) return '0%';
@@ -209,6 +201,33 @@ export function truncateHash(hash: string, len = 16): string {
 /** Pluralize a noun based on count. */
 export function pluralize(count: number, singular: string, plural?: string): string {
   return count === 1 ? `${count} ${singular}` : `${count} ${plural || singular + 's'}`;
+}
+
+/**
+ * Race a promise (in practice a Tauri `invoke()`) against a deadline.
+ *
+ * K24: without this the UI hangs indefinitely when the backend is wedged —
+ * blocked on a slow DNS resolution, a stuck oneshot receiver — and a poll's
+ * in-flight guard stays latched for the rest of the session. Rejects with a
+ * normal `Error` carrying a recognisable message so callers can show a
+ * "timed out, please try again" toast instead of a spinner that never
+ * resolves.
+ *
+ * Only for calls whose expected duration is short and bounded. Anything
+ * legitimately long-running — library scans, file hashing, native file
+ * dialogs waiting on the user — must not be wrapped: a deadline there
+ * reports failure for an operation that is still succeeding.
+ */
+export function withTimeout<T>(promise: Promise<T>, label: string, ms = 20_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+    }, ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
 /** Copy text to clipboard with a DOM fallback for WebView2 / denied permissions. */

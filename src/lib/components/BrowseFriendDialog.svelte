@@ -92,7 +92,9 @@
     }
     return () => {
       if (expectedRequestId && friendHash) {
-        void cancelBrowseFriend(friendHash, expectedRequestId);
+        void cancelBrowseFriend(friendHash, expectedRequestId).catch((e) =>
+          console.error('Failed to cancel friend browse:', e),
+        );
       }
       listenerGen++;
       currentBrowseGen = 0;
@@ -230,7 +232,9 @@
         if (currentBrowseGen === myGen && expectedRequestId === myRequestId && loading) {
           loading = false;
           error = m.browse_request_timed_out();
-          void cancelBrowseFriend(hash, myRequestId);
+          void cancelBrowseFriend(hash, myRequestId).catch((e) =>
+            console.error('Failed to cancel friend browse:', e),
+          );
           currentBrowseGen = 0;
         }
       }, 30_000);

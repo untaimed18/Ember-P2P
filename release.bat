@@ -2,8 +2,6 @@
 setlocal
 
 :: ── Configuration ──────────────────────────────────────────────
-set "GITHUB_OWNER=untaimed18"
-set "GITHUB_REPO=Ember-KAD"
 set "BUNDLE_DIR=%~dp0src-tauri\target\release\bundle\nsis"
 set "MSI_DIR=%~dp0src-tauri\target\release\bundle\msi"
 set "OUT_DIR=%~dp0release-out"
@@ -68,8 +66,21 @@ echo   Artifacts:
 for %%f in ("%NSIS_EXE%") do echo     - %%~nxf
 if not "%MSI_FILE%"=="" for %%f in ("%MSI_FILE%") do echo     - %%~nxf
 echo.
-echo   Upload to GitHub Release "v%VERSION%"
-echo   Tag the release as: v%VERSION%
+echo   These are for local testing only. Do NOT upload them to a GitHub
+echo   Release: a manual upload has no signed latest.json carrying the
+echo   security_epoch and per-platform target/sha256/size the updater
+echo   requires, so every installed client's update check would fail.
+echo.
+echo   To publish, push the version tag and let the workflow sign it. The
+echo   version must already be bumped with "npm run bump-version -- X.Y.Z"
+echo   and committed, then:
+echo     git tag v%VERSION% ^&^& git push origin main --tags
+echo.
+echo   .github\workflows\release.yml then verifies release policy, builds
+echo   and signs the installers, hardens latest.json via
+echo   scripts\harden-update-manifest.mjs, signs that too, and leaves a
+echo   DRAFT release. Review it and press Publish to hand the update to
+echo   installed clients.
 echo ============================================================
 echo.
 

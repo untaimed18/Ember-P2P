@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -1201,9 +1201,12 @@ impl MultiSourceDownload {
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let file_size = self.file_size;
         let load_path = part_path.clone();
-        let mut pt = tokio::task::spawn_blocking(move || PartTracker::new(file_size, &load_path))
-            .await
-            .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
+        let expected_file_hash = self.file_hash;
+        let mut pt = tokio::task::spawn_blocking(move || {
+            PartTracker::new_with_identity(file_size, &load_path, expected_file_hash)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         pt.set_file_hash(self.file_hash);
         pt.set_file_name(&self.file_name);
         let tracker = Arc::new(RwLock::new(pt));
@@ -1440,7 +1443,34 @@ impl MultiSourceDownload {
 
         // Seed live verification from resumed .part.met metadata; a peer may
         // refresh this later, but resume must not wait for another hashset.
-        let resumed_part_hashes = tracker.read().await.part_hashes().to_vec();
+        //
+        // The resumed set gets the same `verify_hashset` treatment as anything
+        // a peer hands us: it is authoritative for every per-part MD4 from here
+        // on, the hashset request below is skipped while it is non-empty, and
+        // `install_verified_part_hashes` refuses to replace a non-empty set —
+        // so a corrupt sidecar hashset would otherwise pin the download into a
+        // permanent verify-fail / re-download loop with no way to recover.
+        let resumed_part_hashes = {
+            let resumed = tracker.read().await.part_hashes().to_vec();
+            if resumed.is_empty()
+                || super::transfer::verify_hashset(&self.file_hash, &resumed, self.file_size)
+            {
+                resumed
+            } else {
+                warn!(
+                    "Resumed .part.met hashset for {} failed verification against {} — discarding it and re-fetching from a peer",
+                    self.file_name,
+                    hex::encode(self.file_hash),
+                );
+                let snap = {
+                    let mut t = tracker.write().await;
+                    t.clear_part_hashes_and_verified();
+                    t.snapshot_for_save()
+                };
+                spawn_save_snapshot(snap).await;
+                Vec::new()
+            }
+        };
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
         // Seed from EPX/cache when available; otherwise first verified
         // HashSet2 peer to provide a master wins (see HashSet2 handler).
@@ -3478,6 +3508,12 @@ impl MultiSourceDownload {
                 .sync_data()
                 .await
                 .context("pre-finalize fsync failed")?;
+            // Close our writer handle before the hard-link/copy and the `.part`
+            // delete further down: on Windows a handle that is still open is
+            // exactly what leaves an orphaned `.part` behind (see
+            // `remove_completed_part_best_effort`). Mirrors the single-source
+            // `drop(output)` in transfer.rs.
+            drop(shared_part_file);
 
             // Always re-read the `.part` file before finalizing. eMule's
             // completion path trusts verified parts, but our process can be
@@ -3490,6 +3526,21 @@ impl MultiSourceDownload {
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
             let mut ember_pin_failed = false;
+            // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop
+            // during "Verifying" would otherwise leave a thread reading a
+            // multi-GB file for minutes. `TransferControl` does not expose its
+            // inner atomic, so mirror it onto a flag the hashers poll between
+            // reads (same shape as the archive-recovery job).
+            let verify_cancel = Arc::new(AtomicBool::new(self.control.is_cancelled()));
+            let cancel_watch = {
+                let flag = verify_cancel.clone();
+                let control = self.control.clone();
+                tokio::spawn(async move {
+                    control.wait_cancelled().await;
+                    flag.store(true, Ordering::Release);
+                })
+            };
+            let job_cancel = verify_cancel.clone();
             let verified_result = match tokio::task::spawn_blocking(move || {
                 use std::io::{Read, Seek, SeekFrom};
                 let allowed = vec![verify_root.to_string_lossy().into_owned()];
@@ -3499,8 +3550,12 @@ impl MultiSourceDownload {
                     false,
                 )?;
                 let identity = crate::security::filesystem::opened_file_identity(&file)?;
-                let hash = super::hash::ed2k_hash_open_file(&mut file)?;
+                let hash =
+                    super::hash::ed2k_hash_open_file_cancellable(&mut file, job_cancel.as_ref())?;
                 let aich = if expected_aich.is_some() {
+                    if job_cancel.load(Ordering::Relaxed) {
+                        anyhow::bail!("cancelled");
+                    }
                     Some(
                         super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?
                             .root_hash,
@@ -3513,6 +3568,9 @@ impl MultiSourceDownload {
                     let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
                     let mut buf = vec![0u8; 1024 * 1024];
                     loop {
+                        if job_cancel.load(Ordering::Relaxed) {
+                            anyhow::bail!("cancelled");
+                        }
                         let n = file.read(&mut buf)?;
                         if n == 0 {
                             break;
@@ -3570,6 +3628,18 @@ impl MultiSourceDownload {
                     None
                 }
             };
+            cancel_watch.abort();
+
+            // A Stop aborts the verification read part-way through the file.
+            // That is not evidence of corruption, so leave the gap list and the
+            // `.part` alone instead of falling into the failure path below,
+            // which re-opens parts for re-download.
+            if verified_result.is_none() && self.control.is_cancelled() {
+                if let Some(ref registry) = self.tracker_registry {
+                    registry.lock().remove(&self.transfer_id);
+                }
+                anyhow::bail!("cancelled by user");
+            }
 
             if ember_pin_failed {
                 let _ = event_tx
@@ -5180,7 +5250,11 @@ async fn download_parts_from_source(
     let single_part = part_count <= 1;
     let completed_bitmap = if peer_extended_requests_ver > 0 {
         let t = tracker.read().await;
-        let completed = t.completed_parts();
+        // Advertise only parts we will actually serve (complete AND
+        // MD4-verified). Using bare `completed_parts()` here advertised
+        // unverified parts that the serve gate then rejected, freezing the
+        // peer's download on a part it kept re-requesting.
+        let completed = t.serveable_parts();
         let bitmap_len = (wire_part_count + 7) / 8;
         let mut bitmap = vec![0u8; bitmap_len];
         for (i, &done) in completed.iter().enumerate() {

@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { DegradedReason, NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
+import { withTimeout } from '$lib/utils';
 import { getSettings, updateSettings } from '$lib/api/settings';
 import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
@@ -500,14 +501,11 @@ export function startStatsPoll() {
     statsPumpOnNextVisible = false;
     statsPollInFlight = true;
     const epoch = storeEpoch;
-    let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const stats = await Promise.race([
-        getNetworkStats(),
-        new Promise<never>((_, reject) => {
-          pollTimeout = setTimeout(() => reject('timeout'), 4000);
-        }),
-      ]);
+      // The deadline lives here rather than in the API wrapper: at a 3 s
+      // cadence a response older than one tick has nothing left to tell us,
+      // which is far tighter than would be right for a one-off caller.
+      const stats = await withTimeout(getNetworkStats(), 'get_network_stats', 4000);
       if (epoch !== storeEpoch) return;
       lastPollOkAt = Date.now();
       lastNetworkUpdate = lastPollOkAt;
@@ -529,8 +527,6 @@ export function startStatsPoll() {
         networkStats.update((current) => withDerivedNetworkState(current));
       }
     } finally {
-      // Clear the race watchdog so the loser timer doesn't linger.
-      if (pollTimeout) clearTimeout(pollTimeout);
       statsPollInFlight = false;
     }
   }, 3000);

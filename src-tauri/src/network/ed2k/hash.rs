@@ -46,7 +46,10 @@ pub fn ed2k_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<String> {
     ed2k_hash_open_file_cancellable(file, &NEVER)
 }
 
-fn ed2k_hash_open_file_cancellable(
+/// Cancellable form of [`ed2k_hash_open_file`]. Download verification runs on
+/// `spawn_blocking`, which cannot be aborted, so the whole-file read has to
+/// poll a flag the async side can set on Stop.
+pub fn ed2k_hash_open_file_cancellable(
     file: &mut std::fs::File,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<String> {
@@ -349,11 +352,6 @@ fn percent_encode_ed2k(name: &str) -> String {
     out
 }
 
-/// Format an ed2k link: ed2k://|file|name|size|hash|/
-pub fn format_ed2k_link(name: &str, size: u64, hash: &str) -> String {
-    format_ed2k_link_ext(name, size, hash, None, None, &[])
-}
-
 /// Format an ed2k link with optional AICH root hash, Ember BLAKE3 digest, and
 /// source endpoints, matching eMule's link variants plus an Ember extension:
 ///   ed2k://|file|name|size|hash|h=<base32 AICH>|eh=<hex BLAKE3>|sources,ip:port,...|/
@@ -598,7 +596,7 @@ mod link_tests {
 
     #[test]
     fn plain_link_unchanged() {
-        let link = format_ed2k_link("movie.avi", 1234, HASH);
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, None, &[]);
         assert_eq!(
             link,
             "ed2k://|file|movie.avi|1234|0123456789ABCDEF0123456789ABCDEF|/"

@@ -63,6 +63,14 @@
     flex-direction: column;
     gap: 8px;
     max-width: 400px;
+    /* Hard stop against a burst (or a few very long backend error strings)
+       growing the stack past the bottom of the window, where the oldest
+       toasts would be unreachable. The container is `pointer-events: none`
+       so it never blocks the app behind it; the toasts opt back in, which is
+       also what lets a wheel over one scroll this list. */
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     pointer-events: none;
   }
   .toast {

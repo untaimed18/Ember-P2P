@@ -223,6 +223,17 @@ async fn create_collection_internal(
         files,
     };
     let path = std::path::PathBuf::from(&output_path);
+    // Reject traversal on the *requested* path: `canonicalize` resolves `..`
+    // away, so the same test on its output can never fire.
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(coded(
+            "collections_output_path_no_parent_dir",
+            "Output path must not contain '..' components",
+        ));
+    }
 
     // `canonicalize` hits the filesystem and can block (network drives, AV,
     // cloud-backed paths). This command is async, so run it on the blocking
@@ -247,16 +258,6 @@ async fn create_collection_internal(
         .map_err(|e| coded_ctx("collections_canonicalize_task", "Path resolution failed", e))?
         .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))?
     };
-
-    if canonical
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(coded(
-            "collections_output_path_no_parent_dir",
-            "Output path must not contain '..' components",
-        ));
-    }
 
     let mut scoped_dirs: Option<Vec<String>> = None;
     if enforce_output_scope {
@@ -385,6 +386,11 @@ pub async fn create_collection(
     create_collection_internal(&state, name, author, files, output_path, binary, true).await
 }
 
+/// Native save-dialog path for Library exports. Picking the destination in the
+/// OS dialog *is* the user's authorization, so the shared/download-root policy
+/// the raw IPC command above enforces does not apply — mirrors
+/// `pick_and_load_collection`. Restricting it here only broke exports to the
+/// desktop or documents folder.
 #[tauri::command]
 pub async fn create_collection_with_dialog(
     app: tauri::AppHandle,
@@ -427,7 +433,7 @@ pub async fn create_collection_with_dialog(
         files,
         selected.to_string_lossy().into_owned(),
         binary,
-        true,
+        false,
     )
     .await
     .map(Some)

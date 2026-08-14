@@ -9,6 +9,11 @@ pub struct LocalIndex {
     /// only in case resolve to the same index entry.
     path_map: HashMap<String, usize>,
     hash_map: HashMap<String, Vec<usize>>,
+    /// Keyed by `FileInfo::id`. Buckets rather than a single index because ids
+    /// are only unique while a row is a placeholder (those embed the path): a
+    /// completed row is keyed by its content hash, so two copies of the same
+    /// file share one id exactly as they share one `hash_map` key.
+    id_map: HashMap<String, Vec<usize>>,
     name_tokens: HashMap<String, Vec<usize>>,
 }
 
@@ -76,6 +81,7 @@ impl LocalIndex {
             files: Vec::new(),
             path_map: HashMap::new(),
             hash_map: HashMap::new(),
+            id_map: HashMap::new(),
             name_tokens: HashMap::new(),
         }
     }
@@ -258,7 +264,7 @@ impl LocalIndex {
         pending_id: &str,
         mut completed: FileInfo,
     ) -> Option<FileInfo> {
-        let pos = self.files.iter().position(|file| file.id == pending_id)?;
+        let pos = self.position_by_id(pending_id)?;
         let pending = self.swap_remove_indexed(pos);
         completed.shared = pending.shared;
         completed.priority = pending.priority;
@@ -334,11 +340,22 @@ impl LocalIndex {
     /// what it missed was an optional digest top-up, so dropping it would
     /// unshare a healthy file because an antivirus scanner held it for a moment.
     ///
-    /// Only `id` changes on the kept path, and no index is keyed on `id`.
+    /// Only `id` changes on the kept path, so `id_map` is the one index that
+    /// needs repointing.
     pub fn abandon_hash_placeholder(&mut self, temp_id: &str) -> Option<FileInfo> {
-        let pos = self.files.iter().position(|f| f.id == temp_id)?;
+        let pos = self.position_by_id(temp_id)?;
         if temp_id.starts_with(REHASH_ID_PREFIX) && !self.files[pos].hash.is_empty() {
-            self.files[pos].id = self.files[pos].hash.clone();
+            let content_id = self.files[pos].hash.clone();
+            self.files[pos].id = content_id.clone();
+            // The row keeps its slot, so only the id key moves; every other
+            // map still points at `pos`.
+            if let Some(v) = self.id_map.get_mut(temp_id) {
+                v.retain(|&i| i != pos);
+                if v.is_empty() {
+                    self.id_map.remove(temp_id);
+                }
+            }
+            self.id_map.entry(content_id).or_default().push(pos);
             return None;
         }
         Some(self.swap_remove_indexed(pos))
@@ -370,8 +387,26 @@ impl LocalIndex {
     /// Uses swap_remove + targeted index patching so cost is O(k) in the
     /// removed file's token count, not O(n) per call.
     pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {
-        let pos = self.files.iter().position(|f| f.id == id)?;
+        let pos = self.position_by_id(id)?;
         Some(self.swap_remove_indexed(pos))
+    }
+
+    /// Lowest index of a row carrying `id`, matching the semantics of the
+    /// `files.iter().position(...)` scan this replaces.
+    ///
+    /// The scan ran once per completed file with the index write lock held and
+    /// compared `String` ids, so a full-library hash pass was O(n²) string
+    /// comparisons with every reader (upload hash resolution, the UI's shared
+    /// file queries) blocked behind it. Bucket entries are re-checked against
+    /// `files` so a drifted map can only fail to find a row, never resolve one
+    /// caller's completion onto an unrelated file.
+    fn position_by_id(&self, id: &str) -> Option<usize> {
+        self.id_map
+            .get(id)?
+            .iter()
+            .copied()
+            .filter(|&idx| self.files.get(idx).is_some_and(|file| file.id == id))
+            .min()
     }
 
     pub fn remove_file_by_path(&mut self, path: &str) -> Option<FileInfo> {
@@ -388,6 +423,7 @@ impl LocalIndex {
             Some((
                 self.files[last_idx].path.clone(),
                 self.files[last_idx].hash.clone(),
+                self.files[last_idx].id.clone(),
                 tokenize(&self.files[last_idx].name.to_lowercase()),
             ))
         } else {
@@ -405,6 +441,14 @@ impl LocalIndex {
                 }
             }
         }
+        if !removed.id.is_empty() {
+            if let Some(v) = self.id_map.get_mut(&removed.id) {
+                v.retain(|&i| i != pos && i != last_idx);
+                if v.is_empty() {
+                    self.id_map.remove(&removed.id);
+                }
+            }
+        }
         for token in tokenize(&removed.name.to_lowercase()) {
             if let Some(v) = self.name_tokens.get_mut(&token) {
                 v.retain(|&i| i != pos && i != last_idx);
@@ -414,7 +458,7 @@ impl LocalIndex {
             }
         }
 
-        if let Some((moved_path, moved_hash, moved_tokens)) = moved_key {
+        if let Some((moved_path, moved_hash, moved_id, moved_tokens)) = moved_key {
             // The moved element previously lived at `last_idx`; repoint all of
             // its index entries to `pos`. The removed-file cleanup above only
             // stripped the *removed* file's hash/tokens (which usually differ
@@ -426,6 +470,11 @@ impl LocalIndex {
             self.path_map.insert(normalize_path_key(&moved_path), pos);
             if !moved_hash.is_empty() {
                 let v = self.hash_map.entry(moved_hash).or_default();
+                v.retain(|&i| i != last_idx && i != pos);
+                v.push(pos);
+            }
+            if !moved_id.is_empty() {
+                let v = self.id_map.entry(moved_id).or_default();
                 v.retain(|&i| i != last_idx && i != pos);
                 v.push(pos);
             }
@@ -866,6 +915,14 @@ impl LocalIndex {
                 }
             }
         }
+        if !file.id.is_empty() {
+            if let Some(v) = self.id_map.get_mut(&file.id) {
+                v.retain(|&i| i != pos);
+                if v.is_empty() {
+                    self.id_map.remove(&file.id);
+                }
+            }
+        }
         for token in tokenize(&file.name.to_lowercase()) {
             if let Some(v) = self.name_tokens.get_mut(&token) {
                 v.retain(|&i| i != pos);
@@ -879,17 +936,21 @@ impl LocalIndex {
     /// Add the map contributions for the file at `pos` (derived from
     /// `self.files[pos]`).
     fn add_index_entries(&mut self, pos: usize) {
-        let (path_key, hash, name_lower) = {
+        let (path_key, hash, id, name_lower) = {
             let file = &self.files[pos];
             (
                 normalize_path_key(&file.path),
                 file.hash.clone(),
+                file.id.clone(),
                 file.name.to_lowercase(),
             )
         };
         self.path_map.insert(path_key, pos);
         if !hash.is_empty() {
             self.hash_map.entry(hash).or_default().push(pos);
+        }
+        if !id.is_empty() {
+            self.id_map.entry(id).or_default().push(pos);
         }
         for token in tokenize(&name_lower) {
             self.name_tokens.entry(token).or_default().push(pos);
@@ -944,6 +1005,7 @@ impl LocalIndex {
     fn rebuild_indices(&mut self) {
         self.path_map.clear();
         self.hash_map.clear();
+        self.id_map.clear();
         self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {
             self.path_map.insert(normalize_path_key(&file.path), idx);
@@ -952,6 +1014,9 @@ impl LocalIndex {
                     .entry(file.hash.clone())
                     .or_default()
                     .push(idx);
+            }
+            if !file.id.is_empty() {
+                self.id_map.entry(file.id.clone()).or_default().push(idx);
             }
             let name_lower = file.name.to_lowercase();
             for token in tokenize(&name_lower) {
@@ -1371,6 +1436,71 @@ mod local_index_tests {
         assert_eq!(
             index.get_by_hash(&"b".repeat(32)).unwrap().path,
             "A/third.bin"
+        );
+    }
+
+    /// Every stored id must resolve to exactly what the linear scan
+    /// `position_by_id` replaced would have found.
+    fn assert_id_map_matches_scan(index: &LocalIndex) {
+        for (idx, stored) in index.all_files().iter().enumerate() {
+            assert!(!stored.id.is_empty(), "test rows must carry an id");
+            assert_eq!(
+                index.position_by_id(&stored.id),
+                index
+                    .all_files()
+                    .iter()
+                    .position(|candidate| candidate.id == stored.id),
+                "id_map disagrees with a linear scan at {idx} ({})",
+                stored.id
+            );
+        }
+    }
+
+    /// Hash completion resolves its row through `id_map` instead of scanning
+    /// every row, so the map has to survive the swap_remove + push that each
+    /// completion performs. A drifted map is worse than the scan it replaced:
+    /// the completion would be silently lost, or land on another file's row.
+    #[test]
+    fn id_lookup_tracks_inserts_removals_and_finalizations() {
+        let mut index = LocalIndex::new();
+        let mut pending_one = file("A/one.bin", "", true, "normal");
+        pending_one.id = "pending:A/one.bin".to_string();
+        let mut pending_two = file("A/two.bin", "", true, "normal");
+        pending_two.id = "pending:A/two.bin".to_string();
+        index.add_files(vec![
+            file("A/kept.bin", &"a".repeat(32), true, "normal"),
+            pending_one,
+            pending_two,
+        ]);
+        assert_id_map_matches_scan(&index);
+
+        // Completing a row that is not last swap_removes it, moving the final
+        // row into its slot — both ids have to be repointed.
+        index
+            .finalize_pending_hash(
+                "pending:A/one.bin",
+                file("A/one.bin", &"b".repeat(32), true, "normal"),
+            )
+            .expect("the pending row is still there");
+        assert_id_map_matches_scan(&index);
+
+        assert!(index.remove_file_by_id(&"a".repeat(32)).is_some());
+        assert_id_map_matches_scan(&index);
+
+        index
+            .finalize_pending_hash(
+                "pending:A/two.bin",
+                file("A/two.bin", &"c".repeat(32), true, "normal"),
+            )
+            .expect("the second pending row outlives the removal");
+        assert_id_map_matches_scan(&index);
+
+        assert_eq!(index.file_count(), 2);
+        assert_eq!(index.get_by_path("A/one.bin").unwrap().hash, "b".repeat(32));
+        assert_eq!(index.get_by_path("A/two.bin").unwrap().hash, "c".repeat(32));
+        assert!(
+            index.remove_file_by_id("pending:A/one.bin").is_none(),
+            "a consumed placeholder id must not resolve to anything"
         );
     }
 

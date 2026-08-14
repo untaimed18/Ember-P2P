@@ -80,13 +80,28 @@ const MAX_DECOMPRESSED_SIZE: usize = 512 * 1024;
 /// to `store::MAX_RETAINED_BYTES_PER_ENTRY` (64 KiB), whose accounting
 /// charges at least one byte per byte the wire form carries plus more
 /// per-tag overhead than the wire spends. So such a packet's body cannot
-/// exceed 64 KiB plus the 34-byte `SEARCH_RES` header. eMule's own worst
-/// case is far smaller (`CIndexed::SendValidKeywordResult` builds into a
-/// fixed `byte byPacket[1024 * 5]`). 96 KiB clears our 64 KiB bound with
-/// room for future per-entry accounting changes while still cutting the
-/// worst-case expansion of a minimum-size datagram to a fifth of the old
-/// flat 512 KiB ceiling.
-const MIN_PACKED_EXPANSION: usize = 96 * 1024;
+/// exceed 64 KiB plus the 34-byte `SEARCH_RES` header, the entry id and one
+/// type/length prefix per tag — under 300 bytes at `MAX_STORED_TAGS`. eMule's
+/// own worst case is far smaller (`CIndexed::SendValidKeywordResult` builds
+/// into a fixed `byte byPacket[1024 * 5]`).
+///
+/// The slack over that entry is 4 KiB rather than the 32 KiB it used to
+/// carry. This floor *is* the amplification budget of a minimum-size
+/// datagram — an attacker pays ~120 wire bytes for whatever it allows — so
+/// headroom kept here for hypothetical future accounting changes is paid for
+/// in decompression work per hostile packet.
+const MIN_PACKED_EXPANSION: usize = 64 * 1024 + 4 * 1024;
+
+/// Ceiling on expansion relative to the bytes the datagram actually paid for,
+/// applied on top of the floor above.
+///
+/// DEFLATE cannot exceed 1032:1 (a 258-byte match encoded in as little as two
+/// bits), so this can never reject a stream a conforming encoder produced,
+/// while it does stop the very smallest datagrams — the ones a flood is built
+/// from — claiming the whole `MIN_PACKED_EXPANSION` floor. A genuinely small
+/// multiple is not available here: our own keyword results are long runs of a
+/// single character and legitimately compress several hundred to one.
+const MAX_PACKED_RATIO: usize = 1032;
 
 #[derive(Debug, Clone)]
 pub enum KadMessage {
@@ -298,6 +313,7 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                 .saturating_mul(10)
                 .saturating_add(300)
                 .max(MIN_PACKED_EXPANSION)
+                .min(compressed.len().saturating_mul(MAX_PACKED_RATIO))
                 .min(MAX_DECOMPRESSED_SIZE);
             // Tracked separately from the error kind: the raw-deflate retry
             // below triggers on `InvalidData`, so reporting an over-size

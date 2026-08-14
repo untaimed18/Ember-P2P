@@ -78,37 +78,47 @@ impl DeadSourceList {
         }
     }
 
-    /// Drop the soonest-to-expire entries until `self.sources` is under
-    /// `MAX_GLOBAL_DEAD_ENTRIES`. Used when cleanup alone can't keep up
-    /// (e.g. steady churn of new dead sources before any prior ones expire).
-    fn evict_global_overflow(&mut self) {
-        while self.sources.len() > MAX_GLOBAL_DEAD_ENTRIES {
-            if let Some((oldest_key, _)) = self
-                .sources
-                .iter()
-                .min_by_key(|(_, expiry)| **expiry)
-                .map(|(k, v)| (k.clone(), *v))
-            {
-                self.sources.remove(&oldest_key);
-            } else {
-                break;
-            }
+    /// Drop the soonest-to-expire entries until `map` is back under
+    /// `max_entries`. Used when cleanup alone can't keep up (e.g. steady churn
+    /// of new dead sources before any prior ones expire).
+    ///
+    /// Evicting a single entry per call meant a full `min_by_key` scan of a
+    /// 20,000-entry map on every `add_dead_source*` once at the cap. Dropping a
+    /// batch instead (the oldest ~10% of the cap, and never fewer than the
+    /// current overflow) amortizes that scan over the thousands of inserts that
+    /// follow while still guaranteeing the documented maximum is never exceeded.
+    fn evict_overflow<K: Eq + std::hash::Hash>(map: &mut HashMap<K, i64>, max_entries: usize) {
+        if map.len() <= max_entries {
+            return;
         }
+        let overflow = map.len() - max_entries;
+        let batch = overflow.max(max_entries / 10);
+        let mut expiries: Vec<i64> = map.values().copied().collect();
+        // `batch` is at least 1 (overflow > 0) and at most `map.len()`, so the
+        // index is in range. Everything below the cutoff goes; expiries are
+        // second-granularity, so ties at the cutoff are common and only as many
+        // of them as needed are dropped.
+        let cutoff = *expiries.select_nth_unstable(batch - 1).1;
+        let below_cutoff = expiries.iter().filter(|&&expiry| expiry < cutoff).count();
+        let mut ties_to_drop = batch.saturating_sub(below_cutoff);
+        map.retain(|_, expiry| {
+            if *expiry < cutoff {
+                false
+            } else if *expiry == cutoff && ties_to_drop > 0 {
+                ties_to_drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn evict_global_overflow(&mut self) {
+        Self::evict_overflow(&mut self.sources, MAX_GLOBAL_DEAD_ENTRIES);
     }
 
     fn evict_per_file_overflow(&mut self) {
-        while self.per_file.len() > MAX_PER_FILE_DEAD_ENTRIES {
-            if let Some((oldest_key, _)) = self
-                .per_file
-                .iter()
-                .min_by_key(|(_, expiry)| **expiry)
-                .map(|(k, v)| (k.clone(), *v))
-            {
-                self.per_file.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
+        Self::evict_overflow(&mut self.per_file, MAX_PER_FILE_DEAD_ENTRIES);
     }
 
     /// Add a source to the global dead list.
@@ -296,6 +306,23 @@ mod tests {
             d.add_dead_source(0, i, 4662, false);
         }
         assert!(d.sources.len() <= MAX_GLOBAL_DEAD_ENTRIES);
+    }
+
+    /// D14: overflow eviction drops the soonest-to-expire entries as one batch
+    /// (not one entry per full scan) and never leaves the map above the cap.
+    #[test]
+    fn overflow_eviction_drops_oldest_batch() {
+        let cap = 1_000usize;
+        let mut map: HashMap<u32, i64> = HashMap::new();
+        for i in 0..=(cap as u32) {
+            map.insert(i, 10_000 + i as i64);
+        }
+        DeadSourceList::evict_overflow(&mut map, cap);
+        assert_eq!(map.len(), cap + 1 - cap / 10);
+        assert!(
+            map.keys().all(|&key| key >= (cap / 10) as u32),
+            "surviving entries must be the latest-expiring ones"
+        );
     }
 
     /// L6 / D14: per-file map also caps.

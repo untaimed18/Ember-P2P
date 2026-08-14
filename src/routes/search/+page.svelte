@@ -10,9 +10,9 @@
   import { appSettings } from '$lib/stores/settings';
   import {
     activeSearchTabId,
+    appendSearchResults,
     clearPendingSearchResults,
     closeSearchTab,
-    mergeSearchResults,
     newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
@@ -54,6 +54,52 @@
 
   let searchResultsList = $derived(activeTab?.results ?? []);
 
+  // Every consumer below — the filter + sort, the checked-key reconcile, the
+  // download-history prefetch — walks the whole accumulated result set, and
+  // the store hands us a new snapshot on every animation-frame flush while a
+  // search streams. Throttle the list they read to ~2.5x/sec: leading edge
+  // plus one coalesced trailing sync, the same shape `downloadsByHash` uses
+  // for the transfers store further down. The trailing timer is what
+  // guarantees the last batch of a finished search always lands, so the table
+  // never settles on a stale count.
+  const RESULTS_SYNC_MIN_INTERVAL_MS = 400;
+  let visibleResults = $state<SearchResult[]>([]);
+  let resultsSyncedAt = 0;
+  let resultsSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let syncedTabId: string | null = null;
+  let syncedLength = 0;
+
+  function syncVisibleResults(list: SearchResult[], tabId: string | null) {
+    if (resultsSyncTimer !== null) {
+      clearTimeout(resultsSyncTimer);
+      resultsSyncTimer = null;
+    }
+    syncedTabId = tabId;
+    syncedLength = list.length;
+    resultsSyncedAt = Date.now();
+    visibleResults = list;
+  }
+
+  $effect(() => {
+    const list = searchResultsList;
+    const tabId = $activeSearchTabId;
+    const elapsed = Date.now() - resultsSyncedAt;
+    // Two things bypass the throttle. A tab switch, because the throttle
+    // exists to smooth one tab's stream and not to delay showing a different
+    // one. And the list getting shorter, which streaming never does — that is
+    // Clear Results, a tab closing, or the store shedding results at its cap,
+    // and the first two are direct user actions that must feel immediate.
+    if (tabId !== syncedTabId || list.length < syncedLength || elapsed >= RESULTS_SYNC_MIN_INTERVAL_MS) {
+      syncVisibleResults(list, tabId);
+    } else if (resultsSyncTimer === null) {
+      resultsSyncTimer = setTimeout(() => {
+        resultsSyncTimer = null;
+        if (destroyed) return;
+        syncVisibleResults(searchResultsList, syncedTabId);
+      }, RESULTS_SYNC_MIN_INTERVAL_MS - elapsed);
+    }
+  });
+
   let downloadHistoryMap = $state<Record<string, string>>({});
   let historyFetchedHashes = new Set<string>();
   let historyPendingHashes = new Set<string>();
@@ -72,6 +118,42 @@
   let historyFetchGen = 0;
   const historyHashGen = new Map<string, number>();
   const HISTORY_BATCH_LIMIT = 5_000;
+  /** Ceiling on the per-hash history bookkeeping. `pruneHistoryToVisible`
+   *  already drops hashes no open tab references, but it only runs on tab
+   *  close / clear results, and the search store now evicts low-availability
+   *  rows from a full tab — so a hash can leave the visible set with nothing
+   *  watching. Same shape as `SPAM_CACHE_MAX` below: object keys and Set/Map
+   *  entries keep insertion order, so dropping from the front evicts the
+   *  least-recently-added hash. Sits above what one tab can hold so ordinary
+   *  browsing never evicts a hash that is still on screen (which would just
+   *  make `queueHistoryFetch` re-request it). */
+  const HISTORY_CACHE_MAX = 20_000;
+
+  function trimHistoryHashSets() {
+    while (historyFetchedHashes.size > HISTORY_CACHE_MAX) {
+      const oldest = historyFetchedHashes.values().next().value;
+      if (oldest === undefined) break;
+      historyFetchedHashes.delete(oldest);
+    }
+    while (historyHashGen.size > HISTORY_CACHE_MAX) {
+      const oldest = historyHashGen.keys().next().value;
+      if (oldest === undefined) break;
+      historyHashGen.delete(oldest);
+    }
+  }
+
+  /** Only ever called from the debounced flush below, never from inside an
+   *  effect: `Object.keys` on a `$state` proxy registers a dependency on the
+   *  key set, so trimming from a tracked context would schedule the very
+   *  effect that refills the map. `historyFetchedHashes` / `historyHashGen`
+   *  are plain collections and safe to trim anywhere, hence the split. */
+  function trimHistoryCaches() {
+    const keys = Object.keys(downloadHistoryMap);
+    for (let i = 0; i < keys.length - HISTORY_CACHE_MAX; i++) {
+      delete downloadHistoryMap[keys[i]];
+    }
+    trimHistoryHashSets();
+  }
   /** Consecutive failed flushes, bounding the retry loop below. */
   let historyFetchFailures = 0;
   const HISTORY_MAX_RETRIES = 3;
@@ -88,16 +170,18 @@
       const result = await getDownloadHistory(batch);
       if (destroyed) return;
       // Per-hash freshness check: only apply keys for which our gen
-      // is still the most recent dispatch.
-      const fresh: Record<string, string> = {};
+      // is still the most recent dispatch. Written key-by-key rather than
+      // spread into a replacement object: `downloadHistoryMap` is `$state`,
+      // so a keyed write is already reactive, and the spread copied every
+      // hash ever seen on every batch.
+      let applied = 0;
       for (const [h, status] of Object.entries(result)) {
         if (historyHashGen.get(h) === myGen) {
-          fresh[h] = status;
+          downloadHistoryMap[h] = status;
+          applied++;
         }
       }
-      if (Object.keys(fresh).length > 0) {
-        downloadHistoryMap = { ...downloadHistoryMap, ...fresh };
-      }
+      if (applied > 0) trimHistoryCaches();
       historyFetchFailures = 0;
     } catch (e) {
       console.error('Failed to fetch download history:', e);
@@ -131,6 +215,7 @@
       added = true;
     }
     if (!added) return;
+    trimHistoryHashSets();
     // Coalesce high-frequency streaming updates into a single batched fetch.
     if (historyFetchTimer) return;
     historyFetchTimer = setTimeout(flushHistoryFetch, 250);
@@ -139,8 +224,9 @@
   $effect(() => {
     // Touch the list length so the effect re-runs as streaming batches arrive,
     // but do the diffing inside queueHistoryFetch to avoid re-sending known
-    // hashes. The actual invoke is debounced.
-    const hashes = searchResultsList.map(r => r.file.hash);
+    // hashes. The actual invoke is debounced. Reads the throttled list so a
+    // fast stream can't drive this whole-list pass at flush rate.
+    const hashes = visibleResults.map(r => r.file.hash);
     if (hashes.length > 0) queueHistoryFetch(hashes);
   });
 
@@ -408,9 +494,15 @@
     destroyed = true;
     if (filterDebounceTimer) { clearTimeout(filterDebounceTimer); filterDebounceTimer = null; }
     if (historyFetchTimer) { clearTimeout(historyFetchTimer); historyFetchTimer = null; }
+    if (resultsSyncTimer !== null) { clearTimeout(resultsSyncTimer); resultsSyncTimer = null; }
     // Leave searchTimeouts alone: tabs/`isSearching` persist in the layout-
     // scoped store, and grace/watchdog callbacks only patch that store. Clearing
     // them here used to strand spinners when search-complete was missed.
+    // For the same reason this prunes `searchInvokeSettled` rather than
+    // clearing it: an id whose fallback is still armed still needs its flag,
+    // or a late getSettings() could re-arm the cancel watchdog against a
+    // background tab's live search.
+    for (const id of [...searchInvokeSettled]) forgetSettledRequest(id);
     for (const id of miscTimers) clearTimeout(id);
   });
 
@@ -790,7 +882,6 @@
       if (joinPoll) clearInterval(joinPoll);
     };
   });
-  let spamHiddenCount = $derived(searchResultsList.filter(r => r.is_spam).length);
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
 
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
@@ -922,16 +1013,18 @@
     selectedResult ? downloadsByHash.get(selectedResult.file.hash) : undefined
   );
 
-  let filteredResults: SearchResult[] = $derived.by(() => {
+  // Filter, sort and the spam tally all in one walk of the list. `spamHidden`
+  // used to be its own `.filter().length` over the same array, which meant a
+  // second full pass riding the same invalidation as this one.
+  let filterPass = $derived.by(() => {
     // Single-pass filter: the previous implementation chained up to 8
     // `.filter()` calls, each allocating a fresh array. On a busy search
-    // the store ships new `searchResultsList` snapshots dozens of times
-    // a second, so a result set of several thousand rows meant we
-    // allocated tens of thousands of short-lived intermediate entries
-    // per second just to get to the sort. Collapsing the predicates and
-    // pre-parsing the filter inputs once keeps the hot path allocation-
-    // light and cuts the re-derive cost roughly proportionally to the
-    // number of active filters.
+    // this re-runs several times a second, so a result set of several
+    // thousand rows meant we allocated tens of thousands of short-lived
+    // intermediate entries per second just to get to the sort. Collapsing
+    // the predicates and pre-parsing the filter inputs once keeps the hot
+    // path allocation-light and cuts the re-derive cost roughly
+    // proportionally to the number of active filters.
     const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
     const hasExt = ext.length > 0;
     const minParsed = filterMinSize !== null ? filterMinSize * filterMinUnit : NaN;
@@ -946,7 +1039,9 @@
     const spamHidden = hideSpam;
 
     const out: SearchResult[] = [];
-    for (const r of searchResultsList) {
+    let spamCount = 0;
+    for (const r of visibleResults) {
+      if (r.is_spam) spamCount++;
       if (spamHidden && r.is_spam) continue;
       if (isLocalOnlySearchResult(r)) continue;
       if (hasType && resultType(r) !== filterType) continue;
@@ -1002,15 +1097,22 @@
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return out;
+    return { rows: out, spamCount };
   });
 
+  let filteredResults: SearchResult[] = $derived(filterPass.rows);
+  let spamHiddenCount = $derived(filterPass.spamCount);
+
+  // O(1) instead of two more full scans of `filteredResults`. The effect below
+  // reconciles `checkedKeys` down to the visible set on every change, and
+  // every write to it (`toggleCheck`, `toggleCheckAll`) only ever adds keys
+  // taken from `filteredResults` — so the set is a subset of what's on screen
+  // and its size alone answers both questions. This is the same invariant the
+  // existing `checkedCount` toolbar counter already depends on.
   let allFilteredChecked = $derived(
-    filteredResults.length > 0 && filteredResults.every((r) => checkedKeys.has(resultKey(r)))
+    filteredResults.length > 0 && checkedCount === filteredResults.length
   );
-  let someFilteredChecked = $derived(
-    filteredResults.some((r) => checkedKeys.has(resultKey(r)))
-  );
+  let someFilteredChecked = $derived(checkedCount > 0);
   let selectAllCheckbox: HTMLInputElement | undefined = $state(undefined);
   $effect(() => {
     if (selectAllCheckbox) {
@@ -1026,8 +1128,14 @@
   // and the bulk action in agreement. `untrack` so writing `checkedKeys`
   // here doesn't retrigger this effect.
   $effect(() => {
-    const visible = new Set(filteredResults.map((r) => resultKey(r)));
+    const rows = filteredResults;
     untrack(() => {
+      // Nothing ticked means nothing to reconcile, and that is the state the
+      // page is in for all but a few seconds of its life — worth skipping the
+      // whole-list key scan for. (Matches the old behaviour exactly: with an
+      // empty set the loop below found nothing to drop either.)
+      if (checkedKeys.size === 0) return;
+      const visible = new Set(rows.map((r) => resultKey(r)));
       let changed = false;
       const next = new Set<string>();
       for (const k of checkedKeys) {
@@ -1049,6 +1157,15 @@
     }
   }
 
+  /** Drop a request's settled flag once nothing can re-arm a timer for it.
+   *  Both the cancel watchdog and the completion fallback live in
+   *  `searchTimeouts`, so an id with no entry left there has neither, and
+   *  `getSettings`'s own `searchTimeouts.has` guard already covers it.
+   *  Without this the set gained an entry per search for the page's life. */
+  function forgetSettledRequest(requestId: number) {
+    if (!searchTimeouts.has(requestId)) searchInvokeSettled.delete(requestId);
+  }
+
   // Grace period after the backend confirms a search finished (the
   // `search_files` invoke resolved) during which we still expect the
   // `search-complete` event to flip `isSearching` off. If that event is
@@ -1068,6 +1185,7 @@
       requestId,
       setTimeout(() => {
         searchTimeouts.delete(requestId);
+        forgetSettledRequest(requestId);
         patchSearchTabByRequestId(requestId, (tab) => {
           if (!tab.isSearching) return tab;
           return { ...tab, isSearching: false, progress: null };
@@ -1264,10 +1382,7 @@
         return;
       }
       if (results && results.length > 0) {
-        patchSearchTabByRequestId(requestId, (tab) => ({
-          ...tab,
-          results: mergeSearchResults(tab.results, results),
-        }));
+        appendSearchResults(requestId, results);
       }
       armSearchCompletionFallback(requestId, method);
     } catch (e: unknown) {
@@ -1282,6 +1397,7 @@
         progress: null,
         error: msg,
       }));
+      forgetSettledRequest(requestId);
     }
   }
 
@@ -1317,6 +1433,7 @@
       isSearching: false,
       progress: null,
     }));
+    forgetSettledRequest(stoppedId);
   }
 
   function dismissTabError() {
@@ -1653,9 +1770,7 @@
     const hash = result.file.hash;
     try {
       await removeDownloadHistoryEntry(hash);
-      downloadHistoryMap = Object.fromEntries(
-        Object.entries(downloadHistoryMap).filter(([k]) => k !== hash),
-      );
+      delete downloadHistoryMap[hash];
       // Drop the cache marks so a later re-download of this file is allowed to
       // re-fetch and re-badge (otherwise the hash would stay permanently in
       // `historyFetchedHashes` and never refresh).
@@ -1751,6 +1866,7 @@
     spamTooltipKey = null;
     clearChecked();
     pruneHistoryToVisible();
+    if (discardedId != null) forgetSettledRequest(discardedId);
   }
 
   function handleConfirm() {
@@ -2034,7 +2150,10 @@
   // drops. When they differ, the "(filtered from N)" suffix should show
   // even if no explicit filter chip is set, so the user understands why
   // the table isn't showing the headline number.
-  let resultsHidden = $derived(searchResultsList.length - filteredResults.length);
+  // Both sides come from `visibleResults`, not the live store list: mixing a
+  // throttled count with an unthrottled one makes "showing X of Y" briefly
+  // disagree with the rows actually on screen (and X - Y go negative).
+  let resultsHidden = $derived(visibleResults.length - filteredResults.length);
 
   let advancedFilterCount = $derived(
     (filterColumn !== 'all' && filterText !== '' ? 1 : 0) +
@@ -2386,7 +2505,7 @@
       <p>{m.search_empty_title()}</p>
       <p class="hint">{m.search_empty_hint()}</p>
     </div>
-  {:else if activeTab?.isSearching && searchResultsList.length === 0}
+  {:else if activeTab?.isSearching && visibleResults.length === 0}
     <div class="empty-state">
       <div class="spinner lg"></div>
       <p>{m.search_searching_network()}</p>
@@ -2400,7 +2519,7 @@
         </p>
       {/if}
     </div>
-  {:else if searchResultsList.length === 0 && !activeTab?.isSearching}
+  {:else if visibleResults.length === 0 && !activeTab?.isSearching}
     <div class="empty-state">
       <div class="icon" aria-hidden="true">
         <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2418,9 +2537,9 @@
           <span class="searching-indicator">{m.search_searching_indicator()}</span>
         {/if}
         {#if filteredResults.length > 0}
-          {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: searchResultsList.length })}{/if}
-        {:else if searchResultsList.length > 0}
-          {searchResultsList.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: searchResultsList.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
+          {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
+        {:else if visibleResults.length > 0}
+          {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
         {:else}
           {m.search_zero_results()}
         {/if}
@@ -2558,7 +2677,7 @@
                 aria-label={m.search_select_result({ name: result.clean_name || result.file.name })}
               />
             </td>
-            <td class="col-name" title={result.file.name}>
+            <td class="col-name" title={result.clean_name || result.file.name}>
               <div class="name-cell-wrap">
                 <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{result.clean_name || result.file.name}</bdi></button>
                 {#if dlTransfer}
@@ -2697,7 +2816,7 @@
         {/each}
       </tbody>
     </table>
-    {#if filteredResults.length === 0 && searchResultsList.length > 0}
+    {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
         <p>{m.search_no_results_filters()}</p>
         <button class="ghost" onclick={clearFilters}>{m.library_clear_filters()}</button>

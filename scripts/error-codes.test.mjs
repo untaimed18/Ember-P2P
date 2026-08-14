@@ -7,6 +7,15 @@ import test from "node:test";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const rustRoot = join(root, "src-tauri", "src");
 const messagesDir = process.env.EMBER_MESSAGES_DIR ?? join(root, "messages");
+const inlang = JSON.parse(
+  readFileSync(join(root, "project.inlang", "settings.json"), "utf8"),
+);
+/** How many files besides English a new key has to be written into. Derived
+ *  from the project settings so the guidance below cannot drift out of date the
+ *  next time a locale is added — it once said "five" against eight. */
+const translationCount = inlang.locales.filter(
+  (locale) => locale !== inlang.baseLocale,
+).length;
 
 /**
  * Error codes the Rust side can emit that have no `error_*` translation yet.
@@ -152,7 +161,7 @@ test("every error code the backend emits is translated", () => {
   assert.deepEqual(
     untranslated.map((code) => `${code} (${codes.get(code)})`),
     [],
-    "add error_<code> to messages/en.json and the five translations",
+    `add error_<code> to messages/en.json and all ${translationCount} translations`,
   );
 });
 

@@ -216,7 +216,6 @@ impl AppState {
     /// `abort_handle()` for every scan up front and calling `.abort()`
     /// on each one when the grace window elapses guarantees no further
     /// writes after this method returns.
-    #[allow(dead_code)]
     pub async fn await_background_scans(&self, grace: std::time::Duration) {
         let handles: Vec<_> = {
             let mut map = self.background_scans.write().await;
@@ -229,7 +228,15 @@ impl AppState {
         let count = handles.len();
         let fut = async move {
             for h in handles {
-                let _ = h.await;
+                // A panicking scan can leave the in-memory index disagreeing
+                // with what is about to be flushed, so it must not pass
+                // silently. A cancelled one is an expected outcome of the
+                // abort path below and stays quiet.
+                if let Err(error) = h.await {
+                    if error.is_panic() {
+                        tracing::error!("Background scan task panicked: {error}");
+                    }
+                }
             }
         };
         if tokio::time::timeout(grace, fut).await.is_err() {

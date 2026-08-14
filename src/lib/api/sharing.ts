@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { withTimeout } from '$lib/utils';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
 /** Open the backend-owned native picker and add every selected folder.
@@ -70,7 +71,11 @@ export async function reloadSharedFiles(): Promise<void> {
 }
 
 export async function getScanStatus(): Promise<boolean> {
-  return invoke('get_scan_status');
+  // Reads a flag, but the library page polls it every 3 s: without a deadline
+  // a wedged backend latches that poll's in-flight guard for good and the
+  // "hashing" banner never clears. Deliberately NOT applied to `startScan` /
+  // `reloadSharedFiles` — those are legitimately long-running.
+  return withTimeout(invoke<boolean>('get_scan_status'), 'get_scan_status', 8_000);
 }
 
 export async function getLibraryScanTruncated(): Promise<boolean> {

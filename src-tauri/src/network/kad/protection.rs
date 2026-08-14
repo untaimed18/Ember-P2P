@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// eMule PacketTracking.cpp: per-opcode limits within a 15-second window.
 /// Global per-IP caps remain as a second layer of defense.
@@ -92,6 +92,68 @@ where
         }
     }
     false
+}
+
+/// Shared counters used when a per-key table is full and `evict_idle` found
+/// nothing to reclaim.
+///
+/// Refusing every source that does not already hold a slot is a denial of
+/// service we inflict on ourselves. These tables are filled purely by
+/// *inbound* traffic and UDP source addresses are unauthenticated, so a few
+/// thousand spoofed addresses sending one packet a second own every slot for
+/// as long as they keep it up — and the layers in front of these tables carry
+/// KAD, eD2K client UDP and Ember-native UDP alike, including the responses to
+/// our own searches and publishes. Sharing a small fixed set of counters keeps
+/// the work O(1) and still bounds a real flood: many sources spend one budget,
+/// so a shard is exhausted faster than an individual counter, never slower.
+const FALLBACK_SHARDS: usize = 64;
+
+/// How many overflow sources one shard is sized to carry, applied as a
+/// multiplier on the per-source limit that would otherwise have applied. Small
+/// enough that a single source flooding through the fallback still hits a
+/// ceiling within the same window it would have hit its own.
+const FALLBACK_SOURCES_PER_SHARD: u32 = 4;
+
+/// Shard for `ip`, FNV-1a over the address bytes. IPv4 is mapped into v6 so
+/// both families run through the same fold.
+fn fallback_shard(ip: IpAddr) -> usize {
+    let octets = match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    };
+    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in octets {
+        acc ^= u64::from(byte);
+        acc = acc.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    (acc % FALLBACK_SHARDS as u64) as usize
+}
+
+/// Fixed-size shared windows; see [`FALLBACK_SHARDS`].
+struct FallbackCounters {
+    windows: [(u32, Instant); FALLBACK_SHARDS],
+}
+
+impl FallbackCounters {
+    fn new() -> Self {
+        FallbackCounters {
+            windows: [(0, Instant::now()); FALLBACK_SHARDS],
+        }
+    }
+
+    /// Charge one packet from `ip` to its shard and report whether the shard
+    /// is now over `limit` for the current `window`.
+    fn over_budget(&mut self, ip: IpAddr, now: Instant, window: Duration, limit: u32) -> bool {
+        let slot = &mut self.windows[fallback_shard(ip)];
+        if now.saturating_duration_since(slot.1) >= window {
+            slot.0 = 1;
+            slot.1 = now;
+            false
+        } else {
+            slot.0 = slot.0.saturating_add(1);
+            slot.0 > limit
+        }
+    }
 }
 
 fn opcode_limit(opcode: u8) -> u32 {
@@ -188,6 +250,11 @@ pub struct FloodProtection {
     opcode_order: VecDeque<(IpAddr, u8)>,
     outgoing_order: VecDeque<IpAddr>,
     compressed_order: VecDeque<IpAddr>,
+    /// Degradation path for the two tables that have no aggregate counter of
+    /// their own to fall back on — see [`FallbackCounters`]. The compressed
+    /// table needs no shards: `global_compressed` is already its aggregate.
+    ip_fallback: FallbackCounters,
+    opcode_fallback: FallbackCounters,
 }
 
 impl FloodProtection {
@@ -206,7 +273,18 @@ impl FloodProtection {
             opcode_order: VecDeque::new(),
             outgoing_order: VecDeque::new(),
             compressed_order: VecDeque::new(),
+            ip_fallback: FallbackCounters::new(),
+            opcode_fallback: FallbackCounters::new(),
         }
+    }
+
+    /// True when we have a prior relationship with `ip`: it is in our routing
+    /// table, or we sent it a request inside `TRACKER_EXPIRY_SECS` and it may
+    /// well be answering us. Used to decide who may degrade onto the shared
+    /// fallback counters when a table is saturated — a spoofed source has
+    /// neither property, so a flood cannot admit itself this way.
+    fn has_relationship(&self, ip: IpAddr, known_peer: bool) -> bool {
+        known_peer || self.has_recent_ip(ip)
     }
 
     /// K21: returns true when `ip` has exceeded its compressed-packet
@@ -234,33 +312,59 @@ impl FloodProtection {
         const MAX_GLOBAL_COMPRESSED_BYTES_PER_SEC: usize = 1024 * 1024;
         let now = Instant::now();
 
-        if !self.compressed_counters.contains_key(&ip) {
-            if self.compressed_counters.len() >= MAX_COMPRESSED_ENTRIES
-                && !evict_idle(
-                    &mut self.compressed_counters,
-                    &mut self.compressed_order,
-                    |(_, _, t)| now.saturating_duration_since(*t).as_secs() >= 1,
-                )
-            {
+        // A peer answering a request we actually sent must never be starved by
+        // unsolicited traffic from elsewhere: the aggregate budget exists to
+        // bound decompression work from strangers, not to drop the search
+        // results we asked for. Probing the fixed set of request opcodes whose
+        // replies can arrive packed keeps this O(1) on the packet path.
+        //
+        // Established before the per-IP table is consulted because table
+        // pressure must not deny it either: the table holds one row per source
+        // address and nothing authenticates those, so
+        // `MAX_COMPRESSED_ENTRIES` spoofed addresses at a packet a second
+        // otherwise blackhole every packed `KADEMLIA2_SEARCH_RES` we are
+        // waiting on.
+        let solicited = PACKED_RESPONSE_REQUESTS
+            .iter()
+            .any(|opcode| self.outgoing_requests.contains_key(&(ip, *opcode)));
+
+        let has_slot = if self.compressed_counters.contains_key(&ip) {
+            true
+        } else if self.compressed_counters.len() < MAX_COMPRESSED_ENTRIES
+            || evict_idle(
+                &mut self.compressed_counters,
+                &mut self.compressed_order,
+                |(_, _, t)| now.saturating_duration_since(*t).as_secs() >= 1,
+            )
+        {
+            self.compressed_order.push_back(ip);
+            true
+        } else {
+            // No slot and nothing idle to reclaim. Skip the per-source layer
+            // rather than denying: the aggregate counters below bound the
+            // decompression work this control exists to bound, and they do it
+            // without a per-source table for a flood to saturate.
+            false
+        };
+
+        if has_slot {
+            let entry = self.compressed_counters.entry(ip).or_insert((0, 0, now));
+            if now.saturating_duration_since(entry.2).as_secs() >= 1 {
+                entry.0 = 1;
+                entry.1 = wire_bytes;
+                entry.2 = now;
+            } else {
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(wire_bytes);
+            }
+            if entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC {
+                // Return before charging the aggregate counter. Charging it
+                // first meant a source already over its own allowance still
+                // spent budget it was never going to be permitted to use,
+                // which is what let a handful of spoofed addresses buy a
+                // global denial for free.
                 return true;
             }
-            self.compressed_order.push_back(ip);
-        }
-        let entry = self.compressed_counters.entry(ip).or_insert((0, 0, now));
-        if now.saturating_duration_since(entry.2).as_secs() >= 1 {
-            entry.0 = 1;
-            entry.1 = wire_bytes;
-            entry.2 = now;
-        } else {
-            entry.0 = entry.0.saturating_add(1);
-            entry.1 = entry.1.saturating_add(wire_bytes);
-        }
-        if entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC {
-            // Return before charging the aggregate counter. Charging it first
-            // meant a source already over its own allowance still spent
-            // budget it was never going to be permitted to use, which is what
-            // let a handful of spoofed addresses buy a global denial for free.
-            return true;
         }
 
         if now
@@ -279,14 +383,7 @@ impl FloodProtection {
             return false;
         }
 
-        // A peer answering a request we actually sent must never be starved
-        // by unsolicited traffic from elsewhere: the aggregate budget exists
-        // to bound decompression work from strangers, not to drop the search
-        // results we asked for. Probing the fixed set of request opcodes
-        // whose replies can arrive packed keeps this O(1) on the packet path.
-        !PACKED_RESPONSE_REQUESTS
-            .iter()
-            .any(|opcode| self.outgoing_requests.contains_key(&(ip, *opcode)))
+        !solicited
     }
 
     /// Layer 1 only: per-(IP, opcode) request-flood check within
@@ -306,14 +403,13 @@ impl FloodProtection {
             // K19: a full table must not reject every new peer outright —
             // one-shot spam would then lock legit peers out. Reclaim a slot
             // whose 15-second window has already lapsed instead. When every
-            // probed slot is still live we drop *this* packet rather than
-            // free space by evicting a counter that is actively holding a
-            // peer under its limit; that lockout lasts as long as the flood
-            // does — `OPCODE_WINDOW_SECS` bounds how long any one entry
-            // stays live, not how long the table stays saturated, so an
+            // probed slot is still live we never free space by evicting a
+            // counter that is actively holding a peer under its limit: that
+            // would hand the attacker a permanent bypass of the per-opcode
+            // cap, since `OPCODE_WINDOW_SECS` bounds how long any one entry
+            // stays live, not how long the table stays saturated — an
             // attacker refreshing it at ~3,333 packets/sec holds it open
-            // indefinitely — whereas evicting a hot counter would hand the
-            // attacker a permanent bypass of the per-opcode cap.
+            // indefinitely.
             if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES
                 && !evict_idle(
                     &mut self.opcode_counters,
@@ -321,7 +417,23 @@ impl FloodProtection {
                     |(_, t)| now.saturating_duration_since(*t).as_secs() >= OPCODE_WINDOW_SECS,
                 )
             {
-                return true;
+                // Nothing idle to reclaim, and evicting a live counter is off
+                // the table for the reason above. A stranger is still refused
+                // — that is what stops a flood buying itself admission — but
+                // refusing *everyone* hands the attacker the whole table as a
+                // lockout, so a peer we already deal with degrades onto a
+                // shared counter instead of being dropped outright.
+                if !self.has_relationship(ip, known_peer) {
+                    return true;
+                }
+                let limit = opcode_limit(opcode);
+                let effective = if known_peer { limit * 2 } else { limit };
+                return self.opcode_fallback.over_budget(
+                    ip,
+                    now,
+                    Duration::from_secs(OPCODE_WINDOW_SECS),
+                    effective.saturating_mul(FALLBACK_SOURCES_PER_SHARD),
+                );
             }
             self.opcode_order.push_back(op_key);
         }
@@ -395,6 +507,11 @@ impl FloodProtection {
         }
 
         let now = Instant::now();
+        let max_packets = if known_peer {
+            MAX_PACKETS_PER_SEC_KNOWN
+        } else {
+            MAX_PACKETS_PER_SEC_UNKNOWN
+        };
 
         // Layer 2: global per-IP per-second cap
         if !self.ip_counters.contains_key(&ip) {
@@ -405,16 +522,25 @@ impl FloodProtection {
                     now.saturating_duration_since(*t).as_secs() >= 1
                 })
             {
-                return true;
+                // Unlike Layer 1 this gate sees *responses* too, so denying
+                // every source without a slot drops the SearchRes and
+                // PublishRes answering our own requests — keyword search then
+                // silently returns nothing while a spoofed flood holds the
+                // table. Sources we have a relationship with degrade onto a
+                // shared counter; strangers are still refused.
+                if !self.has_relationship(ip, known_peer) {
+                    return true;
+                }
+                return self.ip_fallback.over_budget(
+                    ip,
+                    now,
+                    Duration::from_secs(1),
+                    max_packets.saturating_mul(FALLBACK_SOURCES_PER_SHARD),
+                );
             }
             self.ip_order.push_back(ip);
         }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
-        let max_packets = if known_peer {
-            MAX_PACKETS_PER_SEC_KNOWN
-        } else {
-            MAX_PACKETS_PER_SEC_UNKNOWN
-        };
         if now.saturating_duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
             entry.1 = now;
@@ -756,6 +882,91 @@ mod kad_protection_tests {
             fp.check_opcode_limit(victim, false, 0x21),
             "the victim's 11th KadReq must still be refused — its counter \
              must survive a table-full admission attempt"
+        );
+    }
+
+    /// The flip side of the test above. Refusing every source that has no
+    /// slot is a lockout an attacker can hold open indefinitely, and these
+    /// tables are filled purely by inbound traffic from unauthenticated UDP
+    /// source addresses. A peer we already deal with must keep getting
+    /// through; a stranger must not.
+    #[test]
+    fn full_opcode_table_degrades_instead_of_locking_everyone_out() {
+        let mut fp = FloodProtection::new();
+        for i in 0..MAX_OPCODE_ENTRIES {
+            let _ = fp.check_opcode_limit(filler_ip(i), false, 0x21);
+        }
+        assert_eq!(fp.opcode_counters.len(), MAX_OPCODE_ENTRIES);
+
+        let known = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        assert!(
+            !fp.check_opcode_limit(known, true, 0x21),
+            "a routing-table peer must not be locked out by a saturated table"
+        );
+        assert!(
+            fp.check_opcode_limit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), false, 0x21),
+            "a stranger is still refused, so the fallback cannot be used to \
+             bypass a full table"
+        );
+        assert_eq!(
+            fp.opcode_counters.len(),
+            MAX_OPCODE_ENTRIES,
+            "the fallback shares counters; it must not grow the table"
+        );
+    }
+
+    /// Layer 2 sees responses as well as requests, so a full `ip_counters`
+    /// table used to blackhole the `SearchRes`/`PublishRes` answering our own
+    /// requests — keyword search then returns nothing at all. Roughly
+    /// `MAX_IP_ENTRIES` spoofed addresses at a packet a second is enough to
+    /// hold every slot.
+    #[test]
+    fn full_ip_table_still_admits_a_peer_we_queried() {
+        let mut fp = FloodProtection::new();
+        let peer: SocketAddr = "198.51.100.10:4672".parse().unwrap();
+        fp.track_request(peer, 0x33);
+
+        // 0x4B (PublishRes) is not a request opcode, so this exercises Layer 2
+        // alone.
+        for i in 0..MAX_IP_ENTRIES {
+            let _ = fp.check_rate_limit_with_opcode(filler_ip(i), false, 0x4B);
+        }
+        assert_eq!(fp.ip_counters.len(), MAX_IP_ENTRIES);
+
+        assert!(
+            fp.check_rate_limit_with_opcode(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)), false, 0x4B),
+            "a stranger arriving at a saturated table is still refused"
+        );
+        assert!(
+            !fp.check_rate_limit_with_opcode(peer.ip(), false, 0x4B),
+            "the response from a peer we queried must survive a table held \
+             open by spoofed sources"
+        );
+    }
+
+    /// The fallback is shared, so it still bounds a flood: one source that
+    /// degrades onto a shard cannot send without limit just because the table
+    /// was full when it arrived.
+    #[test]
+    fn fallback_counter_still_limits_a_flooding_source() {
+        let mut fp = FloodProtection::new();
+        let peer: SocketAddr = "198.51.100.11:4672".parse().unwrap();
+        fp.track_request(peer, 0x33);
+        for i in 0..MAX_IP_ENTRIES {
+            let _ = fp.check_rate_limit_with_opcode(filler_ip(i), false, 0x4B);
+        }
+
+        let budget = MAX_PACKETS_PER_SEC_UNKNOWN * FALLBACK_SOURCES_PER_SHARD;
+        for i in 0..budget {
+            assert!(
+                !fp.check_rate_limit_with_opcode(peer.ip(), false, 0x4B),
+                "packet {} is inside the shared fallback budget",
+                i + 1
+            );
+        }
+        assert!(
+            fp.check_rate_limit_with_opcode(peer.ip(), false, 0x4B),
+            "the shared fallback must still cut off a flood"
         );
     }
 

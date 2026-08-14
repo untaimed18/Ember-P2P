@@ -25,6 +25,11 @@ tower = { version = "0.5", features = ["util"] }
 strip = true
 lto = true
 codegen-units = 1
+# Keep arithmetic overflow a panic in release builds, not a silent wrap. Every
+# length, timestamp and counter here came off a socket, and the unwinding kept
+# below turns such a panic into one failed request rather than a wrapped value
+# that quietly mis-sizes a buffer or resets a rate limit.
+overflow-checks = true
 # Deliberately NOT panic = "abort". Axum/tokio isolate a panicking
 # request handler to its own task (the runtime catches the unwind at
 # the task boundary and fails just that task's JoinHandle) — that's

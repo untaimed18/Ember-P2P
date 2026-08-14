@@ -1065,7 +1065,13 @@ pub async fn cancel_transfers_batch(
         if let Some((file_hash, file_name, file_size)) = cancelled_info {
             let db = state.db.clone();
             db_blocking(move || {
-                let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+                if let Err(e) =
+                    db.record_download_history(&file_hash, &file_name, file_size, "cancelled")
+                {
+                    tracing::warn!(
+                        "Failed to record cancelled download history for {file_hash}: {e}"
+                    );
+                }
             })
             .await;
         }
@@ -1452,7 +1458,11 @@ pub async fn cancel_transfer(
     if let Some((file_hash, file_name, file_size)) = cancelled_info {
         let db = state.db.clone();
         db_blocking(move || {
-            let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+            if let Err(e) =
+                db.record_download_history(&file_hash, &file_name, file_size, "cancelled")
+            {
+                tracing::warn!("Failed to record cancelled download history for {file_hash}: {e}");
+            }
         })
         .await;
     }

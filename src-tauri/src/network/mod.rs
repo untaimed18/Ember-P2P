@@ -319,15 +319,36 @@ fn spawn_udp_mapping_keepalive(
     packet_tx
 }
 
-/// The TCP counterpart of `advertised_udp_port` — the STUN-over-TCP-confirmed
-/// public TCP port (see `apply_tcp_mapping_keepalive`) when the probe sourced
-/// from the listen port has been stability-confirmed, otherwise the raw
-/// configured listener port.
+/// The TCP port a *peer* should connect back to, in descending order of
+/// authority: a live UPnP mapping, then a STUN-over-TCP-confirmed public port
+/// (see `apply_tcp_mapping_keepalive`), then the raw configured listener port.
+///
+/// UPnP outranks STUN because the two measure different things. UPnP installs
+/// an explicit *inbound* forward for `tcp_port -> tcp_port`, so while it is
+/// live that is exactly where an unsolicited connection lands. STUN over TCP
+/// observes the mapping a NAT created for an *outbound* connection from the
+/// listen port, and plenty of gateways allocate a fresh external port for that
+/// flow even while honouring a static UPnP forward. Preferring the STUN port
+/// there told every KAD peer and the eD2K server to dial a port the router was
+/// not forwarding: every connect-back failed, so we reported Firewalled while
+/// the router's own UPnP page correctly showed the real mapping wide open.
 fn advertised_tcp_port(state: &NetworkState) -> u16 {
-    state
-        .external_tcp_port
+    advertised_tcp_port_from(
+        state.upnp_tcp_port,
+        state.external_tcp_port,
+        state.tcp_port,
+    )
+}
+
+fn advertised_tcp_port_from(
+    upnp_tcp_port: Option<u16>,
+    external_tcp_port: Option<u16>,
+    configured_tcp_port: u16,
+) -> u16 {
+    upnp_tcp_port
         .filter(|port| *port != 0)
-        .unwrap_or(state.tcp_port)
+        .or(external_tcp_port.filter(|port| *port != 0))
+        .unwrap_or(configured_tcp_port)
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
@@ -2014,7 +2035,7 @@ fn emit_search_resight_updates(
             }
         }
     }
-    emit_search_results_event(app_handle, request_id, updates);
+    emit_search_results_event(app_handle, request_id, &updates);
 }
 
 fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
@@ -5360,6 +5381,33 @@ mod tests {
     }
 
     #[test]
+    fn advertised_tcp_port_prefers_the_upnp_forward_over_a_stun_remap() {
+        // The regression this guards: a gateway can honour a UPnP forward on
+        // 4662 while still allocating a fresh external port for the outbound
+        // STUN probe. Advertising 51234 sent every connect-back to a port the
+        // router was not forwarding, so we self-reported Firewalled even
+        // though 4662 was open.
+        assert_eq!(
+            advertised_tcp_port_from(Some(4662), Some(51234), 4662),
+            4662
+        );
+    }
+
+    #[test]
+    fn advertised_tcp_port_uses_the_stun_remap_when_upnp_is_not_mapped() {
+        // Without a forward of our own, the NAT's observed port is the only
+        // reachable one — the CGNAT case STUN keep-alive exists for.
+        assert_eq!(advertised_tcp_port_from(None, Some(51234), 4662), 51234);
+    }
+
+    #[test]
+    fn advertised_tcp_port_falls_back_to_the_configured_port() {
+        assert_eq!(advertised_tcp_port_from(None, None, 4662), 4662);
+        assert_eq!(advertised_tcp_port_from(None, Some(0), 4662), 4662);
+        assert_eq!(advertised_tcp_port_from(Some(0), Some(51234), 4662), 51234);
+    }
+
+    #[test]
     fn tcp_port_confirmation_accepts_1to1_immediately() {
         let result = tcp_port_confirmation(4662, None, 0, 4662);
         assert_eq!(result.confirmed_port, Some(4662));
@@ -6335,19 +6383,19 @@ mod tests {
     }
 
     #[test]
-    fn ember_source_publish_instant_treats_never_and_expired_as_due() {
+    fn ember_publish_instant_treats_never_and_expired_as_due() {
         let now = std::time::Instant::now();
         let interval = std::time::Duration::from_secs(2 * 3600);
         let now_unix = 1_700_000_000i64;
-        assert!(ember_source_publish_instant(0, now_unix, now, interval).is_none());
-        assert!(ember_source_publish_instant(
+        assert!(ember_publish_instant(0, now_unix, now, interval).is_none());
+        assert!(ember_publish_instant(
             (now_unix as u32).saturating_sub(interval.as_secs() as u32),
             now_unix,
             now,
             interval,
         )
         .is_none());
-        assert!(ember_source_publish_instant(
+        assert!(ember_publish_instant(
             (now_unix as u32).saturating_sub(interval.as_secs() as u32 + 60),
             now_unix,
             now,
@@ -6357,12 +6405,12 @@ mod tests {
     }
 
     #[test]
-    fn ember_source_publish_instant_keeps_a_stamp_still_inside_the_interval() {
+    fn ember_publish_instant_keeps_a_stamp_still_inside_the_interval() {
         let now = std::time::Instant::now();
         let interval = std::time::Duration::from_secs(2 * 3600);
         let now_unix = 1_700_000_000i64;
         let last = (now_unix as u32).saturating_sub(60);
-        let at = ember_source_publish_instant(last, now_unix, now, interval)
+        let at = ember_publish_instant(last, now_unix, now, interval)
             .expect("a one-minute-old stamp must still be scheduled");
         let elapsed = now.duration_since(at).as_secs();
         assert!(
@@ -8382,10 +8430,59 @@ fn expected_aich_bytes(value: Option<&str>) -> Option<[u8; 20]> {
     Some(hash)
 }
 
-async fn udp_reask_completed_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
+/// Availability bitmap for the OP_REASKFILEPING we send while downloading.
+///
+/// Advertises only parts we will actually serve (complete AND MD4-verified),
+/// like every other outgoing bitmap: `is_range_safe_to_serve` also requires
+/// `is_part_verified`, so a bitmap built from bare `completed_parts()` told the
+/// peer we hold parts whose block requests we then silently refuse, freezing
+/// its download on a part it keeps re-requesting.
+async fn udp_reask_serveable_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
     let tracker = state.tracker_registry.lock().get(transfer_id).cloned()?;
-    let parts = tracker.read().await.completed_parts();
+    let parts = tracker.read().await.serveable_parts();
     Some(parts)
+}
+
+/// How many queued OP_CALLBACKREQUESTs the event loop sends per turn, so a
+/// login or poll burst cannot monopolize it with a long run of TCP writes.
+const MAX_LOWID_CALLBACKS_PER_TURN: usize = 32;
+
+/// Ceiling on `pending_lowid_callback_queue`. Its drain only runs while we are
+/// logged in with a HighID, so a LowID (or disconnected) session drains nothing
+/// while the producers keep offering the same sources every source-retry tick —
+/// unbounded growth without this.
+const MAX_PENDING_LOWID_CALLBACKS: usize = 1024;
+
+/// Queue OP_CALLBACKREQUEST work for the rate-limited drain in the event loop.
+///
+/// Sending inline is what this exists to avoid: a `request_callback` write is
+/// bounded only by `SERVER_WRITE_TIMEOUT_SECS`, and the event loop is a single
+/// task, so one stalled server would otherwise freeze KAD UDP, every timer,
+/// transfer events and IPC for that long per source in the batch.
+///
+/// Pairs already queued are skipped — every producer re-offers the same
+/// `(file_hash, client_id)` until the source manager sees the callback go out,
+/// so without this the retry tick alone grows the queue without bound. The scan
+/// is linear, which is why the cap is kept small enough for that to stay cheap.
+fn queue_lowid_callbacks(
+    queue: &mut std::collections::VecDeque<([u8; 16], u32)>,
+    entries: impl IntoIterator<Item = ([u8; 16], u32)>,
+) -> usize {
+    let mut queued = 0usize;
+    for entry in entries {
+        if queue.len() >= MAX_PENDING_LOWID_CALLBACKS {
+            debug!(
+                "LowID callback queue at capacity ({MAX_PENDING_LOWID_CALLBACKS}); dropping the rest of this batch"
+            );
+            break;
+        }
+        if queue.contains(&entry) {
+            continue;
+        }
+        queue.push_back(entry);
+        queued += 1;
+    }
+    queued
 }
 
 fn priority_str_to_u32(s: &str) -> u32 {
@@ -8627,10 +8724,13 @@ struct ActiveSearchRequest {
 /// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
 
+/// Borrows the batch: the streaming enrichment path emits every batch it is
+/// about to hand back to its caller, and these vectors are long runs of
+/// multi-`String` rows, so serializing in place avoids cloning each one.
 #[derive(Clone, serde::Serialize)]
-struct SearchResultsEvent {
+struct SearchResultsEvent<'a> {
     request_id: u64,
-    results: Vec<SearchResult>,
+    results: &'a [SearchResult],
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -9054,6 +9154,9 @@ struct NetworkState {
     /// unconfirmed or STUN keep-alive is off/suspended — advertising then
     /// falls back to the configured listener port.
     external_tcp_port: Option<u16>,
+    /// `Some(port)` while UPnP holds a live inbound TCP forward. Outranks
+    /// `external_tcp_port` in `advertised_tcp_port` — see that function.
+    upnp_tcp_port: Option<u16>,
     /// Live Hello / publish TCP port (updated by mapping keep-alive).
     advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
     /// Live Hello / publish UDP port (updated by mapping keep-alive).
@@ -10119,15 +10222,6 @@ fn ember_publish_instant(
         return None;
     }
     now_inst.checked_sub(std::time::Duration::from_secs(elapsed))
-}
-
-fn ember_source_publish_instant(
-    last_unix: u32,
-    now_unix: i64,
-    now_inst: std::time::Instant,
-    interval: std::time::Duration,
-) -> Option<std::time::Instant> {
-    ember_publish_instant(last_unix, now_unix, now_inst, interval)
 }
 
 fn hydrate_ember_publish_schedule(
@@ -11445,7 +11539,7 @@ fn dedup_streamed_batch(
 fn emit_search_results_event(
     app_handle: &tauri::AppHandle,
     request_id: u64,
-    results: Vec<SearchResult>,
+    results: &[SearchResult],
 ) {
     if results.is_empty() {
         return;
@@ -11615,7 +11709,7 @@ async fn enrich_and_emit_search_results(
             min_availability,
         )
     });
-    emit_search_results_event(app_handle, request_id, results.clone());
+    emit_search_results_event(app_handle, request_id, &results);
     results
 }
 
@@ -14019,9 +14113,18 @@ pub async fn start_network(
     let mut server_met_bootstrap_task: Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> =
         None;
 
-    let reputation =
-        ember::reputation::ReputationManager::load_checked(&data_dir.join("reputation.json"))
-            .map_err(|error| anyhow::anyhow!(error))?;
+    // Off the async task: `load_checked` reads and parses the file with
+    // synchronous `std::fs`, and this runs on the same runtime that is already
+    // serving the UI during splash.
+    let reputation = {
+        let reputation_path = data_dir.join("reputation.json");
+        tokio::task::spawn_blocking(move || {
+            ember::reputation::ReputationManager::load_checked(&reputation_path)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("reputation load task failed: {e}"))?
+        .map_err(|error| anyhow::anyhow!(error))?
+    };
 
     let mut state = NetworkState {
         local_id,
@@ -14060,6 +14163,7 @@ pub async fn start_network(
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
+        upnp_tcp_port: None,
         advertise_tcp_port: Arc::new(std::sync::atomic::AtomicU16::new(tcp_port)),
         advertise_udp_port: Arc::new(std::sync::atomic::AtomicU16::new(udp_port)),
         stun_keepalive_enabled: settings.stun_keepalive_enabled,
@@ -14311,8 +14415,14 @@ pub async fn start_network(
     // enabled.
     let nodes_ember_path = data_dir.join("nodes_ember.dat");
     if nodes_ember_path.exists() {
-        match ember::dht::bootstrap::load_nodes(&nodes_ember_path) {
-            Ok(contacts) => {
+        // Read + parse on the blocking pool: this is a synchronous whole-file
+        // `std::fs` read inside an async fn that shares its runtime with the UI.
+        let loaded = tokio::task::spawn_blocking(move || {
+            ember::dht::bootstrap::load_nodes(&nodes_ember_path)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(contacts)) => {
                 let n = contacts.len();
                 state.ember_dht.load_contacts(contacts);
                 info!(
@@ -14320,7 +14430,8 @@ pub async fn start_network(
                     state.ember_dht.contact_count()
                 );
             }
-            Err(e) => warn!("Failed to load nodes_ember.dat: {e}"),
+            Ok(Err(e)) => warn!("Failed to load nodes_ember.dat: {e}"),
+            Err(e) => warn!("nodes_ember.dat load task failed: {e}"),
         }
     } else {
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
@@ -14338,8 +14449,14 @@ pub async fn start_network(
     // refill it.
     let store_ember_path = data_dir.join("store_ember.dat");
     if store_ember_path.exists() {
-        match ember::dht::bootstrap::load_store(&store_ember_path) {
-            Ok(records) => {
+        // Same reasoning as `nodes_ember.dat` above: synchronous file read and
+        // record validation, so it belongs on the blocking pool.
+        let loaded = tokio::task::spawn_blocking(move || {
+            ember::dht::bootstrap::load_store(&store_ember_path)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(records)) => {
                 let offered = records.len();
                 let accepted = state.ember_dht.restore_records(records);
                 // Recorded so the shutdown save can tell "this store is genuinely
@@ -14350,7 +14467,8 @@ pub async fn start_network(
                      (the rest expired while closed or failed validation)"
                 );
             }
-            Err(e) => warn!("Failed to load store_ember.dat: {e}"),
+            Ok(Err(e)) => warn!("Failed to load store_ember.dat: {e}"),
+            Err(e) => warn!("store_ember.dat load task failed: {e}"),
         }
     } else {
         state.ember_store_loaded = true;
@@ -14651,7 +14769,7 @@ pub async fn start_network(
         // rewrite on every cold boot. Fire-and-forget on the credit
         // flush path so we don't stall event-loop entry on SQLite I/O.
         if any_pruned {
-            let _ = spawn_credit_flush(
+            spawn_credit_flush(
                 arc.clone(),
                 db.clone(),
                 data_dir.clone(),
@@ -16067,8 +16185,9 @@ pub async fn start_network(
             }
         }
 
-        // Rate-limit LowID callback requests after login / poll bursts.
-        const MAX_LOWID_CALLBACKS_PER_TURN: usize = 32;
+        // Rate-limit LowID callback requests after login / poll bursts. Every
+        // producer feeds this queue through `queue_lowid_callbacks` (capped at
+        // MAX_PENDING_LOWID_CALLBACKS) rather than writing to the server itself.
         if !pending_lowid_callback_queue.is_empty()
             && state.server_connected
             && !state.low_id
@@ -17392,7 +17511,11 @@ pub async fn start_network(
                     let db2 = db.clone();
                     let h2 = hash_hex.clone();
                     let ip2 = ip_str.clone();
-                    let _ = tokio::task::spawn_blocking(move || db2.update_friend_address(&h2, &ip2, port));
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                            warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                        }
+                    });
                     // `FriendSeen` now carries the peer's Hello listen port
                     // (not the connection's ephemeral socket port — see the
                     // emission sites in multi_source.rs/transfer.rs), so it's
@@ -18341,8 +18464,10 @@ pub async fn start_network(
                             let h2 = hash_hex;
                             let ip2 = ip_str;
                             let port = *port;
-                            let _ = tokio::task::spawn_blocking(move || {
-                                db2.update_friend_address(&h2, &ip2, port)
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                                    warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                                }
                             });
                             reseed_friend_endpoint(
                                 &mut state,
@@ -18369,8 +18494,10 @@ pub async fn start_network(
                             let h2 = hash_hex;
                             let ip2 = ip_str;
                             let port = *port;
-                            let _ = tokio::task::spawn_blocking(move || {
-                                db2.update_friend_address(&h2, &ip2, port)
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                                    warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                                }
                             });
                             reseed_friend_endpoint(
                                 &mut state,
@@ -18411,8 +18538,10 @@ pub async fn start_network(
                             let h2 = hash_hex.clone();
                             let ip2 = ip_str.clone();
                             let port = *port;
-                            let _ = tokio::task::spawn_blocking(move || {
-                                db2.update_friend_address(&h2, &ip2, port)
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                                    warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                                }
                             });
                             // `FriendSeen` now carries the peer's Hello listen
                             // port (see the emission sites in upload.rs), so
@@ -20436,14 +20565,16 @@ pub async fn start_network(
                                         if let std::net::IpAddr::V4(v4) = addr.ip() {
                                             let srv_ip = u32::from_le_bytes(v4.octets());
                                             let srv_port = addr.port();
-                                            for ls in &lowid_sources {
-                                                if ls.ed2k_server_ip == srv_ip
-                                                    && ls.ed2k_server_port == srv_port
-                                                {
-                                                    pending_lowid_callback_queue
-                                                        .push_back((fh, ls.lowid));
-                                                }
-                                            }
+                                            queue_lowid_callbacks(
+                                                &mut pending_lowid_callback_queue,
+                                                lowid_sources
+                                                    .iter()
+                                                    .filter(|ls| {
+                                                        ls.ed2k_server_ip == srv_ip
+                                                            && ls.ed2k_server_port == srv_port
+                                                    })
+                                                    .map(|ls| (fh, ls.lowid)),
+                                            );
                                         }
                                     }
                                 }
@@ -25883,7 +26014,7 @@ pub async fn start_network(
                     }
                     let mut reask_bitmaps: HashMap<String, Vec<bool>> = HashMap::new();
                     for tid in &reask_ids {
-                        if let Some(parts) = udp_reask_completed_parts(&state, tid).await {
+                        if let Some(parts) = udp_reask_serveable_parts(&state, tid).await {
                             reask_bitmaps.insert(tid.clone(), parts);
                         }
                     }
@@ -26094,63 +26225,51 @@ pub async fn start_network(
                         }
                     }
 
-                        if !state.low_id && state.server_connected {
-                            if let Some(conn) = &mut state.server_connection {
-                                let current_server = state.server_addr.and_then(|addr| {
-                                    match addr.ip() {
-                                        std::net::IpAddr::V4(v4) => {
-                                            Some((u32::from_le_bytes(v4.octets()), addr.port()))
-                                        }
-                                        _ => None,
-                                    }
-                                });
-                                if let Some((srv_ip, srv_port)) = current_server {
-                                    let mut fh = [0u8; 16];
-                                    fh.copy_from_slice(&hash_bytes);
-                                    let needing_callback = {
-                                        let sm = source_manager.read().await;
-                                        sm.get_lowid_sources_needing_callback(
-                                            &fh,
-                                            srv_ip,
-                                            srv_port,
-                                            ed2k::dead_sources::FILEREASKTIME_SECS,
-                                        )
-                                    };
-                                    if !needing_callback.is_empty() {
-                                        // Send the callback requests (each an
-                                        // untimed TCP write to the eD2K server)
-                                        // WITHOUT holding the SourceManager lock
-                                        // — mirrors the UDP-reask pass above,
-                                        // which was fixed for the same reason:
-                                        // holding `source_manager.write()`
-                                        // across a network `.await` stalls
-                                        // every other reader/writer (including
-                                        // every active MultiSourceDownload
-                                        // worker) and, since this arm runs
-                                        // inside the network task's own
-                                        // `select!`, the whole event loop, for
-                                        // as long as a slow/stalled server
-                                        // takes to drain its socket. Only the
-                                        // bookkeeping update below needs the
-                                        // lock, and that has no `.await`.
-                                        let mut sent_cids = Vec::with_capacity(needing_callback.len());
-                                        for cid in &needing_callback {
-                                            if conn.request_callback(*cid).await.is_ok() {
-                                                sent_cids.push(*cid);
-                                            }
-                                        }
-                                        if !sent_cids.is_empty() {
-                                            let mut sm = source_manager.write().await;
-                                            for cid in &sent_cids {
-                                                sm.mark_callback_sent(&fh, *cid);
-                                            }
-                                            did_search = true;
-                                            debug!("Sent {} LowID callback requests for pending download", sent_cids.len());
-                                        }
-                                    }
+                    if !state.low_id && state.server_connected && state.server_connection.is_some() {
+                        let current_server = state.server_addr.and_then(|addr| {
+                            match addr.ip() {
+                                std::net::IpAddr::V4(v4) => {
+                                    Some((u32::from_le_bytes(v4.octets()), addr.port()))
+                                }
+                                _ => None,
+                            }
+                        });
+                        if let Some((srv_ip, srv_port)) = current_server {
+                            let mut fh = [0u8; 16];
+                            fh.copy_from_slice(&hash_bytes);
+                            let needing_callback = {
+                                let sm = source_manager.read().await;
+                                sm.get_lowid_sources_needing_callback(
+                                    &fh,
+                                    srv_ip,
+                                    srv_port,
+                                    ed2k::dead_sources::FILEREASKTIME_SECS,
+                                )
+                            };
+                            if !needing_callback.is_empty() {
+                                // Hand the batch to the rate-limited drain rather
+                                // than writing it here. The source list is uncapped
+                                // and every `request_callback` is a TCP write bounded
+                                // only by SERVER_WRITE_TIMEOUT_SECS, so a slow or
+                                // stalled server held this arm — and with it the whole
+                                // single-task event loop: KAD UDP, every timer,
+                                // transfer events and IPC — for that long per source
+                                // in the batch. The drain sends at most
+                                // MAX_LOWID_CALLBACKS_PER_TURN per loop turn, stops at
+                                // the first failure, and owns the `mark_callback_sent`
+                                // bookkeeping for the ones it actually got out, so
+                                // nothing is marked sent here.
+                                let queued = queue_lowid_callbacks(
+                                    &mut pending_lowid_callback_queue,
+                                    needing_callback.iter().map(|cid| (fh, *cid)),
+                                );
+                                if queued > 0 {
+                                    did_search = true;
+                                    debug!("Queued {queued} LowID callback requests for pending download");
                                 }
                             }
                         }
+                    }
 
                     if did_search {
                         if let Some(pd) = state.pending_downloads.get_mut(&tid) {
@@ -26215,11 +26334,15 @@ pub async fn start_network(
                             }
                         }
                         if !to_queue.is_empty() {
-                            let n = to_queue.len();
-                            pending_lowid_callback_queue.extend(to_queue);
-                            debug!(
-                                "Queued {n} LowID callbacks for active downloads via {srv_ip}:{srv_port}"
+                            let n = queue_lowid_callbacks(
+                                &mut pending_lowid_callback_queue,
+                                to_queue,
                             );
+                            if n > 0 {
+                                debug!(
+                                    "Queued {n} LowID callbacks for active downloads via {srv_ip}:{srv_port}"
+                                );
+                            }
                         }
                     }
                 }
@@ -28180,35 +28303,28 @@ pub async fn start_network(
                                             ed2k::dead_sources::FILEREASKTIME_SECS,
                                         )
                                     };
-                                    if !needing_callback.is_empty() {
-                                        if let Some(conn) = &mut state.server_connection {
-                                            let current_server_matches = state.server_addr.map(|server_addr| {
-                                                server_addr.ip() == addr.ip() && server_addr.port() == udp_server_port
-                                            }).unwrap_or(false);
-                                            if current_server_matches {
-                                                // Send outside the SourceManager lock — see
-                                                // the identical fix on the TCP-sourced
-                                                // LowID-callback path above for why: an
-                                                // untimed `request_callback` write can stall
-                                                // on a slow/stuck server, and holding `sm`
-                                                // across it blocks every other reader/writer
-                                                // (and, since this runs inline in the
-                                                // network task's own event loop, all of
-                                                // networking) for as long as the write is
-                                                // stuck.
-                                                let mut sent_cids = Vec::with_capacity(needing_callback.len());
-                                                for cid in &needing_callback {
-                                                    if conn.request_callback(*cid).await.is_ok() {
-                                                        sent_cids.push(*cid);
-                                                    }
-                                                }
-                                                if !sent_cids.is_empty() {
-                                                    let mut sm = source_manager.write().await;
-                                                    for cid in &sent_cids {
-                                                        sm.mark_callback_sent(&file_hash, *cid);
-                                                    }
-                                                    debug!("Sent {} LowID callback requests from UDP sources", sent_cids.len());
-                                                }
+                                    if !needing_callback.is_empty() && state.server_connection.is_some() {
+                                        let current_server_matches = state.server_addr.map(|server_addr| {
+                                            server_addr.ip() == addr.ip() && server_addr.port() == udp_server_port
+                                        }).unwrap_or(false);
+                                        if current_server_matches {
+                                            // Queue instead of writing here — see the
+                                            // identical change on the TCP-sourced
+                                            // LowID-callback path above: an untimed
+                                            // `request_callback` write can stall on a
+                                            // slow/stuck server, and this runs inline in
+                                            // the network task's own event loop, so an
+                                            // uncapped batch of them freezes all of
+                                            // networking for as long as the writes are
+                                            // stuck. The drain paces the sends and does
+                                            // the `mark_callback_sent` bookkeeping for
+                                            // whatever it gets out.
+                                            let queued = queue_lowid_callbacks(
+                                                &mut pending_lowid_callback_queue,
+                                                needing_callback.iter().map(|cid| (file_hash, *cid)),
+                                            );
+                                            if queued > 0 {
+                                                debug!("Queued {queued} LowID callback requests from UDP sources");
                                             }
                                         }
                                     }
@@ -28874,12 +28990,16 @@ pub async fn start_network(
                                 if !pending.is_empty() {
                                     // Queue for rate-limited drain (MAX_LOWID_CALLBACKS_PER_TURN)
                                     // so login cannot monopolize the loop with N sequential awaits.
-                                    let n = pending.len();
-                                    pending_lowid_callback_queue.extend(pending);
-                                    info!(
-                                        "L-2 flush: queued {n} LowID callbacks via newly-connected server {}:{}",
-                                        addr.ip(), server_port_u16,
+                                    let n = queue_lowid_callbacks(
+                                        &mut pending_lowid_callback_queue,
+                                        pending,
                                     );
+                                    if n > 0 {
+                                        info!(
+                                            "L-2 flush: queued {n} LowID callbacks via newly-connected server {}:{}",
+                                            addr.ip(), server_port_u16,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -29198,8 +29318,8 @@ pub async fn start_network(
                                 )
                             }
                         };
-                        let completed_parts = match pending_tid.as_deref() {
-                            Some(tid) => udp_reask_completed_parts(&state, tid).await,
+                        let serveable_parts = match pending_tid.as_deref() {
+                            Some(tid) => udp_reask_serveable_parts(&state, tid).await,
                             None => None,
                         };
                         let complete_sources = state.per_file_sources.values()
@@ -29211,7 +29331,7 @@ pub async fn start_network(
                             &file_hash,
                             file_size,
                             complete_sources,
-                            completed_parts.as_deref(),
+                            serveable_parts.as_deref(),
                         ) else {
                             warn!("Skipping buddy UDP reask: file exceeds standard ED2K wire part-count limit");
                             continue;
@@ -29956,6 +30076,16 @@ pub async fn start_network(
                     let mapped = result.mapped;
                     state.upnp_mapped = mapped;
                     state.stats.upnp_mapped = mapped;
+                    // A live inbound forward is `tcp_port -> tcp_port`, so it
+                    // is authoritative for what peers should dial. Re-run the
+                    // publish state whenever that changes so the advertise
+                    // atomic the upload listener reads follows immediately
+                    // rather than at the next unrelated update.
+                    let upnp_tcp_port = upnp_mappings.tcp_mapped().then_some(state.tcp_port);
+                    if state.upnp_tcp_port != upnp_tcp_port {
+                        state.upnp_tcp_port = upnp_tcp_port;
+                        update_publish_manager_state(&mut state);
+                    }
                     if mapped && !was_mapped {
                         // Same semantics as startup (`firewalled:
                         // !upnp_success`): a fresh mapping means inbound
@@ -30139,14 +30269,20 @@ pub async fn start_network(
                 let cooldown_elapsed = state
                     .last_tcp_remap_reconnect_at
                     .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
-                if should_reconnect_for_tcp_remap(
-                    state.low_id,
-                    state.server_connected,
-                    state.pending_server_connect.is_some(),
-                    state.external_tcp_port,
-                    state.server_login_tcp_port,
-                    cooldown_elapsed,
-                ) {
+                // While UPnP holds the inbound forward we log in on `tcp_port`
+                // regardless of what STUN saw on the outbound flow, so a
+                // "remap" here would reconnect to re-send the port we already
+                // sent — churn that cannot turn LowID into HighID.
+                if state.upnp_tcp_port.is_none()
+                    && should_reconnect_for_tcp_remap(
+                        state.low_id,
+                        state.server_connected,
+                        state.pending_server_connect.is_some(),
+                        state.external_tcp_port,
+                        state.server_login_tcp_port,
+                        cooldown_elapsed,
+                    )
+                {
                     if let Some(addr) = state.server_addr {
                         info!(
                             "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",
@@ -37415,6 +37551,18 @@ async fn handle_udp_packet_inner(
     match msg {
         KadMessage::BootstrapReq => {
             debug!("BootstrapReq from {from}");
+            // The only KAD exchange where an unauthenticated 2-byte request
+            // draws a fixed ~523-byte answer, so it is the one response worth
+            // metering against a source address we cannot verify (~260x toward
+            // a spoofable target). Solicited answers are deliberately left out
+            // of this budget: a single page of SearchRes already fragments to
+            // roughly 18 datagrams, so charging them here would silently
+            // truncate legitimate paging — the very failure
+            // `SEARCH_RES_BUDGET_PER_REQUEST` was widened to avoid.
+            if state.flood_protection.check_outgoing_rate(from.ip()) {
+                debug!("Throttling BootstrapRes to {from}");
+                return;
+            }
             // eMule: GetBootstrapContacts returns 20 contacts from top buckets
             let contacts = state.routing_table.export_bootstrap_contacts(20);
             let res = KadMessage::BootstrapRes {
@@ -38679,11 +38827,12 @@ async fn handle_udp_packet_inner(
                 });
 
             if !page.is_empty() {
+                let local_id = state.local_id;
                 send_kad_search_results(
                     socket,
                     from,
                     state,
-                    state.local_id,
+                    local_id,
                     target,
                     &page,
                     packet_sender_udp_key,
@@ -38706,11 +38855,12 @@ async fn handle_udp_packet_inner(
 
             // eMule behavior: do not send SearchRes when there are no results.
             if !page.is_empty() {
+                let local_id = state.local_id;
                 send_kad_search_results(
                     socket,
                     from,
                     state,
-                    state.local_id,
+                    local_id,
                     target,
                     &page,
                     packet_sender_udp_key,
@@ -38999,11 +39149,12 @@ async fn handle_udp_packet_inner(
                 });
             // eMule behavior: do not send SearchRes when there are no results.
             if !results.is_empty() {
+                let local_id = state.local_id;
                 send_kad_search_results(
                     socket,
                     from,
                     state,
-                    state.local_id,
+                    local_id,
                     target,
                     &results,
                     packet_sender_udp_key,
@@ -41287,7 +41438,12 @@ async fn handle_command_inner(
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
                 if let Some(contact) = state.routing_table.get_contact(&kad_id) {
                     state.banned_ips.remove(&contact.ip);
-                    let _ = db.unban_ip(contact.ip);
+                    if let Err(e) = db.unban_ip(contact.ip) {
+                        warn!(
+                            "Failed to clear persisted IP ban for {} (peer {peer_id_hex}): {e}",
+                            contact.ip
+                        );
+                    }
                 }
             }
             if let Ok(peers) = db.get_peers() {
@@ -41298,7 +41454,11 @@ async fn handle_command_inner(
                                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                                     state.banned_ips.remove(&ip);
                                     // Also clear any persistent auto-ban for this IP.
-                                    let _ = db.unban_ip(ip);
+                                    if let Err(e) = db.unban_ip(ip) {
+                                        warn!(
+                                            "Failed to clear persisted IP ban for {ip} (peer {peer_id_hex}): {e}"
+                                        );
+                                    }
                                     // Soften IP-reputation so the next scored
                                     // event cannot immediately re-arm an IP ban.
                                     let _ = state.reputation.clear_ip_ban(ip);
@@ -42605,19 +42765,28 @@ async fn handle_command_inner(
             let nodes_path = state.data_dir.join("nodes.dat");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                state.nodes_save_lock.lock(),
+                state.nodes_save_lock.clone().lock_owned(),
             )
             .await
             {
-                Ok(_ownership) => {
-                    if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                        error!("Failed to save nodes.dat on disconnect: {e}");
-                    } else {
-                        info!(
-                            "Saved {} contacts to nodes.dat on disconnect",
-                            contacts.len()
-                        );
-                    }
+                Ok(ownership) => {
+                    // Off the loop, exactly like the periodic nodes_save_timer
+                    // arm: `save_nodes_dat` commits through `atomic_write`, which
+                    // fsyncs the file *and* its parent directory inline, so
+                    // running it here stalled UDP receive and every timer for the
+                    // duration — long enough for a full receive buffer to drop KAD
+                    // and Ember packets outright. The blocking task keeps the lock
+                    // guard, so the shutdown writer still serializes behind this
+                    // save instead of renaming an older snapshot over a newer one.
+                    let contact_count = contacts.len();
+                    tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
+                        if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                            error!("Failed to save nodes.dat on disconnect: {e}");
+                        } else {
+                            info!("Saved {contact_count} contacts to nodes.dat on disconnect");
+                        }
+                    });
                 }
                 Err(_) => warn!(
                     "Skipped disconnect nodes.dat checkpoint because the serialized periodic writer did not finish"

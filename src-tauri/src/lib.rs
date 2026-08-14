@@ -153,6 +153,18 @@ pub(crate) async fn run_graceful_shutdown(
         }
     }
 
+    // Cancelling a hasher only asks it to stop; the task still has to unwind,
+    // and dropping its `JoinHandle` detaches it rather than aborting it. Join
+    // the registered scans here so none of them can still hold
+    // `local_index.write()` (or be part-way through a `known_files` update)
+    // while the network task performs the authoritative shutdown flush below —
+    // that race is what leaves a half-written `known.met`. Bounded, and
+    // `await_background_scans` warns and aborts whatever is left when the
+    // window elapses, so a wedged scan cannot hold the process open: with the
+    // cancel flags already set a cooperative scan stops within ~100ms.
+    const SCAN_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+    state.await_background_scans(SCAN_JOIN_GRACE).await;
+
     let tx = state.network_tx.clone();
     const SHUTDOWN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
     let start = std::time::Instant::now();

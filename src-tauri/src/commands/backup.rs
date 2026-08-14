@@ -638,13 +638,14 @@ fn build_archive(
             let bytes = std::fs::read(&snapshot)
                 .map_err(|e| coded_ctx("backup_export_failed", "Failed to read the snapshot", e))?;
             let _ = std::fs::remove_file(&snapshot);
-            bytes
+            Zeroizing::new(bytes)
         } else {
             match std::fs::read(data_dir.join(spec.name)) {
                 Ok(raw) if spec.secret => {
                     // Unwrap here or the restored file is unreadable to any
                     // other Windows account, which is the whole point of the
-                    // feature.
+                    // feature. The plaintext is held in a `Zeroizing` buffer so
+                    // it is wiped once this entry has been written.
                     secret_store::unprotect(&raw).map_err(|e| {
                         coded_ctx(
                             "backup_export_failed",
@@ -653,7 +654,7 @@ fn build_archive(
                         )
                     })?
                 }
-                Ok(raw) => raw,
+                Ok(raw) => Zeroizing::new(raw),
                 // A file that was never created (no Kad contacts yet, no IP
                 // filter installed) is simply absent from the backup.
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2105,8 +2106,8 @@ mod tests {
             "restored identity must be re-wrapped"
         );
         assert_eq!(
-            secret_store::unprotect(&restored_identity).expect("unprotect restored identity"),
-            identity_plaintext
+            &secret_store::unprotect(&restored_identity).expect("unprotect restored identity")[..],
+            &identity_plaintext[..]
         );
 
         // The restored database opens and reports the schema it was taken at.

@@ -29,7 +29,6 @@
      *  is served-parts / part-count so it matches the filled segments.
      *  Fallback when the bitmap is missing. */
     transferred?: number;
-    transferred?: number;
     total?: number;
     color?: string;
     peerColor?: string;

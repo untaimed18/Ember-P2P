@@ -14,6 +14,12 @@ export type SearchTab = {
   fileType?: string;
   filters?: SearchFilters;
   results: SearchResult[];
+  /** Persistent `resultKey` -> index-into-`results` map. Kept on the tab so a
+   *  streaming flush only touches the incoming batch instead of rebuilding an
+   *  index over everything accumulated so far. Treated as a cache: any code
+   *  that replaces `results` without maintaining it (e.g. Clear Results) is
+   *  detected by the length check in `mergeIntoTab` and the map is rebuilt. */
+  resultIndex?: Map<string, number>;
   isSearching: boolean;
   progress: { nodes_contacted: number; results_so_far: number; phase: string } | null;
   error: string | null;
@@ -149,17 +155,63 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   };
 }
 
-export function mergeSearchResults(existing: SearchResult[], incoming: SearchResult[]): SearchResult[] {
-  const merged = new Map<string, SearchResult>();
-  for (const result of existing) {
-    merged.set(resultKey(result), result);
+/**
+ * Hard ceiling on the results one tab retains.
+ *
+ * Nothing upstream bounds accumulation: the ed2k TCP parser caps a single
+ * packet at 1000 hits and UDP is bounded by the datagram, but a global search
+ * keeps streaming those packets from every server and KAD node it reaches for
+ * as long as it runs, so a broad query grew the array (and every full-list
+ * pass the search page makes over it) without limit. 15k rows is far more than
+ * any user scrolls and still merges and sorts in a few milliseconds.
+ */
+const MAX_TAB_RESULTS = 15_000;
+/**
+ * Overflowing a tab trims it to here rather than exactly to the cap, so the
+ * eviction sort runs once per ~1.5k new results instead of once per flush for
+ * the rest of the search.
+ */
+const TAB_RESULTS_LOW_WATER = MAX_TAB_RESULTS - 1_500;
+
+/**
+ * Merge one batch into a tab, preserving `mergeResult`'s dedup semantics
+ * (source counts and origins are combined across duplicates) while touching
+ * only the incoming rows. Returns a new tab object with a fresh `results`
+ * array — consumers are `$derived` off it and would not see an in-place
+ * mutation — but the id index is carried across flushes and updated in place.
+ */
+function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
+  if (incoming.length === 0) return tab;
+  const results = tab.results.slice();
+  let index = tab.resultIndex;
+  // Results are deduplicated by key, so one entry per row is the invariant.
+  // A mismatch means something replaced `results` without the index (Clear
+  // Results empties it), and the cheapest correct answer is to rebuild.
+  if (!index || index.size !== results.length) {
+    index = new Map<string, number>();
+    for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
   for (const result of incoming) {
     const key = resultKey(result);
-    const current = merged.get(key);
-    merged.set(key, current ? mergeResult(current, result) : result);
+    const at = index.get(key);
+    if (at === undefined) {
+      index.set(key, results.length);
+      results.push(result);
+    } else {
+      results[at] = mergeResult(results[at], result);
+    }
   }
-  return [...merged.values()];
+  if (results.length > MAX_TAB_RESULTS) {
+    // Shed the least useful rows first. `availability` is the merged source
+    // count `mergeResult` maintains, so the rows dropped are the ones no peer
+    // claims to have — the ones a user can least act on. `sort` is stable, so
+    // ties keep the earlier-seen hit.
+    results.sort((a, b) => (b.availability || 0) - (a.availability || 0));
+    results.length = TAB_RESULTS_LOW_WATER;
+    index.clear();
+    for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
+  }
+  return { ...tab, results, resultIndex: index };
 }
 
 function updateTabByRequestId(
@@ -177,6 +229,16 @@ function updateTabByRequestId(
 /** Update a tab by network request id (for invoke completion / errors). */
 export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab) => SearchTab) {
   searchTabs.update((tabs) => updateTabByRequestId(tabs, requestId, fn));
+}
+
+/** Merge results into the tab owning `requestId`. The only supported way to
+ *  add results to a tab: it keeps the per-tab id index and the result cap in
+ *  step, which a caller assembling `results` itself would not. */
+export function appendSearchResults(requestId: number, incoming: SearchResult[]) {
+  if (!Array.isArray(incoming) || incoming.length === 0) return;
+  searchTabs.update((tabs) =>
+    updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)),
+  );
 }
 
 /**
@@ -203,6 +265,12 @@ export function patchSpamFlagByHash(fileHash: string, isSpam: boolean, spamRatin
   });
 }
 
+/** Ceiling on open search tabs, evicting oldest-first — the same bound
+ *  `chatTabs.ts` puts on the chat dock. Set well below that store's 50
+ *  because a search tab is far heavier: each one holds its own result array,
+ *  up to `MAX_TAB_RESULTS` rows. */
+const MAX_SEARCH_TABS = 20;
+
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
 export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number } {
   const requestId = newSearchNonce();
@@ -215,11 +283,26 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     fileType,
     filters,
     results: [],
+    resultIndex: new Map(),
     isSearching: true,
     progress: null,
     error: null,
   };
-  searchTabs.update((tabs) => [...tabs, tab]);
+  searchTabs.update((tabs) => {
+    const next = [...tabs, tab];
+    while (next.length > MAX_SEARCH_TABS) {
+      const evicted = next.shift();
+      if (!evicted) break;
+      // The tab is gone, so nothing will ever consume its buffered batches or
+      // stop its backend search — do both here rather than leave the network
+      // streaming results into a void.
+      pendingByRequest.delete(evicted.requestId);
+      if (evicted.isSearching) {
+        void cancelSearch(evicted.requestId).catch(() => { /* best effort */ });
+      }
+    }
+    return next;
+  });
   activeSearchTabId.set(id);
   return { tabId: id, requestId };
 }
@@ -298,10 +381,7 @@ function flushSearchResults() {
   searchTabs.update((tabs) => {
     let next = tabs;
     for (const [requestId, incoming] of batch) {
-      next = updateTabByRequestId(next, requestId, (t) => ({
-        ...t,
-        results: mergeSearchResults(t.results, incoming),
-      }));
+      next = updateTabByRequestId(next, requestId, (t) => mergeIntoTab(t, incoming));
     }
     return next;
   });

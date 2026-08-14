@@ -2,7 +2,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
+  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -763,6 +763,7 @@
     return knownClients.find((kc) => kc.user_hash.toLowerCase() === uh)?.ember_hash ?? undefined;
   }
   let queuePollHandle: ReturnType<typeof setInterval> | null = null;
+  let queueVisibilityHandler: (() => void) | null = null;
   let knownPollHandle: ReturnType<typeof setInterval> | null = null;
   let knownVisibilityHandler: (() => void) | null = null;
   const QUEUE_POLL_INTERVAL_MS = 3000;
@@ -1011,7 +1012,24 @@
     if (bottomView === 'queued') {
       refreshUploadQueue();
       if (queuePollHandle === null) {
-        queuePollHandle = setInterval(refreshUploadQueue, QUEUE_POLL_INTERVAL_MS);
+        queuePollHandle = setInterval(() => {
+          // Same gate as the known-clients poll below and every poll in the
+          // stores: a minimized client has nobody to show a queue rank to.
+          if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+            return;
+          }
+          refreshUploadQueue();
+        }, QUEUE_POLL_INTERVAL_MS);
+      }
+      // Skipping ticks while hidden means the first thing the user sees on
+      // restoring the window is up to a full interval out of date, so pump
+      // once on the way back.
+      if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
+        queueVisibilityHandler = () => {
+          if (document.visibilityState !== 'visible' || bottomView !== 'queued') return;
+          refreshUploadQueue();
+        };
+        document.addEventListener('visibilitychange', queueVisibilityHandler);
       }
     } else if (queuePollHandle !== null) {
       clearInterval(queuePollHandle);
@@ -1021,6 +1039,10 @@
       if (queuePollHandle !== null) {
         clearInterval(queuePollHandle);
         queuePollHandle = null;
+      }
+      if (typeof document !== 'undefined' && queueVisibilityHandler !== null) {
+        document.removeEventListener('visibilitychange', queueVisibilityHandler);
+        queueVisibilityHandler = null;
       }
     };
   });
@@ -1171,7 +1193,14 @@
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
   const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
   const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
+  // localStorage can throw in private mode / on quota-exceeded, and
+  // `loadStoredColumnWidths` runs during mount — an escaped throw there
+  // aborted page initialization. The sort and column-setup persistence below
+  // all goes through these; the handful of other accesses in this file carry
+  // their own try/catch because they want to log or supply a default.
   function safeGetItem(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
+  function safeSetItem(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* ignore */ } }
+  function safeRemoveItem(key: string) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
   let dlSortField: DlSortField = $state(DL_SORT_FIELDS.includes(safeGetItem('transfers-dl-sort-field') as DlSortField) ? safeGetItem('transfers-dl-sort-field') as DlSortField : 'file_name');
   let dlSortAsc = $state(safeGetItem('transfers-dl-sort-asc') !== 'false');
   let ulSortField: UlSortField = $state(UL_SORT_FIELDS.includes(safeGetItem('transfers-ul-sort-field') as UlSortField) ? safeGetItem('transfers-ul-sort-field') as UlSortField : 'file_name');
@@ -1188,14 +1217,14 @@
   function toggleDlSort(field: DlSortField) {
     if (dlSortField === field) dlSortAsc = !dlSortAsc;
     else { dlSortField = field; dlSortAsc = true; }
-    localStorage.setItem('transfers-dl-sort-field', dlSortField);
-    localStorage.setItem('transfers-dl-sort-asc', String(dlSortAsc));
+    safeSetItem('transfers-dl-sort-field', dlSortField);
+    safeSetItem('transfers-dl-sort-asc', String(dlSortAsc));
   }
   function toggleUlSort(field: UlSortField) {
     if (ulSortField === field) ulSortAsc = !ulSortAsc;
     else { ulSortField = field; ulSortAsc = true; }
-    localStorage.setItem('transfers-ul-sort-field', ulSortField);
-    localStorage.setItem('transfers-ul-sort-asc', String(ulSortAsc));
+    safeSetItem('transfers-ul-sort-field', ulSortField);
+    safeSetItem('transfers-ul-sort-asc', String(ulSortAsc));
   }
   function toggleKnSort(field: KnSortField) {
     if (knSortField === field) {
@@ -1208,8 +1237,8 @@
       knSortField = field;
       knSortAsc = field === 'user_hash' || field === 'last_known_ip' || field === 'ident_state';
     }
-    localStorage.setItem('transfers-kn-sort-field', knSortField);
-    localStorage.setItem('transfers-kn-sort-asc', String(knSortAsc));
+    safeSetItem('transfers-kn-sort-field', knSortField);
+    safeSetItem('transfers-kn-sort-asc', String(knSortAsc));
   }
   function sortArrow(current: string, field: string, asc: boolean): string {
     if (current !== field) return '';
@@ -1315,13 +1344,21 @@
     return (t.total_size - completed) / speed;
   }
 
+  // One reused collator instead of the implicit per-comparison one
+  // `String.prototype.localeCompare` allocates. `sortedActiveDownloads`
+  // re-sorts on every `$transfers` update, so the name/category branches
+  // below were paying for a collator per comparison at flush rate. Default
+  // options, so ordering is unchanged. Mirrors the search page's
+  // `sortCollator`.
+  const sortCollator = new Intl.Collator();
+
   /** Shared download-sort comparator. D25 applies the same order to the
    *  Completed section so the user's sort preference isn't silently
    *  ignored for finished rows. */
   function compareDownloads(a: Transfer, b: Transfer): number {
     let cmp = 0;
     switch (dlSortField) {
-      case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
+      case 'file_name': cmp = sortCollator.compare(a.file_name, b.file_name); break;
       case 'total_size': cmp = a.total_size - b.total_size; break;
       case 'transferred': cmp = a.transferred - b.transferred; break;
       case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
@@ -1341,7 +1378,7 @@
       }
       case 'last_seen_complete': cmp = (a.last_seen_complete ?? 0) - (b.last_seen_complete ?? 0); break;
       case 'last_received': cmp = (a.last_received ?? 0) - (b.last_received ?? 0); break;
-      case 'category': cmp = (a.category || '').localeCompare(b.category || ''); break;
+      case 'category': cmp = sortCollator.compare(a.category || '', b.category || ''); break;
       case 'started_at': cmp = a.started_at - b.started_at; break;
     }
     return dlSortAsc ? cmp : -cmp;
@@ -1866,7 +1903,7 @@
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
         case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
-        case 'remove': await removeTransfer(t.id); speedHistory.delete(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'remove': await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
@@ -2187,6 +2224,7 @@
     for (const id of idSet) {
       markDownloadRemoved(id);
       speedHistory.delete(id);
+      forgetTransfer(id);
     }
     selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
     if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
@@ -2321,7 +2359,7 @@
     }
     e.preventDefault();
     splitPercent = Math.max(20, Math.min(80, newVal));
-    localStorage.setItem('transfers-split', String(splitPercent));
+    safeSetItem('transfers-split', String(splitPercent));
   }
 
   function toggleAdvancedDlCols() {
@@ -2457,17 +2495,17 @@
   }
 
   function persistColumnWidths(table: TableKey) {
-    localStorage.setItem(COLUMN_STORAGE_KEYS[table], JSON.stringify(columnWidths[table]));
+    safeSetItem(COLUMN_STORAGE_KEYS[table], JSON.stringify(columnWidths[table]));
   }
 
   function syncAdvancedDlState() {
     showAdvancedDlCols = DOWNLOAD_ADVANCED_COLUMN_KEYS.every((key) => !isColumnHidden('downloads', key));
-    localStorage.setItem('transfers-advanced-cols', showAdvancedDlCols ? '1' : '0');
+    safeSetItem('transfers-advanced-cols', showAdvancedDlCols ? '1' : '0');
   }
 
   function loadStoredColumnWidths() {
     for (const table of Object.keys(TABLE_COLUMNS) as TableKey[]) {
-      const saved = localStorage.getItem(COLUMN_STORAGE_KEYS[table]);
+      const saved = safeGetItem(COLUMN_STORAGE_KEYS[table]);
       if (!saved) continue;
       try {
         const parsed = JSON.parse(saved) as Record<string, unknown>;
@@ -2478,17 +2516,17 @@
           }
         }
       } catch {
-        localStorage.removeItem(COLUMN_STORAGE_KEYS[table]);
+        safeRemoveItem(COLUMN_STORAGE_KEYS[table]);
       }
     }
   }
 
   function persistColumnSetup(table: TableKey) {
-    localStorage.setItem(
+    safeSetItem(
       COLUMN_HIDDEN_STORAGE_KEYS[table],
       JSON.stringify(getOrderedColumns(table).filter((column) => isColumnHidden(table, column.key)).map((column) => column.key)),
     );
-    localStorage.setItem(COLUMN_ORDER_STORAGE_KEYS[table], JSON.stringify(getOrderedColumnKeys(table)));
+    safeSetItem(COLUMN_ORDER_STORAGE_KEYS[table], JSON.stringify(getOrderedColumnKeys(table)));
     if (table === 'downloads') syncAdvancedDlState();
   }
 
@@ -2496,16 +2534,16 @@
     let hasDownloadHiddenState = false;
 
     for (const table of Object.keys(TABLE_COLUMNS) as TableKey[]) {
-      const savedOrder = localStorage.getItem(COLUMN_ORDER_STORAGE_KEYS[table]);
+      const savedOrder = safeGetItem(COLUMN_ORDER_STORAGE_KEYS[table]);
       if (savedOrder) {
         try {
           columnOrder[table] = sanitizeColumnOrder(table, JSON.parse(savedOrder));
         } catch {
-          localStorage.removeItem(COLUMN_ORDER_STORAGE_KEYS[table]);
+          safeRemoveItem(COLUMN_ORDER_STORAGE_KEYS[table]);
         }
       }
 
-      const savedHidden = localStorage.getItem(COLUMN_HIDDEN_STORAGE_KEYS[table]);
+      const savedHidden = safeGetItem(COLUMN_HIDDEN_STORAGE_KEYS[table]);
       if (savedHidden) {
         if (table === 'downloads') hasDownloadHiddenState = true;
         try {
@@ -2519,7 +2557,7 @@
             }
           }
         } catch {
-          localStorage.removeItem(COLUMN_HIDDEN_STORAGE_KEYS[table]);
+          safeRemoveItem(COLUMN_HIDDEN_STORAGE_KEYS[table]);
         }
       }
     }
@@ -4473,6 +4511,7 @@
     // paint the progress bar red before cancel finishes.
     markDownloadRemoved(id);
     speedHistory.delete(id);
+    forgetTransfer(id);
     try {
       await cancelTransfer(id);
     } catch (e: unknown) {
@@ -4514,7 +4553,7 @@
   title={m.transfers_clear_completed()}
   message={m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) speedHistory.delete(id); return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->
@@ -4561,6 +4600,7 @@
     for (const id of idSet) {
       markDownloadRemoved(id);
       speedHistory.delete(id);
+      forgetTransfer(id);
     }
     selectedDownloadIds = [];
     lastClickedDlId = null;

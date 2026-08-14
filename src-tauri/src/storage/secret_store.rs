@@ -15,6 +15,8 @@
 //! Files without `MAGIC` are treated as legacy plaintext and are transparently
 //! re-saved in protected form by the callers on next load.
 
+use zeroize::Zeroizing;
+
 /// Marker prefixing a DPAPI-wrapped blob. Lets us distinguish protected files
 /// from legacy plaintext ones without a separate flag.
 const MAGIC: &[u8; 8] = b"EMBRSEC1";
@@ -66,7 +68,12 @@ pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// unchanged. Returns `Err` only when a MAGIC-tagged blob fails to decrypt
 /// (wrong user/machine, or corruption) — callers treat that like a corrupt
 /// secret file rather than silently rotating identity.
-pub fn unprotect(stored: &[u8]) -> anyhow::Result<Vec<u8>> {
+///
+/// The result is `Zeroizing` because it is the long-term private key material
+/// itself (identity, SecIdent keypair, chat-history key): without a wiping
+/// destructor the plaintext survives in freed heap for the rest of the process
+/// lifetime and lands in any crash dump written afterwards.
+pub fn unprotect(stored: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if is_protected(stored) {
         #[cfg(target_os = "windows")]
         {
@@ -81,12 +88,13 @@ pub fn unprotect(stored: &[u8]) -> anyhow::Result<Vec<u8>> {
             );
         }
     }
-    Ok(stored.to_vec())
+    Ok(Zeroizing::new(stored.to_vec()))
 }
 
 #[cfg(target_os = "windows")]
 mod win {
     use std::os::raw::c_void;
+    use zeroize::{Zeroize, Zeroizing};
 
     /// Win32 `DATA_BLOB` (a.k.a. `CRYPTOAPI_BLOB`).
     #[repr(C)]
@@ -134,14 +142,23 @@ mod win {
         }
     }
 
-    /// Copy the Windows-allocated output blob into an owned `Vec` and release
-    /// the original with `LocalFree`.
+    /// Copy the Windows-allocated output blob into an owned `Vec`, wipe the
+    /// original, and release it with `LocalFree`.
+    ///
+    /// `LocalFree` returns the pages to the process heap without clearing
+    /// them, so for `CryptUnprotectData` the decrypted key material would stay
+    /// legible in freed memory (and in a crash dump) until something else
+    /// happened to reuse the allocation. `Zeroize` for `[u8]` writes through a
+    /// volatile pointer and fences, so the wipe cannot be optimised away as a
+    /// dead store to memory we are about to free.
     ///
     /// # Safety
     /// `out` must be an output blob populated by a successful
     /// `CryptProtectData`/`CryptUnprotectData` call (non-null `pb_data`).
     unsafe fn take_out_blob(out: &DataBlob) -> Vec<u8> {
-        let v = std::slice::from_raw_parts(out.pb_data, out.cb_data as usize).to_vec();
+        let buffer = std::slice::from_raw_parts_mut(out.pb_data, out.cb_data as usize);
+        let v = buffer.to_vec();
+        buffer.zeroize();
         LocalFree(out.pb_data as *mut c_void);
         v
     }
@@ -174,7 +191,7 @@ mod win {
         Ok(unsafe { take_out_blob(&out) })
     }
 
-    pub fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
         let in_blob = blob(ciphertext);
         let ent_blob = blob(entropy);
         let mut out = DataBlob {
@@ -197,7 +214,9 @@ mod win {
         if ok == 0 || out.pb_data.is_null() {
             return Err("CryptUnprotectData failed".to_string());
         }
-        Ok(unsafe { take_out_blob(&out) })
+        // Moving the `Vec` into `Zeroizing` rehomes the pointer, not the bytes,
+        // so the plaintext never exists in a second buffer.
+        Ok(Zeroizing::new(unsafe { take_out_blob(&out) }))
     }
 }
 
@@ -210,7 +229,7 @@ mod tests {
         let secret = b"super secret key material \x00\x01\x02";
         let wrapped = protect(secret).expect("protect");
         let recovered = unprotect(&wrapped).expect("unprotect");
-        assert_eq!(&recovered, secret);
+        assert_eq!(&recovered[..], &secret[..]);
     }
 
     #[test]
@@ -218,6 +237,6 @@ mod tests {
         // A blob without MAGIC is returned unchanged (legacy migration path).
         let legacy = b"{\"kad_id\":[1,2,3]}";
         assert!(!is_protected(legacy));
-        assert_eq!(unprotect(legacy).unwrap(), legacy);
+        assert_eq!(&unprotect(legacy).unwrap()[..], &legacy[..]);
     }
 }

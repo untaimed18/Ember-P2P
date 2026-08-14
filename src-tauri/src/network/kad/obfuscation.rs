@@ -54,13 +54,17 @@ impl Rc4State {
         Rc4State { s, i: 0, j: 0 }
     }
 
+    /// Keystream one byte per input byte into `out`. Zipping the two slices
+    /// makes the length reconciliation structural: every current caller sizes
+    /// `out` exactly, and indexing `out` by the input's length would panic on
+    /// the packet path the first time one did not.
     pub fn process(&mut self, data: &[u8], out: &mut [u8]) {
-        for k in 0..data.len() {
+        for (input, output) in data.iter().zip(out.iter_mut()) {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
             let idx = self.s[self.i as usize].wrapping_add(self.s[self.j as usize]);
-            out[k] = data[k] ^ self.s[idx as usize];
+            *output = *input ^ self.s[idx as usize];
         }
     }
 

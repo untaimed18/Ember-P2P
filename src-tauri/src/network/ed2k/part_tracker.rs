@@ -102,6 +102,24 @@ pub struct PartTracker {
 
 impl PartTracker {
     pub fn new(file_size: u64, part_file: &Path) -> Self {
+        Self::new_with_identity(file_size, part_file, [0u8; 16])
+    }
+
+    /// Load a `.part.met` that is bound to an expected ed2k file hash.
+    ///
+    /// `.part.met` sidecars are named after the transfer, not the content, so
+    /// a stale or hand-moved sidecar can describe a completely different file.
+    /// Callers that know the hash they are downloading pass it here so
+    /// `load_emule_format` can reject a mismatched sidecar; passing `[0u8; 16]`
+    /// (via [`PartTracker::new`]) keeps the historical behaviour of adopting
+    /// whatever hash the file carries, for callers that only want the gap list.
+    /// The expected hash must be supplied at construction time because a later
+    /// `set_file_hash` overwrites the stored value and hides the mismatch.
+    pub fn new_with_identity(
+        file_size: u64,
+        part_file: &Path,
+        expected_file_hash: [u8; 16],
+    ) -> Self {
         let part_count = if file_size == 0 {
             0
         } else {
@@ -120,7 +138,7 @@ impl PartTracker {
             },
             in_progress: vec![false; part_count],
             met_path,
-            file_hash: [0u8; 16],
+            file_hash: expected_file_hash,
             file_name: String::new(),
             part_hashes: Vec::new(),
             part_verified: vec![false; part_count],
@@ -176,10 +194,45 @@ impl PartTracker {
         &self.part_hashes
     }
 
+    /// Drop the stored hashset together with every per-part verified flag,
+    /// leaving the gap list (and therefore the bytes already on disk) alone.
+    ///
+    /// Used when a hashset loaded from `.part.met` fails `verify_hashset`:
+    /// nothing may stay "verified" on the strength of hashes we just rejected,
+    /// and `part_hashes` has to be empty again for the normal
+    /// `OP_HASHSETREQUEST` path to fetch a trustworthy set from a peer.
+    pub fn clear_part_hashes_and_verified(&mut self) {
+        self.part_hashes.clear();
+        self.file_hash_verified = false;
+        for flag in self.part_verified.iter_mut() {
+            *flag = false;
+        }
+    }
+
+    /// Index of the first gap that can overlap a range starting at `start`.
+    ///
+    /// The gap list is always kept sorted by start offset and free of overlaps
+    /// (see `fill_range` / `add_gap` / the merge in `load_emule_format`), so
+    /// gap ends are sorted too and every gap before this index ends at or
+    /// before `start`. Callers scanning parts in ascending order can carry the
+    /// returned index forward instead of re-searching, which is what keeps
+    /// `completed_parts` linear.
+    fn first_gap_reaching(&self, start: u64) -> usize {
+        self.gaps.partition_point(|&(_, gap_end)| gap_end <= start)
+    }
+
+    /// Whether any gap overlaps `[start, end)`, given `from` is the index
+    /// returned by [`Self::first_gap_reaching`] for `start`.
+    fn gap_overlaps_from(&self, from: usize, end: u64) -> bool {
+        self.gaps
+            .get(from)
+            .is_some_and(|&(gap_start, _)| gap_start < end)
+    }
+
     /// Check if a part (9.28 MB chunk) is fully downloaded.
     pub fn is_part_complete(&self, part_idx: usize) -> bool {
         let (start, end) = self.part_range(part_idx);
-        !self.gaps.iter().any(|&(gs, ge)| gs < end && ge > start)
+        !self.gap_overlaps_from(self.first_gap_reaching(start), end)
     }
 
     /// Mark an entire part as complete (removes any gaps in the part's range).
@@ -457,9 +510,28 @@ impl PartTracker {
 
     /// Return a boolean bitmap of completed parts (for OP_FILESTATUS compatibility).
     pub fn completed_parts(&self) -> Vec<bool> {
-        (0..self.part_count)
-            .map(|i| self.is_part_complete(i))
-            .collect()
+        // One forward walk of the gap list rather than a per-part rescan from
+        // the front: this is recomputed on every part completion, source
+        // (re)start and pipeline extension while the shared tracker lock is
+        // held, and a fragmented gap list (up to MAX_GAP_ENTRIES) against the
+        // ~10,300 parts of a 100 GB file made that tens of millions of
+        // comparisons per call. Part starts only increase, so a gap that ends
+        // at or before the current part's start is irrelevant to every later
+        // part as well and can be skipped permanently.
+        let mut out = Vec::with_capacity(self.part_count);
+        let mut gap_idx = 0usize;
+        for part_idx in 0..self.part_count {
+            let (start, end) = self.part_range(part_idx);
+            while self
+                .gaps
+                .get(gap_idx)
+                .is_some_and(|&(_, gap_end)| gap_end <= start)
+            {
+                gap_idx += 1;
+            }
+            out.push(!self.gap_overlaps_from(gap_idx, end));
+        }
+        out
     }
 
     /// Parts that are BOTH gap-complete AND MD4-verified — i.e. the parts we
@@ -468,9 +540,11 @@ impl PartTracker {
     /// the serve gate (`is_range_safe_to_serve`) will then refuse, freezing the
     /// peer's download on a "dead" part it keeps re-requesting.
     pub fn serveable_parts(&self) -> Vec<bool> {
-        (0..self.part_count)
-            .map(|i| self.is_part_complete(i) && self.is_part_verified(i))
-            .collect()
+        let mut parts = self.completed_parts();
+        for (part_idx, serveable) in parts.iter_mut().enumerate() {
+            *serveable &= self.is_part_verified(part_idx);
+        }
+        parts
     }
 
     /// Return the raw gap list.
@@ -622,6 +696,17 @@ impl PartTracker {
         Ok(())
     }
 
+    /// Fall back to "nothing downloaded yet". Used when a `.part.met` is
+    /// rejected outright, because none of its resume data can be trusted once
+    /// the file identity or hashset it describes fails to match the download.
+    fn reset_to_incomplete(&mut self) {
+        self.gaps = if self.file_size > 0 {
+            vec![(0, self.file_size)]
+        } else {
+            Vec::new()
+        };
+    }
+
     fn load(&mut self) {
         if let Err(e) = self.load_inner() {
             if self.met_path.exists() {
@@ -630,11 +715,7 @@ impl PartTracker {
                     self.met_path.display()
                 );
             }
-            self.gaps = if self.file_size > 0 {
-                vec![(0, self.file_size)]
-            } else {
-                Vec::new()
-            };
+            self.reset_to_incomplete();
         }
         self.in_progress = vec![false; self.part_count];
     }
@@ -712,9 +793,41 @@ impl PartTracker {
         cursor.read_exact(&mut hash)?;
         if self.file_hash == [0u8; 16] {
             self.file_hash = hash;
+        } else if hash != [0u8; 16] && hash != self.file_hash {
+            // Never adopt another file's resume state. The caller's
+            // `set_file_hash` would overwrite the stored hash, so without this
+            // check a sidecar left behind by a different download is taken
+            // wholesale — including its part hashes, which would then verify
+            // every part of this file as corrupt.
+            tracing::warn!(
+                "File hash mismatch: part.met says {} but expected {} — ignoring stored gaps",
+                hex::encode(hash),
+                hex::encode(self.file_hash),
+            );
+            self.reset_to_incomplete();
+            return Ok(());
         }
 
         let part_hash_count = cursor.read_u16::<LittleEndian>()? as usize;
+        // A hashset that disagrees with the part count implied by the file size
+        // cannot be indexed by part, so every part beyond the stored range
+        // would silently stay unverifiable. Both counts are legitimate on
+        // disk: the on-wire hashset (one MD4 per part) and the `known.met`
+        // form, which appends the trailing `MD4("")` for sizes that are an
+        // exact multiple of PARTSIZE. Zero means "hashset not fetched yet".
+        if part_hash_count != 0
+            && part_hash_count != super::messages::ed2k_part_count_for_size(self.file_size)
+            && part_hash_count != super::hash::ed2k_known_met_part_hash_count(self.file_size)
+        {
+            tracing::warn!(
+                "Part hash count mismatch: part.met says {} but expected {} for {} bytes — ignoring stored gaps",
+                part_hash_count,
+                super::messages::ed2k_part_count_for_size(self.file_size),
+                self.file_size,
+            );
+            self.reset_to_incomplete();
+            return Ok(());
+        }
         if cursor.position() as usize + part_hash_count * 16 > data.len() {
             anyhow::bail!("truncated part hashes in part.met");
         }
@@ -1461,6 +1574,131 @@ mod tests {
         );
         tracker.mark_file_hash_verified();
         assert_eq!(tracker.progress_bytes(), file_size);
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// `completed_parts` / `serveable_parts` walk the sorted gap list with a
+    /// single forward cursor instead of rescanning it per part. Pin the result
+    /// against the naive per-part overlap scan across the shapes a cursor can
+    /// get wrong: no gaps, one gap spanning every part, gaps landing exactly on
+    /// part boundaries, single-byte gaps either side of a boundary, many small
+    /// gaps inside one part, and a short final part.
+    #[test]
+    fn completed_parts_matches_naive_scan() {
+        fn naive(tracker: &PartTracker) -> Vec<bool> {
+            (0..tracker.part_count)
+                .map(|i| {
+                    let (start, end) = tracker.part_range(i);
+                    !tracker
+                        .gap_list()
+                        .iter()
+                        .any(|&(gs, ge)| gs < end && ge > start)
+                })
+                .collect()
+        }
+
+        let part_path = temp_part_path("completed-parts-scan");
+        // Four full parts plus a 123-byte tail.
+        let file_size = PARTSIZE * 4 + 123;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        assert_eq!(tracker.part_count, 5);
+
+        assert_eq!(tracker.completed_parts(), naive(&tracker));
+        assert!(tracker.completed_parts().iter().all(|&done| !done));
+
+        tracker.fill_range(0, file_size);
+        assert_eq!(tracker.completed_parts(), naive(&tracker));
+        assert!(tracker.completed_parts().iter().all(|&done| done));
+
+        tracker.mark_incomplete(1);
+        tracker.mark_incomplete(3);
+        assert_eq!(tracker.completed_parts(), naive(&tracker));
+        assert_eq!(
+            tracker.completed_parts(),
+            vec![true, false, true, false, true]
+        );
+
+        // The one-byte gaps merge into their neighbour, so parts 0 and 2 lose
+        // exactly one byte each — the cursor must not skip a gap that begins
+        // where the previous part ended.
+        tracker.invalidate_range(4 * PARTSIZE, file_size);
+        tracker.invalidate_range(PARTSIZE - 1, PARTSIZE);
+        tracker.invalidate_range(2 * PARTSIZE, 2 * PARTSIZE + 1);
+        assert_eq!(tracker.completed_parts(), naive(&tracker));
+        assert!(tracker.completed_parts().iter().all(|&done| !done));
+
+        tracker.fill_range(0, file_size);
+        for i in 0..64u64 {
+            let at = 2 * PARTSIZE + i * 1024;
+            tracker.invalidate_range(at, at + 16);
+        }
+        assert_eq!(tracker.gap_list().len(), 64);
+        assert_eq!(tracker.completed_parts(), naive(&tracker));
+        assert_eq!(
+            tracker.completed_parts(),
+            vec![true, true, false, true, true]
+        );
+
+        tracker.set_part_verified(0);
+        tracker.set_part_verified(2);
+        tracker.set_part_verified(4);
+        let expected: Vec<bool> = naive(&tracker)
+            .into_iter()
+            .enumerate()
+            .map(|(i, complete)| complete && tracker.is_part_verified(i))
+            .collect();
+        assert_eq!(tracker.serveable_parts(), expected);
+        assert_eq!(
+            tracker.serveable_parts(),
+            vec![true, false, false, false, true]
+        );
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// A `.part.met` belonging to a different file must not be adopted: its gap
+    /// list would claim bytes this download never received and its part hashes
+    /// would fail every part. The caller's `set_file_hash` overwrites the
+    /// stored hash, so the expected hash has to be bound at load time.
+    #[test]
+    fn part_met_from_another_file_is_rejected() {
+        let part_path = temp_part_path("identity");
+        let file_size = PARTSIZE * 2 + 5;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0xAA; 16]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16], [0x33; 16]]);
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+
+        let same = PartTracker::new_with_identity(file_size, &part_path, [0xAA; 16]);
+        assert_eq!(same.gap_list(), &[(PARTSIZE, file_size)]);
+        assert_eq!(same.part_hashes().len(), 3);
+
+        let other = PartTracker::new_with_identity(file_size, &part_path, [0xBB; 16]);
+        assert_eq!(other.file_hash, [0xBB; 16]);
+        assert_eq!(other.gap_list(), &[(0, file_size)]);
+        assert!(other.part_hashes().is_empty());
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// A stored hashset whose length disagrees with the part count implied by
+    /// the file size cannot be indexed by part, so the sidecar is rejected
+    /// instead of leaving the parts past its end permanently unverifiable.
+    #[test]
+    fn part_met_with_wrong_hash_count_is_rejected() {
+        let part_path = temp_part_path("hash-count");
+        let file_size = PARTSIZE * 3;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0xCD; 16]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16]]);
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+
+        let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0xCD; 16]);
+        assert_eq!(reloaded.gap_list(), &[(0, file_size)]);
+        assert!(reloaded.part_hashes().is_empty());
+
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }
 }

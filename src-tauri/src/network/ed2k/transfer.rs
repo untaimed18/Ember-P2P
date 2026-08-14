@@ -3398,10 +3398,12 @@ impl Ed2kDownload {
 
         let file_size = self.file_size;
         let load_path = part_path.clone();
-        let mut tracker =
-            tokio::task::spawn_blocking(move || PartTracker::new(file_size, &load_path))
-                .await
-                .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
+        let expected_file_hash = self.file_hash;
+        let mut tracker = tokio::task::spawn_blocking(move || {
+            PartTracker::new_with_identity(file_size, &load_path, expected_file_hash)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
         if !part_hashes.is_empty() {
@@ -3417,14 +3419,29 @@ impl Ed2kDownload {
             // download advertised zero serveable parts for its whole life, and
             // a single corrupt block went unnoticed until the whole-file hash
             // at 100%, which then reset every part for re-download.
+            //
+            // The sidecar set is subject to the same `verify_hashset` gate as a
+            // peer-supplied hashset: it becomes authoritative for every per-part
+            // MD4, so a corrupt one would fail every part forever while its
+            // non-empty state suppressed the OP_HASHSETREQ that would replace it.
             let resumed = tracker.part_hashes().to_vec();
             if !resumed.is_empty() {
-                debug!(
-                    "Seeding {} part hash(es) from resumed .part.met for {}",
-                    resumed.len(),
-                    self.file_name
-                );
-                part_hashes = resumed;
+                if verify_hashset(&self.file_hash, &resumed, self.file_size) {
+                    debug!(
+                        "Seeding {} part hash(es) from resumed .part.met for {}",
+                        resumed.len(),
+                        self.file_name
+                    );
+                    part_hashes = resumed;
+                } else {
+                    warn!(
+                        "Resumed .part.met hashset for {} failed verification against {} — discarding it and re-fetching from a peer",
+                        self.file_name,
+                        hex::encode(self.file_hash),
+                    );
+                    tracker.clear_part_hashes_and_verified();
+                    super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
+                }
             }
         }
 
@@ -4849,14 +4866,35 @@ impl Ed2kDownload {
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
+        // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop during
+        // "Verifying" would otherwise leave a thread reading a multi-GB file for
+        // minutes. `TransferControl` does not expose its inner atomic, so mirror
+        // it onto a flag the hashers poll between reads (same shape as the
+        // archive-recovery job).
+        let verify_cancel = Arc::new(std::sync::atomic::AtomicBool::new(
+            self.control.is_cancelled(),
+        ));
+        let cancel_watch = {
+            let flag = verify_cancel.clone();
+            let control = self.control.clone();
+            tokio::spawn(async move {
+                control.wait_cancelled().await;
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let job_cancel = verify_cancel.clone();
         let verified_result = match tokio::task::spawn_blocking(move || {
             use std::io::{Read, Seek, SeekFrom};
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
             let (_, mut file) =
                 crate::security::filesystem::open_existing_approved(&verify_path, &allowed, false)?;
             let identity = crate::security::filesystem::opened_file_identity(&file)?;
-            let hash = super::hash::ed2k_hash_open_file(&mut file)?;
+            let hash =
+                super::hash::ed2k_hash_open_file_cancellable(&mut file, job_cancel.as_ref())?;
             let aich = if expected_aich.is_some() {
+                if job_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    anyhow::bail!("cancelled");
+                }
                 Some(super::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash)
             } else {
                 None
@@ -4866,6 +4904,9 @@ impl Ed2kDownload {
                 let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
                 let mut buf = vec![0u8; 1024 * 1024];
                 loop {
+                    if job_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        anyhow::bail!("cancelled");
+                    }
                     let n = file.read(&mut buf)?;
                     if n == 0 {
                         break;
@@ -4923,10 +4964,17 @@ impl Ed2kDownload {
                 None
             }
         };
+        cancel_watch.abort();
 
         let Some((verified_identity, actual_aich)) = verified_result else {
             if ember_pin_failed {
                 anyhow::bail!(EMBER_BLAKE3_MISMATCH_MSG);
+            }
+            // A Stop aborts the verification read part-way through the file.
+            // That is not evidence of corruption, so leave the gap list and the
+            // `.part` alone rather than re-opening every part for re-download.
+            if self.control.is_cancelled() {
+                anyhow::bail!("cancelled by user");
             }
             for i in 0..tracker.part_count {
                 tracker.mark_incomplete(i);

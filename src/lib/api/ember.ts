@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { withTimeout } from '$lib/utils';
 import type {
   EmberDiagnostics,
   EmberDhtContact,
@@ -12,7 +13,9 @@ import type {
  * count, and the local Noise X25519 public key.
  */
 export async function getEmberDiagnostics(): Promise<EmberDiagnostics> {
-  return invoke<EmberDiagnostics>('get_ember_diagnostics');
+  // Polled every 3 s by both /ember and the search page's readiness strip.
+  // Counter reads only, so a deadline here can only ever fire on a wedge.
+  return withTimeout(invoke<EmberDiagnostics>('get_ember_diagnostics'), 'get_ember_diagnostics', 10_000);
 }
 
 /**

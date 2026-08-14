@@ -230,6 +230,18 @@
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
 
+    // Last-resort floor for promise rejections nothing else caught. Every
+    // `invoke()` rejects whenever its Rust command returns `Err`, so a call
+    // that escapes its own handler used to fail completely silently — the
+    // reason went to the WebView2 console, which no user ever opens, and the
+    // action they triggered just appeared to do nothing.
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      console.error('Unhandled promise rejection:', event.reason);
+      if (!mounted) return;
+      toastError(translateError(event.reason, m.error_operation_failed()));
+    };
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
     // request so it is still surfaced exactly once after the listener is live.
@@ -510,6 +522,7 @@
 
     return () => {
       mounted = false;
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);

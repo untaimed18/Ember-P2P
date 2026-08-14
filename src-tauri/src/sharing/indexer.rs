@@ -39,16 +39,65 @@ pub struct DiscoveryResult {
     pub next_cursor: Option<String>,
 }
 
-/// Names discovery refuses to share: partial downloads, their sidecars, and
-/// our own temp/backup files. Shared with the `known.met` hydration path, which
-/// re-admits records without walking the directory tree — a stale record
-/// written before one of these rules existed would otherwise come straight back
-/// into the shared index.
+/// Credential basenames that must never be published, whatever directory they
+/// are found in — `SENSITIVE_DIR_NAMES` only covers the well-known homes of
+/// these files, and users copy them elsewhere.
+///
+/// Matched as a whole basename rather than as a substring: the real secrets
+/// always use the bare name (`~/.aws/credentials`, `~/.netrc`), while an
+/// ordinary file that merely contains one of these words —
+/// `credentials-explained.mp4`, `my_credentials_list.txt` — is legitimate
+/// shareable content and stays shareable.
+const SENSITIVE_SHARE_FILE_NAMES: &[&str] = &[
+    "credentials",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519",
+    "id_ed25519_sk",
+    ".env",
+    ".netrc",
+    "_netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".dockercfg",
+];
+
+/// Extensions that only ever carry private keys or key stores. Unlike the
+/// basenames above these are unambiguous, so any file with one is excluded.
+const SENSITIVE_SHARE_FILE_EXTENSIONS: &[&str] =
+    &["pem", "ppk", "pfx", "p12", "kdbx", "keystore", "jks"];
+
+/// Names discovery refuses to share: partial downloads, their sidecars, our own
+/// temp/backup files, and credential material. Shared with the `known.met`
+/// hydration path, which re-admits records without walking the directory tree —
+/// a stale record written before one of these rules existed would otherwise
+/// come straight back into the shared index.
 pub fn is_excluded_share_file_name(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
+    // Windows filenames are case-insensitive, so every rule matches on the
+    // lowercased name; otherwise `identity.PEM` or `Archive.BAK` slips through.
+    let name = name.to_ascii_lowercase();
+    if SENSITIVE_SHARE_FILE_NAMES.contains(&name.as_str())
+        // `.env.local`, `.env.production`, … are the same secret with an
+        // environment suffix.
+        || name.starts_with(".env.")
+    {
+        return true;
+    }
+    if let Some(extension) = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+    {
+        if SENSITIVE_SHARE_FILE_EXTENSIONS.contains(&extension.as_str()) {
+            return true;
+        }
+    }
     name.ends_with(".part")
         || name.ends_with(".part.met")
         || name.ends_with(".met.tmp")
@@ -388,5 +437,58 @@ impl FileIndexer {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
         Ok((ed2k, aich, part_hashes, ember, after.len(), modified_at))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excludes_credential_files() {
+        for name in [
+            "credentials",
+            "id_rsa",
+            "id_ed25519",
+            ".env",
+            ".env.production",
+            ".netrc",
+            "_netrc",
+            ".npmrc",
+            "server.pem",
+            "backup.kdbx",
+            "release.jks",
+            "debug.keystore",
+            "client.PFX",
+        ] {
+            assert!(
+                is_excluded_share_file_name(&Path::new(r"C:\Users\me\Documents").join(name)),
+                "{name} must never be shared"
+            );
+        }
+    }
+
+    #[test]
+    fn excludes_partials_and_backups_case_insensitively() {
+        assert!(is_excluded_share_file_name(Path::new("movie.avi.part")));
+        assert!(is_excluded_share_file_name(Path::new("profile.emberbackup")));
+        assert!(is_excluded_share_file_name(Path::new("Archive.BAK")));
+    }
+
+    #[test]
+    fn allows_ordinary_files_that_merely_mention_credentials() {
+        // The denylist is whole-basename, so real content keeps its name.
+        for name in [
+            "credentials-explained.mp4",
+            "my_credentials_list.txt",
+            "id_rsa.pub",
+            "environment.txt",
+            "keynote deck.key",
+        ] {
+            assert!(
+                !is_excluded_share_file_name(&Path::new(r"C:\Users\me\Videos").join(name)),
+                "{name} is ordinary content and must stay shareable"
+            );
+        }
     }
 }

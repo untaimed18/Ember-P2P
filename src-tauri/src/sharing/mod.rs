@@ -6,6 +6,12 @@ pub mod watcher;
 /// during recursive indexing under an allowed parent. Without the indexer
 /// skip, sharing e.g. a home folder would still walk into `.ssh` / `.gnupg`
 /// / `AppData` and expose secrets. Matched case-insensitively.
+///
+/// The dot-directories below are the standard per-user credential stores of
+/// widely installed tooling (`~/.aws/credentials`, `~/.kube/config`,
+/// `~/.docker/config.json`, browser profiles with saved logins). Sharing a home
+/// folder is allowed, so without these entries those files are hashed and
+/// published to eD2K, KAD and the Ember DHT as ordinary fetchable content.
 pub const SENSITIVE_DIR_NAMES: &[&str] = &[
     "windows",
     "program files",
@@ -14,6 +20,13 @@ pub const SENSITIVE_DIR_NAMES: &[&str] = &[
     "appdata",
     ".ssh",
     ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".config",
+    ".password-store",
+    ".mozilla",
+    ".thunderbird",
     "etc",
     "usr",
     "bin",

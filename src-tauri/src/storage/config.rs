@@ -17,6 +17,15 @@ fn backup_corrupt_config(config_path: &Path, reason: &str) -> anyhow::Result<Pat
         bak = config_path.with_extension(format!("json.{ts}.{n}.bak"));
         n += 1;
     }
+    // The search gives up after 1000 attempts. Writing to the name it stopped
+    // at would destroy the config preserved by an earlier failure — the one
+    // recoverable copy this function exists to keep — so fail closed instead.
+    if bak.exists() {
+        anyhow::bail!(
+            "config.json {reason}, but every backup name for this second is already \
+             taken; refusing to overwrite a previously preserved copy"
+        );
+    }
     if std::fs::rename(config_path, &bak).is_ok() {
         tracing::warn!(
             "config.json {reason}; reset to defaults. Original preserved at {}",
