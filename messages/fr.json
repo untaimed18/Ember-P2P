@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "Nom du fichier",
   "transfers_col_size": "Taille",
   "transfers_col_transferred": "Transféré",
+  "transfers_col_transferred_upload_hint": "Total envoyé à ce pair pendant cette session. Peut dépasser la taille du fichier, car un pair dont la vérification échoue redemande la même partie.",
   "transfers_col_completed": "Terminé",
   "transfers_col_speed": "Vitesse",
   "transfers_col_progress": "Progression",

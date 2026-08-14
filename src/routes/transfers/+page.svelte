@@ -53,6 +53,11 @@
     minWidth: number;
     className: string;
     sortField?: TSort;
+    /** Off until the user enables it from the column menu. For columns that
+     *  are useful to have but misleading in the default layout. */
+    defaultHidden?: boolean;
+    /** Header tooltip, for a column whose meaning is not self-evident. */
+    readonly title?: string;
   };
 
   const DOWNLOAD_COLUMNS: TransferColumn<DlSortField>[] = [
@@ -92,8 +97,12 @@
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
     { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
     { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 70, minWidth: 56, className: 'col-ul-speed', sortField: 'speed' },
-    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
-    { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 70, minWidth: 56, className: 'col-ul-total' },
+    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, get title() { return m.transfers_col_transferred_upload_hint(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
+    // Hidden by default. This is session wire bytes measured against the file
+    // size, and re-requests make the former legitimately exceed the latter, so
+    // side by side the pair reads like a bug. eMule's upload list has no size
+    // column at all for the same reason; still available from the column menu.
+    { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 70, minWidth: 56, className: 'col-ul-total', defaultHidden: true },
     { key: 'waited', get label() { return m.transfers_col_wait_time(); }, width: 80, minWidth: 72, className: 'col-ul-wait', sortField: 'waited' },
     { key: 'upload_time', get label() { return m.transfers_col_upload_time(); }, width: 80, minWidth: 72, className: 'col-ul-uptime', sortField: 'upload_time' },
     { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
@@ -158,7 +167,9 @@
   };
   const COLUMN_HIDDEN_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-column-hidden-DownloadListCtrl',
-    uploads: 'transfers-column-hidden-UploadListCtrl',
+    // V2: bumped when Size became hidden by default, so existing users pick
+    // the new layout up once instead of keeping a stale all-visible set.
+    uploads: 'transfers-column-hidden-UploadListCtrlV2',
     queue: 'transfers-column-hidden-QueueListCtrlV2',
     known: 'transfers-column-hidden-KnownClientsCtrl',
     clients: 'transfers-column-hidden-DownloadClientsCtrl',
@@ -176,7 +187,9 @@
   }
 
   function createDefaultHidden(columns: TransferColumn[]): Record<string, boolean> {
-    return Object.fromEntries(columns.map((column) => [column.key, false]));
+    return Object.fromEntries(
+      columns.map((column) => [column.key, column.defaultHidden ?? false]),
+    );
   }
 
   function createDefaultOrder(columns: TransferColumn[]): string[] {
@@ -2574,7 +2587,13 @@
         if (table === 'downloads') hasDownloadHiddenState = true;
         try {
           const parsed = JSON.parse(savedHidden);
-          hiddenColumns[table] = createDefaultHidden(TABLE_COLUMNS[table]);
+          // A saved list is the complete hidden set, so start from all-visible
+          // rather than the defaults. Re-deriving defaults here would re-hide
+          // any `defaultHidden` column the user had deliberately switched on,
+          // every single load — the stored format has no way to say "visible".
+          hiddenColumns[table] = Object.fromEntries(
+            TABLE_COLUMNS[table].map((column) => [column.key, false]),
+          );
           if (Array.isArray(parsed)) {
             for (const value of parsed) {
               if (typeof value === 'string' && value !== getFixedColumnKey(table) && TABLE_COLUMNS[table].some((column) => column.key === value)) {
@@ -3784,7 +3803,7 @@
                   ondrop={(e) => handleColumnDrop(e, 'uploads', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">
+                  <span class="header-content" title={column.title}>
                     {column.label}{column.sortField ? sortArrow(ulSortField, column.sortField, ulSortAsc) : ''}
                   </span>
                   <button

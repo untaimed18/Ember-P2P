@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "Dateiname",
   "transfers_col_size": "Größe",
   "transfers_col_transferred": "Übertragen",
+  "transfers_col_transferred_upload_hint": "Insgesamt in dieser Sitzung an diesen Peer gesendet. Kann die Dateigröße überschreiten, da ein Peer nach einer fehlgeschlagenen Prüfsumme denselben Teil erneut anfordert.",
   "transfers_col_completed": "Abgeschlossen",
   "transfers_col_speed": "Geschwindigkeit",
   "transfers_col_progress": "Fortschritt",

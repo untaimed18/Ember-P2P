@@ -1404,6 +1404,7 @@
   "transfers_col_file_name": "Имя файла",
   "transfers_col_size": "Размер",
   "transfers_col_transferred": "Передано",
+  "transfers_col_transferred_upload_hint": "Всего отправлено этому узлу за сеанс. Может превышать размер файла: узел, у которого не сошлась хеш-сумма, запрашивает ту же часть повторно.",
   "transfers_col_completed": "Завершено",
   "transfers_col_speed": "Скорость",
   "transfers_col_progress": "Прогресс",
