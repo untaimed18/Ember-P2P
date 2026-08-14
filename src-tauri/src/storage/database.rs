@@ -17,7 +17,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 26;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 27;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -1202,6 +1202,17 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 27 {
+            // Optional Ember content BLAKE3 supplied by an ed2k `eh=` link,
+            // friend browse/offer, or collection. Keeping it on the transfer
+            // row carries the pin through pause/restart the same way
+            // `expected_aich` does.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "transfers", "ember_file_hash", "TEXT")?;
+            set_version(&tx, 27)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -1585,8 +1596,8 @@ impl Database {
             TransferStatus::NoneNeeded => "noneneeded",
         };
         conn.execute(
-            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                file_name = excluded.file_name,
                file_hash = excluded.file_hash,
@@ -1601,7 +1612,8 @@ impl Database {
                started_at = excluded.started_at,
                priority = excluded.priority,
                category = excluded.category,
-               expected_aich = excluded.expected_aich",
+               expected_aich = excluded.expected_aich,
+               ember_file_hash = excluded.ember_file_hash",
             params![
                 transfer.id,
                 transfer.file_name,
@@ -1618,6 +1630,7 @@ impl Database {
                 transfer.priority,
                 transfer.category,
                 transfer.expected_aich,
+                transfer.ember_file_hash,
             ],
         )?;
         Ok(())
@@ -1638,7 +1651,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -1663,13 +1676,22 @@ impl Database {
                     // at an IPC boundary, but they are never written by Ember;
                     // seeing one in the database is corruption and must not
                     // silently resume an AICH-required transfer unpinned.
-                    let (expected_aich, pin_corrupt) = match raw_aich.as_deref() {
+                    let (expected_aich, aich_corrupt) = match raw_aich.as_deref() {
                         None => (None, false),
                         Some(value) => match crate::security::parse_expected_aich(Some(value)) {
                             Ok(Some(value)) => (Some(value), false),
                             Ok(None) | Err(_) => (None, true),
                         },
                     };
+                    let raw_ember: Option<String> = row.get(15)?;
+                    let (ember_file_hash, ember_corrupt) = match raw_ember.as_deref() {
+                        None => (None, false),
+                        Some(value) => match crate::security::parse_ember_file_hash(Some(value)) {
+                            Ok(Some(value)) => (Some(value), false),
+                            Ok(None) | Err(_) => (None, true),
+                        },
+                    };
+                    let pin_corrupt = aich_corrupt || ember_corrupt;
                     let mut status = match status_str.trim_matches('"') {
                         "searching" => TransferStatus::Searching,
                         "queued" => TransferStatus::Queued,
@@ -1715,8 +1737,13 @@ impl Database {
                         completed_size: transferred_val,
                         started_at: row.get(11)?,
                         failure_reason: pin_corrupt.then(|| {
-                            "Persisted AICH pin was corrupt; cancel and re-add the AICH link"
-                                .to_string()
+                            if ember_corrupt {
+                                "Persisted Ember digest was corrupt; cancel and re-add the eh= link"
+                                    .to_string()
+                            } else {
+                                "Persisted AICH pin was corrupt; cancel and re-add the AICH link"
+                                    .to_string()
+                            }
                         }),
                         failure_kind: pin_corrupt.then(|| "permanent".to_string()),
                         failure_stage: None,
@@ -1745,6 +1772,7 @@ impl Database {
                         user_hash: None,
                         ember_hash: None,
                         expected_aich,
+                        ember_file_hash,
                         completed_path: None,
                         up_part_status: None,
                         up_part_count: None,
@@ -4149,6 +4177,38 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("AICH")));
         }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn ember_file_hash_survives_transfer_restart_load() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-digest-transfer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        let expected = "cd".repeat(32);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (
+                    id, file_name, file_hash, peer_id, peer_name, direction, status,
+                    progress, speed, total_size, transferred, started_at, priority,
+                    category, expected_aich, ember_file_hash
+                 ) VALUES (?1, ?2, ?3, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', NULL, ?4)",
+                params!["transfer-ember", "file.bin", "11".repeat(16), expected],
+            )
+            .unwrap();
+        let loaded = db.get_incomplete_downloads().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].ember_file_hash.as_deref(),
+            Some(expected.as_str())
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

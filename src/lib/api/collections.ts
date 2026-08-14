@@ -5,6 +5,8 @@ export interface CollectionFile {
   size: number;
   hash: string;
   aich_hash: string;
+  /** Optional 64-char hex BLAKE3 digest when the collection includes it. */
+  ember_file_hash?: string;
 }
 
 export interface Collection {

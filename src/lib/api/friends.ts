@@ -153,6 +153,7 @@ export interface IncomingFileOffer {
   file_hash: string;
   file_name: string;
   file_size: number;
+  ember_file_hash?: string;
 }
 
 export async function retryFriendSearch(userHashHex: string): Promise<void> {
@@ -202,4 +203,6 @@ export interface BrowseFileEntry {
   name: string;
   /** Optional 40-char hex AICH root when the peer includes it. */
   aich_hash?: string;
+  /** Optional 64-char hex BLAKE3 digest when the peer includes it. */
+  ember_file_hash?: string;
 }

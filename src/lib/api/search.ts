@@ -28,38 +28,57 @@ export async function cancelSearch(requestId: number): Promise<void> {
   return invoke('cancel_search', { requestId });
 }
 
-export async function formatEd2kLink(name: string, size: number, fileHash: string): Promise<string> {
-  return invoke('format_ed2k_link', { name, size, fileHash });
+export type Ed2kLinkFile = {
+  name: string;
+  size: number;
+  hash: string;
+  emberFileHash?: string | null;
+};
+
+export async function formatEd2kLink(
+  name: string,
+  size: number,
+  fileHash: string,
+  emberFileHash?: string | null,
+): Promise<string> {
+  return invoke('format_ed2k_link', {
+    name,
+    size,
+    fileHash,
+    emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
+  });
 }
 
 /** Format many standard eD2K links in one IPC call (newline-separated). */
-export async function formatEd2kLinks(
-  files: Array<{ name: string; size: number; hash: string }>
-): Promise<string> {
+export async function formatEd2kLinks(files: Ed2kLinkFile[]): Promise<string> {
   return invoke('format_ed2k_links', { files });
 }
 
 /**
  * Build an ed2k link variant. When `aichHash` (40-char hex) is supplied it is
- * embedded as a base32 `h=` segment; when `withSources` is true our reachable
+ * embedded as a base32 `h=` segment; when `emberFileHash` (64-char hex) is
+ * supplied it is embedded as `eh=`; when `withSources` is true our reachable
  * endpoint is appended as a `sources,` segment (errors if firewalled).
  */
 export async function buildEd2kLink(
   name: string,
   size: number,
   fileHash: string,
-  opts: { aichHash?: string; withSources?: boolean } = {},
+  opts: { aichHash?: string; emberFileHash?: string; withSources?: boolean } = {},
 ): Promise<string> {
   return invoke('build_ed2k_link', {
     name,
     size,
     fileHash,
     aichHash: opts.aichHash ?? null,
+    emberFileHash: opts.emberFileHash ?? null,
     withSources: opts.withSources ?? false,
   });
 }
 
-export async function parseEd2kLink(link: string): Promise<{ name: string; size: number; hash: string; aich?: string }> {
+export async function parseEd2kLink(
+  link: string,
+): Promise<{ name: string; size: number; hash: string; aich?: string; ember?: string }> {
   return invoke('parse_ed2k_link', { link });
 }
 

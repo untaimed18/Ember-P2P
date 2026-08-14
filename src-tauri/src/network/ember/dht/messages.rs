@@ -271,6 +271,25 @@ pub fn encode_message(
     buf
 }
 
+/// The version byte of a DHT frame, if it is outside the range this build
+/// can parse.
+///
+/// Version 0 is not a peer we could upgrade — it is garbage — so it is left
+/// to the ordinary malformed path. A non-zero byte outside
+/// [`EMBER_DHT_MIN_VERSION`]..=[`EMBER_DHT_VERSION`] is a peer speaking a
+/// layout we refused at the version byte rather than misparsed.
+pub fn unsupported_dht_version(data: &[u8]) -> Option<u8> {
+    let version = *data.first()?;
+    if version == 0 {
+        return None;
+    }
+    if version < EMBER_DHT_MIN_VERSION || version > EMBER_DHT_VERSION {
+        Some(version)
+    } else {
+        None
+    }
+}
+
 /// Decode a DHT message from wire format.
 ///
 /// `has_pub_key`: whether the sender's public key is present in the header
@@ -1204,6 +1223,17 @@ mod tests {
         assert!(decode_message(&encoded, true).is_ok());
         assert!(EMBER_DHT_MIN_VERSION >= 1);
         assert!(EMBER_DHT_MIN_VERSION <= EMBER_DHT_VERSION);
+        assert_eq!(unsupported_dht_version(&encoded), None);
+        let mut newer = encoded.clone();
+        newer[0] = EMBER_DHT_VERSION + 1;
+        assert_eq!(unsupported_dht_version(&newer), Some(EMBER_DHT_VERSION + 1));
+        let mut zero = encoded;
+        zero[0] = 0;
+        assert_eq!(
+            unsupported_dht_version(&zero),
+            None,
+            "version 0 is garbage, not a peer we could upgrade"
+        );
     }
 
     #[test]

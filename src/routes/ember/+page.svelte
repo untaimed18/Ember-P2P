@@ -123,7 +123,6 @@
     return contacts.filter(
       (c) =>
         c.node_id.toLowerCase().includes(q) ||
-        c.addr.toLowerCase().includes(q) ||
         (c.distance ?? '').toLowerCase().includes(q),
     );
   });
@@ -341,6 +340,8 @@
     { id: 'serve-truncated', k: m.ember_stat_serve_truncated(), v: `${diag?.ember_dht_found_value_truncated ?? 0}/${diag?.ember_dht_found_value_withheld ?? 0}` },
     { id: 'buddy', k: m.ember_stat_buddy_pub_fwd(), v: `${diag?.ember_dht_buddy_publishes ?? 0}/${diag?.ember_dht_buddy_forwards ?? 0}` },
     { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
+    { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: String(diag?.ember_dht_version_mismatch ?? 0) },
+    { id: 'rendezvous', k: m.ember_stat_rendezvous(), v: `${diag?.ember_dht_rendezvous_last_peers ?? 0} / ${diag?.ember_dht_rendezvous_lookups ?? 0} / ${diag?.ember_dht_rendezvous_empty ?? 0}` },
     { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
     { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
@@ -584,21 +585,17 @@
               <thead>
                 <tr>
                   <th>{m.ember_dht_col_node_id()}</th>
-                  <th>{m.ember_dht_col_addr()}</th>
                   <th>{m.ember_dht_col_distance()}</th>
-                  <th>{m.ember_dht_col_fails()}</th>
                 </tr>
               </thead>
               <tbody>
-                {#each filteredContacts as c (c.node_id + c.addr)}
+                {#each filteredContacts as c (c.node_id)}
                   <tr>
                     <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
-                    <td><code>{c.addr}</code></td>
                     <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
-                    <td>{c.failed_queries}</td>
                   </tr>
                 {:else}
-                  <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
+                  <tr><td colspan="2" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
                 {/each}
               </tbody>
             </table>

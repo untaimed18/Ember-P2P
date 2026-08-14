@@ -241,7 +241,9 @@ On start, a stamp still inside `EMBER_SOURCE_REPUBLISH` (2h) is hydrated back
 to an `Instant`; a stamp older than the interval, or one that cannot be
 represented because the process has not been up that long, is omitted and the
 file is due immediately — republish-too-eager, the safe direction. Keyword
-schedule is still session-only.
+stamps use the same pattern (`FT_EMBER_KEYWORD_PUBLISH` = 0xE5) against
+`EMBER_KEYWORD_REPUBLISH` (12h), so a restart no longer republishes the whole
+library.
 
 ### 6. Storer-side replication costs more than it buys
 
@@ -295,11 +297,11 @@ missing that matter specifically for judging health after a long unattended run:
 
 ### Outside the DHT
 
-- **Transport session keying.** Sessions are keyed by address alone, so the
-  shadow-session map can protect an established peer from a key-churning spoofer
-  but cannot protect a peer whose *first* contact arrives at an address whose
-  shadow allowance is already full. Keying by `(address, static key)` removes the
-  need to rank indistinguishable claimants at all. Named in `install_session`.
+- ~~**Transport session keying.**~~ Sessions are keyed on `(address, static key)`,
+  so claimants at one address coexist (capped at four, the old 1-live-plus-3-shadow
+  budget). A genuine first contact at an address already full of spoof sessions
+  is kept; a named outgoing identity no longer discards another key at that
+  address. Named in `install_session`.
 - **Updater recovery only protects 1.5.3 onward.** The 1.5.2 → 1.5.3 hop runs
   1.5.2's updater, so if a hand-off fails silently again the user still sees
   nothing and must install by hand. The root cause of the original failure was
@@ -314,8 +316,9 @@ settled.
 
 ### Bootstrap and network health
 
-- Monitoring for rendezvous-key health: how many nodes are listed, how
-  often a cold lookup returns nothing.
+- ~~Monitoring for rendezvous-key health: how many nodes are listed, how
+  often a cold lookup returns nothing.~~ Surfaced as `ember_dht_rendezvous_*`
+  on the Ember page (listed / lookups / empty).
 - Stronger observed-IP / STUN interplay under awkward NATs (needs soak
   data).
 - Shard the rendezvous key space. The derivation is already versioned for
@@ -336,8 +339,10 @@ settled.
 ### Integrity and downloads
 
 - Surface BLAKE3 verify pass/fail in the transfer UI.
-- Seed `emberFileHash` from more UI entry points when the digest is
-  already known.
+- ~~Seed `emberFileHash` from more UI entry points when the digest is
+  already known.~~ ed2k `eh=` links, friend-browse trailers, file-offer
+  trailers, paste/deep-link, library copy, and friend accept all pass it
+  when present. Old peers ignore the extra bytes.
 
 ### Hardening and ops
 

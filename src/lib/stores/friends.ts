@@ -214,6 +214,9 @@ export async function initFriendsStore() {
         if (!user_hash || !file_hash) return;
         const file_name = safeEventText(event.payload?.file_name, 256);
         const file_size = Number(event.payload?.file_size) || 0;
+        const emberRaw = (event.payload?.ember_file_hash ?? '').trim().toLowerCase();
+        const ember_file_hash =
+          emberRaw.length === 64 && /^[0-9a-f]+$/.test(emberRaw) ? emberRaw : undefined;
         fileOffers.update((offers) => {
           // A friend re-offering the same file replaces the earlier prompt
           // instead of stacking duplicates.
@@ -221,7 +224,7 @@ export async function initFriendsStore() {
             (o) => !(o.user_hash === user_hash && o.file_hash === file_hash),
           );
           // Bound the list so a misbehaving friend cannot grow it without end.
-          return [...rest, { user_hash, file_hash, file_name, file_size }].slice(-20);
+          return [...rest, { user_hash, file_hash, file_name, file_size, ember_file_hash }].slice(-20);
         });
       }),
     );

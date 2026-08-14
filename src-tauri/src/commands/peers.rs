@@ -1764,7 +1764,8 @@ fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
 
 /// Snapshot the Ember DHT routing table — the contacts this node has learned
 /// from signed PING/PONG traffic, or been seeded with. Backs the contacts
-/// table on the Ember Network page.
+/// table on the Ember Network page. Peer addresses are omitted so the
+/// webview never sees them.
 #[tauri::command]
 pub async fn get_ember_dht_contacts(
     state: tauri::State<'_, AppState>,

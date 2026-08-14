@@ -273,7 +273,7 @@
         peerIp,
         peerPort,
         undefined,
-        undefined,
+        file.ember_file_hash,
         file.aich_hash,
         friendHash,
       );

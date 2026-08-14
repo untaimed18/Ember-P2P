@@ -96,13 +96,10 @@ const MAX_SESSIONS: usize = 4096;
 /// that address, so the stall cannot be renewed.
 const XX_RESPONDER_QUEUE_GRACE: Duration = Duration::from_secs(3);
 
-/// Caps on sessions displaced by another claimant at the same address and kept
-/// until their own frame proves them. See
-/// [`EmberTransport::trim_shadow_sessions`] for why the per-address bound is the
-/// one that carries the security property and the global one is only a memory
-/// backstop.
-const MAX_SHADOW_SESSIONS_PER_ADDR: usize = 3;
-const MAX_SHADOW_SESSIONS: usize = 1024;
+/// How many concurrent sessions one source address may hold. Each is keyed
+/// on `(address, static key)`, so claimants coexist instead of ranking for a
+/// single live slot. Four matches the old 1-live-plus-3-shadow budget.
+const MAX_SESSIONS_PER_ADDR: usize = 4;
 
 /// Retry cookies one XX attempt will act on. See
 /// `PendingHandshake::XxInitiatorMsg1::cookie_retries` for why this is two.
@@ -271,7 +268,7 @@ struct NoiseSession {
     last_activity: Instant,
     /// When this session's handshake completed, and unlike `last_activity` never
     /// touched again. Being able to order sessions by *arrival* rather than by use
-    /// is what makes [`EmberTransport::trim_shadow_sessions`] correct — see there.
+    /// is what makes [`EmberTransport::trim_sessions_at`] correct — see there.
     established: Instant,
     ik_authenticated: bool,
     /// Whether the peer has proven it can *receive* at this socket address.
@@ -622,7 +619,7 @@ impl EmberControlMessage {
 pub struct EmberTransport {
     local_noise_key: [u8; 32],
     local_noise_pub: [u8; 32],
-    sessions: HashMap<SocketAddr, NoiseSession>,
+    sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
     pending: HashMap<SocketAddr, PendingHandshake>,
     /// BLAKE3 digests of recently-processed handshake-initiation packets
     /// (`IK_INIT`, `XX_MSG1`) with the time we first saw them. An attacker can
@@ -639,10 +636,6 @@ pub struct EmberTransport {
     /// own. `take_deferred_ik` already refused an entry whose static key did not
     /// match, so this only stops one claimant evicting another's.
     deferred_ik: HashMap<(SocketAddr, [u8; 32]), DeferredIkPayload>,
-    /// Sessions a different-key claimant displaced at the same address, held
-    /// until one of their own frames proves which claimant really holds it.
-    /// See [`Self::install_session`]. Pruned in [`Self::cleanup`].
-    shadow_sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
     /// Per-process salt for [`Self::salted_addr_rank`], so eviction tie-breaks
     /// cannot be aimed by an attacker choosing its source addresses.
     trim_salt: [u8; 32],
@@ -719,7 +712,6 @@ impl EmberTransport {
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
             deferred_ik: HashMap::new(),
-            shadow_sessions: HashMap::new(),
             trim_salt: fresh_cookie_secret(),
             dialled: HashMap::new(),
             cookie_secret: fresh_cookie_secret(),
@@ -1018,13 +1010,13 @@ impl EmberTransport {
     /// Check if we have an established session with a peer.
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
-        self.sessions.contains_key(addr)
+        self.sessions.keys().any(|(session_addr, _)| session_addr == addr)
     }
 
     pub fn peer_is_ik_authenticated(&self, addr: &SocketAddr) -> bool {
         self.sessions
-            .get(addr)
-            .is_some_and(|session| session.ik_authenticated)
+            .iter()
+            .any(|((session_addr, _), session)| session_addr == addr && session.ik_authenticated)
     }
 
     /// Process an incoming Ember-encrypted UDP packet.
@@ -1079,49 +1071,18 @@ impl EmberTransport {
     ) -> OutgoingResult {
         self.note_dialled(peer.ip());
 
-        // An unvalidated session was installed by whoever sent an IK_INIT
-        // claiming this address, which an off-path attacker can forge. When
-        // we mean to reach a *different* identity, sealing to the squatter's
-        // static key hands it our traffic and leaves the peer we asked for
-        // deaf — the other half of the lockout the takeover guard used to
-        // cause. Nothing is lost by dropping an unproven session, so start a
-        // fresh handshake to the identity the caller named.
-        let squatted = match (remote_noise_pub, self.sessions.get(&peer)) {
-            (Some(want), Some(existing)) => {
-                !existing.addr_validated && existing.remote_noise_pub != *want
+        // Fast path: an established session for the identity we were asked to
+        // reach. Different keys at this address coexist, so a squatter holding
+        // another slot must not capture (or force us to discard) this one.
+        if let Some(session) = self.outgoing_session_mut(peer, remote_noise_pub) {
+            session.last_activity = Instant::now();
+            let key = session.remote_noise_pub;
+            let sealed = session.seal(message);
+            if let Some(packet) = sealed {
+                return OutgoingResult::Ready { packet };
             }
-            _ => false,
-        };
-        if squatted {
-            debug!(
-                "Discarding unvalidated session for {peer}: it holds a different static key \
-                 than the peer we are dialling"
-            );
-            // Only the squatter's own state: its deferred payload is keyed on its
-            // static key, and another claimant's must not be collateral.
-            if let Some(displaced) = self.sessions.remove(&peer) {
-                self.deferred_ik
-                    .remove(&(peer, displaced.remote_noise_pub));
-            }
-        }
-
-        // Fast path: established session
-        if self.sessions.contains_key(&peer) {
-            let sealed = {
-                let session = self
-                    .sessions
-                    .get_mut(&peer)
-                    .expect("checked contains_key above");
-                session.last_activity = Instant::now();
-                session.seal(message)
-            };
-            return match sealed {
-                Some(packet) => OutgoingResult::Ready { packet },
-                None => {
-                    self.sessions.remove(&peer);
-                    OutgoingResult::Error("encrypt failed".to_string())
-                }
-            };
+            self.sessions.remove(&(peer, key));
+            return OutgoingResult::Error("encrypt failed".to_string());
         }
 
         // A responder-side pending is not ours — see `XX_RESPONDER_QUEUE_GRACE`.
@@ -1179,146 +1140,108 @@ impl EmberTransport {
         }
     }
 
-    /// Install `session` as the live one for `addr`, keeping a different-key
-    /// session it displaces as a shadow.
+    /// The session `prepare_outgoing` should seal to.
     ///
-    /// A session is keyed on an address an off-path attacker can forge, so
-    /// "newest unproven claimant wins" is what stops a spoofed session locking
-    /// the address owner out. On its own that also let a spoofer replace a real
-    /// peer's session every few tens of milliseconds, so the peer's own probe
-    /// answer never had a session to decrypt against and its first contact never
-    /// completed. Retaining the displaced one makes an address hold effectively
-    /// one session per static key: the wrong claimant is never the one that opens
-    /// a frame, so neither has to outrank the other.
+    /// A named static key selects only that session. No key — a ping auto-reply
+    /// that just decrypted a frame — prefers a unique session at the address,
+    /// then a validated one, then the most recently active.
+    fn outgoing_session_mut(
+        &mut self,
+        peer: SocketAddr,
+        remote_noise_pub: Option<&[u8; 32]>,
+    ) -> Option<&mut NoiseSession> {
+        if let Some(want) = remote_noise_pub {
+            return self.sessions.get_mut(&(peer, *want));
+        }
+        let mut unique: Option<(SocketAddr, [u8; 32])> = None;
+        let mut best: Option<((SocketAddr, [u8; 32]), bool, Instant)> = None;
+        let mut count = 0usize;
+        for (slot, session) in &self.sessions {
+            if slot.0 != peer {
+                continue;
+            }
+            count += 1;
+            unique = Some(*slot);
+            let rank = (session.addr_validated, session.last_activity);
+            if best.is_none_or(|(_, validated, activity)| rank > (validated, activity)) {
+                best = Some((*slot, rank.0, rank.1));
+            }
+        }
+        let slot = if count == 1 {
+            unique?
+        } else {
+            best.map(|(slot, _, _)| slot)?
+        };
+        self.sessions.get_mut(&slot)
+    }
+
+    /// Install `session` at `(addr, static key)`, replacing a previous handshake
+    /// for the same key and sitting alongside any other keys at the address.
     fn install_session(&mut self, addr: SocketAddr, session: NoiseSession) {
         let arriving_key = session.remote_noise_pub;
-        // Enforced here, not only at the handshake call sites: promoting a proven
-        // shadow can install a session at an address that has none — its live
-        // entry having been evicted or discarded — and that path had no cap check,
-        // so `sessions` could grow past `MAX_SESSIONS` by as many promotions as
-        // there were shadows.
-        if !self.sessions.contains_key(&addr) && self.sessions.len() >= MAX_SESSIONS {
+        let slot = (addr, arriving_key);
+        if !self.sessions.contains_key(&slot) && self.sessions.len() >= MAX_SESSIONS {
             self.evict_one_session();
         }
-        // This handshake supersedes any shadow for the same key: leaving an older
-        // one there would let frames from the earlier handshake promote it back
-        // over the session that just replaced it.
-        self.shadow_sessions.remove(&(addr, arriving_key));
-        if let Some(displaced) = self.sessions.insert(addr, session) {
-            if displaced.remote_noise_pub == arriving_key {
-                return;
+        self.sessions.insert(slot, session);
+        self.trim_sessions_at(addr, arriving_key);
+    }
+
+    /// Keep one address from holding more than [`MAX_SESSIONS_PER_ADDR`] sessions.
+    ///
+    /// Shedding the newest *unvalidated* claimant (never the arrival, never a
+    /// validated peer to admit an unproven one) is what lets a genuine first
+    /// contact complete at an address whose slots are already full of spoofs:
+    /// she is the arrival, so the oldest spoof stays and a newer one is dropped
+    /// instead of her.
+    fn trim_sessions_at(&mut self, addr: SocketAddr, arriving: [u8; 32]) {
+        while self
+            .sessions
+            .keys()
+            .filter(|(session_addr, _)| *session_addr == addr)
+            .count()
+            > MAX_SESSIONS_PER_ADDR
+        {
+            let arriving_validated = self
+                .sessions
+                .get(&(addr, arriving))
+                .is_some_and(|session| session.addr_validated);
+            let newest_unvalidated = self
+                .sessions
+                .iter()
+                .filter(|((session_addr, key), session)| {
+                    *session_addr == addr && *key != arriving && !session.addr_validated
+                })
+                .max_by_key(|(_, session)| session.established)
+                .map(|(slot, _)| *slot);
+            if let Some(victim) = newest_unvalidated {
+                self.sessions.remove(&victim);
+                continue;
             }
-            self.shadow_sessions
-                .insert((addr, displaced.remote_noise_pub), displaced);
-            self.trim_shadow_sessions(addr);
+            if !arriving_validated {
+                // Never shed a validated peer to admit an unproven newcomer.
+                self.sessions.remove(&(addr, arriving));
+                break;
+            }
+            let lru = self
+                .sessions
+                .iter()
+                .filter(|((session_addr, key), _)| *session_addr == addr && *key != arriving)
+                .min_by_key(|(_, session)| session.last_activity)
+                .map(|(slot, _)| *slot);
+            if let Some(victim) = lru {
+                self.sessions.remove(&victim);
+            } else {
+                break;
+            }
         }
     }
 
-    /// Keep [`Self::shadow_sessions`] bounded, per address first.
-    ///
-    /// The shadows at an address are claimants already pushed aside, in the order
-    /// they arrived — the handshake-completion paths only ever displace an
-    /// unvalidated session, though the promotion path in
-    /// [`Self::open_with_shadow_session`] can displace a validated one, so that is
-    /// nearly rather than strictly true. A spoofer churning static keys mints the
-    /// newest of them, so shedding the newest keeps the peer who arrived first.
-    ///
-    /// Worth being exact about what that does and does not buy, because the rule
-    /// reads stronger than it is. It protects a peer whose session predates the
-    /// spoof shadows, which is the ordinary case: an established peer being pushed
-    /// aside by an attacker who starts churning keys. It does *not* protect a peer
-    /// whose first contact arrives at an address where the allowance is already
-    /// full of older spoof shadows — she is then the newest, and is shed at once.
-    /// No ranking can fix that, because at that moment the claimants really are
-    /// indistinguishable: both are unvalidated sessions with a probe outstanding.
-    /// The fix is to stop keying sessions by address alone, which
-    /// [`Self::install_session`] already names, and until then the return-routability
-    /// probe is what limits the damage to first contact.
-    ///
-    /// "Newest" has to mean newest *handshake*, which is why `established` exists.
-    /// Ranking by `last_activity` looked equivalent and inverted the rule in the
-    /// case that matters: a genuine session is displaced while it is busy, so its
-    /// last activity is a moment ago, whereas a spoofer's shadows have not carried
-    /// a byte since they were minted. With a few aged spoof shadows already at the
-    /// address, one more churned key displaced the real peer and the trim then
-    /// picked *it* as the newest and dropped it — handing the attacker exactly the
-    /// lockout the shadow map was added to prevent.
-    ///
-    /// Both caps shed within one address, never across them. The global cap used to
-    /// take the least recently active entry map-wide, which made it a targeted
-    /// eviction primitive rather than a memory backstop: a shadow's activity clock
-    /// stops the moment it is displaced (only a decrypt refreshes it, and that
-    /// promotes it straight back out of the map), so the oldest entry is always
-    /// whoever has been waiting longest for a probe answer — the peer this map
-    /// exists to protect. Around fourteen hundred spoofed initiations spread over a
-    /// few hundred forged source addresses filled the map with newer entries, and
-    /// the next displacement anywhere then evicted the victim, restoring the
-    /// first-contact lockout. Nothing rate-limits inbound handshakes, because the
-    /// frame limiter only runs after decryption.
-    ///
-    /// Shedding from whichever address holds the most therefore serves both goals:
-    /// memory stays bounded at `MAX_SHADOW_SESSIONS`, and pressure applied at one
-    /// address can only ever cost that address.
-    fn trim_shadow_sessions(&mut self, addr: SocketAddr) {
-        while self
-            .shadow_sessions
-            .keys()
-            .filter(|(shadow_addr, _)| *shadow_addr == addr)
-            .count()
-            > MAX_SHADOW_SESSIONS_PER_ADDR
-        {
-            let Some(newest) = self
-                .shadow_sessions
-                .iter()
-                .filter(|((shadow_addr, _), _)| *shadow_addr == addr)
-                .max_by_key(|(_, session)| session.established)
-                .map(|(key, _)| *key)
-            else {
-                break;
-            };
-            self.shadow_sessions.remove(&newest);
-        }
-        while self.shadow_sessions.len() > MAX_SHADOW_SESSIONS {
-            // The address carrying the most, and its newest handshake — the same
-            // rule as above, so a flood is charged to the address that produced it.
-            //
-            // Ties break on a salted hash of the address rather than on the address
-            // itself. A spoofer chooses its own source addresses, so an ordered
-            // tie-break is one it can aim: a thousand forged addresses sorting below
-            // a victim's, one shadow each, leaves every address tied at one and
-            // makes the victim the maximum — shedding the very session this map
-            // exists to keep. The salt is per-process, so the ordering cannot be
-            // computed from outside.
-            let mut held: HashMap<SocketAddr, usize> = HashMap::new();
-            for (shadow_addr, _) in self.shadow_sessions.keys() {
-                *held.entry(*shadow_addr).or_insert(0) += 1;
-            }
-            let Some(heaviest) = held
-                .into_iter()
-                .max_by_key(|(shadow_addr, count)| (*count, self.salted_addr_rank(shadow_addr)))
-                .map(|(shadow_addr, _)| shadow_addr)
-            else {
-                break;
-            };
-            let Some(newest) = self
-                .shadow_sessions
-                .iter()
-                .filter(|((shadow_addr, _), _)| *shadow_addr == heaviest)
-                .max_by_key(|(_, session)| session.established)
-                .map(|(key, _)| *key)
-            else {
-                break;
-            };
-            self.shadow_sessions.remove(&newest);
-        }
-    }
 
     /// Remove expired sessions and pending handshakes.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
         self.sessions
-            .retain(|_, s| now.duration_since(s.last_activity) < SESSION_TIMEOUT);
-        self.shadow_sessions
             .retain(|_, s| now.duration_since(s.last_activity) < SESSION_TIMEOUT);
         self.pending.retain(|_, p| {
             let created = match p {
@@ -1339,8 +1262,7 @@ impl EmberTransport {
     /// Remove an existing session for a peer (e.g., on disconnect).
     #[allow(dead_code)]
     pub fn remove_session(&mut self, addr: &SocketAddr) {
-        self.sessions.remove(addr);
-        self.shadow_sessions.retain(|(shadow, _), _| shadow != addr);
+        self.sessions.retain(|(session_addr, _), _| session_addr != addr);
         self.pending.remove(addr);
         self.deferred_ik.retain(|(deferred, _), _| deferred != addr);
     }
@@ -1352,7 +1274,6 @@ impl EmberTransport {
     /// different intent, possibly different peer trust).
     pub fn cleanup_all(&mut self) {
         self.sessions.clear();
-        self.shadow_sessions.clear();
         self.pending.clear();
         self.recent_handshakes.clear();
         self.deferred_ik.clear();
@@ -1456,7 +1377,10 @@ impl EmberTransport {
         // The probe answer itself is ours to swallow — surfacing it would
         // look like an unsolicited reply to the caller's pending-ping
         // registry — whether or not a deferred payload is still waiting.
-        let probe_answered = self.consume_probe_answer(from, &payload);
+        let probe_answered = match outcome.remote_noise_pub {
+            Some(key) => self.consume_probe_answer(from, &key, &payload),
+            None => false,
+        };
         let mut payloads = Vec::with_capacity(2);
         if let Some(deferred) = released {
             payloads.push(deferred.payload);
@@ -1483,7 +1407,9 @@ impl EmberTransport {
             // source/transfer managers required to act on them.
             if let EmberControlMessage::Ping { nonce } = &message {
                 let pong = EmberControlMessage::Pong { nonce: *nonce }.encode();
-                if let OutgoingResult::Ready { packet } = self.prepare_outgoing(from, None, &pong) {
+                if let OutgoingResult::Ready { packet } =
+                    self.prepare_outgoing(from, outcome.remote_noise_pub.as_ref(), &pong)
+                {
                     outcome.responses.push(packet);
                 }
             }
@@ -1501,8 +1427,13 @@ impl EmberTransport {
     /// two now come apart: an earlier frame can release the payload while the
     /// probe's answer is still in flight, and that answer must still be
     /// swallowed when it lands.
-    fn consume_probe_answer(&mut self, from: SocketAddr, payload: &[u8]) -> bool {
-        let Some(session) = self.sessions.get_mut(&from) else {
+    fn consume_probe_answer(
+        &mut self,
+        from: SocketAddr,
+        remote_noise_pub: &[u8; 32],
+        payload: &[u8],
+    ) -> bool {
+        let Some(session) = self.sessions.get_mut(&(from, *remote_noise_pub)) else {
             return false;
         };
         let Some(nonce) = session.probe_nonce else {
@@ -1660,43 +1591,9 @@ impl EmberTransport {
             }
         };
 
-        // Don't let a NEW handshake from the same socket address silently
-        // replace a live session that belongs to a DIFFERENT Noise identity.
-        // A legitimate peer always re-handshakes with the same static key, so
-        // matching-key re-handshakes are still allowed (session refresh); only
-        // a mismatched static key (potential takeover via a shared NAT mapping
-        // or on-path attacker) is rejected.
-        //
-        // Only a *validated* incumbent earns that protection. An unvalidated
-        // session proves nothing about who is at the address — anyone able to
-        // forge a source address can install one — so preferring it over a
-        // newcomer inverted the guard into a lockout: one spoofed IK_INIT
-        // claiming a victim's address kept the victim itself from ever
-        // handshaking with us, refreshable with a packet per session lifetime
-        // and unrecoverable because decrypt failures never tear a session
-        // down. Between two unproven claimants, let the newest one try.
-        // KNOWN RESIDUAL: "newest unproven claimant wins" is what keeps a
-        // spoofed session from locking the address owner out (see
-        // `an_unvalidated_session_never_locks_out_the_address_owner`), but it
-        // also means a spoofer sending one init every few tens of milliseconds
-        // can replace a real peer's session before its `Pong` lands, so a
-        // targeted peer never completes inbound first contact. The two are in
-        // direct tension here and a grace window only moves the loss around:
-        // protecting the incumbent for one round trip reinstates a bounded
-        // version of the lockout, and one-shot payloads (`STORE_RECORD`,
-        // `ExchangeRequest`) have no retry to survive it. Keying sessions by
-        // `(addr, static_key)` so both claimants coexist — and the wrong one is
-        // simply never selected — removes the need to rank them at all, which is
-        // the actual fix and is deliberately not attempted here.
-        if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
-                debug!(
-                    "IK init from {from} carries a different static key than the live session; \
-                     rejecting to prevent session takeover"
-                );
-                return IncomingResult::Rejected;
-            }
-        }
+        // Sessions are keyed on `(addr, static key)`, so a different identity
+        // at this address installs alongside the incumbent instead of taking
+        // it over. Same-key completion is a refresh of that slot.
 
         let transport = match responder.into_stateless_transport_mode() {
             Ok(t) => t,
@@ -1706,9 +1603,6 @@ impl EmberTransport {
             }
         };
 
-        if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_one_session();
-        }
         let mut session = NoiseSession::new(transport, remote_noise_pub, true);
         // Clear any stale pending handshake for this address (e.g. an
         // earlier XX attempt we initiated before this IK init arrived).
@@ -1809,11 +1703,11 @@ impl EmberTransport {
     }
 
     /// Keep [`Self::deferred_ik`] bounded, on the same rule as
-    /// [`Self::trim_shadow_sessions`] and for the same reason: entries at one
+    /// [`Self::trim_sessions_at`] and for the same reason: entries at one
     /// address arrived in the order their claimants did, so a spoofer churning
     /// static keys mints the newest and shedding those keeps the genuine peer's
     /// request. The global cap sheds from whichever address holds the most, for the
-    /// same reason [`Self::trim_shadow_sessions`] does: shedding the map-wide oldest
+    /// same reason [`Self::trim_sessions_at`] does: shedding the map-wide oldest
     /// picks the peer that has been waiting longest for its probe answer, which is
     /// the one worth keeping. Exploiting that here would take roughly twenty
     /// thousand forged initiations a second against this map's larger bound, so it
@@ -1920,21 +1814,8 @@ impl EmberTransport {
             }
         };
 
-        // Mirror the responder guard: never let a completing handshake replace a
-        // live session that belongs to a DIFFERENT Noise identity at the same
-        // address (session-takeover defense). Same-key completion is a refresh
-        // and allowed, and an unvalidated incumbent — which anyone spoofing
-        // this address could have installed — never outranks a handshake we
-        // started ourselves.
-        if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
-                debug!(
-                    "IK resp from {from} would replace a live session with a different static key; \
-                     rejecting to prevent session takeover"
-                );
-                return IncomingResult::Rejected;
-            }
-        }
+        // Sessions coexist per static key, so completing this handshake cannot
+        // displace a different identity already at `from`.
 
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
@@ -1956,9 +1837,6 @@ impl EmberTransport {
             }
         }
 
-        if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_one_session();
-        }
         self.install_session(from, session);
         trace!("IK handshake completed (initiator) with {from}");
 
@@ -2341,19 +2219,8 @@ impl EmberTransport {
             }
         };
 
-        // Mirror the responder guard: a completing handshake must not replace a
-        // live session belonging to a DIFFERENT Noise identity at the same
-        // address (session-takeover defense). An unvalidated incumbent has
-        // proven nothing and does not outrank a handshake we started.
-        if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
-                debug!(
-                    "XX msg2 from {from} would replace a live session with a different static key; \
-                     rejecting to prevent session takeover"
-                );
-                return IncomingResult::Rejected;
-            }
-        }
+        // Sessions coexist per static key, so completing this handshake cannot
+        // displace a different identity already at `from`.
 
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
@@ -2374,9 +2241,6 @@ impl EmberTransport {
             }
         }
 
-        if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_one_session();
-        }
         self.install_session(from, session);
         trace!("XX handshake completed (initiator) with {from}");
 
@@ -2444,22 +2308,8 @@ impl EmberTransport {
             }
         };
 
-        // Mirror the IK responder guard: a completed XX handshake from the same
-        // socket address must not silently replace a live session belonging to
-        // a DIFFERENT Noise identity. A legitimate peer re-handshakes with its
-        // own static key (allowed — session refresh); a mismatched key is a
-        // potential takeover via a shared NAT mapping or on-path attacker.
-        // Message 3 is itself proof of return-routability, so it outranks an
-        // unvalidated incumbent that only ever claimed this address.
-        if let Some(existing) = self.sessions.get(&from) {
-            if existing.remote_noise_pub != remote_noise_pub && existing.addr_validated {
-                debug!(
-                    "XX msg3 from {from} carries a different static key than the live session; \
-                     rejecting to prevent session takeover"
-                );
-                return IncomingResult::Rejected;
-            }
-        }
+        // Sessions coexist per static key, so completing this handshake cannot
+        // displace a different identity already at `from`.
 
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
@@ -2486,9 +2336,6 @@ impl EmberTransport {
             }
         }
 
-        if self.sessions.len() >= MAX_SESSIONS {
-            self.evict_one_session();
-        }
         self.install_session(from, session);
         trace!(
             "XX handshake completed (responder) with {from}; flushed {} queued message(s)",
@@ -2520,109 +2367,42 @@ impl EmberTransport {
         let nonce = u64::from_le_bytes(data[..8].try_into().expect("8 bytes"));
         let ciphertext = &data[8..];
 
-        // Every way the live session can fail to account for this frame falls
-        // through to the sessions displaced at this address, because a displaced
-        // one lives *only* in `shadow_sessions`. Missing outright: eviction, the
-        // squatter discard in `prepare_outgoing`, or an encrypt failure dropped it.
-        // Refused by the replay window: a squatter holding the live slot can
-        // advance its own receive window with frames it encrypts itself, which
-        // would otherwise make the genuine peer's low-nonce probe answer look
-        // stale. Failed to decrypt: the ordinary case of two claimants.
-        let live_outcome = match self.sessions.get_mut(&from) {
-            Some(session) if session.replay_precheck(nonce) => {
-                let mut payload_buf = vec![0u8; ciphertext.len()];
-                match session
-                    .transport
-                    .read_message(nonce, ciphertext, &mut payload_buf)
-                {
-                    Ok(len) => {
-                        // Commit the nonce to the replay window only now that AEAD
-                        // has authenticated it.
-                        session.replay_commit(nonce);
-                        session.last_activity = Instant::now();
-                        // Deriving these keys required reading the handshake reply
-                        // we sent to this address, so this frame is the
-                        // return-routability proof an IK responder session starts
-                        // out without. From here the session can be trusted with
-                        // the address it is keyed on (see `handle_ik_init`).
-                        session.addr_validated = true;
-                        Some(IncomingResult::Message {
-                            from,
-                            remote_noise_pub: session.remote_noise_pub,
-                            payload: payload_buf[..len].to_vec(),
-                        })
-                    }
-                    Err(e) => {
-                        // Crucially, do NOT tear the session down: over UDP a
-                        // single spoofed, corrupt, or stray datagram would
-                        // otherwise kill a perfectly healthy session.
-                        debug!("Ember transport decrypt failed from {from} (nonce {nonce}): {e}");
-                        None
-                    }
-                }
-            }
-            Some(_) => {
-                trace!("Ember transport replayed/stale nonce {nonce} from {from} on the live session");
-                None
-            }
-            None => {
-                debug!("Ember transport packet from {from} with no live session");
-                None
-            }
-        };
-        match live_outcome {
-            Some(result) => result,
-            None => self.open_with_shadow_session(from, nonce, ciphertext),
-        }
-    }
-
-    /// Try the sessions displaced at `from`, promoting one that opens the frame.
-    fn open_with_shadow_session(
-        &mut self,
-        from: SocketAddr,
-        nonce: u64,
-        ciphertext: &[u8],
-    ) -> IncomingResult {
+        // Try every session at this address until AEAD succeeds. A squatter's
+        // replay window or decrypt failure must not hide the real peer's frame.
         let candidates: Vec<[u8; 32]> = self
-            .shadow_sessions
+            .sessions
             .keys()
             .filter(|(addr, _)| *addr == from)
             .map(|(_, key)| *key)
             .collect();
+        if candidates.is_empty() {
+            debug!("Ember transport packet from {from} with no session");
+            return IncomingResult::Rejected;
+        }
         for key in candidates {
-            let Some(shadow) = self.shadow_sessions.get_mut(&(from, key)) else {
+            let Some(session) = self.sessions.get_mut(&(from, key)) else {
                 continue;
             };
-            if !shadow.replay_precheck(nonce) {
+            if !session.replay_precheck(nonce) {
                 continue;
             }
             let mut payload_buf = vec![0u8; ciphertext.len()];
-            let Ok(len) = shadow
+            match session
                 .transport
                 .read_message(nonce, ciphertext, &mut payload_buf)
-            else {
-                continue;
-            };
-            shadow.replay_commit(nonce);
-            shadow.last_activity = Instant::now();
-            // Opening this frame required keys derived from the handshake reply we
-            // sent to this address, so it is the same return-routability proof a
-            // live session earns above.
-            shadow.addr_validated = true;
-            let remote_noise_pub = shadow.remote_noise_pub;
-            let payload = payload_buf[..len].to_vec();
-            let Some(proven) = self.shadow_sessions.remove(&(from, key)) else {
-                continue;
-            };
-            // Proven, so it takes the live slot back — and whatever it displaces
-            // becomes a shadow in turn, by the same rule.
-            self.install_session(from, proven);
-            debug!("Ember transport frame from {from} proved a displaced session; promoting it");
-            return IncomingResult::Message {
-                from,
-                remote_noise_pub,
-                payload,
-            };
+            {
+                Ok(len) => {
+                    session.replay_commit(nonce);
+                    session.last_activity = Instant::now();
+                    session.addr_validated = true;
+                    return IncomingResult::Message {
+                        from,
+                        remote_noise_pub: session.remote_noise_pub,
+                        payload: payload_buf[..len].to_vec(),
+                    };
+                }
+                Err(_) => continue,
+            }
         }
         IncomingResult::Rejected
     }
@@ -2631,35 +2411,21 @@ impl EmberTransport {
 
     /// Free one session slot when the table is full.
     ///
-    /// Deliberately not the globally least-recently-active session, which is
-    /// what this used to take. `handle_ik_init` installs a session before the
-    /// source address is proven, and nothing rate-limits inbound handshakes
-    /// because the frame limiter only runs after decryption — so a spoofer
-    /// working through forged source addresses could fill the table and shed
-    /// every established peer, because its own entries are always the freshest
-    /// and the honest ones therefore always the least recently active. The peers
-    /// do not find out: their side of the session is still live, so everything
-    /// they send arrives with nothing to decrypt it. That is the same targeted
-    /// eviction primitive [`Self::trim_shadow_sessions`] rejects for the shadow
-    /// map, and the rule here now matches it.
-    ///
-    /// A session that has answered a return-routability probe is proof of a real
-    /// peer at a real address, so those are shed only when there is nothing else
-    /// to take. Among the unproven ones the newest goes first, which makes a
-    /// flood cannibalise its own entries rather than the peers it arrived among.
-    /// Ties break on a per-process salted hash of the address, so the order
-    /// cannot be aimed by choosing source addresses.
+    /// Newest unvalidated first, so a flood of forged initiations cannibalises
+    /// itself rather than established peers. Validated sessions are LRU only
+    /// when nothing unproven remains. Ties break on a per-process salted hash
+    /// of the address, so the order cannot be aimed by choosing source addresses.
     fn evict_one_session(&mut self) {
         let victim = self
             .sessions
             .iter()
             .filter(|(_, s)| !s.addr_validated)
-            .max_by_key(|(addr, s)| (s.established, self.salted_addr_rank(addr)))
+            .max_by_key(|(slot, s)| (s.established, self.salted_addr_rank(&slot.0)))
             .map(|(k, _)| *k)
             .or_else(|| {
                 self.sessions
                     .iter()
-                    .min_by_key(|(addr, s)| (s.last_activity, self.salted_addr_rank(addr)))
+                    .min_by_key(|(slot, s)| (s.last_activity, self.salted_addr_rank(&slot.0)))
                     .map(|(k, _)| *k)
             });
         if let Some(victim) = victim {
@@ -3519,13 +3285,11 @@ mod tests {
         );
     }
 
-    /// "Newest unproven claimant wins" is what keeps a spoofed session from
-    /// locking the address owner out, but on its own it also let a spoofer
-    /// *repeatedly* displace a real peer's session: one initiation every few tens
-    /// of milliseconds — inside the per-IP packet cap — meant the peer's own probe
-    /// answer never had a session to decrypt against, so its first contact never
-    /// completed and nothing tore the squatter down. The displaced session is now
-    /// kept until one of its own frames proves it.
+    /// Sessions coexist per static key, so a spoofer churning identities at
+    /// Alice's address cannot displace her session or her deferred first-contact
+    /// request. The per-address cap sheds the newest unvalidated claimant except
+    /// the arrival, which is what keeps the oldest (Alice) through any amount of
+    /// churn.
     #[test]
     fn a_sustained_spoof_cannot_keep_the_address_owner_from_completing() {
         let (alice_priv, alice_pub) = make_keypair();
@@ -3535,8 +3299,6 @@ mod tests {
         let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
         let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
 
-        // Alice reaches Bob for the first time. Bob installs an unvalidated
-        // session and probes her address.
         let alice_init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"genuine") {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
@@ -3548,21 +3310,9 @@ mod tests {
             _ => panic!("expected Bob to complete the IK handshake"),
         };
 
-        // A spoofer now claims Alice's address repeatedly, minting a fresh static
-        // key each time — free, and the churn is what made a single displaced slot
-        // insufficient. Each initiation takes the live slot, which is what stops
-        // *it* from being locked out in turn, so Alice's session has to survive
-        // somewhere.
-        //
-        // Deliberately far past `MAX_SHADOW_SESSIONS_PER_ADDR` and
-        // `MAX_DEFERRED_IK_PAYLOADS_PER_ADDR`: the point is that the bound sheds
-        // the *newest* claimant at this address, so no amount of churn pushes out
-        // the session and the deferred request Alice arrived with first. Each of
-        // these initiations carries a payload of its own, so both caches are under
-        // pressure.
-        for _ in 0..(MAX_SHADOW_SESSIONS_PER_ADDR.max(MAX_DEFERRED_IK_PAYLOADS_PER_ADDR) * 4) {
-            let (squatter_priv, squatter_pub) = make_keypair();
-            let mut squatter = EmberTransport::new(squatter_priv, squatter_pub);
+        for _ in 0..(MAX_SESSIONS_PER_ADDR.max(MAX_DEFERRED_IK_PAYLOADS_PER_ADDR) * 4) {
+            let (squatter_priv, _squatter_pub) = make_keypair();
+            let mut squatter = EmberTransport::new(squatter_priv, _squatter_pub);
             let squat = match squatter.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat") {
                 OutgoingResult::HandshakeStarted { packet } => packet,
                 other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
@@ -3573,9 +3323,11 @@ mod tests {
             ));
         }
 
-        // Alice answers Bob's probe. It has to reach Bob even though the live slot
-        // now belongs to Mallory, and answering is what proves Alice holds the
-        // address.
+        assert!(
+            bob.sessions.contains_key(&(alice_addr, alice_pub)),
+            "Alice's session must survive the spoof flood"
+        );
+
         let mut probe_answer = None;
         for packet in &to_alice {
             let out = alice.dispatch_incoming(packet, bob_addr);
@@ -3598,14 +3350,9 @@ mod tests {
         );
     }
 
-    /// The shadow map exists so a spoofed IK_INIT cannot lock the address owner
-    /// out by displacing her session, which means the trim must never be the thing
-    /// that drops it. Shedding the *newest* is the right rule, but the newest has
-    /// to be measured by handshake, not by activity: the genuine session is
-    /// displaced while it is carrying traffic, so its last activity is a moment
-    /// ago, while a spoofer's shadows have not carried a byte since they were
-    /// minted. Ranking by activity therefore singled out the one session the map
-    /// was protecting.
+    /// Ranking by last-activity used to drop a genuine session that was busy
+    /// when a newer spoof arrived. Sessions now coexist, and the trim still
+    /// sheds the newest unvalidated handshake — never the busiest one.
     #[test]
     fn a_busy_session_is_not_mistaken_for_the_newest_shadow() {
         let (bob_priv, bob_pub) = make_keypair();
@@ -3613,7 +3360,6 @@ mod tests {
         let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
         let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
 
-        // Alice arrives first, so hers is the oldest handshake at the address.
         let (alice_priv, alice_pub) = make_keypair();
         let mut alice = EmberTransport::new(alice_priv, alice_pub);
         let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"genuine") {
@@ -3622,46 +3368,104 @@ mod tests {
         };
         let _ = bob.process_incoming(&init, alice_addr);
         assert_eq!(
-            bob.sessions.get(&alice_addr).map(|s| s.remote_noise_pub),
+            bob.sessions
+                .get(&(alice_addr, alice_pub))
+                .map(|s| s.remote_noise_pub),
             Some(alice_pub),
-            "her unvalidated session takes the live slot"
+            "her unvalidated session is installed under her static key"
         );
 
-        // A spoofer churns static keys from her address. Each displaces the last,
-        // filling the per-address shadow allowance without evicting her.
         let spoof = |bob: &mut EmberTransport| {
-            let (priv_key, pub_key) = make_keypair();
-            let mut attacker = EmberTransport::new(priv_key, pub_key);
+            let (priv_key, _pub_key) = make_keypair();
+            let mut attacker = EmberTransport::new(priv_key, _pub_key);
             let packet = match attacker.prepare_outgoing(bob_addr, Some(&bob_pub), b"spoof") {
                 OutgoingResult::HandshakeStarted { packet } => packet,
                 other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
             };
             let _ = bob.process_incoming(&packet, alice_addr);
         };
-        for _ in 0..MAX_SHADOW_SESSIONS_PER_ADDR {
+        for _ in 0..(MAX_SESSIONS_PER_ADDR - 1) {
             spoof(&mut bob);
         }
         assert!(
-            bob.shadow_sessions.contains_key(&(alice_addr, alice_pub)),
-            "she must still be held as a shadow before the trim is even reached"
+            bob.sessions.contains_key(&(alice_addr, alice_pub)),
+            "she must still be held before the trim is even reached"
         );
 
-        // She was carrying traffic up to the moment she was displaced — a frame of
-        // hers decrypts against the shadow, which promotes it and stamps its
-        // activity — so her last activity is the most recent at this address even
-        // though her handshake is the oldest.
-        bob.shadow_sessions
+        bob.sessions
             .get_mut(&(alice_addr, alice_pub))
-            .expect("her shadow")
+            .expect("her session")
             .last_activity = Instant::now();
 
-        // One more churned key pushes the address over its allowance and runs the
-        // trim.
         spoof(&mut bob);
         assert!(
-            bob.shadow_sessions.contains_key(&(alice_addr, alice_pub)),
+            bob.sessions.contains_key(&(alice_addr, alice_pub)),
             "the trim must shed the newest handshake, not the busiest session"
         );
+    }
+
+    /// The hole the shadow map could not close: Alice's first contact arrives
+    /// at an address already full of older spoof sessions. She is the newest,
+    /// so the old trim shed her at once. Keying by static key and never shedding
+    /// the arrival to make room for older unvalidated claimants keeps her.
+    #[test]
+    fn first_contact_at_a_full_address_of_spoofs_still_completes() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        for _ in 0..MAX_SESSIONS_PER_ADDR {
+            let (priv_key, _pub_key) = make_keypair();
+            let mut attacker = EmberTransport::new(priv_key, _pub_key);
+            let packet = match attacker.prepare_outgoing(bob_addr, Some(&bob_pub), b"spoof") {
+                OutgoingResult::HandshakeStarted { packet } => packet,
+                other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+            };
+            assert!(matches!(
+                bob.process_incoming(&packet, alice_addr),
+                IncomingResult::HandshakeComplete { .. }
+            ));
+        }
+        assert_eq!(
+            bob.sessions
+                .keys()
+                .filter(|(addr, _)| *addr == alice_addr)
+                .count(),
+            MAX_SESSIONS_PER_ADDR
+        );
+
+        let (alice_priv, alice_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"genuine") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let to_alice = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            other => panic!(
+                "first contact at a full address must complete, got {}",
+                incoming_variant_name(&other)
+            ),
+        };
+        assert!(
+            bob.sessions.contains_key(&(alice_addr, alice_pub)),
+            "Alice's session must be kept even though she was the newest claimant"
+        );
+
+        let mut probe_answer = None;
+        for packet in &to_alice {
+            let out = alice.dispatch_incoming(packet, bob_addr);
+            assert!(!out.rejected);
+            if let Some(response) = out.responses.into_iter().next() {
+                probe_answer = Some(response);
+            }
+        }
+        let probe_answer = probe_answer.expect("Alice answers the probe");
+        let released = bob.dispatch_incoming(&probe_answer, alice_addr);
+        assert_eq!(released.app_payloads, vec![b"genuine".to_vec()]);
     }
 
     /// A cookie packet cannot be authenticated — nothing is keyed at msg1 — so a
@@ -4069,14 +3873,17 @@ mod tests {
             _ => panic!("an unproven squatter must not lock the address owner out"),
         };
 
-        // Answering the probe proves the address and releases Alice's request
-        // — Mallory's deferred payload is discarded with her session.
+        // Answering the probe proves Alice's address and releases her request.
+        // Mallory's session sits alongside; it is not discarded.
         assert!(!alice.dispatch_incoming(&responses[0], bob_addr).rejected);
         let probe_answer = alice.dispatch_incoming(&responses[1], bob_addr);
         let released = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
         assert_eq!(released.app_payloads, vec![b"genuine".to_vec()]);
+        assert!(bob.sessions.contains_key(&(alice_addr, alice_pub)));
+        assert!(bob.sessions.contains_key(&(alice_addr, mallory_pub)));
 
-        // Now that the session is proven, the takeover guard does its job.
+        // A later initiation from Mallory installs (or refreshes) her own slot
+        // rather than being rejected by a takeover guard, and cannot evict Alice.
         mallory.remove_session(&bob_addr);
         let squat_again = match mallory.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat again") {
             OutgoingResult::HandshakeStarted { packet } => packet,
@@ -4085,17 +3892,21 @@ mod tests {
         assert!(
             matches!(
                 bob.process_incoming(&squat_again, alice_addr),
-                IncomingResult::Rejected
+                IncomingResult::HandshakeComplete { .. }
             ),
-            "a validated session is exactly what the takeover guard exists to protect"
+            "a different static key installs alongside a validated peer"
+        );
+        assert!(
+            bob.sessions.contains_key(&(alice_addr, alice_pub)),
+            "Alice's validated session must survive Mallory's later handshake"
         );
     }
 
-    /// The other half of the lockout: an unproven session squatting a peer's
-    /// address must not capture the traffic we send to that peer, or the real
-    /// peer receives frames it cannot decrypt and we never notice.
+    /// An unproven session squatting a peer's address must not capture the
+    /// traffic we send to a *different* identity at that address, and dialling
+    /// the named identity must not discard the squatter's own session.
     #[test]
-    fn dialling_a_peer_discards_an_unvalidated_session_for_another_identity() {
+    fn dialling_a_peer_does_not_discard_another_identitys_session() {
         let (_alice_priv, alice_pub) = make_keypair();
         let (mallory_priv, mallory_pub) = make_keypair();
         let (bob_priv, bob_pub) = make_keypair();
@@ -4113,18 +3924,20 @@ mod tests {
             IncomingResult::HandshakeComplete { .. }
         ));
 
-        // Talking to the identity the session actually belongs to is fine.
         assert!(matches!(
             bob.prepare_outgoing(alice_addr, Some(&mallory_pub), b"for mallory"),
             OutgoingResult::Ready { .. }
         ));
-        // Talking to a different identity at that address is not.
         assert!(
             matches!(
                 bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"for alice"),
                 OutgoingResult::HandshakeStarted { .. }
             ),
-            "an unproven session must not intercept traffic meant for another peer"
+            "a named identity with no session must start its own handshake"
+        );
+        assert!(
+            bob.sessions.contains_key(&(alice_addr, mallory_pub)),
+            "dialling Alice must not discard Mallory's session"
         );
     }
 

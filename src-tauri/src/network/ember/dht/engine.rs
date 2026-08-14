@@ -111,6 +111,10 @@ pub struct DhtInbound {
     /// Decode / signature / identity-binding failure. The caller should
     /// drop the frame; the string is for debug logging only.
     pub error: Option<String>,
+    /// The frame's version byte is outside this build's supported range.
+    /// Distinct from `error` so the caller can count "peer we cannot speak to"
+    /// separately from a malformed payload.
+    pub version_mismatch: Option<u8>,
     /// Slice 14: identical STORE signature rejected as a replay.
     pub store_replay_rejected: bool,
     /// A verified `PROXY_STORE` the caller should fan out via the normal
@@ -897,6 +901,11 @@ impl EmberDht {
         now: i64,
     ) -> DhtInbound {
         let mut out = DhtInbound::default();
+
+        if let Some(version) = messages::unsupported_dht_version(payload) {
+            out.version_mismatch = Some(version);
+            return out;
+        }
 
         // `decode_message(.., true)` verifies the Ed25519 signature and
         // the `sender_id == BLAKE3(pubkey)[..16]` binding, so a frame

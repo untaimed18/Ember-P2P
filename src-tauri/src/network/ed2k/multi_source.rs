@@ -9701,21 +9701,26 @@ pub(crate) fn browse_request_supports_v1(payload: &[u8]) -> bool {
     payload == BROWSE_RESPONSE_V1_MAGIC
 }
 
-/// One browse listing row: `(ed2k_hash_hex, size, name, optional_aich_hex)`.
-pub(crate) type BrowseEntry = (String, u64, String, Option<String>);
+/// One browse listing row: `(ed2k_hash_hex, size, name, optional_aich_hex, optional_ember_hex)`.
+pub(crate) type BrowseEntry = (String, u64, String, Option<String>, Option<String>);
 
 /// Encode a friend-browse answer. When `aich` is a valid 40-char hex root it
 /// is included; otherwise the flag is zero — never invent a pin.
+///
+/// Ember BLAKE3 digests ride a trailer after the v1 body (32 bytes per entry,
+/// zeros when unknown). Pre-1.5.5 parsers stop after `count` v1 rows and
+/// ignore the rest, so this stays compatible with EBR1.
 pub(crate) fn encode_browse_response_v1<'a, I>(entries: I) -> Vec<u8>
 where
-    I: IntoIterator<Item = (&'a [u8; 16], u64, &'a [u8], Option<&'a [u8; 20]>)>,
+    I: IntoIterator<Item = (&'a [u8; 16], u64, &'a [u8], Option<&'a [u8; 20]>, Option<&'a [u8; 32]>)>,
 {
     let mut out = Vec::new();
     out.extend_from_slice(BROWSE_RESPONSE_V1_MAGIC);
     let count_offset = out.len();
     out.extend_from_slice(&0u32.to_le_bytes());
     let mut count = 0u32;
-    for (hash, size, name, aich) in entries {
+    let mut ember_trailer = Vec::new();
+    for (hash, size, name, aich, ember) in entries {
         if count as usize >= MAX_BROWSE_ENTRIES {
             break;
         }
@@ -9731,9 +9736,11 @@ where
             }
             None => out.push(0),
         }
+        ember_trailer.extend_from_slice(&ember.map(|digest| *digest).unwrap_or([0u8; 32]));
         count += 1;
     }
     out[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&ember_trailer);
     out
 }
 
@@ -9792,7 +9799,7 @@ fn parse_browse_response_legacy(data: &[u8]) -> Vec<BrowseEntry> {
         let name_byte_end = name_len.min(MAX_BROWSE_NAME_BYTES);
         let name = String::from_utf8_lossy(&data[pos..pos + name_byte_end]).to_string();
         pos += name_len;
-        entries.push((hash, size, name, None));
+        entries.push((hash, size, name, None, None));
     }
     entries
 }
@@ -9835,7 +9842,17 @@ fn parse_browse_response_v1(data: &[u8]) -> Vec<BrowseEntry> {
         } else {
             None
         };
-        entries.push((hash, size, name, aich));
+        entries.push((hash, size, name, aich, None));
+    }
+    let declared = count.min(MAX_BROWSE_ENTRIES);
+    if entries.len() == declared && pos + declared * 32 == data.len() {
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let start = pos + i * 32;
+            let digest = &data[start..start + 32];
+            if digest.iter().any(|&b| b != 0) {
+                entry.4 = Some(hex::encode(digest));
+            }
+        }
     }
     entries
 }
@@ -9848,9 +9865,10 @@ mod browse_response_tests {
     fn browse_v1_round_trips_optional_aich() {
         let hash = [0x11u8; 16];
         let aich = [0xABu8; 20];
+        let ember = [0xCDu8; 32];
         let encoded = encode_browse_response_v1([
-            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich)),
-            (&hash, 7u64, b"readme.txt".as_slice(), None),
+            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich), Some(&ember)),
+            (&hash, 7u64, b"readme.txt".as_slice(), None, None),
         ]);
         assert!(encoded.starts_with(BROWSE_RESPONSE_V1_MAGIC));
         let parsed = parse_browse_response(&encoded);
@@ -9859,7 +9877,24 @@ mod browse_response_tests {
         assert_eq!(parsed[0].1, 42);
         assert_eq!(parsed[0].2, "song.mp3");
         assert_eq!(parsed[0].3.as_deref(), Some(hex::encode(aich).as_str()));
+        assert_eq!(parsed[0].4.as_deref(), Some(hex::encode(ember).as_str()));
         assert_eq!(parsed[1].3, None);
+        assert_eq!(parsed[1].4, None);
+    }
+
+    #[test]
+    fn browse_v1_without_ember_trailer_still_parses() {
+        let hash = [0x11u8; 16];
+        let aich = [0xABu8; 20];
+        let encoded = encode_browse_response_v1([
+            (&hash, 42u64, b"song.mp3".as_slice(), Some(&aich), Some(&[0xCDu8; 32])),
+        ]);
+        let trailer = 32;
+        let without_trailer = &encoded[..encoded.len() - trailer];
+        let parsed = parse_browse_response(without_trailer);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].3.as_deref(), Some(hex::encode(aich).as_str()));
+        assert_eq!(parsed[0].4, None);
     }
 
     #[test]

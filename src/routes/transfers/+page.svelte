@@ -1883,7 +1883,7 @@
         }
         case 'clear_completed': confirmClearCompleted = true; return;
         case 'copy_link': {
-          const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash);
+          const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash, t.ember_file_hash);
           // Via the helper, not `navigator.clipboard` directly: WebView2 can
           // deny the async clipboard API, and the helper falls back to execCommand.
           if (!(await copyToClipboard(link))) transferError = m.search_copy_failed();
@@ -1905,7 +1905,7 @@
               '',
               0,
               undefined,
-              undefined,
+              info.ember,
               info.aich,
             );
             showInfo(res.already_queued
@@ -1993,7 +1993,12 @@
     copyingAllDownloadLinks = true;
     try {
       const text = await formatEd2kLinks(
-        targets.map((t) => ({ name: t.file_name, size: t.total_size, hash: t.file_hash })),
+        targets.map((t) => ({
+          name: t.file_name,
+          size: t.total_size,
+          hash: t.file_hash,
+          emberFileHash: t.ember_file_hash || undefined,
+        })),
       );
       // No chunking here, unlike the Library: the backend refuses a single
       // `format_ed2k_links` call over 50,000 entries, and a download list that
@@ -2051,7 +2056,7 @@
         '',
         0,
         undefined,
-        undefined,
+        info.ember,
         info.aich,
       );
       showInfo(res.already_queued

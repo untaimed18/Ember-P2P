@@ -222,6 +222,11 @@ pub struct Transfer {
     /// MD4-only eMule transfers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_aich: Option<String>,
+    /// Optional Ember content BLAKE3 (64 hex chars) supplied by an ed2k
+    /// `eh=` link, friend browse/offer, or collection entry. Local
+    /// verification policy; omitted from IPC when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ember_file_hash: Option<String>,
     /// Absolute path of the finished file on disk (downloads only).
     ///
     /// Completion moves the `.part` to `Downloads/<name>`, but
@@ -764,9 +769,26 @@ pub struct EmberDiagnostics {
     /// Average STORE replication depth this session (`replication_sum / publishes`).
     #[serde(default)]
     pub ember_dht_avg_replication: u32,
-    /// Slice 19: inbound Ember DHT frames rejected as malformed / invalid version.
+    /// Slice 19: inbound Ember DHT frames rejected as malformed.
     #[serde(default)]
     pub ember_dht_malformed: u32,
+    /// Inbound Ember DHT frames refused because the version byte is outside
+    /// this build's supported range. Counted separately from `ember_dht_malformed`
+    /// so a peer we cannot speak to does not look like packet loss.
+    #[serde(default)]
+    pub ember_dht_version_mismatch: u32,
+    /// Completed KAD lookups of the Ember rendezvous key this session.
+    #[serde(default)]
+    pub ember_dht_rendezvous_lookups: u32,
+    /// How many of those lookups returned no other Ember node after dropping
+    /// our own advert. The bootstrap canary: a cold node that keeps drawing
+    /// blanks is not going to join.
+    #[serde(default)]
+    pub ember_dht_rendezvous_empty: u32,
+    /// Advertised Ember nodes in the most recent rendezvous lookup, after
+    /// dropping self. A gauge, not a counter.
+    #[serde(default)]
+    pub ember_dht_rendezvous_last_peers: u32,
     /// Slice 19: observed-IP votes recorded from PONG payloads.
     #[serde(default)]
     pub ember_dht_observed_votes: u32,

@@ -8240,16 +8240,24 @@ pub struct EmberValueLookupPending {
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.
-/// Backs the `get_ember_dht_contacts` dev command.
+/// Backs the `get_ember_dht_contacts` snapshot and harness `FIND_NODE`
+/// replies. The UI contacts table redacts `addr` so peer IPs never reach
+/// the webview; harness replies still include it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmberDhtContactInfo {
     /// 128-bit node ID, hex-encoded.
     pub node_id: String,
-    /// `ip:port` of the contact.
+    /// `ip:port` of the contact. Empty (and omitted from JSON) for the
+    /// Ember Network page snapshot so the webview never sees peer IPs.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub addr: String,
-    /// X25519 Noise public key, hex-encoded.
+    /// X25519 Noise public key, hex-encoded. Empty (and omitted from JSON)
+    /// for the Ember Network page snapshot.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub noise_pub: String,
-    /// Ed25519 public key, hex-encoded.
+    /// Ed25519 public key, hex-encoded. Empty (and omitted from JSON) for
+    /// the Ember Network page snapshot.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub ed25519_pub: String,
     /// Unix timestamp of the last successful response.
     pub last_seen: i64,
@@ -8288,7 +8296,8 @@ pub struct EmberDhtStoreInfo {
 
 /// Flatten a routing-table contact into its IPC representation. Shared
 /// by the `get_ember_dht_contacts` snapshot and the `FIND_NODE` reply
-/// path so the two never drift.
+/// path so the two never drift. The UI snapshot clears `addr` after
+/// this so peer IPs never reach the webview.
 fn ember_dht_contact_info(
     c: &ember::dht::EmberContact,
     local_id: ember::dht::EmberNodeId,
@@ -9814,6 +9823,9 @@ struct NetworkState {
     /// tick republishes a file's keywords only after
     /// `EMBER_KEYWORD_REPUBLISH` has elapsed.
     ember_keyword_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// Unix-second copy of the keyword-publish stamps, written to known.met
+    /// so a restart does not republish every keyword on launch.
+    ember_keyword_publish_unix: HashMap<[u8; 16], u32>,
     /// Shared files whose Ember DHT source record has been acknowledged by
     /// at least one storer, keyed by 16-byte eD2K hash. Drives the Library
     /// "Ember" badge, the same way `PublishManager`'s source timestamps
@@ -10043,6 +10055,10 @@ fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordR
                 .ember_diagnostics
                 .ember_dht_keywords_published
                 .saturating_add(1);
+            let unix = chrono::Utc::now().timestamp().max(0) as u32;
+            state
+                .ember_keyword_publish_unix
+                .insert(reference.file_hash, unix);
         }
         EmberPublishKind::Source => {
             state.ember_published_sources.insert(reference.file_hash);
@@ -10061,14 +10077,14 @@ fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordR
     }
 }
 
-/// Convert a persisted Ember source-publish unix timestamp into the
-/// in-session `Instant` the republish scheduler uses.
+/// Convert a persisted Ember publish unix timestamp into the in-session
+/// `Instant` the republish scheduler uses.
 ///
 /// `Instant` counts from boot, so a stamp older than this process has been
 /// up cannot be represented. Omitting it treats the file as due immediately
 /// — republish-too-eager, the safe direction. Stamping `now` instead would
 /// skip a remaining wait, which is silent non-publishing.
-fn ember_source_publish_instant(
+fn ember_publish_instant(
     last_unix: u32,
     now_unix: i64,
     now_inst: std::time::Instant,
@@ -10084,30 +10100,54 @@ fn ember_source_publish_instant(
     now_inst.checked_sub(std::time::Duration::from_secs(elapsed))
 }
 
-fn hydrate_ember_source_publish_schedule(
+fn ember_source_publish_instant(
+    last_unix: u32,
+    now_unix: i64,
+    now_inst: std::time::Instant,
+    interval: std::time::Duration,
+) -> Option<std::time::Instant> {
+    ember_publish_instant(last_unix, now_unix, now_inst, interval)
+}
+
+fn hydrate_ember_publish_schedule(
     known_files: &KnownFileList,
-    dest: &mut HashMap<[u8; 16], std::time::Instant>,
-    unix_dest: &mut HashMap<[u8; 16], u32>,
+    source_dest: &mut HashMap<[u8; 16], std::time::Instant>,
+    source_unix: &mut HashMap<[u8; 16], u32>,
+    keyword_dest: &mut HashMap<[u8; 16], std::time::Instant>,
+    keyword_unix: &mut HashMap<[u8; 16], u32>,
 ) {
     let now_unix = chrono::Utc::now().timestamp();
     let now_inst = std::time::Instant::now();
     for record in known_files.iter_records() {
-        if record.last_ember_source_publish == 0 {
-            continue;
+        if record.last_ember_source_publish != 0 {
+            source_unix
+                .entry(record.file_hash)
+                .or_insert(record.last_ember_source_publish);
+            if !source_dest.contains_key(&record.file_hash) {
+                if let Some(at) = ember_publish_instant(
+                    record.last_ember_source_publish,
+                    now_unix,
+                    now_inst,
+                    EMBER_SOURCE_REPUBLISH,
+                ) {
+                    source_dest.insert(record.file_hash, at);
+                }
+            }
         }
-        unix_dest
-            .entry(record.file_hash)
-            .or_insert(record.last_ember_source_publish);
-        if dest.contains_key(&record.file_hash) {
-            continue;
-        }
-        if let Some(at) = ember_source_publish_instant(
-            record.last_ember_source_publish,
-            now_unix,
-            now_inst,
-            EMBER_SOURCE_REPUBLISH,
-        ) {
-            dest.insert(record.file_hash, at);
+        if record.last_ember_keyword_publish != 0 {
+            keyword_unix
+                .entry(record.file_hash)
+                .or_insert(record.last_ember_keyword_publish);
+            if !keyword_dest.contains_key(&record.file_hash) {
+                if let Some(at) = ember_publish_instant(
+                    record.last_ember_keyword_publish,
+                    now_unix,
+                    now_inst,
+                    EMBER_KEYWORD_REPUBLISH,
+                ) {
+                    keyword_dest.insert(record.file_hash, at);
+                }
+            }
         }
     }
 }
@@ -10119,6 +10159,24 @@ fn sync_ember_source_publish_to_known(
     for (hash, ts) in unix_map {
         known_files.set_last_ember_source_publish(hash, *ts);
     }
+}
+
+fn sync_ember_keyword_publish_to_known(
+    unix_map: &HashMap<[u8; 16], u32>,
+    known_files: &mut KnownFileList,
+) {
+    for (hash, ts) in unix_map {
+        known_files.set_last_ember_keyword_publish(hash, *ts);
+    }
+}
+
+fn sync_ember_publish_to_known(
+    source_unix: &HashMap<[u8; 16], u32>,
+    keyword_unix: &HashMap<[u8; 16], u32>,
+    known_files: &mut KnownFileList,
+) {
+    sync_ember_source_publish_to_known(source_unix, known_files);
+    sync_ember_keyword_publish_to_known(keyword_unix, known_files);
 }
 
 fn ember_highwater_path(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -10252,6 +10310,24 @@ fn charge_ember_publish_failure(
         },
         hex::encode(file_hash)
     );
+}
+
+/// Record one completed lookup of the Ember rendezvous key.
+///
+/// `listed` is advertised peers after dropping this node's own advert, which
+/// is the number that can actually bootstrap us. Zero is the cold-join miss.
+fn note_ember_rendezvous_lookup(state: &mut NetworkState, listed: usize) {
+    state.ember_diagnostics.ember_dht_rendezvous_lookups = state
+        .ember_diagnostics
+        .ember_dht_rendezvous_lookups
+        .saturating_add(1);
+    state.ember_diagnostics.ember_dht_rendezvous_last_peers = listed.min(u32::MAX as usize) as u32;
+    if listed == 0 {
+        state.ember_diagnostics.ember_dht_rendezvous_empty = state
+            .ember_diagnostics
+            .ember_dht_rendezvous_empty
+            .saturating_add(1);
+    }
 }
 
 /// Clear the rendezvous "published" mark if `removed` was its publish search.
@@ -11634,14 +11710,17 @@ fn finalize_removed_searches_with_keyword_results(
         // later tick can retry.
         if state.ember_rendezvous_search == Some(*sid) {
             state.ember_rendezvous_search = None;
-            if let Some(entries) = preserved_results.get(sid) {
-                // Skip our own advert, which every rendezvous lookup returns.
-                let peers: Vec<KadSource> = extract_kad_sources(entries)
-                    .into_iter()
-                    .filter(|s| !is_self_source(s, state))
-                    .collect();
-                harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
-            }
+            let peers: Vec<KadSource> = preserved_results
+                .get(sid)
+                .map(|entries| {
+                    extract_kad_sources(entries)
+                        .into_iter()
+                        .filter(|s| !is_self_source(s, state))
+                        .collect()
+                })
+                .unwrap_or_default();
+            harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
+            note_ember_rendezvous_lookup(state, peers.len());
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             if let Some(entries) = preserved_results.get(sid) {
@@ -13327,7 +13406,9 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
+    state.ember_source_publish_unix.clear();
     state.ember_keyword_publish_at.clear();
+    state.ember_keyword_publish_unix.clear();
     // Library badges must go dark with the feature: the records we placed
     // will age out of the network and we are no longer republishing them.
     state.ember_published_sources.clear();
@@ -14191,6 +14272,7 @@ pub async fn start_network(
         ember_source_publish_at: HashMap::new(),
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
+        ember_keyword_publish_unix: HashMap::new(),
         ember_published_sources: HashSet::new(),
         ember_keyword_searches: HashMap::new(),
         ember_pending_keyword_results: Vec::new(),
@@ -15395,10 +15477,12 @@ pub async fn start_network(
                         state.routing_table.evict_filtered_contacts();
                         state.ember_dht.evict_filtered_contacts();
                         known_files.absorb_missing_from(loads.known_files);
-                        hydrate_ember_source_publish_schedule(
+                        hydrate_ember_publish_schedule(
                             &known_files,
                             &mut state.ember_source_publish_at,
                             &mut state.ember_source_publish_unix,
+                            &mut state.ember_keyword_publish_at,
+                            &mut state.ember_keyword_publish_unix,
                         );
                         state.aich_hash_sets = loads.aich_hash_sets;
                         for (k, v) in loads.aich_root_map {
@@ -16714,6 +16798,10 @@ pub async fn start_network(
                                         .as_ref()
                                         .map(|record| record.last_ember_source_publish)
                                         .unwrap_or(0),
+                                    last_ember_keyword_publish: existing
+                                        .as_ref()
+                                        .map(|record| record.last_ember_keyword_publish)
+                                        .unwrap_or(0),
                                 };
                                 let completed_friends_only = record.friends_only;
                                 known_files.add_or_update(record.clone());
@@ -17046,7 +17134,7 @@ pub async fn start_network(
                                         .and_then(|p| p.parse().ok())
                                         .unwrap_or(0),
                                     extra_sources: Vec::new(),
-                                    ember_file_hash: String::new(),
+                                    ember_file_hash: t.ember_file_hash.clone().unwrap_or_default(),
                                     expected_aich: t.expected_aich.clone(),
                                     transfer_id: t.id.clone(),
                                     control,
@@ -17792,7 +17880,7 @@ pub async fn start_network(
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
-                            ember_file_hash: String::new(),
+                            ember_file_hash: t.ember_file_hash.clone().unwrap_or_default(),
                             expected_aich: t.expected_aich.clone(),
                             transfer_id: t.id.clone(),
                             control,
@@ -18115,6 +18203,7 @@ pub async fn start_network(
                                     "file_hash": hex::encode(offer.file_hash),
                                     "file_name": safe_name,
                                     "file_size": offer.file_size,
+                                    "ember_file_hash": offer.ember_file_hash.map(hex::encode),
                                 }),
                             );
                         }
@@ -18457,8 +18546,13 @@ pub async fn start_network(
                         // the peer receiving our answer actually keeps.
                         const MAX_BROWSE_ANSWER_FILES: usize = 1_000;
                         const MAX_BROWSE_ANSWER_BYTES: usize = 400 * 1024;
-                        let mut encoded_entries: Vec<([u8; 16], u64, Vec<u8>, Option<[u8; 20]>)> =
-                            Vec::new();
+                        let mut encoded_entries: Vec<(
+                            [u8; 16],
+                            u64,
+                            Vec<u8>,
+                            Option<[u8; 20]>,
+                            Option<[u8; 32]>,
+                        )> = Vec::new();
                         // Mutual friends see friends-only files alongside
                         // public ones — that is the whole point of the scope.
                         for f in files
@@ -18485,10 +18579,26 @@ pub async fn start_network(
                             } else {
                                 None
                             };
-                            encoded_entries.push((hash, f.size, name_bytes, aich));
+                            let ember = if f.ember_file_hash.len() == 64 {
+                                let mut digest = [0u8; 32];
+                                if hex::decode_to_slice(&f.ember_file_hash, &mut digest).is_ok() {
+                                    Some(digest)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            encoded_entries.push((hash, f.size, name_bytes, aich, ember));
                             // Rough pre-cap so encode stays under the frame budget.
                             let approx = encoded_entries.iter().fold(8usize, |acc, e| {
-                                acc + 16 + 8 + 2 + e.2.len() + 1 + if e.3.is_some() { 20 } else { 0 }
+                                acc + 16
+                                    + 8
+                                    + 2
+                                    + e.2.len()
+                                    + 1
+                                    + if e.3.is_some() { 20 } else { 0 }
+                                    + 32
                             });
                             if approx >= MAX_BROWSE_ANSWER_BYTES {
                                 break;
@@ -18496,15 +18606,15 @@ pub async fn start_network(
                         }
                         let res_payload = if supports_ebr1 {
                             ed2k::multi_source::encode_browse_response_v1(
-                                encoded_entries.iter().map(|(h, s, n, a)| {
-                                    (h, *s, n.as_slice(), a.as_ref())
+                                encoded_entries.iter().map(|(h, s, n, a, e)| {
+                                    (h, *s, n.as_slice(), a.as_ref(), e.as_ref())
                                 }),
                             )
                         } else {
                             ed2k::multi_source::encode_browse_response_legacy(
                                 encoded_entries
                                     .iter()
-                                    .map(|(h, s, n, _)| (h, *s, n.as_slice())),
+                                    .map(|(h, s, n, _, _)| (h, *s, n.as_slice())),
                             )
                         };
                         let mut packet = Vec::with_capacity(6 + res_payload.len());
@@ -18589,7 +18699,7 @@ pub async fn start_network(
                     let hash_hex = hex::encode(browse_eh);
                     let files: Vec<serde_json::Value> = entries
                         .iter()
-                        .map(|(hash, size, name, aich)| {
+                        .map(|(hash, size, name, aich, ember)| {
                             let clean_name = crate::security::sanitize_display_name(name);
                             let mut obj = serde_json::json!({
                                 "hash": hash,
@@ -18600,6 +18710,13 @@ pub async fn start_network(
                                 obj.as_object_mut().unwrap().insert(
                                     "aich_hash".into(),
                                     serde_json::Value::String(aich_hash.clone()),
+                                );
+                            }
+                            if let Some(ember_file_hash) = ember.as_ref().filter(|h| h.len() == 64)
+                            {
+                                obj.as_object_mut().unwrap().insert(
+                                    "ember_file_hash".into(),
+                                    serde_json::Value::String(ember_file_hash.clone()),
                                 );
                             }
                             obj
@@ -19004,7 +19121,7 @@ pub async fn start_network(
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                             extra_sources: Vec::new(),
-                            ember_file_hash: String::new(),
+                            ember_file_hash: t.ember_file_hash.clone().unwrap_or_default(),
                             expected_aich: t.expected_aich.clone(),
                             transfer_id: t.id.clone(),
                             control,
@@ -19792,7 +19909,7 @@ pub async fn start_network(
                         // source list itself is discarded rather than injected
                         // anywhere. Not a real file, so nothing wants it.
                         state.ember_rendezvous_search = None;
-                        if let Some(search) = state.search_manager.get(&sid) {
+                        let (found, peers) = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
                             let found = all.len();
                             // Our own advert is always in these results — we put
@@ -19802,14 +19919,18 @@ pub async fn start_network(
                                 .into_iter()
                                 .filter(|s| !is_self_source(s, &state))
                                 .collect();
-                            harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
-                            info!(
-                                "Ember rendezvous lookup finished: {found} advertised peer(s), \
-                                 {} after dropping self, {} dialable Noise key(s) cached",
-                                peers.len(),
-                                state.ember_noise_keys.len()
-                            );
-                        }
+                            (found, peers)
+                        } else {
+                            (0, Vec::new())
+                        };
+                        harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers);
+                        note_ember_rendezvous_lookup(&mut state, peers.len());
+                        info!(
+                            "Ember rendezvous lookup finished: {found} advertised peer(s), \
+                             {} after dropping self, {} dialable Noise key(s) cached",
+                            peers.len(),
+                            state.ember_noise_keys.len()
+                        );
                     } else if let Some((_, tx)) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
@@ -30406,8 +30527,9 @@ pub async fn start_network(
                         "known.met save exceeded watchdog timeout; retaining serialized ownership and suppressing overlapping retries"
                     );
                 }
-                sync_ember_source_publish_to_known(
+                sync_ember_publish_to_known(
                     &state.ember_source_publish_unix,
+                    &state.ember_keyword_publish_unix,
                     &mut known_files,
                 );
                 if known_files.is_dirty() && !known_met_save_in_flight {
@@ -32470,8 +32592,9 @@ pub async fn start_network(
     }
 
     let known_path = state.data_dir.join("known.met");
-    sync_ember_source_publish_to_known(
+    sync_ember_publish_to_known(
         &state.ember_source_publish_unix,
+        &state.ember_keyword_publish_unix,
         &mut known_files,
     );
     match tokio::time::timeout_at(
@@ -36112,6 +36235,20 @@ async fn handle_ember_dht_message(
         state.ember_dht.store_reject_source_ip() as u32;
     state.ember_diagnostics.ember_dht_store_reject_proximity =
         state.ember_dht.store_reject_proximity() as u32;
+
+    if let Some(version) = inbound.version_mismatch {
+        state.ember_diagnostics.ember_dht_version_mismatch = state
+            .ember_diagnostics
+            .ember_dht_version_mismatch
+            .saturating_add(1);
+        debug!(
+            "Ember DHT: dropping frame from {from}: unsupported version {version} \
+             (this build speaks {}..={})",
+            ember::dht::EMBER_DHT_MIN_VERSION,
+            ember::dht::EMBER_DHT_VERSION
+        );
+        return;
+    }
 
     if let Some(err) = inbound.error {
         state.ember_diagnostics.ember_dht_malformed = state
@@ -40684,6 +40821,9 @@ async fn handle_command_inner(
                     let fname = file_name.clone();
                     let fhash = file_hash.clone();
                     let expected_for_db = expected_aich.clone();
+                    let ember_for_db = crate::security::parse_ember_file_hash(Some(&ember_file_hash))
+                        .ok()
+                        .flatten();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
                             let _ = db_ref.update_transfer_status(&tid, "searching");
@@ -40728,6 +40868,7 @@ async fn handle_command_inner(
                                 user_hash: None,
                                 ember_hash: None,
                                 expected_aich: expected_for_db,
+                                ember_file_hash: ember_for_db,
                                 completed_path: None,
                                 up_part_status: None,
                                 up_part_count: None,
@@ -41424,7 +41565,13 @@ async fn handle_command_inner(
                 .ember_dht
                 .contacts()
                 .iter()
-                .map(|c| ember_dht_contact_info(c, local_id))
+                .map(|c| {
+                    let mut info = ember_dht_contact_info(c, local_id);
+                    info.addr.clear();
+                    info.noise_pub.clear();
+                    info.ed25519_pub.clear();
+                    info
+                })
                 .collect();
             let _ = tx.send(contacts);
         }
@@ -43280,11 +43427,19 @@ async fn handle_command_inner(
                 let idx = local_index.read().await;
                 idx.get_by_hash(&hash_hex)
                     .filter(|f| f.is_friend_visible())
-                    .map(|f| (f.name.clone(), f.size))
+                    .map(|f| (f.name.clone(), f.size, f.ember_file_hash.clone()))
             };
-            let Some((file_name, file_size)) = entry else {
+            let Some((file_name, file_size, ember_hex)) = entry else {
                 let _ = tx.send(Err("File is not shared".into()));
                 return;
+            };
+            let ember_file_hash = if ember_hex.len() == 64 {
+                let mut digest = [0u8; 32];
+                hex::decode_to_slice(&ember_hex, &mut digest)
+                    .ok()
+                    .map(|_| digest)
+            } else {
+                None
             };
             // A friends-only file is only offerable to a mutual friend, for
             // the same reason it is only servable to one.
@@ -43300,6 +43455,7 @@ async fn handle_command_inner(
                 file_hash,
                 file_size,
                 file_name,
+                ember_file_hash,
             });
             let sessions = state.ember_sessions.read().await;
             let Some(session) = sessions
@@ -43579,6 +43735,10 @@ async fn handle_command_inner(
                                     .as_ref()
                                     .map(|r| r.last_ember_source_publish)
                                     .unwrap_or(0),
+                                last_ember_keyword_publish: existing
+                                    .as_ref()
+                                    .map(|r| r.last_ember_keyword_publish)
+                                    .unwrap_or(0),
                             });
                             // Real BLAKE3 just landed (or was refreshed) —
                             // drop publish timers so the next tick advertises
@@ -43586,6 +43746,8 @@ async fn handle_command_inner(
                             if !f.ember_file_hash.is_empty() {
                                 state.ember_source_publish_at.remove(&fh);
                                 state.ember_keyword_publish_at.remove(&fh);
+                                state.ember_source_publish_unix.remove(&fh);
+                                state.ember_keyword_publish_unix.remove(&fh);
                             }
                         }
                     }
@@ -45579,6 +45741,7 @@ async fn handle_upload_event(
                 user_hash,
                 ember_hash,
                 expected_aich: None,
+                ember_file_hash: None,
                 completed_path: None,
                 up_part_status: None,
                 up_part_count: None,

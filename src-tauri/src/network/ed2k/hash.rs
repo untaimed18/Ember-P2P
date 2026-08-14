@@ -351,21 +351,24 @@ fn percent_encode_ed2k(name: &str) -> String {
 
 /// Format an ed2k link: ed2k://|file|name|size|hash|/
 pub fn format_ed2k_link(name: &str, size: u64, hash: &str) -> String {
-    format_ed2k_link_ext(name, size, hash, None, &[])
+    format_ed2k_link_ext(name, size, hash, None, None, &[])
 }
 
-/// Format an ed2k link with optional AICH root hash and source endpoints,
-/// matching eMule's link variants:
-///   ed2k://|file|name|size|hash|h=<base32 AICH>|sources,ip:port,...|/
+/// Format an ed2k link with optional AICH root hash, Ember BLAKE3 digest, and
+/// source endpoints, matching eMule's link variants plus an Ember extension:
+///   ed2k://|file|name|size|hash|h=<base32 AICH>|eh=<hex BLAKE3>|sources,ip:port,...|/
 ///
 /// `aich_hex` is the 40-char hex AICH root (as stored on `FileInfo`); it is
-/// re-encoded to base32 for the `h=` segment the way eMule expects. `sources`
-/// are appended only when non-empty.
+/// re-encoded to base32 for the `h=` segment the way eMule expects. `ember_hex`
+/// is the 64-char hex BLAKE3 content digest; unknown segments are ignored by
+/// eMule, so `eh=` is safe to emit on a mixed network. `sources` are appended
+/// only when non-empty.
 pub fn format_ed2k_link_ext(
     name: &str,
     size: u64,
     hash: &str,
     aich_hex: Option<&str>,
+    ember_hex: Option<&str>,
     sources: &[(String, u16)],
 ) -> String {
     let mut link = format!(
@@ -380,6 +383,11 @@ pub fn format_ed2k_link_ext(
             link.push_str(&b32);
             link.push('|');
         }
+    }
+    if let Some(digest) = ember_hex.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())) {
+        link.push_str("eh=");
+        link.push_str(&digest.to_lowercase());
+        link.push('|');
     }
     if !sources.is_empty() {
         link.push_str("sources");
@@ -497,14 +505,14 @@ pub fn percent_decode_str(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
-pub type ParsedEd2kLink = (String, u64, String, Option<String>);
+pub type ParsedEd2kLink = (String, u64, String, Option<String>, Option<String>);
 
 /// Strictly parse an ed2k link, distinguishing an absent AICH segment from a
 /// malformed or conflicting one.
 ///
-/// Trailing optional segments (`h=<base32 AICH>`, `sources,...`, `s=<url>`,
-/// etc.) are tolerated; only the AICH root is currently surfaced so imported
-/// links can carry recovery data.
+/// Trailing optional segments (`h=<base32 AICH>`, `eh=<hex BLAKE3>`,
+/// `sources,...`, `s=<url>`, etc.) are tolerated; AICH and the Ember digest
+/// are surfaced so imported links can carry recovery / integrity data.
 pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str> {
     let trimmed = link.trim();
     if !trimmed.starts_with("ed2k://|file|") {
@@ -529,6 +537,7 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
         return Err("Invalid ed2k file hash");
     }
     let mut aich: Option<String> = None;
+    let mut ember: Option<String> = None;
     for seg in parts {
         if let Some(b32) = seg.strip_prefix("h=") {
             let decoded = aich_base32_to_hex(b32).ok_or("Invalid AICH h= segment in ed2k link")?;
@@ -539,9 +548,21 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
                 }
                 Some(_) => {}
             }
+        } else if let Some(digest) = seg.strip_prefix("eh=") {
+            let decoded = digest.trim().to_lowercase();
+            if decoded.len() != 64 || hex::decode(&decoded).is_err() {
+                return Err("Invalid Ember eh= segment in ed2k link");
+            }
+            match &ember {
+                None => ember = Some(decoded),
+                Some(existing) if *existing != decoded => {
+                    return Err("Conflicting Ember eh= segments in ed2k link");
+                }
+                Some(_) => {}
+            }
         }
     }
-    Ok((name, size, hash, aich))
+    Ok((name, size, hash, aich, ember))
 }
 
 /// Compatibility parser for collection imports. Invalid links (including
@@ -585,18 +606,29 @@ mod link_tests {
     #[test]
     fn link_with_aich_has_h_segment() {
         let aich = "1f2e3d4c5b6a798877665544332211000aabbccd";
-        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, Some(aich), &[]);
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, Some(aich), None, &[]);
         assert!(link.contains("|h="), "expected h= segment: {link}");
         assert!(link.ends_with("|/"));
         // Round-trip the embedded AICH back out.
-        let (_, _, _, parsed) = parse_ed2k_link(&link).expect("parse");
+        let (_, _, _, parsed, ember) = parse_ed2k_link(&link).expect("parse");
         assert_eq!(parsed.as_deref(), Some(aich));
+        assert!(ember.is_none());
+    }
+
+    #[test]
+    fn link_with_ember_hash_has_eh_segment() {
+        let digest = "ab".repeat(32);
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, Some(&digest), &[]);
+        assert!(link.contains(&format!("|eh={digest}|")), "{link}");
+        let (_, _, _, aich, parsed) = parse_ed2k_link(&link).expect("parse");
+        assert!(aich.is_none());
+        assert_eq!(parsed.as_deref(), Some(digest.as_str()));
     }
 
     #[test]
     fn link_with_sources_appends_endpoint() {
         let sources = vec![("203.0.113.5".to_string(), 4662u16)];
-        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, &sources);
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, None, &sources);
         assert!(link.contains("|sources,203.0.113.5:4662|"), "{link}");
     }
 
@@ -604,7 +636,7 @@ mod link_tests {
     fn link_with_aich_and_sources_keeps_order() {
         let aich = "1f2e3d4c5b6a798877665544332211000aabbccd";
         let sources = vec![("203.0.113.5".to_string(), 4662u16)];
-        let link = format_ed2k_link_ext("a.bin", 9, HASH, Some(aich), &sources);
+        let link = format_ed2k_link_ext("a.bin", 9, HASH, Some(aich), None, &sources);
         let h_pos = link.find("h=").unwrap();
         let s_pos = link.find("sources,").unwrap();
         assert!(h_pos < s_pos, "h= must precede sources: {link}");
@@ -613,11 +645,12 @@ mod link_tests {
     #[test]
     fn parse_ignores_unknown_trailing_segments() {
         let link = format!("ed2k://|file|a.bin|9|{HASH}|sources,1.2.3.4:1|s=http://x/y|/");
-        let (name, size, hash, aich) = parse_ed2k_link(&link).expect("parse");
+        let (name, size, hash, aich, ember) = parse_ed2k_link(&link).expect("parse");
         assert_eq!(name, "a.bin");
         assert_eq!(size, 9);
         assert_eq!(hash, HASH);
         assert!(aich.is_none());
+        assert!(ember.is_none());
     }
 
     #[test]
@@ -641,6 +674,23 @@ mod link_tests {
         assert_eq!(
             parse_ed2k_link_strict(&repeated).unwrap().3,
             Some(hex::encode([0x11; 20]))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_bad_and_conflicting_ember_segments() {
+        let short = format!("ed2k://|file|a.bin|9|{HASH}|eh=abcd|/");
+        assert!(parse_ed2k_link_strict(&short).is_err());
+
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        let conflicting = format!("ed2k://|file|a.bin|9|{HASH}|eh={first}|eh={second}|/");
+        assert!(parse_ed2k_link_strict(&conflicting).is_err());
+
+        let repeated = format!("ed2k://|file|a.bin|9|{HASH}|eh={first}|eh={first}|/");
+        assert_eq!(
+            parse_ed2k_link_strict(&repeated).unwrap().4,
+            Some(first)
         );
     }
 }

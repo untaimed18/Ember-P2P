@@ -295,7 +295,7 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
                 // discovery_only StartDownload; the network handler reloads
                 // them from SM when workers start.
                 extra_sources: Vec::new(),
-                ember_file_hash: String::new(),
+                ember_file_hash: transfer.ember_file_hash.clone().unwrap_or_default(),
                 expected_aich: transfer.expected_aich.clone(),
                 transfer_id: transfer.id.clone(),
                 control,
@@ -585,6 +585,8 @@ pub async fn start_download(
     });
     let expected_aich = crate::security::parse_expected_aich(expected_aich.as_deref())
         .map_err(|message| coded("transfers_invalid_expected_aich", message))?;
+    let ember_file_hash = crate::security::parse_ember_file_hash(ember_file_hash.as_deref())
+        .map_err(|message| coded("transfers_invalid_ember_file_hash", message))?;
 
     let peer_ip = normalize_primary_peer_ip(peer_ip)?;
 
@@ -706,6 +708,7 @@ pub async fn start_download(
         user_hash: None,
         ember_hash: None,
         expected_aich: expected_aich.clone(),
+        ember_file_hash: ember_file_hash.clone(),
         completed_path: None,
         up_part_status: None,
         up_part_count: None,
@@ -724,6 +727,17 @@ pub async fn start_download(
                     return Err(coded(
                         "transfers_existing_download_aich_mismatch",
                         "This file is already queued without the same trusted AICH pin; cancel it and add the AICH link again",
+                    ));
+                }
+            }
+            if let Some(expected) = ember_file_hash.as_deref() {
+                let existing_pin = manager
+                    .get_transfer(&existing_id)
+                    .and_then(|transfer| transfer.ember_file_hash.as_deref());
+                if existing_pin != Some(expected) {
+                    return Err(coded(
+                        "transfers_existing_download_ember_mismatch",
+                        "This file is already queued without the same Ember digest; cancel it and add the eh= link again",
                     ));
                 }
             }
@@ -770,7 +784,7 @@ pub async fn start_download(
             peer_ip,
             peer_port,
             extra_sources: parsed_extras,
-            ember_file_hash: ember_file_hash.unwrap_or_default(),
+            ember_file_hash: ember_file_hash.clone().unwrap_or_default(),
             expected_aich,
             transfer_id: transfer_id.clone(),
             control,

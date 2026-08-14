@@ -464,7 +464,7 @@ pub enum DownloadEvent {
     /// Incoming Ember browse response from a friend on a download connection.
     EmberBrowseResponse {
         ember_hash: [u8; 16],
-        entries: Vec<(String, u64, String, Option<String>)>,
+        entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
     },
     /// The .part file has been created on disk, signalling the network loop to
     /// offer this partial to the server and publish to KAD so other peers can

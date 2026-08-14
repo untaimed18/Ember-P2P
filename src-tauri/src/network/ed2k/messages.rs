@@ -1000,6 +1000,10 @@ pub struct EmberFileOffer {
     pub file_size: u64,
     /// Display name for the prompt. Untrusted: sanitise before showing.
     pub file_name: String,
+    /// BLAKE3 content digest when the sender already knows it. Rides a
+    /// 32-byte trailer after the v1 name so pre-1.5.5 parsers (which stop at
+    /// the declared name length) ignore it.
+    pub ember_file_hash: Option<[u8; 32]>,
 }
 
 /// Build an [`OP_EMBER_FILE_OFFER`] payload. Rides the friend session's Noise
@@ -1023,6 +1027,9 @@ pub fn build_ember_file_offer(offer: &EmberFileOffer) -> Vec<u8> {
     buf.extend_from_slice(&offer.file_size.to_le_bytes());
     buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
     buf.extend_from_slice(name);
+    if let Some(digest) = offer.ember_file_hash {
+        buf.extend_from_slice(&digest);
+    }
     buf
 }
 
@@ -1048,10 +1055,18 @@ pub fn parse_ember_file_offer(payload: &[u8]) -> Option<EmberFileOffer> {
         return None;
     }
     let file_name = std::str::from_utf8(&payload[start..end]).ok()?.to_string();
+    let ember_file_hash = if payload.len() >= end + 32 {
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&payload[end..end + 32]);
+        digest.iter().any(|&b| b != 0).then_some(digest)
+    } else {
+        None
+    };
     Some(EmberFileOffer {
         file_hash,
         file_size,
         file_name,
+        ember_file_hash,
     })
 }
 
@@ -3006,9 +3021,27 @@ mod tests {
             file_hash: [0x33u8; 16],
             file_size: 4_294_967_296, // deliberately over u32 to prove 64-bit sizing
             file_name: "holiday video.mkv".to_string(),
+            ember_file_hash: None,
         };
         let payload = build_ember_file_offer(&offer);
         assert_eq!(parse_ember_file_offer(&payload), Some(offer));
+    }
+
+    #[test]
+    fn ember_file_offer_roundtrip_with_digest() {
+        let offer = EmberFileOffer {
+            file_hash: [0x55u8; 16],
+            file_size: 12,
+            file_name: "clip.mp4".to_string(),
+            ember_file_hash: Some([0xABu8; 32]),
+        };
+        let payload = build_ember_file_offer(&offer);
+        assert_eq!(parse_ember_file_offer(&payload), Some(offer));
+        // Pre-trailer parsers stop at the declared name; the digest is extra.
+        let without = &payload[..payload.len() - 32];
+        let parsed = parse_ember_file_offer(without).expect("legacy body still parses");
+        assert_eq!(parsed.file_name, "clip.mp4");
+        assert_eq!(parsed.ember_file_hash, None);
     }
 
     #[test]
@@ -3031,6 +3064,7 @@ mod tests {
             file_hash: [0x01u8; 16],
             file_size: 10,
             file_name: "a.bin".to_string(),
+            ember_file_hash: None,
         };
         let good = build_ember_file_offer(&offer);
 
@@ -3063,6 +3097,7 @@ mod tests {
             file_size: 1,
             // 3 bytes per char, so the cap lands mid-character if unguarded.
             file_name: "日".repeat(400),
+            ember_file_hash: None,
         };
         let payload = build_ember_file_offer(&offer);
         let parsed = parse_ember_file_offer(&payload).expect("truncated name still parses");

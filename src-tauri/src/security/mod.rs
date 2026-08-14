@@ -1297,6 +1297,21 @@ pub fn parse_expected_aich(value: Option<&str>) -> Result<Option<String>, &'stat
     }
 }
 
+/// Normalize and validate an Ember content BLAKE3 digest (64 hex chars).
+/// Empty input yields `None`; malformed non-empty input is an error so
+/// callers fail closed rather than silently dropping the pin.
+pub fn parse_ember_file_hash(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(normalized))
+    } else {
+        Err("Ember file hash must be a 64-character hexadecimal BLAKE3 digest")
+    }
+}
+
 /// Clean up log files older than the given number of days.
 pub fn cleanup_old_logs(log_dir: &Path, max_age_days: u64) {
     let Ok(entries) = std::fs::read_dir(log_dir) else {

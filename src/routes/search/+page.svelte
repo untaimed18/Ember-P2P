@@ -1841,7 +1841,12 @@
       return;
     }
     try {
-      const link = await formatEd2kLink(result.file.name, result.file.size, result.file.hash);
+      const link = await formatEd2kLink(
+        result.file.name,
+        result.file.size,
+        result.file.hash,
+        result.file.ember_file_hash,
+      );
       if (!(await copyToClipboard(link))) {
         addToast('error', m.search_copy_failed());
         return;
@@ -1862,7 +1867,12 @@
     copyingLinks = true;
     try {
       const text = await formatEd2kLinks(
-        targets.map((r) => ({ name: r.file.name, size: r.file.size, hash: r.file.hash })),
+        targets.map((r) => ({
+          name: r.file.name,
+          size: r.file.size,
+          hash: r.file.hash,
+          emberFileHash: r.file.ember_file_hash || undefined,
+        })),
       );
       if (!(await copyToClipboard(text))) {
         addToast('error', m.search_copy_failed());

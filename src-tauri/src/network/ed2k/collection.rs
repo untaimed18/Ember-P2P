@@ -10,6 +10,9 @@ const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
 const FT_FILEHASH: u8 = 0x28;
 const FT_AICH_HASH: u8 = 0x27;
+/// Ember BLAKE3 content digest (64 hex chars). Unknown to eMule; skipped by
+/// older parsers the same way any other unfamiliar file tag is.
+const FT_EMBER_FILE_HASH: u8 = 0xE2;
 const FT_COLLECTIONAUTHOR: u8 = 0x31;
 const FT_COLLECTIONAUTHORKEY: u8 = 0x32;
 
@@ -27,6 +30,10 @@ pub struct CollectionFile {
     pub size: u64,
     pub hash: String,
     pub aich_hash: String,
+    /// 64-char hex BLAKE3 digest when known. Empty when the collection
+    /// predates this field or the source never had a digest.
+    #[serde(default)]
+    pub ember_file_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +128,7 @@ impl Collection {
             let mut fsize: u64 = 0;
             let mut fhash = String::new();
             let mut faich = String::new();
+            let mut fember = String::new();
 
             let file_limit = file_tag_count.min(20);
             for _ in 0..file_limit {
@@ -146,6 +154,11 @@ impl Collection {
                             faich = normalize_aich_hash(&s);
                         }
                     }
+                    FT_EMBER_FILE_HASH => {
+                        if let TagValue::String(s) = tag_value {
+                            fember = normalize_ember_file_hash(&s);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -158,6 +171,7 @@ impl Collection {
                 size: fsize,
                 hash: fhash,
                 aich_hash: faich,
+                ember_file_hash: fember,
             });
         }
 
@@ -267,6 +281,10 @@ impl Collection {
                 write_string_tag(&mut file_buf, FT_AICH_HASH, &wire_aich)?;
                 file_tags += 1;
             }
+            if !file.ember_file_hash.is_empty() {
+                write_string_tag(&mut file_buf, FT_EMBER_FILE_HASH, &file.ember_file_hash)?;
+                file_tags += 1;
+            }
 
             buf.write_u32::<LittleEndian>(file_tags)?;
             buf.write_all(&file_buf)?;
@@ -284,11 +302,17 @@ impl Collection {
             } else {
                 Some(file.aich_hash.as_str())
             };
+            let ember = if file.ember_file_hash.is_empty() {
+                None
+            } else {
+                Some(file.ember_file_hash.as_str())
+            };
             content.push_str(&super::hash::format_ed2k_link_ext(
                 &file.name,
                 file.size,
                 &file.hash,
                 aich,
+                ember,
                 &[],
             ));
             content.push('\n');
@@ -298,13 +322,21 @@ impl Collection {
 }
 
 fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
-    let (name, size, hash, aich) = super::hash::parse_ed2k_link(link)?;
+    let (name, size, hash, aich, ember) = super::hash::parse_ed2k_link(link)?;
     Some(CollectionFile {
         name,
         size,
         hash,
         aich_hash: aich.unwrap_or_default(),
+        ember_file_hash: ember.unwrap_or_default(),
     })
+}
+
+fn normalize_ember_file_hash(value: &str) -> String {
+    crate::security::parse_ember_file_hash(Some(value))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 fn normalize_aich_hash(value: &str) -> String {
@@ -574,12 +606,14 @@ mod tests {
                     size: 1_234_567,
                     hash: "00112233445566778899aabbccddeeff".to_string(),
                     aich_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    ember_file_hash: "ab".repeat(32),
                 },
                 CollectionFile {
                     name: "large video.mkv".to_string(),
                     size: u32::MAX as u64 + 42,
                     hash: "ffeeddccbbaa99887766554433221100".to_string(),
                     aich_hash: String::new(),
+                    ember_file_hash: String::new(),
                 },
             ],
         };
@@ -605,7 +639,31 @@ mod tests {
             assert_eq!(actual.size, expected.size);
             assert_eq!(actual.hash, expected.hash);
             assert_eq!(actual.aich_hash, expected.aich_hash);
+            assert_eq!(actual.ember_file_hash, expected.ember_file_hash);
         }
+    }
+
+    #[test]
+    fn text_collection_round_trips_ember_digest() {
+        let digest = "cd".repeat(32);
+        let collection = Collection {
+            name: "links".to_string(),
+            author: String::new(),
+            files: vec![CollectionFile {
+                name: "song.mp3".to_string(),
+                size: 9,
+                hash: "00112233445566778899aabbccddeeff".to_string(),
+                aich_hash: String::new(),
+                ember_file_hash: digest.clone(),
+            }],
+        };
+        let text = collection.to_text_bytes();
+        assert!(
+            text.contains(&format!("eh={digest}")),
+            "text collection must emit eh=: {text}"
+        );
+        let parsed = parse_ed2k_link(text.trim()).expect("parse emitted link");
+        assert_eq!(parsed.ember_file_hash, digest);
     }
 
     #[test]

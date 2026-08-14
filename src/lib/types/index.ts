@@ -117,6 +117,8 @@ export interface Transfer {
   /** Ember identity of an uploading peer. Friends are keyed by this, not `user_hash`. */
   ember_hash?: string;
   expected_aich?: string;
+  /** Optional Ember content BLAKE3 (64 hex) from `eh=` / browse / offer. */
+  ember_file_hash?: string;
   /** Upload-direction only: hex bitmap of ED2K parts fully served to this
    *  peer during the current session (byte index = part / 8, bit = part % 8,
    *  LSB-first within each byte). Drives the chunked "Up Status" parts bar —
@@ -389,8 +391,16 @@ export interface EmberDiagnostics {
   ember_dht_publishes_completed: number;
   /** Average STORE replication depth (acks per finished publish). */
   ember_dht_avg_replication: number;
-  /** Slice 19: inbound frames rejected as malformed / bad version. */
+  /** Slice 19: inbound frames rejected as malformed. */
   ember_dht_malformed: number;
+  /** Frames refused at the version byte rather than misparsed. */
+  ember_dht_version_mismatch?: number;
+  /** Completed lookups of the Ember rendezvous key this session. */
+  ember_dht_rendezvous_lookups?: number;
+  /** Those lookups that returned no other Ember node after dropping self. */
+  ember_dht_rendezvous_empty?: number;
+  /** Advertised Ember nodes in the most recent rendezvous lookup (after dropping self). */
+  ember_dht_rendezvous_last_peers?: number;
   /** Slice 19: observed-IP votes recorded from PONG payloads. */
   ember_dht_observed_votes: number;
   /** Slice 19: confirmed observed external address (`ip:port`), if any. */
@@ -465,14 +475,18 @@ export interface EmberPingResult {
 }
 
 /** One Ember DHT routing-table contact, as returned by
- *  `get_ember_dht_contacts`. All key/id fields are hex-encoded. */
+ *  `get_ember_dht_contacts`. All key/id fields are hex-encoded.
+ *  The UI snapshot omits `addr` so peer IPs never reach the webview. */
 export interface EmberDhtContact {
   node_id: string;
-  addr: string;
-  noise_pub: string;
-  ed25519_pub: string;
-  last_seen: number;
-  failed_queries: number;
+  /** Present on harness `FIND_NODE` replies; omitted from the UI snapshot. */
+  addr?: string;
+  /** Present on harness replies; omitted from the UI snapshot. */
+  noise_pub?: string;
+  /** Present on harness replies; omitted from the UI snapshot. */
+  ed25519_pub?: string;
+  last_seen?: number;
+  failed_queries?: number;
   /** XOR distance from our node ID, hex (slice 16). */
   distance?: string;
 }

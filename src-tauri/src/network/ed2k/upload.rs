@@ -1376,11 +1376,11 @@ pub enum UploadEventKind {
         supports_ebr1: bool,
     },
     /// Incoming Ember browse response from a friend (outbound session).
-    /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex)`.
+    /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex, optional_ember_hex)`.
     EmberBrowseResponse {
         ember_hash: [u8; 16],
         session_id: u64,
-        entries: Vec<(String, u64, String, Option<String>)>,
+        entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
     },
     /// An on-demand browse dial established a new friend session. The network
     /// loop binds the opaque session ID to the queued request before sending

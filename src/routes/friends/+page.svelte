@@ -99,7 +99,13 @@
    * friend as a source. Nothing about the push path bypasses the normal
    * transfer pipeline.
    */
-  async function acceptOffer(offer: { user_hash: string; file_hash: string; file_name: string; file_size: number }) {
+  async function acceptOffer(offer: {
+    user_hash: string;
+    file_hash: string;
+    file_name: string;
+    file_size: number;
+    ember_file_hash?: string;
+  }) {
     const key = offerKey(offer.user_hash, offer.file_hash);
     if (acceptingOffer) return;
     acceptingOffer = key;
@@ -117,6 +123,7 @@
         ip && port > 0 ? ip : '',
         ip && port > 0 ? port : 0,
         undefined,
+        offer.ember_file_hash,
         undefined,
         offer.user_hash,
       );

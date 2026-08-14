@@ -324,7 +324,13 @@
       for (const f of hashedLibraryFiles) {
         if (!selectedFileHashes.has(f.hash) || seenHashes.has(f.hash)) continue;
         seenHashes.add(f.hash);
-        collFiles.push({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash });
+        collFiles.push({
+          name: f.name,
+          size: f.size,
+          hash: f.hash,
+          aich_hash: f.aich_hash,
+          ember_file_hash: f.ember_file_hash || undefined,
+        });
       }
       const msg = await createCollectionWithDialog(
         newCollName.trim(),
@@ -721,7 +727,7 @@
   // emits no trailing newline, so joining chunks reproduces the same output.
   const ED2K_LINK_IPC_BATCH = 10_000;
   async function formatEd2kLinksChunked(
-    entries: Array<{ name: string; size: number; hash: string }>,
+    entries: Array<{ name: string; size: number; hash: string; emberFileHash?: string | null }>,
   ): Promise<string> {
     if (entries.length <= ED2K_LINK_IPC_BATCH) return formatEd2kLinks(entries);
     const parts: string[] = [];
@@ -768,7 +774,7 @@
     copyingAllLibraryLinks = true;
     try {
       const text = await formatEd2kLinksChunked(
-        targets.map((f) => ({ name: f.name, size: f.size, hash: f.hash }))
+        targets.map((f) => ({ name: f.name, size: f.size, hash: f.hash, emberFileHash: f.ember_file_hash || undefined }))
       );
       if (!(await writeClipboard(text))) {
         toastError(m.library_copy_failed());
@@ -1240,11 +1246,11 @@
     }
     try {
       const seen = new Set<string>();
-      const files: Array<{ name: string; size: number; hash: string }> = [];
+      const files: Array<{ name: string; size: number; hash: string; emberFileHash?: string }> = [];
       for (const f of targets) {
         if (seen.has(f.hash)) continue;
         seen.add(f.hash);
-        files.push({ name: f.name, size: f.size, hash: f.hash });
+        files.push({ name: f.name, size: f.size, hash: f.hash, emberFileHash: f.ember_file_hash || undefined });
       }
       const text = await formatEd2kLinksChunked(files);
       if (!(await writeClipboard(text))) {
@@ -1751,11 +1757,11 @@
       }
       try {
         const seen = new Set<string>();
-        const files: Array<{ name: string; size: number; hash: string }> = [];
+        const files: Array<{ name: string; size: number; hash: string; emberFileHash?: string }> = [];
         for (const f of targets) {
           if (seen.has(f.hash)) continue;
           seen.add(f.hash);
-          files.push({ name: f.name, size: f.size, hash: f.hash });
+          files.push({ name: f.name, size: f.size, hash: f.hash, emberFileHash: f.ember_file_hash || undefined });
         }
         const text = await formatEd2kLinksChunked(files);
         if (!(await writeClipboard(text))) {
@@ -1782,7 +1788,12 @@
     }
     if (!selectedFile?.hash) return;
     try {
-      const link = await formatEd2kLink(selectedFile.name, selectedFile.size, selectedFile.hash);
+      const link = await formatEd2kLink(
+        selectedFile.name,
+        selectedFile.size,
+        selectedFile.hash,
+        selectedFile.ember_file_hash,
+      );
       if (!(await writeClipboard(link))) {
         toastError(m.library_copy_failed());
         return;
@@ -1979,12 +1990,19 @@
           break;
         case 'copy_link': {
           let link: string;
+          const emberHash = f.ember_file_hash || undefined;
           if (extra === 'aich') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, { aichHash: f.aich_hash || undefined });
+            link = await buildEd2kLink(f.name, f.size, f.hash, {
+              aichHash: f.aich_hash || undefined,
+              emberFileHash: emberHash,
+            });
           } else if (extra === 'sources') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, { withSources: true });
+            link = await buildEd2kLink(f.name, f.size, f.hash, {
+              withSources: true,
+              emberFileHash: emberHash,
+            });
           } else {
-            link = await formatEd2kLink(f.name, f.size, f.hash);
+            link = await formatEd2kLink(f.name, f.size, f.hash, emberHash);
           }
           if (!(await writeClipboard(link))) {
             toastError(m.library_copy_failed());

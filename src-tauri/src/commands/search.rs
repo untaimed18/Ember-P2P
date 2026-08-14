@@ -577,7 +577,12 @@ pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<String, String> {
+pub fn format_ed2k_link(
+    name: String,
+    size: u64,
+    file_hash: String,
+    ember_file_hash: Option<String>,
+) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
         return Err(coded(
             "search_file_name_invalid",
@@ -590,7 +595,18 @@ pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<St
             "Invalid file hash (expected 32 hex characters)",
         ));
     }
-    Ok(hash::format_ed2k_link(&name, size, &file_hash))
+    let ember = ember_file_hash.as_deref().and_then(|h| {
+        let t = h.trim();
+        (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+    });
+    Ok(hash::format_ed2k_link_ext(
+        &name,
+        size,
+        &file_hash,
+        None,
+        ember,
+        &[],
+    ))
 }
 
 /// One file entry for [`format_ed2k_links`] (bulk clipboard / export).
@@ -600,6 +616,8 @@ pub struct Ed2kLinkFileInput {
     pub name: String,
     pub size: u64,
     pub hash: String,
+    #[serde(default)]
+    pub ember_file_hash: Option<String>,
 }
 
 /// Soft cap for a single clipboard batch. Larger libraries should export a
@@ -633,7 +651,18 @@ pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&hash::format_ed2k_link(&f.name, f.size, &f.hash));
+        let ember = f.ember_file_hash.as_deref().and_then(|h| {
+            let t = h.trim();
+            (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+        });
+        out.push_str(&hash::format_ed2k_link_ext(
+            &f.name,
+            f.size,
+            &f.hash,
+            None,
+            ember,
+            &[],
+        ));
     }
     Ok(out)
 }
@@ -645,6 +674,8 @@ pub struct Ed2kLinkInfo {
     pub hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aich: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ember: Option<String>,
 }
 
 #[tauri::command]
@@ -657,11 +688,12 @@ pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
         ));
     }
     hash::parse_ed2k_link_strict(&link)
-        .map(|(name, size, hash, aich)| Ed2kLinkInfo {
+        .map(|(name, size, hash, aich, ember)| Ed2kLinkInfo {
             name,
             size,
             hash,
             aich,
+            ember,
         })
         .map_err(|error| {
             coded_ctx(
@@ -685,6 +717,7 @@ pub async fn build_ed2k_link(
     size: u64,
     file_hash: String,
     aich_hash: Option<String>,
+    ember_file_hash: Option<String>,
     with_sources: bool,
 ) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
@@ -703,6 +736,10 @@ pub async fn build_ed2k_link(
     let aich = aich_hash.and_then(|h| {
         let t = h.trim().to_string();
         (t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+    });
+    let ember = ember_file_hash.and_then(|h| {
+        let t = h.trim().to_string();
+        (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
     });
 
     let mut sources: Vec<(String, u16)> = Vec::new();
@@ -762,6 +799,7 @@ pub async fn build_ed2k_link(
         size,
         &file_hash,
         aich.as_deref(),
+        ember.as_deref(),
         &sources,
     ))
 }
