@@ -1940,7 +1940,7 @@
   "settings_antileech_restore_confirm": "Wiederherstellen",
   "settings_antileech_file_label": "Datei: {path}",
   "settings_antileech_errors_title": "Vom Regex-Compiler abgelehnte Muster:",
-  "settings_antileech_placeholder": "# Beispiele:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Beispiele:\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "Anti-Leech-Filter konnte nicht geladen werden: {error}",
   "settings_antileech_saved_one": "1 Muster gespeichert.",
   "settings_antileech_saved_other": "{count} Muster gespeichert.",

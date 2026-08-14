@@ -5432,21 +5432,26 @@ impl UploadHandler {
         }
 
         // Anti-leech client-software filter. eMule's `AntiLeech.dat`
-        // equivalent — match the rendered software label against the
-        // user's pattern list and close the connection at handshake
-        // time if anything matches. Done HERE (after the optional
-        // EmuleInfo round-trip) so we have the most complete `mod_version`
-        // string possible; the fast-path branch above leaves
-        // `mod_version` empty and would let some patterns fail to match
-        // a peer that's actually identifiable. Closing pre-slot-grant
-        // means a leech mod can't briefly claim a slot, can't move
-        // bytes, and can't sit in the queue holding rank.
-        let leech_match = self.antileech.read().check(&ul_client_software);
+        // equivalent — match the rendered software label plus the
+        // CT_MODVERSION / ET_MOD_VERSION tag against the user's pattern
+        // list and close the connection at handshake time if anything
+        // matches. Done HERE (after the optional EmuleInfo round-trip)
+        // so we have the most complete `mod_version` string possible.
+        // The eMule fast path (OP_SECIDENTSTATE instead of OP_EMULEINFO)
+        // still leaves `mod_version` empty when the brand lives only in
+        // EmuleInfo; the serve loop re-checks when that packet arrives.
+        // Closing pre-slot-grant means a leech mod can't briefly claim a
+        // slot, can't move bytes, and can't sit in the queue holding rank.
+        let leech_haystack = crate::security::antileech::match_haystack(
+            &ul_client_software,
+            &hello_caps.mod_version,
+        );
+        let leech_match = self.antileech.read().check(&leech_haystack);
         if let Some(m) = leech_match {
             info!(
                 "AntiLeech: rejecting upload session with {peer_addr} — \
-                 client software {ul_client_software:?} matched pattern {:?}",
-                m.pattern,
+                 client software {ul_client_software:?} mod {:?} matched pattern {:?}",
+                hello_caps.mod_version, m.pattern,
             );
             // Best-effort soft-close: send OP_QUEUEFULL so well-behaved
             // peers stop trying immediately rather than retrying with a
@@ -9442,6 +9447,58 @@ impl UploadHandler {
                         &ip_bytes.to_le_bytes(),
                     ).await?;
                     debug!("Sent OP_PUBLICIP_ANSWER ({}) to {peer_addr}", peer_addr.ip());
+                }
+
+                // Late OP_EMULEINFO: the inbound handshake only waits for the
+                // *next* packet after Hello. Modern eMule often sends
+                // OP_SECIDENTSTATE first (fast path), so ET_MOD_VERSION lands
+                // here. Re-merge caps and re-run the anti-leech haystack so
+                // VeryCD / easyMule are still caught if they skipped Hello's
+                // CT_MODVERSION tag.
+                (OP_EMULEPROT, OP_EMULEINFO) | (OP_EMULEPROT, OP_EMULEINFOANSWER) => {
+                    merge_caps(&mut hello_caps, parse_emule_info(&payload));
+                    ul_client_software = client_software_from_caps(&hello_caps);
+                    if opcode == OP_EMULEINFO {
+                        let emule_payload = build_emule_info(
+                            self.advertised_udp_port(),
+                            self.obfuscation_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            Some(&self.ember_hash),
+                            None,
+                        );
+                        let _ = write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &emule_payload,
+                        )
+                        .await;
+                    }
+                    let leech_haystack = crate::security::antileech::match_haystack(
+                        &ul_client_software,
+                        &hello_caps.mod_version,
+                    );
+                    let leech_match = self.antileech.read().check(&leech_haystack);
+                    if let Some(m) = leech_match {
+                        info!(
+                            "AntiLeech: rejecting upload session with {peer_addr} after EmuleInfo — \
+                             client software {ul_client_software:?} mod {:?} matched pattern {:?}",
+                            hello_caps.mod_version,
+                            m.pattern,
+                        );
+                        let _ = write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_QUEUEFULL,
+                            &[],
+                        )
+                        .await;
+                        {
+                            let mut queue = self.upload_queue.lock().await;
+                            queue.retain(|e| e.identity != queue_identity);
+                        }
+                        break;
+                    }
                 }
 
                 // eMule Buddy keepalive: respond to ping with pong

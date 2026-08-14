@@ -1940,7 +1940,7 @@
   "settings_antileech_restore_confirm": "Restaurer",
   "settings_antileech_file_label": "Fichier : {path}",
   "settings_antileech_errors_title": "Motifs rejetés par le compilateur regex :",
-  "settings_antileech_placeholder": "# Exemples :\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Exemples :\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "Échec du chargement du filtre anti-leech : {error}",
   "settings_antileech_saved_one": "1 motif enregistré.",
   "settings_antileech_saved_other": "{count} motifs enregistrés.",

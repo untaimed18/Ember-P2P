@@ -1,12 +1,17 @@
 //! Anti-leech client filter — eMule-style `AntiLeech.dat` equivalent.
 //!
-//! The filter matches a peer's rendered client-software string (the same
-//! string the UI displays in the upload-pane "Software" column, produced
-//! by `messages::client_software_from_caps`) against a list of regexes
-//! the user controls via `~/AppData/Roaming/com.ember.p2p/antileech.dat`
-//! (or the platform equivalent). Connections from peers whose label
+//! The filter matches a haystack of the peer's rendered client-software
+//! string (the upload-pane "Software" column from
+//! `messages::client_software_from_caps`) plus the CT_MODVERSION /
+//! ET_MOD_VERSION tag when that tag is not already in the label. Brand-name
+//! defaults (VeryCD, easyMule, …) live in the mod tag; the software column
+//! alone is usually just "eMule 0.50". Connections from peers whose haystack
 //! matches any pattern are closed at handshake time, before any slot is
 //! granted, queue position is held, or upload bytes flow.
+//!
+//! Patterns are user-controlled via
+//! `~/AppData/Roaming/com.ember.p2p/antileech.dat` (or the platform
+//! equivalent).
 //!
 //! ## File format
 //!
@@ -64,6 +69,37 @@ pub const MAX_FILE_BYTES: u64 = 1 * 1024 * 1024;
 /// blow the memory budget on the hot path.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
+/// Text the filter is matched against: the UI software label plus the
+/// peer's CT_MODVERSION / ET_MOD_VERSION tag when that tag is not already
+/// contained in the label. Brand-name defaults (VeryCD, easyMule, …) live
+/// in the mod tag; `client_software_from_caps` does not append it.
+pub fn match_haystack(client_software: &str, mod_version: &str) -> String {
+    let software = client_software.trim();
+    let modv = mod_version.trim();
+    if modv.is_empty() {
+        return software.to_string();
+    }
+    if software.is_empty() {
+        return modv.to_string();
+    }
+    if software
+        .to_ascii_lowercase()
+        .contains(&modv.to_ascii_lowercase())
+    {
+        software.to_string()
+    } else {
+        format!("{software} {modv}")
+    }
+}
+
+fn is_unmodified_legacy_defaults(loaded: &[String]) -> bool {
+    loaded.len() == LEGACY_DEFAULT_PATTERNS.len()
+        && loaded
+            .iter()
+            .zip(LEGACY_DEFAULT_PATTERNS.iter())
+            .all(|(a, b)| a == b)
+}
+
 /// Built-in patterns — the well-known leech mods + a few that target
 /// clients that explicitly identify as broken. Kept conservative on
 /// purpose; a too-aggressive default would create silent connectivity
@@ -71,11 +107,16 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20;
 ///
 /// Every entry has been cross-checked NOT to match Ember's own client
 /// strings (see the `defaults_do_not_block_ember` unit test).
+///
+/// `\b(LEECHER|LEECH)\b` is intentionally absent: once the haystack
+/// includes mod tags, it hits legitimate DLP/Xtreme-style "Anti-Leech"
+/// strings. Brand names below do the real work.
 const DEFAULT_PATTERNS: &[&str] = &[
     // VeryCD eMule (Chinese mod, widely deployed, well-documented credit
-    // gaming and excessive request behaviour). Matches the mod tag
-    // anywhere in the rendered software string.
+    // gaming and excessive request behaviour). Lives in ET_MOD_VERSION.
     r"VeryCD",
+    // easyMule — VeryCD's later product, same family and rationale.
+    r"easyMule",
     // MagicMule — known credit-forging fork.
     r"MagicMule",
     // Sivka — broken upload accounting mod.
@@ -84,10 +125,6 @@ const DEFAULT_PATTERNS: &[&str] = &[
     // mis-implement queue scoring). The `\b` boundaries avoid matching
     // benign substrings like "exMule" that some other mod might use.
     r"\bxMule\b",
-    // "LEECHER" or "LEECH" tokens — a small number of mods literally
-    // brand themselves this way. Anchored with word boundaries so a
-    // client called "LeecherProtector" or similar isn't caught.
-    r"\b(LEECHER|LEECH)\b",
     // eMule v0.29 and older predate SecIdent entirely; they can't be
     // credited and consume slots with no upload reciprocity. Rare in
     // 2026, but still occasionally seen on long-tail networks. The
@@ -97,6 +134,19 @@ const DEFAULT_PATTERNS: &[&str] = &[
     // (e.g. "0.20a") work because we don't require a word boundary
     // after the digits — the leading anchor + `0.[0-2]\d` is enough
     // to scope the match to the early-2.x release line.
+    r"^eMule 0\.[0-2]\d",
+];
+
+/// Pattern list shipped before the haystack/easyMule change. An on-disk
+/// file whose loaded patterns equal this exact list (order included) is
+/// treated as an unmodified factory file and rewritten with
+/// [`DEFAULT_PATTERNS`]. Customized files are left alone.
+const LEGACY_DEFAULT_PATTERNS: &[&str] = &[
+    r"VeryCD",
+    r"MagicMule",
+    r"\bSivka\b",
+    r"\bxMule\b",
+    r"\b(LEECHER|LEECH)\b",
     r"^eMule 0\.[0-2]\d",
 ];
 
@@ -309,8 +359,9 @@ impl AntiLeechFilter {
         buf.push_str("# Ember anti-leech client filter — one regex per line.\n");
         buf.push_str("# Lines starting with `#` and blank lines are ignored.\n");
         buf.push_str("# Patterns are matched case-insensitively against the rendered\n");
-        buf.push_str("# client-software string (e.g. \"eMule 0.50\", \"aMule 2.3.3\",\n");
-        buf.push_str("# \"VeryCD eMule v1.0\"). Save and reload via Settings to apply.\n\n");
+        buf.push_str("# client-software string plus the peer's mod tag when present\n");
+        buf.push_str("# (e.g. \"eMule 0.50 VeryCD 080828\", \"eMule 0.48 easyMule\").\n");
+        buf.push_str("# Save and reload via Settings to apply.\n\n");
         for pat in &self.raw_patterns {
             buf.push_str(pat);
             buf.push('\n');
@@ -391,11 +442,32 @@ pub type SharedAntiLeechFilter = Arc<RwLock<AntiLeechFilter>>;
 
 /// Convenience helper for the common boot-time path: load the filter
 /// from `data_dir/antileech.dat`; if that file doesn't exist yet, write
-/// out the default list so the user has something to edit.
+/// out the default list so the user has something to edit. An on-disk
+/// file that still holds the pre-haystack factory list (including the
+/// old `LEECH` token) is rewritten with the current defaults so existing
+/// installs pick up `easyMule` without a manual Restore. Customized files
+/// are left unchanged.
 pub fn load_or_seed_defaults(data_dir: &Path, enabled: bool) -> AntiLeechFilter {
     let path = data_dir.join(DEFAULT_FILE_NAME);
     if path.exists() {
-        return AntiLeechFilter::load_from_file(&path, enabled);
+        let loaded = AntiLeechFilter::load_from_file(&path, enabled);
+        if is_unmodified_legacy_defaults(loaded.patterns()) {
+            let next = AntiLeechFilter::with_defaults(enabled);
+            if let Err(e) = next.save_to_file(&path) {
+                warn!(
+                    "AntiLeech: could not migrate factory patterns at {}: {e}",
+                    path.display()
+                );
+                return loaded;
+            }
+            info!(
+                "AntiLeech: migrated unmodified factory list at {} to {} pattern(s)",
+                path.display(),
+                next.pattern_count()
+            );
+            return next;
+        }
+        return loaded;
     }
     let filter = AntiLeechFilter::with_defaults(enabled);
     if let Err(e) = filter.save_to_file(&path) {
@@ -425,18 +497,21 @@ mod tests {
     fn defaults_do_not_block_ember() {
         let filter = AntiLeechFilter::with_defaults(true);
         let labels = [
-            "Ember 0.9.0",
-            "Ember 1.0",
-            "Ember Compat 0.50",
-            "eMule Compat 0.50",
-            "eMule Compat 0.50.1",
+            "Ember 0.9.0".to_string(),
+            "Ember 1.0".to_string(),
+            "Ember 1.5.5".to_string(),
+            "Ember Compat 0.50".to_string(),
+            "eMule Compat 0.50".to_string(),
+            "eMule Compat 0.50.1".to_string(),
             // The `client_software_from_caps` output for our own peers
             // (with mod_version = "Ember X.Y.Z") preferred path:
-            "Ember",
+            "Ember".to_string(),
+            match_haystack("Ember 1.5.5", "Ember 1.5.5"),
+            match_haystack("Ember", "Ember 1.5.5"),
         ];
         for label in labels {
             assert!(
-                filter.check(label).is_none(),
+                filter.check(&label).is_none(),
                 "default filter unexpectedly blocked our own client string {label:?} \
                  — every default regex must avoid matching Ember's identity"
             );
@@ -452,21 +527,54 @@ mod tests {
     fn defaults_block_known_leeches() {
         let filter = AntiLeechFilter::with_defaults(true);
         let blocked = [
-            "VeryCD eMule v1.0",
-            "verycd emule v1.0", // case-insensitive
-            "MagicMule 1.4",
-            "Sivka 17b",
-            "xMule 1.10.0",
-            "eMule 0.20a",
-            "eMule 0.15",
-            "eMule 0.29c LEECHER mod",
+            "VeryCD eMule v1.0".to_string(),
+            "verycd emule v1.0".to_string(),
+            match_haystack("eMule 0.50", "VeryCD 080828"),
+            match_haystack("eMule 0.48", "easyMule"),
+            "MagicMule 1.4".to_string(),
+            match_haystack("eMule 0.50", "MagicMule"),
+            "Sivka 17b".to_string(),
+            match_haystack("eMule 0.42e", "sivka v12e8"),
+            "xMule 1.10.0".to_string(),
+            "eMule 0.20a".to_string(),
+            "eMule 0.15".to_string(),
         ];
         for label in blocked {
             assert!(
-                filter.check(label).is_some(),
+                filter.check(&label).is_some(),
                 "expected default filter to block {label:?}"
             );
         }
+        // Software column alone must NOT be enough for a brand that only
+        // lives in the mod tag — that was the pre-haystack miss.
+        assert!(
+            filter.check("eMule 0.50").is_none(),
+            "plain eMule 0.50 is not a leech"
+        );
+    }
+
+    /// The old LEECH token must not fire on legitimate anti-leech mods
+    /// once the haystack includes mod tags.
+    #[test]
+    fn defaults_do_not_block_antileech_mod_tags() {
+        let filter = AntiLeechFilter::with_defaults(true);
+        let allowed = [
+            match_haystack("eMule 0.50", "Xtreme 8.1"),
+            match_haystack("eMule 0.50a", "MorphXT 12.7"),
+            match_haystack("eMule 0.50", "StulleMule"),
+            match_haystack("eMule 0.50", "Anti-Leech"),
+            "eMule 0.50 Anti-Leech".to_string(),
+        ];
+        for label in allowed {
+            assert!(
+                filter.check(&label).is_none(),
+                "default filter unexpectedly blocked legitimate mod {label:?}"
+            );
+        }
+        assert!(
+            filter.check("eMule 0.29c LEECHER mod").is_some(),
+            "ancient eMule 0.29 still blocked by the version pattern, not LEECH"
+        );
     }
 
     /// A disabled filter must let *everything* through, including the
@@ -509,6 +617,8 @@ mod tests {
             "eD2k",
             "eMule Compat",
             "eMule Compat 0.50",
+            "eMule 0.50 Xtreme 8.1",
+            "eMule 0.50a MorphXT 12.7",
         ];
         for label in allowed {
             assert!(
@@ -600,5 +710,114 @@ MagicMule
         // Disabling should always succeed regardless of set state.
         let _ = filter.set_enabled(false);
         assert!(filter.set_enabled(false).is_ok());
+    }
+
+    #[test]
+    fn match_haystack_appends_distinct_mod_tag() {
+        assert_eq!(match_haystack("eMule 0.50", ""), "eMule 0.50");
+        assert_eq!(match_haystack("", "VeryCD 080828"), "VeryCD 080828");
+        assert_eq!(
+            match_haystack("eMule 0.50", "VeryCD 080828"),
+            "eMule 0.50 VeryCD 080828"
+        );
+        assert_eq!(
+            match_haystack("Ember 1.5.5", "Ember 1.5.5"),
+            "Ember 1.5.5",
+            "identical mod tag must not be duplicated"
+        );
+        assert_eq!(
+            match_haystack("Ember 1.5.5", "ember 1.5.5"),
+            "Ember 1.5.5",
+            "containment is case-insensitive"
+        );
+        assert_eq!(
+            match_haystack("Ember", "Ember 1.5.5"),
+            "Ember Ember 1.5.5",
+            "shorter software label does not swallow a longer mod tag"
+        );
+    }
+
+    #[test]
+    fn version_pattern_stays_anchored_when_mod_tag_is_appended() {
+        let (filter, errors) =
+            AntiLeechFilter::from_patterns(vec![r"^eMule 0\.[0-2]\d".to_string()], true);
+        assert!(errors.is_empty());
+        assert!(
+            filter
+                .check(&match_haystack("eMule 0.50", "VeryCD 080828"))
+                .is_none(),
+            "0.50 must not match the 0.0x–0.2x version pattern just because a mod tag follows"
+        );
+        assert!(filter.check("eMule 0.29c").is_some());
+    }
+
+    #[test]
+    fn load_or_seed_migrates_unmodified_legacy_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-antileech-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEFAULT_FILE_NAME);
+        let (old, errors) = AntiLeechFilter::from_patterns(
+            LEGACY_DEFAULT_PATTERNS.iter().map(|p| (*p).to_string()),
+            true,
+        );
+        assert!(errors.is_empty());
+        old.save_to_file(&path).unwrap();
+
+        let migrated = load_or_seed_defaults(&dir, true);
+        assert!(
+            migrated.patterns().iter().any(|p| p == "easyMule"),
+            "migration must add easyMule: {:?}",
+            migrated.patterns()
+        );
+        assert!(
+            !migrated.patterns().iter().any(|p| p.contains("LEECH")),
+            "migration must drop the LEECH token: {:?}",
+            migrated.patterns()
+        );
+        assert_eq!(
+            migrated.patterns(),
+            &DEFAULT_PATTERNS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_seed_leaves_customized_file_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-antileech-custom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEFAULT_FILE_NAME);
+        let (custom, _) =
+            AntiLeechFilter::from_patterns(vec!["VeryCD".to_string(), "MyMod".to_string()], true);
+        custom.save_to_file(&path).unwrap();
+
+        let loaded = load_or_seed_defaults(&dir, true);
+        assert_eq!(
+            loaded.patterns(),
+            &["VeryCD".to_string(), "MyMod".to_string()]
+        );
+        assert!(
+            !loaded.patterns().iter().any(|p| p == "easyMule"),
+            "custom lists must not be rewritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1940,7 +1940,7 @@
   "settings_antileech_restore_confirm": "恢复",
   "settings_antileech_file_label": "文件：{path}",
   "settings_antileech_errors_title": "被正则编译器拒绝的规则：",
-  "settings_antileech_placeholder": "# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Examples:\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "加载反吸血筛选失败：{error}",
   "settings_antileech_saved_one": "已保存 1 条规则。",
   "settings_antileech_saved_other": "已保存 {count} 条规则。",

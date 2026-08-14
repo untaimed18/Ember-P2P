@@ -1056,7 +1056,8 @@ pub struct AppSettings {
     /// `<data_dir>/antileech.dat` and is loaded at startup; toggling this
     /// at runtime is supported via the `set_antileech_enabled` Tauri
     /// command. Off by default — opt-in to avoid surprising regressions
-    /// for users who didn't ask to filter peers.
+    /// for users who didn't ask to filter peers. Matching uses the
+    /// rendered software label plus the peer's mod tag.
     #[serde(default)]
     pub antileech_enabled: bool,
     /// Upload Speed Sense: dynamically adjust upload limit based on network latency

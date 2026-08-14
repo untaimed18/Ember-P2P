@@ -1090,6 +1090,20 @@ pub fn parse_ember_file_offer_ack(payload: &[u8]) -> Option<(u8, [u8; 16])> {
     Some((payload[1], file_hash))
 }
 
+/// CT_MODVERSION / ET_MOD_VERSION (`0x55`) — used by the anti-leech haystack.
+/// eMule's `CTag::WriteNewEd2kTag` emits strings of length 1–16 as compact
+/// `TAGTYPE_STRn` rather than a length-prefixed `TAGTYPE_STRING`, so both
+/// Hello and EmuleInfo parsers must harvest this name id from either form.
+const MAX_MOD_VERSION_LEN: usize = 8192;
+
+fn harvest_mod_version_tag(caps: &mut PeerCapabilities, name_id: u8, bytes: &[u8]) {
+    if name_id != 0x55 {
+        return;
+    }
+    let capped = bytes.len().min(MAX_MOD_VERSION_LEN);
+    caps.mod_version = String::from_utf8_lossy(&bytes[..capped]).to_string();
+}
+
 /// Parse an EmuleInfo or EmuleInfoAnswer payload into peer capabilities.
 /// Format: version(1) + protocol(1) + tag_count(u32) + tags.
 /// Also handles legacy format without protocol byte (version(1) + tag_count(u32) + tags).
@@ -1160,12 +1174,7 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 if p + slen > payload.len() {
                     break;
                 }
-                if name_id == 0x55 {
-                    // Record mod_version for diagnostics only; never use it
-                    // to drive `is_ember` (see `OP_EMBER_HELLO` for that).
-                    let bytes = &payload[p..p + slen];
-                    caps.mod_version = String::from_utf8_lossy(bytes).to_string();
-                }
+                harvest_mod_version_tag(&mut caps, name_id, &payload[p..p + slen]);
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
@@ -1232,6 +1241,7 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 if p + slen > payload.len() {
                     break;
                 }
+                harvest_mod_version_tag(&mut caps, name_id, &payload[p..p + slen]);
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
@@ -1341,6 +1351,13 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                     let capped = slen.min(MAX_HELLO_STRING_LEN);
                     caps.peer_name =
                         String::from_utf8_lossy(&payload[pos..pos + capped]).to_string();
+                } else {
+                    // CT_MODVERSION / ET_MOD_VERSION. Mods that skip
+                    // OP_EMULEINFO still often put VeryCD / easyMule here;
+                    // the anti-leech haystack reads this field. Compact
+                    // STR1..STR16 (handled below) is the common eMule
+                    // encoding for short mod names.
+                    harvest_mod_version_tag(&mut caps, name_id, &payload[pos..pos + slen]);
                 }
                 cursor.set_position((pos + slen) as u64);
                 continue;
@@ -1395,6 +1412,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 if p + slen > payload.len() {
                     break;
                 }
+                harvest_mod_version_tag(&mut caps, name_id, &payload[p..p + slen]);
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
@@ -2896,6 +2914,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_hello_harvests_mod_version_string_tag() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x11u8; 16]);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x82); // new-format string tag
+        payload.push(0x55); // CT_MODVERSION
+        let modv = b"VeryCD 080828";
+        payload.extend_from_slice(&(modv.len() as u16).to_le_bytes());
+        payload.extend_from_slice(modv);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+
+        let (_hash, caps) = parse_hello_answer(&payload).unwrap();
+        assert_eq!(caps.mod_version, "VeryCD 080828");
+        assert!(!caps.is_ember);
+    }
+
+    #[test]
+    fn parse_hello_harvests_compact_mod_version_str_tag() {
+        // eMule CTag::WriteNewEd2kTag encodes 1–16 char strings as
+        // TAGTYPE_STRn | 0x80. "VeryCD 080828" is 13 bytes → STR13.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x11u8; 16]);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0x80 | 0x1D); // new-format STR13
+        payload.push(0x55); // CT_MODVERSION
+        payload.extend_from_slice(b"VeryCD 080828");
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+
+        let (_hash, caps) = parse_hello_answer(&payload).unwrap();
+        assert_eq!(caps.mod_version, "VeryCD 080828");
+        assert!(!caps.is_ember);
+    }
+
+    #[test]
     fn parse_emule_info_roundtrip_preserves_flags() {
         let caps = parse_emule_info(&build_emule_info(4672, true, None, None));
 
@@ -2938,6 +2996,23 @@ mod tests {
             !caps.is_ember,
             "is_ember must come from OP_EMBER_HELLO, not ET_MOD_VERSION"
         );
+    }
+
+    #[test]
+    fn parse_emule_info_harvests_compact_mod_version_str_tag() {
+        // Old-format EmuleInfo tag with TAGTYPE_STR6 ("VeryCD").
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_u8(0x32).unwrap();
+        buf.write_u8(0x01).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap();
+        buf.write_u8(0x16).unwrap(); // STR6
+        buf.write_u16::<LittleEndian>(1).unwrap();
+        buf.write_u8(0x55).unwrap();
+        buf.write_all(b"VeryCD").unwrap();
+
+        let caps = parse_emule_info(&buf);
+        assert_eq!(caps.mod_version, "VeryCD");
+        assert!(!caps.is_ember);
     }
 
     /// `OP_EMBER_HELLO` round-trip: the builder + parser must agree on the

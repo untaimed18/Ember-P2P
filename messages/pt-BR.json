@@ -1940,7 +1940,7 @@
   "settings_antileech_restore_confirm": "Restaurar",
   "settings_antileech_file_label": "Arquivo: {path}",
   "settings_antileech_errors_title": "Padrões rejeitados pelo compilador de regex:",
-  "settings_antileech_placeholder": "# Exemplos:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Exemplos:\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "Falha ao carregar o filtro anti-leech: {error}",
   "settings_antileech_saved_one": "1 padrão salvo.",
   "settings_antileech_saved_other": "{count} padrões salvos.",

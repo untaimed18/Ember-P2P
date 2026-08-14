@@ -1940,7 +1940,7 @@
   "settings_antileech_restore_confirm": "Restaurar",
   "settings_antileech_file_label": "Archivo: {path}",
   "settings_antileech_errors_title": "Patrones rechazados por el compilador de expresiones regulares:",
-  "settings_antileech_placeholder": "# Ejemplos:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Ejemplos:\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "No se pudo cargar el filtro anti-leech: {error}",
   "settings_antileech_saved_one": "Guardado 1 patrón.",
   "settings_antileech_saved_other": "Guardados {count} patrones.",

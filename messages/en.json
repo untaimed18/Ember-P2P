@@ -1943,7 +1943,7 @@
   "settings_antileech_restore_confirm": "Restore",
   "settings_antileech_file_label": "File: {path}",
   "settings_antileech_errors_title": "Patterns rejected by the regex compiler:",
-  "settings_antileech_placeholder": "# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d",
+  "settings_antileech_placeholder": "# Examples:\nVeryCD\neasyMule\nMagicMule\n^eMule 0\\.[0-2]\\d",
   "settings_antileech_load_failed": "Failed to load anti-leech filter: {error}",
   "settings_antileech_saved_one": "Saved 1 pattern.",
   "settings_antileech_saved_other": "Saved {count} patterns.",

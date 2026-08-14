@@ -675,7 +675,8 @@ export interface AppSettings {
   preview_priority_all: boolean;
   skip_compress_video: boolean;
   /** When on, peers whose advertised client-software string matches any
-   *  pattern in `<data_dir>/antileech.dat` are rejected at handshake. */
+   *  pattern in `<data_dir>/antileech.dat` are rejected at handshake
+   *  (software label plus mod tag). */
   antileech_enabled: boolean;
   uss_enabled: boolean;
   filename_cleanups: string;
