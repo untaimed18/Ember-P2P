@@ -9,9 +9,8 @@ export interface ToastItem {
 let nextId = 0;
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
 /** Ids added with `durationMs = 0`. These are notices the user is meant to
- *  acknowledge (consent prompts, fatal failures), so the queue cap evicts
- *  them last — but they still get the ceiling timer below, so one nobody
- *  closes can't hold a slot for the rest of the session. */
+ *  acknowledge (consent prompts, fatal failures), so they are never dismissed
+ *  on a timer and the queue cap evicts them last. */
 const stickyToasts = new Set<number>();
 
 export const toasts = writable<ToastItem[]>([]);
@@ -21,10 +20,6 @@ export const toasts = writable<ToastItem[]>([]);
  *  every one. Past a handful the stack stops being readable well before it
  *  stops being rendered. */
 const MAX_TOASTS = 5;
-/** Ceiling applied to `durationMs = 0`. Sticky means "outlives a normal
- *  toast", not "forever" — an unnoticed one would otherwise occupy a slot
- *  and keep evicting the messages that follow it. */
-const STICKY_TOAST_MAX_MS = 120_000;
 
 function clearToastTimer(id: number) {
   const timer = toastTimers.get(id);
@@ -50,10 +45,14 @@ export function addToast(type: ToastItem['type'], message: string, durationMs = 
     return next;
   });
   for (const evictedId of evicted) clearToastTimer(evictedId);
-  toastTimers.set(
-    id,
-    setTimeout(() => removeToast(id), durationMs > 0 ? durationMs : STICKY_TOAST_MAX_MS),
-  );
+  // No timer for a sticky toast. Both callers that pass 0 depend on it: the
+  // Ember-default-on notice comes from a one-shot backend latch that is spent
+  // as soon as it resolves, so auto-dismissing it loses the only consent
+  // notice the user will ever get, and the UPnP failure warning only re-fires
+  // when `mapped` changes, so it would not come back either.
+  if (durationMs > 0) {
+    toastTimers.set(id, setTimeout(() => removeToast(id), durationMs));
+  }
   return id;
 }
 

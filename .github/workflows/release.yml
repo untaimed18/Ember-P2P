@@ -1,14 +1,17 @@
 name: Release
 
 # Cuts a signed DRAFT release when an exact version tag is pushed. The flow is:
-#   1. Bump the version (`npm run bump-version -- X.Y.Z`).
+#   1. Bump the version (`npm run bump-version -- X.Y.Z`) and write that
+#      version's section in docs/index.html — the release body and the updater's
+#      notes are both rendered from it, and a missing section fails the build.
 #   2. Commit, then `git tag vX.Y.Z && git push --tags`.
 #   3. This workflow verifies policy in a no-secret job, validates the build in
 #      a second no-secret job, then enters the protected release-signing
 #      environment to build/sign and create a DRAFT GitHub Release.
-#   4. Review the draft, add notes, and Publish. Publishing is what makes
+#   4. Review the draft and Publish. Publishing is what makes
 #      `releases/latest/download/latest.json` resolve, so installed apps only
-#      see the update once you've deliberately published.
+#      see the update once you've deliberately published. Editing the draft body
+#      afterwards does not change the notes already signed into latest.json.
 #
 # Required secrets on the protected `release-signing` environment:
 #   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key
@@ -126,6 +129,15 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Runs before tauri-action because `releaseBody` becomes two things: the
+      # draft release body, and the `notes` field baked into latest.json before
+      # it is hardened and signed. Editing the draft afterwards cannot fix the
+      # manifest, so the notes have to be right here. Fails the release if the
+      # version has no section in docs/index.html.
+      - name: Render release notes from the changelog
+        id: release_notes
+        run: node scripts/release-notes.mjs
+
       - name: Build, sign updater artifacts, and create draft
         id: tauri
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
@@ -136,7 +148,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Ember ${{ github.ref_name }}
-          releaseBody: See the assets below to download and install this version.
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

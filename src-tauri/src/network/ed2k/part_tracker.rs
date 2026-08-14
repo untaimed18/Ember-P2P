@@ -837,6 +837,17 @@ impl PartTracker {
             cursor.read_exact(&mut ph)?;
             self.part_hashes.push(ph);
         }
+        // Normalise the `known.met` form to the on-wire one by dropping the
+        // trailing `MD4("")`. Everything downstream is checked by
+        // `verify_hashset`, which requires exactly one MD4 per part and would
+        // otherwise reject a perfectly good sidecar written by eMule for a
+        // file that is an exact multiple of PARTSIZE — clearing every verified
+        // flag with it. Truncating cannot weaken that check: the set still has
+        // to reproduce the file hash afterwards.
+        let wire_count = super::messages::ed2k_part_count_for_size(self.file_size);
+        if self.part_hashes.len() > wire_count {
+            self.part_hashes.truncate(wire_count);
+        }
 
         let raw_tag_count = cursor.read_u32::<LittleEndian>()?;
         const MAX_TAG_COUNT: u32 = 100_000;
@@ -1698,6 +1709,33 @@ mod tests {
         let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0xCD; 16]);
         assert_eq!(reloaded.gap_list(), &[(0, file_size)]);
         assert!(reloaded.part_hashes().is_empty());
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// eMule stores one extra `MD4("")` for a file that is an exact multiple of
+    /// PARTSIZE. That `known.met` form has to survive a load as the on-wire
+    /// hashset, because `verify_hashset` accepts only one MD4 per part and the
+    /// resume path clears every verified flag when it rejects a set.
+    #[test]
+    fn part_met_known_met_hash_count_is_normalised_to_the_wire_form() {
+        let part_path = temp_part_path("known-met-sentinel");
+        let file_size = PARTSIZE * 2;
+        let wire_count = super::super::messages::ed2k_part_count_for_size(file_size);
+        let known_met_count = super::super::hash::ed2k_known_met_part_hash_count(file_size);
+        assert_eq!(known_met_count, wire_count + 1, "fixture must exercise the sentinel");
+
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0xEE; 16]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16], [0x00; 16]]);
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+
+        let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0xEE; 16]);
+        // Accepted, not reset: the gaps survive and the sentinel is gone.
+        assert_eq!(reloaded.gap_list(), &[(PARTSIZE, file_size)]);
+        assert_eq!(reloaded.part_hashes().len(), wire_count);
+        assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16]]);
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }

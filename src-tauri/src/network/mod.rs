@@ -332,11 +332,19 @@ fn spawn_udp_mapping_keepalive(
 /// there told every KAD peer and the eD2K server to dial a port the router was
 /// not forwarding: every connect-back failed, so we reported Firewalled while
 /// the router's own UPnP page correctly showed the real mapping wide open.
+///
+/// The exception is LowID. That assignment is the eD2K server reporting that it
+/// could not reach the port we advertised, which is direct evidence the forward
+/// is not carrying traffic however healthy the router claims it is — a CGNAT
+/// layer above a UPnP-capable inner router being the usual cause. There the
+/// STUN mapping is the only candidate with a chance of being reachable, so it
+/// wins until a HighID proves the forward works.
 fn advertised_tcp_port(state: &NetworkState) -> u16 {
     advertised_tcp_port_from(
         state.upnp_tcp_port,
         state.external_tcp_port,
         state.tcp_port,
+        state.low_id,
     )
 }
 
@@ -344,10 +352,17 @@ fn advertised_tcp_port_from(
     upnp_tcp_port: Option<u16>,
     external_tcp_port: Option<u16>,
     configured_tcp_port: u16,
+    server_assigned_low_id: bool,
 ) -> u16 {
+    let stun_port = external_tcp_port.filter(|port| *port != 0);
+    if server_assigned_low_id {
+        if let Some(port) = stun_port {
+            return port;
+        }
+    }
     upnp_tcp_port
         .filter(|port| *port != 0)
-        .or(external_tcp_port.filter(|port| *port != 0))
+        .or(stun_port)
         .unwrap_or(configured_tcp_port)
 }
 
@@ -5388,7 +5403,7 @@ mod tests {
         // router was not forwarding, so we self-reported Firewalled even
         // though 4662 was open.
         assert_eq!(
-            advertised_tcp_port_from(Some(4662), Some(51234), 4662),
+            advertised_tcp_port_from(Some(4662), Some(51234), 4662, false),
             4662
         );
     }
@@ -5397,14 +5412,33 @@ mod tests {
     fn advertised_tcp_port_uses_the_stun_remap_when_upnp_is_not_mapped() {
         // Without a forward of our own, the NAT's observed port is the only
         // reachable one — the CGNAT case STUN keep-alive exists for.
-        assert_eq!(advertised_tcp_port_from(None, Some(51234), 4662), 51234);
+        assert_eq!(advertised_tcp_port_from(None, Some(51234), 4662, false), 51234);
+    }
+
+    #[test]
+    fn advertised_tcp_port_prefers_the_stun_remap_once_the_server_says_lowid() {
+        // LowID means the server could not reach what we advertised, so the
+        // forward is not working whatever the router reports — double NAT, or
+        // CGNAT above a UPnP-capable inner router. Falling back lets the remap
+        // reconnect try the one port that has not been ruled out.
+        assert_eq!(
+            advertised_tcp_port_from(Some(4662), Some(51234), 4662, true),
+            51234
+        );
+        // With no STUN observation there is nothing better to switch to, so the
+        // forward stays advertised rather than dropping to a port nobody has
+        // suggested is reachable.
+        assert_eq!(advertised_tcp_port_from(Some(4662), None, 4662, true), 4662);
     }
 
     #[test]
     fn advertised_tcp_port_falls_back_to_the_configured_port() {
-        assert_eq!(advertised_tcp_port_from(None, None, 4662), 4662);
-        assert_eq!(advertised_tcp_port_from(None, Some(0), 4662), 4662);
-        assert_eq!(advertised_tcp_port_from(Some(0), Some(51234), 4662), 51234);
+        assert_eq!(advertised_tcp_port_from(None, None, 4662, false), 4662);
+        assert_eq!(advertised_tcp_port_from(None, Some(0), 4662, false), 4662);
+        assert_eq!(
+            advertised_tcp_port_from(Some(0), Some(51234), 4662, false),
+            51234
+        );
     }
 
     #[test]
@@ -30269,20 +30303,19 @@ pub async fn start_network(
                 let cooldown_elapsed = state
                     .last_tcp_remap_reconnect_at
                     .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
-                // While UPnP holds the inbound forward we log in on `tcp_port`
-                // regardless of what STUN saw on the outbound flow, so a
-                // "remap" here would reconnect to re-send the port we already
-                // sent — churn that cannot turn LowID into HighID.
-                if state.upnp_tcp_port.is_none()
-                    && should_reconnect_for_tcp_remap(
-                        state.low_id,
-                        state.server_connected,
-                        state.pending_server_connect.is_some(),
-                        state.external_tcp_port,
-                        state.server_login_tcp_port,
-                        cooldown_elapsed,
-                    )
-                {
+                // Deliberately not gated on UPnP: a LowID session is exactly
+                // where a UPnP forward has been shown not to work, and
+                // `advertised_tcp_port` already falls back to the STUN port in
+                // that state, so this reconnect re-logs in on a port that has
+                // not been tried yet rather than re-sending the same one.
+                if should_reconnect_for_tcp_remap(
+                    state.low_id,
+                    state.server_connected,
+                    state.pending_server_connect.is_some(),
+                    state.external_tcp_port,
+                    state.server_login_tcp_port,
+                    cooldown_elapsed,
+                ) {
                     if let Some(addr) = state.server_addr {
                         info!(
                             "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",

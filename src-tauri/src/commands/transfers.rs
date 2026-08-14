@@ -905,6 +905,13 @@ pub async fn pause_transfers_batch(
             let mut manager = state.transfer_manager.write().await;
             if let Some(control) = manager.get_control(transfer_id) {
                 control.pause();
+                // Cancel too, exactly as the single-transfer pause does: pause
+                // alone leaves detached per-source tasks running on this
+                // control, and leaves a verification pass reading the whole
+                // file to the end. Safe because a resume routes through
+                // `start_promoted_downloads`, which cancels whatever is
+                // registered and installs a fresh control.
+                control.cancel();
             }
             let promoted = manager.pause_and_promote(transfer_id);
             let status = manager.get_transfer(transfer_id).map(|t| t.status.clone());

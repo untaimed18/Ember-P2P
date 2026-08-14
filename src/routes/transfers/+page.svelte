@@ -1933,7 +1933,7 @@
           break;
         }
         case 'paste_link': {
-          await queuePastedLinks(await navigator.clipboard.readText());
+          await pasteLinksFromClipboard();
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
@@ -2075,6 +2075,7 @@
     let queued = 0;
     let already = 0;
     let failed = 0;
+    let firstError: unknown;
     for (const info of batch.links) {
       try {
         const res = await startDownload(
@@ -2089,16 +2090,24 @@
         );
         if (res.already_queued) already += 1;
         else queued += 1;
-      } catch {
+      } catch (e: unknown) {
         // One rejected link must not abandon the rest of the batch; it is
-        // counted alongside the unparseable lines in the summary below.
+        // counted alongside the unparseable lines in the summary below. The
+        // first reason is kept so a lone link can still say why it failed
+        // rather than reporting itself as an anonymous "1 ignored".
+        if (firstError === undefined) firstError = e;
         failed += 1;
       }
     }
 
-    // A single clean link keeps the by-name message it has always shown.
+    // One link on its own keeps the by-name messaging it has always had,
+    // including the real error, whether or not it succeeded.
     const ignored = batch.invalid + batch.skipped + failed;
-    if (batch.links.length === 1 && ignored === 0) {
+    if (batch.links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
+      if (firstError !== undefined) {
+        transferError = toErrorMsg(firstError);
+        return;
+      }
       const only = batch.links[0];
       showInfo(already > 0
         ? m.transfers_already_in_list({ name: only.name })
@@ -2113,7 +2122,11 @@
     }));
   }
 
-  async function handlePasteLinkFromHeader() {
+  // The single entry point for every Paste-link affordance (header button,
+  // pane menu, row context menu). Re-entrancy is guarded here rather than at
+  // the call sites so a second paste cannot start a concurrent batch of up to
+  // 256 downloads alongside the first and double-count the same links.
+  async function pasteLinksFromClipboard() {
     if (pasteLinkBusy) return;
     pasteLinkBusy = true;
     try {
@@ -3172,7 +3185,7 @@
   <div class="header-actions">
     <button
       class="ghost paste-link-btn"
-      onclick={handlePasteLinkFromHeader}
+      onclick={pasteLinksFromClipboard}
       disabled={pasteLinkBusy}
       title={m.transfers_paste_link_title()}
     >
@@ -4375,7 +4388,7 @@
     <button class="ctx-item danger" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
-    <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void handlePasteLinkFromHeader(); }}>{m.transfers_ctx_paste_link()}</button>
+    <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
       {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
@@ -4445,7 +4458,7 @@
       </div>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
-      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button class="ctx-item" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
       <button class="ctx-item" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>

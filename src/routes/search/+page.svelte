@@ -63,7 +63,11 @@
   // guarantees the last batch of a finished search always lands, so the table
   // never settles on a stale count.
   const RESULTS_SYNC_MIN_INTERVAL_MS = 400;
-  let visibleResults = $state<SearchResult[]>([]);
+  // `$state.raw`, not `$state`: this array is only ever replaced wholesale by
+  // `syncVisibleResults`, never mutated, and at up to `MAX_TAB_RESULTS` rows a
+  // deep proxy would register a dependency per field read in `filterPass` —
+  // working against the throttle this snapshot exists to feed.
+  let visibleResults = $state.raw<SearchResult[]>([]);
   let resultsSyncedAt = 0;
   let resultsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let syncedTabId: string | null = null;

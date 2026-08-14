@@ -1109,7 +1109,11 @@ export function startTransferPoll() {
             continue;
           }
           if (terminalStatuses.includes(t.status)) {
-            missingFromApiSince.delete(t.id);
+            // Also a permanent drop, and the busiest one — every completed or
+            // failed download eventually stops being reported. Clear the whole
+            // per-id side-map set, not just the missing-timer, or the maps
+            // `forgetTransfer` exists to bound leak on the common path.
+            forgetTransfer(t.id);
             continue;
           }
           // Non-terminal row the backend snapshot doesn't include. Keep it

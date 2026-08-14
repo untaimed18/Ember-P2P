@@ -679,6 +679,21 @@ pub(crate) fn is_queue_detached_error(error: &str) -> bool {
 /// per-file source list for fast resume, so repeated pause/resume cycles
 /// would otherwise steadily degrade and eventually evict a transfer's best
 /// peers. eMule treats a user pause/stop as a clean teardown.
+/// Aborts a spawned task when it leaves scope, however the scope exits.
+///
+/// The verification cancel-watchers are only ever released by an explicit
+/// `abort()` on the success path. That is not enough: dropping the worker
+/// future anywhere between the spawn and that line — which is exactly what a
+/// Pause does — would leave the watcher parked on `wait_cancelled` for the rest
+/// of the process, holding a `TransferControl` and the mirrored flag with it.
+pub(super) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) fn is_user_cancel_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("cancelled by user")
@@ -691,6 +706,46 @@ mod tests {
     use super::*;
     use crate::network::ed2k::hash::{ed2k_hash_bytes, PARTSIZE};
     use md4::{Digest, Md4};
+
+    /// The verification watcher parks on `wait_cancelled` for a transfer that
+    /// may never be cancelled, so it has to die with the scope that spawned it
+    /// rather than only on the explicit release at the end of the happy path.
+    #[tokio::test]
+    async fn abort_on_drop_stops_a_watcher_that_is_still_parked() {
+        let control = std::sync::Arc::new(crate::sharing::manager::TransferControl::new());
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let flag = flag.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                control.wait_cancelled().await;
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let raw = {
+            let guard = AbortOnDrop(handle);
+            // Nothing has cancelled the control, so the task is parked here.
+            tokio::task::yield_now().await;
+            assert!(!guard.0.is_finished(), "watcher should still be parked");
+            let raw = guard.0.abort_handle();
+            drop(guard);
+            raw
+        };
+
+        // Dropping the guard must have aborted it even though `cancel` was
+        // never called; without the guard this task would outlive the scope.
+        for _ in 0..50 {
+            if raw.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(raw.is_finished(), "AbortOnDrop must abort the parked watcher");
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::Acquire),
+            "an aborted watcher must not have set the mirrored flag"
+        );
+    }
 
     #[test]
     fn verify_hashset_single_part_under_partsize() {
@@ -4866,22 +4921,23 @@ impl Ed2kDownload {
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
-        // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop during
-        // "Verifying" would otherwise leave a thread reading a multi-GB file for
-        // minutes. `TransferControl` does not expose its inner atomic, so mirror
-        // it onto a flag the hashers poll between reads (same shape as the
-        // archive-recovery job).
+        // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or Pause
+        // during "Verifying" would otherwise leave a thread reading a multi-GB
+        // file for minutes. `TransferControl` does not expose its inner atomic,
+        // so mirror it onto a flag the hashers poll between reads (same shape as
+        // the archive-recovery job). Every pause path cancels as well, so
+        // watching cancellation alone covers both.
         let verify_cancel = Arc::new(std::sync::atomic::AtomicBool::new(
             self.control.is_cancelled(),
         ));
-        let cancel_watch = {
+        let cancel_watch = AbortOnDrop({
             let flag = verify_cancel.clone();
             let control = self.control.clone();
             tokio::spawn(async move {
                 control.wait_cancelled().await;
                 flag.store(true, std::sync::atomic::Ordering::Release);
             })
-        };
+        });
         let job_cancel = verify_cancel.clone();
         let verified_result = match tokio::task::spawn_blocking(move || {
             use std::io::{Read, Seek, SeekFrom};
@@ -4964,7 +5020,7 @@ impl Ed2kDownload {
                 None
             }
         };
-        cancel_watch.abort();
+        drop(cancel_watch);
 
         let Some((verified_identity, actual_aich)) = verified_result else {
             if ember_pin_failed {

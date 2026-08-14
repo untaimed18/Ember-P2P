@@ -5,7 +5,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::storage::paths;
@@ -1295,20 +1295,20 @@ impl Database {
             anyhow::bail!("Invalid SQL identifier in migration: {table}.{column} {col_type}");
         }
         // The base tables are only created by the `version < 1` arm, so a
-        // database opened at a later version can legitimately be missing one
-        // (a pre-v1 install that never held a transfer, or a partial restore).
-        // Adding a column to a table that is not there must not abort the whole
-        // migration chain and with it every future open — the table, when it is
-        // eventually created, is created with the modern column set anyway.
-        let has_table: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                params![table],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
+        // database opened at a later version that is missing one never gets it
+        // back. Aborting the migration chain over it would still be the wrong
+        // trade: that fails every future open of an otherwise usable database,
+        // where skipping degrades only the feature backed by that table. Warn
+        // rather than `debug!` so the cause is in the log when it does happen,
+        // and let a genuine query failure propagate instead of reading as
+        // "absent" — that would mark the migration done and never retry it.
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table],
+            |row| row.get(0),
+        )?;
         if !has_table {
-            debug!("Skipping column {table}.{column}: table does not exist");
+            warn!("Skipping column {table}.{column}: table {table} does not exist");
             return Ok(());
         }
         let has_column = conn

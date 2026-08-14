@@ -47,7 +47,11 @@ jobs:
   check:
     name: Check frontend and desktop Rust
     runs-on: windows-latest
-    timeout-minutes: 60
+    # Three near-full compile passes (check, clippy --all-targets, test --lib)
+    # over ~690 crates and ~180k lines of Rust on a Windows runner. The first
+    # run is always cold, because rust-cache keys include the workflow name and
+    # so cannot reuse release.yml's cache.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:

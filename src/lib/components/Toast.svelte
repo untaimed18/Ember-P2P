@@ -70,6 +70,10 @@
        also what lets a wheel over one scroll this list. */
     max-height: calc(100dvh - 24px);
     overflow-y: auto;
+    /* Not `visible`: alongside `overflow-y: auto` that computes to `auto` too,
+       and the enter/exit `fly` translates 24px on x — enough to flash a
+       horizontal scrollbar on every toast. */
+    overflow-x: clip;
     overscroll-behavior: contain;
     pointer-events: none;
   }

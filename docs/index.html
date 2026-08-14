@@ -1730,6 +1730,7 @@ npm run tauri build</code></pre>
         <h4>What&rsquo;s New</h4>
 
         <ul>
+          <li><strong>Paste a whole list of ed2k links at once.</strong> Copy as many links as you like, one per line, and use Paste link. Every one is queued and you get a summary of what was added, what was already in the list, and what could not be read. Pasting several links used to look like it worked while quietly keeping only the first</li>
           <li><strong>The anti-leech filter can actually see VeryCD and easyMule.</strong> Those names live in the peer&rsquo;s mod tag, not in the Software column, which is usually just &ldquo;eMule 0.50&rdquo;. The filter now matches both. It is still off unless you turn it on</li>
           <li><strong>A failed Ember content hash is visible, and it stops the download.</strong> The green Ember badge already meant the BLAKE3 check ran and matched. A mismatch used to look like a generic hash failure and then re-download parts that were already correct. It now fails for good, with a red Ember badge</li>
         </ul>
@@ -1740,11 +1741,32 @@ npm run tauri build</code></pre>
         <ul>
           <li><strong>Same Ember network as 1.5.4.</strong> No protocol bump: 1.5.5 still speaks Ember DHT version 2. The library database is unchanged, so you can move between 1.5.4 and 1.5.5 in either direction</li>
           <li><strong>Anti-leech stays off unless you enable it.</strong> If you never edited the pattern file, the built-in list drops the old LEECH token (it was matching honest Anti-Leech mods) and adds easyMule. A file you customized is left alone</li>
+          <li><strong>Pausing a download during &ldquo;Verifying&rdquo; now stops the check.</strong> It used to read the finished file all the way through before noticing. On a large download that could take minutes. The partial file is kept, so the download resumes normally</li>
+          <li><strong>A search tab keeps its best 15,000 results.</strong> A broad search on a busy server used to grow until the tab crawled. Beyond that ceiling the least-available hits are dropped as new ones arrive. Use a narrower search, or the collection importer, if you genuinely need more</li>
+          <li><strong>Some credential files are no longer shared.</strong> If a shared folder contains things like <code>.env</code>, <code>.pem</code> keys or an <code>.aws</code> folder, they are skipped from now on and disappear from your Library on the next scan</li>
+        </ul>
+
+        <h5>Connections and ports</h5>
+        <ul>
+          <li><strong>Ember no longer reports Firewalled while UPnP is working.</strong> If your router mapped the port but something else on the network also remapped outgoing connections, Ember advertised the wrong port. Every peer and every server then tried to reach a port your router was not forwarding, so nothing could connect in and Ember called itself firewalled &mdash; while the router&rsquo;s own UPnP page showed the port wide open. The port your router actually forwarded is now the one Ember hands out</li>
+          <li><strong>Except when the server says otherwise.</strong> If you get a LowID even though UPnP claims a mapping, that mapping demonstrably is not carrying traffic &mdash; usually a second router or carrier-grade NAT above your own. Ember now falls back to the port it observed from the outside and retries, instead of insisting on the one that has already failed</li>
         </ul>
 
         <h5>Transfers</h5>
         <ul>
           <li><strong>Upload rows no longer show 100% while parts are still missing.</strong> Session bytes (including re-requests) were capped at the file size and used as progress, so a half-empty parts bar could still read complete. Unique coverage drives the bar now; transferred bytes can exceed the file size when a peer asked twice</li>
+          <li><strong>A resumed download re-checks the part hashes it saved.</strong> Those were trusted purely because they came off your own disk. If they were damaged, every part failed its check, a good copy could never replace them, and the download re-downloaded itself forever with no way out</li>
+          <li><strong>Resume data belonging to a different file is rejected.</strong> A <code>.part.met</code> whose file hash or part count does not match is discarded instead of being adopted along with its part hashes. Resume files written by eMule for exactly-sized files are now read correctly rather than thrown away</li>
+          <li><strong>Uploads no longer freeze on a part we will not send.</strong> Ember was telling peers it had parts that had finished downloading but not yet passed their hash check, then refusing every request for them. The peer kept asking and the transfer sat still</li>
+          <li><strong>Stopping a download during verification keeps the partial file.</strong> Previously the cancel path could mark every part incomplete, throwing away a download that was seconds from finishing</li>
+          <li><strong>Large downloads stay responsive near the end.</strong> Working out which parts are complete was re-scanned from scratch for every source on every completed part, which got slowest exactly when a download was nearly done</li>
+          <li><strong>One slow eD2K server can no longer stall the whole app.</strong> Callback requests for LowID sources were sent inline and unbounded, so a server that stopped reading could freeze transfers, searches and the interface for up to 30 seconds per source</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>A long-running search stays smooth.</strong> Results were re-indexed and re-sorted in full on every incoming batch, so a search got slower the longer it ran. The list is now updated incrementally and the table refreshes on a steady cadence</li>
+          <li><strong>Kad stops silencing its own answers under load.</strong> When the flood-protection tables filled up, replies to searches you started were dropped along with the flood, so a keyword search could quietly return nothing. Peers you are already talking to now keep getting through</li>
         </ul>
 
         <h5>Ember search and publishing</h5>

@@ -3526,20 +3526,21 @@ impl MultiSourceDownload {
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
             let mut ember_pin_failed = false;
-            // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop
-            // during "Verifying" would otherwise leave a thread reading a
+            // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or
+            // Pause during "Verifying" would otherwise leave a thread reading a
             // multi-GB file for minutes. `TransferControl` does not expose its
             // inner atomic, so mirror it onto a flag the hashers poll between
-            // reads (same shape as the archive-recovery job).
+            // reads (same shape as the archive-recovery job). Every pause path
+            // cancels as well, so watching cancellation alone covers both.
             let verify_cancel = Arc::new(AtomicBool::new(self.control.is_cancelled()));
-            let cancel_watch = {
+            let cancel_watch = super::transfer::AbortOnDrop({
                 let flag = verify_cancel.clone();
                 let control = self.control.clone();
                 tokio::spawn(async move {
                     control.wait_cancelled().await;
                     flag.store(true, Ordering::Release);
                 })
-            };
+            });
             let job_cancel = verify_cancel.clone();
             let verified_result = match tokio::task::spawn_blocking(move || {
                 use std::io::{Read, Seek, SeekFrom};
@@ -3628,7 +3629,7 @@ impl MultiSourceDownload {
                     None
                 }
             };
-            cancel_watch.abort();
+            drop(cancel_watch);
 
             // A Stop aborts the verification read part-way through the file.
             // That is not evidence of corruption, so leave the gap list and the
