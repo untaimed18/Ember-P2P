@@ -149,7 +149,8 @@ export function formatDuration(ms: number): string {
   const hrs = Math.floor(totalSecs / 3600);
   const mins = Math.floor((totalSecs % 3600) / 60);
   if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}`;
-  return `${mins} min`;
+  if (mins > 0) return `${mins} min`;
+  return `${totalSecs}s`;
 }
 
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */

@@ -864,6 +864,7 @@
 
   async function handleSave() {
     if (!settings || saving) return;
+    const antileechDirtyAtSave = antileechDraftDirty;
     const validation = validateSettings(settings);
     if (validation.error) {
       showSaveMsg(validation.error, true, 5000);
@@ -970,6 +971,9 @@
           });
         }
         showRestartPrompt = true;
+      }
+      if (antileechDirtyAtSave) {
+        await handleSaveAntileech();
       }
     } catch (e) {
       console.error('Failed to save:', e);
@@ -1159,11 +1163,10 @@
   let antileechCompileErrors: Array<[string, string]> = $state([]);
   let antileechLoaded = $state(false);
   // The anti-leech textarea has its own dedicated Save button
-  // (`handleSaveAntileech`) and isn't part of `settings`, so it needs its
-  // own dirty check folded into `hasUnsavedChanges` above — otherwise edits
-  // here are invisible to the "unsaved changes" indicator, `beforeunload`,
-  // and Discard (which reverts `antileechDraft` in `resetChanges` below,
-  // but stayed disabled unless `settings` itself also had changes).
+  // (`handleSaveAntileech`) and isn't part of `settings`. Dirty drafts
+  // still fold into `hasUnsavedChanges` and the page Save / Ctrl+S path
+  // so they persist with the rest of Settings. Discard reverts
+  // `antileechDraft` in `resetChanges` below.
   let antileechDraftDirty = $derived.by(() => {
     // Narrow via a local const first — TS doesn't reliably narrow a
     // `$state`-backed getter read directly inside a ternary the way it

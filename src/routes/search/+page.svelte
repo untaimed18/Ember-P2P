@@ -27,6 +27,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
+  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
@@ -808,7 +809,6 @@
   let emberContacts = $state(0);
   let emberJoinTimedOut = $state(false);
   let emberJoinActiveSince = $state<number | null>(null);
-  const EMBER_JOIN_TIMEOUT_MS = 30_000;
 
   function recomputeEmberJoinState() {
     if (!emberEnabled) {

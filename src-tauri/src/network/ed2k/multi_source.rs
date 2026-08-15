@@ -869,6 +869,23 @@ async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-source ENOSPC is not a peer fault — it is transfer-level Insufficient.
+/// Source tasks set this flag; the parent bails so `DownloadEvent::Failed`
+/// can run `mark_download_insufficient` instead of retrying forever.
+fn note_disk_full(flag: &AtomicBool, err: &anyhow::Error) {
+    if super::transfer::is_disk_full_error(&err.to_string()) {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+fn disk_full_hit(flag: &AtomicBool) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+fn disk_full_error() -> anyhow::Error {
+    anyhow::anyhow!("stage:insufficient_disk disk write failed")
+}
+
 /// Grace window a per-source task gets, after its control is cancelled, to
 /// shut down gracefully on its own before the outer task `select!` force-drops
 /// it.
@@ -1621,6 +1638,7 @@ impl MultiSourceDownload {
         // Semaphore to limit concurrent source connections (avoids overwhelming
         // the network with dozens of simultaneous TCP handshakes to unreachable peers)
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
+        let disk_full = Arc::new(AtomicBool::new(false));
 
         // Tracks "what stage did this peer reach?" per peer, so we
         // can cool peers that queued us for eMule's 29 min
@@ -1737,6 +1755,7 @@ impl MultiSourceDownload {
             let init_missing_parts = peers_missing_parts.clone();
             let init_src_ip = source.peer_ip.clone();
             let init_src_port = source.peer_port;
+            let init_disk_full = disk_full.clone();
             let handle = tokio::spawn(async move {
                 if sem_clone.available_permits() == 0 {
                     let _ = fail_etx
@@ -1858,6 +1877,7 @@ impl MultiSourceDownload {
                         // don't penalize (and eventually evict) a good peer.
                         info!("Source {} ({}): stopped by user", src_idx, fail_ip);
                     } else {
+                        note_disk_full(&init_disk_full, &e);
                         debug!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
                         let _ = fail_etx
                             .send(DownloadEvent::SourceDetail {
@@ -1941,6 +1961,16 @@ impl MultiSourceDownload {
                     }
                     while pending_futs.next().await.is_some() {}
                     return Err(e);
+                }
+                if disk_full_hit(&disk_full) {
+                    for ah in &abort_handles {
+                        ah.abort();
+                    }
+                    for ah in &injected_abort_handles {
+                        ah.abort();
+                    }
+                    while pending_futs.next().await.is_some() {}
+                    return Err(disk_full_error());
                 }
                 let all_done = {
                     let t = tracker.read().await;
@@ -2166,6 +2196,7 @@ impl MultiSourceDownload {
                             let inj_sx_oh = self.sx_overhead.clone();
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
+                            let inj_disk_full = disk_full.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
@@ -2203,6 +2234,7 @@ impl MultiSourceDownload {
                                     csel.remove_source(&freq_avail);
                                 }
                                 if let Err(e) = &result {
+                                    note_disk_full(&inj_disk_full, e);
                                     if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
                                         debug!("Injected source {} ({}) failed: {e:#}", src_idx, fail_ip);
@@ -2407,6 +2439,7 @@ impl MultiSourceDownload {
                             let inj_sx_oh = self.sx_overhead.clone();
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
+                            let inj_disk_full = disk_full.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
@@ -2445,6 +2478,7 @@ impl MultiSourceDownload {
                                     csel.remove_source(&freq_avail);
                                 }
                                 if let Err(e) = &result {
+                                    note_disk_full(&inj_disk_full, e);
                                     if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
                                         debug!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
@@ -2546,6 +2580,9 @@ impl MultiSourceDownload {
         drop(progress_tx);
 
         aggregator.await?;
+        if disk_full_hit(&disk_full) {
+            return Err(disk_full_error());
+        }
 
         // Emit final source counts after all tasks complete
         let _ = event_tx
@@ -2655,6 +2692,15 @@ impl MultiSourceDownload {
         };
 
         while retry_round < max_retry_rounds {
+            if disk_full_hit(&disk_full) {
+                for handle in adopted_handles.drain(..) {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                drop(adopt_progress_tx);
+                let _ = adopt_agg.await;
+                return Err(disk_full_error());
+            }
             if let Err(e) = check_control(&self.control).await {
                 for handle in adopted_handles.drain(..) {
                     let _ = handle.await;
@@ -2892,6 +2938,7 @@ impl MultiSourceDownload {
                 let a_sx_oh = self.sx_overhead.clone();
                 let a_file_req_oh = self.file_req_overhead.clone();
                 let a_missing_parts = peers_missing_parts.clone();
+                let a_disk_full = disk_full.clone();
                 adopted_handles.push(tokio::spawn(async move {
                     let _permit = match acquire_source_permit(&sem, &ctrl).await {
                         Ok(p) => p,
@@ -2925,6 +2972,7 @@ impl MultiSourceDownload {
                         csel.remove_source(&freq_avail);
                     }
                     if let Err(e) = &result {
+                        note_disk_full(&a_disk_full, e);
                         if !super::transfer::is_queue_detached_error(&e.to_string())
                                         && !super::transfer::is_user_cancel_error(&e.to_string()) {
                             debug!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
@@ -3341,6 +3389,7 @@ impl MultiSourceDownload {
                 let r_missing_parts = peers_missing_parts.clone();
                 let r_src_ip = source.peer_ip.clone();
                 let r_src_port = source.peer_port;
+                let r_disk_full = disk_full.clone();
                 retry_handles.push(tokio::spawn(async move {
                     let _permit = match acquire_source_permit(&r_sem, &rctrl).await {
                         Ok(p) => p,
@@ -3375,6 +3424,7 @@ impl MultiSourceDownload {
                     };
                     if let Err(e) = result {
                         let err_str = e.to_string();
+                        note_disk_full(&r_disk_full, &e);
                         // Queue-phase errors (peer kicked us from its
                         // upload queue, TCP dropped while queued, queue
                         // full, queue timeout, no-needed-parts): tag
@@ -3454,6 +3504,15 @@ impl MultiSourceDownload {
                 }
             }
             retry_agg.await?;
+            if disk_full_hit(&disk_full) {
+                for handle in adopted_handles.drain(..) {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                drop(adopt_progress_tx);
+                let _ = adopt_agg.await;
+                return Err(disk_full_error());
+            }
             // Stamp the round-end so the inter-round backoff at the
             // top of the next iteration can decide whether to sleep.
             last_round_end = Some(std::time::Instant::now());
@@ -3480,6 +3539,9 @@ impl MultiSourceDownload {
             let _ = h.await;
         }
         let _ = adopt_agg.await;
+        if disk_full_hit(&disk_full) {
+            return Err(disk_full_error());
+        }
 
         // eMule-style: remaining incomplete parts are handled through normal
         // retry rounds above. Endgame: tighter request pipelining and (when ≤3

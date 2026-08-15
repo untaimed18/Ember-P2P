@@ -351,15 +351,19 @@
   // K30: formats "started_at" (unix seconds) into a short relative age
   // string like "1m 23s" / "3h 5m" for the Age column.
   function formatSearchAge(startedAt: number): string {
-    if (!startedAt) return '—';
+    if (!startedAt) return '\u2014';
     const diff = Math.max(0, Math.floor(Date.now() / 1000) - startedAt);
-    if (diff < 60) return `${diff}s`;
+    if (diff < 60) return m.kad_search_age_seconds({ count: diff });
     const mins = Math.floor(diff / 60);
     const secs = diff % 60;
-    if (mins < 60) return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+    if (mins < 60) {
+      return secs > 0
+        ? m.kad_search_age_minutes_seconds({ minutes: mins, seconds: secs })
+        : m.kad_search_age_minutes({ minutes: mins });
+    }
     const hrs = Math.floor(mins / 60);
     const mr = mins % 60;
-    return `${hrs}h ${mr}m`;
+    return m.kad_search_age_hours_minutes({ hours: hrs, minutes: mr });
   }
 
   async function copyText(text: string, label?: string) {
