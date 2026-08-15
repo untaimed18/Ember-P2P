@@ -555,6 +555,44 @@
   let commentSaveMessage = $state('');
   let commentLastSavedAt = $state<number | null>(null);
   let commentSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let commentBaselineRating = $state(0);
+  let commentBaselineText = $state('');
+  let commentDirty = $derived(
+    !commentLoading && !!selectedHash &&
+    (ourRating !== commentBaselineRating || ourComment !== commentBaselineText),
+  );
+  let confirmDiscardComment = $state(false);
+  let pendingSelectPath: string | null = null;
+  let pendingReveal = false;
+  let pendingPlay = false;
+
+  function requestSelectPath(path: string | null, opts?: { reveal?: boolean; play?: boolean }): boolean {
+    if (path === selectedPath) return true;
+    if (commentDirty) {
+      pendingSelectPath = path;
+      pendingReveal = !!opts?.reveal;
+      pendingPlay = !!opts?.play;
+      confirmDiscardComment = true;
+      return false;
+    }
+    selectedPath = path;
+    return true;
+  }
+
+  function applyPendingSelectPath() {
+    const reveal = pendingReveal;
+    const play = pendingPlay;
+    const path = pendingSelectPath;
+    pendingSelectPath = null;
+    pendingReveal = false;
+    pendingPlay = false;
+    selectedPath = path;
+    if (reveal && path) void revealSelected(path);
+    if (play && path) {
+      mediaPlayPath = path;
+      mediaPlayId += 1;
+    }
+  }
 
   let mounted = false;
   let busy = false;
@@ -675,7 +713,7 @@
     const ext = file?.extension || extensionFromPath(path);
     if (playableKind(ext)) {
       if (selectedPath !== path) {
-        selectedPath = path;
+        if (!requestSelectPath(path, { play: true })) return;
       }
       mediaPlayPath = path;
       mediaPlayId += 1;
@@ -1400,15 +1438,13 @@
       .slice(0, TOP_PANEL_SIZE);
   });
   let topMaxValue = $derived(topFiles.length === 0 ? 0 : topValueFor(topFiles[0]));
-  async function selectAndRevealFile(path: string) {
-    selectedPath = path;
+  async function revealSelected(path: string) {
     const visibleIdx = sortedFiles.findIndex((f) => f.path === path);
     if (visibleIdx >= 0) {
       await tick();
       libraryTableRef?.scrollRowIntoView(visibleIdx);
       return;
     }
-    // Hidden by the active filters — clear them so the file can be shown.
     if (hasActiveLibraryFilters) {
       clearLibraryFilters();
       toastWarning(m.library_cleared_filters_to_reveal());
@@ -1416,6 +1452,11 @@
       const idx = sortedFiles.findIndex((f) => f.path === path);
       if (idx >= 0) libraryTableRef?.scrollRowIntoView(idx);
     }
+  }
+
+  async function selectAndRevealFile(path: string) {
+    if (!requestSelectPath(path, { reveal: true })) return;
+    await revealSelected(path);
   }
 
   // --- File type display ---
@@ -1532,6 +1573,8 @@
     // new file's stored comment with an empty save before the fetch lands.
     ourComment = '';
     ourRating = 0;
+    commentBaselineRating = 0;
+    commentBaselineText = '';
     if (commentSaveTimer) {
       clearTimeout(commentSaveTimer);
       commentSaveTimer = null;
@@ -1555,6 +1598,8 @@
         commentInfo = info;
         ourRating = info?.our_rating ?? 0;
         ourComment = info?.our_comment ?? '';
+        commentBaselineRating = ourRating;
+        commentBaselineText = ourComment;
         commentLoading = false;
       }).catch(() => {
         if (selectedHash !== hash) return;
@@ -1627,6 +1672,8 @@
       commentSaveState = 'saved';
       commentSaveMessage = m.library_saved();
       commentLastSavedAt = Date.now();
+      commentBaselineRating = ourRating;
+      commentBaselineText = ourComment;
       if (commentSaveTimer) clearTimeout(commentSaveTimer);
       commentSaveTimer = setTimeout(() => {
         commentSaveState = 'idle';
@@ -1810,6 +1857,14 @@
     if (!mounted) return;
     if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); return; }
 
+    // Ignore shortcuts while a modal is open. Must run before Escape so a
+    // discard/delete confirm isn't also treated as "deselect the row".
+    // `collectionsOpen` deliberately isn't part of this guard: the collection
+    // panel is an inline collapsible (the file table stays visible and
+    // interactive below it), not a modal, and it has no keyboard handling of
+    // its own that these shortcuts could conflict with.
+    if (createCollectionOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) return;
+
     const typing = isTypingTarget(e.target);
 
     // "/" focuses the search input when not already typing.
@@ -1828,20 +1883,13 @@
         return;
       }
       if (!typing && selectedPath) {
-        selectedPath = null;
+        if (!requestSelectPath(null)) return;
         e.preventDefault();
         return;
       }
     }
 
     if (typing) return;
-
-    // Ignore shortcuts while a modal is open. `collectionsOpen` deliberately
-    // isn't part of this guard: the collection panel is an inline collapsible
-    // (the file table stays visible and interactive below it), not a modal,
-    // and it has no keyboard handling of its own that these shortcuts could
-    // conflict with.
-    if (createCollectionOpen || confirmOpen || stopConfirmVisible) return;
 
     // Ctrl/Cmd+A selects all visible. Merge into the existing selection
     // (matching `toggleCheckAll`) rather than replacing it — selections are
@@ -1928,7 +1976,7 @@
       if (nextIdx !== currentIdx && nextIdx >= 0) {
         e.preventDefault();
         const next = sortedFiles[nextIdx];
-        selectedPath = next.path;
+        if (!requestSelectPath(next.path)) return;
         if (e.shiftKey) {
           // Extend the selection to span the row we moved from and the row we
           // moved onto. Use add (not toggle) so sweeping back over an
@@ -1965,7 +2013,7 @@
     try {
       switch (action) {
         case 'properties':
-          selectedPath = f.path;
+          requestSelectPath(f.path);
           break;
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
@@ -2488,6 +2536,20 @@
   danger={true}
   onconfirm={() => settleConfirm(true)}
   oncancel={() => settleConfirm(false)}
+/>
+
+<ConfirmDialog
+  bind:open={confirmDiscardComment}
+  title={m.library_confirm_discard_comment_title()}
+  message={m.library_confirm_discard_comment_message()}
+  confirmLabel={m.library_discard()}
+  danger={true}
+  onconfirm={applyPendingSelectPath}
+  oncancel={() => {
+    pendingSelectPath = null;
+    pendingReveal = false;
+    pendingPlay = false;
+  }}
 />
 
 <div class="page-header">
@@ -3091,7 +3153,7 @@
         {sortedFiles}
         {selectedPath}
         contextPath={ctxMenu?.file.path ?? null}
-        onSelectPath={(path) => { selectedPath = path; }}
+        onSelectPath={(path) => { requestSelectPath(path); }}
         onOpenFile={openSharedFile}
         onRowContextMenu={onCtx}
         {fileType}
@@ -3180,7 +3242,7 @@
             {/if}
           </span>
         </div>
-        <button class="ghost drawer-close" onclick={() => selectedPath = null} title={m.library_close_details()} aria-label={m.library_close_details()}>
+        <button class="ghost drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15" aria-hidden="true">
             <line x1="6" y1="6" x2="18" y2="18"/>
             <line x1="18" y1="6" x2="6" y2="18"/>

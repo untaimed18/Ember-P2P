@@ -351,7 +351,7 @@
       <div class="browse-header">
         <div class="browse-header-text">
           <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()}</h3>
-          <p class="browse-subtitle">
+          <p class="browse-subtitle" title={friendName || friendHash}>
             <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
           </p>
         </div>
@@ -366,7 +366,10 @@
         {#if loading}
           <div class="browse-status">{m.browse_requesting()}</div>
         {:else if error}
-          <div class="browse-error">{error}</div>
+          <div class="browse-error">
+            <p>{error}</p>
+            <button type="button" class="browse-retry" onclick={() => void requestBrowse(friendHash)}>{m.common_retry()}</button>
+          </div>
         {:else if files.length === 0}
           <div class="browse-status">{m.browse_no_files()}</div>
         {:else}
@@ -460,8 +463,8 @@
                             class="dl-btn"
                             onclick={() => downloadFile(file)}
                             disabled={downloadingHashes.has(file.hash)}
-                            title={m.browse_download()}
-                            aria-label={m.browse_download()}
+                            title={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download()}
+                            aria-label={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download()}
                           >
                             {#if downloadingHashes.has(file.hash)}
                               <span class="dl-spinner" aria-hidden="true"></span>
@@ -492,7 +495,7 @@
     position: fixed;
     inset: 0;
     background: var(--overlay-bg);
-    z-index: 999;
+    z-index: 10000;
     animation: browse-fade-in 0.15s ease;
   }
 
@@ -512,7 +515,7 @@
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    z-index: 1000;
+    z-index: 10001;
     display: flex;
     flex-direction: column;
     box-shadow:
@@ -600,6 +603,29 @@
     text-align: center;
     padding: 32px 16px;
     font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .browse-error p {
+    margin: 0;
+  }
+
+  .browse-retry {
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .browse-retry:hover {
+    background: var(--bg-hover);
   }
 
   .browse-status-compact {

@@ -698,7 +698,7 @@
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_connected()}</div>
-      <div class="value">{connectedServer ? m.common_yes() : connecting ? '...' : m.common_no()}</div>
+      <div class="value">{connectedServer ? m.common_yes() : connecting ? m.servers_status_connecting() : m.common_no()}</div>
       {#if connectedServer}
         <div class="sub">{connectedServer.name || `${connectedServer.ip}:${connectedServer.port}`}</div>
       {/if}

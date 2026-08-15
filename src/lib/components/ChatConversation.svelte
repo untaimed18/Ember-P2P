@@ -573,7 +573,7 @@
           <circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
         </svg>
       </div>
-      <span class="conv-name">
+      <span class="conv-name" title={friendName || friendHash}>
         <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
       </span>
       {#if isOnline}
@@ -623,7 +623,7 @@
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0}
-      <div class="conv-empty">{m.chat_say_hello()}</div>
+      <div class="conv-empty">{chatDisabled ? m.chat_empty_disabled() : m.chat_say_hello()}</div>
     {:else}
       {#if hasMoreHistory}
         <div class="conv-load-older">

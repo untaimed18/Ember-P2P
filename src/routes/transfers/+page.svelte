@@ -426,7 +426,7 @@
     userHash: '',
     name: '',
   });
-  let confirmClearCompleted = $state(false);
+  let confirmClearCompleted = $state({ open: false, filter: '', count: 0 });
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
   let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
@@ -1937,7 +1937,7 @@
           confirmRecover = { open: true, id: t.id, name: t.file_name };
           return;
         }
-        case 'clear_completed': confirmClearCompleted = true; return;
+        case 'clear_completed': openClearCompletedConfirm(); return;
         case 'copy_link': {
           const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash, t.ember_file_hash);
           // Via the helper, not `navigator.clipboard` directly: WebView2 can
@@ -1985,6 +1985,8 @@
     if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
     try {
       await pauseTransfersBatch(ids);
+      const filter = transferFilter.trim();
+      if (filter) showInfo(m.transfers_paused_matching({ count: ids.length, filter }));
     } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
   async function handleResumeAll() {
@@ -1992,6 +1994,8 @@
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
     try {
       await resumeTransfersBatch(ids);
+      const filter = transferFilter.trim();
+      if (filter) showInfo(m.transfers_resumed_matching({ count: ids.length, filter }));
     } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
 
@@ -2218,8 +2222,8 @@
     ids: string[],
     fn: (id: string) => Promise<void>,
     label: string,
-  ): Promise<void> {
-    if (!ids.length) return;
+  ): Promise<number> {
+    if (!ids.length) return 0;
     const failed: { id: string; name: string; error: string }[] = [];
     const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
     for (const id of ids) {
@@ -2230,6 +2234,7 @@
       }
     }
     summarizeBatchResult(label, ids.length, failed);
+    return failed.length;
   }
 
   async function handleBatchPauseDownloads() {
@@ -2326,10 +2331,23 @@
     return pool.filter((t) => t.status === 'completed');
   }
 
+  function openClearCompletedConfirm() {
+    const targets = clearCompletedTargets();
+    confirmClearCompleted = {
+      open: true,
+      filter: transferFilter.trim(),
+      count: targets.length,
+    };
+  }
+
   async function handleStopAll() {
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
-    await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    const failedCount = await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    const filter = transferFilter.trim();
+    if (filter && failedCount === 0) {
+      showInfo(m.transfers_stopped_matching({ count: ids.length, filter }));
+    }
   }
 
   function handleCancelAll() {
@@ -2921,6 +2939,17 @@
     }
   }
 
+  function identStateLabel(state: string): string {
+    switch (state) {
+      case 'Verified': return m.transfers_ident_verified();
+      case 'Failed': return m.transfers_ident_failed();
+      case 'BadGuy': return m.transfers_ident_bad_guy();
+      case 'Needed': return m.transfers_ident_needed();
+      case 'Unknown': return m.transfers_ident_unknown();
+      default: return state;
+    }
+  }
+
   function dlStatusTooltip(t: Transfer): string {
     switch (t.status) {
       case 'active': {
@@ -3176,7 +3205,7 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open) return;
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -3276,7 +3305,7 @@
               <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
             {/if}
             {#if clearCompletedTargets().length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { confirmClearCompleted = true; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+              <button type="button" role="menuitem" onclick={(e) => { openClearCompletedConfirm(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
           </div>
         </details>
@@ -3648,10 +3677,18 @@
           <span>{sourcesLabel(selectedTransfer)} {m.transfers_src_suffix()}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
-          <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
-          <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
-          <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
-          <button class="tb-btn" disabled={isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
+          <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
+            <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
+          </span>
+          <span class="tb-btn-wrap" title={!canResume(selectedTransfer) ? m.transfers_action_cannot_resume() : undefined}>
+            <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
+          </span>
+          <span class="tb-btn-wrap" title={!canStop(selectedTransfer) ? m.transfers_action_cannot_stop() : undefined}>
+            <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
+          </span>
+          <span class="tb-btn-wrap" title={isFinished(selectedTransfer) ? m.transfers_action_cannot_find_sources() : undefined}>
+            <button class="tb-btn" disabled={isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
+          </span>
           <button class="tb-btn" disabled={!canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
           {#if selectedTransfer}
             {@const copyOne = selectedTransfer}
@@ -3989,7 +4026,7 @@
                       {formatSize(q.uploaded)} / {formatSize(q.downloaded)}
                     </td>
                   {:else if column.key === 'ident_state'}
-                    <td class="status-cell"><span class="status-label ident-{q.ident_state.toLowerCase()}">{q.ident_state}</span></td>
+                    <td class="status-cell"><span class="status-label ident-{q.ident_state.toLowerCase()}">{identStateLabel(q.ident_state)}</span></td>
                   {/if}
                 {/each}
               </tr>
@@ -4198,7 +4235,7 @@
                       </span>
                     </td>
                   {:else if column.key === 'ident_state'}
-                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? m.transfers_known_no_pubkey() : m.transfers_known_ident_title({ state: kc.ident_state })}>{kc.ident_state}</span></td>
+                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? m.transfers_known_no_pubkey() : m.transfers_known_ident_title({ state: identStateLabel(kc.ident_state) })}>{identStateLabel(kc.ident_state)}</span></td>
                   {:else if column.key === 'last_seen'}
                     <!-- Show relative time ("3d ago") so users can scan
                          freshness at a glance, but keep the absolute date
@@ -4302,7 +4339,7 @@
                     {:else if column.key === 'client_software'}
                       <td title={src.client_software}><bdi dir="auto">{src.client_software || '\u2014'}</bdi></td>
                     {:else if column.key === 'file_name'}
-                      <td class="name-cell"><bdi dir="auto">{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</bdi></td>
+                      <td class="name-cell" title={clientParent?.file_name || ''}><bdi dir="auto">{clientParent?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
                       <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
                     {:else if column.key === 'downloaded'}
@@ -4427,7 +4464,7 @@
     <button class="ctx-item" disabled={filteredSelectableDownloads.length === 0} onclick={() => { closePaneCtx(); toggleDlCheckAll(); }}>
       {allVisibleDlChecked ? m.transfers_ctx_clear_selection() : m.transfers_ctx_select_all()}
     </button>
-    <button class="ctx-item" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); confirmClearCompleted = true; }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
   </div>
@@ -4609,9 +4646,11 @@
 />
 
 <ConfirmDialog
-  bind:open={confirmClearCompleted}
+  bind:open={confirmClearCompleted.open}
   title={m.transfers_clear_completed()}
-  message={m.transfers_confirm_clear_completed_msg()}
+  message={confirmClearCompleted.filter
+    ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
+    : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
   onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
@@ -4787,6 +4826,12 @@
     opacity: 0.5;
     cursor: default;
     background: var(--bg-primary);
+  }
+  .tb-btn-wrap {
+    display: inline-flex;
+  }
+  .tb-btn-wrap .tb-btn:disabled {
+    pointer-events: none;
   }
   .tb-btn.tb-toggle {
     color: var(--text-muted);
