@@ -5,22 +5,21 @@
   Requires WeasyPrint (pip install weasyprint).
 -->
 <html lang="en">
-<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>EmberDHT Protocol Specification — Wire Version 2</title>
 <meta name="author" content="Ember">
-<meta name="description" content="Protocol specification for EmberDHT, Ember's native encrypted Kademlia overlay. Wire version 2, as implemented in Ember 1.5.4.">
+<meta name="description" content="Protocol specification for EmberDHT, Ember's native encrypted Kademlia overlay. Wire version 2, as implemented in Ember 1.5.6.">
 <meta name="keywords" content="EmberDHT, Kademlia, Noise, DHT, eMule, P2P">
 <style>
-@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Regular.ttf"); font-weight: 400; }
-@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Italic.ttf"); font-weight: 400; font-style: italic; }
-@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Medium.ttf"); font-weight: 500; }
-@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-SemiBold.ttf"); font-weight: 600; }
-@font-face { font-family: Inter; src: url("file:///usr/share/fonts/truetype/macos/Inter-Bold.ttf"); font-weight: 700; }
-@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"); font-weight: 400; }
-@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Medium.ttf"); font-weight: 500; }
-@font-face { font-family: JetBrains Mono; src: url("file:///usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf"); font-weight: 700; }
+@font-face { font-family: Inter; src: url("fonts/Inter-Regular.ttf"); font-weight: 400; }
+@font-face { font-family: Inter; src: url("fonts/Inter-Italic.ttf"); font-weight: 400; font-style: italic; }
+@font-face { font-family: Inter; src: url("fonts/Inter-Medium.ttf"); font-weight: 500; }
+@font-face { font-family: Inter; src: url("fonts/Inter-SemiBold.ttf"); font-weight: 600; }
+@font-face { font-family: Inter; src: url("fonts/Inter-Bold.ttf"); font-weight: 700; }
+@font-face { font-family: JetBrains Mono; src: url("fonts/JetBrainsMono-Regular.ttf"); font-weight: 400; }
+@font-face { font-family: JetBrains Mono; src: url("fonts/JetBrainsMono-Medium.ttf"); font-weight: 500; }
+@font-face { font-family: JetBrains Mono; src: url("fonts/JetBrainsMono-Bold.ttf"); font-weight: 700; }
 
 :root {
   --ink: #1c1917;
@@ -67,7 +66,7 @@ body {
     text-transform: uppercase;
   }
   @top-right {
-    content: "Wire version 2  ·  Ember 1.5.4";
+    content: "Wire version 2  ·  Ember 1.5.6";
     font-family: Inter, sans-serif;
     font-size: 8pt;
     color: #a8a29e;
@@ -575,7 +574,7 @@ footer.doc-end {
     <p class="subtitle">Protocol Specification</p>
     <div class="cover-meta">
       <div><strong>Wire version</strong>2  (min 2)</div>
-      <div><strong>Software</strong>Ember 1.5.4</div>
+      <div><strong>Software</strong>Ember 1.5.6</div>
       <div><strong>Transport</strong>Noise_IK / Noise_XX</div>
       <div><strong>Date</strong>August 2026</div>
     </div>
@@ -585,7 +584,7 @@ footer.doc-end {
       the eMule KAD network and eD2K servers. This document specifies the identity
       model, Noise transport, wire frames, routing table, record formats, lookup
       and publish algorithms, bootstrap paths, and abuse limits as implemented in
-      Ember 1.5.4. It is written from the code, not from comments.
+      Ember 1.5.6. It is written from the code, not from comments.
     </div>
     <div class="cover-foot">
       <div>Canonical implementation: <span class="mono">src-tauri/src/network/ember/</span></div>
@@ -622,10 +621,12 @@ footer.doc-end {
     <tr><td class="num">B</td><td class="title"><a href="#sec-b">Code map</a></td><td class="page"><a href="#sec-b"></a></td></tr>
   </table>
   <p style="margin-top:8mm;font-size:9pt;color:#57534e;">
-    This specification describes the protocol as shipped in Ember 1.5.4
-    (<code>EMBER_DHT_VERSION = 2</code>). Remaining work, including the dormant
-    native transfer path, is called out where it affects interoperability.
-    Design notes that are not yet wire-stable live in <code>docs/ember-dht.md</code>.
+    This specification describes the protocol as implemented in Ember 1.5.6
+    (<code>EMBER_DHT_VERSION = 2</code>). Wire version is unchanged since 1.5.3;
+    1.5.4–1.5.6 are local and operational changes on the same overlay. Remaining
+    work, including the dormant native transfer path, is called out where it
+    affects interoperability. Design notes that are not yet wire-stable live in
+    <code>docs/ember-dht.md</code>.
   </p>
 </section>
 
@@ -696,8 +697,9 @@ footer.doc-end {
 <h3>1.4 Document conventions</h3>
 <p>
   Integers on the DHT frame header and most payload lengths are
-  <strong>little-endian</strong>. Socket ports in contact addresses are
-  <strong>big-endian</strong>. Byte strings are concatenated in the order shown.
+  <strong>little-endian</strong>. Socket ports in <em>contact-list and PONG</em>
+  addresses are <strong>big-endian</strong>; TCP/UDP ports inside a signed
+  source record are little-endian. Byte strings are concatenated in the order shown.
   Hexadecimal constants use a <code>0x</code> prefix. Time constants are wall-clock
   seconds unless noted as <code>Instant</code> (process-monotonic).
 </p>
@@ -744,10 +746,12 @@ footer.doc-end {
 <h3>2.2 Always on</h3>
 <p>
   Profiles that still had the overlay off are turned on at load. Publishing
-  starts once the node has contacts. A fresh node can sit at zero contacts for
-  a minute or two while the first maintenance cycle runs the KAD bridge; the
-  Ember Network page reports <strong>Connecting</strong> for that window rather
-  than a fault.
+  starts once the node has contacts. Search, the Ember Network page, and the
+  status bar wait for a <strong>verified</strong> contact before showing
+  Connected — gossip in the table is not a join. A fresh node therefore reports
+  <strong>Connecting</strong> for a minute or two while the first maintenance
+  cycle runs the KAD bridge, rather than a fault. After the join timeout with
+  still-zero verified peers, Search shows the muted no-peers hint.
 </p>
 
 <!-- ══════════════════════════════════════════════ 3 ══════════════════════════════════════════════ -->
@@ -785,11 +789,12 @@ footer.doc-end {
 <h3>3.3 Frame signature</h3>
 <p>
   <code>encode_message</code> serializes version, type, request id, sender id,
-  optional public key, payload length, and payload, then appends a 64-byte
+  public key, payload length, and payload, then appends a 64-byte
   Ed25519 signature over every preceding byte. <code>decode_message</code>
   verifies that signature and the <code>sender_id == BLAKE3(pubkey)[..16]</code>
   binding <em>before</em> constructing a <code>DhtMessage</code>. An invalid
-  frame never becomes a message object.
+  frame never becomes a message object. This build always includes the public
+  key on the wire.
 </p>
 
 <h3>3.4 Record signature</h3>
@@ -855,16 +860,17 @@ footer.doc-end {
   <tbody>
     <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>Must outlive the 600 s liveness-ping interval; 300 s forced a fresh handshake on every ping</td></tr>
     <tr><td>MAX_SESSIONS</td><td>4096</td><td>LRU eviction when full</td></tr>
+    <tr><td>MAX_SESSIONS_PER_ADDR</td><td>4</td><td>Claimants coexist; keyed on (address, static key)</td></tr>
     <tr><td>Pending handshakes</td><td>512</td><td>Caps unauthenticated work</td></tr>
     <tr><td>MAX_EMBER_DATAGRAM_BYTES</td><td>4096</td><td>Hard drop before decryption; sender sees a “successful” send</td></tr>
   </tbody>
 </table>
 <p>
-  Sessions are currently keyed by address alone. A shadow-session map can
-  protect an established peer from a key-churning spoofer at the same address,
-  but cannot protect a peer whose <em>first</em> contact arrives at an address
-  whose shadow allowance is already full. Keying by <code>(address, static key)</code>
-  is listed as future transport work.
+  Sessions are keyed on <code>(address, static key)</code>, so claimants at one
+  address coexist instead of ranking for a single live slot. Four matches the
+  old 1-live-plus-3-shadow budget. A genuine first contact at an address already
+  full of spoof sessions is kept; a named outgoing identity no longer discards
+  another key at that address.
 </p>
 
 <h3>4.4 Inner namespace: control vs DHT</h3>
@@ -1025,22 +1031,24 @@ footer.doc-end {
   <span class="c-orange">msg_type</span>    u8     see table below<br>
   <span class="c-teal">request_id</span>  u32 LE  correlation; 0 is reserved<br>
   <span class="c-teal">sender_id</span>   16 B    BLAKE3(sender Ed25519)[..16]<br>
-  <span class="c-green">sender_pub</span>  32 B    optional; present when include_pub_key<br>
+  <span class="c-green">sender_pub</span>  32 B    Ed25519 public key; always present in this build<br>
   <span class="c-muted">payload_len</span> u16 LE  ≤ MAX_DELIVERABLE_PAYLOAD<br>
   <span class="c-white">payload</span>     N B    message-specific<br>
   <span class="c-red">signature</span>   64 B    Ed25519 over every preceding byte
 </div>
 <p>
-  Public key is included on frames built for first contact (the engine’s
-  builders pass <code>include_pub_key = true</code>) so a peer who has never
-  seen us can verify the signature and learn our identity. Inside an
-  established Noise session the decoder may be told the key is omitted; the
-  session already authenticated the static key.
+  The encoder always includes the sender’s 32-byte Ed25519 public key
+  (<code>include_pub_key = true</code>). The decoder always expects it
+  (<code>has_pub_key = true</code>) and refuses a frame that omits it, so a
+  peer who has never seen us can verify the signature and learn our identity
+  even inside an established Noise session. The size budget in §4.5 therefore
+  always counts those 32 bytes. The encode/decode flags still exist in the
+  API; production never takes the other branch.
 </p>
 <p>
-  Header without public key is 22 bytes: version + type + request id + sender
-  id. Request id 0 is skipped by the allocator so it can never collide with
-  “unset.”
+  Header with public key is 54 bytes before payload_len: version + type +
+  request id + sender id + public key. Request id 0 is skipped by the
+  allocator so it can never collide with “unset.”
 </p>
 
 <h3>6.3 Message catalog</h3>
@@ -1096,9 +1104,10 @@ footer.doc-end {
 <h3>6.5 PING / PONG</h3>
 <p>
   <code>PING</code> is empty. <code>PONG</code> may carry the sender’s observed
-  address (the address we received the ping from). An empty PONG payload
-  decodes as “no observation” for backward compatibility. Observed-IP voting
-  is specified in §11.
+  address (the address we received the ping from), encoded the same way as a
+  contact address: <code>0x04</code>/<code>0x06</code> + IP + port (big-endian).
+  An empty PONG payload decodes as “no observation” for backward compatibility.
+  Observed-IP voting is specified in §11.
 </p>
 
 <h3>6.6 FIND_NODE / FOUND_NODE</h3>
@@ -1203,14 +1212,24 @@ footer.doc-end {
   </tbody>
 </table>
 
-<h3>7.1 Keyword hash</h3>
+<h3>7.1 Keyword hash and tokenization</h3>
 <div class="eq">keyword_hash(s) = BLAKE3(s.to_lowercase().as_bytes())[0..16]</div>
 <p>
-  Tokens shorter than 2 characters are dropped. Multi-word queries are split
-  on whitespace, lowercased, sorted by length descending (most selective
-  first), and de-duplicated. The first hash is the primary walk key; up to
-  seven more ride on <code>FIND_VALUE</code> for peer-side intersection.
+  Publish, and the Search UI, tokenize with eMule’s <code>extract_keywords</code>
+  so Ember and KAD hash the same words: split on the eMule separators
+  <code>()[]{}&lt;&gt;,._-!?:;\/"</code> plus whitespace, keep tokens of
+  <strong>UTF-8 length ≥ 3</strong>, de-duplicate case-insensitively in first-seen
+  order, and drop a trailing 3-byte/3-character token when it is a file extension.
   Stemming is not performed.
+</p>
+<p>
+  Each surviving token is hashed as above. The Search UI then packs those hashes
+  onto <code>FIND_VALUE</code> via <code>compute_keyword_hashes</code>: join the
+  tokens with spaces, split on whitespace, drop anything shorter than 2 characters
+  (already gone after <code>extract_keywords</code>), sort by length descending
+  (most selective first), and de-duplicate. The first hash is the primary walk
+  key; up to seven more ride along for peer-side <code>file_hash</code>
+  intersection.
 </p>
 
 <h3>7.2 Source contact block</h3>
@@ -1234,12 +1253,22 @@ footer.doc-end {
 
 <h3>7.3 Ember file hash</h3>
 <p>
-  <code>ember_file_hash</code> is a 32-byte BLAKE3 digest of the file (the
-  hash-tree root specified for the dormant native transfer: BLAKE3 of each
-  256&nbsp;KiB chunk, then BLAKE3 of the concatenated chunk hashes). Search
-  hits, DHT source records, and <code>known.met</code> / library entries can
-  carry it. A download verifies against it whenever one is available. Deep
-  links without a digest still complete and are hashed for future sharing.
+  <code>ember_file_hash</code> is a 32-byte <strong>streaming BLAKE3 of the
+  file contents</strong> — the same digest <code>blake3::hash</code> would
+  produce for the whole file, computed in the same pass as the eD2K and AICH
+  hashes (<code>Blake3FileHasher</code>). Search hits, DHT keyword and source
+  records, and <code>known.met</code> / library entries can carry it. A download
+  verifies against it whenever one is available: a match shows a green Ember
+  badge (<code>ember_verified</code>); a mismatch is a permanent download failure
+  with a red Ember badge and does not reopen parts that already matched the
+  ed2k hash. Deep links without a digest still complete and are hashed for
+  future sharing.
+</p>
+<p>
+  That digest is <em>not</em> the dormant native-transfer hash tree. The unused
+  256&nbsp;KiB chunk tree in <code>ember/transfer.rs</code> hashes each chunk,
+  then BLAKE3 of the concatenated chunk hashes; that root is a different value
+  and is not what DHT records carry.
 </p>
 
 <h3>7.4 Why two TTLs</h3>
@@ -1292,7 +1321,7 @@ footer.doc-end {
   On the wire, each record in <code>FOUND_VALUE</code> is
   <code>record_body ‖ signature[64]</code>. The searcher verifies the publisher
   signature, checks that <code>keyword_hash</code> matches the queried key, and
-  drops junk. Charging the per-node result budget on blobs <em>offered</em>,
+  drops junk. The per-node result budget is charged on blobs <em>offered</em>,
   not only those accepted, so a peer that sends nothing but junk still hits
   its own limit.
 </p>
@@ -1336,8 +1365,9 @@ footer.doc-end {
 <p>
   Intersection is <strong>sparse</strong>: missing secondary keys are skipped,
   plus a filename match at emit time. It is not a strict worldwide AND of
-  every keyword. Tokens of length 1 are ignored. Successive queries rotate
-  which window a storer serves (§8.4).
+  every keyword. Product search already tokenizes with
+  <code>extract_keywords</code> (§7.1), so 1- and 2-byte tokens never become
+  DHT keys. Successive queries rotate which window a storer serves (§8.4).
 </p>
 <p>
   The Search page exposes an <strong>Ember Only</strong> method. <strong>Global</strong>
@@ -1393,9 +1423,10 @@ footer.doc-end {
 
 <h3>9.1 Publisher cycle</h3>
 <p>
-  Shared files are published as keyword records (one per token of length ≥ 2)
-  and one source record, and republished on a cycle to stay alive. Publishing
-  starts once the node has contacts. The Library marks a file with an
+  Shared files are published as keyword records (one per
+  <code>extract_keywords</code> token) and one source record, and republished
+  on a cycle to stay alive. Publishing starts once the node has contacts. The
+  Library marks a file with an
   <strong>Ember</strong> badge once a source record is placed — that is the
   point at which other Ember users can actually fetch it.
 </p>
@@ -1403,7 +1434,7 @@ footer.doc-end {
   <thead><tr><th>Cycle</th><th>Interval</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td>Source republish</td><td>2 h</td><td>Persisted in known.met as FT_EMBER_SOURCE_PUBLISH (0xE4)</td></tr>
-    <tr><td>Keyword republish</td><td>12 h</td><td>Session-only schedule (not persisted)</td></tr>
+    <tr><td>Keyword republish</td><td>12 h</td><td>Persisted in known.met as FT_EMBER_KEYWORD_PUBLISH (0xE5)</td></tr>
     <tr><td>Rendezvous advertise</td><td>5 h</td><td>Only while reachable and already publishing something</td></tr>
     <tr><td>Publish timeout</td><td>30 s</td><td>Wait for STORE_ACK</td></tr>
     <tr><td>MIN_STORE_NODES</td><td>5</td><td>Minimum replicas the publisher aims for</td></tr>
@@ -1412,18 +1443,20 @@ footer.doc-end {
 </table>
 <p>
   Keyword publish rate per maintenance tick scales with library size, clamped
-  between 2 and 96 records per tick, aiming to finish a full pass inside the
-  12-hour cycle at an estimate of 8 keywords per file. Source publish is
-  similarly paced so a large library is not slammed in one tick after a restart.
+  between 2 and 96 <strong>files</strong> per tick (not records), aiming to
+  finish a full pass inside the 12-hour cycle at an estimate of 8 keywords per
+  file. Source publish is similarly paced (5–256 files per tick) so a large
+  library is not slammed in one tick after a restart.
 </p>
 <p>
-  The last successful source-publish is written to <code>known.met</code>. On
-  start, a stamp still inside the 2-hour interval is hydrated back to an
-  <code>Instant</code>; a stamp older than the interval, or one that cannot be
-  represented because the process has not been up that long, is omitted and
-  the file is due immediately — republish-too-eager, the safe direction.
-  Previously the schedule was keyed on <code>Instant</code> alone, so every
-  restart marked the whole library as never-published.
+  The last successful source-publish and keyword-publish are written to
+  <code>known.met</code> (<code>0xE4</code> / <code>0xE5</code>). On start, a
+  stamp still inside its interval (2 hours for sources, 12 hours for keywords)
+  is hydrated back to an <code>Instant</code>; a stamp older than the interval,
+  or one that cannot be represented because the process has not been up that
+  long, is omitted and the file is due immediately — republish-too-eager, the
+  safe direction. Previously both schedules were keyed on <code>Instant</code>
+  alone, so every restart marked the whole library as never-published.
 </p>
 
 <h3>9.2 Storer-side replication</h3>
@@ -1466,7 +1499,7 @@ footer.doc-end {
 </p>
 
 <ul class="flow">
-  <li><strong>The KAD rendezvous key.</strong> Ember nodes advertise themselves under one fixed KAD key as an ordinary source record carrying their Noise pubkey tag. A node with a near-empty table runs a plain source lookup there. Re-advertised every 5 hours (matching KAD’s source TTL) and only while the node is reachable and already publishing something — a leecher never generates publish traffic purely to list itself. Lookups are spaced 10 minutes apart and stop once the table reaches one k-bucket of verified contacts. Seed string: <code>ember-dht-rendezvous-v1</code>, hashed with MD4 into a KAD ID. The derivation is versioned so the key space can be sharded later without a flag day.</li>
+  <li><strong>The KAD rendezvous key.</strong> Ember nodes advertise themselves under one fixed KAD key as an ordinary source record carrying their Noise pubkey tag. A node with a near-empty table runs a plain source lookup there. Re-advertised every 5 hours (matching KAD’s source TTL) and only while the node is reachable and already publishing something — a leecher never generates publish traffic purely to list itself. Lookups are spaced 10 minutes apart and stop once the table reaches one k-bucket of verified contacts. Seed string: <code>ember-dht-rendezvous-v1</code>, hashed with MD4 into a KAD ID. The derivation is versioned so the key space can be sharded later without a flag day. Health is surfaced on the Ember page as <code>ember_dht_rendezvous_*</code> (listed / lookups / empty).</li>
   <li><strong>The KAD bridge.</strong> Ember peers noticed in ordinary KAD traffic are DHT-pinged so their signed PONG folds them into the routing table. Capped per maintenance cycle; quiet above 20 verified contacts.</li>
   <li><strong>eD2K client-to-client sessions.</strong> Peers that advertise the Ember capability bit over a normal eD2K transfer are cached with their UDP port and bridged via Noise_XX when no static key is known. This is the path for a client running with no KAD at all.</li>
   <li><strong>DHT gossip and <code>nodes_ember.dat</code>.</strong> FOUND_NODE / PEER_LIST / ANNOUNCE_PEER, plus up to 200 persisted contacts, once the node has been online before. Persisted contacts load as unverified leads.</li>
@@ -1637,6 +1670,9 @@ footer.doc-end {
   <thead><tr><th>Task</th><th>Interval / budget</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td>Tick</td><td>60 s</td><td>EMBER_MAINT_INTERVAL</td></tr>
+    <tr><td>Disconnect / re-bootstrap</td><td>inbound silence &gt; 20 min</td><td>Re-arms the KAD bridge, rendezvous lookup, and self-lookup rather than sitting on a dead table</td></tr>
+    <tr><td>Stale-contact purge</td><td>verified unheard &gt; 2 h</td><td>Contacts still needed by an in-flight search are spared. Unverified leads are not purged this way (last_seen is 0)</td></tr>
+    <tr><td>Self-lookup</td><td>180 s cold / 20 s if ≥ 10 verified; repeats every 4 h</td><td>FIND_NODE for our own ID, to fill close-to-home buckets</td></tr>
     <tr><td>Bucket refresh</td><td>idle &gt; 3600 s, max 3 FIND_NODE / tick</td><td>Random target in the idle bucket</td></tr>
     <tr><td>Liveness ping</td><td>unheard &gt; 600 s</td><td>8/tick steady; 32/tick while verified &lt; 20. Scales to cover the table inside the stale window, capped at 32. 8 s ping timeout.</td></tr>
     <tr><td>Lead ping reserve</td><td>1 in 4 of the budget</td><td>When verified contacts could spend the whole budget, keep promoting gossip</td></tr>
@@ -1677,8 +1713,8 @@ footer.doc-end {
   ip_present(1) ‖ ip(4, optional) ‖ data_len(u32 LE) ‖ data
 </div>
 <ul>
-  <li>Up to 20,000 records. Written on shutdown only — a periodic write of several megabytes was a disk hitch every few minutes. Abnormal exit falls back to replication refilling the store within the hour.</li>
-  <li>Only <code>data</code> and <code>signature</code> are load-bearing on the way back in. Key, publisher, and expiry are re-derived from the signed body. Believing the unsigned fields would let anything that can write the file file a genuine record under the wrong key or with a life it was never granted.</li>
+  <li>Up to 20,000 records. Written on shutdown only — a periodic write of several megabytes was a disk hitch every few minutes. Abnormal exit falls back to replication refilling the store within two hours (the storer republish cadence).</li>
+  <li>Only <code>data</code> and <code>signature</code> are load-bearing on the way back in. Key, publisher, and expiry are re-derived from the signed body. Believing the unsigned fields would let anything that can write the file place a genuine record under the wrong key or with a life it was never granted.</li>
   <li>Records already past TTL are refused, so the file cleans itself up. Bodies larger than 4096 bytes are corruption.</li>
 </ul>
 
@@ -1687,6 +1723,7 @@ footer.doc-end {
   <thead><tr><th>Location</th><th>What</th></tr></thead>
   <tbody>
     <tr><td>known.met tag 0xE4</td><td>Last successful Ember source-publish per file</td></tr>
+    <tr><td>known.met tag 0xE5</td><td>Last successful Ember keyword-publish per file</td></tr>
     <tr><td>ember_dht_highwater.json</td><td>Daily and all-time high-water of verified contacts</td></tr>
   </tbody>
 </table>
@@ -1744,7 +1781,7 @@ footer.doc-end {
 
 <h3>16.1 Known limits (user-facing)</h3>
 <ul>
-  <li><strong>Content still moves over eD2K.</strong> Native 256&nbsp;KiB chunks and a BLAKE3 hash tree exist but nothing imports them.</li>
+  <li><strong>Content still moves over eD2K.</strong> Native 256&nbsp;KiB chunks and a BLAKE3 hash tree exist but nothing imports them. Downloads still verify the streaming BLAKE3 pin when one is present: mismatch is a permanent failure with a red Ember badge.</li>
   <li><strong>Bootstrap depends on eMule</strong> except for a previously persisted contact file.</li>
   <li><strong>Version mismatches are silent</strong> — clean refusal, no upgrade prompt.</li>
   <li><strong>Multi-keyword search is approximate</strong> — sparse intersection plus filename match, not a worldwide AND.</li>
@@ -1771,11 +1808,10 @@ footer.doc-end {
 
 <h3>16.3 Future, non-blocking</h3>
 <ul>
-  <li>Rendezvous-key health monitoring; shard the rendezvous key space once one KAD bucket’s 1000-entry cap is in sight.</li>
+  <li>Shard the rendezvous key space once one KAD bucket’s 1000-entry cap is in sight. Rendezvous-key health (listed / lookups / empty) is already on the Ember page.</li>
   <li>Richer keyword indexing (stemming) if recall lags KAD on real libraries.</li>
   <li>Score gossip under Sybil pressure, beyond per-IP and per-subnet caps.</li>
-  <li>Transport sessions keyed by <code>(address, static key)</code>.</li>
-  <li>Surface BLAKE3 verify pass/fail in the transfer UI; wire the native transfer path.</li>
+  <li>Wire the native transfer path (<code>ember/transfer.rs</code>).</li>
   <li>Longer fuzz / property tests and overnight soak jobs.</li>
 </ul>
 
@@ -1784,14 +1820,15 @@ footer.doc-end {
   <code>ember/transfer.rs</code> specifies a stream of
   <code>REQUEST_CHUNKS</code>, <code>CHUNK_DATA</code>, <code>FILE_INFO</code>,
   and <code>TRANSFER_COMPLETE</code> over 256&nbsp;KiB chunks with a BLAKE3 hash
-  tree whose root is the Ember file hash already carried on DHT records.
-  Nothing in the tree imports this module. Wiring it is the largest remaining
-  piece if the goal is a network that does not need the eMule wire at all.
+  tree whose root is a separate digest from the streaming BLAKE3 already
+  carried on DHT records. Nothing in the tree imports this module. Wiring it
+  is the largest remaining piece if the goal is a network that does not need
+  the eMule wire at all.
 </p>
 
 <!-- ══════════════════════════════════════════════ A ══════════════════════════════════════════════ -->
 <h2 id="sec-a">Appendix A. Constant tables</h2>
-<p class="sec-lead" style="margin-top:-2mm;">Values as compiled in Ember 1.5.4. Source files in parentheses.</p>
+<p class="sec-lead" style="margin-top:-2mm;">Values as compiled in Ember 1.5.6. Source files in parentheses.</p>
 
 <h3>A.1 Overlay</h3>
 <table class="data">
@@ -1834,12 +1871,20 @@ footer.doc-end {
     <tr><td>EMBER_RECORD_REPUBLISH_SECS</td><td>7200</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_SOURCE_REPUBLISH</td><td>2 h</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_KEYWORD_REPUBLISH</td><td>12 h</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_KEYWORD_PUBLISH_MIN/MAX_PER_TICK</td><td>2 / 96 files</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SOURCE_PUBLISH_MIN/MAX_PER_TICK</td><td>5 / 256 files</td><td>network/mod.rs</td></tr>
     <tr><td>KEYWORD_RECORD_TTL</td><td>24 h</td><td>dht/store.rs</td></tr>
     <tr><td>SOURCE_RECORD_TTL</td><td>6 h</td><td>dht/store.rs</td></tr>
-    <tr><td>CLOCK_SKEW_TOLERANCE</td><td>1 h</td><td>dht/store.rs</td></tr>
+    <tr><td>CLOCK_SKEW_TOLERANCE_SECS</td><td>1 h</td><td>dht/store.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_REPUBLISH_SECS</td><td>5 h</td><td>network/mod.rs</td></tr>
-    <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL</td><td>10 min</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS</td><td>10 min</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SEARCH_QUEUED_QUERY_TIMEOUT</td><td>12 s</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SELF_LOOKUP_FIRST_DELAY_SECS</td><td>180 s (20 s if ≥ 10 verified)</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SELF_LOOKUP_REPEAT_SECS</td><td>4 h</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_DISCONNECT_SECS</td><td>20 min</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_CONTACT_STALE_SECS</td><td>2 h</td><td>network/mod.rs</td></tr>
     <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>transport.rs</td></tr>
+    <tr><td>MAX_SESSIONS_PER_ADDR</td><td>4</td><td>transport.rs</td></tr>
     <tr><td>STORE_SIG_REPLAY_TTL</td><td>60 s</td><td>dht/engine.rs</td></tr>
     <tr><td>MIN_OBSERVED_IP_VOTES</td><td>3 / 15 min</td><td>dht/observed.rs</td></tr>
   </tbody>
@@ -1854,6 +1899,7 @@ footer.doc-end {
     <tr><td>NODES_EMBER_MAGIC</td><td>EMB3</td><td>dht/bootstrap.rs</td></tr>
     <tr><td>STORE_EMBER_MAGIC</td><td>EMS1</td><td>dht/bootstrap.rs</td></tr>
     <tr><td>FT_EMBER_SOURCE_PUBLISH</td><td>0xE4</td><td>known.met</td></tr>
+    <tr><td>FT_EMBER_KEYWORD_PUBLISH</td><td>0xE5</td><td>known.met</td></tr>
     <tr><td>EMBER_RENDEZVOUS_SEED</td><td>ember-dht-rendezvous-v1</td><td>kad/publish.rs</td></tr>
   </tbody>
 </table>
@@ -1869,8 +1915,10 @@ footer.doc-end {
     <tr><td>IO-free inbound handling, proximity, PROXY_STORE</td><td><code>dht/engine.rs</code></td></tr>
     <tr><td>128-bucket table, replacement cache, admission</td><td><code>dht/routing.rs</code></td></tr>
     <tr><td>Signed records, capacity, TTL, serve cursor</td><td><code>dht/store.rs</code></td></tr>
-    <tr><td>Iterative lookup, keyword hashing</td><td><code>dht/search.rs</code></td></tr>
+    <tr><td>Iterative lookup, FIND_VALUE key packing</td><td><code>dht/search.rs</code></td></tr>
     <tr><td>Keyword/source record builders</td><td><code>dht/publish.rs</code></td></tr>
+    <tr><td>Filename / query tokenization</td><td><code>kad/publish.rs</code> · <code>extract_keywords()</code></td></tr>
+    <tr><td>Streaming BLAKE3 file digest</td><td><code>ember/crypto.rs</code> · <code>Blake3FileHasher</code></td></tr>
     <tr><td>Adaptive abuse limits</td><td><code>dht/scale.rs</code></td></tr>
     <tr><td>Per-IP / per-peer rate limits</td><td><code>dht/protection.rs</code></td></tr>
     <tr><td>Observed-IP voting</td><td><code>dht/observed.rs</code></td></tr>
@@ -1889,7 +1937,7 @@ footer.doc-end {
 
 <footer class="doc-end">
   <p>
-    EmberDHT Protocol Specification · Wire version 2 · Ember 1.5.4 · August 2026.
+    EmberDHT Protocol Specification · Wire version 2 · Ember 1.5.6 · August 2026.
     Derived from the canonical implementation in the ember-p2p repository.
     Licensed under the GNU General Public License, version 3.
   </p>
