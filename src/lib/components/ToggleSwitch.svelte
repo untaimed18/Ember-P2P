@@ -67,7 +67,7 @@
     width: 40px;
     height: 22px;
     border-radius: 11px;
-    background: var(--border-light);
+    background: color-mix(in srgb, var(--text-muted) 28%, var(--bg-tertiary));
     border: none;
     padding: 0;
     cursor: inherit;

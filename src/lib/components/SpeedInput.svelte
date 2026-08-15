@@ -174,7 +174,7 @@
     display: flex;
     align-items: stretch;
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     overflow: hidden;
     background: var(--bg-input);
     transition: border-color 0.15s;
@@ -182,6 +182,7 @@
 
   .speed-input:focus-within {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .speed-number {
@@ -192,6 +193,7 @@
     padding: 7px 10px;
     font-size: 13px;
     outline: none;
+    box-shadow: none;
     min-width: 0;
     font-family: inherit;
   }
@@ -203,11 +205,13 @@
   }
 
   .speed-unit {
+    flex: 0 0 auto;
+    width: auto;
     border: none;
     border-left: 1px solid var(--border);
-    background: var(--bg-surface);
+    background-color: var(--bg-surface);
     color: var(--text-secondary);
-    padding: 0 10px;
+    padding: 0 24px 0 10px;
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;
@@ -215,6 +219,9 @@
     font-family: inherit;
     -webkit-appearance: none;
     appearance: none;
+    background-position: right 6px center;
+    background-size: 10px;
+    border-radius: 0;
   }
 
   .unlimited-btn {

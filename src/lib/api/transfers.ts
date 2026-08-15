@@ -108,9 +108,9 @@ export async function getUploadQueue(): Promise<UploadQueueClient[]> {
   return withTimeout(invoke<UploadQueueClient[]>('get_upload_queue'), 'get_upload_queue', 8_000);
 }
 
-/** Snapshot of every persistent SecIdent credit record (transfers/uploads
- *  pane, "Known Clients" tab). Lifetime view independent of which peers
- *  are connected right now. */
+/** Snapshot of every persistent SecIdent credit record (transfers bottom
+ *  pane, Known ED2K Peers / Known Ember Peers tabs). Lifetime view
+ *  independent of which peers are connected right now. */
 export async function getKnownClients(): Promise<KnownClient[]> {
   // Also polled (8 s). Reads the persistent credit store, so allow more room
   // than the queue snapshot above.

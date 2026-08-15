@@ -9,20 +9,20 @@
   --text-primary: #1a1c24;
   --text-secondary: #4a5068;
   --text-muted: #8890a8;
-  --text-accent: #1a73e8;
+  --text-accent: #245f9a;
 
-  --accent: #1a73e8;
-  --accent-hover: #1565d8;
-  --accent-dim: #d2e3fc;
-  --accent-halo: #d2e3fc;
+  --accent: #2a6cb0;
+  --accent-hover: #245f9a;
+  --accent-dim: #d5e4f2;
+  --accent-halo: #d5e4f2;
   --on-accent: #ffffff;
   --on-success: #ffffff;
   --on-warning: #1a1c24;
   --on-danger: #ffffff;
-  --success: #34a853;
-  --warning: #ea8600;
-  --danger: #d93025;
-  --danger-hover: #c62828;
+  --success: #2f9a55;
+  --warning: #c98412;
+  --danger: #c4453c;
+  --danger-hover: #b03c34;
   --badge-success-text: color-mix(in srgb, var(--success) 85%, #000);
   --badge-warning-text: color-mix(in srgb, var(--warning) 80%, #000);
   --badge-danger-text: color-mix(in srgb, var(--danger) 85%, #000);
@@ -66,9 +66,10 @@
   --bp-md: 980px;
   --bp-sm: 760px;
 
-  --radius-sm: 5px;
-  --radius-md: 7px;
-  --radius-lg: 10px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
 
   --font-mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI', Roboto, sans-serif;
@@ -219,6 +220,26 @@
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+:where([data-theme="dark"]) button.secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-weight: 500;
+  border: 1px solid var(--border);
+}
+:where([data-theme="dark"]) button.secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-light);
+}
+:where([data-theme="dark"]) button.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+:where([data-theme="dark"]) button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--on-accent);
+}
 :where([data-theme="dark"]) button.danger {
   background: var(--danger);
   color: var(--on-danger);
@@ -249,6 +270,10 @@
 [data-theme="dark"] ::selection {
   background: color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--text-primary);
+}
+
+[data-theme="dark"] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%23737985' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
 }
 
 *, *::before, *::after {
@@ -312,14 +337,15 @@ button {
   font-size: inherit;
   font-weight: 500;
   cursor: pointer;
-  border: none;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  padding: 6px 14px;
+  padding: 7px 14px;
   background: var(--accent);
   color: var(--on-accent);
   transition:
     background-color var(--transition-normal) ease,
     color var(--transition-normal) ease,
+    border-color var(--transition-normal) ease,
     transform 0.08s ease,
     box-shadow var(--transition-normal) ease;
   will-change: transform;
@@ -365,6 +391,28 @@ button.ghost:hover {
   color: var(--text-primary);
 }
 
+button.secondary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-light);
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--on-accent);
+}
+
 input, select, textarea {
   font-family: inherit;
   font-size: inherit;
@@ -377,13 +425,25 @@ input, select, textarea {
   transition: border-color 0.15s;
 }
 
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  padding-right: 28px;
+  background-color: var(--bg-input);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%238890a8' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 12px;
+}
+
 input:focus, select:focus, textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-halo);
 }
 
 input:disabled, select:disabled, textarea:disabled {
-  background: var(--bg-disabled);
+  background-color: var(--bg-disabled);
   color: var(--text-disabled);
   cursor: not-allowed;
 }
@@ -483,7 +543,7 @@ tr:hover td {
   align-items: center;
   gap: 4px;
   padding: 2px 9px;
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -598,14 +658,32 @@ tr:hover td {
 
 .empty-state .icon {
   font-size: 48px;
-  opacity: 0.3;
+  opacity: 0.45;
+  color: var(--text-muted);
+}
+
+/*
+ * Strip banners under page headers. Tinted fill + soft edge, matching
+ * the badge/toast recipe, so errors don't read as a hard red rule.
+ */
+.error-banner,
+.search-error-banner {
+  background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
+  color: var(--badge-danger-text);
+}
+.info-banner,
+.success-banner {
+  background: color-mix(in srgb, var(--success) 9%, var(--bg-secondary));
+  border-bottom: 1px solid color-mix(in srgb, var(--success) 36%, var(--border));
+  color: var(--badge-success-text);
 }
 
 .page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
+  padding: 18px 22px;
   /* Gradient divider — fades to transparent at both edges so the line
      reads as a soft horizon rather than a hard rule. */
   border-bottom: 1px solid transparent;
@@ -796,6 +874,8 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 }
 .confirm-dialog h3 {
   margin-bottom: 10px;
+  font-size: 16px;
+  font-weight: 600;
 }
 .confirm-dialog p {
   color: var(--text-secondary);

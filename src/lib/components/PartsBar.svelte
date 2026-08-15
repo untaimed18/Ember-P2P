@@ -144,7 +144,7 @@
     height: 16px;
     background: var(--bg-input);
     border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
-    border-radius: 2px;
+    border-radius: var(--radius-pill);
     overflow: hidden;
     min-width: 100px;
   }

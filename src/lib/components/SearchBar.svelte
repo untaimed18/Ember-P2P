@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import IconX from './IconX.svelte';
 
   let {
     value = $bindable(''),
@@ -243,10 +244,7 @@
     {/if}
     {#if value}
       <button class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
-        <svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-          <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
-          <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
-        </svg>
+        <IconX size={11} />
       </button>
     {/if}
   </div>
@@ -304,7 +302,7 @@
     min-height: 42px;
     padding: 0 12px;
     border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: linear-gradient(
       to bottom,
       color-mix(in srgb, var(--bg-input) 95%, var(--bg-surface) 5%),
@@ -316,7 +314,7 @@
 
   .search-bar:focus-within {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-dim) 45%, transparent), var(--shadow-md);
+    box-shadow: 0 0 0 2px var(--accent-halo), var(--shadow-md);
   }
 
   .search-icon {
@@ -347,6 +345,7 @@
   input:focus {
     border: none;
     outline: none;
+    box-shadow: none;
   }
 
   input::placeholder {

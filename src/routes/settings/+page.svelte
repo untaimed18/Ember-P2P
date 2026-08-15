@@ -1589,7 +1589,13 @@
       <!-- General -->
       <section class="card" class:hidden={activeSection !== 'general'}>
         <div class="card-header">
-          <span class="card-icon">&#9775;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="3" y1="5.5" x2="17" y2="5.5"/>
+              <line x1="3" y1="10" x2="17" y2="10"/>
+              <line x1="3" y1="14.5" x2="17" y2="14.5"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_general()}</h3>
             <p class="card-desc">{m.settings_general_desc()}</p>
@@ -1717,10 +1723,12 @@
               {/each}
             </div>
           </div>
+          <div class="divider"></div>
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
             <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
           </div>
+          <div class="divider"></div>
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_launch_maximized_label()}</span>
@@ -1829,7 +1837,13 @@
       <!-- Transfers -->
       <section class="card" class:hidden={activeSection !== 'downloads'}>
         <div class="card-header">
-          <span class="card-icon">&#8615;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="10" y1="3" x2="10" y2="13"/>
+              <polyline points="6,9.5 10,13.5 14,9.5"/>
+              <line x1="4" y1="17" x2="16" y2="17"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_downloads()}</h3>
             <p class="card-desc">{m.settings_downloads_desc()}</p>
@@ -1860,6 +1874,8 @@
             <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
             <span class="hint">{m.settings_max_file_size_hint()}</span>
           </div>
+
+          <div class="divider"></div>
 
           <!-- Protocol budget / retry knobs (max_sources, max_connections,
                queue wait, retry rounds) stay in AppSettings for config.json
@@ -1893,6 +1909,8 @@
             </div>
             <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel={m.settings_skip_compress_video()} />
           </div>
+
+          <div class="divider"></div>
 
           <div class="field">
             <span class="toggle-title">{m.settings_download_history()}</span>
@@ -1929,10 +1947,10 @@
               </div>
             </div>
             {#if historyStatsError}
-              <span class="hint" style="margin-top: 4px; color: var(--danger);">{historyStatsError}</span>
+              <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
             {/if}
             {#if historyClearMsg}
-              <span class="hint" style="margin-top: 4px;">{historyClearMsg}</span>
+              <span class="hint">{historyClearMsg}</span>
             {/if}
           </div>
         </div>
@@ -1941,7 +1959,12 @@
       <!-- Search -->
       <section class="card" class:hidden={activeSection !== 'search'}>
         <div class="card-header">
-          <span class="card-icon">&#x1F50D;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="8.5" cy="8.5" r="5.5"/>
+              <line x1="12.5" y1="12.5" x2="17" y2="17"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_search()}</h3>
             <p class="card-desc">{m.settings_search_desc()}</p>
@@ -1983,13 +2006,14 @@
                 <div class="spam-stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
               </div>
             {/if}
-            <div class="action-row" style="margin-top:8px;">
+            <div class="action-row">
               <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
               <button class="danger" onclick={handleResetSpamData} disabled={spamResetting}>
                 {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
               </button>
             </div>
           </div>
+          <div class="divider"></div>
           <div class="field">
             <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
             <span class="hint">{m.settings_search_timeout_hint()}</span>
@@ -2007,6 +2031,7 @@
             <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
             <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder={m.settings_filename_cleanups_placeholder()} />
           </div>
+          <div class="divider"></div>
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_save_search_history()}</span>
@@ -2020,7 +2045,14 @@
       <!-- Bandwidth -->
       <section class="card" class:hidden={activeSection !== 'bandwidth'}>
         <div class="card-header">
-          <span class="card-icon">&#8693;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="7" y1="3" x2="7" y2="17"/>
+              <polyline points="3.5,6.5 7,3 10.5,6.5"/>
+              <line x1="13" y1="3" x2="13" y2="17"/>
+              <polyline points="9.5,13.5 13,17 16.5,13.5"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_bandwidth()}</h3>
             <p class="card-desc">{m.settings_bandwidth_desc()}</p>
@@ -2044,6 +2076,7 @@
               ariaLabel={m.settings_uss_label()}
             />
           </div>
+          <div class="divider"></div>
           <div class="field speed-test-section">
             <div class="speed-test-header">
               <span class="toggle-title">{m.settings_speed_test_label()}</span>
@@ -2079,7 +2112,16 @@
       <!-- Network -->
       <section class="card" class:hidden={activeSection !== 'network'}>
         <div class="card-header">
-          <span class="card-icon">&#8942;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="10" cy="4" r="2"/>
+              <circle cx="4" cy="15" r="2"/>
+              <circle cx="16" cy="15" r="2"/>
+              <line x1="10" y1="6" x2="5" y2="13"/>
+              <line x1="10" y1="6" x2="15" y2="13"/>
+              <line x1="6" y1="15" x2="14" y2="15"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_network()}</h3>
             <p class="card-desc">{m.settings_network_desc()}</p>
@@ -2104,6 +2146,8 @@
               <span class="hint">{m.settings_udp_port_hint()}</span>
             </div>
           </div>
+
+          <div class="divider"></div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -2142,6 +2186,8 @@
               </div>
             </div>
           </div>
+
+          <div class="divider"></div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -2227,7 +2273,12 @@
       <!-- Security -->
       <section class="card" class:hidden={activeSection !== 'security'}>
         <div class="card-header">
-          <span class="card-icon">&#128737;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 2L3 6v4c0 4.4 3 8.5 7 10 4-1.5 7-5.6 7-10V6l-7-4z"/>
+              <polyline points="7,10 9.5,12.5 13.5,7.5"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_security()}</h3>
             <p class="card-desc">{m.settings_security_desc()}</p>
@@ -2359,7 +2410,14 @@
       <!-- Friends -->
       <section class="card" class:hidden={activeSection !== 'friends'}>
         <div class="card-header">
-          <span class="card-icon">&#128101;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7" cy="6" r="3"/>
+              <circle cx="14" cy="7" r="2.5"/>
+              <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
+              <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_friends()}</h3>
             <p class="card-desc">{m.settings_friends_desc()}</p>
@@ -2400,13 +2458,19 @@
       <!-- Backup & Restore -->
       <section class="card" class:hidden={activeSection !== 'backup'}>
         <div class="card-header">
-          <span class="card-icon">&#128190;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2.5" y="4" width="15" height="4" rx="1"/>
+              <path d="M4 8v7.5c0 .6.4 1 1 1h10c.6 0 1-.4 1-1V8"/>
+              <line x1="8" y1="11.5" x2="12" y2="11.5"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_backup()}</h3>
             <p class="card-desc">{m.settings_backup_desc()}</p>
           </div>
         </div>
-        <div class="card-body">
+        <div class="card-body backup-body">
           {#if pendingRestore?.pending}
             <div class="field pending-restore" role="status">
               <span class="field-label">{m.settings_backup_pending_title()}</span>
@@ -2427,46 +2491,56 @@
               </div>
             </div>
           {/if}
-          <div class="field">
-            <span class="field-label">{m.settings_backup_contents_label()}</span>
-            <span class="hint">{m.settings_backup_contents_hint()}</span>
-            <span class="hint">{m.settings_backup_excludes_hint()}</span>
+
+          <div class="backup-block">
+            <div class="backup-copy">
+              <span class="field-label">{m.settings_backup_contents_label()}</span>
+              <span class="hint">{m.settings_backup_contents_hint()}</span>
+              <span class="hint">{m.settings_backup_excludes_hint()}</span>
+            </div>
           </div>
 
-          <div class="field">
-            <label for="backup-passphrase">{m.settings_backup_passphrase_label()}</label>
-            <span class="hint">{m.settings_backup_passphrase_hint()}</span>
-            <input
-              id="backup-passphrase"
-              type="password"
-              autocomplete="new-password"
-              bind:value={backupPassphrase}
-              placeholder={m.settings_backup_passphrase_placeholder()}
-            />
-          </div>
-          <div class="field">
-            <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
-            <input
-              id="backup-passphrase-confirm"
-              type="password"
-              autocomplete="new-password"
-              bind:value={backupPassphraseConfirm}
-            />
-          </div>
-          <div class="action-row">
-            <button
-              class="action-btn"
-              onclick={handleExportBackup}
-              disabled={backupBusy || backupPassphrase.length === 0}
-            >{m.settings_backup_export()}</button>
+          <div class="backup-block">
+            <div class="field">
+              <div class="backup-copy">
+                <label for="backup-passphrase">{m.settings_backup_passphrase_label()}</label>
+                <span class="hint">{m.settings_backup_passphrase_hint()}</span>
+              </div>
+              <input
+                id="backup-passphrase"
+                type="password"
+                autocomplete="new-password"
+                bind:value={backupPassphrase}
+                placeholder={m.settings_backup_passphrase_placeholder()}
+              />
+            </div>
+            <div class="field">
+              <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
+              <input
+                id="backup-passphrase-confirm"
+                type="password"
+                autocomplete="new-password"
+                bind:value={backupPassphraseConfirm}
+              />
+            </div>
+            <div class="action-row">
+              <button
+                class="action-btn"
+                onclick={handleExportBackup}
+                disabled={backupBusy || backupPassphrase.length === 0}
+              >{m.settings_backup_export()}</button>
+            </div>
           </div>
 
           <!-- Hidden while a restore is staged: importing a second one is
                refused by the backend, so the banner's Restart / Discard pair
                is the only sensible next step. -->
-          <div class="field" class:hidden={pendingRestore?.pending}>
-            <span class="field-label">{m.settings_backup_restore_label()}</span>
-            <span class="hint">{m.settings_backup_restore_hint()}</span>
+          <div class="backup-block" class:hidden={pendingRestore?.pending}>
+            <div class="divider"></div>
+            <div class="backup-copy">
+              <span class="field-label">{m.settings_backup_restore_label()}</span>
+              <span class="hint">{m.settings_backup_restore_hint()}</span>
+            </div>
             <div class="action-row">
               <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
                 {m.settings_backup_choose_file()}
@@ -2474,13 +2548,15 @@
             </div>
             {#if restoreSource}
               <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
-              <label for="restore-passphrase">{m.settings_backup_restore_passphrase_label()}</label>
-              <input
-                id="restore-passphrase"
-                type="password"
-                autocomplete="current-password"
-                bind:value={restorePassphrase}
-              />
+              <div class="field">
+                <label for="restore-passphrase">{m.settings_backup_restore_passphrase_label()}</label>
+                <input
+                  id="restore-passphrase"
+                  type="password"
+                  autocomplete="current-password"
+                  bind:value={restorePassphrase}
+                />
+              </div>
               <div class="action-row">
                 <button
                   class="action-btn"
@@ -2535,7 +2611,13 @@
       <!-- About & Updates -->
       <section class="card" class:hidden={activeSection !== 'about'}>
         <div class="card-header">
-          <span class="card-icon">&#9432;</span>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="10" cy="10" r="7.5"/>
+              <line x1="10" y1="9" x2="10" y2="14"/>
+              <circle cx="10" cy="6.5" r="0.6" fill="currentColor"/>
+            </svg>
+          </span>
           <div>
             <h3>{m.settings_section_about()}</h3>
             <p class="card-desc">{m.settings_about_desc()}</p>
@@ -2935,8 +3017,7 @@
     to   { opacity: 1; transform: translateY(0); }
   }
 
-  .card.hidden,
-  .field.hidden {
+  .card.hidden {
     display: none;
   }
 
@@ -2959,6 +3040,12 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-radius: var(--radius-md);
     flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .card-icon svg {
+    width: 18px;
+    height: 18px;
   }
 
   .card-header h3 {
@@ -2977,16 +3064,21 @@
   }
 
   .card-body {
-    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: 20px 20px 24px;
   }
 
   /* ── Fields ────────────────────────────────────── */
   .field {
-    margin-bottom: 16px;
+    margin-bottom: 0;
   }
 
-  .field:last-child {
-    margin-bottom: 0;
+  .field:not(.toggle-row):not(.ember-lock-field) {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .field > label,
@@ -2996,19 +3088,21 @@
     gap: 8px;
     font-size: 13px;
     color: var(--text-secondary);
-    margin-bottom: 6px;
+    margin-bottom: 0;
     font-weight: 500;
   }
 
   .field input[type='number'],
-  .field input:not([type]) {
+  .field input[type='text'],
+  .field input:not([type]),
+  .field > select {
     width: 100%;
   }
 
   .field-row {
     display: flex;
     gap: 14px;
-    margin-bottom: 16px;
+    margin-bottom: 0;
   }
 
   .field.half {
@@ -3019,9 +3113,9 @@
   .hint {
     font-size: 11px;
     color: var(--text-muted);
-    margin-top: 4px;
+    margin-top: 0;
     display: block;
-    line-height: 1.4;
+    line-height: 1.5;
   }
 
   /* ── Restart badge ─────────────────────────────── */
@@ -3032,7 +3126,7 @@
     text-transform: uppercase;
     letter-spacing: 0.3px;
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
     vertical-align: middle;
@@ -3046,7 +3140,7 @@
     text-transform: uppercase;
     letter-spacing: 0.3px;
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     vertical-align: middle;
@@ -3064,6 +3158,9 @@
   .toggle-info {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
   }
 
   .toggle-title {
@@ -3077,7 +3174,7 @@
   }
 
   .toggle-info .hint {
-    margin-top: 2px;
+    margin-top: 0;
   }
 
   .ember-lock-field {
@@ -3093,13 +3190,13 @@
     padding: 10px 12px;
     background: color-mix(in srgb, var(--ember-color, var(--accent)) 8%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--ember-color, var(--accent)) 22%, var(--border));
-    border-radius: var(--radius-md, 8px);
+    border-radius: var(--radius-md);
   }
 
   .ember-lock-icon {
     width: 26px;
     height: 26px;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -3126,13 +3223,13 @@
   .nested {
     margin-left: 0;
     margin-top: -8px;
-    padding-left: 4px;
+    padding-left: 12px;
   }
 
   .divider {
     height: 1px;
     background: var(--border);
-    margin: 14px 0;
+    margin: 2px 0;
     opacity: 0.6;
   }
 
@@ -3149,6 +3246,7 @@
 
   .folder-input:focus-within {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .folder-input input {
@@ -3159,6 +3257,7 @@
     font-size: 13px;
     color: var(--text-primary);
     outline: none;
+    box-shadow: none;
     min-width: 0;
   }
 
@@ -3166,7 +3265,8 @@
     display: block;
     font-size: 11px;
     color: var(--text-muted);
-    margin-top: 4px;
+    margin-top: 0;
+    line-height: 1.5;
   }
 
   .folder-btn {
@@ -3247,7 +3347,7 @@
   .about-mark {
     width: 44px;
     height: 44px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     flex-shrink: 0;
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent);
@@ -3266,8 +3366,8 @@
   .about-wordmark {
     margin: 0 0 3px;
     font-size: 18px;
-    font-weight: 800;
-    letter-spacing: 2.5px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
     color: var(--accent);
     line-height: 1;
   }
@@ -3291,7 +3391,7 @@
     color: var(--badge-accent-text);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     line-height: 1.4;
   }
 
@@ -3385,7 +3485,7 @@
   .about-progress {
     margin-top: 8px;
     height: 4px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, var(--bg-input));
     overflow: hidden;
   }
@@ -3592,7 +3692,7 @@
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 10px;
-    margin-top: 8px;
+    margin-top: 0;
   }
 
   .behavior-card {
@@ -3708,22 +3808,22 @@
   }
 
   .speed-test-section {
-    border-top: 1px solid var(--border);
-    padding-top: 12px;
-    margin-top: 4px;
+    padding-top: 0;
+    margin-top: 0;
   }
 
   .speed-test-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 4px;
+    gap: 12px;
+    margin-bottom: 0;
   }
 
   .speed-test-btn {
     padding: 4px 12px;
     font-size: 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
     color: var(--text-primary);
@@ -3740,10 +3840,10 @@
   }
 
   .speed-results {
-    margin-top: 8px;
+    margin-top: 0;
     padding: 8px 12px;
     background: var(--bg-tertiary);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     font-size: 13px;
   }
 
@@ -3773,7 +3873,7 @@
     padding: 6px;
     font-size: 12px;
     font-weight: 600;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: none;
     background: var(--accent);
     color: var(--on-accent);
@@ -3795,7 +3895,7 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 8px;
-    margin-top: 8px;
+    margin-top: 0;
   }
 
   .spam-stat {
@@ -3818,18 +3918,75 @@
     color: var(--text-primary);
   }
 
+  .backup-body {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 22px 20px 24px;
+  }
+
+  .backup-block {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .backup-block.hidden {
+    display: none;
+  }
+
+  .backup-block > .divider {
+    margin: 0;
+  }
+
+  .backup-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 68ch;
+  }
+
+  .backup-body .field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 0;
+  }
+
+  .backup-body .field > label,
+  .backup-body .field > .field-label,
+  .backup-copy > label,
+  .backup-copy > .field-label {
+    margin-bottom: 0;
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .backup-body .hint {
+    margin-top: 0;
+    line-height: 1.5;
+  }
+
+  .backup-body input[type='password'] {
+    width: 100%;
+    max-width: 28rem;
+  }
+
   .backup-preview {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 8px;
-    margin-top: 8px;
+    gap: 10px;
   }
 
   .pending-restore {
-    border: 1px solid var(--warning);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--warning) 10%, transparent);
-    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+    padding: 12px 14px;
+    margin-bottom: 0;
   }
 
   .backup-path {
@@ -3838,13 +3995,14 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--font-mono, monospace);
+    max-width: 68ch;
   }
 
   .history-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
     gap: 10px;
-    margin-top: 10px;
+    margin-top: 0;
   }
 
   .history-card {

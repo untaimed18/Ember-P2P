@@ -20,6 +20,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText, firewallStatusText } from '$lib/i18n';
   import { inertBackground } from '$lib/a11y';
+  import IconX from '$lib/components/IconX.svelte';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
@@ -919,7 +920,7 @@
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}>×</button>
+          <button class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
         </div>
         <div class="modal-body">
           <div class="bootstrap-tabs" role="tablist">
@@ -1124,9 +1125,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 20px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
     font-size: 13px;
   }
 
@@ -1190,12 +1188,12 @@
     min-width: 80px;
     max-width: 280px;
     margin: 4px 6px 4px 0;
-    padding: 4px 8px;
+    padding: 5px 12px;
     font-size: 12px;
     background: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-pill);
   }
   .filter-input:focus {
     outline: none;
@@ -1207,12 +1205,12 @@
   }
   .filter-select {
     margin: 4px 6px 4px 0;
-    padding: 4px 8px;
+    padding: 5px 24px 5px 10px;
     font-size: 12px;
-    background: var(--bg-secondary);
+    background-color: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-pill);
   }
   .filter-select:disabled {
     opacity: 0.5;
@@ -1284,33 +1282,35 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
+    padding: 14px 20px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-header h3 { margin: 0; font-size: 14px; font-weight: 600; }
+  .modal-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
   .modal-close {
-    font-size: 18px;
-    line-height: 1;
-    padding: 0 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
     cursor: pointer;
     border: none;
     background: none;
     color: var(--text-muted);
+    border-radius: var(--radius-sm);
   }
   .modal-close:hover { color: var(--text-primary); }
-  .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
+  .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
-    padding: 12px 16px;
+    padding: 12px 20px;
     border-top: 1px solid var(--border);
   }
   .form-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 10px;
+    gap: 10px;
+    margin-bottom: 12px;
   }
   .form-label {
     font-size: 12px;
@@ -1321,10 +1321,10 @@
   }
   .form-input {
     flex: 1;
-    padding: 5px 8px;
+    padding: 7px 10px;
     font-size: 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-md);
     background: var(--bg-input);
     color: inherit;
     outline: none;
@@ -1369,7 +1369,7 @@
     font-family: var(--font-mono);
     background: var(--bg-tertiary);
     padding: 1px 4px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
   .port-input {
     width: 110px;
@@ -1695,7 +1695,7 @@
     justify-content: center;
     width: 14px;
     height: 14px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: 9px;
     font-weight: 700;
     line-height: 1;

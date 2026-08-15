@@ -28,6 +28,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
+  import IconX from '$lib/components/IconX.svelte';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -125,15 +126,17 @@
     { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident' },
   ];
   // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
-  // sourced from clients.met. Independent of which peers are connected,
-  // so this view is the "credit ledger" view of the network. Every
-  // non-flag column is sortable; the user's last-used sort is persisted
+  // sourced from clients.met. The same columns back both the eD2K-only
+  // and Ember-only tabs; the first data column's header switches to
+  // "User Name" on the Ember tab. Independent of which peers are
+  // connected, so this view is the "credit ledger" view of the network.
+  // Every non-flag column is sortable; the user's last-used sort is persisted
   // via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
   // `KnSortField` type and `toggleKnSort` below).
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
-    { key: 'user_hash', get label() { return m.transfers_col_user_hash(); }, width: 200, minWidth: 140, className: 'col-k-hash', sortField: 'user_hash' },
-    { key: 'last_known_ip', get label() { return m.transfers_col_last_ip(); }, width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip' },
+    { key: 'user_hash', get label() { return showingEmberKnown ? m.transfers_col_user_name() : m.transfers_col_user_hash(); }, width: 248, minWidth: 168, className: 'col-k-hash', sortField: 'user_hash' },
+    { key: 'last_known_ip', get label() { return m.transfers_col_last_ip(); }, width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip', defaultHidden: true },
     { key: 'uploaded', get label() { return m.transfers_col_uploaded_to(); }, width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
     { key: 'downloaded', get label() { return m.transfers_col_downloaded_from(); }, width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
     { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-k-score', sortField: 'credit_ratio' },
@@ -171,7 +174,9 @@
     // the new layout up once instead of keeping a stale all-visible set.
     uploads: 'transfers-column-hidden-UploadListCtrlV2',
     queue: 'transfers-column-hidden-QueueListCtrlV2',
-    known: 'transfers-column-hidden-KnownClientsCtrl',
+    // V2: bumped when Last IP became hidden by default, so existing users
+    // pick the new layout up once instead of keeping a stale all-visible set.
+    known: 'transfers-column-hidden-KnownClientsCtrlV2',
     clients: 'transfers-column-hidden-DownloadClientsCtrl',
   };
   const COLUMN_ORDER_STORAGE_KEYS: Record<TableKey, string> = {
@@ -265,8 +270,8 @@
     // not just after the user has clicked each tab. The per-tab
     // `$effect`s below still own the ongoing polling while a tab is
     // visible — this only primes the counts for tabs the user hasn't
-    // opened yet. Without it, "Queued (N)" / "Known Clients (N)"
-    // rendered as bare "Queued" / "Known Clients" until first click,
+    // opened yet. Without it, "Queued (N)" / "Known ED2K Peers (N)"
+    // rendered as bare "Queued" / "Known ED2K Peers" until first click,
     // and the numbers vanished again every time the user navigated
     // away from /transfers and back.
     refreshUploadQueue();
@@ -740,14 +745,18 @@
   // Migrated from `'on_queue'` (which was always-empty placeholder data
   // derived from `Transfer.status === 'queued'`) to `'queued'` (real
   // upload-server queue snapshot via `getUploadQueue()`). `'known_clients'`
-  // is new — surfaces the SecIdent credit ledger so users can see who
-  // they've earned upload priority with on the wider eMule network.
-  type BottomView = 'uploading' | 'queued' | 'known_clients' | 'download_clients';
+  // is the eD2K-only credit ledger; `'known_ember'` is the same ledger
+  // filtered to peers that bound an Ember identity. A peer with both
+  // identities appears only on the Ember tab.
+  type BottomView = 'uploading' | 'queued' | 'known_clients' | 'known_ember' | 'download_clients';
   const BOTTOM_VIEW_KEY = 'transfers-bottom-view';
+  function isKnownLedgerView(v: BottomView): boolean {
+    return v === 'known_clients' || v === 'known_ember';
+  }
   function loadBottomView(): BottomView {
     try {
       const v = localStorage.getItem(BOTTOM_VIEW_KEY);
-      if (v === 'uploading' || v === 'queued' || v === 'known_clients' || v === 'download_clients') return v;
+      if (v === 'uploading' || v === 'queued' || v === 'known_clients' || v === 'known_ember' || v === 'download_clients') return v;
       // Migrate the legacy 'on_queue' key (replaced by 'queued') so users
       // with a stored preference don't get bumped back to the default tab.
       if (v === 'on_queue') return 'queued';
@@ -927,7 +936,22 @@
     reputationMap = next;
   }
 
-  // --- Known Clients sub-toolbar state ---
+  // Split the SecIdent ledger: Ember-bound peers live on the Ember tab
+  // and must not also appear on the eD2K tab. `ember_hash` is set only
+  // after a verified hello binding (or a live queue fallback).
+  let knownSplit = $derived.by(() => {
+    const ed2k: KnownClient[] = [];
+    const ember: KnownClient[] = [];
+    for (const kc of knownClients) {
+      if (kc.ember_hash) ember.push(kc);
+      else ed2k.push(kc);
+    }
+    return { ed2k, ember };
+  });
+  let showingEmberKnown = $derived(bottomView === 'known_ember');
+  let knownLedger = $derived(showingEmberKnown ? knownSplit.ember : knownSplit.ed2k);
+
+  // --- Known-peers sub-toolbar state ---
   // Filter string applied case-insensitively across user_hash, last_known_ip,
   // country_code, and (when the peer is a friend) the friend nickname so a
   // user can find a peer they know about by any cue available to them.
@@ -968,7 +992,7 @@
     } catch (e) {
       // Non-fatal: an unavailable friends list just means we won't
       // mark friend rows. The rest of the table still renders.
-      console.warn('Failed to load friend hashes for Known Clients:', e);
+      console.warn('Failed to load friend hashes for known peers:', e);
     }
   }
 
@@ -996,22 +1020,23 @@
     filteredKnownClients.slice(0, KNOWN_CLIENT_DISPLAY_LIMIT)
   );
 
-  // Top-line stats for the Known Clients sub-toolbar. Computed off the
-  // unfiltered list so the totals reflect the full ledger regardless of
-  // the current search. Friend count uses backend is_friend (ember hash)
-  // with a live friendHashSet fallback after add/remove.
+  // Top-line stats for the active known-peers tab. Computed off the
+  // unfiltered split (eD2K or Ember) so totals match that tab's ledger
+  // regardless of the current search. Friend count uses backend
+  // is_friend (ember hash) with a live friendHashSet fallback after
+  // add/remove.
   let knownStats = $derived.by(() => {
     let totalUp = 0;
     let totalDown = 0;
     let friendCount = 0;
-    for (const kc of knownClients) {
+    for (const kc of knownLedger) {
       totalUp += kc.uploaded;
       totalDown += kc.downloaded;
       const ember = kc.ember_hash?.toLowerCase();
       if (kc.is_friend || (ember != null && friendHashSet.has(ember))) friendCount++;
     }
     return {
-      total: knownClients.length,
+      total: knownLedger.length,
       friends: friendCount,
       totalUp,
       totalDown,
@@ -1065,7 +1090,7 @@
     // records change far less often than queue rank. Friend hashes are
     // refreshed on the same cadence so add/remove from the Friends page
     // updates markers while this tab stays open.
-    if (bottomView === 'known_clients') {
+    if (isKnownLedgerView(bottomView)) {
       refreshKnownClients();
       void refreshFriendHashes();
       if (knownPollHandle === null) {
@@ -1086,7 +1111,7 @@
       // stores do around their own visibility gates.
       if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
         knownVisibilityHandler = () => {
-          if (document.visibilityState !== 'visible' || bottomView !== 'known_clients') {
+          if (document.visibilityState !== 'visible' || !isKnownLedgerView(bottomView)) {
             return;
           }
           refreshKnownClients();
@@ -1121,8 +1146,8 @@
     Verified: 0, Needed: 1, Unknown: 2, Failed: 3, BadGuy: 4,
   };
   let sortedKnownClients = $derived.by(() => {
-    if (knownClients.length === 0) return knownClients;
-    const sorted = [...knownClients];
+    if (knownLedger.length === 0) return knownLedger;
+    const sorted = [...knownLedger];
     const dir = knSortAsc ? 1 : -1;
     const cmpStr = (a: string | null | undefined, b: string | null | undefined) => {
       const ax = (a ?? '').toLowerCase();
@@ -1166,9 +1191,16 @@
     sorted.sort((a, b) => {
       let raw: number;
       switch (knSortField) {
-        case 'user_hash':
-          raw = cmpStr(a.user_hash, b.user_hash);
+        case 'user_hash': {
+          const nameOf = (kc: KnownClient) => {
+            const ember = kc.ember_hash?.toLowerCase();
+            const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
+            if (nick && nick.trim()) return nick;
+            return showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash;
+          };
+          raw = cmpStr(nameOf(a), nameOf(b));
           break;
+        }
         case 'last_known_ip':
           raw = cmpIp(a.last_known_ip, b.last_known_ip);
           break;
@@ -2698,7 +2730,7 @@
       case 'downloads': return m.transfers_column_menu_downloads();
       case 'uploads': return m.transfers_column_menu_uploads();
       case 'queue': return m.transfers_column_menu_queue();
-      case 'known': return m.transfers_column_menu_known();
+      case 'known': return showingEmberKnown ? m.transfers_column_menu_known_ember() : m.transfers_column_menu_known();
       case 'clients': return m.transfers_column_menu_clients();
     }
   }
@@ -3719,10 +3751,11 @@
     aria-label={m.transfers_resize_panes_aria()}
   ></button>
 
-  <!-- BOTTOM PANE: Uploading / Queued / Known Clients / Download Clients
-       (eMule-style tabs). Queued + Known Clients are backed by on-demand
-       backend snapshots (`get_upload_queue`, `get_known_clients`) polled
-       only while the matching tab is visible — see the `$effect`s above. -->
+  <!-- BOTTOM PANE: Uploading / Queued / Known ED2K Peers / Known Ember Peers /
+       Download Clients (eMule-style tabs). Queued + known-peer ledgers are
+       backed by on-demand backend snapshots (`get_upload_queue`,
+       `get_known_clients`) polled only while the matching tab is visible
+       — see the `$effect`s above. -->
   <div class="pane uploads-pane" style="flex: 1;">
     <div class="pane-toolbar tabs-bar">
       <!--
@@ -3732,7 +3765,7 @@
         the others are reachable with Left/Right arrow). The pane body
         below is implicitly the tabpanel — wired via aria-controls
         pointing at its DOM id. Without these roles, screen readers
-        announce four unrelated buttons rather than "tab 1 of 4".
+        announce four unrelated buttons rather than "tab 1 of 5".
       -->
       <div
         class="bottom-tabs"
@@ -3740,7 +3773,7 @@
         aria-label={m.transfers_bottom_pane_aria()}
         tabindex="-1"
         onkeydown={(e) => {
-          const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'download_clients'];
+          const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'known_ember', 'download_clients'];
           const idx = order.indexOf(bottomView);
           if (idx < 0) return;
           if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
@@ -3786,7 +3819,17 @@
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title={m.transfers_tab_known_title()}
-        >{knownClientsLoaded ? m.transfers_tab_known_count({ count: knownClients.length }) : m.transfers_tab_known()}</button>
+        >{knownClientsLoaded ? m.transfers_tab_known_count({ count: knownSplit.ed2k.length }) : m.transfers_tab_known()}</button>
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'known_ember'}
+          role="tab"
+          aria-selected={bottomView === 'known_ember'}
+          aria-controls="bottom-pane-content"
+          tabindex={bottomView === 'known_ember' ? 0 : -1}
+          onclick={() => bottomView = 'known_ember'}
+          title={m.transfers_tab_known_ember_title()}
+        >{knownClientsLoaded ? m.transfers_tab_known_ember_count({ count: knownSplit.ember.length }) : m.transfers_tab_known_ember()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -3806,6 +3849,7 @@
         bottomView === 'uploading' ? m.transfers_tab_uploading_label()
         : bottomView === 'queued' ? m.transfers_tab_queued()
         : bottomView === 'known_clients' ? m.transfers_tab_known()
+        : bottomView === 'known_ember' ? m.transfers_tab_known_ember()
         : m.transfers_tab_download_clients()
       }
     >
@@ -4052,11 +4096,11 @@
             {/if}
           </tbody>
         </table>
-      {:else if bottomView === 'known_clients'}
-        <!-- KNOWN CLIENTS VIEW: lifetime SecIdent credit ledger (every
-             peer in clients.met). Independent of which peers are
-             connected; this is the cumulative view that drives upload
-             priority across sessions. Polled at a longer cadence than
+      {:else if isKnownLedgerView(bottomView)}
+        <!-- KNOWN PEERS VIEW: lifetime SecIdent credit ledger, split by
+             whether the peer bound an Ember identity. eD2K-only rows stay
+             on Known ED2K Peers; Ember-bound rows only appear here when
+             `showingEmberKnown` is true. Polled at a longer cadence than
              the queue tab because credit records change far less often. -->
         <!--
           Sub-toolbar: search box + summary stats. Sits above the
@@ -4067,7 +4111,7 @@
           country code, and friend nickname (when applicable);
           totals reflect the full ledger, not the filtered view.
         -->
-        <div class="known-toolbar" role="group" aria-label={m.transfers_known_filter_aria()}>
+        <div class="known-toolbar" role="group" aria-label={showingEmberKnown ? m.transfers_known_ember_filter_aria() : m.transfers_known_filter_aria()}>
           <label class="known-search">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <circle cx="7" cy="7" r="4.5"/>
@@ -4076,8 +4120,8 @@
             <input
               type="text"
               bind:value={knownFilter}
-              placeholder={m.transfers_known_filter_placeholder()}
-              aria-label={m.transfers_known_input_aria()}
+              placeholder={showingEmberKnown ? m.transfers_known_ember_filter_placeholder() : m.transfers_known_filter_placeholder()}
+              aria-label={showingEmberKnown ? m.transfers_known_ember_input_aria() : m.transfers_known_input_aria()}
             />
             {#if knownFilter}
               <button
@@ -4085,7 +4129,7 @@
                 class="known-search-clear"
                 aria-label={m.transfers_known_clear_filter()}
                 onclick={() => (knownFilter = '')}
-              >&times;</button>
+              ><IconX size={13} /></button>
             {/if}
           </label>
           {#if knownClientsLoaded}
@@ -4171,6 +4215,7 @@
               {@const emberKey = kc.ember_hash?.toLowerCase()}
               {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
               {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
+              {@const shownHash = showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash}
               <tr
                 class="client-row"
                 class:client-row-friend={isFriend}
@@ -4180,31 +4225,25 @@
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={kc.country_code ?? ''}>{#if countryFlagSrc(kc.country_code ?? undefined)}<img src={countryFlagSrc(kc.country_code ?? undefined)} alt={kc.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'user_hash'}
-                    <!-- Click-to-copy: the truncated form is unrecognisable, so a
-                         user wanting to look up the peer or share the hash
-                         needs the full 32-char hex. We show the truncated
-                         form for layout, full hash on hover, and copy the
-                         full hash on click with brief inline feedback. The
-                         friend marker (small filled dot) sits before the
-                         hash so the eye picks out friends without having to
-                         scan the IP / country columns first. -->
-                    <td class="client-cell mono known-hash-cell" title={knownCopiedHash === kc.user_hash ? m.transfers_known_copied_title() : (friendNick ? m.transfers_known_friend_copy_title({ nick: friendNick, hash: kc.user_hash }) : m.transfers_known_copy_title({ hash: kc.user_hash }))}>
+                    <!-- Ember tab: nickname + friend marker when known;
+                         otherwise the Ember hash. eD2K tab: full 32-char
+                         user hash. Click copies the value shown. -->
+                    <td class="client-cell known-hash-cell" class:mono={!friendNick} title={knownCopiedHash === shownHash ? m.transfers_known_copied_title() : (friendNick ? m.transfers_known_friend_copy_title({ nick: friendNick, hash: shownHash }) : m.transfers_known_copy_title({ hash: shownHash }))}>
                       <button
                         type="button"
                         class="known-hash-btn"
-                        class:copied={knownCopiedHash === kc.user_hash}
-                        onclick={() => copyKnownHash(kc.user_hash)}
+                        class:copied={knownCopiedHash === shownHash}
+                        onclick={() => copyKnownHash(shownHash)}
                       >
                         {#if isFriend}
                           <span class="known-friend-dot" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
                         {/if}
                         {#if friendNick}
                           <span class="known-hash-nick"><bdi dir="auto">{friendNick}</bdi></span>
-                          <span class="known-hash-hex">{kc.user_hash.slice(0, 8) + '\u2026'}</span>
                         {:else}
-                          <span class="known-hash-hex">{kc.user_hash.slice(0, 16) + '\u2026'}</span>
+                          <span class="known-hash-hex">{shownHash}</span>
                         {/if}
-                        {#if knownCopiedHash === kc.user_hash}
+                        {#if knownCopiedHash === shownHash}
                           <span class="known-hash-copied" aria-live="polite">{m.transfers_known_copied_inline()}</span>
                         {/if}
                       </button>
@@ -4256,14 +4295,19 @@
                     <div class="spinner"></div>
                     <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
                   </div>
-                {:else if knownClients.length === 0}
+                {:else if knownLedger.length === 0}
                   <div class="empty-cell-body">
                     <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                       <circle cx="12" cy="7" r="4"></circle>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_empty_no_credit()}</p>
-                    <p class="empty-cell-sub">{m.transfers_empty_no_credit_sub()}</p>
+                    {#if showingEmberKnown}
+                      <p class="empty-cell-title">{m.transfers_empty_no_ember()}</p>
+                      <p class="empty-cell-sub">{m.transfers_empty_no_ember_sub()}</p>
+                    {:else}
+                      <p class="empty-cell-title">{m.transfers_empty_no_credit()}</p>
+                      <p class="empty-cell-sub">{m.transfers_empty_no_credit_sub()}</p>
+                    {/if}
                   </div>
                 {:else}
                   <div class="empty-cell-body">
@@ -4751,6 +4795,7 @@
     border: 1px solid var(--border);
     padding: 1px 6px;
     background: var(--bg-primary);
+    border-radius: var(--radius-sm);
   }
   .overview-label {
     font-weight: 600;
@@ -4771,9 +4816,9 @@
   .filter-input {
     width: 220px;
     max-width: 45vw;
-    padding: 2px 6px;
+    padding: 2px 8px;
     border: 1px solid var(--border);
-    border-radius: 0;
+    border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
     font-size: 11px;
@@ -4812,7 +4857,7 @@
     font-size: 11px;
     padding: 1px 8px;
     border: 1px solid var(--border);
-    border-radius: 0;
+    border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
     cursor: pointer;
@@ -5169,7 +5214,7 @@
     display: inline-block;
     margin-left: 6px;
     padding: 0 6px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     font-size: 10px;
     font-weight: 600;
     line-height: 16px;
@@ -5281,7 +5326,7 @@
     color: var(--text-secondary);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-sm);
     cursor: pointer;
     transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
@@ -5405,7 +5450,7 @@
   .rep-badge {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 10px;
+    border-radius: var(--radius-pill);
     font-size: 10px;
     font-weight: 600;
     text-transform: capitalize;
@@ -5447,7 +5492,7 @@
     display: inline-block;
     margin-left: 4px;
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     font-size: 9px;
     font-weight: 600;
     line-height: 1.4;
@@ -5460,7 +5505,7 @@
     display: inline-block;
     margin-left: 4px;
     padding: 1px 6px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     font-size: 9px;
     font-weight: 600;
     line-height: 1.4;
@@ -5590,9 +5635,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 6px 16px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
     font-size: 12px;
     flex-shrink: 0;
   }
@@ -5602,9 +5644,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 6px 16px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--success);
-    color: var(--success);
     font-size: 12px;
     flex-shrink: 0;
   }
@@ -5615,9 +5654,9 @@
     z-index: 1000;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 2px;
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
-    padding: 4px 0;
+    padding: 4px;
     min-width: 180px;
   }
   .column-menu {
@@ -5635,10 +5674,11 @@
     display: flex;
     width: 100%;
     text-align: left;
-    padding: 4px 14px;
+    padding: 4px 12px;
     font-size: 11px;
     background: none;
     border: none;
+    border-radius: var(--radius-sm);
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
@@ -5663,9 +5703,9 @@
     top: -4px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 2px;
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
-    padding: 4px 0;
+    padding: 4px;
     min-width: 100px;
   }
 
@@ -5724,13 +5764,14 @@
     padding: 3px 8px;
     background: var(--bg-input, var(--bg-primary));
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-pill);
     flex: 1 1 240px;
     max-width: 360px;
     transition: border-color var(--transition-fast);
   }
   .known-search:focus-within {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
   .known-search svg {
     width: 14px;
@@ -5746,19 +5787,22 @@
     font-size: 12px;
     padding: 2px 0;
     outline: none;
+    box-shadow: none;
     min-width: 0;
   }
   .known-search input::placeholder {
     color: var(--text-muted);
   }
   .known-search-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 16px;
-    line-height: 1;
     cursor: pointer;
     padding: 0 2px;
+    border-radius: var(--radius-sm);
     transition: color var(--transition-fast);
   }
   .known-search-clear:hover {
@@ -5799,6 +5843,7 @@
     gap: 6px;
     width: 100%;
     height: 100%;
+    min-width: 0;
     padding: 3px 6px;
     border: none;
     background: transparent;
@@ -5836,6 +5881,11 @@
   .known-hash-hex {
     color: var(--text-muted);
     font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .known-hash-btn:hover .known-hash-hex,
   .known-hash-btn:focus-visible .known-hash-hex {
@@ -5946,7 +5996,7 @@
     font-weight: 600;
     font-size: 10px;
     padding: 1px 7px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     line-height: 1.4;
   }
   .source-tag {
@@ -5954,7 +6004,7 @@
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     padding: 1px 6px;
     font-variant-numeric: tabular-nums;
     line-height: 1.4;
@@ -5969,7 +6019,7 @@
     font-size: 11px;
     padding: 2px 8px;
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
     cursor: pointer;
@@ -6044,7 +6094,7 @@
   .ss-chip {
     font-size: 10px;
     padding: 0 5px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-variant-numeric: tabular-nums;
   }
   .ss-xfer { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }

@@ -266,6 +266,7 @@
   .dot.connecting {
     background: var(--status-connecting);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
+    animation: status-pulse 1.5s ease-in-out infinite;
   }
 
   .dot.disconnected, .dot.inactive {
@@ -298,6 +299,11 @@
 
   .status-item.muted {
     color: var(--text-muted);
+  }
+
+  @keyframes status-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
   }
 
   /* Laptop / mid-width: keep connection dots + live rates; tuck secondary

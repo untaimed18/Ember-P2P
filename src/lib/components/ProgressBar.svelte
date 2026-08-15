@@ -43,7 +43,7 @@
     height: 16px;
     background: var(--bg-input);
     border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
-    border-radius: 2px;
+    border-radius: var(--radius-pill);
     overflow: hidden;
     min-width: 100px;
   }
@@ -53,7 +53,7 @@
     top: 0;
     left: 0;
     bottom: 0;
-    border-radius: 1px;
+    border-radius: inherit;
     transition: width 0.3s ease;
   }
 

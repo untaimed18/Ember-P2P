@@ -518,7 +518,7 @@
   .hero-icon {
     width: 42px;
     height: 42px;
-    border-radius: 10px;
+    border-radius: var(--radius-lg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -673,12 +673,12 @@
   .oh-track {
     height: 8px;
     background: var(--bg-tertiary);
-    border-radius: 4px;
+    border-radius: var(--radius-pill);
     overflow: hidden;
   }
   .oh-fill {
     height: 100%;
-    border-radius: 4px;
+    border-radius: var(--radius-pill);
     transition: width 0.4s ease;
   }
   /* Visible sliver only when the category contributed — a blanket

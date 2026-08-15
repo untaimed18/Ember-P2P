@@ -3074,12 +3074,12 @@
   }
 
   .type-select {
-    padding: 7px 10px;
+    padding: 7px 28px 7px 10px;
     font-size: 12px;
     font-weight: 600;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--bg-surface);
+    background-color: var(--bg-surface);
     color: var(--text-secondary);
     flex-shrink: 0;
     cursor: pointer;
@@ -3168,7 +3168,7 @@
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 78%, var(--bg-secondary));
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     padding: 1px 7px;
     line-height: 1.3;
     flex-shrink: 0;
@@ -3303,7 +3303,7 @@
     display: flex;
     align-items: center;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-pill);
     overflow: hidden;
     background: var(--bg-surface);
     transition: border-color 0.15s;
@@ -3312,12 +3312,13 @@
 
   .filter-text-wrap:focus-within {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .column-select {
-    background: var(--bg-input);
+    background-color: var(--bg-input);
     font-size: 12px;
-    padding: 6px 8px;
+    padding: 6px 28px 6px 8px;
     min-width: 110px;
     color: var(--text-secondary);
   }
@@ -3326,6 +3327,7 @@
     flex: 1;
     border: none;
     outline: none;
+    box-shadow: none;
     font-size: 13px;
     padding: 5px 8px;
     background: transparent;
@@ -3375,6 +3377,7 @@
 
   .filter-group select {
     min-width: 100px;
+    padding-right: 28px;
   }
 
   .size-input {
@@ -3387,7 +3390,7 @@
   }
 
   .size-input select {
-    min-width: 56px;
+    min-width: 72px;
   }
 
   .ext-input {
@@ -3419,7 +3422,7 @@
     font-size: 10px;
     background: var(--bg-hover);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: 0 4px;
   }
 
@@ -3715,7 +3718,7 @@
   .history-badge {
     display: inline-block;
     padding: 1px 6px;
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.02em;
@@ -3798,7 +3801,7 @@
     min-width: 22px;
     text-align: center;
     padding: 1px 5px;
-    border-radius: 10px;
+    border-radius: var(--radius-pill);
     font-size: 11px;
     font-weight: 600;
     background: var(--bg-hover);
@@ -3874,10 +3877,9 @@
   .search-readiness-hint {
     padding: 9px 20px;
     font-size: 12px;
-    color: var(--warning);
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    border-left: 3px solid var(--warning);
+    color: var(--badge-warning-text);
+    background: color-mix(in srgb, var(--warning) 9%, var(--bg-secondary));
+    border-bottom: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
   }
 
   .search-readiness-muted {
@@ -3889,10 +3891,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 20px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    border-left: 3px solid var(--danger);
-    color: var(--danger);
     font-size: 13px;
   }
 
@@ -3948,7 +3946,7 @@
     align-items: center;
     margin-left: 8px;
     padding: 1px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 11px;
     font-weight: 600;
   }
@@ -4047,7 +4045,7 @@
 
   .spam-flag-btn {
     padding: 1px 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger);
@@ -4111,7 +4109,7 @@
     font-size: 12px;
     color: var(--text-secondary);
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-surface);
     padding: 5px 10px;
     cursor: pointer;
@@ -4198,7 +4196,7 @@
   .dl-status-badge {
     display: inline-block;
     padding: 2px 7px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: 11px;
     font-weight: 500;
     white-space: nowrap;
@@ -4258,7 +4256,7 @@
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    padding: 4px 0;
+    padding: 4px;
     min-width: 160px;
     box-shadow: var(--shadow-md);
     transform-origin: top left;
@@ -4271,9 +4269,10 @@
   .context-menu button {
     display: block;
     width: 100%;
-    padding: 6px 14px;
+    padding: 6px 12px;
     background: none;
     border: none;
+    border-radius: var(--radius-sm);
     color: var(--text-primary);
     font-size: 0.85rem;
     text-align: left;

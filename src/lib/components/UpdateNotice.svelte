@@ -16,6 +16,7 @@
     runStagedInstaller,
     dismissNotice,
   } from '$lib/stores/updater';
+  import IconX from '$lib/components/IconX.svelte';
 
   let showNotes = $state(false);
 
@@ -86,7 +87,7 @@
         {/if}
       </div>
       {#if !inProgress}
-        <button class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}>&times;</button>
+        <button class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
       {/if}
     </div>
 
@@ -182,7 +183,7 @@
     place-items: center;
     width: 26px;
     height: 26px;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
     flex-shrink: 0;
@@ -201,13 +202,14 @@
   }
 
   .notice-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 18px;
-    line-height: 1;
     cursor: pointer;
-    padding: 0 2px;
+    padding: 2px;
     border-radius: var(--radius-sm);
   }
 
@@ -224,7 +226,7 @@
 
   .notice-progress {
     height: 6px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-tertiary, var(--bg-hover));
     overflow: hidden;
   }
@@ -232,7 +234,7 @@
   .notice-progress-fill {
     height: 100%;
     background: var(--accent);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     transition: width 0.2s ease;
   }
 
