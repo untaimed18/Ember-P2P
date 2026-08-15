@@ -120,6 +120,21 @@
     }
   });
 
+  let nextDisabledReason = $derived.by(() => {
+    switch (step) {
+      case 2:
+        return nickname.trim().length > 0 ? '' : m.wizard_validation_nickname();
+      case 3:
+        return downloadFolder.trim().length > 0 ? '' : m.wizard_validation_folder();
+      case 4:
+        return tcpPort >= 1 && tcpPort <= 65535 && udpPort >= 1 && udpPort <= 65535
+          ? ''
+          : m.wizard_validation_ports();
+      default:
+        return '';
+    }
+  });
+
   function goNext() {
     if (step >= TOTAL_STEPS) return;
     if (!canAdvance) return;
@@ -637,9 +652,11 @@
 
       <div class="footer-right">
         {#if step < TOTAL_STEPS}
-          <button type="button" class="btn-next" onclick={goNext} disabled={!canAdvance}>
-            {step === 1 ? m.wizard_get_started() : m.common_next()}
-          </button>
+          <span class="btn-next-wrap" title={nextDisabledReason || undefined}>
+            <button type="button" class="btn-next" onclick={goNext} disabled={!canAdvance}>
+              {step === 1 ? m.wizard_get_started() : m.common_next()}
+            </button>
+          </span>
         {:else}
           <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading}>
             {#if saving}
@@ -1247,6 +1264,14 @@
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s;
+  }
+
+  .btn-next-wrap {
+    display: inline-flex;
+  }
+
+  .btn-next:disabled {
+    pointer-events: none;
   }
 
   .btn-next:hover, .btn-finish:hover {

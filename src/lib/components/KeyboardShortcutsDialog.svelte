@@ -10,6 +10,11 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
 
+  // Detect macOS so we show ⌘ where handlers also accept metaKey.
+  const modifierKey =
+    typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
+      ? '⌘'
+      : 'Ctrl';
   type Shortcut = { keys: string[]; label: () => string };
   type Group = { title: () => string; shortcuts: Shortcut[] };
 
@@ -73,7 +78,7 @@
       shortcuts: [
         { keys: ['?'], label: () => m.shortcuts_show_shortcuts() },
         { keys: ['F1'], label: () => m.shortcuts_show_shortcuts() },
-        { keys: ['Ctrl', 'B'], label: () => m.shortcuts_toggle_sidebar() },
+        { keys: [modifierKey, 'B'], label: () => m.shortcuts_toggle_sidebar() },
         ...navShortcuts,
       ],
     },
@@ -81,7 +86,7 @@
       title: () => m.shortcuts_section_dialogs(),
       shortcuts: [
         { keys: ['Esc'], label: () => m.shortcuts_modal_close() },
-        { keys: ['Ctrl', 'Enter'], label: () => m.shortcuts_modal_confirm() },
+        { keys: [modifierKey, 'Enter'], label: () => m.shortcuts_modal_confirm() },
         { keys: ['Tab'], label: () => m.shortcuts_modal_cycle_focus() },
         { keys: ['Enter'], label: () => m.shortcuts_modal_submit_form() },
       ],
@@ -89,19 +94,19 @@
     {
       title: () => m.shortcuts_section_tables(),
       shortcuts: [
-        { keys: ['Click'], label: () => m.shortcuts_table_sort() },
-        { keys: ['Shift', 'Click'], label: () => m.shortcuts_table_multiselect() },
-        { keys: ['Double-click'], label: () => m.shortcuts_table_open() },
-        { keys: ['Right-click'], label: () => m.shortcuts_table_context() },
+        { keys: [m.shortcuts_key_click()], label: () => m.shortcuts_table_sort() },
+        { keys: ['Shift', m.shortcuts_key_click()], label: () => m.shortcuts_table_multiselect() },
+        { keys: [m.shortcuts_key_double_click()], label: () => m.shortcuts_table_open() },
+        { keys: [m.shortcuts_key_right_click()], label: () => m.shortcuts_table_context() },
       ],
     },
     {
       title: () => m.shortcuts_section_library(),
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
-        { keys: ['Ctrl', 'A'], label: () => m.shortcuts_library_select_all() },
-        { keys: ['Ctrl', 'D'], label: () => m.shortcuts_library_clear_selection() },
-        { keys: ['Ctrl', 'C'], label: () => m.shortcuts_library_copy_links() },
+        { keys: [modifierKey, 'A'], label: () => m.shortcuts_library_select_all() },
+        { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
+        { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
         { keys: ['Enter'], label: () => m.shortcuts_library_open() },
         { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
         { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
@@ -113,7 +118,7 @@
     {
       title: () => m.shortcuts_section_search(),
       shortcuts: [
-        { keys: ['Ctrl', 'C'], label: () => m.shortcuts_search_copy_links() },
+        { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
       ],
     },
     {
@@ -126,9 +131,9 @@
     {
       title: () => m.shortcuts_section_chat(),
       shortcuts: [
-        { keys: ['Ctrl', '/'], label: () => m.shortcuts_toggle_chat() },
-        { keys: ['Ctrl', 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
-        { keys: ['Ctrl', 'W'], label: () => m.shortcuts_chat_close_tab() },
+        { keys: [modifierKey, '/'], label: () => m.shortcuts_toggle_chat() },
+        { keys: [modifierKey, 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
+        { keys: [modifierKey, 'W'], label: () => m.shortcuts_chat_close_tab() },
         { keys: ['Esc'], label: () => m.shortcuts_chat_close_dock() },
       ],
     },

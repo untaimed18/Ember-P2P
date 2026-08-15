@@ -84,7 +84,18 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') handleDismiss();
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      handleDismiss();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      handleConfirm();
+      return;
+    }
     if (e.key === 'Tab' && dialogEl) {
       const focusable = dialogEl.querySelectorAll<HTMLElement>(
         'button:not([disabled]), [tabindex]:not([tabindex="-1"])'

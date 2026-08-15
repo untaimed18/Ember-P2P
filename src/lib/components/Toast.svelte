@@ -3,6 +3,7 @@
   import * as m from '$lib/paraglide/messages';
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { chatDockOpen } from '$lib/stores/chatTabs';
 
   const flyParams = () => ({ x: prefersReducedMotion.current ? 0 : 24, duration: prefersReducedMotion.current ? 0 : 200 });
 </script>
@@ -11,7 +12,7 @@
   <!-- No live region on the container: each toast is its own `role="alert"`,
        and nesting an assertive region inside a polite one makes the
        announcement behavior ambiguous across screen readers. -->
-  <div class="toast-container" data-a11y-no-inert>
+  <div class="toast-container" class:dock-open={$chatDockOpen} data-a11y-no-inert>
     {#each $toasts as toast (toast.id)}
       <div class="toast toast-{toast.type}" role="alert" transition:fly={flyParams()}>
         <span class="toast-icon" aria-hidden="true">
@@ -76,6 +77,9 @@
     overflow-x: clip;
     overscroll-behavior: contain;
     pointer-events: none;
+  }
+  .toast-container.dock-open {
+    right: calc(min(420px, 40vw) + 12px);
   }
   .toast {
     pointer-events: auto;

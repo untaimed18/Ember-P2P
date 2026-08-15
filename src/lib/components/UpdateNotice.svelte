@@ -154,7 +154,7 @@
   .update-notice {
     position: fixed;
     right: 18px;
-    bottom: 18px;
+    bottom: calc(var(--statusbar-height) + 10px);
     z-index: 9500;
     width: min(340px, calc(100vw - 36px));
     background: var(--bg-secondary);

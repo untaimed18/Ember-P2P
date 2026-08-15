@@ -273,7 +273,7 @@
               <circle cx="8" cy="8" r="6.25"/>
               <path d="M8 4.5V8l2.25 1.5"/>
             </svg>
-            <span class="recent-text">{q}</span>
+            <span class="recent-text" title={q}>{q}</span>
           </div>
         {/each}
       </div>

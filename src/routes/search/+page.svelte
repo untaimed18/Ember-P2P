@@ -804,6 +804,43 @@
     return result.file_type || inferSearchTypeFromExtension(result.file.extension);
   }
 
+  function resultTypeLabel(result: SearchResult): string {
+    switch (resultType(result)) {
+      case 'Audio': return m.library_type_audio();
+      case 'Video': return m.library_type_video();
+      case 'Image': return m.library_type_image();
+      case 'Pro': return m.search_filetype_program();
+      case 'Doc': return m.library_type_document();
+      case 'Arc': return m.library_type_archive();
+      case 'Iso': return m.search_filetype_cd_image();
+      case 'EmuleCollection': return m.search_filetype_collection();
+      default: return resultType(result);
+    }
+  }
+
+  function originLabel(origin: string): string {
+    if (!origin.trim()) return '';
+    return origin.split(' · ').map((token) => {
+      switch (token) {
+        case 'Local': return m.search_origin_local();
+        case 'KAD': return m.search_origin_kad();
+        case 'Server': return m.search_origin_server();
+        case 'UDP': return m.search_origin_udp();
+        case 'Notes': return m.search_origin_notes();
+        case 'Ember': return m.search_origin_ember();
+        default: return token;
+      }
+    }).join(' · ');
+  }
+
+  function spamProfileLabel(profile: string): string {
+    switch (profile) {
+      case 'aggressive': return m.settings_spam_profile_aggressive();
+      case 'relaxed': return m.settings_spam_profile_relaxed();
+      default: return m.settings_spam_profile_balanced();
+    }
+  }
+
   let searchTimeoutSecs = $state(120);
   let emberEnabled = $derived(!!$appSettings?.ember_native_enabled);
   let emberContacts = $state(0);
@@ -2367,7 +2404,7 @@
                 {/if}
                 <br />
                 {m.search_spam_help_prefix()}
-                <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfile}</strong> {m.search_spam_help_suffix()}
+                <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfileLabel(spamProfile)}</strong> {m.search_spam_help_suffix()}
               </div>
             {/if}
           </span>
@@ -2663,6 +2700,7 @@
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
           {@const blockingDl = getBlockingDownloadTransfer(result)}
+          {@const originText = originLabel(result.result_origin || '')}
           <tr
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
@@ -2726,8 +2764,8 @@
               </div>
             </td>
             <td class="col-size">{formatSize(result.file.size)}</td>
-            <td class="col-type">{resultType(result) || result.file.extension || '\u2014'}</td>
-            <td class="col-origin" title={result.result_origin || ''}>{result.result_origin || '\u2014'}</td>
+            <td class="col-type">{resultTypeLabel(result) || result.file.extension || '\u2014'}</td>
+            <td class="col-origin" title={originText}>{originText || '\u2014'}</td>
             <td class="col-sources">
               <span class="source-count" class:high-sources={result.availability >= 10}>
                 {result.availability}
@@ -2930,7 +2968,7 @@
             </div>
           {/if}
           {#if selectedResult.result_origin}
-            <div class="detail-row"><strong>{m.search_hit_origin()}</strong> {selectedResult.result_origin}</div>
+            <div class="detail-row"><strong>{m.search_hit_origin()}</strong> {originLabel(selectedResult.result_origin)}</div>
           {/if}
           {#if selectedDlTransfer}
             <div class="detail-section-dl">
