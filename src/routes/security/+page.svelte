@@ -20,6 +20,7 @@
   import { translateError } from '$lib/i18n';
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
+  import IconX from '$lib/components/IconX.svelte';
 
   let stats: IpFilterStats | null = $state(null);
   let loading = $state(true);
@@ -580,7 +581,7 @@
           placeholder={m.security_search_placeholder()}
         />
         {#if searchQuery}
-          <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}>&times;</button>
+          <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}><IconX size={12} /></button>
         {/if}
       </div>
       <span class="result-count">
@@ -681,7 +682,7 @@
                     onclick={() => handleRemoveRange(entry)}
                     title={m.security_remove_range_title()}
                     aria-label={m.security_remove_range_aria({ start: entry.start_ip, end: entry.end_ip })}
-                  >&times;</button>
+                  ><IconX size={13} /></button>
                 </td>
               </tr>
             {/each}
@@ -737,7 +738,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 16px;
+    padding: 10px 16px;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
   }
@@ -745,7 +746,7 @@
     flex: 1;
     min-width: 0;
     padding: 6px 10px;
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--bg-primary);
     color: var(--text-primary);
@@ -753,8 +754,8 @@
     font-size: 12px;
   }
   .ipfilter-url-form input[type='url']:focus {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
   .ipfilter-url-form button {
     flex-shrink: 0;
@@ -768,17 +769,6 @@
     padding: 8px 16px;
     font-size: 12px;
   }
-  .error-banner {
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
-  }
-  .success-banner {
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--success);
-    color: var(--success);
-  }
-
   /* --- Controls bar (combines toggles + inline stats) --- */
   .controls-bar {
     display: flex;
@@ -815,20 +805,20 @@
 
   /* --- Add range form --- */
   .add-form {
-    padding: 10px 16px;
+    padding: 12px 16px;
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
   }
   .add-form-inner {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     flex-wrap: wrap;
   }
   .add-field {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 6px;
   }
   .add-field-grow {
     flex: 1;
@@ -866,7 +856,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 6px 16px;
+    padding: 8px 16px;
     gap: 12px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -878,14 +868,14 @@
     flex: 1;
     max-width: 400px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-pill);
     padding: 0 8px;
     background: var(--bg-input, var(--bg-primary));
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .search-wrap:focus-within {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-dim);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
   .search-icon {
     color: var(--text-muted);
@@ -902,8 +892,12 @@
     font-size: 12px;
     color: inherit;
     outline: none;
+    box-shadow: none;
   }
   .search-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     border: none;
     background: transparent;
     color: var(--text-muted);
@@ -911,8 +905,6 @@
     height: 20px;
     border-radius: 50%;
     padding: 0;
-    font-size: 14px;
-    line-height: 1;
     cursor: pointer;
     flex-shrink: 0;
   }
@@ -1071,9 +1063,10 @@
      keyboard users can reach it without first hovering the row. Faded
      baseline keeps it from competing with the IP/description text. */
   .btn-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     padding: 2px 6px;
-    font-size: 14px;
-    line-height: 1;
     opacity: 0.5;
     transition: opacity 0.15s;
   }

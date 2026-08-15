@@ -4,6 +4,7 @@
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { chatDockOpen } from '$lib/stores/chatTabs';
+  import IconX from './IconX.svelte';
 
   const flyParams = () => ({ x: prefersReducedMotion.current ? 0 : 24, duration: prefersReducedMotion.current ? 0 : 200 });
 </script>
@@ -41,10 +42,7 @@
         </span>
         <span class="toast-msg">{toast.message}</span>
         <button class="toast-close" onclick={() => removeToast(toast.id)} aria-label={m.common_dismiss()}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true">
-            <line x1="6" y1="6" x2="18" y2="18" />
-            <line x1="18" y1="6" x2="6" y2="18" />
-          </svg>
+          <IconX size={13} />
         </button>
       </div>
     {/each}
@@ -87,20 +85,54 @@
     align-items: center;
     gap: 10px;
     padding: 10px 12px 10px 14px;
-    border-radius: var(--radius-md, 8px);
+    border-radius: var(--radius-md);
     font-size: 13px;
-    color: var(--on-accent);
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
     box-shadow: var(--shadow-md);
   }
-  .toast-success { background: var(--success); color: var(--on-success); }
-  .toast-error { background: var(--danger); color: var(--on-danger); }
-  .toast-warning { background: var(--warning); color: var(--on-warning); }
-  .toast-info { background: var(--accent); color: var(--on-accent); }
+  .toast-success {
+    background: color-mix(in srgb, var(--success) 14%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--success) 32%, transparent);
+  }
+  .toast-error {
+    background: color-mix(in srgb, var(--danger) 14%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  }
+  .toast-warning {
+    background: color-mix(in srgb, var(--warning) 14%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+  }
+  .toast-info {
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  }
   .toast-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+  }
+  .toast-success .toast-icon { color: var(--badge-success-text); }
+  .toast-error .toast-icon { color: var(--badge-danger-text); }
+  .toast-warning .toast-icon { color: var(--badge-warning-text); }
+  .toast-info .toast-icon { color: var(--badge-accent-text); }
+  :global([data-theme="dark"]) .toast-success {
+    background: color-mix(in srgb, var(--success) 18%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--success) 36%, transparent);
+  }
+  :global([data-theme="dark"]) .toast-error {
+    background: color-mix(in srgb, var(--danger) 18%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--danger) 36%, transparent);
+  }
+  :global([data-theme="dark"]) .toast-warning {
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--warning) 36%, transparent);
+  }
+  :global([data-theme="dark"]) .toast-info {
+    background: color-mix(in srgb, var(--accent) 16%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--accent) 34%, transparent);
   }
   /* Backend error strings carry hashes and full Windows paths; without
      min-width:0 a flex item won't shrink below its min-content width. */
@@ -113,16 +145,17 @@
     height: 22px;
     background: none;
     border: none;
-    border-radius: 5px;
-    color: inherit;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
     cursor: pointer;
     padding: 0;
-    opacity: 0.75;
+    opacity: 0.85;
     flex-shrink: 0;
-    transition: opacity 0.12s, background 0.12s;
+    transition: opacity 0.12s, background 0.12s, color 0.12s;
   }
   .toast-close:hover {
     opacity: 1;
-    background: color-mix(in srgb, currentColor 18%, transparent);
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--text-primary) 10%, transparent);
   }
 </style>

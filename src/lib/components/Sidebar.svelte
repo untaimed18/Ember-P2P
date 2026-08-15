@@ -450,13 +450,11 @@
   .sidebar-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    border-bottom: 1px solid var(--border);
-    position: relative;
+    flex-shrink: 0;
   }
 
   .logo {
-    padding: 16px;
+    padding: 18px 16px 12px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -473,7 +471,7 @@
     width: 38px;
     height: 38px;
     flex-shrink: 0;
-    border-radius: 9px;
+    border-radius: var(--radius-md);
     display: block;
     user-select: none;
     /* Crisp 1px ring + soft drop shadow so the badge reads as a
@@ -492,7 +490,7 @@
 
   /* Collapsed: center the icon badge and drop the wordmark entirely. */
   .sidebar.collapsed .logo {
-    padding: 16px 0;
+    padding: 18px 0 12px;
     justify-content: center;
     gap: 0;
   }
@@ -508,8 +506,8 @@
 
   .logo-text {
     font-size: 22px;
-    font-weight: 800;
-    letter-spacing: 3px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
     line-height: 1.1;
     color: var(--accent);
   }
@@ -524,7 +522,7 @@
 
   .nav-list {
     list-style: none;
-    padding: 8px 0;
+    padding: 4px 0 8px;
     flex: 1;
     min-height: 0;
   }
@@ -542,7 +540,7 @@
     width: 100%;
     padding: 10px 16px;
     border: none;
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-muted);
     font-size: 13px;
@@ -721,7 +719,7 @@
     min-width: 20px;
     height: 18px;
     padding: 0 5px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
     font-size: 10px;
@@ -758,7 +756,7 @@
     gap: 1px;
     height: 18px;
     padding: 0 6px 0 4px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     font-size: 10px;
     font-weight: 700;
     line-height: 1;

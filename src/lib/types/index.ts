@@ -617,8 +617,10 @@ export interface UploadQueueClient {
   emule_version: number;
 }
 
-/** Row in the upload-pane "Known Clients" tab. Mirrors
- *  `crate::types::KnownClient`. Populated by `invoke('get_known_clients')`. */
+/** Row in the upload-pane "Known ED2K Peers" / "Known Ember Peers"
+ *  tabs. Mirrors `crate::types::KnownClient`. Populated by
+ *  `invoke('get_known_clients')`. Ember-bound rows (`ember_hash` set)
+ *  are shown only on the Ember tab. */
 export interface KnownClient {
   user_hash: string;
   downloaded: number;

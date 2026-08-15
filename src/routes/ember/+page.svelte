@@ -710,7 +710,7 @@
     text-transform: uppercase;
     letter-spacing: 0.4px;
     padding: 2px 8px;
-    border-radius: 8px;
+    border-radius: var(--radius-pill);
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     vertical-align: middle;
@@ -719,7 +719,7 @@
   .card {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg, 10px);
+    border-radius: var(--radius-lg);
     padding: 18px 20px;
   }
 
@@ -742,7 +742,7 @@
     padding: 22px 24px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg, 10px);
+    border-radius: var(--radius-lg);
     transition:
       background 0.35s ease,
       border-color 0.35s ease,
@@ -866,13 +866,13 @@
     padding: 12px 16px;
     background: color-mix(in srgb, var(--ember-color, #c2185b) 8%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--ember-color, #c2185b) 24%, var(--border));
-    border-radius: var(--radius-lg, 10px);
+    border-radius: var(--radius-lg);
   }
 
   .beta-lock-icon {
     width: 32px;
     height: 32px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -923,7 +923,7 @@
   .stat {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg, 10px);
+    border-radius: var(--radius-lg);
     padding: 18px 16px;
     text-align: center;
     transition: border-color 0.2s ease;
@@ -1032,7 +1032,7 @@
     font-size: 11px;
     font-weight: 600;
     padding: 2px 9px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid transparent;
     white-space: nowrap;
   }
@@ -1083,7 +1083,7 @@
     padding: 14px 20px;
     cursor: pointer;
     list-style: none;
-    border-radius: var(--radius-lg, 10px);
+    border-radius: var(--radius-lg);
   }
 
   .advanced summary::-webkit-details-marker {
@@ -1202,9 +1202,9 @@
     flex: 1;
     min-width: 140px;
     max-width: 260px;
-    padding: 6px 10px;
+    padding: 6px 12px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-pill);
     background: var(--bg-primary);
     color: var(--text-primary);
     font-size: 13px;
@@ -1214,7 +1214,7 @@
     overflow: auto;
     max-height: 280px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
   .dht-table {
@@ -1290,7 +1290,7 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
     color: var(--text-secondary);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     padding: 4px 10px;
     font-size: 12px;
     cursor: pointer;
@@ -1312,7 +1312,7 @@
   }
 
   .banner {
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     padding: 10px 14px;
     font-size: 13px;
     line-height: 1.5;

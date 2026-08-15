@@ -2584,7 +2584,9 @@
         bind:this={searchInputEl}
       />
       {#if searchQuery}
-        <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title={m.search_bar_clear()}>✕</button>
+        <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}>
+          <IconX size={11} />
+        </button>
       {/if}
     </div>
     <select class="filter-type" bind:value={typeFilter}>
@@ -2956,15 +2958,24 @@
             </select>
             <span class="tree-actions">
               <button
+                type="button"
                 class="tree-btn tree-unshare"
                 onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
                 title={m.library_unshare_folder_title()}
-              >&#x20E0;</button>
+                aria-label={m.library_unshare_folder_title()}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <line x1="7.2" y1="7.2" x2="16.8" y2="16.8" />
+                </svg>
+              </button>
               <button
+                type="button"
                 class="tree-btn tree-remove"
                 onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
                 title={m.library_remove_folder_btn_title()}
-              >&times;</button>
+                aria-label={m.library_remove_folder_btn_title()}
+              ><IconX size={12} /></button>
             </span>
           </div>
         </div>
@@ -2978,7 +2989,11 @@
         aria-expanded={topPanelOpen}
         onclick={() => (topPanelOpen = !topPanelOpen)}
       >
-        <span class="section-arrow" class:open={topPanelOpen} aria-hidden="true">{'\u25B8'}</span>
+        <span class="section-arrow" class:open={topPanelOpen} aria-hidden="true">
+          <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 2.5 L8.5 6 L4 9.5" />
+          </svg>
+        </span>
         <span class="section-title">{m.library_top_uploads()}</span>
       </button>
       {#if topPanelOpen}
@@ -3243,10 +3258,7 @@
           </span>
         </div>
         <button class="ghost drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15" aria-hidden="true">
-            <line x1="6" y1="6" x2="18" y2="18"/>
-            <line x1="18" y1="6" x2="6" y2="18"/>
-          </svg>
+          <IconX size={15} />
         </button>
       </div>
 
@@ -3444,7 +3456,7 @@
                     </button>
                   {/each}
                   {#if ourRating > 0}
-                    <button class="star-clear" onclick={() => ourRating = 0} title={m.library_clear_rating()}>&times;</button>
+                    <button class="star-clear" onclick={() => ourRating = 0} title={m.library_clear_rating()}><IconX size={12} /></button>
                   {/if}
                 </div>
                 <div class="comment-input-row">
@@ -3619,7 +3631,7 @@
   .dnd-hint {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: var(--radius-lg);
     padding: 22px 28px;
     text-align: center;
     color: var(--text-primary);
@@ -3632,15 +3644,10 @@
 
   /* --- Layout --- */
   .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--border);
     gap: 10px;
     flex-wrap: wrap;
   }
-  .page-header h2 { margin: 0; font-size: 16px; }
+  .page-header h2 { margin: 0; }
   .header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
   .error-banner {
@@ -3648,9 +3655,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 20px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
     font-size: 13px;
   }
 
@@ -3659,9 +3663,9 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+    color: var(--badge-accent-text);
     font-size: 12px;
     flex-shrink: 0;
   }
@@ -3670,6 +3674,8 @@
     height: 3px;
     background: var(--border);
     flex-shrink: 0;
+    border-radius: var(--radius-pill);
+    overflow: hidden;
   }
   .hash-progress-fill {
     height: 100%;
@@ -3681,14 +3687,18 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
+    border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
+    color: var(--badge-danger-text);
     font-size: 12px;
     flex-shrink: 0;
   }
   .confirm-text { flex: 1; }
-  .resume-banner { color: var(--warning); }
+  .resume-banner {
+    color: var(--badge-warning-text);
+    background: color-mix(in srgb, var(--warning) 10%, var(--bg-secondary));
+    border-bottom-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  }
   .scan-warning {
     color: var(--warning);
     border-bottom-color: color-mix(in srgb, var(--warning) 45%, var(--border));
@@ -3697,7 +3707,7 @@
   .scan-btn {
     padding: 2px 10px;
     font-size: 11px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
     flex-shrink: 0;
@@ -3738,8 +3748,8 @@
     box-shadow: var(--shadow-sm);
   }
   .sidebar-header {
-    padding: 10px 12px;
-    font-size: 12px;
+    padding: 9px 12px;
+    font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -3747,7 +3757,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
   }
-  .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 6px; min-height: 80px; }
+  .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 8px; min-height: 80px; }
 
   /* --- Top Uploads (popularity) panel --- */
   .sidebar-section {
@@ -3763,7 +3773,7 @@
     align-items: center;
     gap: 6px;
     width: 100%;
-    padding: 8px 10px;
+    padding: 9px 12px;
     background: var(--bg-surface);
     border: none;
     border-bottom: 1px solid var(--border);
@@ -3776,7 +3786,14 @@
     text-align: left;
   }
   .sidebar-section-header:hover { color: var(--text-primary); }
-  .section-arrow { width: 10px; color: var(--text-muted); font-size: 10px; display: inline-block; transition: transform var(--transition-normal) ease; }
+  .section-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 12px;
+    color: var(--text-muted);
+    transition: transform var(--transition-normal) ease;
+  }
   .section-arrow.open { transform: rotate(90deg); }
   .section-title { flex: 1; }
   .top-metric-switch {
@@ -3790,15 +3807,15 @@
     font-size: 11px;
     background: var(--bg-primary);
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--text-muted);
     cursor: pointer;
     transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
   .top-metric-switch button:hover { color: var(--text-primary); }
   .top-metric-switch button.active {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
     color: var(--text-primary);
     font-weight: 600;
   }
@@ -3849,8 +3866,8 @@
     border-color: var(--border);
   }
   .top-row.selected {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
     color: var(--text-primary);
   }
   .top-rank {
@@ -3897,29 +3914,31 @@
     display: flex;
     flex-direction: column;
     align-items: stretch;
-    gap: 5px;
-    padding: 6px 8px;
-    margin-bottom: 4px;
+    gap: 6px;
+    padding: 7px 10px;
+    margin-bottom: 6px;
     border: 1px solid var(--border);
-    border-left: 3px solid transparent;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     background: var(--bg-surface);
+    box-shadow: inset 3px 0 0 transparent;
     font-size: 12px;
     cursor: pointer;
     color: var(--text-secondary);
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
   }
   .tree-item:hover {
     background: var(--bg-hover);
-    border-color: var(--border);
-    border-left-color: color-mix(in srgb, var(--accent) 50%, transparent);
+    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
   }
   .tree-item.active {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    box-shadow: inset 3px 0 0 var(--accent);
     color: var(--text-primary);
-    font-weight: 600;
+  }
+  .tree-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
   .tree-main {
     display: inline-flex;
@@ -3937,7 +3956,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     padding-left: 32px;
     min-width: 0;
   }
@@ -3949,7 +3968,7 @@
     justify-content: center;
     width: 24px;
     height: 24px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
     flex-shrink: 0;
@@ -3964,7 +3983,7 @@
     word-break: break-word;
     line-height: 1.3;
     font-size: 12.5px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--text-primary);
   }
   .tree-count {
@@ -3972,18 +3991,20 @@
     align-items: center;
     height: 22px;
     font-size: 11px;
+    font-weight: 500;
     font-variant-numeric: tabular-nums;
-    color: var(--text-accent);
-    background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
-    border-radius: 999px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
     padding: 0 8px;
     flex-shrink: 0;
+    line-height: 1;
   }
   .tree-item.active .tree-count {
-    color: var(--text-accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
+    color: var(--badge-accent-text);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
   }
   .tree-actions {
     display: inline-flex;
@@ -3993,35 +4014,30 @@
   .tree-btn {
     width: 22px;
     height: 22px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    font-size: 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    padding: 0;
     line-height: 1;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
-  /* Stop-sharing: warning (amber) tint; Remove: danger (red) tint. Subtle by
-     default, fully saturated on hover so the destructive action reads clearly. */
-  .tree-btn.tree-unshare {
-    color: var(--warning);
-    border-color: color-mix(in srgb, var(--warning) 35%, var(--border));
-    background: color-mix(in srgb, var(--warning) 12%, transparent);
+  .tree-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
+  /* Stop-sharing / remove stay identifiable by glyph color, but don't fill
+     until hover — the old tinted squares competed with the folder name. */
+  .tree-btn.tree-unshare { color: var(--warning); }
   .tree-btn.tree-unshare:hover {
     color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
   }
-  .tree-btn.tree-remove {
-    font-size: 13px;
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
+  .tree-btn.tree-remove { color: var(--danger); }
   .tree-btn.tree-remove:hover {
     color: var(--on-danger);
     border-color: var(--danger);
@@ -4033,18 +4049,25 @@
     flex-shrink: 0;
     max-width: 96px;
     height: 22px;
-    padding: 0 4px;
+    margin: 0;
+    padding: 0 18px 0 6px;
     font-size: 11px;
-    border-radius: 5px;
+    font-weight: 500;
+    line-height: 20px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: var(--bg-surface);
+    background-color: var(--bg-secondary);
+    background-position: right 4px center;
+    background-size: 10px;
     color: var(--text-secondary);
     cursor: pointer;
   }
+  .tree-prio:focus {
+    box-shadow: 0 0 0 2px var(--accent-halo);
+  }
   .tree-prio.tree-prio-set {
-    color: var(--text-accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
+    color: var(--badge-accent-text);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
   }
 
   .sidebar-divider {
@@ -4126,7 +4149,7 @@
     padding: 0;
     cursor: pointer;
     border: 1px solid transparent;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
     display: inline-flex;
@@ -4175,7 +4198,7 @@
     justify-content: space-between;
     gap: 10px;
     padding: 8px 10px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     font-size: 12px;
     line-height: 1.35;
   }
@@ -4193,7 +4216,7 @@
     flex-shrink: 0;
     padding: 3px 8px;
     font-size: 11px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     border: 1px solid currentColor;
     background: transparent;
     color: inherit;
@@ -4253,8 +4276,8 @@
     z-index: 9999;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 4px 0;
+    border-radius: var(--radius-md);
+    padding: 4px;
     min-width: 180px;
     box-shadow: var(--shadow-lg);
     font-size: 12px;
@@ -4274,7 +4297,7 @@
     white-space: nowrap;
     position: relative;
     border: none;
-    border-radius: 0;
+    border-radius: var(--radius-sm);
     background: none;
     color: inherit;
     font: inherit;
@@ -4298,8 +4321,8 @@
     top: 0;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 4px 0;
+    border-radius: var(--radius-md);
+    padding: 4px;
     min-width: 140px;
     box-shadow: var(--shadow-lg);
   }
@@ -4351,14 +4374,14 @@
     align-items: center;
     gap: 8px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 0 8px;
+    border-radius: var(--radius-pill);
+    padding: 0 10px;
     background: var(--bg-input);
   }
 
   .filter-search-wrap:focus-within {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-dim);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .filter-search-icon {
@@ -4379,6 +4402,7 @@
 
   .filter-search:focus {
     outline: none;
+    box-shadow: none;
   }
 
   .filter-clear-btn {
@@ -4389,8 +4413,11 @@
     height: 20px;
     border-radius: 50%;
     padding: 0;
-    font-size: 11px;
-    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    cursor: pointer;
   }
 
   .filter-clear-btn:hover {
@@ -4399,11 +4426,11 @@
   }
 
   .filter-type {
-    padding: 7px 10px;
+    padding: 7px 28px 7px 10px;
     font-size: 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-primary);
+    border-radius: var(--radius-sm);
+    background-color: var(--bg-primary);
     color: inherit;
     cursor: pointer;
   }
@@ -4416,7 +4443,7 @@
     padding: 7px 10px;
     font-size: 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: inherit;
     cursor: pointer;
@@ -4474,7 +4501,7 @@
     font-weight: 600;
     color: var(--accent);
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     white-space: nowrap;
   }
@@ -4521,7 +4548,7 @@
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     padding: 1px 8px;
     margin-right: 4px;
     cursor: pointer;
@@ -4649,7 +4676,7 @@
     font-size: 11px;
     font-weight: 600;
     padding: 1px 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-muted);
@@ -4670,7 +4697,7 @@
     gap: 2px;
     padding: 8px 9px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-surface);
     min-width: 0;
   }
@@ -4726,9 +4753,7 @@
     font-size: 10px;
     padding: 1px 5px;
     border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-    color: var(--text-muted);
+    border-radius: var(--radius-sm);
     background: var(--bg-surface);
     flex-shrink: 0;
   }
@@ -4741,7 +4766,7 @@
     font-size: 10px;
     font-weight: 600;
     padding: 1px 6px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     letter-spacing: 0.3px;
     border: 1px solid transparent;
   }
@@ -4778,7 +4803,7 @@
     font-size: 11px;
     font-weight: 600;
     padding: 1px 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--border);
     background: var(--bg-surface);
   }
@@ -4830,13 +4855,16 @@
   }
   .star-btn:hover { transform: scale(1.2); }
   .star-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 13px;
     color: var(--text-muted);
     margin-left: 4px;
-    padding: 0 2px;
+    padding: 2px;
+    border-radius: var(--radius-sm);
     line-height: 1;
   }
   .star-clear:hover { color: var(--danger); }
@@ -4851,7 +4879,7 @@
     font-size: 12px;
     font-family: inherit;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-md);
     background: var(--bg-primary);
     color: inherit;
     outline: none;
@@ -4866,7 +4894,7 @@
     padding: 6px 12px;
     font-size: 11px;
     border: 1px solid var(--accent);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--accent);
     color: var(--on-accent);
     cursor: pointer;
@@ -4895,7 +4923,7 @@
     gap: 6px;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--bg-secondary) 85%, var(--bg-primary));
     flex-wrap: wrap;
   }
@@ -4959,7 +4987,7 @@
   .coll-action-btn {
     padding: 3px 10px;
     font-size: 11px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
     flex-shrink: 0;
@@ -5058,7 +5086,7 @@
     padding: 0;
     cursor: pointer;
     border: 1px solid transparent;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     background: none;
     color: var(--text-muted);
     transition: background 0.12s, border-color 0.12s, color 0.12s;
@@ -5094,7 +5122,7 @@
     padding: 5px 8px;
     font-size: 12px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: inherit;
     outline: none;
@@ -5113,7 +5141,7 @@
     gap: 8px;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     transition: background 0.12s, border-color 0.12s;
   }
@@ -5144,7 +5172,7 @@
     max-height: 260px;
     overflow-y: auto;
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--bg-secondary);
   }
   .coll-pick-row {

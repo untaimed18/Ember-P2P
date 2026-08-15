@@ -167,7 +167,7 @@
   .about-mark {
     width: 48px;
     height: 48px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     flex-shrink: 0;
   }
@@ -180,8 +180,8 @@
 
   .about-wordmark h2 {
     font-size: 20px;
-    font-weight: 800;
-    letter-spacing: 3px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
     color: var(--accent);
     line-height: 1;
     margin: 0 0 4px;

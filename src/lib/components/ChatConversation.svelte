@@ -767,7 +767,7 @@
     align-items: center;
     gap: 4px;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 11px;
     font-weight: 600;
     line-height: 1;
@@ -880,7 +880,7 @@
 
   .conv-load-older-btn {
     padding: 6px 12px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
@@ -905,7 +905,7 @@
     align-self: center;
     margin: 10px 0 4px;
     padding: 3px 10px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     color: var(--text-muted);
     font-size: 10.5px;
@@ -922,7 +922,7 @@
   .conv-bubble {
     max-width: 80%;
     padding: 8px 12px;
-    border-radius: 14px;
+    border-radius: var(--radius-lg);
     font-size: 13px;
     line-height: 1.4;
     word-wrap: break-word;
@@ -1028,7 +1028,7 @@
     flex: 1;
     padding: 8px 12px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-lg);
     background: var(--bg-primary);
     color: var(--text-primary);
     font-size: 13px;
@@ -1052,7 +1052,7 @@
     width: 40px;
     height: 40px;
     border: none;
-    border-radius: var(--radius-sm);
+    border-radius: 50%;
     background: var(--accent);
     color: var(--on-accent);
     cursor: pointer;
@@ -1065,7 +1065,6 @@
 
   .conv-send:hover:not(:disabled) {
     background: var(--accent-hover, var(--accent));
-    filter: brightness(1.1);
   }
 
   .conv-send:disabled {

@@ -380,14 +380,7 @@
         <div class="step-content">
           <div class="brand-row">
             <div class="brand-icon" aria-hidden="true">
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="10" cy="4" r="2.5"></circle>
-                <circle cx="4" cy="14" r="2.5"></circle>
-                <circle cx="16" cy="14" r="2.5"></circle>
-                <line x1="10" y1="6.5" x2="5.5" y2="11.5"></line>
-                <line x1="10" y1="6.5" x2="14.5" y2="11.5"></line>
-                <line x1="6.5" y1="14" x2="13.5" y2="14"></line>
-              </svg>
+              <img src="/icon.png" alt="" width="48" height="48" draggable="false" />
             </div>
             <div>
               <h2 class="step-title welcome-title">{m.wizard_welcome_title()}</h2>
@@ -713,7 +706,7 @@
     flex-direction: column;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-md);
     animation: wizard-in 400ms ease-out;
     overflow: hidden;
@@ -841,18 +834,18 @@
   .brand-icon {
     width: 48px;
     height: 48px;
-    border-radius: 12px;
-    display: grid;
-    place-items: center;
-    border: 1px solid var(--border);
-    background: var(--bg-tertiary);
-    color: var(--accent);
+    border-radius: var(--radius-md);
+    overflow: hidden;
     flex-shrink: 0;
+    box-shadow:
+      0 0 0 1px var(--border),
+      var(--shadow-sm);
   }
 
-  .brand-icon svg {
-    width: 28px;
-    height: 28px;
+  .brand-icon img {
+    width: 100%;
+    height: 100%;
+    display: block;
   }
 
   .step-desc {
@@ -883,13 +876,13 @@
     padding: 12px 14px;
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
   }
 
   .info-icon {
     width: 32px;
     height: 32px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     display: grid;
     place-items: center;
     background: var(--accent-dim);
@@ -1052,7 +1045,7 @@
     padding: 14px 16px;
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
   }
 
   .connect-option strong {
@@ -1078,7 +1071,7 @@
   .theme-card {
     flex: 1;
     border: 2px solid var(--border);
-    border-radius: 10px;
+    border-radius: var(--radius-lg);
     padding: 14px;
     background: var(--bg-surface);
     cursor: pointer;
@@ -1104,7 +1097,7 @@
   .theme-preview {
     width: 100%;
     height: 80px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     display: flex;
     overflow: hidden;
     border: 1px solid rgba(128,128,128,0.2);
@@ -1179,7 +1172,7 @@
   /* Summary */
   .summary {
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     overflow: hidden;
   }
 

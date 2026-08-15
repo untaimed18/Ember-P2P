@@ -28,6 +28,7 @@
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
+  import IconX from '$lib/components/IconX.svelte';
 
   let friends: FriendInfo[] = $state([]);
   let browseDisabled = $derived($appSettings?.friend_browse_disabled === true);
@@ -1049,7 +1050,7 @@
             aria-label={m.common_search()}
           />
           {#if searchQuery}
-            <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}>&times;</button>
+            <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}><IconX size={12} /></button>
           {/if}
         </div>
       {/if}
@@ -1385,15 +1386,15 @@
   }
 
   .error-banner {
-    background: var(--bg-secondary);
-    border: 1px solid var(--danger);
-    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+    color: var(--badge-danger-text);
   }
 
   .success-banner {
-    background: var(--bg-secondary);
-    border: 1px solid var(--success);
-    color: var(--success);
+    background: color-mix(in srgb, var(--success) 8%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--success) 35%, var(--border));
+    color: var(--badge-success-text);
   }
 
   /* --- Your Friend ID card --- */
@@ -1469,7 +1470,7 @@
     width: fit-content;
     margin-top: 4px;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 11px;
     font-weight: 600;
   }
@@ -1617,7 +1618,7 @@
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: 12px 16px;
+    padding: 14px 16px;
     margin-bottom: 12px;
   }
 
@@ -1682,7 +1683,7 @@
     width: 100%;
     padding: 5px 26px 5px 30px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
     font-size: 12px;
@@ -1709,8 +1710,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 15px;
-    line-height: 1;
     padding: 0;
   }
 
@@ -1755,7 +1754,7 @@
 
   .friend-card.editing {
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-dim);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .card-avatar {
@@ -1858,7 +1857,7 @@
 
   .edit-input:focus {
     outline: none;
-    box-shadow: 0 0 0 2px var(--accent-dim);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   @keyframes badge-pulse {
@@ -2179,7 +2178,7 @@
     justify-content: center;
     min-width: 18px;
     height: 18px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
     font-size: 10px;
@@ -2262,7 +2261,7 @@
     text-transform: uppercase;
     letter-spacing: 0.4px;
     padding: 1px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius-pill);
     flex-shrink: 0;
   }
   .request-badge-verified {
@@ -2385,7 +2384,7 @@
     justify-content: center;
     min-width: 18px;
     height: 18px;
-    border-radius: 9px;
+    border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     color: var(--text-muted);
     font-size: 10px;

@@ -203,9 +203,9 @@
 <style>
   .library-media-player {
     margin-top: 10px;
-    padding: 8px;
+    padding: 10px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     background: var(--bg-surface);
   }
   .library-media-player:not(:has(.media-el)):not(:has(.media-error)) {
@@ -214,7 +214,7 @@
   .media-el {
     display: block;
     width: 100%;
-    border-radius: calc(var(--radius-sm) - 2px);
+    border-radius: calc(var(--radius-md) - 2px);
     background: color-mix(in srgb, var(--bg-base, var(--bg-surface)) 70%, transparent);
   }
   .media-video {

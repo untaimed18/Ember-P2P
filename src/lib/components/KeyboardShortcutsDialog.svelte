@@ -244,7 +244,7 @@
     height: 28px;
     background: none;
     border: 1px solid transparent;
-    border-radius: 7px;
+    border-radius: var(--radius-sm);
     color: var(--text-muted);
     cursor: pointer;
     padding: 0;
@@ -325,7 +325,7 @@
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-bottom-width: 2px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--font-mono);
     font-size: 11px;
     font-weight: 600;

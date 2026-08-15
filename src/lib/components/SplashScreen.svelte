@@ -7,14 +7,7 @@
   <div class="content">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="10" cy="4" r="2.5"></circle>
-          <circle cx="4" cy="14" r="2.5"></circle>
-          <circle cx="16" cy="14" r="2.5"></circle>
-          <line x1="10" y1="6.5" x2="5.5" y2="11.5"></line>
-          <line x1="10" y1="6.5" x2="14.5" y2="11.5"></line>
-          <line x1="6.5" y1="14" x2="13.5" y2="14"></line>
-        </svg>
+        <img src="/icon.png" alt="" width="44" height="44" draggable="false" />
       </div>
       <div class="wordmark">
         <h1>EMBER</h1>
@@ -52,7 +45,7 @@
   .content {
     width: min(520px, 92vw);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     background: var(--bg-secondary);
     box-shadow: var(--shadow-md);
     padding: 26px 24px 20px;
@@ -69,24 +62,25 @@
   .brand-mark {
     width: 44px;
     height: 44px;
-    border-radius: 10px;
-    display: grid;
-    place-items: center;
-    border: 1px solid var(--border);
-    color: var(--accent);
-    background: var(--bg-tertiary);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    flex-shrink: 0;
+    box-shadow:
+      0 0 0 1px var(--border),
+      var(--shadow-sm);
   }
 
-  .brand-mark svg {
-    width: 26px;
-    height: 26px;
+  .brand-mark img {
+    width: 100%;
+    height: 100%;
+    display: block;
     animation: pulse 1.4s ease-in-out infinite;
   }
 
   .wordmark h1 {
     font-size: 22px;
-    font-weight: 800;
-    letter-spacing: 3px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
     color: var(--accent);
     line-height: 1;
     margin-bottom: 4px;
@@ -108,7 +102,7 @@
   .progress-track {
     width: 100%;
     height: 6px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     overflow: hidden;
   }
@@ -132,12 +126,10 @@
 
   @keyframes pulse {
     0%, 100% {
-      opacity: 0.75;
-      transform: scale(1);
+      opacity: 0.82;
     }
     50% {
       opacity: 1;
-      transform: scale(1.04);
     }
   }
 
@@ -169,7 +161,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     .content,
-    .brand-mark svg,
+    .brand-mark img,
     .progress-fill {
       animation: none !important;
     }

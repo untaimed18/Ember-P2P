@@ -13,6 +13,7 @@
   } from '$lib/stores/chatTabs';
   import { unreadCounts, onlineFriends } from '$lib/stores/friends';
   import * as m from '$lib/paraglide/messages';
+  import IconX from '$lib/components/IconX.svelte';
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
@@ -233,9 +234,7 @@
               title={m.chat_dock_close_tab_title()}
               onclick={(e) => { e.stopPropagation(); closeTab(tab.hash); }}
             >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M4 4l8 8M12 4l-8 8"/>
-              </svg>
+              <IconX size={10} />
             </button>
           </div>
         {/each}
@@ -279,7 +278,7 @@
           </div>
           <p class="empty-title">{m.chat_dock_empty_title()}</p>
           <p class="empty-hint">{m.chat_dock_empty_hint()}</p>
-          <button type="button" class="empty-cta" onclick={handleNewChat}>{m.chat_dock_empty_cta()}</button>
+          <button type="button" class="secondary empty-cta" onclick={handleNewChat}>{m.chat_dock_empty_cta()}</button>
         </div>
       {/if}
     </div>
@@ -414,7 +413,7 @@
     font-size: 10px;
     font-weight: 700;
     padding: 1px 6px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     min-width: 18px;
     text-align: center;
     line-height: 1.2;
@@ -447,11 +446,6 @@
   .dock-tab-close:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
-  }
-
-  .dock-tab-close svg {
-    width: 10px;
-    height: 10px;
   }
 
   .dock-new,
@@ -544,18 +538,6 @@
 
   .empty-cta {
     margin-top: 8px;
-    padding: 8px 14px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
-    background: var(--bg-surface);
-    color: var(--text-primary);
     font-size: 13px;
-    font-family: inherit;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  .empty-cta:hover {
-    background: var(--bg-hover);
   }
 </style>

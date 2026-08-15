@@ -11,6 +11,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import IconX from '$lib/components/IconX.svelte';
 
   interface Props {
     open: boolean;
@@ -356,9 +357,7 @@
           </p>
         </div>
         <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
-          </svg>
+          <IconX size={14} />
         </button>
       </div>
 
@@ -398,7 +397,7 @@
                   }}
                   title={m.common_clear()}
                   aria-label={m.common_clear()}
-                >×</button>
+                ><IconX size={14} /></button>
               {/if}
             </div>
             <div class="browse-count">
@@ -583,11 +582,6 @@
     color: var(--text-primary);
   }
 
-  .browse-close svg {
-    width: 14px;
-    height: 14px;
-  }
-
   .browse-body {
     flex: 1;
     min-height: 0;
@@ -665,7 +659,7 @@
     width: 100%;
     padding: 8px 32px 8px 32px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
     font-size: 13px;
@@ -690,8 +684,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 16px;
-    line-height: 1;
   }
 
   .browse-filter-clear:hover {

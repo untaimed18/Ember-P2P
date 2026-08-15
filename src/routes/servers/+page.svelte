@@ -16,6 +16,7 @@
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import IconX from '$lib/components/IconX.svelte';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -735,7 +736,7 @@
               aria-label={m.servers_filter_aria()}
             />
             {#if serverFilter}
-              <button class="ghost btn-sm filter-clear" onclick={() => (serverFilter = '')} title={m.servers_filter_clear()} aria-label={m.servers_filter_clear()}>✕</button>
+              <button class="ghost btn-sm filter-clear" onclick={() => (serverFilter = '')} title={m.servers_filter_clear()} aria-label={m.servers_filter_clear()}><IconX size={12} /></button>
             {/if}
           </div>
           <button class="ghost btn-sm" onclick={handleRemoveAll} disabled={servers.length === 0}>{m.servers_remove_all()}</button>
@@ -825,7 +826,7 @@
                   </td>
                   <td>{server.is_static ? m.common_yes() : '—'}</td>
                   <td>
-                    <button class="ghost danger btn-sm" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}>✕</button>
+                    <button class="ghost danger btn-sm" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
@@ -1032,18 +1033,6 @@
     font-size: 13px;
   }
 
-  .error-banner {
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--danger);
-    color: var(--danger);
-  }
-
-  .success-banner {
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--success);
-    color: var(--success);
-  }
-
   .server-layout {
     flex: 1;
     display: flex;
@@ -1106,7 +1095,7 @@
     align-items: center;
     min-width: 240px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md, 8px);
+    border-radius: var(--radius-pill);
     background: var(--bg-input, var(--bg-surface));
     overflow: hidden;
     transition: border-color 0.15s ease;
@@ -1114,6 +1103,7 @@
 
   .server-filter-wrap:focus-within {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .server-filter-input {
@@ -1124,11 +1114,15 @@
     font-size: 12px;
     padding: 6px 8px;
     color: var(--text-primary);
+    box-shadow: none;
   }
 
   .filter-clear {
-    border-radius: 0;
-    padding: 4px 9px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
   }
 
   .server-table-wrap {
@@ -1225,7 +1219,7 @@
     justify-content: center;
     width: 18px;
     height: 18px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
     color: var(--text-muted);
     font-size: 10px;
@@ -1284,13 +1278,13 @@
   .form-stack {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
   }
 
   .form-field {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 6px;
   }
 
   .form-field label {
@@ -1301,7 +1295,7 @@
 
   .form-field input {
     font-size: 12px;
-    padding: 5px 8px;
+    padding: 7px 10px;
   }
 
   .form-row {
@@ -1417,9 +1411,9 @@
     z-index: 1000;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
-    padding: 4px 0;
+    padding: 4px;
     min-width: 180px;
   }
 
@@ -1427,10 +1421,11 @@
     display: block;
     width: 100%;
     text-align: left;
-    padding: 6px 14px;
+    padding: 6px 12px;
     font-size: 12px;
     background: none;
     border: none;
+    border-radius: var(--radius-sm);
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
@@ -1470,7 +1465,7 @@
     align-items: center;
     gap: 5px;
     padding: 2px 8px;
-    border-radius: 10px;
+    border-radius: var(--radius-pill);
     font-size: 11px;
     font-weight: 600;
   }
