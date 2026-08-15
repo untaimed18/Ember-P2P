@@ -7,6 +7,7 @@
   import * as m from '$lib/paraglide/messages';
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { chatDockOpen } from '$lib/stores/chatTabs';
   import {
     updater,
     installUpdate,
@@ -60,6 +61,7 @@
 {#if visible}
   <div
     class="update-notice"
+    class:dock-open={$chatDockOpen}
     role="status"
     aria-live="polite"
     transition:fly={{ y: prefersReducedMotion.current ? 0 : 16, duration: prefersReducedMotion.current ? 0 : 220 }}
@@ -163,6 +165,10 @@
     display: flex;
     flex-direction: column;
     gap: 9px;
+  }
+
+  .update-notice.dock-open {
+    right: calc(min(420px, 40vw) + 18px);
   }
 
   .notice-head {

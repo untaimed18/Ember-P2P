@@ -7,6 +7,7 @@
     type BrowseFileEntry,
   } from '$lib/api/friends';
   import { startDownload } from '$lib/api/transfers';
+  import { formatSize } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -243,13 +244,6 @@
       loading = false;
       if (currentBrowseGen === myGen) currentBrowseGen = 0;
     }
-  }
-
-  function formatSize(bytes: number): string {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
   }
 
   let downloadError: string | null = $state(null);

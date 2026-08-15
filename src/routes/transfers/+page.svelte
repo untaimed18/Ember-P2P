@@ -2305,8 +2305,9 @@
 
   function handleBatchCancelDownloads() {
     const ids = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
+    const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
     if (!ids.length) return;
-    confirmBatchCancel = { open: true, ids, count: ids.length, removeIds: [], filter: '' };
+    confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
   }
 
   /** Rows a global "...All" command applies to. A narrowed filter box scopes
@@ -2321,7 +2322,8 @@
    *  it cleared every finished download, including rows the current view never
    *  showed. */
   function clearCompletedTargets(): Transfer[] {
-    return transferFilter.trim() ? filteredCompletedDownloads : completedDownloads;
+    const pool = transferFilter.trim() ? filteredCompletedDownloads : completedDownloads;
+    return pool.filter((t) => t.status === 'completed');
   }
 
   async function handleStopAll() {
@@ -3416,7 +3418,7 @@
                 {:else if column.key === 'last_received'}
                   <td class="date-cell">{t.last_received ? formatDate(t.last_received) : '\u2014'}</td>
                 {:else if column.key === 'category'}
-                  <td class="cat-cell">{t.category || '\u2014'}</td>
+                  <td class="cat-cell">{t.category ? categoryLabel(t.category) : '\u2014'}</td>
                 {:else if column.key === 'started_at'}
                   <td class="date-cell">{formatDate(t.started_at)}</td>
                 {/if}
@@ -3583,7 +3585,7 @@
                   {:else if column.key === 'last_received'}
                     <td class="date-cell">{t.last_received ? formatDate(t.last_received) : '\u2014'}</td>
                   {:else if column.key === 'category'}
-                    <td class="cat-cell">{t.category || '\u2014'}</td>
+                    <td class="cat-cell">{t.category ? categoryLabel(t.category) : '\u2014'}</td>
                   {:else if column.key === 'started_at'}
                     <td class="date-cell">{formatDate(t.started_at)}</td>
                   {/if}
@@ -4343,6 +4345,19 @@
                   </svg>
                   <p class="empty-cell-title">{m.transfers_empty_multiple_selected()}</p>
                   <p class="empty-cell-sub">{m.transfers_empty_multiple_selected_sub()}</p>
+                </div>
+              </td></tr>
+            {:else if selectedDownloadIds.length === 1 && !activeDownloads.some((d) => d.id === selectedDownloadIds[0])}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
+                  </svg>
+                  <p class="empty-cell-title">{m.transfers_empty_finished_dl()}</p>
+                  <p class="empty-cell-sub">{m.transfers_empty_finished_dl_sub()}</p>
                 </div>
               </td></tr>
             {:else if activeDownloads.length === 0}

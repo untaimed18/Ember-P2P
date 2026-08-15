@@ -17266,10 +17266,13 @@ pub async fn start_network(
                         || ed2k::transfer::is_disk_full_error(error);
                     let is_ember_pin_fail = ed2k::transfer::is_ember_blake3_mismatch(error)
                         || ed2k::transfer::is_ember_blake3_mismatch(&failure_summary);
-                    if is_ember_pin_fail && !is_user_cancel {
+                    let is_aich_pin_fail = ed2k::transfer::is_expected_aich_mismatch(error)
+                        || ed2k::transfer::is_expected_aich_mismatch(&failure_summary);
+                    if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel {
                         state.pending_downloads.remove(transfer_id);
                         info!(
-                            "Ember BLAKE3 pin failed for {transfer_id} — not re-queuing"
+                            "{} pin failed for {transfer_id} — not re-queuing",
+                            if is_ember_pin_fail { "Ember BLAKE3" } else { "AICH" }
                         );
                     } else if is_disk_full && !is_user_cancel {
                         let file_name = {
@@ -18447,11 +18450,14 @@ pub async fn start_network(
                         _ => None,
                     };
                     if let Some(eh) = activity_eh {
-                        if !state.online_friends.contains_key(&eh) && friend_hashes.read().await.contains(&eh) {
+                        if friend_hashes.read().await.contains(&eh) {
+                            let was_new = !state.online_friends.contains_key(&eh);
                             state.online_friends.insert(eh, chrono::Utc::now().timestamp());
-                            let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-                                "user_hash": hex::encode(eh),
-                            }));
+                            if was_new {
+                                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                                    "user_hash": hex::encode(eh),
+                                }));
+                            }
                         }
                     }
                 }
@@ -18468,16 +18474,19 @@ pub async fn start_network(
                         // UI. `friend_hashes` re-check guards the same removal race
                         // documented on the `FriendSeen` handlers.
                         let still_friend = friend_hashes.read().await.contains(ember_hash);
-                        if still_friend && !state.online_friends.contains_key(ember_hash) {
+                        if still_friend {
+                            let was_new = !state.online_friends.contains_key(ember_hash);
                             state
                                 .online_friends
                                 .insert(*ember_hash, chrono::Utc::now().timestamp());
-                            let _ = app_handle.emit(
-                                "ember:friend-online",
-                                serde_json::json!({
-                                    "user_hash": hex::encode(ember_hash),
-                                }),
-                            );
+                            if was_new {
+                                let _ = app_handle.emit(
+                                    "ember:friend-online",
+                                    serde_json::json!({
+                                        "user_hash": hex::encode(ember_hash),
+                                    }),
+                                );
+                            }
                         }
                         // The session is live, so anything the user typed
                         // while this friend was unreachable can go out now.
@@ -24861,12 +24870,29 @@ pub async fn start_network(
                 let now = chrono::Utc::now().timestamp();
                 state.overloaded_nodes.retain(|_, &mut ts| now - ts < 600);
 
-                // Expire online_friends entries not seen in 5 minutes (aligned with session idle timeout)
+                // Expire online_friends entries not seen in 5 minutes, but only
+                // when no live Ember session is still fresh. Keepalives refresh
+                // `EmberSessionHandle`, not this map, so a healthy idle session
+                // must not flip the friend Offline / disable Browse.
                 {
-                    let expired: Vec<[u8; 16]> = state.online_friends.iter()
-                        .filter(|(_, &ts)| now - ts >= 300)
-                        .map(|(k, _)| *k)
-                        .collect();
+                    let now = chrono::Utc::now().timestamp();
+                    let sessions = state.ember_sessions.read().await;
+                    let mut refresh = Vec::new();
+                    let mut expired = Vec::new();
+                    for (eh, &ts) in &state.online_friends {
+                        if now - ts < 300 {
+                            continue;
+                        }
+                        if sessions.get(eh).is_some_and(|h| h.is_fresh()) {
+                            refresh.push(*eh);
+                        } else {
+                            expired.push(*eh);
+                        }
+                    }
+                    drop(sessions);
+                    for eh in refresh {
+                        state.online_friends.insert(eh, now);
+                    }
                     for eh in &expired {
                         state.online_friends.remove(eh);
                         let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
@@ -42290,6 +42316,16 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetOnlineFriends { tx } => {
+            let now = chrono::Utc::now().timestamp();
+            {
+                let sessions = state.ember_sessions.read().await;
+                let friends = friend_hashes.read().await;
+                for (eh, handle) in sessions.iter() {
+                    if handle.is_fresh() && friends.contains(eh) {
+                        state.online_friends.entry(*eh).or_insert(now);
+                    }
+                }
+            }
             let online: Vec<String> = state.online_friends.keys().map(hex::encode).collect();
             let _ = tx.send(online);
         }

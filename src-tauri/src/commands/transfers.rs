@@ -430,6 +430,60 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     }
 }
 
+/// Relocate a failed download's `.part` into `Downloads/` so "Remove from List"
+/// keeps the bytes instead of deleting Temp/{uuid}.part. Named `*.part` so it
+/// is not mistaken for a completed file. No-op if the partial is already gone.
+async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_name: &str) {
+    if uuid::Uuid::parse_str(transfer_id).is_err() {
+        return;
+    }
+    let part_path = std::path::PathBuf::from(download_folder)
+        .join("Temp")
+        .join(format!("{transfer_id}.part"));
+    let allowed = vec![download_folder.to_string()];
+    let pinned = match pin_cleanup_target(&part_path, &allowed) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("preserve_failed_partial: refusing unverified part path: {error}");
+            return;
+        }
+    };
+    let Some((verified, identity)) = pinned else {
+        return;
+    };
+    let downloads = std::path::PathBuf::from(download_folder).join("Downloads");
+    if let Err(error) = tokio::fs::create_dir_all(&downloads).await {
+        tracing::warn!("preserve_failed_partial: could not create Downloads: {error}");
+        return;
+    }
+    let safe = crate::security::sanitize_filename(file_name);
+    let dest_name = if safe
+        .rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("part"))
+    {
+        safe
+    } else {
+        format!("{safe}.part")
+    };
+    let dest = downloads.join(dest_name);
+    let root = std::path::PathBuf::from(download_folder);
+    match tokio::task::spawn_blocking(move || {
+        crate::network::ed2k::transfer::move_part_to_final_approved(
+            &verified, &dest, &root, &identity,
+        )
+    })
+    .await
+    {
+        Ok(Ok(path)) => tracing::info!(
+            "Preserved failed download partial as {}",
+            path.display()
+        ),
+        Ok(Err(error)) => tracing::warn!("Failed to preserve partial for {transfer_id}: {error}"),
+        Err(error) => tracing::warn!("Preserve-partial task failed for {transfer_id}: {error}"),
+    }
+}
+
 /// Walk `<download_folder>/Temp/` and remove any `.part` / `.part.met`
 /// files whose `<uuid>` prefix doesn't match a transfer ID the
 /// `transfer_manager` knows about. Idempotent and safe to call at
@@ -1526,6 +1580,16 @@ pub async fn remove_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    let snapshot = {
+        let manager = state.transfer_manager.read().await;
+        manager.get_transfer(&transfer_id).map(|t| {
+            (
+                t.status.clone(),
+                t.file_name.clone(),
+                t.direction.clone(),
+            )
+        })
+    };
     let promoted = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
@@ -1566,6 +1630,15 @@ pub async fn remove_transfer(
     }
     let db = state.db.clone();
     let tid = transfer_id.clone();
+    let keep_failed_partial = matches!(
+        snapshot,
+        Some((TransferStatus::Failed, _, TransferDirection::Download))
+    );
+    if keep_failed_partial {
+        if let Some((_, file_name, _)) = snapshot {
+            preserve_failed_partial(&dl_folder, &transfer_id, &file_name).await;
+        }
+    }
     tokio::join!(cleanup_partial_files(&dl_folder, &transfer_id), async {
         db_blocking(move || {
             if let Err(e) = db.remove_transfer(&tid) {

@@ -541,6 +541,15 @@ pub fn is_ember_blake3_mismatch(err: &str) -> bool {
     lower.contains("ember blake3 mismatch") || lower.contains("ember content hash mismatch")
 }
 
+/// True when a trusted `|h=` / `expected_aich` pin missed after the ed2k
+/// file hash already matched. Same class as Ember BLAKE3: more sources
+/// cannot change the digest of a complete, hash-verified file.
+pub fn is_expected_aich_mismatch(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    // Raw completion error, plus `summarize_error`'s canned UI string.
+    lower.contains("expected aich hash mismatch") || lower == "aich hash mismatch"
+}
+
 /// Canned error for a terminal Ember pin failure. Kept as one string so the
 /// single-source and multi-source completion paths, plus the event-loop
 /// re-queue skip, all agree.
@@ -602,6 +611,9 @@ pub(crate) fn summarize_error(error: &str, kind: &SourceFailureKind) -> String {
     }
     if is_ember_blake3_mismatch(error) {
         return "Ember content hash mismatch".to_string();
+    }
+    if is_expected_aich_mismatch(error) {
+        return "AICH hash mismatch".to_string();
     }
     if lower.contains("hash mismatch") || lower.contains("hash verification failed") {
         return "Hash mismatch".to_string();
@@ -831,6 +843,26 @@ mod tests {
         assert!(
             !is_ember_blake3_mismatch("Download hash mismatch for file: expected=x, got=y"),
             "ed2k mismatch must not be classified as an Ember pin failure"
+        );
+    }
+
+    #[test]
+    fn expected_aich_mismatch_is_distinct_from_ed2k() {
+        let raw = "Expected AICH hash mismatch: expected aa, got bb";
+        assert!(is_expected_aich_mismatch(raw));
+        assert!(!is_ember_blake3_mismatch(raw));
+        assert_eq!(summarize_error(raw, &classify_error(raw)), "AICH hash mismatch");
+        assert!(
+            !is_expected_aich_mismatch("Download hash mismatch for file: expected=x, got=y"),
+            "ed2k mismatch must not be classified as an AICH pin failure"
+        );
+        assert!(
+            !is_expected_aich_mismatch("AICH verification did not produce a root"),
+            "missing AICH root is retryable, not a pin miss"
+        );
+        assert!(
+            is_expected_aich_mismatch("AICH hash mismatch"),
+            "the canned UI summary must also classify as an AICH pin failure"
         );
     }
 

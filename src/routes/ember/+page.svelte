@@ -27,6 +27,7 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { formatDurationSecs } from '$lib/utils';
+  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -58,8 +59,8 @@
   // A shorter window used to be fine when joining kicked an immediate fetch
   // from a central pool; without one, a fresh node can legitimately sit at
   // zero contacts for a minute or two, and giving up at 30s made a healthy
-  // node look broken.
-  const JOINING_TIMEOUT_MS = 150_000;
+  // node look broken. Shared with Search and the status bar.
+  const JOINING_TIMEOUT_MS = EMBER_JOIN_TIMEOUT_MS;
 
   async function refreshDiag() {
     if (unmounted || inFlightDiag) return;

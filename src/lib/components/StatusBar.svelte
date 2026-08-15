@@ -4,6 +4,7 @@
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatSpeed } from '$lib/utils';
+  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import * as m from '$lib/paraglide/messages';
 
   // Count / total size of files the user is actively sharing (the `shared`
@@ -12,6 +13,35 @@
   let sharedCount = $state(0);
   let sharedBytes = $state(0);
   let sharedRefreshGen = 0;
+  let emberJoinTimedOut = $state(false);
+  let emberJoinSince: number | null = null;
+  let emberJoinTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function recomputeEmberJoin(stats: typeof $networkStats) {
+    const enabled = !!stats.ember_native_enabled;
+    const verified = stats.ember_dht_verified_contacts ?? 0;
+    if (!enabled || verified > 0) {
+      if (emberJoinTimer) {
+        clearTimeout(emberJoinTimer);
+        emberJoinTimer = null;
+      }
+      emberJoinSince = null;
+      emberJoinTimedOut = false;
+      return;
+    }
+    if (emberJoinSince === null) {
+      emberJoinSince = Date.now();
+      emberJoinTimedOut = false;
+      emberJoinTimer = setTimeout(() => {
+        emberJoinTimedOut = true;
+        emberJoinTimer = null;
+      }, EMBER_JOIN_TIMEOUT_MS);
+    }
+  }
+
+  $effect(() => {
+    recomputeEmberJoin($networkStats);
+  });
 
   function sharedTitle(count: number, bytes: number): string {
     const size = formatBytes(bytes);
@@ -49,6 +79,10 @@
 
     return () => {
       active = false;
+      if (emberJoinTimer) {
+        clearTimeout(emberJoinTimer);
+        emberJoinTimer = null;
+      }
       void unlistenPromise
         .then((unlisten) => unlisten())
         .catch((e) => console.error('Failed to unlisten shared-files-changed:', e));
@@ -62,7 +96,8 @@
 
   function emberDhtStatus(stats: typeof $networkStats): 'connected' | 'connecting' | 'disconnected' {
     if (!stats.ember_native_enabled) return 'disconnected';
-    return (stats.ember_dht_verified_contacts ?? 0) > 0 ? 'connected' : 'connecting';
+    if ((stats.ember_dht_verified_contacts ?? 0) > 0) return 'connected';
+    return emberJoinTimedOut ? 'disconnected' : 'connecting';
   }
 
   function emberDhtTitle(stats: typeof $networkStats): string {
@@ -72,6 +107,9 @@
       return peers === 1
         ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
         : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });
+    }
+    if (stats.ember_native_enabled && emberJoinTimedOut) {
+      return m.statusbar_ember_dht_title_no_peers();
     }
     return m.statusbar_ember_dht_title({ status: statusLabel(status) });
   }
