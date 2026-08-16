@@ -849,6 +849,16 @@ const PROGRESS_EMIT_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// normal.
 const SLOT_IDLE_TIMEOUT_SECS: u64 = 60;
 
+/// How long after the last credited byte an `OP_REQUESTPARTS` naming only
+/// already-delivered ranges still counts as activity.
+///
+/// Generous enough that a genuinely pipelined peer is never rotated for it —
+/// padding accompanies a stream of real blocks, so the gap is milliseconds —
+/// while bounding a peer that only re-asks to roughly this window rather than
+/// to the hour-long `SESSIONMAXTIME_SECS`.
+const PADDING_KEEPALIVE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(SLOT_IDLE_TIMEOUT_SECS * 2);
+
 /// Diagnostic: cadence of the per-session "heartbeat" log emitted at the
 /// top of the outer packet loop. Keeps log volume bounded (≤ 1 line per
 /// session per interval) while still surfacing enough state to answer
@@ -1264,8 +1274,20 @@ fn filter_already_sent_ranges(
 /// every packet names three ranges) also count: the peer is still in the
 /// session. EOF / zero-length / unservable garbage must not (eMule Plus
 /// 1.2.5 used to pin the slot forever by re-asking ranges we filter out).
-fn requestparts_resets_idle(credited_bytes: u64, skipped_already_sent: usize) -> bool {
-    credited_bytes > 0 || skipped_already_sent > 0
+///
+/// Padding only counts while real bytes are still recent. A peer that pads a
+/// full pipeline is by definition being served continuously, so
+/// `since_last_credit` stays near zero; one that has stopped taking data and
+/// only re-asks for ranges it already has looks identical to the pin-forever
+/// case, and used to hold the slot until `SESSIONMAXTIME_SECS` — an hour, and
+/// only then if anyone was queued behind it.
+fn requestparts_resets_idle(
+    credited_bytes: u64,
+    skipped_already_sent: usize,
+    since_last_credit: std::time::Duration,
+) -> bool {
+    credited_bytes > 0
+        || (skipped_already_sent > 0 && since_last_credit < PADDING_KEEPALIVE_WINDOW)
 }
 
 /// Unique bytes delivered this session from the per-part served tally
@@ -5796,6 +5818,10 @@ impl UploadHandler {
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
         let mut last_part_request: std::time::Instant = std::time::Instant::now();
+        // Last time this session actually credited bytes, so padding can be
+        // told apart from a peer that has stopped taking data — see
+        // `requestparts_resets_idle`.
+        let mut last_credited_at: std::time::Instant = std::time::Instant::now();
 
         // HighID AddUpNextClient push-grant: we dialed this peer, so seed the
         // file hash, reserve a slot, and send OP_ACCEPTUPLOADREQ before the
@@ -8383,8 +8409,15 @@ impl UploadHandler {
                     // the slot. EOF / zero-length / unservable garbage
                     // still does not — that is the eMule Plus 1.2.5
                     // pin-forever case this timer exists to break.
-                    if requestparts_resets_idle(batch_credited_bytes, skipped_already_sent) {
+                    if requestparts_resets_idle(
+                        batch_credited_bytes,
+                        skipped_already_sent,
+                        last_credited_at.elapsed(),
+                    ) {
                         last_part_request = std::time::Instant::now();
+                    }
+                    if batch_credited_bytes > 0 {
+                        last_credited_at = std::time::Instant::now();
                     }
 
                     // OP_REQUESTPARTS is the hot path. After the inner
@@ -10842,10 +10875,32 @@ mod unique_served_tests {
 
     #[test]
     fn padding_only_requestparts_still_reset_idle_but_garbage_does_not() {
-        assert!(requestparts_resets_idle(1, 0));
-        assert!(requestparts_resets_idle(0, 3));
-        assert!(requestparts_resets_idle(180 * 1024, 2));
-        assert!(!requestparts_resets_idle(0, 0));
+        let fresh = std::time::Duration::from_secs(1);
+        assert!(requestparts_resets_idle(1, 0, fresh));
+        assert!(requestparts_resets_idle(0, 3, fresh));
+        assert!(requestparts_resets_idle(180 * 1024, 2, fresh));
+        assert!(!requestparts_resets_idle(0, 0, fresh));
+    }
+
+    /// Padding keeps a pipelined peer's slot, but must not keep the slot of a
+    /// peer that stopped taking data: re-asking for ranges it already has was
+    /// enough to defeat `SLOT_IDLE_TIMEOUT_SECS` entirely, leaving the hour-long
+    /// session cap as the only limit — and that only applies with a queue.
+    #[test]
+    fn padding_stops_holding_the_slot_once_real_bytes_go_stale() {
+        let stale = PADDING_KEEPALIVE_WINDOW + std::time::Duration::from_secs(1);
+        assert!(
+            !requestparts_resets_idle(0, 3, stale),
+            "padding alone must not renew a slot that has moved no bytes for the whole window"
+        );
+        // Real bytes in the same batch still count, however old the last ones were.
+        assert!(requestparts_resets_idle(180 * 1024, 3, stale));
+        // And a peer being served continuously is never affected.
+        assert!(requestparts_resets_idle(
+            0,
+            3,
+            PADDING_KEEPALIVE_WINDOW - std::time::Duration::from_secs(1)
+        ));
     }
 }
 

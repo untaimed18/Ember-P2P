@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
+  import { pickDownloadFolder } from '$lib/api/settings';
   import { relaunch } from '@tauri-apps/plugin-process';
   import { onDestroy, untrack } from 'svelte';
   import { theme, applyTheme, getInitialTheme, type Theme } from '$lib/stores/theme';
@@ -161,11 +161,13 @@
   async function pickFolder() {
     folderError = '';
     try {
-      const selected = await open({ directory: true, multiple: false, title: m.wizard_pick_folder_dialog_title() });
+      // Backend picker, so the path is authorized where it is chosen: saving a
+      // changed download folder the renderer named on its own is refused.
+      const selected = await pickDownloadFolder();
       // A user cancel resolves to null and is handled by this check, so the
       // catch below only ever sees a real plugin/permission failure — which
       // previously made the Browse button look simply dead.
-      if (selected && typeof selected === 'string') {
+      if (selected) {
         downloadFolder = selected;
       }
     } catch (e) {

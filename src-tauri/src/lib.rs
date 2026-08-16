@@ -1750,6 +1750,7 @@ pub fn run() {
             commands::peers::ember_request_sources,
             commands::settings::get_settings,
             commands::settings::update_settings,
+            commands::settings::pick_download_folder,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
