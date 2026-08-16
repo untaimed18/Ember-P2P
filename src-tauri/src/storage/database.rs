@@ -17,7 +17,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 29;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 30;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -69,6 +69,7 @@ pub struct StoredChannelMember {
     pub nickname: String,
     pub last_seen: i64,
     pub banned: bool,
+    pub moderator: bool,
 }
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
@@ -1448,6 +1449,24 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 29)?;
+            tx.commit()?;
+        }
+
+        if version < 30 {
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_members",
+                "moderator",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_members",
+                "ban_revised_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 30)?;
             tx.commit()?;
         }
 
@@ -3779,8 +3798,8 @@ impl Database {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned)
-             VALUES (?1, ?2, ?3, ?4, 0)
+            "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
+             VALUES (?1, ?2, ?3, ?4, 0, 0)
              ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
                 nickname = excluded.nickname,
                 last_seen = excluded.last_seen",
@@ -3795,7 +3814,7 @@ impl Database {
     ) -> anyhow::Result<Vec<StoredChannelMember>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT member_pubkey, nickname, last_seen, banned
+            "SELECT member_pubkey, nickname, last_seen, banned, moderator
              FROM channel_members WHERE channel_id = ?1
              ORDER BY nickname COLLATE NOCASE, member_pubkey",
         )?;
@@ -3806,6 +3825,7 @@ impl Database {
                     nickname: row.get(1)?,
                     last_seen: row.get(2)?,
                     banned: row.get::<_, i64>(3)? != 0,
+                    moderator: row.get::<_, i64>(4)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3828,16 +3848,28 @@ impl Database {
         Ok(banned.unwrap_or(0) != 0)
     }
 
-    pub fn list_banned_channel_pubkeys(
+    pub fn channel_member_is_moderator(
         &self,
         channel_id: &str,
-    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        member_pubkey: &str,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT member_pubkey FROM channel_members
-             WHERE channel_id = ?1 AND banned = 1
-             ORDER BY member_pubkey",
-        )?;
+        let flag: Option<i64> = conn
+            .query_row(
+                "SELECT moderator FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flag.unwrap_or(0) != 0)
+    }
+
+    fn hex_pubkeys_from_query(
+        conn: &Connection,
+        sql: &str,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![channel_id], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for pk_hex in rows {
@@ -3854,8 +3886,71 @@ impl Database {
         Ok(out)
     }
 
+    pub fn list_banned_channel_pubkeys(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let conn = self.conn.lock();
+        Self::hex_pubkeys_from_query(
+            &conn,
+            "SELECT member_pubkey FROM channel_members
+             WHERE channel_id = ?1 AND banned = 1
+             ORDER BY member_pubkey",
+            channel_id,
+        )
+    }
+
+    pub fn list_moderator_channel_pubkeys(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let conn = self.conn.lock();
+        Self::hex_pubkeys_from_query(
+            &conn,
+            "SELECT member_pubkey FROM channel_members
+             WHERE channel_id = ?1 AND moderator = 1
+             ORDER BY member_pubkey",
+            channel_id,
+        )
+    }
+
+    /// Apply a gossip ban/unban from a delegated moderator. Wins only if newer
+    /// than the last owner snapshot *and* any previous revision on that row.
+    pub fn apply_channel_ban_action(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        banned: bool,
+        timestamp: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let snapshot: i64 = conn
+            .query_row(
+                "SELECT moderation_updated_at FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if timestamp < snapshot {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "INSERT INTO channel_members
+                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+             VALUES (?1, ?2, '', 0, ?3, 0, ?4)
+             ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                banned = excluded.banned,
+                ban_revised_at = excluded.ban_revised_at
+             WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
+            params![channel_id, member_pubkey, if banned { 1 } else { 0 }, timestamp],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Apply an owner-signed moderation snapshot if it is newer than what we hold.
-    /// Replaces the ban list wholesale so an unban on the wire clears the local flag.
+    /// Replaces bans and the moderator list; a later gossip action can still
+    /// override an individual ban via `ban_revised_at`.
     pub fn apply_channel_moderation(
         &self,
         channel_id: &str,
@@ -3863,6 +3958,7 @@ impl Database {
         welcome: &str,
         timestamp: i64,
         banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let current: i64 = conn
@@ -3888,15 +3984,34 @@ impl Database {
             return Ok(false);
         }
         tx.execute(
-            "UPDATE channel_members SET banned = 0 WHERE channel_id = ?1",
+            "UPDATE channel_members SET banned = 0
+             WHERE channel_id = ?1 AND ban_revised_at <= ?2",
+            params![channel_id, timestamp],
+        )?;
+        tx.execute(
+            "UPDATE channel_members SET moderator = 0 WHERE channel_id = ?1",
             params![channel_id],
         )?;
         for pk in banned_pubkeys.iter().take(32) {
             let hex_pk = hex::encode(pk);
             tx.execute(
-                "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned)
-                 VALUES (?1, ?2, '', 0, 1)
-                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET banned = 1",
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 1, 0, ?3)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                    banned = 1,
+                    ban_revised_at = excluded.ban_revised_at
+                 WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
+                params![channel_id, hex_pk, timestamp],
+            )?;
+        }
+        for pk in moderator_pubkeys.iter().take(16) {
+            let hex_pk = hex::encode(pk);
+            tx.execute(
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 0, 1, 0)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET moderator = 1",
                 params![channel_id, hex_pk],
             )?;
         }
@@ -5109,7 +5224,7 @@ mod tests {
         let banned = [0x33u8; 32];
         let banned_hex = hex::encode(banned);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[])
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
@@ -5117,14 +5232,33 @@ mod tests {
         assert!(db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
         assert!(!db
-            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[])
+            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[])
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[])
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
+
+        let moderator = [0x44u8; 32];
+        let mod_hex = hex::encode(moderator);
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator])
+            .unwrap());
+        assert!(db.channel_member_is_moderator(&channel_id, &mod_hex).unwrap());
+        assert!(!db.channel_member_is_moderator(&channel_id, &pubkey).unwrap());
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &banned_hex, true, 80)
+            .unwrap());
+        assert!(db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator])
+            .unwrap());
+        assert!(
+            db.channel_member_is_banned(&channel_id, &banned_hex).unwrap(),
+            "newer gossip ban must survive an older owner snapshot"
+        );
 
         let msg_id = "aa".repeat(16);
         let id = db

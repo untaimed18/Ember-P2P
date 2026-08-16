@@ -385,6 +385,9 @@ pub struct ChannelGossip {
 }
 
 const CHAT_PLAIN_VERSION: u8 = 1;
+const MOD_ACTION_PLAIN_VERSION: u8 = 2;
+const MOD_ACTION_BAN: u8 = 1;
+const MOD_ACTION_UNBAN: u8 = 0;
 
 /// `version(1) || sender_pubkey(32) || utf8 text` inside a gossip body.
 pub fn encode_channel_chat_plain(sender_pubkey: &[u8; 32], text: &str) -> Vec<u8> {
@@ -403,6 +406,40 @@ pub fn decode_channel_chat_plain(bytes: &[u8]) -> Option<([u8; 32], String)> {
     pk.copy_from_slice(&bytes[1..33]);
     let text = std::str::from_utf8(&bytes[33..]).ok()?.to_string();
     Some((pk, text))
+}
+
+/// Moderator gossip: `version(1) || sender(32) || action(1) || target(32)`.
+pub fn encode_channel_mod_action(
+    sender_pubkey: &[u8; 32],
+    target_pubkey: &[u8; 32],
+    banned: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 1 + 32);
+    out.push(MOD_ACTION_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.push(if banned {
+        MOD_ACTION_BAN
+    } else {
+        MOD_ACTION_UNBAN
+    });
+    out.extend_from_slice(target_pubkey);
+    out
+}
+
+pub fn decode_channel_mod_action(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], bool)> {
+    if bytes.len() != 66 || bytes[0] != MOD_ACTION_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let banned = match bytes[33] {
+        MOD_ACTION_BAN => true,
+        MOD_ACTION_UNBAN => false,
+        _ => return None,
+    };
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes[34..66]);
+    Some((sender, target, banned))
 }
 
 impl ChannelGossip {
@@ -709,6 +746,16 @@ mod tests {
         }
         .decremented_ttl()
         .is_none());
+        let (sender, target, banned) = decode_channel_mod_action(&encode_channel_mod_action(
+            &[1u8; 32],
+            &[2u8; 32],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(sender, [1u8; 32]);
+        assert_eq!(target, [2u8; 32]);
+        assert!(banned);
+        assert!(decode_channel_mod_action(&encode_channel_chat_plain(&[1u8; 32], "x")).is_none());
     }
 
     #[test]

@@ -2469,6 +2469,9 @@
   "channels_banned_badge": "Заблокирован",
   "channels_you_are_banned": "Вас заблокировали в этом канале.",
   "channels_edit_moderation": "Тема и приветствие",
+  "channels_moderator_badge": "Модератор",
+  "channels_add_moderator": "Назначить модератора",
+  "channels_remove_moderator": "Снять модератора",
   "error_channels_name_invalid": "Channel name must not be empty",
   "error_channels_name_too_long": "Channel name is too long",
   "error_channels_not_found": "Channel not found",
@@ -2495,5 +2498,8 @@
   "error_channels_ban_list_full": "Ban list is full (max 32)",
   "error_channels_member_invalid": "Invalid member key",
   "error_channels_moderation_failed": "Could not update room info: {detail}",
-  "error_channels_ban_failed": "Could not update the ban list: {detail}"
+  "error_channels_ban_failed": "Could not update the ban list: {detail}",
+  "error_channels_not_moderator": "Это может сделать только владелец или модератор",
+  "error_channels_mod_self": "Нельзя назначить себя модератором",
+  "error_channels_mod_list_full": "Список модераторов заполнен (макс. 16)"
 }

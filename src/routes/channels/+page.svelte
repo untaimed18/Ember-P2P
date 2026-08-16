@@ -4,48 +4,47 @@
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import ChatConversation from '$lib/components/ChatConversation.svelte';
   import { appSettings } from '$lib/stores/settings';
   import { copyToClipboard } from '$lib/utils';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import {
+    addChannelModerator,
     banChannelMember,
     createChannel,
     gatherChannels,
     getChannelInvite,
-    getChannelMessages,
     joinChannel,
     leaveChannel,
     listChannelMembers,
-    listChannels,
-    markChannelMessagesRead,
-    sendChannelMessage,
+    removeChannelModerator,
     unbanChannelMember,
     updateChannelModeration,
-    type ChannelInfo,
     type ChannelMemberInfo,
-    type ChannelMessageInfo,
     type GatheredChannelInfo,
   } from '$lib/api/channels';
+  import {
+    activeChannelId,
+    bumpChannelUnread,
+    channels as channelsStore,
+    clearChannelUnread,
+    refreshChannels,
+    replaceChannel,
+  } from '$lib/stores/channels';
 
-  const MAX_MESSAGE_BYTES = 4096;
-
-  let channels: ChannelInfo[] = $state([]);
-  let selectedId: string | null = $state(null);
+  let channelList = $derived($channelsStore);
+  let selectedId = $derived($activeChannelId);
   let members: ChannelMemberInfo[] = $state([]);
-  let messages: ChannelMessageInfo[] = $state([]);
   let loading = $state(true);
-  let sending = $state(false);
   let discovering = $state(false);
   let discovered: GatheredChannelInfo[] = $state([]);
-  let inputText = $state('');
   let createName = $state('');
   let createPrivate = $state(false);
   let joinUri = $state('');
   let error: string | null = $state(null);
   let leaveOpen = $state(false);
-  let messagesEnd: HTMLDivElement | undefined = $state();
   let editTopic = $state('');
   let editWelcome = $state('');
   let editingModeration = $state(false);
@@ -53,7 +52,16 @@
   let moderatingMember = $state<string | null>(null);
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
-  let selected = $derived(channels.find((c) => c.channel_id === selectedId) ?? null);
+  let selected = $derived(channelList.find((c) => c.channel_id === selectedId) ?? null);
+  let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
+  let memberNames = $derived(
+    Object.fromEntries(
+      members.map((mem) => [
+        mem.member_pubkey,
+        mem.is_self ? m.channels_you() : mem.nickname,
+      ]),
+    ),
+  );
 
   onMount(() => {
     const joinParam = $page.url.searchParams.get('join');
@@ -63,35 +71,8 @@
     loadChannels();
     let cancelled = false;
     let unlisten: UnlistenFn | undefined;
-    listen<{
-      id: number;
-      channel_id: string;
-      sender_pubkey: string;
-      direction: string;
-      message: string;
-      timestamp: number;
-    }>('ember:channel-message', (event) => {
-      const payload = event.payload;
-      if (payload.channel_id === selectedId) {
-        if (messages.some((msg) => msg.id === payload.id)) return;
-        messages = [
-          ...messages,
-          {
-            id: payload.id,
-            sender_pubkey: payload.sender_pubkey,
-            direction: payload.direction,
-            message: payload.message,
-            timestamp: payload.timestamp,
-            read: true,
-          },
-        ];
-        markChannelMessagesRead(payload.channel_id).catch(() => {});
-        queueMicrotask(() => messagesEnd?.scrollIntoView({ block: 'end' }));
-      } else {
-        channels = channels.map((c) =>
-          c.channel_id === payload.channel_id ? { ...c, unread: c.unread + 1 } : c,
-        );
-      }
+    listen<{ channel_id: string }>('ember:channel-message', (event) => {
+      bumpChannelUnread(event.payload.channel_id);
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -99,11 +80,7 @@
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
-      listChannels()
-        .then((list) => {
-          channels = list;
-        })
-        .catch(() => {});
+      refreshChannels().catch(() => {});
       if (id === selectedId) {
         listChannelMembers(id)
           .then((mems) => {
@@ -118,10 +95,9 @@
     let unlistenModeration: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
       const id = event.payload.channel_id;
-      listChannels()
-        .then((list) => {
-          channels = list;
-          const ch = list.find((c) => c.channel_id === selectedId);
+      refreshChannels()
+        .then(() => {
+          const ch = $channelsStore.find((c) => c.channel_id === selectedId);
           if (ch && !editingModeration) {
             editTopic = ch.topic;
             editWelcome = ch.welcome;
@@ -157,10 +133,9 @@
     loading = true;
     error = null;
     try {
-      channels = await listChannels();
-      if (selectedId && !channels.some((c) => c.channel_id === selectedId)) {
-        selectedId = null;
-        messages = [];
+      await refreshChannels();
+      if (selectedId && !$channelsStore.some((c) => c.channel_id === selectedId)) {
+        activeChannelId.set(null);
         members = [];
       }
     } catch (e) {
@@ -171,21 +146,14 @@
   }
 
   async function selectChannel(id: string) {
-    selectedId = id;
-    inputText = '';
+    activeChannelId.set(id);
     try {
-      const [msgs, mems] = await Promise.all([
-        getChannelMessages(id, 100),
-        listChannelMembers(id),
-      ]);
-      messages = msgs.slice().reverse();
-      members = mems;
-      editTopic = channels.find((c) => c.channel_id === id)?.topic ?? '';
-      editWelcome = channels.find((c) => c.channel_id === id)?.welcome ?? '';
+      members = await listChannelMembers(id);
+      const ch = $channelsStore.find((c) => c.channel_id === id);
+      editTopic = ch?.topic ?? '';
+      editWelcome = ch?.welcome ?? '';
       editingModeration = false;
-      await markChannelMessagesRead(id);
-      channels = channels.map((c) => (c.channel_id === id ? { ...c, unread: 0 } : c));
-      queueMicrotask(() => messagesEnd?.scrollIntoView({ block: 'end' }));
+      clearChannelUnread(id);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     }
@@ -222,8 +190,7 @@
     if (!selectedId) return;
     try {
       await leaveChannel(selectedId);
-      selectedId = null;
-      messages = [];
+      activeChannelId.set(null);
       members = [];
       await loadChannels();
     } catch (e) {
@@ -261,33 +228,12 @@
     await handleJoin(uri);
   }
 
-  async function handleSend() {
-    if (!selectedId || sending || selected?.you_are_banned) return;
-    const text = inputText.trim();
-    if (!text) return;
-    if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
-      toastError(m.error_channels_message_size_invalid());
-      return;
-    }
-    sending = true;
-    try {
-      const sent = await sendChannelMessage(selectedId, text);
-      messages = [...messages, sent];
-      inputText = '';
-      queueMicrotask(() => messagesEnd?.scrollIntoView({ block: 'end' }));
-    } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
-    } finally {
-      sending = false;
-    }
-  }
-
   async function handleSaveModeration() {
     if (!selectedId || savingModeration) return;
     savingModeration = true;
     try {
       const updated = await updateChannelModeration(selectedId, editTopic, editWelcome);
-      channels = channels.map((c) => (c.channel_id === updated.channel_id ? updated : c));
+      replaceChannel(updated);
       editingModeration = false;
       toastSuccess(m.channels_moderation_saved());
     } catch (e) {
@@ -323,10 +269,29 @@
     }
   }
 
-  function onKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+  async function handleAddModerator(memberPubkey: string) {
+    if (!selectedId || moderatingMember) return;
+    moderatingMember = memberPubkey;
+    try {
+      await addChannelModerator(selectedId, memberPubkey);
+      members = await listChannelMembers(selectedId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      moderatingMember = null;
+    }
+  }
+
+  async function handleRemoveModerator(memberPubkey: string) {
+    if (!selectedId || moderatingMember) return;
+    moderatingMember = memberPubkey;
+    try {
+      await removeChannelModerator(selectedId, memberPubkey);
+      members = await listChannelMembers(selectedId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      moderatingMember = null;
     }
   }
 
@@ -400,10 +365,10 @@
       <aside class="list">
         {#if loading}
           <p class="muted">{m.common_loading()}</p>
-        {:else if channels.length === 0}
+        {:else if channelList.length === 0}
           <p class="muted">{m.channels_empty()}</p>
         {:else}
-          {#each channels as ch}
+          {#each channelList as ch}
             <button
               class="chan-row"
               class:active={ch.channel_id === selectedId}
@@ -468,14 +433,15 @@
               <button type="submit" disabled={savingModeration}>{m.channels_save_moderation()}</button>
             </form>
           {/if}
-          <div class="messages">
-            {#each messages as msg (msg.id)}
-              <div class="bubble" class:mine={msg.direction === 'sent'}>
-                <span class="who">{msg.direction === 'sent' ? m.channels_you() : shortId(msg.sender_pubkey)}</span>
-                <p>{msg.message}</p>
-              </div>
-            {/each}
-            <div bind:this={messagesEnd}></div>
+          <div class="transcript">
+            <ChatConversation
+              friendHash=""
+              friendName={selected.name}
+              channelId={selected.channel_id}
+              hideHeader
+              youAreBanned={selected.you_are_banned}
+              memberNames={memberNames}
+            />
           </div>
           {#if members.length > 0}
             <div class="members">
@@ -489,7 +455,10 @@
                     {#if mem.banned}
                       <span class="badge banned">{m.channels_banned_badge()}</span>
                     {/if}
-                    {#if selected.is_owner && !mem.is_self}
+                    {#if mem.moderator}
+                      <span class="badge">{m.channels_moderator_badge()}</span>
+                    {/if}
+                    {#if canModerate && !mem.is_self}
                       {#if mem.banned}
                         <button
                           class="ghost"
@@ -508,24 +477,28 @@
                         </button>
                       {/if}
                     {/if}
+                    {#if selected.is_owner && !mem.is_self && !mem.banned}
+                      {#if mem.moderator}
+                        <button
+                          class="ghost"
+                          disabled={moderatingMember === mem.member_pubkey}
+                          onclick={() => handleRemoveModerator(mem.member_pubkey)}
+                        >
+                          {m.channels_remove_moderator()}
+                        </button>
+                      {:else}
+                        <button
+                          class="ghost"
+                          disabled={moderatingMember === mem.member_pubkey}
+                          onclick={() => handleAddModerator(mem.member_pubkey)}
+                        >
+                          {m.channels_add_moderator()}
+                        </button>
+                      {/if}
+                    {/if}
                   </li>
                 {/each}
               </ul>
-            </div>
-          {/if}
-          {#if selected.you_are_banned}
-            <p class="banned-banner" role="status">{m.channels_you_are_banned()}</p>
-          {:else}
-            <div class="composer">
-              <textarea
-                bind:value={inputText}
-                onkeydown={onKeydown}
-                placeholder={m.channels_send_placeholder()}
-                maxlength="4096"
-                rows="2"
-                disabled={sending}
-              ></textarea>
-              <button onclick={handleSend} disabled={!inputText.trim() || sending}>{m.chat_send_title_short()}</button>
             </div>
           {/if}
         {/if}
@@ -634,6 +607,7 @@
     padding: 0 5px;
   }
   .conversation { display: flex; flex-direction: column; }
+  .transcript { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .conv-header {
     display: flex;
     justify-content: space-between;

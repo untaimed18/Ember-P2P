@@ -37,6 +37,7 @@ const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
 pub const CHANNEL_NAME_MAX: usize = 64;
 pub const CHANNEL_WELCOME_MAX: usize = 512;
 pub const CHANNEL_BAN_LIST_MAX: usize = 32;
+pub const CHANNEL_MOD_LIST_MAX: usize = 16;
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
@@ -101,12 +102,13 @@ pub struct ChannelPresenceMember {
     pub noise_pub: [u8; 32],
 }
 
-/// Owner-signed topic, welcome, and ban list. No addresses.
+/// Owner-signed topic, welcome, ban list, and delegated moderators. No addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelModeration {
     pub topic: String,
     pub welcome: String,
     pub banned_pubkeys: Vec<[u8; 32]>,
+    pub moderator_pubkeys: Vec<[u8; 32]>,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
 }
@@ -247,11 +249,12 @@ impl SignedRecord {
         )
     }
 
-    /// Moderation record signed by the **channel** key: topic, welcome, bans.
+    /// Moderation record signed by the **channel** key: topic, welcome, bans, mods.
     pub fn channel_moderation(
         topic: &str,
         welcome: &str,
         banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         private: bool,
@@ -259,7 +262,7 @@ impl SignedRecord {
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
-        let extra = encode_moderation_extra(welcome, banned_pubkeys);
+        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys);
         Self::build(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
@@ -454,11 +457,12 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_MODERATION {
             return None;
         }
-        let (welcome, banned_pubkeys) = decode_moderation_extra(&meta.extra)?;
+        let (welcome, banned_pubkeys, moderator_pubkeys) = decode_moderation_extra(&meta.extra)?;
         Some(ChannelModeration {
             topic: rec.file_name,
             welcome,
             banned_pubkeys,
+            moderator_pubkeys,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
         })
@@ -615,24 +619,40 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-fn encode_moderation_extra(welcome: &str, banned_pubkeys: &[[u8; 32]]) -> Vec<u8> {
+fn encode_moderation_extra(
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+) -> Vec<u8> {
     let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
     let bans = banned_pubkeys
         .iter()
         .take(CHANNEL_BAN_LIST_MAX)
         .collect::<Vec<_>>();
-    let mut extra = Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32);
+    let mods = moderator_pubkeys
+        .iter()
+        .take(CHANNEL_MOD_LIST_MAX)
+        .collect::<Vec<_>>();
+    let mut extra = Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32);
     extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
     extra.extend_from_slice(welcome.as_bytes());
     extra.extend_from_slice(&(bans.len() as u16).to_le_bytes());
     for pk in bans {
         extra.extend_from_slice(pk);
     }
+    extra.extend_from_slice(&(mods.len() as u16).to_le_bytes());
+    for pk in mods {
+        extra.extend_from_slice(pk);
+    }
     extra
 }
 
 /// Decode the extra blob from a moderation record.
-pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>)> {
+///
+/// Records published before moderator delegations omit the trailing list;
+/// treat that as an empty delegation set so a mixed network can still apply
+/// topic/welcome/bans.
+pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>, Vec<[u8; 32]>)> {
     if extra.len() < 4 {
         return None;
     }
@@ -646,17 +666,38 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>)> 
     if ban_count > CHANNEL_BAN_LIST_MAX {
         return None;
     }
-    let rest = &extra[ban_off + 2..];
-    if rest.len() != ban_count * 32 {
+    let bans_end = ban_off + 2 + ban_count * 32;
+    if extra.len() < bans_end {
         return None;
     }
     let mut bans = Vec::with_capacity(ban_count);
-    for chunk in rest.chunks_exact(32) {
+    for chunk in extra[ban_off + 2..bans_end].chunks_exact(32) {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(chunk);
         bans.push(pk);
     }
-    Some((welcome, bans))
+    let rest = &extra[bans_end..];
+    if rest.is_empty() {
+        return Some((welcome, bans, Vec::new()));
+    }
+    if rest.len() < 2 {
+        return None;
+    }
+    let mod_count = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+    if mod_count > CHANNEL_MOD_LIST_MAX {
+        return None;
+    }
+    let mods_bytes = &rest[2..];
+    if mods_bytes.len() != mod_count * 32 {
+        return None;
+    }
+    let mut mods = Vec::with_capacity(mod_count);
+    for chunk in mods_bytes.chunks_exact(32) {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(chunk);
+        mods.push(pk);
+    }
+    Some((welcome, bans, mods))
 }
 
 /// Tracks a single publish operation: store a record on the closest K nodes.
@@ -1099,10 +1140,12 @@ mod tests {
     fn channel_moderation_round_trip() {
         let ident = channel::ChannelIdentity::generate();
         let banned = [[0x11u8; 32], [0x22u8; 32]];
+        let mods = [[0xAAu8; 32]];
         let record = SignedRecord::channel_moderation(
             "rules",
             "be kind",
             &banned,
+            &mods,
             ident.channel_id,
             ident.pubkey,
             false,
@@ -1110,10 +1153,12 @@ mod tests {
         );
         assert!(record.channel_store_ok());
         let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
-        let (welcome, bans) = decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
+        let (welcome, bans, parsed_mods) =
+            decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
         assert_eq!(parsed.file_name, "rules");
         assert_eq!(welcome, "be kind");
         assert_eq!(bans, banned);
+        assert_eq!(parsed_mods, mods);
 
         let mut blob = record.data.clone();
         blob.extend_from_slice(&record.signature);
@@ -1122,8 +1167,17 @@ mod tests {
         assert_eq!(mod_info.topic, "rules");
         assert_eq!(mod_info.welcome, "be kind");
         assert_eq!(mod_info.banned_pubkeys, banned);
+        assert_eq!(mod_info.moderator_pubkeys, mods);
         assert_eq!(mod_info.publisher_key, ident.pubkey);
         assert!(SignedRecord::parse_channel_moderation(&blob, &[0x00; 16]).is_none());
+
+        // Pre-delegation extra: welcome + bans and nothing after.
+        let mut legacy = encode_moderation_extra("hi", &banned, &[]);
+        legacy.truncate(legacy.len() - 2);
+        let (w, b, m) = decode_moderation_extra(&legacy).unwrap();
+        assert_eq!(w, "hi");
+        assert_eq!(b, banned);
+        assert!(m.is_empty());
     }
 
     #[test]

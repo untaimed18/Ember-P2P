@@ -2469,6 +2469,9 @@
   "channels_banned_badge": "Gesperrt",
   "channels_you_are_banned": "Sie sind in diesem Kanal gesperrt.",
   "channels_edit_moderation": "Thema und Willkommen",
+  "channels_moderator_badge": "Moderator",
+  "channels_add_moderator": "Zum Moderator machen",
+  "channels_remove_moderator": "Moderator entfernen",
   "error_channels_name_invalid": "Kanalname darf nicht leer sein",
   "error_channels_name_too_long": "Kanalname ist zu lang",
   "error_channels_not_found": "Kanal nicht gefunden",
@@ -2495,5 +2498,8 @@
   "error_channels_ban_list_full": "Sperrliste ist voll (max. 32)",
   "error_channels_member_invalid": "Ungültiger Mitgliedsschlüssel",
   "error_channels_moderation_failed": "Rauminfo konnte nicht aktualisiert werden: {detail}",
-  "error_channels_ban_failed": "Sperrliste konnte nicht aktualisiert werden: {detail}"
+  "error_channels_ban_failed": "Sperrliste konnte nicht aktualisiert werden: {detail}",
+  "error_channels_not_moderator": "Nur der Eigentümer oder ein Moderator darf das",
+  "error_channels_mod_self": "Sie können sich nicht selbst zum Moderator machen",
+  "error_channels_mod_list_full": "Die Moderatorenliste ist voll (max. 16)"
 }

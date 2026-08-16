@@ -2469,6 +2469,9 @@
   "channels_banned_badge": "Bloqueado",
   "channels_you_are_banned": "Estás bloqueado en este canal.",
   "channels_edit_moderation": "Tema y bienvenida",
+  "channels_moderator_badge": "Moderador",
+  "channels_add_moderator": "Nombrar moderador",
+  "channels_remove_moderator": "Quitar moderador",
   "error_channels_name_invalid": "Channel name must not be empty",
   "error_channels_name_too_long": "Channel name is too long",
   "error_channels_not_found": "Channel not found",
@@ -2495,5 +2498,8 @@
   "error_channels_ban_list_full": "Ban list is full (max 32)",
   "error_channels_member_invalid": "Invalid member key",
   "error_channels_moderation_failed": "Could not update room info: {detail}",
-  "error_channels_ban_failed": "Could not update the ban list: {detail}"
+  "error_channels_ban_failed": "Could not update the ban list: {detail}",
+  "error_channels_not_moderator": "Solo el propietario o un moderador puede hacer eso",
+  "error_channels_mod_self": "No puedes nombrarte moderador",
+  "error_channels_mod_list_full": "La lista de moderadores está llena (máx. 16)"
 }

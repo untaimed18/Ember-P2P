@@ -1009,30 +1009,15 @@ async fn punch_friend(
                 let expected_capability = match expected_capability {
                     Some(capability) => capability,
                     None => {
-                        let _ = crate::network::ember::relay::ack_punch(
-                            rendezvous_url,
-                            &our_ember_hash,
-                            &info.punch_id,
-                            &info.capability,
-                            info.epoch,
-                            secret_key,
-                        )
-                        .await;
+                        // Leave the mailbox entry in place: a channel punch
+                        // uses a different capability, and acknowledging here
+                        // would delete it before the channel poller sees it.
                         continue;
                     }
                 };
                 if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
                     || info.capability != expected_capability
                 {
-                    let _ = crate::network::ember::relay::ack_punch(
-                        rendezvous_url,
-                        &our_ember_hash,
-                        &info.punch_id,
-                        &info.capability,
-                        info.epoch,
-                        secret_key,
-                    )
-                    .await;
                     continue;
                 }
                 let peer_nat = crate::network::ember::nat::NatType::from_u8(info.nat_type);

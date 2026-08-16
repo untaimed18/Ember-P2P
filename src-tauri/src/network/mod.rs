@@ -10287,6 +10287,9 @@ async fn load_rendezvous_register_targets(
 
 const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
+const CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK: usize = 2;
+const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
+const CHANNEL_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
 
 /// FIND_VALUE the current (and previous) presence keys so members are
@@ -10480,6 +10483,7 @@ fn ingest_channel_moderation_records(
         &moderation.welcome,
         moderation.timestamp,
         &moderation.banned_pubkeys,
+        &moderation.moderator_pubkeys,
     )
     .unwrap_or(false)
 }
@@ -10530,11 +10534,15 @@ async fn maybe_publish_channel_moderation(
         let bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
+        let mods = db
+            .list_moderator_channel_pubkeys(&ch.channel_id)
+            .unwrap_or_default();
         let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
         let record = ember::dht::publish::SignedRecord::channel_moderation(
             &ch.topic,
             &ch.welcome,
             &bans,
+            &mods,
             channel_id,
             ident.pubkey,
             private,
@@ -10595,7 +10603,8 @@ fn ingest_channel_presence_records(
     changed
 }
 
-fn maybe_dial_channel_neighbors(
+async fn maybe_dial_channel_neighbors(
+    socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Database,
     settings: &AppSettings,
@@ -10615,6 +10624,9 @@ fn maybe_dial_channel_neighbors(
     };
     let now = std::time::Instant::now();
     let mut started = 0usize;
+    let mut find_nodes = 0usize;
+    let mut pending_find = Vec::new();
+    let punch = state.external_ip.map(|ip| (ip, advertised_udp_port(state), state.nat_info.nat_type.as_u8()));
     for (channel_id, peer_pubkey) in neighbors {
         if started >= CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK {
             break;
@@ -10642,9 +10654,22 @@ fn maybe_dial_channel_neighbors(
             our_secret,
             peer_pubkey,
             channel_id,
+            punch,
             result_tx.clone(),
         );
         started += 1;
+        if find_nodes < CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK {
+            if let Some(search_id) = state
+                .ember_search
+                .start_find_node(node_id, state.ember_dht.routing())
+            {
+                find_nodes += 1;
+                pending_find.push(search_id);
+            }
+        }
+    }
+    for search_id in pending_find {
+        drive_ember_search(socket, state, search_id).await;
     }
 }
 
@@ -10655,10 +10680,11 @@ fn spawn_channel_neighbor_lookup(
     our_secret: [u8; 32],
     peer_pubkey: [u8; 32],
     channel_id: [u8; 16],
+    punch: Option<(Ipv4Addr, u16, u8)>,
     result_tx: mpsc::UnboundedSender<ChannelNeighborLookupResult>,
 ) {
     tokio::spawn(async move {
-        let endpoint = rendezvous::lookup_channel_presence(
+        let mut endpoint = rendezvous::lookup_channel_presence(
             &rv_url,
             &our_ember_hash,
             &our_pubkey,
@@ -10669,11 +10695,129 @@ fn spawn_channel_neighbor_lookup(
         .await
         .ok()
         .flatten();
+        if endpoint.is_none() {
+            if let Some((ip, port, nat_type)) = punch {
+                endpoint = punch_channel_neighbor(
+                    &rv_url,
+                    our_ember_hash,
+                    our_pubkey,
+                    our_secret,
+                    peer_pubkey,
+                    channel_id,
+                    ip,
+                    port,
+                    nat_type,
+                )
+                .await;
+            }
+        }
         let _ = result_tx.send(ChannelNeighborLookupResult {
             peer_pubkey,
             endpoint,
         });
     });
+}
+
+/// Coordinated UDP punch keyed by the channel presence capability.
+/// Advertises the Ember UDP port (not QUIC). Does not ack punches whose
+/// capability belongs to a friend slot.
+async fn punch_channel_neighbor(
+    rendezvous_url: &str,
+    our_ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    advertised_ip: Ipv4Addr,
+    port: u16,
+    nat_type: u8,
+) -> Option<(Ipv4Addr, u16)> {
+    if port == 0 {
+        return None;
+    }
+    let ts = rendezvous::current_timestamp();
+    let epoch = ember::crypto::pairwise_capability_epoch(ts);
+    let register_cap = ember::channel::derive_channel_presence_capability(
+        &our_secret,
+        &peer_pubkey,
+        &peer_pubkey,
+        &channel_id,
+        epoch,
+    )?;
+    let expected_cap = ember::channel::derive_channel_presence_capability(
+        &our_secret,
+        &peer_pubkey,
+        &our_pubkey,
+        &channel_id,
+        epoch,
+    )?;
+    let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
+    let expected_from = rendezvous::hashed_id(&peer_hash);
+    if ember::relay::register_punch_with_capability(
+        rendezvous_url,
+        &our_ember_hash,
+        &peer_hash,
+        register_cap,
+        epoch,
+        port,
+        nat_type,
+        IpAddr::V4(advertised_ip),
+        &our_secret,
+    )
+    .await
+    .is_err()
+    {
+        return None;
+    }
+    for _ in 0..CHANNEL_PUNCH_POLL_ATTEMPTS {
+        tokio::time::sleep(CHANNEL_PUNCH_POLL_INTERVAL).await;
+        match ember::relay::poll_punch(rendezvous_url, &our_ember_hash, &our_secret).await {
+            Ok(Some(info)) => {
+                if info.from_id != expected_from || info.capability != expected_cap {
+                    continue;
+                }
+                let Ok(IpAddr::V4(ip)) = info.ip.parse::<IpAddr>() else {
+                    let _ = ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        &our_secret,
+                    )
+                    .await;
+                    continue;
+                };
+                if crate::security::is_special_use_v4(ip) || info.port == 0 {
+                    let _ = ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        &our_secret,
+                    )
+                    .await;
+                    continue;
+                }
+                let _ = ember::relay::ack_punch(
+                    rendezvous_url,
+                    &our_ember_hash,
+                    &info.punch_id,
+                    &info.capability,
+                    info.epoch,
+                    &our_secret,
+                )
+                .await;
+                return Some((ip, info.port));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!("Ember channel punch poll error: {e}");
+            }
+        }
+    }
+    None
 }
 
 async fn apply_channel_neighbor_lookup(
@@ -10831,6 +10975,38 @@ async fn handle_inbound_channel_gossip(
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         return;
     };
+    if let Some((sender_pk, target_pk, banned)) =
+        ember::channel::decode_channel_mod_action(&plain)
+    {
+        let sender_hex = hex::encode(sender_pk);
+        if db
+            .channel_member_is_banned(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if !db
+            .channel_member_is_moderator(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let target_hex = hex::encode(target_pk);
+        let _ = db.apply_channel_ban_action(
+            &channel_id_hex,
+            &target_hex,
+            banned,
+            gossip.timestamp,
+        );
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": channel_id_hex }),
+        );
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+        return;
+    }
     let Some((sender_pk, text)) = ember::channel::decode_channel_chat_plain(&plain) else {
         return;
     };
@@ -31370,6 +31546,7 @@ pub async fn start_network(
                 }
                 if settings.ember_native_enabled {
                     maybe_dial_channel_neighbors(
+                        &udp_socket,
                         &mut state,
                         &db,
                         &settings,
@@ -31377,7 +31554,8 @@ pub async fn start_network(
                         ed25519_pubkey,
                         ed25519_secret_key,
                         &channel_neighbor_lookup_tx,
-                    );
+                    )
+                    .await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);

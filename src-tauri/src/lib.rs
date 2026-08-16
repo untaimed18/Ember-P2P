@@ -1725,6 +1725,8 @@ pub fn run() {
             commands::channels::update_channel_moderation,
             commands::channels::ban_channel_member,
             commands::channels::unban_channel_member,
+            commands::channels::add_channel_moderator,
+            commands::channels::remove_channel_moderator,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,

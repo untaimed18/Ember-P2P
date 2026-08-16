@@ -13,6 +13,7 @@ export interface ChannelInfo {
   member_count: number;
   unread: number;
   you_are_banned: boolean;
+  you_are_moderator: boolean;
 }
 
 export interface ChannelMemberInfo {
@@ -21,6 +22,7 @@ export interface ChannelMemberInfo {
   last_seen: number;
   banned: boolean;
   is_self: boolean;
+  moderator: boolean;
 }
 
 export interface ChannelMessageInfo {
@@ -112,4 +114,12 @@ export async function banChannelMember(channelId: string, memberPubkey: string):
 
 export async function unbanChannelMember(channelId: string, memberPubkey: string): Promise<void> {
   return invoke('unban_channel_member', { channelId, memberPubkey });
+}
+
+export async function addChannelModerator(channelId: string, memberPubkey: string): Promise<void> {
+  return invoke('add_channel_moderator', { channelId, memberPubkey });
+}
+
+export async function removeChannelModerator(channelId: string, memberPubkey: string): Promise<void> {
+  return invoke('remove_channel_moderator', { channelId, memberPubkey });
 }

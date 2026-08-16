@@ -2,7 +2,14 @@
   import { onDestroy } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
+  import {
+    getChannelMessages,
+    markChannelMessagesRead,
+    sendChannelMessage,
+    type ChannelMessageInfo,
+  } from '$lib/api/channels';
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
+  import { clearChannelUnread } from '$lib/stores/channels';
   import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
@@ -22,9 +29,25 @@
   interface Props {
     friendHash: string;
     friendName: string;
+    channelId?: string;
+    hideHeader?: boolean;
+    youAreBanned?: boolean;
+    memberNames?: Record<string, string>;
   }
 
-  let { friendHash, friendName }: Props = $props();
+  type ConvMessage = ChatMessage & { sender_pubkey?: string };
+
+  let {
+    friendHash,
+    friendName,
+    channelId = '',
+    hideHeader = false,
+    youAreBanned = false,
+    memberNames = {},
+  }: Props = $props();
+
+  let isChannel = $derived(channelId.length > 0);
+  let conversationKey = $derived(isChannel ? `ch:${channelId}` : friendHash);
 
   // Live verification/online indicator. After the H1 fix the
   // `ember:friend-online` event is only emitted after the peer's
@@ -34,12 +57,12 @@
   // surface a warning that the message will be queued and may reach
   // a peer that hasn't been re-authenticated since this session
   // opened.
-  let isOnline = $derived(friendHash ? $onlineFriends.has(friendHash) : false);
+  let isOnline = $derived(!isChannel && friendHash ? $onlineFriends.has(friendHash) : false);
 
   // The user can disable chat entirely in Settings; when off, the backend
   // drops inbound and refuses outbound chat, so reflect that in the UI rather
   // than letting the user type into a textarea whose sends will be rejected.
-  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
+  let chatDisabled = $derived(!isChannel && $appSettings?.friend_chat_disabled === true);
 
   /**
    * Hard cap on in-memory chat messages per conversation. Old messages beyond
@@ -56,7 +79,7 @@
    */
   const MAX_LIVE_MESSAGES = MAX_LOADED_MESSAGES;
 
-  let messages: ChatMessage[] = $state([]);
+  let messages: ConvMessage[] = $state([]);
   let inputText = $state('');
   let loading = $state(false);
   let sending = $state(false);
@@ -90,66 +113,67 @@
   // wrongly hid "load older" even though the DB still had history.
   let oldestDbId: number | null = null;
 
+  function fromChannelRow(row: ChannelMessageInfo): ConvMessage {
+    return {
+      id: row.id,
+      direction: row.direction === 'sent' ? 'sent' : 'received',
+      message: row.message,
+      timestamp: row.timestamp,
+      read: row.read,
+      delivery: 'delivered',
+      sender_pubkey: row.sender_pubkey,
+    };
+  }
+
+  function senderLabel(pubkey?: string): string {
+    if (!pubkey) return '';
+    const name = memberNames[pubkey];
+    if (name) return name;
+    return pubkey.slice(0, 8) + '\u2026';
+  }
+
   $effect(() => {
-    if (!chatInputEl) return;
+    if (!chatInputEl || youAreBanned) return;
     const raf = requestAnimationFrame(() => chatInputEl?.focus());
     return () => cancelAnimationFrame(raf);
   });
 
   // Whenever the active conversation changes (mounted with new
-  // friendHash, or parent reuses this component for a different
+  // friendHash/channelId, or parent reuses this component for a different
   // tab), tear down the previous listener + state and re-fetch.
   $effect(() => {
-    // Capture friendHash into a local so the cleanup closure
-    // below can save the draft against the conversation we're
-    // LEAVING (not the one we're entering). Reading `friendHash`
-    // directly inside cleanup would resolve to the new tab's hash
-    // because Svelte runs cleanup AFTER the rune has settled to
-    // its new value, which would clobber the new tab's draft with
-    // text typed in the old tab.
-    const hash = friendHash;
-    if (hash) {
+    // Capture keys into locals so the cleanup closure below can save the
+    // draft against the conversation we're LEAVING. Reading the props
+    // directly inside cleanup would resolve to the new tab's id because
+    // Svelte runs cleanup AFTER the rune has settled to its new value.
+    const key = conversationKey;
+    const channel = channelId;
+    const friend = friendHash;
+    if (key) {
       sendError = null;
       sending = false;
-      // Restore any draft the user had typed for THIS conversation
-      // before they switched tabs / closed the dock. New drafts
-      // are saved in the cleanup below. Empty string is a valid
-      // draft (the map slot is deleted on empty so we don't
-      // accumulate empty entries from every visited tab).
-      inputText = getDraft(hash);
-      activeChatHash.set(hash);
-      // Drop any unread badge accumulated for this friend BEFORE the
-      // chat opened. `markAsRead` clears the DB rows; the global
-      // store mirrored those counts and would stay stuck on the
-      // pre-open value otherwise.
-      clearUnread(hash);
+      inputText = getDraft(key);
+      if (channel) {
+        clearChannelUnread(channel);
+      } else {
+        activeChatHash.set(friend);
+        clearUnread(friend);
+      }
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       messages = [];
       earlyDeliveredIds.clear();
-      // Reset load state for the new conversation. Without this, the
-      // previous tab's `loadError` (or stale `loading`/pagination flags)
-      // is shown against the just-cleared (empty) message list during the
-      // brief `await setupListener` window before `loadMessages` runs.
       loadError = null;
       liveError = false;
       loading = true;
       loadingOlder = false;
       hasMoreHistory = false;
       oldestDbId = null;
-      // Await the listener registration BEFORE the historical
-      // snapshot fetch starts. Otherwise a chat-message that arrives
-      // during the (possibly 50–200 ms) `getChatMessages` round trip
-      // is dropped on the floor — the listener isn't attached yet,
-      // and the snapshot doesn't include rows that were inserted
-      // after it began. `loadMessages` then merges its result
-      // against any push events that landed in the meantime,
-      // deduping by content tuple.
       (async () => {
-        const listenerOk = await setupListener(gen, hash);
+        const listenerOk = await setupListener(gen, friend, channel);
         if (gen !== loadGen) return;
-        await loadMessages(gen, hash);
+        await loadMessages(gen, friend, channel);
         if (gen === loadGen) liveError = !listenerOk;
       })();
       markAsRead();
@@ -158,22 +182,57 @@
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-      // Save whatever the user has typed-but-not-sent against the
-      // hash they were ON when this effect last ran. `inputText`
-      // is a $state, so reading it here resolves to the latest
-      // keystroke value — exactly what we want to stash.
-      if (hash) setDraft(hash, inputText);
-      // Clear active-chat tracking when the conversation closes or
-      // the friend hash changes, so subsequent chat-message events
-      // resume bumping `unreadCounts` as usual.
-      activeChatHash.set(null);
+      if (key) setDraft(key, inputText);
+      if (!channel) activeChatHash.set(null);
     };
   });
 
-  async function setupListener(gen: number, hash: string): Promise<boolean> {
+  async function setupListener(gen: number, hash: string, channel: string): Promise<boolean> {
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
-      if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (channel) {
+      let fn: UnlistenFn;
+      try {
+        fn = await listen<{
+          id: number;
+          channel_id: string;
+          sender_pubkey: string;
+          direction: string;
+          message: string;
+          timestamp: number;
+        }>('ember:channel-message', (event) => {
+          if (gen !== loadGen) return;
+          if (event.payload.channel_id !== channel) return;
+          if (messages.some((mm) => mm.id === event.payload.id)) return;
+          const wasPinned = isPinnedToBottom();
+          const next: ConvMessage[] = [...messages, {
+            id: event.payload.id,
+            direction: event.payload.direction === 'sent' ? 'sent' : 'received',
+            message: event.payload.message,
+            timestamp: event.payload.timestamp,
+            read: true,
+            delivery: 'delivered',
+            sender_pubkey: event.payload.sender_pubkey,
+          }];
+          messages = next.length > MAX_LIVE_MESSAGES
+            ? next.slice(next.length - MAX_LIVE_MESSAGES)
+            : next;
+          if (event.payload.direction === 'sent' || wasPinned) {
+            scrollToBottom();
+          }
+          if (event.payload.direction === 'received' && isAppVisible()) {
+            markAsRead();
+          }
+        });
+      } catch (e) {
+        console.warn('ChatConversation: failed to register channel listener', e);
+        return false;
+      }
+      if (gen !== loadGen) { fn(); return false; }
+      unlisten = fn;
+      return true;
+    }
     let fn: UnlistenFn;
     try {
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
@@ -262,11 +321,13 @@
     return true;
   }
 
-  async function loadMessages(gen: number, hash: string) {
+  async function loadMessages(gen: number, hash: string, channel: string) {
     loading = true;
     loadError = null;
     try {
-      const rows = await getChatMessages(hash, PAGE_SIZE);
+      const rows: ConvMessage[] = channel
+        ? (await getChannelMessages(channel, PAGE_SIZE)).map(fromChannelRow)
+        : await getChatMessages(hash, PAGE_SIZE);
       if (gen !== loadGen) return;
       hasMoreHistory = rows.length >= PAGE_SIZE;
       const snapshot = rows.reverse();
@@ -322,8 +383,9 @@
   }
 
   async function loadOlderMessages() {
-    if (loadingOlder || !hasMoreHistory || !friendHash) return;
+    if (loadingOlder || !hasMoreHistory || !conversationKey) return;
     const hash = friendHash;
+    const channel = channelId;
     // Bound in-memory history. The rest stays in the DB; stopping here keeps
     // both the array and the rendered DOM from growing without limit on a very
     // long conversation.
@@ -340,7 +402,9 @@
         hasMoreHistory = false;
         return;
       }
-      const rows = await getChatMessages(hash, PAGE_SIZE, cursor);
+      const rows: ConvMessage[] = channel
+        ? (await getChannelMessages(channel, PAGE_SIZE, cursor)).map(fromChannelRow)
+        : await getChatMessages(hash, PAGE_SIZE, cursor);
       if (gen !== loadGen) return;
       if (rows.length === 0) {
         hasMoreHistory = false;
@@ -373,23 +437,31 @@
   }
 
   async function retryLoad() {
-    if (!friendHash) return;
+    if (!conversationKey) return;
     const hash = friendHash;
+    const channel = channelId;
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     liveError = false;
-    const listenerOk = await setupListener(gen, hash);
+    const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
-    await loadMessages(gen, hash);
+    await loadMessages(gen, hash, channel);
     if (gen === loadGen) liveError = !listenerOk;
   }
 
   async function markAsRead() {
-    // Capture the hash up front: `friendHash` is a reactive prop that can
-    // change while the IPC round-trip is in flight (fast tab switching), and
-    // re-reading it after the await would clear unread for the WRONG friend.
+    const channel = channelId;
     const h = friendHash;
+    if (channel) {
+      try {
+        await markChannelMessagesRead(channel);
+        clearChannelUnread(channel);
+      } catch (e) {
+        console.warn('markChannelMessagesRead failed:', e);
+      }
+      return;
+    }
     if (!h) return;
     try {
       await markMessagesRead(h);
@@ -424,7 +496,7 @@
 
   async function handleSend() {
     const text = inputText.trim();
-    if (!text || sending) return;
+    if (!text || sending || youAreBanned) return;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
     // can be under 4096 chars yet over 4096 bytes and be rejected server-side
@@ -433,14 +505,24 @@
       sendError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
       return;
     }
-    // Capture the target friend up front: `friendHash` is a reactive prop that
-    // can change mid-send (fast tab switching), and re-reading it after the
-    // await would clear the draft / surface the send error on the WRONG
-    // conversation. Mirrors `markAsRead` above.
+    const channel = channelId;
     const h = friendHash;
+    const key = conversationKey;
     sending = true;
     sendError = null;
     try {
+      if (channel) {
+        const sent = await sendChannelMessage(channel, text);
+        if (channel === channelId) {
+          if (!messages.some((message) => message.id === sent.id)) {
+            messages = [...messages, fromChannelRow(sent)];
+          }
+          inputText = '';
+          scrollToBottom();
+        }
+        clearDraft(key);
+        return;
+      }
       const result = await sendChatMessage(h, text);
       // A queued send is not echoed back as an `ember:chat-message`, since
       // nothing reached the peer. Append it here so the user sees what they
@@ -474,8 +556,11 @@
       // clear it explicitly; `clearDraft` is a no-op when there's no entry.
       clearDraft(h);
     } catch (e: unknown) {
-      // Don't surface this send's failure on a different conversation.
-      if (h === friendHash) sendError = translateError(e, m.chat_failed_to_send());
+      if (channel) {
+        if (channel === channelId) sendError = translateError(e, m.chat_failed_to_send());
+      } else if (h === friendHash) {
+        sendError = translateError(e, m.chat_failed_to_send());
+      }
     } finally {
       // `sending` is the editor's state, not tied to a friend — always release
       // it so the (possibly newly-active) conversation's input is usable.
@@ -516,6 +601,12 @@
     });
   }
 
+  function sameChannelAuthor(a: ConvMessage, b: ConvMessage): boolean {
+    if (a.direction !== b.direction) return false;
+    if (!isChannel) return true;
+    return (a.sender_pubkey ?? '') === (b.sender_pubkey ?? '');
+  }
+
   /**
    * Messages annotated for display: where a new day starts, and where a run of
    * consecutive messages from the same author begins and ends.
@@ -533,8 +624,8 @@
       const day = days[i];
       const hasNext = i + 1 < messages.length;
       const newDay = day !== null && (i === 0 || days[i - 1] !== day);
-      const sameAuthorAsPrev = i > 0 && messages[i - 1].direction === msg.direction;
-      const sameAuthorAsNext = hasNext && messages[i + 1].direction === msg.direction;
+      const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
+      const sameAuthorAsNext = hasNext && sameChannelAuthor(messages[i + 1], msg);
       // An undated row neither opens nor closes a day, so it stays with its run.
       const sameDayAsNext =
         hasNext && (day === null || days[i + 1] === null || days[i + 1] === day);
@@ -566,6 +657,7 @@
 </script>
 
 <div class="conversation">
+  {#if !hideHeader}
   <div class="conv-header">
     <div class="conv-header-info">
       <div class="conv-avatar" aria-hidden="true">
@@ -607,6 +699,7 @@
       </span>
     </div>
   </div>
+  {/if}
 
   <div class="conv-messages" bind:this={messagesContainerEl}>
     {#if liveError && !loading && !loadError}
@@ -661,6 +754,9 @@
             style spoofing class). The text is still rendered exactly as
             written; only its bidi influence is scoped to this element.
           -->
+          {#if isChannel && row.startsRun && row.msg.direction === 'received'}
+            <div class="bubble-who">{senderLabel(row.msg.sender_pubkey)}</div>
+          {/if}
           <div class="bubble-text"><bdi dir="auto">{row.msg.message}</bdi></div>
           <!--
             Once per run, not once per message: within a burst the timestamps
@@ -687,7 +783,9 @@
     <div class="conv-error">{sendError}</div>
   {/if}
 
-  {#if chatDisabled}
+  {#if youAreBanned}
+    <div class="conv-disabled" role="status">{m.channels_you_are_banned()}</div>
+  {:else if chatDisabled}
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
     <div class="conv-input-area">
@@ -696,7 +794,7 @@
         bind:value={inputText}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
-        placeholder={m.chat_input_placeholder()}
+        placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
         maxlength="4096"
         rows="2"
         disabled={sending}
@@ -974,6 +1072,13 @@
 
   .bubble-text {
     white-space: pre-wrap;
+  }
+
+  .bubble-who {
+    font-size: 11px;
+    font-weight: 600;
+    opacity: 0.75;
+    margin-bottom: 2px;
   }
 
   .bubble-time {
