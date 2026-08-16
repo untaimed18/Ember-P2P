@@ -101,6 +101,10 @@ pub struct DhtInbound {
     pub peer_list: Option<(u32, Vec<EmberContact>)>,
     /// We learned (added) a new contact from this frame's signed sender.
     pub learned_contact: bool,
+    /// The signed sender as a contact, even when the routing table refused
+    /// the address (LAN while `block_private_ips` is on). The network loop
+    /// keeps firsthand eD2K-session peers so FIND_VALUE can still ask them.
+    pub sender_contact: Option<EmberContact>,
     /// Full-bucket liveness checks the caller should perform: each is the
     /// current oldest contact `(addr, node_id, noise_pub)` of a bucket that
     /// just rejected a newcomer into its replacement cache. The caller pings
@@ -929,6 +933,7 @@ impl EmberDht {
                 last_seen: now,
                 failed_queries: 0,
             };
+            out.sender_contact = Some(contact.clone());
             match self.routing.add_contact(contact) {
                 AddResult::Added => out.learned_contact = true,
                 AddResult::PingOldest {

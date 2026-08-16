@@ -1334,6 +1334,64 @@ fn xx_bridge_candidates_at(
         .collect()
 }
 
+/// Hard cap on firsthand DHT contacts learned from live eD2K Ember sessions.
+/// These sit beside the routing table so a LAN peer can be asked without
+/// being gossiped onto the public overlay.
+const MAX_EMBER_SESSION_DHT_CONTACTS: usize = 64;
+
+fn record_ember_session_dht_contact(
+    map: &mut HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+    contact: ember::dht::EmberContact,
+) {
+    let IpAddr::V4(ip) = contact.addr.ip() else {
+        return;
+    };
+    if contact.addr.port() == 0 || crate::security::is_bogus_v4(ip) {
+        return;
+    }
+    let key = (ip, contact.addr.port());
+    if map.len() >= MAX_EMBER_SESSION_DHT_CONTACTS && !map.contains_key(&key) {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, c)| c.last_seen)
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(key, contact);
+}
+
+fn ember_session_introduced(state: &NetworkState, ip: Ipv4Addr, udp_port: u16) -> bool {
+    state.ember_keyless_peers.contains_key(&(ip, udp_port))
+        || state.ember_session_dht_contacts.contains_key(&(ip, udp_port))
+        || state.ember_transport.recently_dialled(IpAddr::V4(ip))
+        || state.known_ember_peers.keys().any(|(peer_ip, _)| *peer_ip == ip)
+}
+
+fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::dht::EmberContact) {
+    let IpAddr::V4(ip) = contact.addr.ip() else {
+        return;
+    };
+    if !ember_session_introduced(state, ip, contact.addr.port()) {
+        return;
+    }
+    record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);
+}
+
+/// Verified routing-table contacts plus firsthand session peers the table
+/// refused (typically LAN while `block_private_ips` is on).
+fn ember_dht_ui_contact_counts(state: &NetworkState) -> (u32, u32) {
+    let contacts = state.ember_dht.contact_count();
+    let verified = state.ember_dht.routing().verified_len();
+    let extra = state
+        .ember_session_dht_contacts
+        .values()
+        .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
+        .count();
+    ((contacts + extra) as u32, (verified + extra) as u32)
+}
+
 /// Drop expired entries from the noise-key cache. Called next to
 /// `prune_stale_ember_peers` so the two Ember-mesh caches stay in
 /// step on the same TTL.
@@ -7373,6 +7431,32 @@ mod tests {
     }
 
     #[test]
+    fn session_dht_contacts_keep_lan_and_drop_bogus() {
+        let mut map = HashMap::new();
+        let lan = ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([1u8; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4672),
+            noise_pub: [2u8; 32],
+            ed25519_pub: [3u8; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        };
+        record_ember_session_dht_contact(&mut map, lan);
+        assert_eq!(map.len(), 1);
+
+        let loopback = ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([4u8; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4672),
+            noise_pub: [5u8; 32],
+            ed25519_pub: [6u8; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        };
+        record_ember_session_dht_contact(&mut map, loopback);
+        assert_eq!(map.len(), 1, "loopback is never a DHT contact");
+    }
+
+    #[test]
     fn record_ember_noise_key_evicts_oldest_at_capacity() {
         let mut map = HashMap::new();
         // Fill to the cap with sequentially-aged entries so the first
@@ -9710,6 +9794,10 @@ struct NetworkState {
     /// UDP port because the Noise transport rides the shared KAD UDP socket.
     /// Bounded and pruned exactly like `known_ember_peers`.
     ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// Signed DHT identity of an eD2K-session Ember peer. Kept even when the
+    /// routing table refuses the address (LAN / `block_private_ips`) so
+    /// FIND_VALUE can still ask a connected publisher.
+    ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
     ember_rendezvous_published_at: i64,
@@ -10140,6 +10228,100 @@ fn seed_ember_local_records(
         .ember_search
         .seed_local_results(search_id, local_id, local);
     debug!("Ember DHT: seeded {seeded} local record(s) into search {search_id}");
+}
+
+/// Record a live eD2K Ember session as a DHT introduction and ping it now.
+///
+/// A connected peer is not unsolicited LAN gossip: the TCP session already
+/// passed PoP. Skipping `block_private_ips` here is what lets a 1.5.x LAN
+/// neighbour join the overlay. Loopback/multicast/docs ranges stay out.
+async fn note_connected_ember_peer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    ember_native_enabled: bool,
+    ip: Ipv4Addr,
+    tcp_port: u16,
+    udp_port: u16,
+) {
+    if crate::security::is_bogus_v4(ip) {
+        return;
+    }
+    if tcp_port > 0 && record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
+        state.stats.ember_peers = state.known_ember_peers.len() as u32;
+        state.ember_payload_dirty = true;
+    }
+    if udp_port == 0 {
+        return;
+    }
+    record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
+    if !ember_native_enabled {
+        return;
+    }
+    let key = (ip, udp_port);
+    if !bridge_retry_due(
+        &state.ember_kad_bridge_attempted,
+        &key,
+        std::time::Instant::now(),
+    ) {
+        return;
+    }
+    let noise = lookup_ember_noise_key(&state.ember_noise_keys, ip, udp_port);
+    send_ember_bridge_ping(socket, state, ip, udp_port, noise.as_ref()).await;
+}
+
+/// DHT-PING an Ember address so the signed PONG can teach us its node ID.
+async fn send_ember_bridge_ping(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    ip: Ipv4Addr,
+    udp_port: u16,
+    noise_pub: Option<&[u8; 32]>,
+) -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
+    let (_wire_req_id, frame) = state.ember_dht.build_ping();
+    let sent = match state
+        .ember_transport
+        .prepare_outgoing(addr, noise_pub, &frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
+                Ok(_) => true,
+                Err(e) => {
+                    debug!("Ember bridge: ping to {addr} failed: {e}");
+                    false
+                }
+            }
+        }
+        ember::transport::OutgoingResult::Queued => true,
+        ember::transport::OutgoingResult::Error(e) => {
+            debug!("Ember bridge: transport error pinging {addr}: {e}");
+            false
+        }
+    };
+    state
+        .ember_kad_bridge_attempted
+        .insert((ip, udp_port), std::time::Instant::now());
+    if sent {
+        state.ember_diagnostics.ember_dht_kad_bridge_pings = state
+            .ember_diagnostics
+            .ember_dht_kad_bridge_pings
+            .saturating_add(1);
+    }
+    sent
+}
+
+/// Pin connected eD2K Ember peers onto a FIND_VALUE walk. Their records live
+/// on that node; XOR-closest public contacts will not have them.
+fn seed_ember_session_search_contacts(state: &mut NetworkState, search_id: u32) {
+    if state.ember_session_dht_contacts.is_empty() {
+        return;
+    }
+    let extras: Vec<_> = state.ember_session_dht_contacts.values().cloned().collect();
+    let seeded = state.ember_search.seed_extra_contacts(search_id, extras);
+    if seeded > 0 {
+        debug!("Ember DHT: pinned {seeded} session contact(s) onto search {search_id}");
+    }
 }
 
 /// The per-file publish schedule, borrowed as a unit.
@@ -13645,6 +13827,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_kad_bridge_attempted.clear();
     state.known_ember_peers.clear();
     state.ember_keyless_peers.clear();
+    state.ember_session_dht_contacts.clear();
     // `ember_content_hashes` deliberately survives: it holds the expected BLAKE3
     // for downloads in flight, seeded from deep links as well as DHT hits, and
     // clearing it here would drop the digest a running transfer verifies against.
@@ -14409,6 +14592,7 @@ pub async fn start_network(
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
         ember_keyless_peers: HashMap::new(),
+        ember_session_dht_contacts: HashMap::new(),
         ember_rendezvous_published_at: 0,
         ember_rendezvous_search: None,
         ember_rendezvous_looked_up_at: 0,
@@ -17599,16 +17783,18 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port, udp_port } = event {
-                    // Respect `block_private_ips` / filter ranges via
-                    // `is_blocked_readonly` so LAN Ember peers are
-                    // learnable when the user opts into private dialing.
-                    if !state.ip_filter.is_blocked_readonly(ip) {
-                        if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
-                            state.stats.ember_peers = state.known_ember_peers.len() as u32;
-                            state.ember_payload_dirty = true;
-                        }
-                        record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
-                    }
+                    // A live eD2K session is an introduction. Do not apply
+                    // `block_private_ips` here — that would hide a LAN 1.5.x
+                    // neighbour from Ember DHT even though TCP already accepted it.
+                    note_connected_ember_peer(
+                        &udp_socket,
+                        &mut state,
+                        settings.ember_native_enabled,
+                        ip,
+                        tcp_port,
+                        udp_port,
+                    )
+                    .await;
                 }
 
                 if let DownloadEvent::FriendSeen { ember_hash: friend_eh, ip, port } = event {
@@ -18509,13 +18695,15 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port, udp_port } = event.kind {
-                    if !state.ip_filter.is_blocked_readonly(ip) {
-                        if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
-                            state.stats.ember_peers = state.known_ember_peers.len() as u32;
-                            state.ember_payload_dirty = true;
-                        }
-                        record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);
-                    }
+                    note_connected_ember_peer(
+                        &udp_socket,
+                        &mut state,
+                        settings.ember_native_enabled,
+                        ip,
+                        tcp_port,
+                        udp_port,
+                    )
+                    .await;
                 }
 
                 // Any inbound friend activity implies they're online — update
@@ -31152,6 +31340,10 @@ pub async fn start_network(
                 prune_stale_ember_peers(&mut state.known_ember_peers);
                 prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
                 prune_stale_ember_peers(&mut state.ember_keyless_peers);
+                state.ember_session_dht_contacts.retain(|(ip, port), _| {
+                    state.ember_keyless_peers.contains_key(&(*ip, *port))
+                        || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
+                });
                 // The bridge's "already attempted" set has no TTL of its own;
                 // bound it to the two caches it mirrors. Once a peer ages out
                 // of both (and is later re-learned) we want to be able to
@@ -33998,13 +34190,23 @@ fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr) -> bool {
         std::net::IpAddr::V4(v4) => Some(v4),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
     } {
-        if state.ip_filter.is_blocked_readonly(v4) {
+        if crate::security::is_bogus_v4(v4) {
             debug!("Dropping Ember UDP from blocked IP {from}");
             return false;
         }
         if state.banned_ips.contains(&v4) {
             debug!("Dropping Ember UDP from banned peer {from}");
             return false;
+        }
+        if state.ip_filter.is_blocked_readonly(v4) {
+            // Live eD2K Ember sessions and our own outbound DHT pings are
+            // introductions, not unsolicited LAN gossip.
+            let session_ok = crate::security::is_lan_or_cgnat_v4(v4)
+                && ember_session_introduced(state, v4, from.port());
+            if !session_ok {
+                debug!("Dropping Ember UDP from blocked IP {from}");
+                return false;
+            }
         }
     }
 
@@ -35991,6 +36193,7 @@ async fn start_ember_source_search(
         return false;
     };
     seed_ember_local_records(state, search_id, &source_key, &[]);
+    seed_ember_session_search_contacts(state, search_id);
     state
         .ember_download_source_searches
         .insert(search_id, (transfer_id.to_string(), file_hash));
@@ -36034,96 +36237,33 @@ async fn run_ember_maintenance(
             EMBER_KAD_BRIDGE_MAX_PINGS,
         );
         for (ip, port, noise_pub) in candidates {
-            let addr = SocketAddr::new(IpAddr::V4(ip), port);
-            let (_wire_req_id, frame) = state.ember_dht.build_ping();
-            let sent = match state
-                .ember_transport
-                .prepare_outgoing(addr, Some(&noise_pub), &frame)
-            {
-                ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember KAD-bridge: ping to {addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::Queued => true,
-                ember::transport::OutgoingResult::Error(e) => {
-                    debug!("Ember KAD-bridge: transport error pinging {addr}: {e}");
-                    false
-                }
-            };
-            // Mark attempted regardless of send outcome: a peer we couldn't
-            // reach now is unlikely to become reachable within the same
-            // bootstrap window, and this guarantees the bridge advances
-            // through the cache instead of retrying the same few each tick.
-            state
-                .ember_kad_bridge_attempted
-                .insert((ip, port), std::time::Instant::now());
-            if sent {
+            if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
                 result.kad_bridge_pings_sent += 1;
-                state.ember_diagnostics.ember_dht_kad_bridge_pings = state
-                    .ember_diagnostics
-                    .ember_dht_kad_bridge_pings
-                    .saturating_add(1);
             }
         }
-        // Same bootstrap, for peers met over an eD2K client-to-client session
-        // instead of a KAD source tag. Those carry no Noise key, so the
-        // transport negotiates Noise_XX (2-RTT) rather than IK — a peer with
-        // servers but no KAD would otherwise have no way into the DHT at all.
-        // Budgeted against whatever the IK pass left so one tick can't burst.
-        let xx_budget = EMBER_KAD_BRIDGE_MAX_PINGS.saturating_sub(result.kad_bridge_pings_sent);
-        let xx_candidates = xx_bridge_candidates(
-            &state.ember_keyless_peers,
-            &state.ember_noise_keys,
-            &state.ember_kad_bridge_attempted,
-            xx_budget,
+    }
+    // eD2K XX-bridge: a live client session is an introduction even when the
+    // public table is already full. Without this, a LAN or island 1.5.x peer
+    // is never DHT-pinged and FIND_VALUE never asks it.
+    let xx_budget = EMBER_KAD_BRIDGE_MAX_PINGS.saturating_sub(result.kad_bridge_pings_sent);
+    let xx_candidates = xx_bridge_candidates(
+        &state.ember_keyless_peers,
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        xx_budget,
+    );
+    let mut xx_sent = 0usize;
+    for (ip, port) in xx_candidates {
+        if send_ember_bridge_ping(socket, state, ip, port, None).await {
+            xx_sent += 1;
+            result.kad_bridge_pings_sent += 1;
+        }
+    }
+    if result.kad_bridge_pings_sent > 0 {
+        debug!(
+            "Ember bridge: pinged {} peer(s) to seed the DHT ({xx_sent} over Noise_XX)",
+            result.kad_bridge_pings_sent
         );
-        let mut xx_sent = 0usize;
-        for (ip, port) in xx_candidates {
-            let addr = SocketAddr::new(IpAddr::V4(ip), port);
-            let (_wire_req_id, frame) = state.ember_dht.build_ping();
-            let sent = match state.ember_transport.prepare_outgoing(addr, None, &frame) {
-                ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember XX-bridge: ping to {addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::Queued => true,
-                ember::transport::OutgoingResult::Error(e) => {
-                    debug!("Ember XX-bridge: transport error pinging {addr}: {e}");
-                    false
-                }
-            };
-            // Same one-shot policy as the IK pass: advance through the cache
-            // rather than retrying the same unreachable few every tick.
-            state
-                .ember_kad_bridge_attempted
-                .insert((ip, port), std::time::Instant::now());
-            if sent {
-                xx_sent += 1;
-                result.kad_bridge_pings_sent += 1;
-                state.ember_diagnostics.ember_dht_kad_bridge_pings = state
-                    .ember_diagnostics
-                    .ember_dht_kad_bridge_pings
-                    .saturating_add(1);
-            }
-        }
-        if result.kad_bridge_pings_sent > 0 {
-            debug!(
-                "Ember bridge: pinged {} peer(s) to seed the DHT ({xx_sent} over Noise_XX)",
-                result.kad_bridge_pings_sent
-            );
-        }
     }
 
     // 0a) Disconnect detection. If nothing has spoken to us for a long
@@ -36457,7 +36597,7 @@ async fn run_ember_maintenance(
         }
     }
 
-    let verified_now = state.ember_dht.routing().verified_len() as u32;
+    let verified_now = ember_dht_ui_contact_counts(state).1;
     if note_ember_verified_contacts(&mut state.ember_verified_highwater, verified_now) {
         state.ember_verified_highwater_dirty = true;
     }
@@ -36561,6 +36701,9 @@ async fn handle_ember_dht_message(
     // silence is what triggers a re-bootstrap in the maintenance loop.
     if inbound.sender_id.is_some() {
         state.ember_last_inbound = Some(now);
+    }
+    if let Some(contact) = inbound.sender_contact.clone() {
+        remember_ember_session_dht_contact(state, contact);
     }
 
     // A PING from a public address we have neither a contact for nor ever dialled
@@ -40363,6 +40506,7 @@ async fn handle_command_inner(
                         state.ember_dht.routing(),
                     ) {
                         seed_ember_local_records(state, search_id, primary_hash, &extras);
+                        seed_ember_session_search_contacts(state, search_id);
                         state.ember_keyword_searches.insert(
                             search_id,
                             EmberKeywordSearch {
@@ -41780,9 +41924,9 @@ async fn handle_command_inner(
             state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
             // EmberDHT status-bar gauges — same sources as GetEmberDiagnostics.
             state.stats.ember_native_enabled = settings.ember_native_enabled;
-            state.stats.ember_dht_contacts = state.ember_dht.contact_count() as u32;
-            state.stats.ember_dht_verified_contacts =
-                state.ember_dht.routing().verified_len() as u32;
+            let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
+            state.stats.ember_dht_contacts = ember_contacts;
+            state.stats.ember_dht_verified_contacts = ember_verified;
             let _ = tx.send(state.stats.clone());
         }
 
@@ -41795,8 +41939,9 @@ async fn handle_command_inner(
                 hex::encode(state.ember_transport.local_noise_public_key());
             diag.ember_dht_node_id = state.ember_dht.local_id().to_hex();
             diag.local_ed25519_public_key = hex::encode(state.ember_dht.ed25519_public_key());
-            diag.ember_dht_contacts = state.ember_dht.contact_count() as u32;
-            diag.ember_dht_verified_contacts = state.ember_dht.routing().verified_len() as u32;
+            let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
+            diag.ember_dht_contacts = ember_contacts;
+            diag.ember_dht_verified_contacts = ember_verified;
             if note_ember_verified_contacts(
                 &mut state.ember_verified_highwater,
                 diag.ember_dht_verified_contacts,
@@ -42438,6 +42583,7 @@ async fn handle_command_inner(
             };
 
             seed_ember_local_records(state, search_id, primary_hash, &extras);
+            seed_ember_session_search_contacts(state, search_id);
 
             let (records_tx, records_rx) = oneshot::channel();
             state

@@ -5129,7 +5129,7 @@ async fn download_parts_from_source(
                                         if let std::net::IpAddr::V4(v4) = addr.ip() {
                                             let peer_tcp = addr.port();
                                             if peer_tcp > 0
-                                                && !crate::security::is_special_use_v4(v4)
+                                                && !crate::security::is_bogus_v4(v4)
                                             {
                                                 if let Some(ref etx) = event_tx {
                                                     let _ = etx
@@ -5290,7 +5290,7 @@ async fn download_parts_from_source(
     if hello_caps.is_ember && ember_hash_binding_verified && !mesh_discovered_emitted {
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
-            if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
+            if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                 if let Some(ref etx) = event_tx {
                     let _ = etx
                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -5775,7 +5775,7 @@ async fn download_parts_from_source(
                             if hello_caps.is_ember && !mesh_discovered_emitted {
                                 if let std::net::IpAddr::V4(v4) = addr.ip() {
                                     let peer_tcp = addr.port();
-                                    if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
+                                    if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                                         if let Some(ref etx) = event_tx {
                                             let _ = etx
                                                 .send(DownloadEvent::EmberPeerDiscovered {
@@ -5856,7 +5856,7 @@ async fn download_parts_from_source(
                                 if hello_caps.is_ember && !mesh_discovered_emitted {
                                     if let std::net::IpAddr::V4(v4) = addr.ip() {
                                         let peer_tcp = addr.port();
-                                        if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
+                                        if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                                             if let Some(ref etx) = event_tx {
                                                 let _ = etx
                                                     .send(DownloadEvent::EmberPeerDiscovered {

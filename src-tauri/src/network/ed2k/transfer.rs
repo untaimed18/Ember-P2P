@@ -2075,7 +2075,7 @@ impl Ed2kDownload {
                                             {
                                                 let peer_tcp = self.source_addr.port();
                                                 if peer_tcp > 0
-                                                    && !crate::security::is_special_use_v4(v4)
+                                                    && !crate::security::is_bogus_v4(v4)
                                                 {
                                                     let _ = event_tx
                                                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -2217,7 +2217,7 @@ impl Ed2kDownload {
         if peer_is_ember && ember_hash_binding_verified && !mesh_discovered_emitted {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
-                if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
+                if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                     let _ = event_tx
                         .send(DownloadEvent::EmberPeerDiscovered {
                             ip: v4,
@@ -2705,7 +2705,7 @@ impl Ed2kDownload {
                                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                             let peer_tcp = self.source_addr.port();
                                             if peer_tcp > 0
-                                                && !crate::security::is_special_use_v4(v4)
+                                                && !crate::security::is_bogus_v4(v4)
                                             {
                                                 let _ = event_tx
                                                     .send(DownloadEvent::EmberPeerDiscovered {
@@ -2800,7 +2800,7 @@ impl Ed2kDownload {
                                             {
                                                 let peer_tcp = self.source_addr.port();
                                                 if peer_tcp > 0
-                                                    && !crate::security::is_special_use_v4(v4)
+                                                    && !crate::security::is_bogus_v4(v4)
                                                 {
                                                     let _ = event_tx
                                                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -4509,7 +4509,7 @@ impl Ed2kDownload {
                                                 {
                                                     let peer_tcp = self.source_addr.port();
                                                     if peer_tcp > 0
-                                                        && !crate::security::is_special_use_v4(v4)
+                                                        && !crate::security::is_bogus_v4(v4)
                                                     {
                                                         let _ = event_tx
                                                             .send(
