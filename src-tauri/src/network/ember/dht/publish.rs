@@ -34,11 +34,9 @@ pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
 const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
 const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
-const CHANNEL_NAME_MAX: usize = 64;
-#[allow(dead_code)]
-const CHANNEL_WELCOME_MAX: usize = 512;
-#[allow(dead_code)]
-const CHANNEL_BAN_LIST_MAX: usize = 32;
+pub const CHANNEL_NAME_MAX: usize = 64;
+pub const CHANNEL_WELCOME_MAX: usize = 512;
+pub const CHANNEL_BAN_LIST_MAX: usize = 32;
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
@@ -101,6 +99,16 @@ pub struct ChannelPresenceMember {
     pub nickname: String,
     pub timestamp: i64,
     pub noise_pub: [u8; 32],
+}
+
+/// Owner-signed topic, welcome, and ban list. No addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModeration {
+    pub topic: String,
+    pub welcome: String,
+    pub banned_pubkeys: Vec<[u8; 32]>,
+    pub timestamp: i64,
+    pub publisher_key: [u8; 32],
 }
 
 pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
@@ -240,7 +248,6 @@ impl SignedRecord {
     }
 
     /// Moderation record signed by the **channel** key: topic, welcome, bans.
-    #[allow(dead_code)]
     pub fn channel_moderation(
         topic: &str,
         welcome: &str,
@@ -430,6 +437,33 @@ impl SignedRecord {
         })
     }
 
+    /// Parse an owner-signed moderation blob. Topic lives in `file_name`;
+    /// welcome and the ban list are in the trailer extra.
+    pub fn parse_channel_moderation(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelModeration> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_MODERATION {
+            return None;
+        }
+        let (welcome, banned_pubkeys) = decode_moderation_extra(&meta.extra)?;
+        Some(ChannelModeration {
+            topic: rec.file_name,
+            welcome,
+            banned_pubkeys,
+            timestamp: rec.timestamp,
+            publisher_key: rec.publisher_key,
+        })
+    }
+
     /// Whether `blob` carries a signature its embedded publisher key really
     /// made, without building the record.
     ///
@@ -581,7 +615,6 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-#[allow(dead_code)]
 fn encode_moderation_extra(welcome: &str, banned_pubkeys: &[[u8; 32]]) -> Vec<u8> {
     let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
     let bans = banned_pubkeys
@@ -599,7 +632,6 @@ fn encode_moderation_extra(welcome: &str, banned_pubkeys: &[[u8; 32]]) -> Vec<u8
 }
 
 /// Decode the extra blob from a moderation record.
-#[allow(dead_code)]
 pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>)> {
     if extra.len() < 4 {
         return None;
@@ -1082,6 +1114,16 @@ mod tests {
         assert_eq!(parsed.file_name, "rules");
         assert_eq!(welcome, "be kind");
         assert_eq!(bans, banned);
+
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let mod_info =
+            SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
+        assert_eq!(mod_info.topic, "rules");
+        assert_eq!(mod_info.welcome, "be kind");
+        assert_eq!(mod_info.banned_pubkeys, banned);
+        assert_eq!(mod_info.publisher_key, ident.pubkey);
+        assert!(SignedRecord::parse_channel_moderation(&blob, &[0x00; 16]).is_none());
     }
 
     #[test]

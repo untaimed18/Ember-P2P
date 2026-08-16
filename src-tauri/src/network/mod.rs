@@ -10059,6 +10059,14 @@ struct NetworkState {
     ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
     /// Last presence FIND_VALUE start per channel.
     channel_presence_fetch_at: HashMap<[u8; 16], i64>,
+    /// In-flight FIND_VALUE of channel moderation keys (`search_id` → channel).
+    ember_channel_moderation_searches: HashMap<u32, [u8; 16]>,
+    /// Moderation blobs waiting for DB apply + UI emit (async drain).
+    ember_pending_channel_moderation: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// Last moderation FIND_VALUE start per channel.
+    channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
+    /// Last owner moderation STORE per channel.
+    channel_moderation_publish_at: HashMap<[u8; 16], i64>,
     /// Member Ed25519 → Noise static key from presence extra (no IP).
     ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
@@ -10369,6 +10377,180 @@ async fn maybe_refresh_channel_members(
     }
 }
 
+const CHANNEL_MODERATION_FETCH_PER_TICK: usize = 2;
+const CHANNEL_MODERATION_PUBLISH_PER_TICK: usize = 2;
+
+/// FIND_VALUE the owner-signed moderation record (topic, welcome, bans).
+/// One key per channel — extra FIND_VALUE keys intersect by `file_hash`.
+async fn maybe_refresh_channel_moderation(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if started >= CHANNEL_MODERATION_FETCH_PER_TICK {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        if state
+            .ember_channel_moderation_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let last = state
+            .channel_moderation_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::MODERATION_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::moderation_key(&channel_id);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_moderation_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_moderation_fetch_at.insert(channel_id, now);
+        started += 1;
+    }
+}
+
+fn ingest_channel_moderation_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
+        return false;
+    };
+    let mut best: Option<ember::dht::publish::ChannelModeration> = None;
+    for blob in records {
+        let Some(parsed) =
+            ember::dht::publish::SignedRecord::parse_channel_moderation(blob, &channel_id)
+        else {
+            continue;
+        };
+        if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|cur| parsed.timestamp > cur.timestamp)
+        {
+            best = Some(parsed);
+        }
+    }
+    let Some(moderation) = best else {
+        return false;
+    };
+    db.apply_channel_moderation(
+        &channel_id_hex,
+        &moderation.topic,
+        &moderation.welcome,
+        moderation.timestamp,
+        &moderation.banned_pubkeys,
+    )
+    .unwrap_or(false)
+}
+
+/// Owners re-STORE the moderation record so the 24h DHT TTL cannot age out.
+async fn maybe_publish_channel_moderation(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if started >= CHANNEL_MODERATION_PUBLISH_PER_TICK {
+            break;
+        }
+        if !ch.is_owner {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let last = state
+            .channel_moderation_publish_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::MODERATION_REPUBLISH_SECS {
+            continue;
+        }
+        let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
+            continue;
+        };
+        let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+        if ident.channel_id != channel_id {
+            continue;
+        }
+        let bans = db
+            .list_banned_channel_pubkeys(&ch.channel_id)
+            .unwrap_or_default();
+        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        let record = ember::dht::publish::SignedRecord::channel_moderation(
+            &ch.topic,
+            &ch.welcome,
+            &bans,
+            channel_id,
+            ident.pubkey,
+            private,
+            &ident.signing_key,
+        );
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            state.channel_moderation_publish_at.insert(channel_id, now);
+            drive_ember_publish(socket, state, publish_id).await;
+            started += 1;
+        }
+    }
+}
+
 fn ingest_channel_presence_records(
     state: &mut NetworkState,
     db: &Database,
@@ -10652,11 +10834,17 @@ async fn handle_inbound_channel_gossip(
     let Some((sender_pk, text)) = ember::channel::decode_channel_chat_plain(&plain) else {
         return;
     };
+    let sender_hex = hex::encode(sender_pk);
+    if db
+        .channel_member_is_banned(&channel_id_hex, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
     let cleaned = crate::security::sanitize_chat_text(&text);
     if cleaned.is_empty() || cleaned.len() > 4096 {
         return;
     }
-    let sender_hex = hex::encode(sender_pk);
     let msg_id_hex = hex::encode(gossip.msg_id);
     if db
         .channel_message_exists(&channel_id_hex, &msg_id_hex)
@@ -14185,6 +14373,10 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_presence_searches.clear();
     state.ember_pending_channel_presence.clear();
     state.channel_presence_fetch_at.clear();
+    state.ember_channel_moderation_searches.clear();
+    state.ember_pending_channel_moderation.clear();
+    state.channel_moderation_fetch_at.clear();
+    state.channel_moderation_publish_at.clear();
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
@@ -15079,6 +15271,10 @@ pub async fn start_network(
         ember_channel_presence_searches: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         channel_presence_fetch_at: HashMap::new(),
+        ember_channel_moderation_searches: HashMap::new(),
+        ember_pending_channel_moderation: Vec::new(),
+        channel_moderation_fetch_at: HashMap::new(),
+        channel_moderation_publish_at: HashMap::new(),
         ember_channel_noise_keys: HashMap::new(),
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
@@ -31813,6 +32009,7 @@ pub async fn start_network(
                     && state.ember_pending_source_injections.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
                     && state.ember_pending_channel_presence.is_empty()
+                    && state.ember_pending_channel_moderation.is_empty()
                     // The batch publisher is on an entirely separate path from
                     // the maps above — `flush_ember_batch_publish` only ever
                     // writes `in_flight` — and `expire()` below is its only
@@ -31889,6 +32086,7 @@ pub async fn start_network(
                         maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
                     }
                     state.ember_channel_presence_searches.remove(&search_id);
+                    state.ember_channel_moderation_searches.remove(&search_id);
                     // A publish-target lookup can end here rather than through
                     // `maybe_finish_ember_search`: if every send in its first
                     // batch fails, the whole shortlist goes back to Pending, so
@@ -32264,6 +32462,17 @@ pub async fn start_network(
                         );
                     }
                 }
+                if !state.ember_pending_channel_moderation.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_moderation);
+                    for (channel_id, records) in pending {
+                        if ingest_channel_moderation_records(&db, channel_id, &records) {
+                            let _ = app_handle.emit(
+                                "ember:channel-moderation",
+                                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+                            );
+                        }
+                    }
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_search_timer' panicked: {}", describe_panic(&*__p));
@@ -32294,9 +32503,18 @@ pub async fn start_network(
                         &identity,
                     )
                     .await;
+                    maybe_publish_channel_moderation(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                    )
+                    .await;
                 }
                 if settings.ember_native_enabled {
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings)
+                        .await;
+                    maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)
                         .await;
                 }
 
@@ -35184,6 +35402,12 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
             {
                 state
                     .ember_pending_channel_presence
+                    .push((channel_id, records));
+            } else if let Some(channel_id) =
+                state.ember_channel_moderation_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_moderation
                     .push((channel_id, records));
             }
         }

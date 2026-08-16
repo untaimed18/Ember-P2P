@@ -12,6 +12,7 @@ export interface ChannelInfo {
   last_active: number;
   member_count: number;
   unread: number;
+  you_are_banned: boolean;
 }
 
 export interface ChannelMemberInfo {
@@ -19,6 +20,7 @@ export interface ChannelMemberInfo {
   nickname: string;
   last_seen: number;
   banned: boolean;
+  is_self: boolean;
 }
 
 export interface ChannelMessageInfo {
@@ -94,4 +96,20 @@ export async function markChannelMessagesRead(channelId: string): Promise<void> 
 
 export async function gatherChannels(): Promise<GatheredChannelInfo[]> {
   return invoke('gather_channels');
+}
+
+export async function updateChannelModeration(
+  channelId: string,
+  topic: string,
+  welcome: string,
+): Promise<ChannelInfo> {
+  return invoke('update_channel_moderation', { channelId, topic, welcome });
+}
+
+export async function banChannelMember(channelId: string, memberPubkey: string): Promise<void> {
+  return invoke('ban_channel_member', { channelId, memberPubkey });
+}
+
+export async function unbanChannelMember(channelId: string, memberPubkey: string): Promise<void> {
+  return invoke('unban_channel_member', { channelId, memberPubkey });
 }

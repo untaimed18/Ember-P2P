@@ -12,7 +12,9 @@ use crate::network::ember::channel::{
     self, ChannelIdentity, ChannelInvite, CHANNEL_KIND_PRIVATE, CHANNEL_KIND_PUBLIC,
 };
 use crate::network::ember::dht::messages::MAX_FIND_VALUE_KEYS;
-use crate::network::ember::dht::publish::SignedRecord;
+use crate::network::ember::dht::publish::{
+    SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_NAME_MAX, CHANNEL_WELCOME_MAX,
+};
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
 use crate::storage::database::{StoredChannel, StoredChannelMember};
@@ -34,10 +36,11 @@ pub struct ChannelInfo {
     pub last_active: i64,
     pub member_count: i64,
     pub unread: i64,
+    pub you_are_banned: bool,
 }
 
-impl From<StoredChannel> for ChannelInfo {
-    fn from(row: StoredChannel) -> Self {
+impl ChannelInfo {
+    fn from_stored(row: StoredChannel, you_are_banned: bool) -> Self {
         Self {
             channel_id: row.channel_id,
             pubkey: row.pubkey,
@@ -50,6 +53,7 @@ impl From<StoredChannel> for ChannelInfo {
             last_active: row.last_active,
             member_count: row.member_count,
             unread: row.unread,
+            you_are_banned,
         }
     }
 }
@@ -60,15 +64,17 @@ pub struct ChannelMemberInfo {
     pub nickname: String,
     pub last_seen: i64,
     pub banned: bool,
+    pub is_self: bool,
 }
 
-impl From<StoredChannelMember> for ChannelMemberInfo {
-    fn from(row: StoredChannelMember) -> Self {
+impl ChannelMemberInfo {
+    fn from_stored(row: StoredChannelMember, is_self: bool) -> Self {
         Self {
             member_pubkey: row.member_pubkey,
             nickname: row.nickname,
             last_seen: row.last_seen,
             banned: row.banned,
+            is_self,
         }
     }
 }
@@ -128,6 +134,43 @@ fn sanitize_channel_name(name: &str) -> Result<String, String> {
     Ok(cleaned)
 }
 
+fn sanitize_topic(topic: &str) -> Result<String, String> {
+    let cleaned = crate::security::sanitize_remote_text(topic, CHANNEL_NAME_MAX);
+    Ok(truncate_bytes(cleaned, CHANNEL_NAME_MAX))
+}
+
+fn sanitize_welcome(welcome: &str) -> Result<String, String> {
+    let cleaned = crate::security::sanitize_remote_text(welcome, CHANNEL_WELCOME_MAX);
+    Ok(truncate_bytes(cleaned, CHANNEL_WELCOME_MAX))
+}
+
+fn truncate_bytes(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
+    let canonical = hex_str.trim().to_ascii_lowercase();
+    let bytes = hex::decode(&canonical).map_err(|_| {
+        coded(
+            "channels_member_invalid",
+            "Invalid member key",
+        )
+    })?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        coded(
+            "channels_member_invalid",
+            "Invalid member key",
+        )
+    })
+}
+
 fn parse_channel_id(hex_str: &str) -> Result<String, String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     if canonical.len() != 32 || hex::decode(&canonical).map(|b| b.len()).unwrap_or(0) != 16 {
@@ -142,12 +185,23 @@ fn parse_channel_id(hex_str: &str) -> Result<String, String> {
 #[tauri::command]
 pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     require_ember(&state).await?;
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.list_channels())
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
-    Ok(rows.into_iter().map(ChannelInfo::from).collect())
+    let rows = tokio::task::spawn_blocking(move || {
+        let rows = db.list_channels()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let you_are_banned = db
+                .channel_member_is_banned(&row.channel_id, &our_pk)
+                .unwrap_or(false);
+            out.push(ChannelInfo::from_stored(row, you_are_banned));
+        }
+        Ok::<_, anyhow::Error>(out)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -237,6 +291,16 @@ pub async fn create_channel(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
     let _ = publish_signed_record(&state, presence).await;
+    let moderation = SignedRecord::channel_moderation(
+        "",
+        "",
+        &[],
+        ident.channel_id,
+        ident.pubkey,
+        private,
+        &ident.signing_key,
+    );
+    let _ = publish_signed_record(&state, moderation).await;
 
     let invite = ChannelInvite {
         channel_id: ident.channel_id,
@@ -364,7 +428,7 @@ pub async fn join_channel(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
-    Ok(row.into())
+    Ok(ChannelInfo::from_stored(row, false))
 }
 
 #[tauri::command]
@@ -458,12 +522,19 @@ pub async fn list_channel_members(
 ) -> Result<Vec<ChannelMemberInfo>, String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.list_channel_members(&channel_id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_members_failed", "Failed to list members", e))?;
-    Ok(rows.into_iter().map(ChannelMemberInfo::from).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let is_self = row.member_pubkey.eq_ignore_ascii_case(&our_pk);
+            ChannelMemberInfo::from_stored(row, is_self)
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -526,10 +597,25 @@ pub async fn send_channel_message(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    let sender = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let banned_id = channel_id.clone();
+    let banned_pk = sender.clone();
+    let banned = tokio::task::spawn_blocking(move || {
+        db.channel_member_is_banned(&banned_id, &banned_pk)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
+    if banned {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
     let mut msg_id = [0u8; 16];
     OsRng.fill_bytes(&mut msg_id);
     let sender_pk = state.identity.ed25519_public_key;
-    let sender = hex::encode(sender_pk);
     let db = state.db.clone();
     let id = channel_id.clone();
     let sender2 = sender.clone();
@@ -602,6 +688,221 @@ pub async fn mark_channel_messages_read(
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_read_failed", "Failed to mark read", e))?;
+    Ok(())
+}
+
+struct OwnedChannel {
+    row: StoredChannel,
+    ident: ChannelIdentity,
+    channel_id: [u8; 16],
+}
+
+async fn load_owned_channel(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<OwnedChannel, String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let (row, seed) = tokio::task::spawn_blocking(move || {
+        let row = db.get_channel(&id)?;
+        let seed = db.load_channel_owner_seed(&id)?;
+        Ok::<_, anyhow::Error>((row, seed))
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
+    let row = row.ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    if !row.is_owner {
+        return Err(coded(
+            "channels_not_owner",
+            "Only the channel owner can do that",
+        ));
+    }
+    let seed = seed.ok_or_else(|| {
+        coded(
+            "channels_not_owner",
+            "Only the channel owner can do that",
+        )
+    })?;
+    let ident = ChannelIdentity::from_seed(&seed);
+    let Ok(id_bytes) = hex::decode(&row.channel_id) else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    if ident.channel_id != channel_id {
+        return Err(coded(
+            "channels_moderation_failed",
+            "Stored channel key does not match this room",
+        ));
+    }
+    Ok(OwnedChannel {
+        row,
+        ident,
+        channel_id,
+    })
+}
+
+async fn commit_channel_moderation(
+    state: &AppState,
+    owned: &OwnedChannel,
+    topic: &str,
+    welcome: &str,
+    bans: &[[u8; 32]],
+) -> Result<(), String> {
+    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    let record = SignedRecord::channel_moderation(
+        topic,
+        welcome,
+        bans,
+        owned.channel_id,
+        owned.ident.pubkey,
+        private,
+        &owned.ident.signing_key,
+    );
+    let ts = record.timestamp;
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let topic_s = topic.to_string();
+    let welcome_s = welcome.to_string();
+    let bans_v = bans.to_vec();
+    let applied = tokio::task::spawn_blocking(move || {
+        db.apply_channel_moderation(&id, &topic_s, &welcome_s, ts, &bans_v)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to save room info", e))?;
+    if !applied {
+        return Err(coded(
+            "channels_moderation_failed",
+            "A newer moderation record is already stored",
+        ));
+    }
+    let _ = publish_signed_record(state, record).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_channel_moderation(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    topic: String,
+    welcome: String,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let topic = sanitize_topic(&topic)?;
+    let welcome = sanitize_welcome(&welcome)?;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let bans = tokio::task::spawn_blocking(move || db.list_banned_channel_pubkeys(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load bans", e))?;
+    commit_channel_moderation(&state, &owned, &topic, &welcome, &bans).await?;
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let row = tokio::task::spawn_blocking(move || db.get_channel(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?
+        .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    let you_are_banned = state
+        .db
+        .channel_member_is_banned(&channel_id, &our_pk)
+        .unwrap_or(false);
+    Ok(ChannelInfo::from_stored(row, you_are_banned))
+}
+
+#[tauri::command]
+pub async fn ban_channel_member(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    member_pubkey: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to moderate this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let pk = parse_member_pubkey(&member_pubkey)?;
+    if pk == state.identity.ed25519_public_key {
+        return Err(coded(
+            "channels_ban_self",
+            "You cannot ban yourself",
+        ));
+    }
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let mut bans = tokio::task::spawn_blocking(move || db.list_banned_channel_pubkeys(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_ban_failed", "Failed to load bans", e))?;
+    if !bans.contains(&pk) {
+        if bans.len() >= CHANNEL_BAN_LIST_MAX {
+            return Err(coded_ctx(
+                "channels_ban_list_full",
+                format!("Ban list is full (max {CHANNEL_BAN_LIST_MAX})"),
+                CHANNEL_BAN_LIST_MAX,
+            ));
+        }
+        bans.push(pk);
+    }
+    commit_channel_moderation(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unban_channel_member(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    member_pubkey: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to moderate this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let pk = parse_member_pubkey(&member_pubkey)?;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let mut bans = tokio::task::spawn_blocking(move || db.list_banned_channel_pubkeys(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_ban_failed", "Failed to load bans", e))?;
+    bans.retain(|existing| existing != &pk);
+    commit_channel_moderation(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+    )
+    .await?;
     Ok(())
 }
 

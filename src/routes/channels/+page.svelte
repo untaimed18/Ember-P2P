@@ -10,6 +10,7 @@
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import {
+    banChannelMember,
     createChannel,
     gatherChannels,
     getChannelInvite,
@@ -20,6 +21,8 @@
     listChannels,
     markChannelMessagesRead,
     sendChannelMessage,
+    unbanChannelMember,
+    updateChannelModeration,
     type ChannelInfo,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
@@ -43,6 +46,11 @@
   let error: string | null = $state(null);
   let leaveOpen = $state(false);
   let messagesEnd: HTMLDivElement | undefined = $state();
+  let editTopic = $state('');
+  let editWelcome = $state('');
+  let editingModeration = $state(false);
+  let savingModeration = $state(false);
+  let moderatingMember = $state<string | null>(null);
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   let selected = $derived(channels.find((c) => c.channel_id === selectedId) ?? null);
@@ -107,10 +115,35 @@
       if (cancelled) fn();
       else unlistenMembers = fn;
     });
+    let unlistenModeration: UnlistenFn | undefined;
+    listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
+      const id = event.payload.channel_id;
+      listChannels()
+        .then((list) => {
+          channels = list;
+          const ch = list.find((c) => c.channel_id === selectedId);
+          if (ch && !editingModeration) {
+            editTopic = ch.topic;
+            editWelcome = ch.welcome;
+          }
+        })
+        .catch(() => {});
+      if (id === selectedId) {
+        listChannelMembers(id)
+          .then((mems) => {
+            members = mems;
+          })
+          .catch(() => {});
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenModeration = fn;
+    });
     return () => {
       cancelled = true;
       unlisten?.();
       unlistenMembers?.();
+      unlistenModeration?.();
     };
   });
 
@@ -147,6 +180,9 @@
       ]);
       messages = msgs.slice().reverse();
       members = mems;
+      editTopic = channels.find((c) => c.channel_id === id)?.topic ?? '';
+      editWelcome = channels.find((c) => c.channel_id === id)?.welcome ?? '';
+      editingModeration = false;
       await markChannelMessagesRead(id);
       channels = channels.map((c) => (c.channel_id === id ? { ...c, unread: 0 } : c));
       queueMicrotask(() => messagesEnd?.scrollIntoView({ block: 'end' }));
@@ -226,7 +262,7 @@
   }
 
   async function handleSend() {
-    if (!selectedId || sending) return;
+    if (!selectedId || sending || selected?.you_are_banned) return;
     const text = inputText.trim();
     if (!text) return;
     if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
@@ -243,6 +279,47 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       sending = false;
+    }
+  }
+
+  async function handleSaveModeration() {
+    if (!selectedId || savingModeration) return;
+    savingModeration = true;
+    try {
+      const updated = await updateChannelModeration(selectedId, editTopic, editWelcome);
+      channels = channels.map((c) => (c.channel_id === updated.channel_id ? updated : c));
+      editingModeration = false;
+      toastSuccess(m.channels_moderation_saved());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      savingModeration = false;
+    }
+  }
+
+  async function handleBan(memberPubkey: string) {
+    if (!selectedId || moderatingMember) return;
+    moderatingMember = memberPubkey;
+    try {
+      await banChannelMember(selectedId, memberPubkey);
+      members = await listChannelMembers(selectedId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      moderatingMember = null;
+    }
+  }
+
+  async function handleUnban(memberPubkey: string) {
+    if (!selectedId || moderatingMember) return;
+    moderatingMember = memberPubkey;
+    try {
+      await unbanChannelMember(selectedId, memberPubkey);
+      members = await listChannelMembers(selectedId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      moderatingMember = null;
     }
   }
 
@@ -349,13 +426,48 @@
           <header class="conv-header">
             <div>
               <h3>{selected.name}</h3>
-              <p class="topic">{selected.topic || selected.welcome || shortId(selected.channel_id)}</p>
+              {#if selected.topic}
+                <p class="topic">{selected.topic}</p>
+              {/if}
+              {#if selected.welcome}
+                <p class="welcome">{selected.welcome}</p>
+              {/if}
+              {#if !selected.topic && !selected.welcome}
+                <p class="topic">{shortId(selected.channel_id)}</p>
+              {/if}
             </div>
             <div class="conv-actions">
               <button class="ghost" onclick={handleCopyInvite}>{m.channels_invite()}</button>
               <button class="ghost danger" onclick={() => (leaveOpen = true)}>{m.channels_leave()}</button>
             </div>
           </header>
+          {#if selected.is_owner}
+            <form
+              class="moderation-form"
+              onsubmit={(e) => {
+                e.preventDefault();
+                handleSaveModeration();
+              }}
+            >
+              <p class="mod-label">{m.channels_edit_moderation()}</p>
+              <input
+                bind:value={editTopic}
+                maxlength="64"
+                placeholder={m.channels_topic_placeholder()}
+                aria-label={m.channels_topic_placeholder()}
+                oninput={() => (editingModeration = true)}
+              />
+              <textarea
+                bind:value={editWelcome}
+                maxlength="512"
+                rows="2"
+                placeholder={m.channels_welcome_placeholder()}
+                aria-label={m.channels_welcome_placeholder()}
+                oninput={() => (editingModeration = true)}
+              ></textarea>
+              <button type="submit" disabled={savingModeration}>{m.channels_save_moderation()}</button>
+            </form>
+          {/if}
           <div class="messages">
             {#each messages as msg (msg.id)}
               <div class="bubble" class:mine={msg.direction === 'sent'}>
@@ -366,19 +478,56 @@
             <div bind:this={messagesEnd}></div>
           </div>
           {#if members.length > 0}
-            <p class="members">{m.channels_members()}: {members.map((x) => x.nickname || shortId(x.member_pubkey)).join(', ')}</p>
+            <div class="members">
+              <p class="members-label">{m.channels_members()}</p>
+              <ul class="member-list">
+                {#each members as mem (mem.member_pubkey)}
+                  <li>
+                    <span class="member-name">
+                      {mem.is_self ? m.channels_you() : mem.nickname || shortId(mem.member_pubkey)}
+                    </span>
+                    {#if mem.banned}
+                      <span class="badge banned">{m.channels_banned_badge()}</span>
+                    {/if}
+                    {#if selected.is_owner && !mem.is_self}
+                      {#if mem.banned}
+                        <button
+                          class="ghost"
+                          disabled={moderatingMember === mem.member_pubkey}
+                          onclick={() => handleUnban(mem.member_pubkey)}
+                        >
+                          {m.channels_unban()}
+                        </button>
+                      {:else}
+                        <button
+                          class="ghost danger"
+                          disabled={moderatingMember === mem.member_pubkey}
+                          onclick={() => handleBan(mem.member_pubkey)}
+                        >
+                          {m.channels_ban()}
+                        </button>
+                      {/if}
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            </div>
           {/if}
-          <div class="composer">
-            <textarea
-              bind:value={inputText}
-              onkeydown={onKeydown}
-              placeholder={m.channels_send_placeholder()}
-              maxlength="4096"
-              rows="2"
-              disabled={sending}
-            ></textarea>
-            <button onclick={handleSend} disabled={!inputText.trim() || sending}>{m.chat_send_title_short()}</button>
-          </div>
+          {#if selected.you_are_banned}
+            <p class="banned-banner" role="status">{m.channels_you_are_banned()}</p>
+          {:else}
+            <div class="composer">
+              <textarea
+                bind:value={inputText}
+                onkeydown={onKeydown}
+                placeholder={m.channels_send_placeholder()}
+                maxlength="4096"
+                rows="2"
+                disabled={sending}
+              ></textarea>
+              <button onclick={handleSend} disabled={!inputText.trim() || sending}>{m.chat_send_title_short()}</button>
+            </div>
+          {/if}
         {/if}
       </section>
     </div>
@@ -494,7 +643,30 @@
   }
   .conv-header h3 { margin: 0; font-size: 16px; }
   .topic { margin: 2px 0 0; font-size: 12px; color: var(--text-secondary); }
+  .welcome { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); }
   .conv-actions { display: flex; gap: 8px; }
+  .moderation-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .mod-label { margin: 0; font-size: 12px; color: var(--text-secondary); }
+  .members { margin: 0; padding: 6px 14px; font-size: 12px; color: var(--text-secondary); border-top: 1px solid var(--border); }
+  .members-label { margin: 0 0 6px; }
+  .member-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .member-list li { display: flex; align-items: center; gap: 8px; }
+  .member-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge.banned { color: var(--danger, #c44); border-color: var(--danger, #c44); }
+  .banned-banner {
+    margin: 0;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    color: var(--danger, #c44);
+    font-size: 13px;
+  }
+  .composer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
   .messages { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
   .bubble {
     max-width: 80%;
@@ -506,8 +678,6 @@
   .bubble.mine { align-self: flex-end; background: var(--accent-dim, var(--bg-primary)); }
   .who { display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 2px; }
   .bubble p { margin: 0; white-space: pre-wrap; word-break: break-word; }
-  .members { margin: 0; padding: 6px 14px; font-size: 12px; color: var(--text-secondary); border-top: 1px solid var(--border); }
-  .composer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
   .muted { color: var(--text-secondary); }
   .pad { padding: 24px; }
   .danger { color: var(--danger, #c44); }

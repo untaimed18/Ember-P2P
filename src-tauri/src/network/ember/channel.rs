@@ -35,6 +35,10 @@ pub const PRESENCE_EPOCH_SECS: i64 = 15 * 60;
 pub const PRESENCE_REPUBLISH_SECS: i64 = 10 * 60;
 /// How often a member walks the presence DHT keys for rooms they have joined.
 pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
+/// How often members re-fetch the owner-signed moderation record.
+pub const MODERATION_FETCH_SECS: i64 = 5 * 60;
+/// Owners re-publish moderation so the 24h record TTL cannot age out.
+pub const MODERATION_REPUBLISH_SECS: i64 = 6 * 60 * 60;
 /// Cap on rooms whose XOR-neighbors we register at rendezvous per heartbeat.
 pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
 /// Deterministic gossip degree: XOR-closest members to self.
@@ -69,7 +73,6 @@ impl ChannelIdentity {
         Self::from_signing_key(signing_key)
     }
 
-    #[allow(dead_code)]
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self::from_signing_key(SigningKey::from_bytes(seed))
     }
