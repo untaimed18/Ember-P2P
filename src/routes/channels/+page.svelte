@@ -27,7 +27,6 @@
   } from '$lib/api/channels';
   import {
     activeChannelId,
-    bumpChannelUnread,
     channels as channelsStore,
     clearChannelUnread,
     refreshChannels,
@@ -70,13 +69,6 @@
     }
     loadChannels();
     let cancelled = false;
-    let unlisten: UnlistenFn | undefined;
-    listen<{ channel_id: string }>('ember:channel-message', (event) => {
-      bumpChannelUnread(event.payload.channel_id);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
@@ -117,7 +109,6 @@
     });
     return () => {
       cancelled = true;
-      unlisten?.();
       unlistenMembers?.();
       unlistenModeration?.();
     };
@@ -311,6 +302,7 @@
 
 <div class="page-content channels-page">
   <p class="lede">{m.channels_page_subtitle()}</p>
+  <p class="limits-note">{m.channels_limits_note()}</p>
 
   {#if error}
     <div class="banner error-banner" role="alert">{error}</div>
@@ -519,8 +511,15 @@
 <style>
   .lede {
     color: var(--text-secondary);
+    margin: 0 0 8px;
+    max-width: 52rem;
+  }
+  .limits-note {
+    color: var(--text-tertiary, var(--text-secondary));
+    font-size: 0.85rem;
     margin: 0 0 16px;
     max-width: 52rem;
+    line-height: 1.45;
   }
   .banner {
     padding: 10px 12px;

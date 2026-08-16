@@ -634,8 +634,9 @@ pub async fn send_channel_message(
     let sender2 = sender.clone();
     let text = cleaned.clone();
     let msg_id_hex = hex::encode(msg_id);
+    let sent_at = chrono::Utc::now().timestamp();
     let row_id = tokio::task::spawn_blocking(move || {
-        db.insert_channel_message(&id, &sender2, "sent", &text, &msg_id_hex)
+        db.insert_channel_message(&id, &sender2, "sent", &text, &msg_id_hex, sent_at)
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -666,9 +667,10 @@ pub async fn send_channel_message(
                     channel_id_bytes,
                     msg_id,
                     &key,
-                    chrono::Utc::now().timestamp().max(0) as u64,
+                    sent_at.max(0) as u64,
                     &plain,
                     channel::CHANNEL_MSG_TTL_DEFAULT,
+                    sent_at,
                 );
                 let _ = state
                     .network_tx
@@ -684,7 +686,7 @@ pub async fn send_channel_message(
         sender_pubkey: sender,
         direction: "sent".into(),
         message: cleaned,
-        timestamp: chrono::Utc::now().timestamp(),
+        timestamp: sent_at,
         read: true,
     })
 }
@@ -892,13 +894,15 @@ fn enqueue_channel_gossip(state: &AppState, channel_id: &str, join_secret: [u8; 
     let mut msg_id = [0u8; 16];
     OsRng.fill_bytes(&mut msg_id);
     let key = channel::content_key(&join_secret);
+    let ts = chrono::Utc::now().timestamp();
     let gossip = channel::ChannelGossip::sealed(
         channel_id_bytes,
         msg_id,
         &key,
-        chrono::Utc::now().timestamp().max(0) as u64,
+        ts.max(0) as u64,
         &plain,
         channel::CHANNEL_MSG_TTL_DEFAULT,
+        ts,
     );
     let _ = state
         .network_tx

@@ -235,16 +235,22 @@ impl SignedRecord {
         signing_key: &SigningKey,
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
-        let nickname = truncate_utf8(nickname, CHANNEL_NAME_MAX);
+        let (nickname, extra) = channel::encode_presence_extra(
+            private,
+            &channel::content_key(join_secret),
+            &channel_id,
+            noise_pub,
+            nickname,
+        );
         Self::build(
             RECORD_TYPE_CHANNEL,
             channel::presence_key(&channel_id, join_secret, epoch),
             channel_id,
             channel_pubkey,
             pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
-            nickname,
+            &nickname,
             None,
-            Some(noise_pub.to_vec()),
+            Some(extra),
             signing_key,
         )
     }
@@ -302,7 +308,7 @@ impl SignedRecord {
             }
             CHANNEL_KIND_PRESENCE => {
                 crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
-                    && meta.extra.len() == 32
+                    && channel::presence_extra_store_ok(&meta.extra)
             }
             CHANNEL_KIND_MODERATION => {
                 self.publisher_key == self.ember_file_hash
@@ -419,6 +425,7 @@ impl SignedRecord {
     pub fn parse_channel_presence_member(
         blob: &[u8],
         expected_channel_id: &[u8; 16],
+        content_key: Option<&[u8; 32]>,
     ) -> Option<ChannelPresenceMember> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
@@ -431,10 +438,15 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_PRESENCE {
             return None;
         }
-        let noise_pub = <[u8; 32]>::try_from(meta.extra.as_slice()).ok()?;
+        let (noise_pub, nickname) = channel::decode_presence_extra(
+            content_key,
+            expected_channel_id,
+            &meta.extra,
+            &rec.file_name,
+        )?;
         Some(ChannelPresenceMember {
             publisher_key: rec.publisher_key,
-            nickname: rec.file_name,
+            nickname,
             timestamp: rec.timestamp,
             noise_pub,
         })
@@ -1127,13 +1139,45 @@ mod tests {
         let mut blob = record.data.clone();
         blob.extend_from_slice(&record.signature);
         let member_info =
-            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id).unwrap();
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).unwrap();
         assert_eq!(member_info.publisher_key, member.verifying_key().to_bytes());
         assert_eq!(member_info.nickname, "Ada");
         assert_eq!(member_info.noise_pub, noise_pub);
-        assert!(SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16]).is_none());
+        assert!(SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16], None).is_none());
         record.channel.as_mut().unwrap().extra.clear();
         assert!(!record.channel_store_ok());
+    }
+
+    #[test]
+    fn private_channel_presence_extra_is_encrypted() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = [0x77u8; 32];
+        let noise_pub = [0x42u8; 32];
+        let record = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            true,
+            3,
+            &noise_pub,
+            &member,
+        );
+        assert!(record.channel_store_ok());
+        assert!(record.file_name.is_empty());
+        assert_ne!(record.channel.as_ref().unwrap().extra, noise_pub);
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert!(
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).is_none()
+        );
+        let key = channel::content_key(&join);
+        let member_info =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, Some(&key))
+                .unwrap();
+        assert_eq!(member_info.nickname, "Ada");
+        assert_eq!(member_info.noise_pub, noise_pub);
     }
 
     #[test]
@@ -1289,19 +1333,22 @@ mod tests {
             };
             let _ = SignedRecord::from_value_blob(&buf);
             let _ = SignedRecord::value_blob_is_authentic(&buf);
-            if SignedRecord::parse_channel_presence_member(&buf, &ident.channel_id).is_some() {
+            if SignedRecord::parse_channel_presence_member(&buf, &ident.channel_id, None).is_some()
+            {
                 parsed_ok += 1;
             }
             if SignedRecord::parse_channel_moderation(&buf, &ident.channel_id).is_some() {
                 parsed_ok += 1;
             }
-            let _ = SignedRecord::parse_channel_presence_member(&buf, &[0u8; 16]);
+            let _ = SignedRecord::parse_channel_presence_member(&buf, &[0u8; 16], None);
             let _ = SignedRecord::parse_channel_moderation(&buf, &[0u8; 16]);
         }
-        assert!(
-            SignedRecord::parse_channel_presence_member(&presence_blob, &ident.channel_id)
-                .is_some()
-        );
+        assert!(SignedRecord::parse_channel_presence_member(
+            &presence_blob,
+            &ident.channel_id,
+            None
+        )
+        .is_some());
         assert!(
             SignedRecord::parse_channel_moderation(&moderation_blob, &ident.channel_id).is_some()
         );

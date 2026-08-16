@@ -14,6 +14,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
@@ -194,6 +195,7 @@
       initTransferStore(),
       initSearchStore(),
       initFriendsStore(),
+      initChannelsStore(),
       loadAppSettings(),
     ]);
   }
@@ -508,6 +510,7 @@
           cleanupTransferStore();
           cleanupSearchStore();
           cleanupFriendsStore();
+          cleanupChannelsStore();
         }
       })
       .catch((e) => {
@@ -515,6 +518,7 @@
         cleanupTransferStore();
         cleanupSearchStore();
         cleanupFriendsStore();
+        cleanupChannelsStore();
         initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
@@ -534,6 +538,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      cleanupChannelsStore();
       clearAllToasts();
       clearAppSettings();
       if (unlistenClose) unlistenClose();

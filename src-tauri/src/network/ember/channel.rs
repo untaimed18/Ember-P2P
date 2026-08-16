@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::crypto;
 use super::dht::EmberNodeId;
@@ -49,6 +49,18 @@ pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
 /// In-session cap on distinct gossip ids remembered for flood dedup.
 pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
+/// Outbound `CHANNEL_MSG` frames we will originate or relay per second.
+pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
+/// Inbound `CHANNEL_MSG` frames accepted from one DHT hop per second.
+pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
+/// Cap on distinct hops tracked in the inbound gossip rate map.
+pub const CHANNEL_GOSSIP_IN_PEER_CAP: usize = 512;
+/// Recent local messages offered to a neighbor that asks for catch-up.
+pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
+/// How often we ask one neighbor for missed history.
+pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
+/// Retry rendezvous lookup sooner when a neighbor still has no UDP session.
+pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
 pub const CHANNEL_MSG_VERSION: u8 = 1;
 const GOSSIP_NONCE_LEN: usize = 24;
 const GOSSIP_TAG_LEN: usize = 16;
@@ -382,8 +394,15 @@ pub struct ChannelGossip {
 
 const CHAT_PLAIN_VERSION: u8 = 1;
 const MOD_ACTION_PLAIN_VERSION: u8 = 2;
+const SYNC_REQUEST_PLAIN_VERSION: u8 = 3;
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
+const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
+const PRESENCE_NICK_PAD: usize = 64;
+const PRESENCE_EXTRA_AAD: &[u8] = b"ember-channel-presence-extra-v1\0";
+/// Encrypted private extra: version + nonce + tag + noise + nick_len + pad.
+pub const PRESENCE_EXTRA_ENC_LEN: usize =
+    1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN + 32 + 1 + PRESENCE_NICK_PAD;
 
 /// `version(1) || sender_pubkey(32) || utf8 text` inside a gossip body.
 pub fn encode_channel_chat_plain(sender_pubkey: &[u8; 32], text: &str) -> Vec<u8> {
@@ -438,6 +457,160 @@ pub fn decode_channel_mod_action(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], bo
     Some((sender, target, banned))
 }
 
+pub fn encode_channel_sync_request(sender_pubkey: &[u8; 32], since_ts: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 8);
+    out.push(SYNC_REQUEST_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(&since_ts.to_le_bytes());
+    out
+}
+
+pub fn decode_channel_sync_request(bytes: &[u8]) -> Option<([u8; 32], i64)> {
+    if bytes.len() != 41 || bytes[0] != SYNC_REQUEST_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let since_ts = i64::from_le_bytes(bytes[33..41].try_into().ok()?);
+    Some((sender, since_ts))
+}
+
+/// Sliding-window admit: true if `now` can be recorded without exceeding
+/// `limit` events in `window`.
+pub fn rate_window_allow(
+    times: &mut VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+    limit: usize,
+) -> bool {
+    while times
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) > window)
+    {
+        times.pop_front();
+    }
+    if times.len() >= limit {
+        return false;
+    }
+    times.push_back(now);
+    true
+}
+
+/// Storers cannot decrypt a private extra; they only check the length so a
+/// truncated or obviously-junk blob is dropped.
+pub fn presence_extra_store_ok(extra: &[u8]) -> bool {
+    extra.len() == 32
+        || (extra.first() == Some(&PRESENCE_EXTRA_ENC_VERSION)
+            && extra.len() == PRESENCE_EXTRA_ENC_LEN)
+}
+
+/// Public rooms keep nickname in `file_name` and Noise pub as 32 raw extra
+/// bytes (legacy). Private rooms leave `file_name` empty and seal both under
+/// the content key so a storer cannot read membership metadata.
+pub fn encode_presence_extra(
+    private: bool,
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    noise_pub: &[u8; 32],
+    nickname: &str,
+) -> (String, Vec<u8>) {
+    let nick = truncate_nickname(nickname);
+    if !private {
+        return (nick, noise_pub.to_vec());
+    }
+    let mut plain = vec![0u8; 32 + 1 + PRESENCE_NICK_PAD];
+    plain[..32].copy_from_slice(noise_pub);
+    let nick_bytes = nick.as_bytes();
+    plain[32] = nick_bytes.len() as u8;
+    plain[33..33 + nick_bytes.len()].copy_from_slice(nick_bytes);
+    (
+        String::new(),
+        seal_presence_extra(content_key, channel_id, &plain),
+    )
+}
+
+pub fn decode_presence_extra(
+    content_key: Option<&[u8; 32]>,
+    channel_id: &[u8; 16],
+    extra: &[u8],
+    file_name: &str,
+) -> Option<([u8; 32], String)> {
+    if extra.len() == 32 {
+        let mut noise = [0u8; 32];
+        noise.copy_from_slice(extra);
+        return Some((noise, file_name.to_string()));
+    }
+    let key = content_key?;
+    let plain = open_presence_extra(key, channel_id, extra)?;
+    if plain.len() != 32 + 1 + PRESENCE_NICK_PAD {
+        return None;
+    }
+    let mut noise = [0u8; 32];
+    noise.copy_from_slice(&plain[..32]);
+    let nick_len = plain[32] as usize;
+    if nick_len > PRESENCE_NICK_PAD {
+        return None;
+    }
+    let nick = std::str::from_utf8(&plain[33..33 + nick_len])
+        .ok()?
+        .to_string();
+    Some((noise, nick))
+}
+
+fn truncate_nickname(s: &str) -> String {
+    if s.len() <= PRESENCE_NICK_PAD {
+        return s.to_string();
+    }
+    let mut end = PRESENCE_NICK_PAD;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn presence_extra_aad(channel_id: &[u8; 16]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(PRESENCE_EXTRA_AAD.len() + 16);
+    aad.extend_from_slice(PRESENCE_EXTRA_AAD);
+    aad.extend_from_slice(channel_id);
+    aad
+}
+
+fn seal_presence_extra(key: &[u8; 32], channel_id: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &presence_extra_aad(channel_id),
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail for presence extra");
+    let mut out = Vec::with_capacity(1 + GOSSIP_NONCE_LEN + encrypted.len());
+    out.push(PRESENCE_EXTRA_ENC_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    out
+}
+
+fn open_presence_extra(key: &[u8; 32], channel_id: &[u8; 16], extra: &[u8]) -> Option<Vec<u8>> {
+    if extra.len() != PRESENCE_EXTRA_ENC_LEN || extra[0] != PRESENCE_EXTRA_ENC_VERSION {
+        return None;
+    }
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(&extra[1..1 + GOSSIP_NONCE_LEN]),
+            Payload {
+                msg: &extra[1 + GOSSIP_NONCE_LEN..],
+                aad: &presence_extra_aad(channel_id),
+            },
+        )
+        .ok()
+}
+
 /// Record `msg_id` in the flood seen-set. Returns `true` the first time
 /// this id is observed; later copies are dropped so a cycle cannot loop.
 pub fn remember_gossip_id(
@@ -479,6 +652,7 @@ impl ChannelGossip {
             sender_counter,
             plaintext,
             ttl,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -489,8 +663,8 @@ impl ChannelGossip {
         sender_counter: u64,
         plaintext: &[u8],
         ttl: u8,
+        timestamp: i64,
     ) -> Self {
-        let timestamp = chrono::Utc::now().timestamp();
         let ciphertext = encrypt_gossip_body(
             content_key,
             &channel_id,
@@ -926,6 +1100,8 @@ mod tests {
             }
             let _ = decode_channel_chat_plain(&buf);
             let _ = decode_channel_mod_action(&buf);
+            let _ = decode_channel_sync_request(&buf);
+            let _ = decode_presence_extra(Some(&key), &channel_id, &buf, "");
         }
         let chat = ChannelGossip::decode(&well_chat).unwrap();
         let (pk, text) = decode_channel_chat_plain(&chat.decrypt(&key).unwrap()).unwrap();
@@ -1038,6 +1214,58 @@ mod tests {
             assert_eq!(order.len(), N);
             assert!(map.len() <= CHANNEL_GOSSIP_SEEN_CAP);
         }
+    }
+
+    #[test]
+    fn presence_extra_private_hides_nickname_and_noise() {
+        let key = content_key(&[3u8; 32]);
+        let channel_id = [0x11u8; 16];
+        let noise = [0x42u8; 32];
+        let (public_name, public_extra) =
+            encode_presence_extra(false, &key, &channel_id, &noise, "Ada");
+        assert_eq!(public_name, "Ada");
+        assert_eq!(public_extra, noise);
+        assert!(presence_extra_store_ok(&public_extra));
+        let (n, nick) = decode_presence_extra(None, &channel_id, &public_extra, "Ada").unwrap();
+        assert_eq!(n, noise);
+        assert_eq!(nick, "Ada");
+
+        let (private_name, private_extra) =
+            encode_presence_extra(true, &key, &channel_id, &noise, "Ada");
+        assert!(private_name.is_empty());
+        assert_ne!(private_extra, noise);
+        assert!(presence_extra_store_ok(&private_extra));
+        assert!(decode_presence_extra(None, &channel_id, &private_extra, "").is_none());
+        let (n, nick) = decode_presence_extra(Some(&key), &channel_id, &private_extra, "").unwrap();
+        assert_eq!(n, noise);
+        assert_eq!(nick, "Ada");
+        assert!(
+            decode_presence_extra(Some(&key), &[0x22u8; 16], &private_extra, "").is_none(),
+            "presence extra must bind the channel id"
+        );
+    }
+
+    #[test]
+    fn sync_request_round_trip_and_rate_window() {
+        let plain = encode_channel_sync_request(&[9u8; 32], 1_700_000_000);
+        let (pk, since) = decode_channel_sync_request(&plain).unwrap();
+        assert_eq!(pk, [9u8; 32]);
+        assert_eq!(since, 1_700_000_000);
+        assert!(decode_channel_sync_request(&encode_channel_chat_plain(&[9u8; 32], "x")).is_none());
+
+        let mut times = VecDeque::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(1);
+        for _ in 0..3 {
+            assert!(rate_window_allow(&mut times, t0, window, 3));
+        }
+        assert!(!rate_window_allow(&mut times, t0, window, 3));
+        assert!(rate_window_allow(
+            &mut times,
+            t0 + Duration::from_millis(1_001),
+            window,
+            3
+        ));
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

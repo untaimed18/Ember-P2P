@@ -10053,6 +10053,10 @@ struct NetworkState {
     channel_gossip_seen_order: VecDeque<[u8; 16]>,
     /// Timestamps of recent outbound `CHANNEL_MSG` frames (token bucket).
     channel_gossip_sent_times: VecDeque<std::time::Instant>,
+    /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
+    channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
+    /// Last history-sync request per (channel_id, neighbor pubkey).
+    channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
     ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
     /// Presence blobs waiting for DB upsert + UI emit (async drain).
@@ -10190,7 +10194,7 @@ async fn maybe_publish_channel_presence(
     }
 }
 
-const CHANNEL_GOSSIP_RATE_PER_SEC: usize = 16;
+const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn remember_channel_gossip(state: &mut NetworkState, msg_id: [u8; 16]) -> bool {
     ember::channel::remember_gossip_id(
@@ -10203,20 +10207,42 @@ fn remember_channel_gossip(state: &mut NetworkState, msg_id: [u8; 16]) -> bool {
 }
 
 fn channel_gossip_rate_ok(state: &mut NetworkState) -> bool {
+    ember::channel::rate_window_allow(
+        &mut state.channel_gossip_sent_times,
+        std::time::Instant::now(),
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+    )
+}
+
+fn channel_gossip_inbound_ok(state: &mut NetworkState, from_id: &ember::dht::EmberNodeId) -> bool {
     let now = std::time::Instant::now();
-    let window = std::time::Duration::from_secs(1);
-    while state
-        .channel_gossip_sent_times
-        .front()
-        .is_some_and(|t| now.saturating_duration_since(*t) > window)
+    if state.channel_gossip_from_times.len() >= ember::channel::CHANNEL_GOSSIP_IN_PEER_CAP
+        && !state.channel_gossip_from_times.contains_key(&from_id.0)
     {
-        state.channel_gossip_sent_times.pop_front();
-    }
-    if state.channel_gossip_sent_times.len() >= CHANNEL_GOSSIP_RATE_PER_SEC {
         return false;
     }
-    state.channel_gossip_sent_times.push_back(now);
-    true
+    let times = state
+        .channel_gossip_from_times
+        .entry(from_id.0)
+        .or_default();
+    ember::channel::rate_window_allow(
+        times,
+        now,
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        ember::channel::CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+    )
+}
+
+fn channel_content_key(db: &Database, ch: &crate::storage::database::StoredChannel) -> Option<[u8; 32]> {
+    let join_secret = if ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE {
+        db.load_channel_join_secret(&ch.channel_id).ok().flatten()?
+    } else {
+        let pk_bytes = hex::decode(&ch.pubkey).ok()?;
+        let pk = <[u8; 32]>::try_from(pk_bytes).ok()?;
+        ember::channel::public_join_secret(&pk)
+    };
+    Some(ember::channel::content_key(&join_secret))
 }
 
 fn channel_member_pubkeys(
@@ -10276,7 +10302,8 @@ async fn load_rendezvous_register_targets(
     .unwrap_or_default()
 }
 
-const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS);
 const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
 const CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK: usize = 2;
 const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
@@ -10561,9 +10588,10 @@ fn ingest_channel_presence_records(
         return false;
     }
     let channel_id_hex = hex::encode(channel_id);
-    let Ok(Some(_)) = db.get_channel(&channel_id_hex) else {
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return false;
     };
+    let content_key = channel_content_key(db, &ch);
     let existing: HashSet<String> = db
         .list_channel_members(&channel_id_hex)
         .unwrap_or_default()
@@ -10572,9 +10600,11 @@ fn ingest_channel_presence_records(
         .collect();
     let mut changed = false;
     for blob in records {
-        let Some(member) =
-            ember::dht::publish::SignedRecord::parse_channel_presence_member(blob, &channel_id)
-        else {
+        let Some(member) = ember::dht::publish::SignedRecord::parse_channel_presence_member(
+            blob,
+            &channel_id,
+            content_key.as_ref(),
+        ) else {
             continue;
         };
         let pk_hex = hex::encode(member.publisher_key);
@@ -10913,14 +10943,33 @@ async fn fanout_channel_gossip_body(
         &members,
         ember::channel::CHANNEL_NEIGHBOR_COUNT,
     );
-    for pk in neighbors {
-        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&pk));
+    let mut targets = Vec::new();
+    for pk in &neighbors {
+        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
         if exclude == Some(node_id) {
             continue;
         }
-        let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() else {
-            continue;
-        };
+        if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+            targets.push(contact);
+        }
+    }
+    if targets.len() < ember::channel::CHANNEL_NEIGHBOR_COUNT {
+        for pk in &members {
+            if targets.len() >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
+                break;
+            }
+            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+            if exclude == Some(node_id)
+                || targets.iter().any(|c| c.node_id == node_id)
+            {
+                continue;
+            }
+            if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+                targets.push(contact);
+            }
+        }
+    }
+    for contact in targets {
         let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         send_ember_dht_frame(socket, state, &contact, &frame).await;
     }
@@ -10937,6 +10986,12 @@ async fn handle_inbound_channel_gossip(
     let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
         return;
     };
+    if !channel_gossip_inbound_ok(state, &from_id) {
+        let _ = state
+            .reputation
+            .record_event(&from_id.0, ember::reputation::ReputationEvent::ProtocolViolation);
+        return;
+    }
     if !remember_channel_gossip(state, gossip.msg_id) {
         return;
     }
@@ -10947,25 +11002,33 @@ async fn handle_inbound_channel_gossip(
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return;
     };
-    let join_secret = if ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE {
-        match db.load_channel_join_secret(&channel_id_hex) {
-            Ok(Some(secret)) => secret,
-            _ => return,
-        }
-    } else {
-        let Ok(pk_bytes) = hex::decode(&ch.pubkey) else {
-            return;
-        };
-        let Ok(pk) = <[u8; 32]>::try_from(pk_bytes) else {
-            return;
-        };
-        ember::channel::public_join_secret(&pk)
+    let Some(key) = channel_content_key(db, &ch) else {
+        return;
     };
-    let key = ember::channel::content_key(&join_secret);
     let Some(plain) = gossip.decrypt(&key) else {
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         return;
     };
+    if let Some((sender_pk, since_ts)) = ember::channel::decode_channel_sync_request(&plain) {
+        let sender_hex = hex::encode(sender_pk);
+        if db
+            .channel_member_is_banned(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        reply_channel_history_sync(
+            socket,
+            state,
+            db,
+            &ch,
+            &key,
+            &from_id,
+            since_ts,
+        )
+        .await;
+        return;
+    }
     if let Some((sender_pk, target_pk, banned)) =
         ember::channel::decode_channel_mod_action(&plain)
     {
@@ -11029,6 +11092,7 @@ async fn handle_inbound_channel_gossip(
         "received",
         &cleaned,
         &msg_id_hex,
+        now,
     ) {
         Ok(row_id) => {
             let _ = db.upsert_channel_member(&channel_id_hex, &sender_hex, "", now);
@@ -11050,6 +11114,140 @@ async fn handle_inbound_channel_gossip(
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn send_channel_gossip_unicast(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    node_id: &ember::dht::EmberNodeId,
+    body: Vec<u8>,
+) {
+    let Some(contact) = state.ember_dht.routing().get_contact(node_id).cloned() else {
+        return;
+    };
+    if !channel_gossip_rate_ok(state) {
+        return;
+    }
+    let (_rid, frame) = state.ember_dht.build_channel_msg(body);
+    send_ember_dht_frame(socket, state, &contact, &frame).await;
+}
+
+async fn reply_channel_history_sync(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    key: &[u8; 32],
+    to: &ember::dht::EmberNodeId,
+    since_ts: i64,
+) {
+    let Ok(rows) = db.list_channel_messages_for_sync(
+        &ch.channel_id,
+        since_ts.max(0),
+        ember::channel::CHANNEL_HISTORY_SYNC_MAX as i64,
+    ) else {
+        return;
+    };
+    let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+        return;
+    };
+    let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+        return;
+    };
+    for (msg_id_hex, sender_hex, text, timestamp) in rows {
+        let Ok(msg_id_bytes) = hex::decode(&msg_id_hex) else {
+            continue;
+        };
+        let Ok(msg_id) = <[u8; 16]>::try_from(msg_id_bytes) else {
+            continue;
+        };
+        let Ok(sender_bytes) = hex::decode(&sender_hex) else {
+            continue;
+        };
+        let Ok(sender_pk) = <[u8; 32]>::try_from(sender_bytes) else {
+            continue;
+        };
+        let plain = ember::channel::encode_channel_chat_plain(&sender_pk, &text);
+        let gossip = ember::channel::ChannelGossip::sealed(
+            channel_id,
+            msg_id,
+            key,
+            timestamp.max(0) as u64,
+            &plain,
+            1,
+            timestamp,
+        );
+        send_channel_gossip_unicast(socket, state, to, gossip.encode()).await;
+    }
+}
+
+async fn maybe_sync_channel_history(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Database,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let interval = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_SYNC_SECS);
+    let our_pk = state.local_ed25519_pubkey;
+    let mut sent = 0usize;
+    for ch in channels {
+        if sent >= 4 {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let Some(key) = channel_content_key(db, &ch) else {
+            continue;
+        };
+        let members = channel_member_pubkeys(db, &ch.channel_id);
+        let neighbors = ember::channel::xor_closest_neighbors(
+            &our_pk,
+            &members,
+            ember::channel::CHANNEL_NEIGHBOR_COUNT,
+        );
+        let since = db
+            .latest_channel_message_timestamp(&ch.channel_id)
+            .unwrap_or(0);
+        for pk in neighbors {
+            if sent >= 4 {
+                break;
+            }
+            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&pk));
+            if state.ember_dht.routing().get_contact(&node_id).is_none() {
+                continue;
+            }
+            let stamp_key = (channel_id, pk);
+            if state
+                .channel_history_sync_at
+                .get(&stamp_key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < interval)
+            {
+                continue;
+            }
+            state.channel_history_sync_at.insert(stamp_key, now);
+            let plain = ember::channel::encode_channel_sync_request(&our_pk, since);
+            let gossip = ember::channel::ChannelGossip::new_plaintext(
+                channel_id,
+                &key,
+                chrono::Utc::now().timestamp().max(0) as u64,
+                &plain,
+                1,
+            );
+            send_channel_gossip_unicast(socket, state, &node_id, gossip.encode()).await;
+            sent += 1;
+        }
     }
 }
 
@@ -14547,6 +14745,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
+    state.channel_gossip_from_times.clear();
+    state.channel_history_sync_at.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -15435,6 +15635,8 @@ pub async fn start_network(
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
+        channel_gossip_from_times: HashMap::new(),
+        channel_history_sync_at: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         channel_presence_fetch_at: HashMap::new(),
@@ -31547,6 +31749,7 @@ pub async fn start_network(
                         &channel_neighbor_lookup_tx,
                     )
                     .await;
+                    maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);

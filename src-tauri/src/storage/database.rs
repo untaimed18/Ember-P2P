@@ -478,12 +478,12 @@ impl Database {
         label: &str,
         stored: &str,
     ) -> anyhow::Result<[u8; 32]> {
-        let encoded = stored.strip_prefix(CHANNEL_SECRET_PREFIX).ok_or_else(|| {
-            anyhow::anyhow!("Channel secret for {channel_id} is not encrypted")
+        let encoded = stored
+            .strip_prefix(CHANNEL_SECRET_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("Channel secret for {channel_id} is not encrypted"))?;
+        let envelope = STANDARD_NO_PAD.decode(encoded).map_err(|_| {
+            anyhow::anyhow!("Channel secret for {channel_id} has invalid ciphertext")
         })?;
-        let envelope = STANDARD_NO_PAD
-            .decode(encoded)
-            .map_err(|_| anyhow::anyhow!("Channel secret for {channel_id} has invalid ciphertext"))?;
         if envelope.len() < CHAT_NONCE_LEN + 16 {
             anyhow::bail!("Channel secret for {channel_id} is truncated");
         }
@@ -497,17 +497,14 @@ impl Database {
                     aad: &aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("Channel secret authentication failed for {channel_id}"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("Channel secret authentication failed for {channel_id}")
+            })?;
         <[u8; 32]>::try_from(plaintext)
             .map_err(|_| anyhow::anyhow!("Channel secret for {channel_id} has invalid length"))
     }
 
-    fn channel_row_aad(
-        id: i64,
-        channel_id: &str,
-        direction: &str,
-        timestamp: i64,
-    ) -> Vec<u8> {
+    fn channel_row_aad(id: i64, channel_id: &str, direction: &str, timestamp: i64) -> Vec<u8> {
         let mut aad = Vec::with_capacity(
             CHANNEL_MSG_AAD_DOMAIN.len() + 8 + 8 + 4 + channel_id.len() + 4 + direction.len(),
         );
@@ -559,9 +556,9 @@ impl Database {
         timestamp: i64,
         stored: &str,
     ) -> anyhow::Result<String> {
-        let encoded = stored.strip_prefix(CHAT_CIPHERTEXT_PREFIX).ok_or_else(|| {
-            anyhow::anyhow!("Channel message {id} is not encrypted")
-        })?;
+        let encoded = stored
+            .strip_prefix(CHAT_CIPHERTEXT_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("Channel message {id} is not encrypted"))?;
         let envelope = STANDARD_NO_PAD
             .decode(encoded)
             .map_err(|_| anyhow::anyhow!("Channel message {id} has invalid ciphertext"))?;
@@ -3886,10 +3883,7 @@ impl Database {
         Ok(out)
     }
 
-    pub fn list_banned_channel_pubkeys(
-        &self,
-        channel_id: &str,
-    ) -> anyhow::Result<Vec<[u8; 32]>> {
+    pub fn list_banned_channel_pubkeys(&self, channel_id: &str) -> anyhow::Result<Vec<[u8; 32]>> {
         let conn = self.conn.lock();
         Self::hex_pubkeys_from_query(
             &conn,
@@ -3943,7 +3937,12 @@ impl Database {
                 banned = excluded.banned,
                 ban_revised_at = excluded.ban_revised_at
              WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
-            params![channel_id, member_pubkey, if banned { 1 } else { 0 }, timestamp],
+            params![
+                channel_id,
+                member_pubkey,
+                if banned { 1 } else { 0 },
+                timestamp
+            ],
         )?;
         Ok(n > 0)
     }
@@ -4028,7 +4027,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn channels_due_for_presence(&self, now: i64, interval_secs: i64) -> anyhow::Result<Vec<String>> {
+    pub fn channels_due_for_presence(
+        &self,
+        now: i64,
+        interval_secs: i64,
+    ) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT channel_id FROM channels
@@ -4049,6 +4052,7 @@ impl Database {
         direction: &str,
         message: &str,
         msg_id: &str,
+        timestamp: i64,
     ) -> anyhow::Result<i64> {
         const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
         const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
@@ -4063,7 +4067,11 @@ impl Database {
         };
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        let now = chrono::Utc::now().timestamp();
+        let now = if timestamp > 0 {
+            timestamp
+        } else {
+            chrono::Utc::now().timestamp()
+        };
         tx.execute(
             "INSERT INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -4169,20 +4177,11 @@ impl Database {
         let mut messages = Vec::with_capacity(rows.len());
         for (id, sender, direction, stored, timestamp, read) in rows {
             match Self::decrypt_channel_message_body(
-                chat_key,
-                id,
-                channel_id,
-                &direction,
-                timestamp,
-                &stored,
+                chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
-                Ok(message) => {
-                    messages.push((id, sender, direction, message, timestamp, read))
-                }
+                Ok(message) => messages.push((id, sender, direction, message, timestamp, read)),
                 Err(error) => {
-                    tracing::warn!(
-                        "Channel message {id} in {channel_id} is unavailable: {error}"
-                    );
+                    tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
                     messages.push((
                         id,
                         sender,
@@ -4214,6 +4213,60 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Recent decrypted messages for neighbor history catch-up.
+    /// Returns `(msg_id, sender_pubkey, body, timestamp)` oldest-first.
+    pub fn list_channel_messages_for_sync(
+        &self,
+        channel_id: &str,
+        since_ts: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+        let limit = limit.clamp(1, 64);
+        let rows: Vec<(i64, String, String, String, String, i64)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp
+                 FROM channel_messages
+                 WHERE channel_id = ?1 AND timestamp >= ?2
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(chat_key) = self.chat_key.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, msg_id, sender, direction, stored, timestamp) in rows {
+            if let Ok(message) = Self::decrypt_channel_message_body(
+                chat_key, id, channel_id, &direction, timestamp, &stored,
+            ) {
+                out.push((msg_id, sender, message, timestamp));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn latest_channel_message_timestamp(&self, channel_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let ts: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(timestamp), 0) FROM channel_messages WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
     }
 
     /// Reclaim unused pages freed by DELETE operations.
@@ -5213,7 +5266,10 @@ mod tests {
         )
         .expect("insert channel");
         assert_eq!(db.load_channel_owner_seed(&channel_id).unwrap(), Some(seed));
-        assert_eq!(db.load_channel_join_secret(&channel_id).unwrap(), Some(join));
+        assert_eq!(
+            db.load_channel_join_secret(&channel_id).unwrap(),
+            Some(join)
+        );
 
         db.upsert_channel_member(&channel_id, &pubkey, "Ada", 100)
             .unwrap();
@@ -5229,7 +5285,9 @@ mod tests {
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
         assert_eq!(ch.welcome, "welcome");
-        assert!(db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
+        assert!(db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
         assert!(!db
             .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[])
@@ -5239,35 +5297,57 @@ mod tests {
         assert!(db
             .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[])
             .unwrap());
-        assert!(!db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
+        assert!(!db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
 
         let moderator = [0x44u8; 32];
         let mod_hex = hex::encode(moderator);
         assert!(db
             .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator])
             .unwrap());
-        assert!(db.channel_member_is_moderator(&channel_id, &mod_hex).unwrap());
-        assert!(!db.channel_member_is_moderator(&channel_id, &pubkey).unwrap());
+        assert!(db
+            .channel_member_is_moderator(&channel_id, &mod_hex)
+            .unwrap());
+        assert!(!db
+            .channel_member_is_moderator(&channel_id, &pubkey)
+            .unwrap());
         assert!(db
             .apply_channel_ban_action(&channel_id, &banned_hex, true, 80)
             .unwrap());
-        assert!(db.channel_member_is_banned(&channel_id, &banned_hex).unwrap());
+        assert!(db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
         assert!(db
             .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator])
             .unwrap());
         assert!(
-            db.channel_member_is_banned(&channel_id, &banned_hex).unwrap(),
+            db.channel_member_is_banned(&channel_id, &banned_hex)
+                .unwrap(),
             "newer gossip ban must survive an older owner snapshot"
         );
 
         let msg_id = "aa".repeat(16);
         let id = db
-            .insert_channel_message(&channel_id, &pubkey, "sent", "hello room", &msg_id)
+            .insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "sent",
+                "hello room",
+                &msg_id,
+                1_700_000_000,
+            )
             .unwrap();
         let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, id);
         assert_eq!(msgs[0].3, "hello room");
+        assert_eq!(msgs[0].4, 1_700_000_000);
+        let sync = db
+            .list_channel_messages_for_sync(&channel_id, 0, 32)
+            .unwrap();
+        assert_eq!(sync.len(), 1);
+        assert_eq!(sync[0].0, msg_id);
 
         let listed = db.list_channels().unwrap();
         assert_eq!(listed.len(), 1);

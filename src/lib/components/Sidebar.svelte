@@ -6,6 +6,7 @@
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import { totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { navItems, NAV_SHORTCUT_LIMIT, type NavItem } from '$lib/navItems';
@@ -137,6 +138,7 @@
   // previously the only signal was per-friend badges on /friends,
   // which required navigating there to notice activity.
   let totalUnreadChats = $derived($totalUnread);
+  let totalUnreadChannels = $derived($totalChannelUnread);
 
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
@@ -352,6 +354,14 @@
                 ? m.sidebar_friend_requests_title_one()
                 : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
             >{pendingFriendRequestCount}</span>
+          {/if}
+          {#if item.id === 'channels' && totalUnreadChannels > 0}
+            <span
+              class="nav-badge"
+              title={totalUnreadChannels === 1
+                ? m.channels_unread_title_one()
+                : m.channels_unread_title_other({ count: totalUnreadChannels })}
+            >{totalUnreadChannels > 99 ? '99+' : totalUnreadChannels}</span>
           {/if}
         </a>
       </li>
