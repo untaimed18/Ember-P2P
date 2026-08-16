@@ -233,6 +233,7 @@ pub async fn create_channel(
         &join_secret,
         private,
         channel::presence_epoch(chrono::Utc::now().timestamp()),
+        &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
     let _ = publish_signed_record(&state, presence).await;
@@ -352,6 +353,7 @@ pub async fn join_channel(
         &invite.join_secret,
         invite.private,
         channel::presence_epoch(chrono::Utc::now().timestamp()),
+        &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
     let _ = publish_signed_record(&state, presence).await;

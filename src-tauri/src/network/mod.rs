@@ -217,6 +217,15 @@ struct RendezvousRegisterResult {
     result: Result<(), String>,
 }
 
+/// Result of a background rendezvous lookup for a channel gossip neighbor.
+/// Applied on the 1s stats tick so we do not add another `select!` arm
+/// (the loop is already at tokio's 64-branch ceiling). Never writes
+/// `friend_hashes`.
+struct ChannelNeighborLookupResult {
+    peer_pubkey: [u8; 32],
+    endpoint: Option<(Ipv4Addr, u16)>,
+}
+
 struct FriendRelayTicketPollResult {
     result: Result<rendezvous::FriendRelayTicketPollPage, String>,
 }
@@ -10044,6 +10053,17 @@ struct NetworkState {
     channel_gossip_seen_order: VecDeque<[u8; 16]>,
     /// Timestamps of recent outbound `CHANNEL_MSG` frames (token bucket).
     channel_gossip_sent_times: VecDeque<std::time::Instant>,
+    /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
+    ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
+    /// Presence blobs waiting for DB upsert + UI emit (async drain).
+    ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// Last presence FIND_VALUE start per channel.
+    channel_presence_fetch_at: HashMap<[u8; 16], i64>,
+    /// Member Ed25519 → Noise static key from presence extra (no IP).
+    ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
+    channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
+    channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -10149,6 +10169,7 @@ async fn maybe_publish_channel_presence(
             &join_secret,
             private,
             ember::channel::presence_epoch(now),
+            &identity.noise_public_key,
             &signing,
         );
         if let Some(publish_id) = state
@@ -10208,10 +10229,322 @@ fn channel_member_pubkeys(
     };
     rows.into_iter()
         .filter_map(|row| {
+            if row.banned {
+                return None;
+            }
             let bytes = hex::decode(row.member_pubkey).ok()?;
             <[u8; 32]>::try_from(bytes).ok()
         })
         .collect()
+}
+
+fn collect_channel_neighbor_caps(
+    db: &Database,
+    our_pubkey: &[u8; 32],
+) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
+    let mut members_by_channel = Vec::new();
+    for ch in db.list_channels()? {
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        members_by_channel.push((channel_id, channel_member_pubkeys(db, &ch.channel_id)));
+    }
+    Ok(ember::channel::rendezvous_neighbor_targets(
+        our_pubkey,
+        &members_by_channel,
+        ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS,
+        ember::channel::CHANNEL_NEIGHBOR_COUNT,
+    ))
+}
+
+async fn load_rendezvous_register_targets(
+    db: &Arc<Database>,
+    our_pubkey: [u8; 32],
+) -> (
+    Vec<([u8; 16], [u8; 32])>,
+    Vec<([u8; 16], [u8; 32])>,
+) {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let friends = db.get_friend_public_keys().unwrap_or_default();
+        let neighbors = collect_channel_neighbor_caps(&db, &our_pubkey).unwrap_or_default();
+        (friends, neighbors)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
+const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
+
+/// FIND_VALUE the current (and previous) presence keys so members are
+/// learned without prior gossip. Extra FIND_VALUE keys intersect by
+/// `file_hash`, which would drop members who only appear in one epoch,
+/// so the two keys are walked as independent searches.
+async fn maybe_refresh_channel_members(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if started >= CHANNEL_PRESENCE_FETCH_PER_TICK {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        if state
+            .ember_channel_presence_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let last = state
+            .channel_presence_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::PRESENCE_FETCH_SECS {
+            continue;
+        }
+        let Ok(pk_bytes) = hex::decode(&ch.pubkey) else {
+            continue;
+        };
+        let Ok(channel_pubkey) = <[u8; 32]>::try_from(pk_bytes) else {
+            continue;
+        };
+        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        let join_secret = if private {
+            match db.load_channel_join_secret(&ch.channel_id) {
+                Ok(Some(secret)) => secret,
+                _ => continue,
+            }
+        } else {
+            ember::channel::public_join_secret(&channel_pubkey)
+        };
+        let epoch = ember::channel::presence_epoch(now);
+        let current_key = ember::channel::presence_key(&channel_id, &join_secret, epoch);
+        let prev_key = ember::channel::presence_key(&channel_id, &join_secret, epoch - 1);
+        let mut keys = vec![current_key];
+        if prev_key != current_key {
+            keys.push(prev_key);
+        }
+        let mut any = false;
+        for key in keys {
+            let Some(search_id) = state.ember_search.start_find_value(
+                ember::dht::EmberNodeId(key),
+                Vec::new(),
+                state.ember_dht.routing(),
+            ) else {
+                break;
+            };
+            seed_ember_local_records(state, search_id, &key, &[]);
+            state
+                .ember_channel_presence_searches
+                .insert(search_id, channel_id);
+            drive_ember_search(socket, state, search_id).await;
+            any = true;
+        }
+        if any {
+            state.channel_presence_fetch_at.insert(channel_id, now);
+            started += 1;
+        }
+    }
+}
+
+fn ingest_channel_presence_records(
+    state: &mut NetworkState,
+    db: &Database,
+    our_pubkey: &[u8; 32],
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(_)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let existing: HashSet<String> = db
+        .list_channel_members(&channel_id_hex)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.member_pubkey)
+        .collect();
+    let mut changed = false;
+    for blob in records {
+        let Some(member) =
+            ember::dht::publish::SignedRecord::parse_channel_presence_member(blob, &channel_id)
+        else {
+            continue;
+        };
+        let pk_hex = hex::encode(member.publisher_key);
+        let nick = crate::security::sanitize_display_name(&member.nickname);
+        if db
+            .upsert_channel_member(&channel_id_hex, &pk_hex, &nick, member.timestamp)
+            .is_ok()
+        {
+            state
+                .ember_channel_noise_keys
+                .insert(member.publisher_key, member.noise_pub);
+            if !existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn maybe_dial_channel_neighbors(
+    state: &mut NetworkState,
+    db: &Database,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    result_tx: &mpsc::UnboundedSender<ChannelNeighborLookupResult>,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    if settings.rendezvous_url.is_empty() {
+        return;
+    }
+    let Ok(neighbors) = collect_channel_neighbor_caps(db, &our_pubkey) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut started = 0usize;
+    for (channel_id, peer_pubkey) in neighbors {
+        if started >= CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK {
+            break;
+        }
+        if state.channel_neighbor_lookup_inflight.contains(&peer_pubkey) {
+            continue;
+        }
+        if state
+            .channel_neighbor_lookup_at
+            .get(&peer_pubkey)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL)
+        {
+            continue;
+        }
+        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer_pubkey));
+        if state.ember_dht.routing().get_contact(&node_id).is_some() {
+            continue;
+        }
+        state.channel_neighbor_lookup_at.insert(peer_pubkey, now);
+        state.channel_neighbor_lookup_inflight.insert(peer_pubkey);
+        spawn_channel_neighbor_lookup(
+            settings.rendezvous_url.clone(),
+            ember_hash,
+            our_pubkey,
+            our_secret,
+            peer_pubkey,
+            channel_id,
+            result_tx.clone(),
+        );
+        started += 1;
+    }
+}
+
+fn spawn_channel_neighbor_lookup(
+    rv_url: String,
+    our_ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    result_tx: mpsc::UnboundedSender<ChannelNeighborLookupResult>,
+) {
+    tokio::spawn(async move {
+        let endpoint = rendezvous::lookup_channel_presence(
+            &rv_url,
+            &our_ember_hash,
+            &our_pubkey,
+            &our_secret,
+            &peer_pubkey,
+            &channel_id,
+        )
+        .await
+        .ok()
+        .flatten();
+        let _ = result_tx.send(ChannelNeighborLookupResult {
+            peer_pubkey,
+            endpoint,
+        });
+    });
+}
+
+async fn apply_channel_neighbor_lookup(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    result: ChannelNeighborLookupResult,
+) {
+    state
+        .channel_neighbor_lookup_inflight
+        .remove(&result.peer_pubkey);
+    let Some((ip, port)) = result.endpoint else {
+        return;
+    };
+    if state.external_ip == Some(ip) && port == advertised_udp_port(state) {
+        return;
+    }
+    // Channel peers resolve over Ember UDP and must never enter the
+    // friend-privilege set. This path only DHT-PINGs.
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let noise = state
+        .ember_channel_noise_keys
+        .get(&result.peer_pubkey)
+        .copied();
+    if let Some(noise_pub) = noise {
+        state
+            .ember_noise_keys
+            .insert((ip, port), (noise_pub, std::time::Instant::now()));
+    }
+    ping_ember_udp_peer(socket, state, addr, noise.as_ref()).await;
+}
+
+async fn ping_ember_udp_peer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    addr: SocketAddr,
+    noise_pub: Option<&[u8; 32]>,
+) {
+    let (_rid, frame) = state.ember_dht.build_ping();
+    match state
+        .ember_transport
+        .prepare_outgoing(addr, noise_pub, &frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            if let Err(e) = socket.send_to(&packet, addr).await {
+                debug!("Ember channel neighbor: ping to {addr} failed: {e}");
+            }
+        }
+        ember::transport::OutgoingResult::Queued => {}
+        ember::transport::OutgoingResult::Error(e) => {
+            debug!("Ember channel neighbor: transport error pinging {addr}: {e}");
+        }
+    }
 }
 
 async fn send_ember_dht_frame(
@@ -13849,6 +14182,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_source_injections.clear();
     state.ember_keyword_searches.clear();
     state.ember_pending_keyword_results.clear();
+    state.ember_channel_presence_searches.clear();
+    state.ember_pending_channel_presence.clear();
+    state.channel_presence_fetch_at.clear();
+    state.ember_channel_noise_keys.clear();
+    state.channel_neighbor_lookup_at.clear();
+    state.channel_neighbor_lookup_inflight.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -14737,6 +15076,12 @@ pub async fn start_network(
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
+        ember_channel_presence_searches: HashMap::new(),
+        ember_pending_channel_presence: Vec::new(),
+        channel_presence_fetch_at: HashMap::new(),
+        ember_channel_noise_keys: HashMap::new(),
+        channel_neighbor_lookup_at: HashMap::new(),
+        channel_neighbor_lookup_inflight: HashSet::new(),
     };
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -15511,6 +15856,8 @@ pub async fn start_network(
         mpsc::unbounded_channel::<UpnpMaintainResult>();
     let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
         mpsc::unbounded_channel::<RendezvousRegisterResult>();
+    let (channel_neighbor_lookup_tx, mut channel_neighbor_lookup_rx) =
+        mpsc::unbounded_channel::<ChannelNeighborLookupResult>();
     let (friend_relay_ticket_poll_result_tx, mut friend_relay_ticket_poll_result_rx) =
         mpsc::unbounded_channel::<FriendRelayTicketPollResult>();
     let (friend_relay_ticket_session_done_tx, mut friend_relay_ticket_session_done_rx) =
@@ -22737,6 +23084,7 @@ pub async fn start_network(
                     // correct current value of it.
                     let rv_url = settings.rendezvous_url.clone();
                     let rv_port = advertised_tcp_port(&state);
+                    let rv_udp_port = advertised_udp_port(&state);
                     let rv_hash = ember_hash;
                     // The outer `if !state.friend_presence_initial_done
                     // && state.external_ip.is_some()` already guarantees
@@ -22751,14 +23099,8 @@ pub async fn start_network(
                     if let Some(rv_ip) = state.external_ip {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
-                        let rv_key_db = db.clone();
-                        let rv_friends = tokio::task::spawn_blocking(move || {
-                            rv_key_db.get_friend_public_keys()
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
+                        let (rv_friends, rv_channel_neighbors) =
+                            load_rendezvous_register_targets(&db, rv_pubkey).await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -22771,10 +23113,12 @@ pub async fn start_network(
                                     &rv_url,
                                     &rv_hash,
                                     rv_port,
+                                    rv_udp_port,
                                     rv_ip,
                                     &rv_pubkey,
                                     &rv_secret,
                                     &rv_friends,
+                                    &rv_channel_neighbors,
                                 )
                                     .await;
                             let _ = tx.send(RendezvousRegisterResult {
@@ -23157,17 +23501,12 @@ pub async fn start_network(
                             // STUN remap discovered between heartbeats
                             // naturally refreshes the rendezvous entry.
                             let rv_port = advertised_tcp_port(&state);
+                            let rv_udp_port = advertised_udp_port(&state);
                             let rv_hash = ember_hash;
                             let rv_pubkey = ed25519_pubkey;
                             let rv_secret = ed25519_secret_key;
-                            let rv_key_db = db.clone();
-                            let rv_friends = tokio::task::spawn_blocking(move || {
-                                rv_key_db.get_friend_public_keys()
-                            })
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or_default();
+                            let (rv_friends, rv_channel_neighbors) =
+                                load_rendezvous_register_targets(&db, rv_pubkey).await;
                             let tx = rendezvous_register_result_tx.clone();
                             rendezvous_register_in_flight = true;
                             rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -23180,10 +23519,12 @@ pub async fn start_network(
                                         &rv_url,
                                         &rv_hash,
                                         rv_port,
+                                        rv_udp_port,
                                         rv_ip,
                                         &rv_pubkey,
                                         &rv_secret,
                                         &rv_friends,
+                                        &rv_channel_neighbors,
                                     )
                                         .await;
                                 let _ = tx.send(RendezvousRegisterResult {
@@ -30828,6 +31169,20 @@ pub async fn start_network(
                         debug!("Ember digest for {hash_hex} computed after completion");
                     }
                 }
+                while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
+                    apply_channel_neighbor_lookup(&udp_socket, &mut state, lookup).await;
+                }
+                if settings.ember_native_enabled {
+                    maybe_dial_channel_neighbors(
+                        &mut state,
+                        &db,
+                        &settings,
+                        ember_hash,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                        &channel_neighbor_lookup_tx,
+                    );
+                }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
                 // Fold peer-to-peer SX bytes (OP_REQUESTSOURCES /
@@ -31457,6 +31812,7 @@ pub async fn start_network(
                     && state.ember_dht_maint_pings.is_empty()
                     && state.ember_pending_source_injections.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
+                    && state.ember_pending_channel_presence.is_empty()
                     // The batch publisher is on an entirely separate path from
                     // the maps above — `flush_ember_batch_publish` only ever
                     // writes `in_flight` — and `expire()` below is its only
@@ -31532,6 +31888,7 @@ pub async fn start_network(
                         }
                         maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
                     }
+                    state.ember_channel_presence_searches.remove(&search_id);
                     // A publish-target lookup can end here rather than through
                     // `maybe_finish_ember_search`: if every send in its first
                     // batch fails, the whole shortlist goes back to Pending, so
@@ -31879,6 +32236,34 @@ pub async fn start_network(
                         }
                     }
                 }
+                if !state.ember_pending_channel_presence.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_presence);
+                    let mut any_new = false;
+                    let mut updated_ids = HashSet::new();
+                    for (channel_id, records) in pending {
+                        if ingest_channel_presence_records(
+                            &mut state,
+                            &db,
+                            &ed25519_pubkey,
+                            channel_id,
+                            &records,
+                        ) {
+                            any_new = true;
+                            updated_ids.insert(hex::encode(channel_id));
+                        }
+                    }
+                    if any_new {
+                        // New XOR neighbors: re-register channel capabilities
+                        // without waiting out the friend heartbeat.
+                        state.rendezvous_last_register = None;
+                    }
+                    for channel_id in updated_ids {
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id }),
+                        );
+                    }
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_search_timer' panicked: {}", describe_panic(&*__p));
@@ -31909,6 +32294,10 @@ pub async fn start_network(
                         &identity,
                     )
                     .await;
+                }
+                if settings.ember_native_enabled {
+                    maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings)
+                        .await;
                 }
 
                 // Nothing to bridge from means nobody has crossed our path yet.
@@ -34777,19 +35166,25 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                         }
                     }
                 }
+                    state
+                        .ember_pending_keyword_results
+                        .push(EmberKeywordResultBatch {
+                            request_id: kw.request_id,
+                            keywords: kw.keywords,
+                            file_type_filter: kw.file_type_filter,
+                            min_size: kw.min_size,
+                            max_size: kw.max_size,
+                            file_extension: kw.file_extension,
+                            min_availability: kw.min_availability,
+                            results,
+                            final_batch: true,
+                        });
+            } else if let Some(channel_id) =
+                state.ember_channel_presence_searches.remove(&search_id)
+            {
                 state
-                    .ember_pending_keyword_results
-                    .push(EmberKeywordResultBatch {
-                        request_id: kw.request_id,
-                        keywords: kw.keywords,
-                        file_type_filter: kw.file_type_filter,
-                        min_size: kw.min_size,
-                        max_size: kw.max_size,
-                        file_extension: kw.file_extension,
-                        min_availability: kw.min_availability,
-                        results,
-                        final_batch: true,
-                    });
+                    .ember_pending_channel_presence
+                    .push((channel_id, records));
             }
         }
     }

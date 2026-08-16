@@ -88,9 +88,29 @@
       if (cancelled) fn();
       else unlisten = fn;
     });
+    let unlistenMembers: UnlistenFn | undefined;
+    listen<{ channel_id: string }>('ember:channel-members', (event) => {
+      const id = event.payload.channel_id;
+      listChannels()
+        .then((list) => {
+          channels = list;
+        })
+        .catch(() => {});
+      if (id === selectedId) {
+        listChannelMembers(id)
+          .then((mems) => {
+            members = mems;
+          })
+          .catch(() => {});
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenMembers = fn;
+    });
     return () => {
       cancelled = true;
       unlisten?.();
+      unlistenMembers?.();
     };
   });
 

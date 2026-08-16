@@ -33,6 +33,10 @@ pub const INDEX_SHARD_COUNT: u8 = 16;
 pub const PRESENCE_EPOCH_SECS: i64 = 15 * 60;
 /// Members re-announce presence this often (inside one epoch).
 pub const PRESENCE_REPUBLISH_SECS: i64 = 10 * 60;
+/// How often a member walks the presence DHT keys for rooms they have joined.
+pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
+/// Cap on rooms whose XOR-neighbors we register at rendezvous per heartbeat.
+pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
 /// Deterministic gossip degree: XOR-closest members to self.
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.
@@ -181,7 +185,6 @@ pub fn moderation_key(channel_id: &[u8; 16]) -> [u8; 16] {
 /// Distinct from friend presence: the purpose binds the channel and the
 /// presence-slot owner, so a channel neighbor cannot reuse the capability
 /// to look up a friend slot, and Alice's entry cannot overwrite Bob's.
-#[allow(dead_code)]
 pub fn derive_channel_presence_capability(
     our_ed25519_seed: &[u8; 32],
     peer_ed25519_pubkey: &[u8; 32],
@@ -220,6 +223,24 @@ pub fn xor_closest_neighbors(
     ranked.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
     ranked.truncate(k);
     ranked.into_iter().map(|(pk, _)| pk).collect()
+}
+
+/// XOR-closest gossip neighbors across joined rooms, for rendezvous
+/// capability registration. Caps both the number of rooms and the degree
+/// so a large join list cannot explode the heartbeat HTTP fan-out.
+pub fn rendezvous_neighbor_targets(
+    our_pubkey: &[u8; 32],
+    members_by_channel: &[([u8; 16], Vec<[u8; 32]>)],
+    max_channels: usize,
+    neighbor_count: usize,
+) -> Vec<([u8; 16], [u8; 32])> {
+    let mut out = Vec::new();
+    for (channel_id, members) in members_by_channel.iter().take(max_channels) {
+        for pk in xor_closest_neighbors(our_pubkey, members, neighbor_count) {
+            out.push((*channel_id, pk));
+        }
+    }
+    out
 }
 
 /// Parsed `ember-channel:` invite.
@@ -719,5 +740,40 @@ mod tests {
         )
         .unwrap();
         assert_ne!(alice_to_bob, other_channel);
+        let friend_cap = crypto::derive_pairwise_presence_capability(
+            &alice.to_bytes(),
+            &bob.verifying_key().to_bytes(),
+            &bob.verifying_key().to_bytes(),
+            epoch,
+        )
+        .unwrap();
+        assert_ne!(
+            alice_to_bob, friend_cap,
+            "channel capability must not collide with friend presence"
+        );
+    }
+
+    #[test]
+    fn rendezvous_neighbor_targets_are_xor_closest_and_skip_self() {
+        let self_pk = SigningKey::generate(&mut OsRng)
+            .verifying_key()
+            .to_bytes();
+        let a = SigningKey::generate(&mut OsRng)
+            .verifying_key()
+            .to_bytes();
+        let b = SigningKey::generate(&mut OsRng)
+            .verifying_key()
+            .to_bytes();
+        let channel_id = [0xab; 16];
+        let closest = xor_closest_neighbors(&self_pk, &[self_pk, a, b], 1);
+        assert_eq!(closest.len(), 1);
+        assert_ne!(closest[0], self_pk);
+        let targets = rendezvous_neighbor_targets(
+            &self_pk,
+            &[(channel_id, vec![self_pk, a, b])],
+            CHANNEL_RENDEZVOUS_MAX_CHANNELS,
+            1,
+        );
+        assert_eq!(targets, vec![(channel_id, closest[0])]);
     }
 }

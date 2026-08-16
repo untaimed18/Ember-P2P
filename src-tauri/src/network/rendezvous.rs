@@ -496,14 +496,21 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 /// unreachable host). Callers must therefore wait until the firewall
 /// checker / KAD probe has produced a confirmed IPv4 address before
 /// invoking this function.
+///
+/// `port` is the TCP listener friends dial. `udp_port` is advertised
+/// only on channel-neighbor capabilities so gossip peers DHT-PING the
+/// Ember UDP socket instead of opening a friend TCP session.
+/// `channel_neighbors` are `(channel_id, peer_pubkey)` pairs.
 pub async fn register(
     base_url: &str,
     ember_hash: &[u8; 16],
     port: u16,
+    udp_port: u16,
     external_ip: Ipv4Addr,
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     friend_identities: &[([u8; 16], [u8; 32])],
+    channel_neighbors: &[([u8; 16], [u8; 32])],
 ) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
@@ -585,6 +592,40 @@ pub async fn register(
             .await
             {
                 debug!("Pairwise presence registration failed: {error}");
+            }
+        }
+        // Channel gossip neighbors resolve over Ember UDP, not the friend
+        // TCP listener. Capability `port` is per-entry, so these sit
+        // alongside friend slots without changing `/register`.
+        if udp_port > 0 {
+            for (channel_id, neighbor_pubkey) in channel_neighbors {
+                let Some(capability) =
+                    crate::network::ember::channel::derive_channel_presence_capability(
+                        secret_key,
+                        neighbor_pubkey,
+                        pubkey,
+                        channel_id,
+                        epoch,
+                    )
+                else {
+                    continue;
+                };
+                if let Err(error) = register_capability_presence(
+                    base_url,
+                    &capability,
+                    epoch,
+                    udp_port,
+                    external_ip,
+                    pubkey,
+                    neighbor_pubkey,
+                    secret_key,
+                    protocol,
+                    false,
+                )
+                .await
+                {
+                    debug!("Channel presence registration failed: {error}");
+                }
             }
         }
         Ok(())
@@ -843,10 +884,7 @@ pub async fn lookup(
     else {
         return Ok(None);
     };
-    let requester_id = hashed_id(our_ember_hash);
-    let requester_raw = sha256_id_raw(our_ember_hash);
     let friend_id = hashed_id(friend_hash);
-    let protocol = negotiate_protocol(base_url).await?;
     let now = current_timestamp();
     let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
 
@@ -867,6 +905,78 @@ pub async fn lookup(
             candidates.push((pairwise, epoch, *our_pubkey));
         }
     }
+    lookup_capability_entries(
+        base_url,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+        &friend_pubkey,
+        &friend_id,
+        candidates,
+    )
+    .await
+}
+
+/// Look up a channel gossip neighbor whose Ed25519 pubkey is already known
+/// from a DHT presence record. Skips the friend identity oracle and uses
+/// the channel-bound pairwise capability so a room neighbor cannot read
+/// a friend presence slot.
+pub async fn lookup_channel_presence(
+    base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    require_https(base_url)?;
+    let peer_hash = crate::network::ember::channel::channel_id_from_pubkey(peer_pubkey);
+    let peer_id = hashed_id(&peer_hash);
+    let now = current_timestamp();
+    let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
+    let mut candidates: Vec<([u8; 32], i64, [u8; 32])> = Vec::with_capacity(2);
+    for epoch in [current_epoch, current_epoch - 1] {
+        if let Some(capability) =
+            crate::network::ember::channel::derive_channel_presence_capability(
+                our_secret_key,
+                peer_pubkey,
+                peer_pubkey,
+                channel_id,
+                epoch,
+            )
+        {
+            candidates.push((capability, epoch, *our_pubkey));
+        }
+    }
+    lookup_capability_entries(
+        base_url,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+        peer_pubkey,
+        &peer_id,
+        candidates,
+    )
+    .await
+}
+
+async fn lookup_capability_entries(
+    base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    expected_pubkey: &[u8; 32],
+    expected_id: &str,
+    candidates: Vec<([u8; 32], i64, [u8; 32])>,
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    let requester_id = hashed_id(our_ember_hash);
+    let requester_raw = sha256_id_raw(our_ember_hash);
+    let protocol = negotiate_protocol(base_url).await?;
+    let log_id = if expected_id.len() >= 8 {
+        &expected_id[..8]
+    } else {
+        expected_id
+    };
 
     let mut successful: Option<(reqwest::Response, [u8; 32], i64, [u8; 32])> = None;
     for (capability, epoch, proof_peer_pubkey) in candidates {
@@ -941,9 +1051,7 @@ pub async fn lookup(
     let raw_port = body["port"].as_u64().unwrap_or_default();
     if raw_port == 0 || raw_port > u16::MAX as u64 {
         debug!(
-            "Rendezvous: lookup for {}… returned invalid port: {}",
-            &friend_id[..8],
-            raw_port
+            "Rendezvous: lookup for {log_id}… returned invalid port: {raw_port}"
         );
         return Ok(None);
     }
@@ -978,24 +1086,20 @@ pub async fn lookup(
     let sig_ok = hex::decode_to_slice(sig_hex, &mut sig).is_ok();
     if !pubkey_ok || !sig_ok {
         warn!(
-            "Rendezvous: lookup for {}… missing/malformed auth fields; refusing to connect",
-            &friend_id[..8]
+            "Rendezvous: lookup for {log_id}… missing/malformed auth fields; refusing to connect"
         );
         return Ok(None);
     }
-    if pubkey != friend_pubkey || !pubkey_matches_id(&pubkey, &friend_id) {
+    if pubkey != *expected_pubkey || !pubkey_matches_id(&pubkey, expected_id) {
         warn!(
-            "Rendezvous: lookup for {}… pubkey does not derive to requested id; refusing to connect (server may be compromised)",
-            &friend_id[..8]
+            "Rendezvous: lookup for {log_id}… pubkey does not derive to requested id; refusing to connect (server may be compromised)"
         );
         return Ok(None);
     }
     let now = current_timestamp();
     if (now - ts).abs() > MAX_LOOKUP_SIG_AGE_SECS {
         warn!(
-            "Rendezvous: lookup for {}… returned a stale signed registration (ts={}); refusing to connect",
-            &friend_id[..8],
-            ts
+            "Rendezvous: lookup for {log_id}… returned a stale signed registration (ts={ts}); refusing to connect"
         );
         return Ok(None);
     }
@@ -1028,44 +1132,30 @@ pub async fn lookup(
                 ts,
             ),
             _ => {
-                warn!(
-                    "Rendezvous: lookup for {}… returned unknown proof version",
-                    &friend_id[..8]
-                );
+                warn!("Rendezvous: lookup for {log_id}… returned unknown proof version");
                 return Ok(None);
             }
         };
         if !ed25519_verify_lookup(&pubkey, &msg, &sig) {
             warn!(
-                "Rendezvous: lookup for {}… signature verification failed; refusing to connect (server may be compromised)",
-                &friend_id[..8]
+                "Rendezvous: lookup for {log_id}… signature verification failed; refusing to connect (server may be compromised)"
             );
             return Ok(None);
         }
         if port > 0 && is_routable_public_v4(ip) {
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.
-            debug!(
-                "Rendezvous: presence found for {}… at {}:{}",
-                &friend_id[..8],
-                ip,
-                port
-            );
+            debug!("Rendezvous: presence found for {log_id}… at {ip}:{port}");
             return Ok(Some((ip, port)));
         }
         if port > 0 {
             warn!(
-                "Rendezvous: lookup for {}… returned non-public IP ({}); refusing to connect",
-                &friend_id[..8],
-                ip
+                "Rendezvous: lookup for {log_id}… returned non-public IP ({ip}); refusing to connect"
             );
             return Ok(None);
         }
     }
-    debug!(
-        "Rendezvous: lookup for {}… returned unparseable data",
-        &friend_id[..8]
-    );
+    debug!("Rendezvous: lookup for {log_id}… returned unparseable data");
     Ok(None)
 }
 
@@ -1137,6 +1227,14 @@ mod lookup_filter_tests {
         assert!(is_routable_public_v4(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(is_routable_public_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(is_routable_public_v4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+
+    #[test]
+    fn channel_neighbor_id_matches_rendezvous_pubkey_binding() {
+        let sk = SigningKey::from_bytes(&[7; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let node_id = crate::network::ember::channel::channel_id_from_pubkey(&pk);
+        assert!(pubkey_matches_id(&pk, &hashed_id(&node_id)));
     }
 
     #[test]

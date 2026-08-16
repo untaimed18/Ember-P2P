@@ -94,6 +94,15 @@ impl ChannelRecordMeta {
     }
 }
 
+/// A member announced under a channel presence key. No address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelPresenceMember {
+    pub publisher_key: [u8; 32],
+    pub nickname: String,
+    pub timestamp: i64,
+    pub noise_pub: [u8; 32],
+}
+
 pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
     u64::from(kind) | (u64::from(flags) << 8)
 }
@@ -201,8 +210,10 @@ impl SignedRecord {
         )
     }
 
-    /// Membership presence: pubkey + nickname, never an address. Signed by
-    /// the **member**, with the channel pubkey in `ember_file_hash`.
+    /// Membership presence: pubkey + nickname + Noise static key, never an
+    /// address. Signed by the **member**, with the channel pubkey in
+    /// `ember_file_hash`. `noise_pub` lets XOR-neighbors start Noise_IK
+    /// after a rendezvous lookup without publishing an IP.
     pub fn channel_presence(
         nickname: &str,
         channel_id: [u8; 16],
@@ -210,6 +221,7 @@ impl SignedRecord {
         join_secret: &[u8; 32],
         private: bool,
         epoch: i64,
+        noise_pub: &[u8; 32],
         signing_key: &SigningKey,
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
@@ -222,7 +234,7 @@ impl SignedRecord {
             pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
             nickname,
             None,
-            Some(Vec::new()),
+            Some(noise_pub.to_vec()),
             signing_key,
         )
     }
@@ -278,7 +290,10 @@ impl SignedRecord {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::index_key_for_channel(&self.file_hash)
             }
-            CHANNEL_KIND_PRESENCE => crypto::verifying_key_from_bytes(&self.publisher_key).is_some(),
+            CHANNEL_KIND_PRESENCE => {
+                crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
+                    && meta.extra.len() == 32
+            }
             CHANNEL_KIND_MODERATION => {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::moderation_key(&self.file_hash)
@@ -386,6 +401,33 @@ impl SignedRecord {
         let (data, sig_bytes) = blob.split_at(split);
         let signature: [u8; 64] = sig_bytes.try_into().ok()?;
         Self::from_wire(data, signature)
+    }
+
+    /// Parse a channel presence blob into the member's identity. IPs never
+    /// appear here; `noise_pub` is the Ember UDP static key for a later
+    /// Noise_IK handshake after rendezvous supplies an address.
+    pub fn parse_channel_presence_member(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelPresenceMember> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_PRESENCE {
+            return None;
+        }
+        let noise_pub = <[u8; 32]>::try_from(meta.extra.as_slice()).ok()?;
+        Some(ChannelPresenceMember {
+            publisher_key: rec.publisher_key,
+            nickname: rec.file_name,
+            timestamp: rec.timestamp,
+            noise_pub,
+        })
     }
 
     /// Whether `blob` carries a signature its embedded publisher key really
@@ -983,13 +1025,15 @@ mod tests {
         let channel = channel::ChannelIdentity::generate();
         let member = SigningKey::generate(&mut OsRng);
         let join = channel::public_join_secret(&channel.pubkey);
-        let record = SignedRecord::channel_presence(
+        let noise_pub = [0x42u8; 32];
+        let mut record = SignedRecord::channel_presence(
             "Ada",
             channel.channel_id,
             channel.pubkey,
             &join,
             false,
             3,
+            &noise_pub,
             &member,
         );
         assert_eq!(record.publisher_key, member.verifying_key().to_bytes());
@@ -1002,7 +1046,21 @@ mod tests {
         let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
         assert_eq!(parsed.file_name, "Ada");
         assert_eq!(parsed.channel.as_ref().unwrap().kind, CHANNEL_KIND_PRESENCE);
+        assert_eq!(parsed.channel.as_ref().unwrap().extra, noise_pub);
         assert!(parsed.source_contact.is_none());
+
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let member_info =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id).unwrap();
+        assert_eq!(member_info.publisher_key, member.verifying_key().to_bytes());
+        assert_eq!(member_info.nickname, "Ada");
+        assert_eq!(member_info.noise_pub, noise_pub);
+        assert!(
+            SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16]).is_none()
+        );
+        record.channel.as_mut().unwrap().extra.clear();
+        assert!(!record.channel_store_ok());
     }
 
     #[test]
