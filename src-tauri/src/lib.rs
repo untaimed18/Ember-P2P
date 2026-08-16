@@ -625,6 +625,9 @@ pub fn run() {
             let spam_filter = Arc::new(RwLock::new(
                 search::spam::SpamFilter::load(&spam_data_dir),
             ));
+            let comment_manager = Arc::new(RwLock::new(
+                network::ed2k::comments::CommentManager::new(),
+            ));
 
             // Capacity 1024 (was 256): every Tauri command that mutates
             // persistent state (`UpdateSettings`, `BanPeer`, `BootstrapContacts`,
@@ -767,6 +770,7 @@ pub fn run() {
                 hash_cancel_flags: hash_cancel_flags.clone(),
                 fresh_part_hashes: fresh_part_hashes.clone(),
                 spam_filter: spam_filter.clone(),
+                comment_manager: comment_manager.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
                 mutual_friend_hashes: mutual_friend_hashes.clone(),
@@ -1531,6 +1535,7 @@ pub fn run() {
             let bw_rtt = uss_rtt_queue.clone();
             let bw_uss_flag = uss_enabled_flag.clone();
             let net_spam = spam_filter.clone();
+            let net_comments = comment_manager.clone();
             let net_identity = identity.clone();
             let net_security_policy = security_policy.clone();
             let net_handle_err = app_handle.clone();
@@ -1560,6 +1565,7 @@ pub fn run() {
                     uss_rtt_queue,
                     uss_enabled_flag,
                     net_spam,
+                    net_comments,
                 )
                 .await
                 {
@@ -1602,6 +1608,7 @@ pub fn run() {
             commands::search::get_spam_stats,
             commands::search::explain_spam_result,
             commands::search::reset_spam_filter,
+            commands::search::rescore_search_results,
             commands::search::get_download_history,
             commands::search::get_download_history_stats,
             commands::search::clear_download_history,

@@ -854,6 +854,18 @@ pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
         .collect()
 }
 
+/// Remaining keyword hashes attached to FIND_VALUE for peer-side `file_hash`
+/// intersection. Pass `intersect = false` for OR queries: that intersection
+/// is AND semantics and would drop the non-matching half at any peer that
+/// also stored a secondary key.
+pub fn extra_keyword_hashes(hashed: &[([u8; 16], String)], intersect: bool) -> Vec<[u8; 16]> {
+    if !intersect {
+        Vec::new()
+    } else {
+        hashed.iter().skip(1).map(|(h, _)| *h).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,6 +1269,15 @@ mod tests {
         let hashes = compute_keyword_hashes("iso abc iso");
         assert_eq!(hashes.len(), 2, "the repeated keyword is counted once");
         assert_eq!(hashes.iter().filter(|(_, k)| k == "iso").count(), 1);
+    }
+
+    #[test]
+    fn extra_keyword_hashes_skip_on_or_keep_on_and() {
+        let hashed = compute_keyword_hashes("ubuntu server");
+        assert_eq!(hashed.len(), 2);
+        assert!(extra_keyword_hashes(&hashed, false).is_empty());
+        assert_eq!(extra_keyword_hashes(&hashed, true).len(), 1);
+        assert_eq!(extra_keyword_hashes(&hashed, true)[0], hashed[1].0);
     }
 
     #[test]

@@ -1,9 +1,10 @@
-import { get, writable } from 'svelte/store';
+import { get, writable, type Unsubscriber } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters } from '$lib/api/search';
-import { cancelSearch } from '$lib/api/search';
+import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
+import { appSettings } from './settings';
 import { dev } from '$app/environment';
 
 export type SearchTab = {
@@ -30,6 +31,8 @@ export const activeSearchTabId = writable<string | null>(null);
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
+let unsubSettings: Unsubscriber | null = null;
+let lastSpamSettingsKey: string | null = null;
 let searchNonce = 0;
 // Bumped by `cleanupSearchStore`; see the matching comment in
 // `stores/network.ts` for why `initSearchStore` needs to re-check this
@@ -400,6 +403,47 @@ function scheduleFlush() {
   }
 }
 
+function spamSettingsKey(
+  s: { spam_filter_enabled: boolean; spam_filter_profile: string } | null | undefined,
+): string | null {
+  if (!s) return null;
+  return `${s.spam_filter_enabled ? '1' : '0'}:${s.spam_filter_profile}`;
+}
+
+/** Re-score every open tab after spam settings change (SF8). Honors per-hash
+ *  user mark/unmark overrides so an explicit classification is not overwritten. */
+async function rescoreOpenTabs() {
+  const tabs = get(searchTabs);
+  for (const tab of tabs) {
+    if (tab.results.length === 0) continue;
+    const keywords = tab.query.split(/\s+/).filter((w) => w.length > 0).slice(0, 32);
+    const tabId = tab.id;
+    try {
+      const scored = await rescoreSearchResults(tab.results, keywords);
+      searchTabs.update((current) => {
+        const i = current.findIndex((t) => t.id === tabId);
+        if (i === -1) return current;
+        const byHash = new Map(scored.map((r) => [r.file.hash, r]));
+        const results = current[i].results.map((r) => {
+          const n = byHash.get(r.file.hash);
+          if (!n) return r;
+          const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
+          return {
+            ...r,
+            spam_rating: override?.spamRating ?? n.spam_rating,
+            is_spam: override?.isSpam ?? n.is_spam,
+          };
+        });
+        const next = [...current];
+        next[i] = { ...current[i], results, resultIndex: undefined };
+        return next;
+      });
+    } catch (e) {
+      console.error('Failed to rescore search results:', e);
+    }
+  }
+}
+
 export async function initSearchStore() {
   if (initialized) return;
 
@@ -486,12 +530,23 @@ export async function initSearchStore() {
     return;
   }
   unlisteners.push(...registered);
+  lastSpamSettingsKey = spamSettingsKey(get(appSettings));
+  unsubSettings = appSettings.subscribe((s) => {
+    const key = spamSettingsKey(s);
+    if (key === lastSpamSettingsKey) return;
+    lastSpamSettingsKey = key;
+    if (key === null) return;
+    void rescoreOpenTabs();
+  });
 }
 
 export function cleanupSearchStore() {
   storeEpoch++;
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
+  unsubSettings?.();
+  unsubSettings = null;
+  lastSpamSettingsKey = null;
   initialized = false;
   // Cancel any scheduled result flush so a stale rAF/timeout can't merge a
   // buffered batch into the freshly-cleared tabs after teardown/re-init.
