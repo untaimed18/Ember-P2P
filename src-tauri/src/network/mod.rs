@@ -10190,25 +10190,16 @@ async fn maybe_publish_channel_presence(
     }
 }
 
-const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
 const CHANNEL_GOSSIP_RATE_PER_SEC: usize = 16;
 
 fn remember_channel_gossip(state: &mut NetworkState, msg_id: [u8; 16]) -> bool {
-    if state.channel_gossip_seen.contains_key(&msg_id) {
-        return false;
-    }
-    while state.channel_gossip_seen_order.len() >= CHANNEL_GOSSIP_SEEN_CAP {
-        if let Some(old) = state.channel_gossip_seen_order.pop_front() {
-            state.channel_gossip_seen.remove(&old);
-        } else {
-            break;
-        }
-    }
-    state
-        .channel_gossip_seen
-        .insert(msg_id, std::time::Instant::now());
-    state.channel_gossip_seen_order.push_back(msg_id);
-    true
+    ember::channel::remember_gossip_id(
+        &mut state.channel_gossip_seen,
+        &mut state.channel_gossip_seen_order,
+        ember::channel::CHANNEL_GOSSIP_SEEN_CAP,
+        msg_id,
+        std::time::Instant::now(),
+    )
 }
 
 fn channel_gossip_rate_ok(state: &mut NetworkState) -> bool {

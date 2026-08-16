@@ -14,6 +14,8 @@ use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use super::crypto;
 use super::dht::EmberNodeId;
@@ -45,6 +47,8 @@ pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.
 pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
+/// In-session cap on distinct gossip ids remembered for flood dedup.
+pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
 pub const CHANNEL_MSG_VERSION: u8 = 1;
 const GOSSIP_NONCE_LEN: usize = 24;
 const GOSSIP_TAG_LEN: usize = 16;
@@ -157,11 +161,7 @@ pub fn presence_epoch(unix_seconds: i64) -> i64 {
 
 /// Presence DHT key. Private channels fold `join_secret` in so non-members
 /// cannot enumerate the room.
-pub fn presence_key(
-    channel_id: &[u8; 16],
-    join_secret: &[u8; 32],
-    epoch: i64,
-) -> [u8; 16] {
+pub fn presence_key(channel_id: &[u8; 16], join_secret: &[u8; 32], epoch: i64) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(PRESENCE_KEY_PREFIX);
     hasher.update(channel_id);
@@ -209,11 +209,7 @@ pub fn derive_channel_presence_capability(
 ///
 /// Distance is on the 16-byte IDs (`BLAKE3(pubkey)[..16]`), matching DHT
 /// node IDs, so both sides independently compute the same pairing.
-pub fn xor_closest_neighbors(
-    self_pub: &[u8; 32],
-    members: &[[u8; 32]],
-    k: usize,
-) -> Vec<[u8; 32]> {
+pub fn xor_closest_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize) -> Vec<[u8; 32]> {
     let self_id = EmberNodeId(channel_id_from_pubkey(self_pub));
     let mut ranked: Vec<([u8; 32], EmberNodeId)> = members
         .iter()
@@ -442,6 +438,30 @@ pub fn decode_channel_mod_action(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], bo
     Some((sender, target, banned))
 }
 
+/// Record `msg_id` in the flood seen-set. Returns `true` the first time
+/// this id is observed; later copies are dropped so a cycle cannot loop.
+pub fn remember_gossip_id(
+    seen: &mut HashMap<[u8; 16], Instant>,
+    order: &mut VecDeque<[u8; 16]>,
+    cap: usize,
+    msg_id: [u8; 16],
+    now: Instant,
+) -> bool {
+    if seen.contains_key(&msg_id) {
+        return false;
+    }
+    while order.len() >= cap {
+        if let Some(old) = order.pop_front() {
+            seen.remove(&old);
+        } else {
+            break;
+        }
+    }
+    seen.insert(msg_id, now);
+    order.push_back(msg_id);
+    true
+}
+
 impl ChannelGossip {
     pub fn new_plaintext(
         channel_id: [u8; 16],
@@ -617,6 +637,7 @@ fn decrypt_gossip_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn channel_id_matches_ember_node_id_derivation() {
@@ -731,8 +752,12 @@ mod tests {
         let channel_id = [3u8; 16];
         let msg = ChannelGossip::new_plaintext(channel_id, &key, 42, b"hello room", 4);
         let decoded = ChannelGossip::decode(&msg.encode()).unwrap();
-        assert_eq!(decoded.decrypt(&key).as_deref(), Some(b"hello room".as_slice()));
-        let (pk, text) = decode_channel_chat_plain(&encode_channel_chat_plain(&[9u8; 32], "hi")).unwrap();
+        assert_eq!(
+            decoded.decrypt(&key).as_deref(),
+            Some(b"hello room".as_slice())
+        );
+        let (pk, text) =
+            decode_channel_chat_plain(&encode_channel_chat_plain(&[9u8; 32], "hi")).unwrap();
         assert_eq!(pk, [9u8; 32]);
         assert_eq!(text, "hi");
         assert!(decoded.decrypt(&[8u8; 32]).is_none());
@@ -740,18 +765,12 @@ mod tests {
         tampered.sender_counter = 43;
         assert!(tampered.decrypt(&key).is_none());
         assert_eq!(decoded.decremented_ttl().unwrap().ttl, 3);
-        assert!(ChannelGossip {
-            ttl: 1,
-            ..decoded
-        }
-        .decremented_ttl()
-        .is_none());
-        let (sender, target, banned) = decode_channel_mod_action(&encode_channel_mod_action(
-            &[1u8; 32],
-            &[2u8; 32],
-            true,
-        ))
-        .unwrap();
+        assert!(ChannelGossip { ttl: 1, ..decoded }
+            .decremented_ttl()
+            .is_none());
+        let (sender, target, banned) =
+            decode_channel_mod_action(&encode_channel_mod_action(&[1u8; 32], &[2u8; 32], true))
+                .unwrap();
         assert_eq!(sender, [1u8; 32]);
         assert_eq!(target, [2u8; 32]);
         assert!(banned);
@@ -805,15 +824,9 @@ mod tests {
 
     #[test]
     fn rendezvous_neighbor_targets_are_xor_closest_and_skip_self() {
-        let self_pk = SigningKey::generate(&mut OsRng)
-            .verifying_key()
-            .to_bytes();
-        let a = SigningKey::generate(&mut OsRng)
-            .verifying_key()
-            .to_bytes();
-        let b = SigningKey::generate(&mut OsRng)
-            .verifying_key()
-            .to_bytes();
+        let self_pk = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let a = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let b = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let channel_id = [0xab; 16];
         let closest = xor_closest_neighbors(&self_pk, &[self_pk, a, b], 1);
         assert_eq!(closest.len(), 1);
@@ -825,5 +838,221 @@ mod tests {
             1,
         );
         assert_eq!(targets, vec![(channel_id, closest[0])]);
+    }
+
+    #[test]
+    fn gossip_seen_set_dedups_and_evicts_oldest() {
+        let mut seen = HashMap::new();
+        let mut order = VecDeque::new();
+        let now = Instant::now();
+        let cap = 4;
+        let ids: Vec<[u8; 16]> = (0u8..6)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = i;
+                id
+            })
+            .collect();
+        for id in &ids[..4] {
+            assert!(remember_gossip_id(&mut seen, &mut order, cap, *id, now));
+        }
+        assert!(!remember_gossip_id(&mut seen, &mut order, cap, ids[0], now));
+        assert!(remember_gossip_id(&mut seen, &mut order, cap, ids[4], now));
+        assert!(!seen.contains_key(&ids[0]));
+        assert!(remember_gossip_id(&mut seen, &mut order, cap, ids[5], now));
+        assert!(!seen.contains_key(&ids[1]));
+        assert_eq!(seen.len(), cap);
+        assert_eq!(order.len(), cap);
+        assert!(seen.contains_key(&ids[2]));
+        assert!(seen.contains_key(&ids[5]));
+    }
+
+    #[test]
+    fn gossip_seen_set_respects_session_cap() {
+        let mut seen = HashMap::new();
+        let mut order = VecDeque::new();
+        let now = Instant::now();
+        let cap = CHANNEL_GOSSIP_SEEN_CAP;
+        for i in 0..(cap + 10) {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(remember_gossip_id(&mut seen, &mut order, cap, id, now));
+        }
+        assert_eq!(seen.len(), cap);
+        assert_eq!(order.len(), cap);
+        let mut evicted = [0u8; 16];
+        evicted[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(!seen.contains_key(&evicted));
+        let mut kept = [0u8; 16];
+        kept[..8].copy_from_slice(&10u64.to_le_bytes());
+        assert!(seen.contains_key(&kept));
+        assert!(!remember_gossip_id(&mut seen, &mut order, cap, kept, now));
+    }
+
+    #[test]
+    fn gossip_decode_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_7E11);
+        let key = content_key(&[7u8; 32]);
+        let channel_id = [3u8; 16];
+        let chat_plain = encode_channel_chat_plain(&[9u8; 32], "fuzz");
+        let well_chat = ChannelGossip::new_plaintext(channel_id, &key, 1, &chat_plain, 4).encode();
+        let mod_plain = encode_channel_mod_action(&[1u8; 32], &[2u8; 32], true);
+        let well_mod = ChannelGossip::new_plaintext(channel_id, &key, 2, &mod_plain, 4).encode();
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            let buf = match i {
+                0 => well_chat.clone(),
+                1 => well_mod.clone(),
+                _ => {
+                    let len = rng.gen_range(0..=512);
+                    let mut buf = vec![0u8; len];
+                    rng.fill(&mut buf[..]);
+                    if i % 17 == 0 {
+                        buf = well_chat.clone();
+                        let at = rng.gen_range(0..buf.len());
+                        buf[at] ^= rng.gen_range(1u8..=255);
+                    }
+                    buf
+                }
+            };
+            if let Some(decoded) = ChannelGossip::decode(&buf) {
+                decoded_ok += 1;
+                let _ = decoded.decremented_ttl();
+                if let Some(plain) = decoded.decrypt(&key) {
+                    let _ = decode_channel_chat_plain(&plain);
+                    let _ = decode_channel_mod_action(&plain);
+                }
+            }
+            let _ = decode_channel_chat_plain(&buf);
+            let _ = decode_channel_mod_action(&buf);
+        }
+        let chat = ChannelGossip::decode(&well_chat).unwrap();
+        let (pk, text) = decode_channel_chat_plain(&chat.decrypt(&key).unwrap()).unwrap();
+        assert_eq!(pk, [9u8; 32]);
+        assert_eq!(text, "fuzz");
+        let mod_g = ChannelGossip::decode(&well_mod).unwrap();
+        let (sender, target, banned) =
+            decode_channel_mod_action(&mod_g.decrypt(&key).unwrap()).unwrap();
+        assert_eq!(sender, [1u8; 32]);
+        assert_eq!(target, [2u8; 32]);
+        assert!(banned);
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a buffer that reached ChannelGossip::decode"
+        );
+    }
+
+    #[test]
+    fn gossip_mesh_soak_delivers_once_within_ttl() {
+        const N: usize = 12;
+        let members: Vec<[u8; 32]> = (0..N)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[0] = i as u8;
+                pk[1] = 0xC8;
+                pk[2] = 0xA1;
+                pk
+            })
+            .collect();
+        let neighbors: Vec<Vec<usize>> = members
+            .iter()
+            .map(|self_pk| {
+                xor_closest_neighbors(self_pk, &members, CHANNEL_NEIGHBOR_COUNT)
+                    .into_iter()
+                    .filter_map(|pk| members.iter().position(|m| *m == pk))
+                    .collect()
+            })
+            .collect();
+        let key = content_key(&[9u8; 32]);
+        let channel_id = [0x42u8; 16];
+        let now = Instant::now();
+        let mut seen: Vec<(HashMap<[u8; 16], Instant>, VecDeque<[u8; 16]>)> =
+            (0..N).map(|_| (HashMap::new(), VecDeque::new())).collect();
+
+        for origin in 0..N {
+            let reachable = directed_reach(&neighbors, origin, CHANNEL_MSG_TTL_DEFAULT);
+            assert_eq!(
+                reachable.len(),
+                N,
+                "XOR-{CHANNEL_NEIGHBOR_COUNT} graph on {N} members should be fully reachable from {origin} within TTL"
+            );
+            let expected = format!("soak-{origin}");
+            let gossip = ChannelGossip::new_plaintext(
+                channel_id,
+                &key,
+                origin as u64 + 1,
+                expected.as_bytes(),
+                CHANNEL_MSG_TTL_DEFAULT,
+            );
+            let mut delivered = vec![0u8; N];
+            let mut q = VecDeque::new();
+            {
+                let (map, order) = &mut seen[origin];
+                assert!(remember_gossip_id(
+                    map,
+                    order,
+                    CHANNEL_GOSSIP_SEEN_CAP,
+                    gossip.msg_id,
+                    now,
+                ));
+            }
+            delivered[origin] = 1;
+            for &nbr in &neighbors[origin] {
+                q.push_back((nbr, gossip.clone()));
+            }
+            while let Some((node, pkt)) = q.pop_front() {
+                let first_seen = {
+                    let (map, order) = &mut seen[node];
+                    remember_gossip_id(map, order, CHANNEL_GOSSIP_SEEN_CAP, pkt.msg_id, now)
+                };
+                if !first_seen {
+                    continue;
+                }
+                assert_eq!(pkt.decrypt(&key).as_deref(), Some(expected.as_bytes()));
+                delivered[node] += 1;
+                let Some(next) = pkt.decremented_ttl() else {
+                    continue;
+                };
+                for &nbr in &neighbors[node] {
+                    q.push_back((nbr, next.clone()));
+                }
+            }
+            for node in 0..N {
+                assert_eq!(
+                    delivered[node], 1,
+                    "node {node} should receive origin {origin}'s message exactly once"
+                );
+                let (map, order) = &mut seen[node];
+                assert!(!remember_gossip_id(
+                    map,
+                    order,
+                    CHANNEL_GOSSIP_SEEN_CAP,
+                    gossip.msg_id,
+                    now,
+                ));
+            }
+        }
+        for (map, order) in &seen {
+            assert_eq!(map.len(), N);
+            assert_eq!(order.len(), N);
+            assert!(map.len() <= CHANNEL_GOSSIP_SEEN_CAP);
+        }
+    }
+
+    fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {
+        let mut reach = HashSet::from([origin]);
+        let mut q = VecDeque::from([(origin, 0u8)]);
+        while let Some((node, depth)) = q.pop_front() {
+            if depth >= ttl {
+                continue;
+            }
+            for &nbr in &neighbors[node] {
+                if reach.insert(nbr) {
+                    q.push_back((nbr, depth + 1));
+                }
+            }
+        }
+        reach
     }
 }

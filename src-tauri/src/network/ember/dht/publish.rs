@@ -492,7 +492,8 @@ impl SignedRecord {
             return false;
         }
         if data[0] == RECORD_TYPE_CHANNEL
-            && !channel_trailer_len(data, name_len).is_some_and(|n| data.len() == 115 + name_len + n)
+            && !channel_trailer_len(data, name_len)
+                .is_some_and(|n| data.len() == 115 + name_len + n)
         {
             return false;
         }
@@ -633,7 +634,8 @@ fn encode_moderation_extra(
         .iter()
         .take(CHANNEL_MOD_LIST_MAX)
         .collect::<Vec<_>>();
-    let mut extra = Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32);
+    let mut extra =
+        Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32);
     extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
     extra.extend_from_slice(welcome.as_bytes());
     extra.extend_from_slice(&(bans.len() as u16).to_le_bytes());
@@ -1129,9 +1131,7 @@ mod tests {
         assert_eq!(member_info.publisher_key, member.verifying_key().to_bytes());
         assert_eq!(member_info.nickname, "Ada");
         assert_eq!(member_info.noise_pub, noise_pub);
-        assert!(
-            SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16]).is_none()
-        );
+        assert!(SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16]).is_none());
         record.channel.as_mut().unwrap().extra.clear();
         assert!(!record.channel_store_ok());
     }
@@ -1162,8 +1162,7 @@ mod tests {
 
         let mut blob = record.data.clone();
         blob.extend_from_slice(&record.signature);
-        let mod_info =
-            SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
+        let mod_info = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
         assert_eq!(mod_info.topic, "rules");
         assert_eq!(mod_info.welcome, "be kind");
         assert_eq!(mod_info.banned_pubkeys, banned);
@@ -1195,5 +1194,120 @@ mod tests {
         let mut blob = truncated.to_vec();
         blob.extend_from_slice(&record.signature);
         assert!(!SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    #[test]
+    fn decode_moderation_extra_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_E07A);
+        let well_formed =
+            encode_moderation_extra("welcome ☕", &[[0x11u8; 32], [0x22u8; 32]], &[[0xAAu8; 32]]);
+        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[]);
+        legacy.truncate(legacy.len() - 2);
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            let extra = match i {
+                0 => well_formed.clone(),
+                1 => legacy.clone(),
+                _ => {
+                    let len = rng.gen_range(0..=800);
+                    let mut buf = vec![0u8; len];
+                    rng.fill(&mut buf[..]);
+                    if i % 19 == 0 {
+                        buf = well_formed.clone();
+                        let at = rng.gen_range(0..buf.len());
+                        buf[at] ^= rng.gen_range(1u8..=255);
+                    }
+                    buf
+                }
+            };
+            if decode_moderation_extra(&extra).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        let (welcome, bans, mods) = decode_moderation_extra(&well_formed).unwrap();
+        assert_eq!(welcome, "welcome ☕");
+        assert_eq!(bans.len(), 2);
+        assert_eq!(mods.len(), 1);
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a buffer that reached decode_moderation_extra"
+        );
+    }
+
+    #[test]
+    fn channel_record_parse_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_51C6);
+        let ident = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&ident.pubkey);
+        let presence = SignedRecord::channel_presence(
+            "Ada",
+            ident.channel_id,
+            ident.pubkey,
+            &join,
+            false,
+            3,
+            &[0x42u8; 32],
+            &member,
+        );
+        let moderation = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &[[0x11u8; 32]],
+            &[[0xAAu8; 32]],
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let mut presence_blob = presence.data.clone();
+        presence_blob.extend_from_slice(&presence.signature);
+        let mut moderation_blob = moderation.data.clone();
+        moderation_blob.extend_from_slice(&moderation.signature);
+        let mut parsed_ok = 0usize;
+        for i in 0..2_000 {
+            let buf = match i {
+                0 => presence_blob.clone(),
+                1 => moderation_blob.clone(),
+                _ => {
+                    let len = rng.gen_range(0..=1_200);
+                    let mut buf = vec![0u8; len];
+                    rng.fill(&mut buf[..]);
+                    if i % 21 == 0 {
+                        buf = if i % 2 == 0 {
+                            presence_blob.clone()
+                        } else {
+                            moderation_blob.clone()
+                        };
+                        let at = rng.gen_range(0..buf.len());
+                        buf[at] ^= rng.gen_range(1u8..=255);
+                    }
+                    buf
+                }
+            };
+            let _ = SignedRecord::from_value_blob(&buf);
+            let _ = SignedRecord::value_blob_is_authentic(&buf);
+            if SignedRecord::parse_channel_presence_member(&buf, &ident.channel_id).is_some() {
+                parsed_ok += 1;
+            }
+            if SignedRecord::parse_channel_moderation(&buf, &ident.channel_id).is_some() {
+                parsed_ok += 1;
+            }
+            let _ = SignedRecord::parse_channel_presence_member(&buf, &[0u8; 16]);
+            let _ = SignedRecord::parse_channel_moderation(&buf, &[0u8; 16]);
+        }
+        assert!(
+            SignedRecord::parse_channel_presence_member(&presence_blob, &ident.channel_id)
+                .is_some()
+        );
+        assert!(
+            SignedRecord::parse_channel_moderation(&moderation_blob, &ident.channel_id).is_some()
+        );
+        assert!(
+            parsed_ok > 0,
+            "the fuzz never produced a buffer that reached the channel record parsers"
+        );
     }
 }
