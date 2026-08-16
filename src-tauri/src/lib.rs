@@ -9,6 +9,7 @@ mod sharing;
 mod storage;
 mod types;
 
+use futures::FutureExt;
 use tauri::Emitter;
 
 use std::sync::Arc;
@@ -1540,7 +1541,15 @@ pub fn run() {
             let net_security_policy = security_policy.clone();
             let net_handle_err = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = network::start_network(
+                // `catch_unwind` because a panic here is not survivable in the
+                // way an `Err` is: it unwinds straight past the reporting below,
+                // so the UI is never told and every later poll keeps succeeding
+                // off the last cached snapshot. The user sees a frozen-but-
+                // plausible network view instead of an error. Release builds set
+                // `overflow-checks`, and this loop does arithmetic on lengths and
+                // offsets taken from ed2k, KAD and Ember frames, so an overflow
+                // panic on hostile input is exactly the case to contain.
+                let outcome = std::panic::AssertUnwindSafe(network::start_network(
                     net_handle,
                     network_rx,
                     settings,
@@ -1566,16 +1575,36 @@ pub fn run() {
                     uss_enabled_flag,
                     net_spam,
                     net_comments,
-                )
-                .await
-                {
-                    tracing::error!("Network error: {e}");
-                    // The full error chain can contain IPs, peer IDs, paths,
-                    // and low-level socket diagnostics we don't want to leak
-                    // to the UI (it's shown verbatim). Log the rich version
-                    // for diagnostics and send a redacted, user-facing summary.
-                    let redacted = crate::security::redact_fatal_error(&e);
-                    let _ = net_handle_err.emit("network-fatal-error", redacted);
+                ))
+                .catch_unwind()
+                .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("Network error: {e}");
+                        // The full error chain can contain IPs, peer IDs, paths,
+                        // and low-level socket diagnostics we don't want to leak
+                        // to the UI (it's shown verbatim). Log the rich version
+                        // for diagnostics and send a redacted, user-facing summary.
+                        let redacted = crate::security::redact_fatal_error(&e);
+                        let _ = net_handle_err.emit("network-fatal-error", redacted);
+                    }
+                    Err(_panic) => {
+                        // Location and payload are already in the log via the
+                        // panic hook installed at startup; the payload itself can
+                        // carry peer data, so it is not forwarded to the UI.
+                        tracing::error!(
+                            "Network task panicked; networking is stopped until restart"
+                        );
+                        let _ = net_handle_err.emit(
+                            "network-fatal-error",
+                            crate::commands::errors::coded(
+                                "network_task_panicked",
+                                "The network service stopped unexpectedly. \
+                                 Restart Ember to reconnect; see logs for details.",
+                            ),
+                        );
+                    }
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });

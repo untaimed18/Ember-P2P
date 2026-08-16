@@ -83,6 +83,40 @@ test("repository release versions and workflow policy agree", () => {
   assert.ok(result.actions > 0);
 });
 
+test("a branch ref is not mistaken for a release tag", () => {
+  // CI runs these gates on `main` and on pull requests, where GITHUB_REF_NAME
+  // is a branch name or `<number>/merge`. Reading either as a tag failed every
+  // non-release run with "expected vX.Y.Z, got main", which is why the
+  // version-ahead ratchet had never actually run anywhere.
+  const original = process.env.GITHUB_REF_NAME;
+  try {
+    for (const ref of ["main", "42/merge", "release-1.5.6"]) {
+      process.env.GITHUB_REF_NAME = ref;
+      const result = verifyReleasePolicy({ root });
+      assert.equal(result.version, packageVersion);
+      if (result.latestTag) {
+        assert.equal(
+          result.versionAdvanced,
+          true,
+          `${ref} must leave the version-ahead comparison switched on`,
+        );
+      }
+    }
+
+    // A real tag still selects release semantics: the version has to equal it,
+    // so the ahead-of comparison is skipped rather than run against itself.
+    process.env.GITHUB_REF_NAME = `v${packageVersion}`;
+    assert.equal(verifyReleasePolicy({ root }).versionAdvanced, false);
+
+    // And a tag-shaped ref that disagrees with the manifests is still caught.
+    process.env.GITHUB_REF_NAME = "v0.0.1";
+    assert.throws(() => verifyReleasePolicy({ root }), /release tag: expected/);
+  } finally {
+    if (original === undefined) delete process.env.GITHUB_REF_NAME;
+    else process.env.GITHUB_REF_NAME = original;
+  }
+});
+
 test("security epoch stays aligned between workflow and updater", () => {
   assert.equal(verifySecurityEpoch({ root }), 1);
 

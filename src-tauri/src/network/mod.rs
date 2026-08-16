@@ -9796,7 +9796,10 @@ struct NetworkState {
     ember_keyless_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
     /// Signed DHT identity of an eD2K-session Ember peer. Kept even when the
     /// routing table refuses the address (LAN / `block_private_ips`) so
-    /// FIND_VALUE can still ask a connected publisher.
+    /// FIND_VALUE can still ask a connected publisher. Retained while the
+    /// contact's own `last_seen` is inside `KNOWN_EMBER_PEER_TTL` — a peer that
+    /// keeps sending signed frames renews its entry without needing a fresh
+    /// eD2K introduction.
     ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
@@ -31340,10 +31343,29 @@ pub async fn start_network(
                 prune_stale_ember_peers(&mut state.known_ember_peers);
                 prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
                 prune_stale_ember_peers(&mut state.ember_keyless_peers);
-                state.ember_session_dht_contacts.retain(|(ip, port), _| {
-                    state.ember_keyless_peers.contains_key(&(*ip, *port))
-                        || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
-                });
+                // Keep a session contact while it is still talking to us, not
+                // merely while one of the two sibling caches remembers it.
+                // Those are refreshed by `note_connected_ember_peer` on an eD2K
+                // introduction, so a session that stays up longer than the TTL
+                // without reconnecting used to lose its pin — and
+                // `ember_session_introduced` then refuses to re-learn it from
+                // the signed frames the peer is still sending, which silently
+                // drops the LAN publisher this pin exists to reach.
+                // `sender_contact` stamps `last_seen` on every signed frame, so
+                // an active peer now renews its own entry.
+                let session_contact_cutoff = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    .saturating_sub(KNOWN_EMBER_PEER_TTL.as_secs())
+                    as i64;
+                state
+                    .ember_session_dht_contacts
+                    .retain(|(ip, port), contact| {
+                        contact.last_seen > session_contact_cutoff
+                            || state.ember_keyless_peers.contains_key(&(*ip, *port))
+                            || state.known_ember_peers.keys().any(|(peer_ip, _)| peer_ip == ip)
+                    });
                 // The bridge's "already attempted" set has no TTL of its own;
                 // bound it to the two caches it mirrors. Once a peer ages out
                 // of both (and is later re-learned) we want to be able to
@@ -34342,6 +34364,7 @@ async fn handle_ember_native_udp_inner(
             socket,
             control,
             from,
+            outcome.remote_noise_pub,
             state,
             transfer_manager,
             source_manager,
@@ -34362,6 +34385,10 @@ async fn handle_ember_control_message(
     socket: &UdpSocket,
     control: ember::transport::EmberControlMessage,
     from: SocketAddr,
+    // Static key of the session that decrypted this frame. Always `Some` for a
+    // decoded control frame: `dispatch_incoming` only produces controls from
+    // `Message` / `HandshakeComplete`, both of which set it.
+    remote_noise_pub: Option<[u8; 32]>,
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
@@ -34391,7 +34418,20 @@ async fn handle_ember_control_message(
             }
         }
         EmberControlMessage::ExchangeRequest => {
-            if !state.ember_transport.peer_is_ik_authenticated(&from) {
+            // Scope both the authentication check and the reply to the session
+            // that actually decrypted this request. Sessions are keyed by
+            // `(addr, static key)` and several identities can hold slots at one
+            // address, so the address-scoped check would let an XX peer borrow a
+            // neighbour's IK, and an unkeyed `prepare_outgoing` would seal the
+            // answer to whichever session sorts highest — not the asker.
+            let Some(session_key) = remote_noise_pub else {
+                debug!("ember-udp: EPX exchange request from {from} carried no session key");
+                return;
+            };
+            if !state
+                .ember_transport
+                .session_is_ik_authenticated(&from, &session_key)
+            {
                 debug!(
                     "ember-udp: refusing EPX exchange request from unauthenticated XX session {from}"
                 );
@@ -34444,7 +34484,10 @@ async fn handle_ember_control_message(
                 payload: (*payload_arc).clone(),
             }
             .encode();
-            match state.ember_transport.prepare_outgoing(from, None, &msg) {
+            match state
+                .ember_transport
+                .prepare_outgoing(from, Some(&session_key), &msg)
+            {
                 ember::transport::OutgoingResult::Ready { packet } => {
                     if let Err(e) = send_ember_udp(socket, &packet, from, &state.epx_overhead).await
                     {
@@ -34465,7 +34508,17 @@ async fn handle_ember_control_message(
             }
         }
         EmberControlMessage::ExchangeData { payload } => {
-            if !state.ember_transport.peer_is_ik_authenticated(&from) {
+            // Session-scoped for the same reason as `ExchangeRequest`: the
+            // sources in this payload are trusted as far as the sender's
+            // authentication goes, so it must be the sender's own.
+            let Some(session_key) = remote_noise_pub else {
+                debug!("ember-udp: EPX ExchangeData from {from} carried no session key");
+                return;
+            };
+            if !state
+                .ember_transport
+                .session_is_ik_authenticated(&from, &session_key)
+            {
                 debug!(
                     "ember-udp: refusing EPX ExchangeData from unauthenticated XX session {from}"
                 );

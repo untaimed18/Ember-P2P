@@ -397,6 +397,12 @@ enum PendingHandshake {
         state: snow::HandshakeState,
         queued: Vec<Vec<u8>>,
         created: Instant,
+        /// Static key this handshake was started for. `pending` is keyed by
+        /// address alone while `sessions` is keyed by `(address, static key)`,
+        /// so this is what tells a later `prepare_outgoing` whether the
+        /// handshake in flight will actually reach the identity it was asked
+        /// for.
+        remote_noise_pub: [u8; 32],
     },
     /// Noise_XX: we sent message 1, waiting for message 2.
     XxInitiatorMsg1 {
@@ -1015,10 +1021,23 @@ impl EmberTransport {
             .any(|(session_addr, _)| session_addr == addr)
     }
 
-    pub fn peer_is_ik_authenticated(&self, addr: &SocketAddr) -> bool {
+    /// Whether the one session identified by `remote_noise_pub` completed
+    /// Noise_IK.
+    ///
+    /// Scoped to a session rather than an address: sessions are keyed by
+    /// `(addr, static key)` and up to [`MAX_SESSIONS_PER_ADDR`] identities can
+    /// hold slots at the same address, so asking "does *anyone* here hold IK"
+    /// would let an unauthenticated XX peer borrow a neighbour's
+    /// authentication. Callers acting on a frame they just decrypted should ask
+    /// about the key that decrypted it.
+    pub fn session_is_ik_authenticated(
+        &self,
+        addr: &SocketAddr,
+        remote_noise_pub: &[u8; 32],
+    ) -> bool {
         self.sessions
-            .iter()
-            .any(|((session_addr, _), session)| session_addr == addr && session.ik_authenticated)
+            .get(&(*addr, *remote_noise_pub))
+            .is_some_and(|session| session.ik_authenticated)
     }
 
     /// Process an incoming Ember-encrypted UDP packet.
@@ -1107,6 +1126,32 @@ impl EmberTransport {
                 XX_RESPONDER_QUEUE_GRACE
             );
             self.pending.remove(&peer);
+        }
+
+        // Never queue behind a handshake that is reaching for a different
+        // identity. `pending` holds one slot per address while `sessions` are
+        // keyed by `(address, static key)`, so a payload parked here would be
+        // sealed to whichever peer that handshake completes with — not the one
+        // the caller named. Failing is recoverable (the caller retries, and
+        // `cleanup` frees the slot after 30s); encrypting to the wrong identity
+        // is not.
+        if let (
+            Some(PendingHandshake::IkInitiator {
+                remote_noise_pub: target,
+                ..
+            }),
+            Some(want),
+        ) = (self.pending.get(&peer), remote_noise_pub)
+        {
+            if target != want {
+                debug!(
+                    "Not queuing for {peer}: an IK handshake to a different identity \
+                     at this address is still in flight"
+                );
+                return OutgoingResult::Error(
+                    "handshake in flight for another identity at this address".to_string(),
+                );
+            }
         }
 
         // Queue behind in-progress handshake
@@ -1483,6 +1528,7 @@ impl EmberTransport {
                         state: initiator,
                         queued: Vec::new(),
                         created: Instant::now(),
+                        remote_noise_pub: *remote_pub,
                     },
                 );
                 trace!("Started IK handshake with {peer}");
@@ -3837,6 +3883,58 @@ mod tests {
             bob.dispatch_incoming(&third, alice_addr).app_payloads.len(),
             1
         );
+    }
+
+    /// Two identities can hold slots at one address, because `sessions` is
+    /// keyed by `(addr, static key)` — but `pending` still has one slot per
+    /// address. A payload aimed at the second identity used to be queued onto
+    /// the first one's handshake and then sealed to it on completion,
+    /// delivering it to a peer it was never addressed to. Refusing is
+    /// recoverable (the caller retries, and `cleanup` frees the slot);
+    /// misdirecting is not.
+    #[test]
+    fn a_payload_is_not_queued_onto_a_handshake_for_another_identity() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let (_other_priv, other_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let for_bob = vec![0xA1u8; 96];
+        let for_other = vec![0xB2u8; 96];
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &for_bob) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        match alice.prepare_outgoing(bob_addr, Some(&other_pub), &for_other) {
+            OutgoingResult::Error(_) => {}
+            other => panic!(
+                "a payload for another identity must not ride Bob's handshake, got {}",
+                variant_name(&other)
+            ),
+        }
+
+        // A retry for the identity the handshake *is* for still queues.
+        assert!(
+            matches!(
+                alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"also for bob"),
+                OutgoingResult::Queued
+            ),
+            "the same identity must still ride its own handshake"
+        );
+
+        let handshake = bob.dispatch_incoming(&init, alice_addr);
+        let flushed = alice.dispatch_incoming(&handshake.responses[0], bob_addr);
+        let delivered = bob.dispatch_incoming(&flushed.responses[0], alice_addr);
+        assert!(
+            !delivered.app_payloads.contains(&for_other),
+            "the other identity's payload must never reach Bob"
+        );
+        assert_eq!(delivered.app_payloads.first(), Some(&for_bob));
     }
 
     /// A session installed from a forged source address has proven nothing,

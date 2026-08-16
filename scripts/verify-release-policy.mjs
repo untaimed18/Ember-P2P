@@ -6,6 +6,21 @@ import { fileURLToPath } from "node:url";
 
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
+const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+$/;
+
+/**
+ * The release tag from the environment, if this build is running on one.
+ *
+ * `GITHUB_REF_NAME` is the tag only on a tagged build; on a push to `main` it
+ * is `main`, and on a pull request it is `<number>/merge`. Reading those as a
+ * tag made every non-release run fail with "expected v1.2.3, got main", which
+ * is why the checks below could only ever be run from the release workflow.
+ * An explicit `--tag` is honoured exactly as given, mismatch included.
+ */
+function envReleaseTag() {
+  const ref = process.env.GITHUB_REF_NAME;
+  return ref && RELEASE_TAG_RE.test(ref) ? ref : null;
+}
 
 function read(root, relativePath) {
   return readFileSync(join(root, relativePath), "utf8");
@@ -109,7 +124,7 @@ export function verifyVersions({
     );
   }
 
-  const effectiveTag = tag ?? process.env.GITHUB_REF_NAME ?? null;
+  const effectiveTag = tag ?? envReleaseTag();
   if (requireTag && !effectiveTag) {
     errors.push(
       "release tag is required (pass --tag vX.Y.Z or set GITHUB_REF_NAME)",
@@ -193,7 +208,7 @@ export function verifyVersionAdvanced({
   const latest = latestReleaseTag(root);
   if (!latest) return { version, latestTag: null, checked: false };
 
-  const effectiveTag = tag ?? process.env.GITHUB_REF_NAME ?? null;
+  const effectiveTag = tag ?? envReleaseTag();
   const cuttingRelease =
     requireTag || (effectiveTag != null && effectiveTag === `v${version}`);
   if (cuttingRelease) {

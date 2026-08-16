@@ -35,11 +35,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # `verifyVersionAdvanced` compares the declared version against the
+          # newest `v*.*.*` tag via `git tag --list`. The default shallow
+          # checkout fetches no tags, so the comparison would silently find
+          # nothing to compare against and pass.
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+
+      # Not `--require-tag`: that flag means "a release is being cut", which
+      # skips the version-ahead comparison because the version must equal the
+      # tag. Off a tag, this is the check that keeps `main` from sitting on an
+      # already-released version — the one gap the test suite cannot cover,
+      # since the tests pass `requireTag: true` themselves.
+      - name: Verify release policy
+        run: node scripts/verify-release-policy.mjs
 
       - name: Run release policy, locale, and error-code tests
         run: node --test scripts/*.test.mjs
