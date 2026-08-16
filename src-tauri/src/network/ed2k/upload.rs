@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read as _, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -1237,6 +1237,24 @@ struct ResolvedUploadFile {
 pub struct UploadEvent {
     pub transfer_id: String,
     pub kind: UploadEventKind,
+}
+
+/// Drop block ranges already delivered this session (exact start/end match).
+///
+/// eMule `CUpDownClient::AddReqBlock` refuses a request already on
+/// `m_BlockRequests_queue` or `m_DoneBlocks_list`. aMule and other
+/// non-eMule clients pad every `OP_REQUESTPARTS` with still-queued
+/// in-flight blocks so the packet always names three ranges. Without
+/// this filter we re-send those blocks and Transferred climbs to 2–3×
+/// unique coverage while the parts bar barely moves.
+fn filter_already_sent_ranges(
+    offsets: Vec<(u64, u64)>,
+    sent: &HashSet<(u64, u64)>,
+) -> Vec<(u64, u64)> {
+    if sent.is_empty() {
+        return offsets;
+    }
+    offsets.into_iter().filter(|r| !sent.contains(r)).collect()
 }
 
 /// Unique bytes delivered this session from the per-part served tally
@@ -5714,6 +5732,11 @@ impl UploadHandler {
         // `mark_served_parts` records each delivered range and
         // `build_up_part_status` packs the completed-part bitmap for IPC.
         let mut served_bytes_per_part: Vec<u64> = Vec::new();
+        // eMule `m_DoneBlocks_list` / `m_BlockRequests_queue`: exact
+        // (start, end) ranges already served this session. Cleared on
+        // slot grant, file switch, and session end along with the
+        // served-parts tally.
+        let mut sent_blocks: HashSet<(u64, u64)> = HashSet::new();
         // eMule `m_abyUpPartStatus`: the parts the downloader told us it
         // already has, captured from the `OP_REQUESTFILENAME` extended-info
         // block and shaded dark on the parts bar. Keyed by file hash so a
@@ -6332,6 +6355,7 @@ impl UploadHandler {
                                         queued_identity = None;
                                         uploaded = 0;
                                         served_bytes_per_part.clear();
+                                        sent_blocks.clear();
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                                         session_start = Some(std::time::Instant::now());
                                         rate_tracker = SessionRateTracker::new();
@@ -6671,6 +6695,7 @@ impl UploadHandler {
                                     }).await;
                                     uploaded = 0;
                                     served_bytes_per_part.clear();
+                                    sent_blocks.clear();
                                 }
                             }
                         }
@@ -7407,6 +7432,7 @@ impl UploadHandler {
                     queued_identity = None;
                     uploaded = 0;
                     served_bytes_per_part.clear();
+                    sent_blocks.clear();
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                     session_start = Some(std::time::Instant::now());
                     rate_tracker = SessionRateTracker::new();
@@ -7484,6 +7510,7 @@ impl UploadHandler {
                                         }).await;
                                         uploaded = 0;
                                         served_bytes_per_part.clear();
+                                        sent_blocks.clear();
                                     }
                                 }
                             }
@@ -7696,6 +7723,22 @@ impl UploadHandler {
                             }
                         }
                         offsets = split;
+                    }
+
+                    // eMule AddReqBlock: drop ranges already queued or already
+                    // delivered this session. aMule and other non-eMule clients
+                    // pad each OP_REQUESTPARTS with still-in-flight blocks so
+                    // the packet always names three ranges; serving those again
+                    // is what made Transferred climb to 2–3× unique coverage.
+                    let after_split = offsets.len();
+                    offsets = filter_already_sent_ranges(offsets, &sent_blocks);
+                    if offsets.len() != after_split {
+                        debug!(
+                            target: "ember::upload_diag",
+                            "reqparts_skip_dup {peer_addr} skipped={} kept={}",
+                            after_split - offsets.len(),
+                            offsets.len(),
+                        );
                     }
 
                     // Diagnostic: summarise the batch shape for this REQUESTPARTS
@@ -8169,6 +8212,7 @@ impl UploadHandler {
                                 start,
                                 data.len() as u64,
                             );
+                            sent_blocks.insert((start, end));
                             sent_compressed = true;
                         }
                         if sent_compressed {
@@ -8269,6 +8313,7 @@ impl UploadHandler {
                             served_bytes_per_part = vec![0u64; want_parts];
                         }
                         mark_served_parts(&mut served_bytes_per_part, start, data.len() as u64);
+                        sent_blocks.insert((start, end));
                     }
 
                     // Diagnostic: batch-level summary. `credited_bytes == 0`
@@ -8560,6 +8605,7 @@ impl UploadHandler {
                         // re-promoted until it dialled back in.
                         uploaded = 0;
                         served_bytes_per_part.clear();
+                        sent_blocks.clear();
                         self.slot_rates.lock().remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
 
@@ -8803,6 +8849,7 @@ impl UploadHandler {
                     transfer_id = None;
                     uploaded = 0;
                     served_bytes_per_part.clear();
+                    sent_blocks.clear();
                     session_start = None;
                     self.slot_rates.lock().remove(&peer_addr);
                     rate_tracker = SessionRateTracker::new();
@@ -9124,6 +9171,7 @@ impl UploadHandler {
                                         }).await;
                                         uploaded = 0;
                                         served_bytes_per_part.clear();
+                                        sent_blocks.clear();
                                     }
                                 }
                             }
@@ -10755,6 +10803,28 @@ mod unique_served_tests {
     fn unique_served_bytes_empty_or_unknown_size_is_zero() {
         assert_eq!(unique_served_bytes(&[PARTSIZE], 0), 0);
         assert_eq!(unique_served_bytes(&[], PARTSIZE), 0);
+    }
+
+    #[test]
+    fn already_sent_ranges_are_dropped_on_exact_match_only() {
+        let sent = HashSet::from([(0, EMBLOCKSIZE), (EMBLOCKSIZE, EMBLOCKSIZE * 2)]);
+        let offsets = vec![
+            (0, EMBLOCKSIZE),
+            (EMBLOCKSIZE * 2, EMBLOCKSIZE * 3),
+            (EMBLOCKSIZE, EMBLOCKSIZE * 2),
+            (0, EMBLOCKSIZE + 1),
+        ];
+        assert_eq!(
+            filter_already_sent_ranges(offsets, &sent),
+            vec![(EMBLOCKSIZE * 2, EMBLOCKSIZE * 3), (0, EMBLOCKSIZE + 1)]
+        );
+    }
+
+    #[test]
+    fn already_sent_filter_is_noop_when_nothing_has_been_sent() {
+        let sent = HashSet::new();
+        let offsets = vec![(0, 100), (100, 200)];
+        assert_eq!(filter_already_sent_ranges(offsets.clone(), &sent), offsets);
     }
 }
 
