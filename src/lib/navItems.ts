@@ -34,6 +34,7 @@ export const navItems: NavItem[] = [
   { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
   { href: '/library', label: () => m.nav_library(), id: 'library' },
   { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+  { href: '/channels', label: () => m.nav_channels(), id: 'channels' },
   { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
   { href: '/security', label: () => m.nav_security(), id: 'security' },
   { href: '/settings', label: () => m.nav_settings(), id: 'settings' },

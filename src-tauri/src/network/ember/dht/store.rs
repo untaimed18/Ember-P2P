@@ -5,7 +5,9 @@ use tracing::debug;
 
 use crate::network::ember::crypto;
 
-use super::publish::RECORD_TYPE_SOURCE;
+use super::publish::{
+    channel_kind_from_data, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
+};
 use super::{scale, EmberNodeId};
 
 /// Maximum records per key (anti-spam).
@@ -78,10 +80,18 @@ const KEYWORD_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// tighter margin than this.
 const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// Presence records are re-announced by members every 10 minutes; a 45-minute
+/// TTL survives a few missed republishes without keeping a departed member
+/// listed for a full day.
+const CHANNEL_PRESENCE_TTL: Duration = Duration::from_secs(45 * 60);
+
 /// How long a record of this type lives, from its leading type byte.
 fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
         Some(&RECORD_TYPE_SOURCE) => SOURCE_RECORD_TTL,
+        Some(&RECORD_TYPE_CHANNEL) if channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE) => {
+            CHANNEL_PRESENCE_TTL
+        }
         _ => KEYWORD_RECORD_TTL,
     }
 }
@@ -888,7 +898,9 @@ impl DhtStore {
                 // re-announces its own source records on its publish tick, so
                 // they stay alive without storer-side replication. Only
                 // address-free records (e.g. keyword) replicate here.
-                if r.data.first() == Some(&RECORD_TYPE_SOURCE) {
+                if r.data.first() == Some(&RECORD_TYPE_SOURCE)
+                    || channel_kind_from_data(&r.data) == Some(CHANNEL_KIND_PRESENCE)
+                {
                     continue;
                 }
                 // A lapsed record is not worth a replica set of frames. Expiry is
@@ -1042,6 +1054,7 @@ impl DhtStore {
             .values()
             .flat_map(|records| records.iter())
             .filter(|r| r.data.first() != Some(&RECORD_TYPE_SOURCE))
+            .filter(|r| channel_kind_from_data(&r.data) != Some(CHANNEL_KIND_PRESENCE))
             // Counted on the same terms the batch selects on, or the gauge
             // reports work that will never be done.
             .filter(|r| r.expires_at > now)

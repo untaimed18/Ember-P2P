@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod channel;
 pub mod crypto;
 pub mod ingest;
 pub mod mapping_keepalive;

@@ -9,10 +9,16 @@
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { navItems, NAV_SHORTCUT_LIMIT, type NavItem } from '$lib/navItems';
+  import { appSettings } from '$lib/stores/settings';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
   let shortcutsOpen = $state(false);
+  let visibleNav = $derived(
+    $appSettings?.ember_native_enabled === false
+      ? navItems.filter((item) => item.id !== 'channels')
+      : navItems,
+  );
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -208,9 +214,9 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const n = Number.parseInt(e.key, 10);
-    if (!Number.isFinite(n) || n < 1 || n > Math.min(NAV_SHORTCUT_LIMIT, navItems.length)) return;
+    if (!Number.isFinite(n) || n < 1 || n > Math.min(NAV_SHORTCUT_LIMIT, visibleNav.length)) return;
     e.preventDefault();
-    navigateTo(navItems[n - 1].href);
+    navigateTo(visibleNav[n - 1].href);
   }
 
   onMount(() => {
@@ -238,7 +244,7 @@
   </div>
 
   <ul class="nav-list">
-    {#each navItems as item, i}
+    {#each visibleNav as item, i}
       <li>
         <a
           href={item.href}
@@ -290,6 +296,11 @@
                 <circle cx="14" cy="7" r="2.5"/>
                 <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                 <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
+              </svg>
+            {:else if item.id === 'channels'}
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5h9a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 2.5V13H4a2 2 0 01-2-2V7a2 2 0 012-2z"/>
+                <path d="M16 7.5h.5A1.5 1.5 0 0118 9v3.5a1.5 1.5 0 01-1.5 1.5H16v1.5L14.5 14"/>
               </svg>
             {:else if item.id === 'ember'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

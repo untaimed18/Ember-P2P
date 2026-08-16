@@ -29,6 +29,8 @@ pub const MSG_PROXY_STORE_ACK: u8 = 0x0C;
 pub const MSG_STORE_BATCH: u8 = 0x0D;
 /// Answer to `STORE_BATCH`, reporting how many of its records were stored.
 pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
+/// Channel gossip body. `0x0D` is already `STORE_BATCH`; this is the next free opcode.
+pub const MSG_CHANNEL_MSG: u8 = 0x0F;
 
 /// Records one `STORE_BATCH` may carry.
 ///
@@ -211,6 +213,11 @@ pub enum DhtPayload {
     },
     PeerList {
         contacts: Vec<EmberContact>,
+    },
+    /// Authenticated channel gossip. The DHT frame already binds the sender;
+    /// the body is AEAD under the channel content key (see `ember::channel`).
+    ChannelMsg {
+        body: Vec<u8>,
     },
     Unknown(Vec<u8>),
 }
@@ -595,6 +602,20 @@ pub fn build_store_batch_ack(sender_id: EmberNodeId, request_id: u32, accepted: 
     }
 }
 
+/// Gossip a channel message to a neighbor. `body` is the encoded
+/// [`crate::network::ember::channel::ChannelGossip`].
+pub fn build_channel_msg(sender_id: EmberNodeId, request_id: u32, body: Vec<u8>) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_CHANNEL_MSG,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::ChannelMsg { body },
+        signature: [0u8; 64],
+    }
+}
+
 /// How many bytes `record` costs inside a `STORE_BATCH`: the 16-byte key, the
 /// 2-byte length prefix, the body, and the 64-byte record signature.
 pub fn batched_record_wire_len(record_len: usize) -> usize {
@@ -743,6 +764,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             }
             buf
         }
+        DhtPayload::ChannelMsg { body } => body.clone(),
         DhtPayload::Unknown(data) => data.clone(),
     }
 }
@@ -1014,6 +1036,14 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             }
             Ok(DhtPayload::FoundValue { key, records })
         }
+        MSG_CHANNEL_MSG => {
+            if data.len() > MAX_DHT_PAYLOAD {
+                anyhow::bail!("CHANNEL_MSG body exceeds max {MAX_DHT_PAYLOAD}");
+            }
+            Ok(DhtPayload::ChannelMsg {
+                body: data.to_vec(),
+            })
+        }
         _ => Ok(DhtPayload::Unknown(data.to_vec())),
     }
 }
@@ -1166,6 +1196,20 @@ mod tests {
                 assert_eq!(observed, Some("203.0.113.50:4672".parse().unwrap()));
             }
             _ => panic!("expected Pong"),
+        }
+    }
+
+    #[test]
+    fn channel_msg_round_trip() {
+        let (sk, id) = test_keypair();
+        let body = b"gossip-body".to_vec();
+        let msg = build_channel_msg(id, 7, body.clone());
+        let encoded = encode_message(&msg, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        assert_eq!(decoded.msg_type, MSG_CHANNEL_MSG);
+        match decoded.payload {
+            DhtPayload::ChannelMsg { body: got } => assert_eq!(got, body),
+            other => panic!("expected ChannelMsg, got {other:?}"),
         }
     }
 
@@ -1366,6 +1410,7 @@ mod tests {
             MSG_PROXY_STORE_ACK,
             MSG_STORE_BATCH,
             MSG_STORE_BATCH_ACK,
+            MSG_CHANNEL_MSG,
             0x00,
             0xFF,
         ];

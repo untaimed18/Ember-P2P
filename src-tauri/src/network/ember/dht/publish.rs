@@ -9,6 +9,7 @@ use tracing::{debug, trace, warn};
 use super::routing::RoutingTable;
 use super::search::keyword_hash;
 use super::{EmberContact, EmberNodeId, K_BUCKET_SIZE};
+use crate::network::ember::channel;
 use crate::network::ember::crypto;
 
 /// Maximum concurrent publish operations.
@@ -23,6 +24,21 @@ const MIN_STORE_NODES: usize = 5;
 /// Record type constants.
 pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
 pub const RECORD_TYPE_SOURCE: u8 = 0x02;
+/// Channel index, presence, or moderation metadata. Never carries an IP.
+pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
+
+pub const CHANNEL_KIND_INDEX: u8 = 1;
+pub const CHANNEL_KIND_PRESENCE: u8 = 2;
+pub const CHANNEL_KIND_MODERATION: u8 = 3;
+pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
+const CHANNEL_TRAILER_VERSION: u8 = 1;
+/// `version(1) + extra_len(2)` before the variable extra blob.
+const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
+const CHANNEL_NAME_MAX: usize = 64;
+#[allow(dead_code)]
+const CHANNEL_WELCOME_MAX: usize = 512;
+#[allow(dead_code)]
+const CHANNEL_BAN_LIST_MAX: usize = 32;
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
@@ -61,6 +77,37 @@ pub struct SourceContact {
     pub noise_pub: [u8; 32],
 }
 
+/// Channel-specific trailer parsed from a `RECORD_TYPE_CHANNEL` body.
+///
+/// `kind`/`flags` are also packed into `file_size` so the store can pick a
+/// TTL without walking the variable-length name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRecordMeta {
+    pub kind: u8,
+    pub flags: u8,
+    pub extra: Vec<u8>,
+}
+
+impl ChannelRecordMeta {
+    pub fn is_private(&self) -> bool {
+        self.flags & CHANNEL_FLAG_PRIVATE != 0
+    }
+}
+
+pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
+    u64::from(kind) | (u64::from(flags) << 8)
+}
+
+pub fn channel_kind_from_data(data: &[u8]) -> Option<u8> {
+    // `file_size` sits at offset 65 in the fixed header and is little-endian,
+    // so the low byte — the kind — is `data[65]`.
+    if data.first() == Some(&RECORD_TYPE_CHANNEL) {
+        data.get(65).copied()
+    } else {
+        None
+    }
+}
+
 /// A signed record ready for DHT storage.
 #[derive(Debug, Clone)]
 pub struct SignedRecord {
@@ -79,6 +126,8 @@ pub struct SignedRecord {
     /// Present only for `RECORD_TYPE_SOURCE`: the publisher's reachable
     /// contact, appended to `data` after the file name and thus signed.
     pub source_contact: Option<SourceContact>,
+    /// Present only for `RECORD_TYPE_CHANNEL`.
+    pub channel: Option<ChannelRecordMeta>,
 }
 
 impl SignedRecord {
@@ -99,6 +148,7 @@ impl SignedRecord {
             ember_file_hash,
             file_size,
             file_name,
+            None,
             None,
             signing_key,
         )
@@ -123,8 +173,118 @@ impl SignedRecord {
             file_size,
             file_name,
             Some(contact),
+            None,
             signing_key,
         )
+    }
+
+    /// Public/private index listing, signed by the **channel** key.
+    pub fn channel_index(
+        name: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let name = truncate_utf8(name, CHANNEL_NAME_MAX);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::index_key_for_channel(&channel_id),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_INDEX, flags),
+            name,
+            None,
+            Some(Vec::new()),
+            signing_key,
+        )
+    }
+
+    /// Membership presence: pubkey + nickname, never an address. Signed by
+    /// the **member**, with the channel pubkey in `ember_file_hash`.
+    pub fn channel_presence(
+        nickname: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        epoch: i64,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let nickname = truncate_utf8(nickname, CHANNEL_NAME_MAX);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::presence_key(&channel_id, join_secret, epoch),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            nickname,
+            None,
+            Some(Vec::new()),
+            signing_key,
+        )
+    }
+
+    /// Moderation record signed by the **channel** key: topic, welcome, bans.
+    #[allow(dead_code)]
+    pub fn channel_moderation(
+        topic: &str,
+        welcome: &str,
+        banned_pubkeys: &[[u8; 32]],
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
+        let extra = encode_moderation_extra(welcome, banned_pubkeys);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::moderation_key(&channel_id),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_MODERATION, flags),
+            topic,
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Whether a STORE of this channel record is well-formed enough to keep.
+    ///
+    /// Storers cannot check a private presence key (it folds in `join_secret`),
+    /// but they can refuse a record whose channel_id does not match the
+    /// claimed channel pubkey, an index/moderation record not signed by that
+    /// key, or an index filed under the wrong shard.
+    pub fn channel_store_ok(&self) -> bool {
+        if self.record_type != RECORD_TYPE_CHANNEL {
+            return false;
+        }
+        let Some(meta) = &self.channel else {
+            return false;
+        };
+        let Some(expected_id) = crypto::node_id_from_ed25519_bytes(&self.ember_file_hash) else {
+            return false;
+        };
+        if self.file_hash != expected_id {
+            return false;
+        }
+        match meta.kind {
+            CHANNEL_KIND_INDEX => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::index_key_for_channel(&self.file_hash)
+            }
+            CHANNEL_KIND_PRESENCE => crypto::verifying_key_from_bytes(&self.publisher_key).is_some(),
+            CHANNEL_KIND_MODERATION => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::moderation_key(&self.file_hash)
+            }
+            _ => false,
+        }
     }
 
     fn build(
@@ -135,6 +295,7 @@ impl SignedRecord {
         file_size: u64,
         file_name: &str,
         source_contact: Option<SourceContact>,
+        channel_extra: Option<Vec<u8>>,
         signing_key: &SigningKey,
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
@@ -166,6 +327,20 @@ impl SignedRecord {
             data.extend_from_slice(&sc.noise_pub);
         }
 
+        let channel = if let Some(extra) = channel_extra {
+            let extra_len = extra.len().min(u16::MAX as usize);
+            data.push(CHANNEL_TRAILER_VERSION);
+            data.write_u16::<LittleEndian>(extra_len as u16).unwrap();
+            data.extend_from_slice(&extra[..extra_len]);
+            Some(ChannelRecordMeta {
+                kind: (file_size & 0xff) as u8,
+                flags: ((file_size >> 8) & 0xff) as u8,
+                extra: extra[..extra_len].to_vec(),
+            })
+        } else {
+            None
+        };
+
         let signature = crypto::sign(signing_key, &data);
 
         Self {
@@ -180,6 +355,7 @@ impl SignedRecord {
             data,
             signature,
             source_contact,
+            channel,
         }
     }
 
@@ -233,6 +409,11 @@ impl SignedRecord {
             return false;
         }
         if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
+            return false;
+        }
+        if data[0] == RECORD_TYPE_CHANNEL
+            && !channel_trailer_len(data, name_len).is_some_and(|n| data.len() == 115 + name_len + n)
+        {
             return false;
         }
         let (Ok(signature), Ok(publisher_key)) = (
@@ -296,6 +477,25 @@ impl SignedRecord {
             None
         };
 
+        let channel = if record_type == RECORD_TYPE_CHANNEL {
+            let off = 115 + name_len;
+            let trailer_len = channel_trailer_len(data, name_len)?;
+            if data.len() != off + trailer_len {
+                return None;
+            }
+            if data[off] != CHANNEL_TRAILER_VERSION {
+                return None;
+            }
+            let extra_len = u16::from_le_bytes([data[off + 1], data[off + 2]]) as usize;
+            Some(ChannelRecordMeta {
+                kind: (file_size & 0xff) as u8,
+                flags: ((file_size >> 8) & 0xff) as u8,
+                extra: data[off + 3..off + 3 + extra_len].to_vec(),
+            })
+        } else {
+            None
+        };
+
         // Verify signature
         let pk = crypto::verifying_key_from_bytes(&publisher_key)?;
         if !crypto::verify(&pk, data, &signature) {
@@ -314,8 +514,75 @@ impl SignedRecord {
             data: data.to_vec(),
             signature,
             source_contact,
+            channel,
         })
     }
+}
+
+fn channel_trailer_len(data: &[u8], name_len: usize) -> Option<usize> {
+    let off = 115 + name_len;
+    if data.len() < off + CHANNEL_TRAILER_MIN_LEN {
+        return None;
+    }
+    let extra_len = u16::from_le_bytes([data[off + 1], data[off + 2]]) as usize;
+    Some(CHANNEL_TRAILER_MIN_LEN + extra_len)
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[allow(dead_code)]
+fn encode_moderation_extra(welcome: &str, banned_pubkeys: &[[u8; 32]]) -> Vec<u8> {
+    let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
+    let bans = banned_pubkeys
+        .iter()
+        .take(CHANNEL_BAN_LIST_MAX)
+        .collect::<Vec<_>>();
+    let mut extra = Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32);
+    extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
+    extra.extend_from_slice(welcome.as_bytes());
+    extra.extend_from_slice(&(bans.len() as u16).to_le_bytes());
+    for pk in bans {
+        extra.extend_from_slice(pk);
+    }
+    extra
+}
+
+/// Decode the extra blob from a moderation record.
+#[allow(dead_code)]
+pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>)> {
+    if extra.len() < 4 {
+        return None;
+    }
+    let welcome_len = u16::from_le_bytes([extra[0], extra[1]]) as usize;
+    if extra.len() < 2 + welcome_len + 2 {
+        return None;
+    }
+    let welcome = String::from_utf8(extra[2..2 + welcome_len].to_vec()).ok()?;
+    let ban_off = 2 + welcome_len;
+    let ban_count = u16::from_le_bytes([extra[ban_off], extra[ban_off + 1]]) as usize;
+    if ban_count > CHANNEL_BAN_LIST_MAX {
+        return None;
+    }
+    let rest = &extra[ban_off + 2..];
+    if rest.len() != ban_count * 32 {
+        return None;
+    }
+    let mut bans = Vec::with_capacity(ban_count);
+    for chunk in rest.chunks_exact(32) {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(chunk);
+        bans.push(pk);
+    }
+    Some((welcome, bans))
 }
 
 /// Tracks a single publish operation: store a record on the closest K nodes.
@@ -663,5 +930,116 @@ mod tests {
         }
         assert!(op.complete);
         assert_eq!(op.acked.len(), to_store.len());
+    }
+
+    #[test]
+    fn channel_index_round_trip_and_store_ok() {
+        let ident = channel::ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert_eq!(record.record_type, RECORD_TYPE_CHANNEL);
+        assert_eq!(
+            record.keyword_hash,
+            channel::index_key_for_channel(&ident.channel_id)
+        );
+        assert!(record.channel_store_ok());
+        assert_eq!(record.channel.as_ref().unwrap().kind, CHANNEL_KIND_INDEX);
+        assert!(!record.channel.as_ref().unwrap().is_private());
+
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.file_name, "Lobby");
+        assert_eq!(parsed.file_hash, ident.channel_id);
+        assert!(parsed.channel_store_ok());
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert!(SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    #[test]
+    fn channel_index_rejects_wrong_shard() {
+        let ident = channel::ChannelIdentity::generate();
+        let mut record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        record.keyword_hash = channel::index_key(index_other_shard(&ident.channel_id));
+        assert!(!record.channel_store_ok());
+    }
+
+    fn index_other_shard(channel_id: &[u8; 16]) -> u8 {
+        (channel::index_shard(channel_id) + 1) % channel::INDEX_SHARD_COUNT
+    }
+
+    #[test]
+    fn channel_presence_is_signed_by_member_not_channel() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&channel.pubkey);
+        let record = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &member,
+        );
+        assert_eq!(record.publisher_key, member.verifying_key().to_bytes());
+        assert_ne!(record.publisher_key, channel.pubkey);
+        assert!(record.channel_store_ok());
+        assert_eq!(
+            record.keyword_hash,
+            channel::presence_key(&channel.channel_id, &join, 3)
+        );
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.file_name, "Ada");
+        assert_eq!(parsed.channel.as_ref().unwrap().kind, CHANNEL_KIND_PRESENCE);
+        assert!(parsed.source_contact.is_none());
+    }
+
+    #[test]
+    fn channel_moderation_round_trip() {
+        let ident = channel::ChannelIdentity::generate();
+        let banned = [[0x11u8; 32], [0x22u8; 32]];
+        let record = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &banned,
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert!(record.channel_store_ok());
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        let (welcome, bans) = decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
+        assert_eq!(parsed.file_name, "rules");
+        assert_eq!(welcome, "be kind");
+        assert_eq!(bans, banned);
+    }
+
+    #[test]
+    fn truncated_channel_trailer_is_rejected() {
+        let ident = channel::ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "x",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let truncated = &record.data[..record.data.len() - 1];
+        assert!(SignedRecord::from_wire(truncated, record.signature).is_none());
+        let mut blob = truncated.to_vec();
+        blob.extend_from_slice(&record.signature);
+        assert!(!SignedRecord::value_blob_is_authentic(&blob));
     }
 }

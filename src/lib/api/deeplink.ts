@@ -7,7 +7,7 @@ export interface PendingDeepLink {
 }
 
 export interface DeepLinkPreview {
-  kind: 'file' | 'server' | 'serverList' | 'collection';
+  kind: 'file' | 'server' | 'serverList' | 'collection' | 'channel';
   name?: string;
   size?: number;
   hash?: string;

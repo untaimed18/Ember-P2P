@@ -110,6 +110,20 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             host: Some(host),
         });
     }
+    if lower.starts_with("ember-channel:") {
+        let invite = crate::network::ember::channel::ChannelInvite::parse(payload).ok_or_else(
+            || coded("deeplink_terminal_invalid", "Invalid channel invite"),
+        )?;
+        let name = crate::security::sanitize_remote_text(&invite.name, 64);
+        return Ok(DeepLinkPreview {
+            kind: "channel".into(),
+            name: if name.is_empty() { None } else { Some(name) },
+            size: None,
+            hash: Some(hex::encode(invite.channel_id)),
+            endpoint: None,
+            host: None,
+        });
+    }
     if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
         let name = std::path::Path::new(payload)
             .file_name()

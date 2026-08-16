@@ -17,7 +17,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 27;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 28;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -45,6 +45,31 @@ pub type CreditRowRef<'a> = (
     Option<&'a [u8; 16]>,
     bool,
 );
+
+/// One joined channel, as listed in the Channels page.
+#[derive(Debug, Clone)]
+pub struct StoredChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+    pub visibility: String,
+    pub is_owner: bool,
+    pub topic: String,
+    pub welcome: String,
+    pub joined_at: i64,
+    pub last_active: i64,
+    pub member_count: i64,
+    pub unread: i64,
+}
+
+/// One member of a joined channel. `member_pubkey` is 64-char hex.
+#[derive(Debug, Clone)]
+pub struct StoredChannelMember {
+    pub member_pubkey: String,
+    pub nickname: String,
+    pub last_seen: i64,
+    pub banned: bool,
+}
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -65,6 +90,9 @@ pub const CHAT_FAILED: i64 = 2;
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
+const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
+const CHANNEL_SECRET_AAD_DOMAIN: &[u8] = b"ember-channel-secret-v1\0";
+const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -401,6 +429,157 @@ impl Database {
             })?;
         String::from_utf8(plaintext)
             .map_err(|_| anyhow::anyhow!("Chat history row {id} decrypted to invalid UTF-8"))
+    }
+
+    fn channel_secret_aad(channel_id: &str, label: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHANNEL_SECRET_AAD_DOMAIN.len() + 4 + channel_id.len() + 4 + label.len(),
+        );
+        aad.extend_from_slice(CHANNEL_SECRET_AAD_DOMAIN);
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad.extend_from_slice(&(label.len() as u32).to_le_bytes());
+        aad.extend_from_slice(label.as_bytes());
+        aad
+    }
+
+    fn encrypt_channel_secret(
+        key: &[u8; 32],
+        channel_id: &str,
+        label: &str,
+        plaintext: &[u8; 32],
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_secret_aad(channel_id, label);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt channel secret"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!(
+            "{CHANNEL_SECRET_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        ))
+    }
+
+    fn decrypt_channel_secret(
+        key: &[u8; 32],
+        channel_id: &str,
+        label: &str,
+        stored: &str,
+    ) -> anyhow::Result<[u8; 32]> {
+        let encoded = stored.strip_prefix(CHANNEL_SECRET_PREFIX).ok_or_else(|| {
+            anyhow::anyhow!("Channel secret for {channel_id} is not encrypted")
+        })?;
+        let envelope = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("Channel secret for {channel_id} has invalid ciphertext"))?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            anyhow::bail!("Channel secret for {channel_id} is truncated");
+        }
+        let aad = Self::channel_secret_aad(channel_id, label);
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Channel secret authentication failed for {channel_id}"))?;
+        <[u8; 32]>::try_from(plaintext)
+            .map_err(|_| anyhow::anyhow!("Channel secret for {channel_id} has invalid length"))
+    }
+
+    fn channel_row_aad(
+        id: i64,
+        channel_id: &str,
+        direction: &str,
+        timestamp: i64,
+    ) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHANNEL_MSG_AAD_DOMAIN.len() + 8 + 8 + 4 + channel_id.len() + 4 + direction.len(),
+        );
+        aad.extend_from_slice(CHANNEL_MSG_AAD_DOMAIN);
+        aad.extend_from_slice(&id.to_le_bytes());
+        aad.extend_from_slice(&timestamp.to_le_bytes());
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad.extend_from_slice(&(direction.len() as u32).to_le_bytes());
+        aad.extend_from_slice(direction.as_bytes());
+        aad
+    }
+
+    fn encrypt_channel_message_body(
+        key: &[u8; 32],
+        id: i64,
+        channel_id: &str,
+        direction: &str,
+        timestamp: i64,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_row_aad(id, channel_id, direction, timestamp);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt channel message"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!(
+            "{CHAT_CIPHERTEXT_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        ))
+    }
+
+    fn decrypt_channel_message_body(
+        key: &[u8; 32],
+        id: i64,
+        channel_id: &str,
+        direction: &str,
+        timestamp: i64,
+        stored: &str,
+    ) -> anyhow::Result<String> {
+        let encoded = stored.strip_prefix(CHAT_CIPHERTEXT_PREFIX).ok_or_else(|| {
+            anyhow::anyhow!("Channel message {id} is not encrypted")
+        })?;
+        let envelope = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("Channel message {id} has invalid ciphertext"))?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            anyhow::bail!("Channel message {id} is truncated");
+        }
+        let aad = Self::channel_row_aad(id, channel_id, direction, timestamp);
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Channel message {id} failed authentication"))?;
+        String::from_utf8(plaintext)
+            .map_err(|_| anyhow::anyhow!("Channel message {id} decrypted to invalid UTF-8"))
     }
 
     fn is_corruption_error(error: &anyhow::Error) -> bool {
@@ -1210,6 +1389,52 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "transfers", "ember_file_hash", "TEXT")?;
             set_version(&tx, 27)?;
+            tx.commit()?;
+        }
+
+        if version < 28 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channels (
+                    channel_id TEXT PRIMARY KEY,
+                    pubkey TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    visibility TEXT NOT NULL,
+                    is_owner INTEGER NOT NULL DEFAULT 0,
+                    owner_seed TEXT,
+                    join_secret TEXT,
+                    topic TEXT NOT NULL DEFAULT '',
+                    welcome TEXT NOT NULL DEFAULT '',
+                    joined_at INTEGER NOT NULL,
+                    last_active INTEGER NOT NULL DEFAULT 0,
+                    presence_published_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS channel_members (
+                    channel_id TEXT NOT NULL,
+                    member_pubkey TEXT NOT NULL,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    last_seen INTEGER NOT NULL DEFAULT 0,
+                    banned INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (channel_id, member_pubkey)
+                );
+                CREATE TABLE IF NOT EXISTS channel_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT NOT NULL,
+                    sender_pubkey TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0,
+                    msg_id TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_dedup
+                    ON channel_messages(channel_id, msg_id);
+                CREATE INDEX IF NOT EXISTS idx_channel_messages_chan
+                    ON channel_messages(channel_id, id);
+                CREATE INDEX IF NOT EXISTS idx_channel_members_chan
+                    ON channel_members(channel_id);",
+            )?;
+            set_version(&tx, 28)?;
             tx.commit()?;
         }
 
@@ -3359,6 +3584,449 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn list_channels(&self) -> anyhow::Result<Vec<StoredChannel>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                    c.joined_at, c.last_active,
+                    (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
+                    (SELECT COUNT(*) FROM channel_messages msg
+                     WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received')
+             FROM channels c
+             ORDER BY c.last_active DESC, c.joined_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredChannel {
+                    channel_id: row.get(0)?,
+                    pubkey: row.get(1)?,
+                    name: row.get(2)?,
+                    visibility: row.get(3)?,
+                    is_owner: row.get::<_, i64>(4)? != 0,
+                    topic: row.get(5)?,
+                    welcome: row.get(6)?,
+                    joined_at: row.get(7)?,
+                    last_active: row.get(8)?,
+                    member_count: row.get(9)?,
+                    unread: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_channel(&self, channel_id: &str) -> anyhow::Result<Option<StoredChannel>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                        c.joined_at, c.last_active,
+                        (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
+                        (SELECT COUNT(*) FROM channel_messages msg
+                         WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received')
+                 FROM channels c WHERE c.channel_id = ?1",
+                params![channel_id],
+                |row| {
+                    Ok(StoredChannel {
+                        channel_id: row.get(0)?,
+                        pubkey: row.get(1)?,
+                        name: row.get(2)?,
+                        visibility: row.get(3)?,
+                        is_owner: row.get::<_, i64>(4)? != 0,
+                        topic: row.get(5)?,
+                        welcome: row.get(6)?,
+                        joined_at: row.get(7)?,
+                        last_active: row.get(8)?,
+                        member_count: row.get(9)?,
+                        unread: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn insert_channel(
+        &self,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        is_owner: bool,
+        owner_seed: Option<&[u8; 32]>,
+        join_secret: Option<&[u8; 32]>,
+    ) -> anyhow::Result<()> {
+        let owner_enc = match owner_seed {
+            Some(seed) => Some(Self::encrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "owner",
+                seed,
+            )?),
+            None => None,
+        };
+        let join_enc = match join_secret {
+            Some(secret) => Some(Self::encrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "join",
+                secret,
+            )?),
+            None => None,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO channels (channel_id, pubkey, name, visibility, is_owner, owner_seed,
+                 join_secret, topic, welcome, joined_at, last_active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', '', ?8, ?8)",
+            params![
+                channel_id,
+                pubkey,
+                name,
+                visibility,
+                if is_owner { 1 } else { 0 },
+                owner_enc,
+                join_enc,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM channel_messages WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_members WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM channels WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    #[allow(dead_code)]
+    pub fn load_channel_owner_seed(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
+        let stored: Option<String> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT owner_seed FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten()
+        };
+        match stored {
+            Some(enc) => Ok(Some(Self::decrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "owner",
+                &enc,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_channel_join_secret(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
+        let stored: Option<String> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT join_secret FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten()
+        };
+        match stored {
+            Some(enc) => Ok(Some(Self::decrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "join",
+                &enc,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_channel_member(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        nickname: &str,
+        last_seen: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned)
+             VALUES (?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                nickname = excluded.nickname,
+                last_seen = excluded.last_seen",
+            params![channel_id, member_pubkey, nickname, last_seen],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_channel_members(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<StoredChannelMember>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT member_pubkey, nickname, last_seen, banned
+             FROM channel_members WHERE channel_id = ?1
+             ORDER BY nickname COLLATE NOCASE, member_pubkey",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id], |row| {
+                Ok(StoredChannelMember {
+                    member_pubkey: row.get(0)?,
+                    nickname: row.get(1)?,
+                    last_seen: row.get(2)?,
+                    banned: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[allow(dead_code)]
+    pub fn set_channel_member_banned(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        banned: bool,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channel_members SET banned = ?3 WHERE channel_id = ?1 AND member_pubkey = ?2",
+            params![channel_id, member_pubkey, if banned { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn update_channel_moderation(
+        &self,
+        channel_id: &str,
+        topic: &str,
+        welcome: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET topic = ?2, welcome = ?3 WHERE channel_id = ?1",
+            params![channel_id, topic, welcome],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_channel_presence(&self, channel_id: &str, when: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET presence_published_at = ?2 WHERE channel_id = ?1",
+            params![channel_id, when],
+        )?;
+        Ok(())
+    }
+
+    pub fn channels_due_for_presence(&self, now: i64, interval_secs: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id FROM channels
+             WHERE presence_published_at <= ?1
+             ORDER BY presence_published_at ASC",
+        )?;
+        let cutoff = now.saturating_sub(interval_secs);
+        let rows = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_channel_message(
+        &self,
+        channel_id: &str,
+        sender_pubkey: &str,
+        direction: &str,
+        message: &str,
+        msg_id: &str,
+    ) -> anyhow::Result<i64> {
+        const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
+        const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
+        let message: &str = if message.len() > MAX_CHANNEL_MESSAGE_LEN {
+            let mut end = MAX_CHANNEL_MESSAGE_LEN;
+            while end > 0 && !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            &message[..end]
+        } else {
+            message
+        };
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                channel_id,
+                sender_pubkey,
+                direction,
+                CHAT_CIPHERTEXT_PREFIX,
+                now,
+                if direction == "sent" { 1 } else { 0 },
+                msg_id
+            ],
+        )?;
+        let new_id = tx.last_insert_rowid();
+        let encrypted = Self::encrypt_channel_message_body(
+            self.require_chat_key()?,
+            new_id,
+            channel_id,
+            direction,
+            now,
+            message,
+        )?;
+        tx.execute(
+            "UPDATE channel_messages SET message = ?1 WHERE id = ?2",
+            params![encrypted, new_id],
+        )?;
+        tx.execute(
+            "UPDATE channels SET last_active = ?2 WHERE channel_id = ?1",
+            params![channel_id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_messages WHERE id IN (
+                 SELECT id FROM channel_messages
+                 WHERE channel_id = ?1
+                 ORDER BY id DESC
+                 LIMIT -1 OFFSET ?2
+             )",
+            params![channel_id, MAX_MESSAGES_PER_CHANNEL],
+        )?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    pub fn get_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
+        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+            let conn = self.conn.lock();
+            if let Some(bid) = before_id {
+                let mut stmt = conn.prepare(
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                     FROM channel_messages WHERE channel_id = ?1 AND id < ?2
+                     ORDER BY id DESC LIMIT ?3",
+                )?;
+                let mapped = stmt.query_map(params![channel_id, bid, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                     FROM channel_messages WHERE channel_id = ?1
+                     ORDER BY id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![channel_id, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let Some(chat_key) = self.chat_key.as_deref() else {
+            return Ok(rows
+                .into_iter()
+                .map(|(id, sender, direction, _, timestamp, read)| {
+                    (
+                        id,
+                        sender,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                    )
+                })
+                .collect());
+        };
+        let mut messages = Vec::with_capacity(rows.len());
+        for (id, sender, direction, stored, timestamp, read) in rows {
+            match Self::decrypt_channel_message_body(
+                chat_key,
+                id,
+                channel_id,
+                &direction,
+                timestamp,
+                &stored,
+            ) {
+                Ok(message) => {
+                    messages.push((id, sender, direction, message, timestamp, read))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Channel message {id} in {channel_id} is unavailable: {error}"
+                    );
+                    messages.push((
+                        id,
+                        sender,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                    ));
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    pub fn mark_channel_messages_read(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channel_messages SET read = 1 WHERE channel_id = ?1 AND read = 0",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_message_exists(&self, channel_id: &str, msg_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+            params![channel_id, msg_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Reclaim unused pages freed by DELETE operations.
     /// Should be called periodically (e.g. alongside credit flush).
     pub fn incremental_vacuum(&self) {
@@ -4321,6 +4989,66 @@ mod tests {
             )
             .expect("version");
         assert_eq!(version, MAX_SUPPORTED_SCHEMA_VERSION);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channels_round_trip_secrets_and_messages() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channels-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+
+        let channel_id = "ab".repeat(16);
+        let pubkey = "cd".repeat(32);
+        let seed = [0x11u8; 32];
+        let join = [0x22u8; 32];
+        db.insert_channel(
+            &channel_id,
+            &pubkey,
+            "Lobby",
+            "private",
+            true,
+            Some(&seed),
+            Some(&join),
+        )
+        .expect("insert channel");
+        assert_eq!(db.load_channel_owner_seed(&channel_id).unwrap(), Some(seed));
+        assert_eq!(db.load_channel_join_secret(&channel_id).unwrap(), Some(join));
+
+        db.upsert_channel_member(&channel_id, &pubkey, "Ada", 100)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].nickname, "Ada");
+
+        let msg_id = "aa".repeat(16);
+        let id = db
+            .insert_channel_message(&channel_id, &pubkey, "sent", "hello room", &msg_id)
+            .unwrap();
+        let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, id);
+        assert_eq!(msgs[0].3, "hello room");
+
+        let listed = db.list_channels().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Lobby");
+        assert!(listed[0].is_owner);
+
+        assert!(db.delete_channel(&channel_id).unwrap());
+        assert!(db.list_channels().unwrap().is_empty());
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

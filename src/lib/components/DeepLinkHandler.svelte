@@ -84,6 +84,9 @@
     }
     if (preview.kind === 'server') return preview.endpoint ?? '';
     if (preview.kind === 'serverList') return preview.host ?? '';
+    if (preview.kind === 'channel') {
+      return `${preview.name ?? m.nav_channels()}\n${preview.hash ?? ''}`;
+    }
     return preview.name ?? '';
   }
 
@@ -206,6 +209,12 @@
         if (!destroyed) {
           toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
         }
+      } else if (preview.kind === 'channel') {
+        await goto(`/channels?join=${encodeURIComponent(payload)}`);
+        if (get(page).url.pathname !== '/channels') {
+          return 'defer';
+        }
+        if (!destroyed) toastSuccess(m.channels_join_title());
       }
       // Unknown ed2k:// variants (e.g. magnet-style or future opcodes) are
       // ignored silently — the buffer already filtered to our known prefixes.

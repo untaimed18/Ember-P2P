@@ -22,7 +22,7 @@ use ed25519_dalek::SigningKey;
 use tracing::trace;
 
 use super::messages::{self, DhtPayload};
-use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_SOURCE};
+use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE};
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -122,6 +122,10 @@ pub struct DhtInbound {
     /// Carries the wire `request_id` so the caller can ACK only after
     /// `start_publish` succeeds.
     pub proxy_store_forward: Option<(u32, SignedRecord)>,
+    /// Authenticated channel gossip body (`MSG_CHANNEL_MSG`). The DHT
+    /// frame is already bound to `sender_id`; the body is AEAD under the
+    /// channel content key and is handled by the network task.
+    pub channel_msg: Option<Vec<u8>>,
 }
 
 /// What happened to one record offered to the local store.
@@ -318,6 +322,11 @@ impl EmberDht {
             return StoreOutcome::Rejected;
         }
 
+        if parsed.record_type == RECORD_TYPE_CHANNEL && !parsed.channel_store_ok() {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+
         // Slice 14: collapse identical STORE frames (same publisher
         // signature) for a short window so a retransmit storm can't re-verify
         // the same blob forever. Hourly republish still lands after the TTL.
@@ -491,6 +500,14 @@ impl EmberDht {
     pub fn build_announce_peer(&mut self, contacts: Vec<EmberContact>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_announce_peer(self.local_id, request_id, contacts);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
+    }
+
+    /// Build a signed `CHANNEL_MSG` gossip frame. No ack is expected.
+    pub fn build_channel_msg(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_channel_msg(self.local_id, request_id, body);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
     }
@@ -1117,6 +1134,9 @@ impl EmberDht {
             }
             DhtPayload::FoundValue { key: _, records } => {
                 out.found_value = Some((msg.request_id, records));
+            }
+            DhtPayload::ChannelMsg { body } => {
+                out.channel_msg = Some(body);
             }
             other => {
                 // Unknown arrive here once peers speak them. We've already
