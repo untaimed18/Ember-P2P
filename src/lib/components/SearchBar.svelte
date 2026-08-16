@@ -245,7 +245,7 @@
       />
     {/if}
     {#if value}
-      <button class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
+      <button type="button" class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
         <IconX size={11} />
       </button>
     {/if}
@@ -362,7 +362,7 @@
     border: none;
     border-radius: 50%;
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -380,7 +380,7 @@
     top: calc(100% + 6px);
     left: 0;
     right: 0;
-    z-index: 50;
+    z-index: 9999;
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);

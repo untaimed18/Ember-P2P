@@ -5444,7 +5444,10 @@ mod tests {
     fn advertised_tcp_port_uses_the_stun_remap_when_upnp_is_not_mapped() {
         // Without a forward of our own, the NAT's observed port is the only
         // reachable one — the CGNAT case STUN keep-alive exists for.
-        assert_eq!(advertised_tcp_port_from(None, Some(51234), 4662, false), 51234);
+        assert_eq!(
+            advertised_tcp_port_from(None, Some(51234), 4662, false),
+            51234
+        );
     }
 
     #[test]
@@ -9582,6 +9585,12 @@ struct NetworkState {
     shared_ip_filter: kad::ip_filter::SharedIpFilter,
     /// Lock-free KAD upload wire bytes (drained into StatsManager each second)
     kad_upload_overhead: crate::storage::statistics::SharedKadUploadOverhead,
+    /// Ember Peer Exchange wire bytes (TCP EPX + Ember UDP Exchange*).
+    /// Same Arc as `StatsManager::epx_counters`.
+    epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Ember DHT (and Ember-native handshake / transport ping) wire bytes.
+    /// Same Arc as `StatsManager::ember_dht_counters`.
+    ember_dht_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     /// Event receiver for our buddy connection (we are firewalled)
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
@@ -14689,6 +14698,7 @@ async fn try_start_pending_download_from_known_sources(
     ed25519_secret_key: [u8; 32],
     sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
     file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
+    epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
@@ -14895,6 +14905,7 @@ async fn try_start_pending_download_from_known_sources(
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
         sx_overhead: sx_overhead.clone(),
+        epx_overhead: epx_overhead.clone(),
         file_req_overhead: file_req_overhead.clone(),
     };
     let dl_tid = ms_download.transfer_id.clone();
@@ -16116,9 +16127,13 @@ pub async fn start_network(
     let mut ember_dht =
         ember::dht::engine::EmberDht::new(identity.ed25519_secret_key, settings.block_private_ips);
     ember_dht.set_ip_filter(shared_ip_filter.clone());
-    // Shared with StatsManager below so send_kad_packet can record wire
-    // bytes without holding the manager.
+    // Shared with StatsManager below so send_kad_packet / Ember UDP
+    // send-recv can record wire bytes without holding the manager.
     let kad_upload_overhead = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let epx_overhead =
+        std::sync::Arc::new(crate::storage::statistics::SxOverheadCounters::default());
+    let ember_dht_overhead =
+        std::sync::Arc::new(crate::storage::statistics::SxOverheadCounters::default());
 
     let mut dht_store = DhtStore::new();
     dht_store.set_local_id(local_id);
@@ -16391,6 +16406,8 @@ pub async fn start_network(
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),
         kad_upload_overhead: kad_upload_overhead.clone(),
+        epx_overhead: epx_overhead.clone(),
+        ember_dht_overhead: ember_dht_overhead.clone(),
         buddy_event_rx: None,
         serving_event_rx: None,
         pending_outgoing_buddy: None,
@@ -16650,6 +16667,8 @@ pub async fn start_network(
     let mut stats_manager = StatsManager::new();
     stats_manager.load_cumulative(&db);
     stats_manager.kad_upload_bytes = kad_upload_overhead;
+    stats_manager.epx_counters = epx_overhead;
+    stats_manager.ember_dht_counters = ember_dht_overhead;
 
     // Rate-limit DB persistence of download progress. DownloadEvent::Progress
     // fires many times per second per active download (one per block landing
@@ -17026,6 +17045,7 @@ pub async fn start_network(
         let ul_disconnected = state.upload_disconnected.clone();
         let ul_queue = upload_queue_handle.clone();
         let ul_sx_overhead = stats_manager.sx_counters.clone();
+        let ul_epx_overhead = stats_manager.epx_counters.clone();
         let ul_inbound_stream_rx = inbound_stream_rx;
         let ul_adv_tcp = state.advertise_tcp_port.clone();
         let ul_adv_udp = state.advertise_udp_port.clone();
@@ -17081,6 +17101,7 @@ pub async fn start_network(
                 ul_disconnected,
                 ul_queue,
                 ul_sx_overhead,
+                ul_epx_overhead,
                 connect_serve_rx,
                 ul_inbound_stream_rx,
             )
@@ -22092,6 +22113,7 @@ pub async fn start_network(
                                 ed25519_secret_key,
                                 &stats_manager.sx_counters,
                                 &stats_manager.file_req_counters,
+                            &stats_manager.epx_counters,
                             )
                             .await;
                             if started {
@@ -23261,6 +23283,7 @@ pub async fn start_network(
                                         tracker_registry: Some(state.tracker_registry.clone()),
                                         sx_overhead: stats_manager.sx_counters.clone(),
                                         file_req_overhead: stats_manager.file_req_counters.clone(),
+                                        epx_overhead: stats_manager.epx_counters.clone(),
                                     };
                                     let tid = ms_download.transfer_id.clone();
                                     let tid2 = tid.clone();
@@ -27574,6 +27597,7 @@ pub async fn start_network(
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
                             &stats_manager.file_req_counters,
+                            &stats_manager.epx_counters,
                         )
                         .await;
                     }
@@ -27853,6 +27877,7 @@ pub async fn start_network(
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
                             file_req_overhead: stats_manager.file_req_counters.clone(),
+                            epx_overhead: stats_manager.epx_counters.clone(),
                         };
                         let tx = dl_event_tx.clone();
                         let dl_tid = ms_download.transfer_id.clone();
@@ -28074,6 +28099,7 @@ pub async fn start_network(
                             tracker_registry: Some(state.tracker_registry.clone()),
                             sx_overhead: stats_manager.sx_counters.clone(),
                             file_req_overhead: stats_manager.file_req_counters.clone(),
+                            epx_overhead: stats_manager.epx_counters.clone(),
                         };
                         let dl_tid = ms_download.transfer_id.clone();
                         let dl_tid2 = dl_tid.clone();
@@ -30114,6 +30140,7 @@ pub async fn start_network(
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
                             &stats_manager.file_req_counters,
+                            &stats_manager.epx_counters,
                         ).await;
                     }
                 }
@@ -30696,6 +30723,7 @@ pub async fn start_network(
                                         ed25519_secret_key,
                                         &stats_manager.sx_counters,
                                         &stats_manager.file_req_counters,
+                                        &stats_manager.epx_counters,
                                     ).await;
                                 }
                             }
@@ -31469,6 +31497,7 @@ pub async fn start_network(
                                     tracker_registry: Some(state.tracker_registry.clone()),
                                     sx_overhead: stats_manager.sx_counters.clone(),
                                     file_req_overhead: stats_manager.file_req_counters.clone(),
+                                    epx_overhead: stats_manager.epx_counters.clone(),
                                 };
                                 let dl_tid = ms_download.transfer_id.clone();
                                 state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
@@ -31769,6 +31798,7 @@ pub async fn start_network(
                                 geoip: geoip.clone(),
                                 sx_overhead: stats_manager.sx_counters.clone(),
                                 file_req_overhead: stats_manager.file_req_counters.clone(),
+                                epx_overhead: stats_manager.epx_counters.clone(),
                             };
                             {
                                 let mut mgr = transfer_manager.write().await;
@@ -32752,12 +32782,11 @@ pub async fn start_network(
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
-                // Fold peer-to-peer SX bytes (OP_REQUESTSOURCES /
-                // OP_ANSWERSOURCES + Ember EPX) accumulated by the
-                // upload / transfer / multi_source tasks into the
-                // overhead category. Without this the Source Exchange
-                // row on the Statistics page shows only server-based
-                // source-asking and reads zero on KAD/Ember-only runs.
+                // Fold lock-free SX / file-request / EPX / Ember-DHT
+                // bytes into their Statistics-page categories. Without
+                // this drain, those rows only show traffic recorded
+                // directly on the network loop (server packets, KAD
+                // recv) and read zero for peer TCP / Ember UDP.
                 stats_manager.drain_sx_counters();
                 stats_manager.record_rate(chrono::Utc::now().timestamp());
                 // Keep the Statistics IPC cache in lock-step with the 1s rate
@@ -33647,6 +33676,7 @@ pub async fn start_network(
                             ed25519_secret_key,
                             &stats_manager.sx_counters,
                             &stats_manager.file_req_counters,
+                            &stats_manager.epx_counters,
                         )
                         .await;
                     }
@@ -35464,6 +35494,23 @@ async fn send_kad_packet(
     result
 }
 
+/// Send an Ember-native UDP datagram and count its on-wire bytes against
+/// the given overhead counter (EPX or Ember DHT). Matches
+/// [`send_kad_packet`]'s accounting: only successful `send_to` lengths
+/// are recorded, so a failed send cannot inflate the Statistics page.
+async fn send_ember_udp(
+    socket: &UdpSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+    overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+) -> std::io::Result<usize> {
+    let result = socket.send_to(packet, addr).await;
+    if let Ok(n) = result {
+        overhead.record_upload(n as u64);
+    }
+    result
+}
+
 fn from_ip_v4(from: SocketAddr) -> Option<Ipv4Addr> {
     match from.ip() {
         std::net::IpAddr::V4(v4) => Some(v4),
@@ -36276,8 +36323,27 @@ async fn handle_ember_native_udp_inner(
         return;
     }
 
+    // Classify the datagram after decrypt so EPX Exchange* does not land
+    // in the Ember DHT row (and vice versa). Handshake-only packets and
+    // transport Ping/Pong have no EPX control and no DHT app payload —
+    // they are the cost of the Ember DHT channel, so they count as DHT.
+    // A mixed datagram (DHT app + EPX control) is counted as DHT so the
+    // same UDP packet is never billed twice.
+    let is_epx = outcome.controls.iter().any(|c| {
+        matches!(
+            c,
+            ember::transport::EmberControlMessage::ExchangeRequest
+                | ember::transport::EmberControlMessage::ExchangeData { .. }
+        )
+    });
+    if is_epx && outcome.app_payloads.is_empty() {
+        state.epx_overhead.record_download(data.len() as u64);
+    } else {
+        state.ember_dht_overhead.record_download(data.len() as u64);
+    }
+
     for pkt in &outcome.responses {
-        if let Err(e) = socket.send_to(pkt, from).await {
+        if let Err(e) = send_ember_udp(socket, pkt, from, &state.ember_dht_overhead).await {
             debug!("Ember transport: failed to send packet to {from}: {e}");
         }
     }
@@ -36418,7 +36484,8 @@ async fn handle_ember_control_message(
             .encode();
             match state.ember_transport.prepare_outgoing(from, None, &msg) {
                 ember::transport::OutgoingResult::Ready { packet } => {
-                    if let Err(e) = socket.send_to(&packet, from).await {
+                    if let Err(e) = send_ember_udp(socket, &packet, from, &state.epx_overhead).await
+                    {
                         debug!("ember-udp: failed to send ExchangeData reply to {from}: {e}");
                     } else {
                         state.ember_diagnostics.ember_exchange_sent = state
@@ -36549,7 +36616,8 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
         ) {
             ember::transport::OutgoingResult::Ready { packet }
             | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                match socket.send_to(&packet, contact.addr).await {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(
@@ -37173,7 +37241,9 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
             ) {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match socket.send_to(&packet, contact.addr).await {
+                    match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead)
+                        .await
+                    {
                         Ok(_) => true,
                         Err(e) => {
                             debug!("Ember batch publish: send to {} failed: {e}", contact.addr);
@@ -37305,7 +37375,8 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
         ) {
             ember::transport::OutgoingResult::Ready { packet }
             | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                match socket.send_to(&packet, contact.addr).await {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(
@@ -37979,7 +38050,9 @@ async fn ask_ember_source_buddies(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    socket.send_to(&packet, buddy.addr).await.is_ok()
+                    send_ember_udp(socket, &packet, buddy.addr, &state.ember_dht_overhead)
+                        .await
+                        .is_ok()
                 }
                 ember::transport::OutgoingResult::Queued => true,
                 ember::transport::OutgoingResult::Error(_) => false,
@@ -38204,7 +38277,7 @@ async fn run_ember_maintenance(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match socket.send_to(&packet, addr).await {
+                    match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
                         Ok(_) => true,
                         Err(e) => {
                             debug!("Ember KAD-bridge: ping to {addr} failed: {e}");
@@ -38252,7 +38325,7 @@ async fn run_ember_maintenance(
             let sent = match state.ember_transport.prepare_outgoing(addr, None, &frame) {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match socket.send_to(&packet, addr).await {
+                    match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
                         Ok(_) => true,
                         Err(e) => {
                             debug!("Ember XX-bridge: ping to {addr} failed: {e}");
@@ -38441,7 +38514,8 @@ async fn run_ember_maintenance(
         ) {
             ember::transport::OutgoingResult::Ready { packet }
             | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                match socket.send_to(&packet, contact.addr).await {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(
@@ -38592,7 +38666,8 @@ async fn run_ember_maintenance(
         ) {
             ember::transport::OutgoingResult::Ready { packet }
             | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                match socket.send_to(&packet, contact.addr).await {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(
@@ -38912,7 +38987,9 @@ async fn handle_ember_dht_message(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) = socket.send_to(&packet, from).await {
+                    if let Err(e) =
+                        send_ember_udp(socket, &packet, from, &state.ember_dht_overhead).await
+                    {
                         debug!("Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}");
                     }
                 }
@@ -38940,7 +39017,9 @@ async fn handle_ember_dht_message(
         {
             ember::transport::OutgoingResult::Ready { packet }
             | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                if let Err(e) = socket.send_to(&packet, from).await {
+                if let Err(e) =
+                    send_ember_udp(socket, &packet, from, &state.ember_dht_overhead).await
+                {
                     debug!("Ember DHT: failed to send reply to {from}: {e}");
                 }
             }
@@ -38980,7 +39059,9 @@ async fn handle_ember_dht_message(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    match socket.send_to(&packet, *oldest_addr).await {
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
                         Ok(_) => true,
                         Err(e) => {
                             debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
@@ -43214,6 +43295,7 @@ async fn handle_command_inner(
                         tracker_registry: Some(state.tracker_registry.clone()),
                         sx_overhead: stats_manager.sx_counters.clone(),
                         file_req_overhead: stats_manager.file_req_counters.clone(),
+                        epx_overhead: stats_manager.epx_counters.clone(),
                     };
 
                     let tx = dl_event_tx.clone();
@@ -44107,7 +44189,9 @@ async fn handle_command_inner(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) = socket.send_to(&packet, addr).await {
+                    if let Err(e) =
+                        send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await
+                    {
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
@@ -44273,7 +44357,8 @@ async fn handle_command_inner(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) = socket.send_to(&packet, addr).await {
+                    if let Err(e) = send_ember_udp(socket, &packet, addr, &state.epx_overhead).await
+                    {
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
@@ -44346,7 +44431,9 @@ async fn handle_command_inner(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) = socket.send_to(&packet, addr).await {
+                    if let Err(e) =
+                        send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await
+                    {
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
@@ -44433,7 +44520,9 @@ async fn handle_command_inner(
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) = socket.send_to(&packet, addr).await {
+                    if let Err(e) =
+                        send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await
+                    {
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }

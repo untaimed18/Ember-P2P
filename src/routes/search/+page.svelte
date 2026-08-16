@@ -2349,7 +2349,7 @@
           class="filter-text-input"
         />
         {#if filterTextInput}
-          <button class="filter-text-clear" onclick={clearFilterText} title={m.search_clear_filter_text()} aria-label={m.search_clear_filter_text()}>
+          <button type="button" class="filter-text-clear" onclick={clearFilterText} title={m.search_clear_filter_text()} aria-label={m.search_clear_filter_text()}>
             <svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
               <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
@@ -2598,7 +2598,7 @@
       </span>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>
-          <summary class="column-menu-summary" title={m.search_columns_aria()}>
+          <summary class="column-menu-summary" title={m.search_columns_aria()} aria-haspopup="true">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <rect x="2" y="2.5" width="12" height="11" rx="1.5"/>
               <line x1="6.5" y1="2.5" x2="6.5" y2="13.5"/>
@@ -2919,7 +2919,7 @@
       <div class="file-details-panel scroll-shadows">
         <div class="panel-header">
           <h3>{m.search_file_details()}</h3>
-          <button class="ghost panel-close" aria-label={m.search_close_details_aria()} onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
+          <button type="button" class="panel-close" title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
             <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
               <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
@@ -3228,7 +3228,7 @@
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -3263,8 +3263,8 @@
 
   .search-tab-close:hover,
   .search-tab-close:focus-visible {
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    color: #ffffff;
+    background: var(--danger);
     outline-color: var(--danger);
   }
 
@@ -3351,19 +3351,24 @@
   }
 
   .filter-text-clear {
-    border: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
     background: none;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
-    padding: 4px 8px;
-    font-size: 12px;
     line-height: 1;
     flex-shrink: 0;
-    border-radius: 0;
   }
 
   .filter-text-clear:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
 
   .filter-group {
@@ -3505,7 +3510,7 @@
     position: absolute;
     top: calc(100% + 6px);
     right: 0;
-    z-index: 50;
+    z-index: 9999;
     min-width: 180px;
     background: var(--bg-surface);
     border: 1px solid var(--border);
@@ -3926,6 +3931,28 @@
     font-size: 14px;
   }
 
+  .panel-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .panel-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
   .panel-body {
     padding: 14px 20px;
   }
@@ -4074,7 +4101,7 @@
     position: absolute;
     top: calc(100% + 6px);
     right: 0;
-    z-index: 30;
+    z-index: 9999;
     width: min(360px, 70vw);
     padding: 8px 10px;
     border-radius: var(--radius-md);
@@ -4181,7 +4208,7 @@
     top: calc(100% + 8px);
     right: 0;
     width: min(320px, 72vw);
-    z-index: 35;
+    z-index: 9999;
     padding: 8px 10px;
     border-radius: var(--radius-md);
     border: 1px solid var(--border);

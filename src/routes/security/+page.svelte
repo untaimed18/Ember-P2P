@@ -582,7 +582,7 @@
           aria-label={m.security_search_placeholder()}
         />
         {#if searchQuery}
-          <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}><IconX size={12} /></button>
+          <button type="button" class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}><IconX size={12} /></button>
         {/if}
       </div>
       <span class="result-count">
@@ -679,7 +679,8 @@
                 </td>
                 <td class="actions-cell">
                   <button
-                    class="ghost danger btn-remove"
+                    type="button"
+                    class="btn-remove"
                     onclick={() => handleRemoveRange(entry)}
                     title={m.security_remove_range_title()}
                     aria-label={m.security_remove_range_aria({ start: entry.start_ip, end: entry.end_ip })}
@@ -901,7 +902,7 @@
     justify-content: center;
     border: none;
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     width: 20px;
     height: 20px;
     border-radius: 50%;
@@ -1067,9 +1068,23 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 2px 6px;
-    opacity: 0.5;
-    transition: opacity 0.15s;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+    cursor: pointer;
+    line-height: 1;
+    opacity: 0.7;
+    transition: opacity 0.15s, background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .btn-remove:hover {
+    color: #ffffff;
+    border-color: var(--danger);
+    background: var(--danger);
+    opacity: 1;
   }
   .ip-table tbody tr:hover .btn-remove,
   .ip-table tbody tr:focus-within .btn-remove,

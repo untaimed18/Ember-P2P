@@ -736,7 +736,7 @@
               aria-label={m.servers_filter_aria()}
             />
             {#if serverFilter}
-              <button class="ghost btn-sm filter-clear" onclick={() => (serverFilter = '')} title={m.servers_filter_clear()} aria-label={m.servers_filter_clear()}><IconX size={12} /></button>
+              <button type="button" class="filter-clear" onclick={() => (serverFilter = '')} title={m.servers_filter_clear()} aria-label={m.servers_filter_clear()}><IconX size={12} /></button>
             {/if}
           </div>
           <button class="ghost btn-sm" onclick={handleRemoveAll} disabled={servers.length === 0}>{m.servers_remove_all()}</button>
@@ -826,7 +826,7 @@
                   </td>
                   <td>{server.is_static ? m.common_yes() : '—'}</td>
                   <td>
-                    <button class="ghost danger btn-sm" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
+                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
@@ -1121,8 +1121,41 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    padding: 4px 8px;
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .filter-clear:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .server-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .server-remove:hover {
+    color: #ffffff;
+    border-color: var(--danger);
+    background: var(--danger);
   }
 
   .server-table-wrap {

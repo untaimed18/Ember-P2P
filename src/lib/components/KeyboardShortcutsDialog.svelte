@@ -165,7 +165,7 @@
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
-        <button class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
+        <button type="button" class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
       </div>
       <div class="shortcut-body">
         {#each groups as group, gi (gi)}
@@ -241,12 +241,13 @@
     justify-content: center;
     width: 28px;
     height: 28px;
+    padding: 0;
     background: none;
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
-    padding: 0;
+    line-height: 1;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
 

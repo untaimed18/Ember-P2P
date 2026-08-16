@@ -846,10 +846,14 @@ pub struct MultiSourceDownload {
     /// Expected Ember content BLAKE3 (slice 18). All-zero skips verify.
     pub ember_file_hash: [u8; 32],
     /// Lock-free counter the per-source workers bump on every
-    /// peer-to-peer Source Exchange packet they send or receive.
-    /// Drained on the network loop's stats tick into the
-    /// `Source Exchange` overhead row.
+    /// peer-to-peer Source Exchange packet they send or receive
+    /// (`OP_REQUESTSOURCES` / `OP_ANSWERSOURCES`). Ember EPX is
+    /// counted on `epx_overhead`. Drained into the Source Exchange
+    /// overhead row.
     pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE`) wire bytes.
+    /// Drained into `OverheadCategory::Epx`.
+    pub epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     /// Same idea as `sx_overhead`, but for file-open/queue handshake bytes
     /// (hashset request/answer, StartUploadReq/AcceptUploadReq/QueueFull/
     /// QueueRanking). Drained into `OverheadCategory::FileRequest`.
@@ -1745,6 +1749,7 @@ impl MultiSourceDownload {
             let geo_clone = self.geoip.clone();
             let fh_clone = self.friend_hashes.clone();
             let sx_oh = self.sx_overhead.clone();
+            let epx_oh = self.epx_overhead.clone();
             let file_req_oh = self.file_req_overhead.clone();
 
             let fail_etx = event_tx.clone();
@@ -1827,6 +1832,7 @@ impl MultiSourceDownload {
                         src_ember_secret,
                         nick_for_src.clone(),
                         sx_oh.clone(),
+                        epx_oh.clone(),
                         file_req_oh.clone(),
                         // No pre-established stream — this is the initial-
                         // sources path; we always dial these peers fresh.
@@ -2194,6 +2200,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_epx_oh = self.epx_overhead.clone();
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
@@ -2219,6 +2226,7 @@ impl MultiSourceDownload {
                                         inj_ember_secret,
                                         inj_nick,
                                         inj_sx_oh,
+                                        inj_epx_oh,
                                         inj_file_req_oh,
                                         // Metadata-only injection (peer
                                         // discovered via KAD/server source
@@ -2437,6 +2445,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_epx_oh = self.epx_overhead.clone();
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
@@ -2462,6 +2471,7 @@ impl MultiSourceDownload {
                                         inj_ember_secret,
                                         inj_nick,
                                         inj_sx_oh,
+                                        inj_epx_oh,
                                         inj_file_req_oh,
                                         // The crucial bit: hand the
                                         // already-handshaked stream to
@@ -2936,6 +2946,7 @@ impl MultiSourceDownload {
                 let a_geo = self.geoip.clone();
                 let a_fh = self.friend_hashes.clone();
                 let a_sx_oh = self.sx_overhead.clone();
+                let a_epx_oh = self.epx_overhead.clone();
                 let a_file_req_oh = self.file_req_overhead.clone();
                 let a_missing_parts = peers_missing_parts.clone();
                 let a_disk_full = disk_full.clone();
@@ -2961,6 +2972,7 @@ impl MultiSourceDownload {
                             a_ember_secret,
                             a_nick,
                             a_sx_oh,
+                            a_epx_oh,
                             a_file_req_oh,
                             Some(stream),
                             a_missing_parts,
@@ -3376,6 +3388,7 @@ impl MultiSourceDownload {
                 let r_geo = self.geoip.clone();
                 let r_fh = self.friend_hashes.clone();
                 let r_sx_oh = self.sx_overhead.clone();
+                let r_epx_oh = self.epx_overhead.clone();
                 let r_file_req_oh = self.file_req_overhead.clone();
                 let r_sem = conn_semaphore.clone();
                 // Clone the shared "peers that queued" set so this
@@ -3412,6 +3425,7 @@ impl MultiSourceDownload {
                             r_ember_secret,
                             r_nick,
                             r_sx_oh,
+                            r_epx_oh,
                             r_file_req_oh,
                             // Retry round always re-dials; the original
                             // pre-established stream (if any) was consumed
@@ -3926,6 +3940,7 @@ async fn download_parts_from_source(
     ed25519_secret_key: [u8; 32],
     our_nickname: String,
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     file_req_overhead: crate::storage::statistics::SharedFileReqOverheadCounters,
     // `pre_established`: if `Some`, skip TCP connect + obfuscation +
     // Hello + EmuleInfo because the upload listener already did all
@@ -4887,7 +4902,7 @@ async fn download_parts_from_source(
                     && epx_packets_received
                         < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
             {
-                sx_overhead.record_download((6 + payload.len()) as u64);
+                epx_overhead.record_download((6 + payload.len()) as u64);
                 epx_packets_received += 1;
                 info!(
                     "Received early EPX from source {} during pre-file-control ({} bytes)",
@@ -5262,7 +5277,7 @@ async fn download_parts_from_source(
                 &*epx_data,
             )
             .await;
-            sx_overhead.record_upload((6 + epx_data.len()) as u64);
+            epx_overhead.record_upload((6 + epx_data.len()) as u64);
             initial_epx_sent_generation = Some(sent_gen);
         } else {
             info!(
@@ -5618,7 +5633,7 @@ async fn download_parts_from_source(
             && ember_hash_binding_verified
             && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
         {
-            sx_overhead.record_download((6 + _payload.len()) as u64);
+            epx_overhead.record_download((6 + _payload.len()) as u64);
             epx_packets_received += 1;
             info!(
                 "Received EPX from source {} during file-status-wait ({} bytes)",
@@ -5794,7 +5809,7 @@ async fn download_parts_from_source(
                                     .await
                                     .is_ok()
                                     {
-                                        sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                        epx_overhead.record_upload((6 + epx_data.len()) as u64);
                                         initial_epx_sent_generation = Some(sent_gen);
                                     }
                                 } else {
@@ -5875,7 +5890,7 @@ async fn download_parts_from_source(
                                         .await
                                         .is_ok()
                                         {
-                                            sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                            epx_overhead.record_upload((6 + epx_data.len()) as u64);
                                             initial_epx_sent_generation = Some(sent_gen);
                                         }
                                     } else {
@@ -7083,7 +7098,7 @@ async fn download_parts_from_source(
                             .is_ok()
                             {
                                 last_epx_generation = current_gen;
-                                sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                epx_overhead.record_upload((6 + epx_data.len()) as u64);
                             }
                         } else {
                             last_epx_generation = current_gen;
@@ -8037,7 +8052,7 @@ async fn download_parts_from_source(
                     (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                         if hello_caps.is_ember && ember_hash_binding_verified =>
                     {
-                        sx_overhead.record_download((6 + payload.len()) as u64);
+                        epx_overhead.record_download((6 + payload.len()) as u64);
                         if epx_packets_received
                             >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                         {

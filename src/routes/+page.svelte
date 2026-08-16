@@ -716,7 +716,7 @@
                     <div class="contact-cell-inner">
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.id })} ondblclick={() => copyText(contact.id, m.kad_copied_contact_id())}>{contact.id}</span>
-                      <button class="ghost copy-btn" aria-label={m.kad_copy_id()} onclick={() => copyText(contact.id, m.kad_copied_contact_id())} title={m.kad_copy_id()}>
+                      <button type="button" class="copy-btn" aria-label={m.kad_copy_id()} onclick={() => copyText(contact.id, m.kad_copied_contact_id())} title={m.kad_copy_id()}>
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                       </button>
                     </div>
@@ -731,7 +731,7 @@
                     <div class="contact-cell-inner">
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.distance })} ondblclick={() => copyText(contact.distance, m.kad_copied_distance())}>{contact.distance}</span>
-                      <button class="ghost copy-btn" aria-label={m.kad_copy_distance()} onclick={() => copyText(contact.distance, m.kad_copied_distance())} title={m.kad_copy_distance()}>
+                      <button type="button" class="copy-btn" aria-label={m.kad_copy_distance()} onclick={() => copyText(contact.distance, m.kad_copied_distance())} title={m.kad_copy_distance()}>
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                       </button>
                     </div>
@@ -948,7 +948,7 @@
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
+          <button type="button" class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
         </div>
         <div class="modal-body">
           <div class="bootstrap-tabs" role="tablist">
@@ -1122,12 +1122,13 @@
                 <td>
                   {#if search.status === 'active'}
                     <button
-                      class="ghost cancel-btn"
+                      type="button"
+                      class="cancel-btn"
                       title={m.kad_search_cancel_title()}
                       aria-label={m.kad_search_cancel_aria({ id: search.id })}
                       onclick={() => handleCancelSearch(search.id)}
                     >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
                     </button>
                   {/if}
                 </td>
@@ -1318,14 +1319,22 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 2px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    flex-shrink: 0;
     cursor: pointer;
-    border: none;
+    border: 1px solid transparent;
     background: none;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     border-radius: var(--radius-sm);
+    line-height: 1;
   }
-  .modal-close:hover { color: var(--text-primary); }
+  .modal-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
   .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;
@@ -1679,7 +1688,7 @@
   }
 
   .copy-btn {
-    padding: 2px !important;
+    padding: 0 !important;
     min-width: 0;
     width: 18px;
     height: 18px;
@@ -1687,8 +1696,12 @@
     align-items: center;
     justify-content: center;
     opacity: 0;
-    transition: opacity 0.1s;
-    color: var(--text-muted);
+    transition: opacity 0.1s, color 0.1s, background 0.1s;
+    color: var(--text-secondary);
+    line-height: 1;
+    background: none;
+    border: 1px solid transparent;
+    cursor: pointer;
   }
 
   .copy-btn svg {
@@ -1703,6 +1716,7 @@
 
   .copy-btn:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
 
   .contact-type {
@@ -1797,19 +1811,20 @@
     color: var(--badge-warning-text);
   }
 
-  /* Per-row Cancel button: small ghost variant that lines up with the
-     compact table's tight 26-px row height. Uses V2's existing `.ghost`
-     button class for the base look so the visual language stays
-     consistent across the app. */
+  /* Per-row Cancel: compact danger chip that fits the 26px row and
+     keeps the stop glyph readable (global button padding would clip it). */
   .cancel-btn {
-    padding: 2px !important;
+    padding: 0 !important;
     min-width: 0;
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    color: var(--text-muted);
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    line-height: 1;
   }
 
   .cancel-btn svg {
@@ -1818,7 +1833,9 @@
   }
 
   .cancel-btn:hover {
-    color: var(--danger);
+    color: #ffffff;
+    border-color: var(--danger);
+    background: var(--danger);
   }
 
   /* Short laptop viewports: give the contact map more of the column and

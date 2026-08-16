@@ -41,7 +41,7 @@
           {/if}
         </span>
         <span class="toast-msg">{toast.message}</span>
-        <button class="toast-close" onclick={() => removeToast(toast.id)} aria-label={m.common_dismiss()}>
+        <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} aria-label={m.common_dismiss()}>
           <IconX size={13} />
         </button>
       </div>
@@ -146,7 +146,7 @@
     background: none;
     border: none;
     border-radius: var(--radius-sm);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     padding: 0;
     opacity: 0.85;

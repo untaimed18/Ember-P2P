@@ -185,9 +185,9 @@
   <div class="status-right" aria-label={m.statusbar_speeds_aria()}>
     <!--
       Status bar rates/totals are file-transfer payload only (BandwidthLimiter).
-      Protocol overhead (server, KAD, source exchange, reasks) is tracked on
-      the Statistics page — these numbers intentionally differ from a full
-      "network bytes" view.
+      Protocol overhead (server, KAD, source exchange, EPX, Ember DHT, reasks)
+      is tracked on the Statistics page — these numbers intentionally differ
+      from a full "network bytes" view.
     -->
     <span class="status-item upload" title={m.statusbar_upload_title()}>
       <span aria-hidden="true">↑</span>

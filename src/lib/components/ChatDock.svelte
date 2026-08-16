@@ -238,7 +238,7 @@
               title={m.chat_dock_close_tab_title()}
               onclick={(e) => { e.stopPropagation(); closeTab(tab.hash); }}
             >
-              <IconX size={10} />
+              <IconX size={12} />
             </button>
           </div>
         {/each}
@@ -434,7 +434,7 @@
     border: none;
     border-radius: 50%;
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     flex-shrink: 0;
     opacity: 0;
@@ -448,8 +448,8 @@
   }
 
   .dock-tab-close:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
+    background: var(--danger);
+    color: #ffffff;
   }
 
   .dock-new,
@@ -461,7 +461,7 @@
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -478,10 +478,14 @@
     margin-left: auto;
   }
 
-  .dock-new:hover,
-  .dock-close:hover {
+  .dock-new:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  .dock-close:hover {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .dock-new:focus-visible,

@@ -494,6 +494,8 @@
   "stats_overhead_kad": "KAD",
   "stats_overhead_source_exchange": "Échange de sources",
   "stats_overhead_file_requests": "Demandes de fichiers",
+  "stats_overhead_epx": "EPX",
+  "stats_overhead_ember_dht": "Ember DHT",
   "stats_no_overhead": "Aucune surcharge enregistrée pour l'instant",
   "stats_session_down_overhead": "Surcharge téléchargement (session)",
   "stats_session_up_overhead": "Surcharge envoi (session)",
