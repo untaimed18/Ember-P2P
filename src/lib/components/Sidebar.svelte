@@ -8,7 +8,8 @@
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
-  import { navItems, NAV_SHORTCUT_LIMIT, type NavItem } from '$lib/navItems';
+  import { navItems, navIndexFromShortcutEvent, navShortcutDigit, type NavItem } from '$lib/navItems';
+  import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -207,10 +208,10 @@
     }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
-    const n = Number.parseInt(e.key, 10);
-    if (!Number.isFinite(n) || n < 1 || n > Math.min(NAV_SHORTCUT_LIMIT, navItems.length)) return;
+    const idx = navIndexFromShortcutEvent(e);
+    if (idx === null || idx >= navItems.length) return;
     e.preventDefault();
-    navigateTo(navItems[n - 1].href);
+    navigateTo(navItems[idx].href);
   }
 
   onMount(() => {
@@ -239,14 +240,17 @@
 
   <ul class="nav-list">
     {#each navItems as item, i}
+      {@const digit = navShortcutDigit(i)}
       <li>
         <a
           href={item.href}
           class:active={isActive(item, $page.url.pathname)}
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
-          aria-keyshortcuts={i < NAV_SHORTCUT_LIMIT ? `Alt+${i + 1}` : undefined}
+          aria-keyshortcuts={digit ? `Alt+${digit}` : undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={i < NAV_SHORTCUT_LIMIT ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: i + 1 }) : item.label()}
+          title={digit
+            ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: digit })
+            : item.label()}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}
@@ -353,9 +357,14 @@
       class="about-btn chats-btn"
       class:active={$chatDockOpen}
       onclick={toggleChatDock}
-      title={$chatDockOpen ? m.sidebar_chats_close() : m.sidebar_chats_open()}
+      title={$chatDockOpen
+        ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
+        : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
+      aria-label={$chatDockOpen
+        ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
+        : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
       aria-pressed={$chatDockOpen}
-      aria-keyshortcuts="Control+/"
+      aria-keyshortcuts={`${shortcutModAria()}+/`}
     >
       <span class="about-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -382,6 +391,7 @@
       class="about-btn"
       onclick={() => (shortcutsOpen = true)}
       title={m.sidebar_keyboard_shortcuts_title()}
+      aria-label={m.sidebar_keyboard_shortcuts_title()}
       aria-keyshortcuts="?"
     >
       <span class="about-icon" aria-hidden="true">
@@ -396,7 +406,7 @@
       </span>
       <span>{m.sidebar_shortcuts_label()}</span>
     </button>
-    <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title={m.sidebar_about_title()}>
+    <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title={m.sidebar_about_title()} aria-label={m.sidebar_about_title()}>
       <span class="about-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="10" cy="10" r="7.5"/>
@@ -410,9 +420,11 @@
       type="button"
       class="about-btn collapse-btn"
       onclick={toggleCollapsed}
-      title={isCollapsed ? m.sidebar_expand() : m.sidebar_collapse()}
+      title={isCollapsed
+        ? m.sidebar_expand({ mod: shortcutModSymbol() })
+        : m.sidebar_collapse({ mod: shortcutModSymbol() })}
       aria-label={isCollapsed ? m.sidebar_expand_aria() : m.sidebar_collapse_aria()}
-      aria-keyshortcuts="Control+B"
+      aria-keyshortcuts={`${shortcutModAria()}+B`}
     >
       <span class="about-icon" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

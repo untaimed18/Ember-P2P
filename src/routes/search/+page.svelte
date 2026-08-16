@@ -833,6 +833,14 @@
     }).join(' · ');
   }
 
+  function searchPhaseLabel(phase: string): string | null {
+    switch (phase) {
+      case 'Lookup': return m.search_phase_lookup();
+      case 'Fetch': return m.search_phase_fetch();
+      default: return null;
+    }
+  }
+
   function spamProfileLabel(profile: string): string {
     switch (profile) {
       case 'aggressive': return m.settings_spam_profile_aggressive();
@@ -2211,8 +2219,8 @@
 
 <svelte:document onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (contextMenu) { closeContextMenu(); e.preventDefault(); }
-    else if (selectedResultKey) { selectedResultKey = null; e.preventDefault(); }
+    if (contextMenu) { closeContextMenu(); e.preventDefault(); e.stopPropagation(); }
+    else if (selectedResultKey) { selectedResultKey = null; e.preventDefault(); e.stopPropagation(); }
     return;
   }
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
@@ -2551,12 +2559,15 @@
       <div class="spinner lg"></div>
       <p>{m.search_searching_network()}</p>
       {#if activeTab.progress}
+        {@const phase = searchPhaseLabel(activeTab.progress.phase)}
         <p class="search-detail">
           {m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
           {#if activeTab.progress.results_so_far > 0}
             &middot; {m.search_results_so_far({ count: activeTab.progress.results_so_far })}
           {/if}
-          &middot; {activeTab.progress.phase}
+          {#if phase}
+            &middot; {phase}
+          {/if}
         </p>
       {/if}
     </div>
@@ -4243,7 +4254,7 @@
   .context-menu-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 999;
+    z-index: 9998;
     padding: 0;
     margin: 0;
     border: none;
@@ -4252,7 +4263,7 @@
   }
   .context-menu {
     position: fixed;
-    z-index: 1000;
+    z-index: 9999;
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

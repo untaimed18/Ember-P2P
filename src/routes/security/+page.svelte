@@ -579,6 +579,7 @@
           class="search-input"
           bind:value={searchQuery}
           placeholder={m.security_search_placeholder()}
+          aria-label={m.security_search_placeholder()}
         />
         {#if searchQuery}
           <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}><IconX size={12} /></button>

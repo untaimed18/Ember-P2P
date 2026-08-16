@@ -691,12 +691,21 @@
 
   function editKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') saveEdit();
-    else if (e.key === 'Escape') cancelEdit();
+    else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelEdit();
+    }
   }
 
   function addFormKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') handleAdd();
-    else if (e.key === 'Escape') { showAddForm = false; addError = null; }
+    else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      showAddForm = false;
+      addError = null;
+    }
   }
 
   function formatDate(ts: number): string {

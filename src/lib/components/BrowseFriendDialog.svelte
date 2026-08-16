@@ -291,6 +291,8 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
       onclose();
       return;
     }

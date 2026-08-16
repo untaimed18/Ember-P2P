@@ -450,6 +450,7 @@
   function onDocumentKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape' && colMenu) {
       event.preventDefault();
+      event.stopPropagation();
       closeMenu();
     }
   }

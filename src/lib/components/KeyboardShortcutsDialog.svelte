@@ -4,17 +4,14 @@
   // Grouped by scope so users can quickly scan to the shortcuts that
   // apply to where they are in the app.
   import * as m from '$lib/paraglide/messages';
-  import { navItems, NAV_SHORTCUT_LIMIT } from '$lib/navItems';
+  import { navItems, NAV_SHORTCUT_LIMIT, navShortcutDigit } from '$lib/navItems';
+  import { shortcutModSymbol } from '$lib/platform';
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
 
-  // Detect macOS so we show ⌘ where handlers also accept metaKey.
-  const modifierKey =
-    typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
-      ? '⌘'
-      : 'Ctrl';
+  const modifierKey = shortcutModSymbol();
   type Shortcut = { keys: string[]; label: () => string };
   type Group = { title: () => string; shortcuts: Shortcut[] };
 
@@ -59,11 +56,12 @@
   // just an entry's position, so a hand-kept copy drifts the moment anything
   // is inserted or reordered — which is exactly what happened when the Ember
   // page was added in the middle and three rows started naming the wrong key.
-  // Entries past the shortcut limit are click-only and are left out.
+  // Alt+1..9 then Alt+0 cover the first ten items; anything past that is
+  // click-only and is left out.
   const navShortcuts: Shortcut[] = navItems
     .slice(0, NAV_SHORTCUT_LIMIT)
     .map((item, i) => ({
-      keys: ['Alt', String(i + 1)],
+      keys: ['Alt', navShortcutDigit(i) ?? String(i + 1)],
       label: () => m.shortcuts_jump_to({ page: item.label() }),
     }));
 
@@ -142,6 +140,7 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
       open = false;
       return;
     }

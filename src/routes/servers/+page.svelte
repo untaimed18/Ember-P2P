@@ -658,7 +658,7 @@
 </script>
 
 <svelte:document onclick={closeContextMenu} onkeydown={(e) => {
-  if (e.key === 'Escape' && ctxMenu) { closeContextMenu(); e.preventDefault(); }
+  if (e.key === 'Escape' && ctxMenu) { closeContextMenu(); e.preventDefault(); e.stopPropagation(); }
 }} />
 
 <div class="page-header">
@@ -1408,7 +1408,7 @@
   /* Context menu */
   .context-menu {
     position: fixed;
-    z-index: 1000;
+    z-index: 9999;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

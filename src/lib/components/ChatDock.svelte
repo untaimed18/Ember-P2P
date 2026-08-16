@@ -14,6 +14,7 @@
   import { unreadCounts, onlineFriends } from '$lib/stores/friends';
   import * as m from '$lib/paraglide/messages';
   import IconX from '$lib/components/IconX.svelte';
+  import { shortcutModAria } from '$lib/platform';
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
@@ -73,6 +74,9 @@
       if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) {
         return;
       }
+      // Page chrome that already handled Escape (recent-search dropdown, column
+      // menus, clearing a filter) calls preventDefault. Don't also close the dock.
+      if (e.defaultPrevented) return;
       e.preventDefault();
       closeDock();
       return;
@@ -196,7 +200,7 @@
     bind:this={panelEl}
     role="complementary"
     aria-label={m.chat_dock_aria_label()}
-    aria-keyshortcuts="Escape Control+/"
+    aria-keyshortcuts={`Escape ${shortcutModAria()}+/`}
     tabindex="-1"
   >
     <div class="dock-tabs" role="tablist" aria-label={m.chat_dock_tablist_aria()}>

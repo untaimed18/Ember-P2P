@@ -496,7 +496,7 @@
           <p class="step-desc">{m.wizard_connect_desc()}</p>
           <div class="connect-options">
             <div class="connect-option">
-              <ToggleSwitch bind:checked={autoConnectKad} />
+              <ToggleSwitch bind:checked={autoConnectKad} ariaLabel={m.wizard_connect_kad_title()} />
               <div>
                 <strong>{m.wizard_connect_kad_title()}</strong>
                 <span>{m.wizard_connect_kad_desc()}</span>
