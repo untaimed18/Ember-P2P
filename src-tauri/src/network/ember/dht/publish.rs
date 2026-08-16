@@ -30,6 +30,7 @@ pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
 pub const CHANNEL_KIND_INDEX: u8 = 1;
 pub const CHANNEL_KIND_PRESENCE: u8 = 2;
 pub const CHANNEL_KIND_MODERATION: u8 = 3;
+pub const CHANNEL_KIND_HANDOFF: u8 = 4;
 pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
 const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
@@ -109,6 +110,17 @@ pub struct ChannelModeration {
     pub welcome: String,
     pub banned_pubkeys: Vec<[u8; 32]>,
     pub moderator_pubkeys: Vec<[u8; 32]>,
+    pub timestamp: i64,
+    pub publisher_key: [u8; 32],
+}
+
+/// Owner-signed successor mapping. `file_hash` is the **old** channel_id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelHandoff {
+    pub version: u64,
+    pub successor_pubkey: [u8; 32],
+    pub successor_channel_id: [u8; 16],
+    pub flags: u8,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
 }
@@ -282,6 +294,35 @@ impl SignedRecord {
         )
     }
 
+    /// Successor mapping signed by the **old** channel key. Does not copy
+    /// the seed; members follow `successor_channel_id`.
+    pub fn channel_handoff(
+        version: u64,
+        successor_pubkey: [u8; 32],
+        old_channel_id: [u8; 16],
+        old_channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private {
+            channel::HANDOFF_FLAG_KEEP_JOIN_SECRET
+        } else {
+            0
+        };
+        let extra = channel::encode_handoff_extra(version, &successor_pubkey, flags);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::handoff_key(&old_channel_id),
+            old_channel_id,
+            old_channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_HANDOFF, flags),
+            "",
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
     /// Whether a STORE of this channel record is well-formed enough to keep.
     ///
     /// Storers cannot check a private presence key (it folds in `join_secret`),
@@ -313,6 +354,11 @@ impl SignedRecord {
             CHANNEL_KIND_MODERATION => {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::moderation_key(&self.file_hash)
+            }
+            CHANNEL_KIND_HANDOFF => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::handoff_key(&self.file_hash)
+                    && channel::decode_handoff_extra(&meta.extra).is_some()
             }
             _ => false,
         }
@@ -475,6 +521,34 @@ impl SignedRecord {
             welcome,
             banned_pubkeys,
             moderator_pubkeys,
+            timestamp: rec.timestamp,
+            publisher_key: rec.publisher_key,
+        })
+    }
+
+    /// Parse an owner-signed handoff blob for `expected_channel_id` (the old id).
+    pub fn parse_channel_handoff(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelHandoff> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_HANDOFF {
+            return None;
+        }
+        let (version, successor_pubkey, successor_channel_id, flags) =
+            channel::decode_handoff_extra(&meta.extra)?;
+        Some(ChannelHandoff {
+            version,
+            successor_pubkey,
+            successor_channel_id,
+            flags,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
         })
@@ -1213,6 +1287,25 @@ mod tests {
         assert_eq!(mod_info.moderator_pubkeys, mods);
         assert_eq!(mod_info.publisher_key, ident.pubkey);
         assert!(SignedRecord::parse_channel_moderation(&blob, &[0x00; 16]).is_none());
+
+        let successor = channel::ChannelIdentity::generate();
+        let handoff = SignedRecord::channel_handoff(
+            1,
+            successor.pubkey,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+        );
+        assert!(handoff.channel_store_ok());
+        assert_ne!(handoff.keyword_hash, record.keyword_hash);
+        let mut hblob = handoff.data.clone();
+        hblob.extend_from_slice(&handoff.signature);
+        let parsed = SignedRecord::parse_channel_handoff(&hblob, &ident.channel_id).unwrap();
+        assert_eq!(parsed.successor_pubkey, successor.pubkey);
+        assert_eq!(parsed.successor_channel_id, successor.channel_id);
+        assert_eq!(parsed.flags, channel::HANDOFF_FLAG_KEEP_JOIN_SECRET);
+        assert!(SignedRecord::parse_channel_handoff(&hblob, &[0u8; 16]).is_none());
 
         // Pre-delegation extra: welcome + bans and nothing after.
         let mut legacy = encode_moderation_extra("hi", &banned, &[]);

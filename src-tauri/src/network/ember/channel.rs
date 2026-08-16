@@ -26,7 +26,10 @@ const CONTENT_KEY_CONTEXT: &str = "ember-channel-content-v1";
 const INDEX_KEY_PREFIX: &[u8] = b"ember:channels:index:v1:";
 const PRESENCE_KEY_PREFIX: &[u8] = b"ember:channel:presence:v1";
 const MODERATION_KEY_PREFIX: &[u8] = b"ember:channel:mod:v1";
+const HANDOFF_KEY_PREFIX: &[u8] = b"ember:channel:handoff:v1";
+const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
 const GOSSIP_AAD_DOMAIN: &[u8] = b"ember-channel-gossip-v1\0";
+const FILE_AAD_DOMAIN: &[u8] = b"ember-channel-file-v1\0";
 
 /// How many public-index shards Gather walks. Sized so each shard stays under
 /// the 300-records-per-key FIND_VALUE cap for longer.
@@ -61,6 +64,17 @@ pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
 /// Retry rendezvous lookup sooner when a neighbor still has no UDP session.
 pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
+/// How often members walk the owner-signed handoff key.
+pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
+/// Largest attachment that rides the channel mesh (not friend TCP).
+pub const CHANNEL_FILE_MAX_BYTES: usize = 256 * 1024;
+/// Unicast chunk size; stays under the unfragmented DHT payload budget.
+pub const CHANNEL_FILE_CHUNK_SIZE: usize = 1024;
+pub const CHANNEL_FILE_NAME_MAX: usize = 128;
+/// Local chat-row marker for a file offer (`EMBERFILE:{blake3}:{size}:{name}`).
+pub const CHANNEL_FILE_PREFIX: &str = "EMBERFILE:";
+/// Private rooms keep the existing join secret across ownership transfer.
+pub const HANDOFF_FLAG_KEEP_JOIN_SECRET: u8 = 0x01;
 pub const CHANNEL_MSG_VERSION: u8 = 1;
 const GOSSIP_NONCE_LEN: usize = 24;
 const GOSSIP_TAG_LEN: usize = 16;
@@ -188,6 +202,19 @@ pub fn presence_key(channel_id: &[u8; 16], join_secret: &[u8; 32], epoch: i64) -
 pub fn moderation_key(channel_id: &[u8; 16]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(MODERATION_KEY_PREFIX);
+    hasher.update(channel_id);
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// DHT key for an owner-signed successor record. `file_hash` on that record
+/// is the **old** `channel_id`, so it never shares a STORE slot with
+/// moderation (same publisher + file_hash would replace).
+pub fn handoff_key(channel_id: &[u8; 16]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(HANDOFF_KEY_PREFIX);
     hasher.update(channel_id);
     let hash = hasher.finalize();
     let mut key = [0u8; 16];
@@ -395,6 +422,11 @@ pub struct ChannelGossip {
 const CHAT_PLAIN_VERSION: u8 = 1;
 const MOD_ACTION_PLAIN_VERSION: u8 = 2;
 const SYNC_REQUEST_PLAIN_VERSION: u8 = 3;
+const FILE_OFFER_PLAIN_VERSION: u8 = 4;
+const FILE_WANT_PLAIN_VERSION: u8 = 5;
+const HANDOFF_OFFER_PLAIN_VERSION: u8 = 6;
+const HANDOFF_READY_PLAIN_VERSION: u8 = 7;
+const FILE_CHUNK_PLAIN_VERSION: u8 = 8;
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
@@ -473,6 +505,338 @@ pub fn decode_channel_sync_request(bytes: &[u8]) -> Option<([u8; 32], i64)> {
     sender.copy_from_slice(&bytes[1..33]);
     let since_ts = i64::from_le_bytes(bytes[33..41].try_into().ok()?);
     Some((sender, since_ts))
+}
+
+/// File offer: `v(1) || sender(32) || size(8) || blake3(32) || name`.
+pub fn encode_channel_file_offer(
+    sender_pubkey: &[u8; 32],
+    size: u64,
+    digest: &[u8; 32],
+    name: &str,
+) -> Vec<u8> {
+    let name = truncate_utf8_owned(name, CHANNEL_FILE_NAME_MAX);
+    let mut out = Vec::with_capacity(1 + 32 + 8 + 32 + name.len());
+    out.push(FILE_OFFER_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(digest);
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+pub fn decode_channel_file_offer(bytes: &[u8]) -> Option<([u8; 32], u64, [u8; 32], String)> {
+    if bytes.len() < 1 + 32 + 8 + 32 || bytes[0] != FILE_OFFER_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let size = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
+    if size == 0 || size > CHANNEL_FILE_MAX_BYTES as u64 {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[41..73]);
+    if bytes.len() - 73 > CHANNEL_FILE_NAME_MAX {
+        return None;
+    }
+    let name = std::str::from_utf8(&bytes[73..]).ok()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some((sender, size, digest, name))
+}
+
+pub fn encode_channel_file_want(sender_pubkey: &[u8; 32], digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 32);
+    out.push(FILE_WANT_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(digest);
+    out
+}
+
+pub fn decode_channel_file_want(bytes: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    if bytes.len() != 65 || bytes[0] != FILE_WANT_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[33..65]);
+    Some((sender, digest))
+}
+
+/// Unicast chunk: `v(1) || sender(32) || blake3(32) || offset(4) || data`.
+pub fn encode_channel_file_chunk(
+    sender_pubkey: &[u8; 32],
+    digest: &[u8; 32],
+    offset: u32,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    if data.is_empty() || data.len() > CHANNEL_FILE_CHUNK_SIZE {
+        return None;
+    }
+    let mut out = Vec::with_capacity(1 + 32 + 32 + 4 + data.len());
+    out.push(FILE_CHUNK_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(digest);
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(data);
+    Some(out)
+}
+
+pub fn decode_channel_file_chunk(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], u32, &[u8])> {
+    if bytes.len() < 1 + 32 + 32 + 4 + 1 || bytes[0] != FILE_CHUNK_PLAIN_VERSION {
+        return None;
+    }
+    let data = &bytes[69..];
+    if data.len() > CHANNEL_FILE_CHUNK_SIZE {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[33..65]);
+    let offset = u32::from_le_bytes(bytes[65..69].try_into().ok()?);
+    Some((sender, digest, offset, data))
+}
+
+/// Offer signed by the **old channel key**, not the owner's user key.
+/// Members share the content key, so an unsigned inner sender field is not
+/// proof of ownership.
+pub fn encode_channel_handoff_offer(
+    channel_id: &[u8; 16],
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    target_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 32 + 8 + 64);
+    out.push(HANDOFF_OFFER_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(target_pubkey);
+    out.extend_from_slice(&version.to_le_bytes());
+    let sig = crypto::sign(
+        signing_key,
+        &handoff_offer_preimage(channel_id, sender_pubkey, target_pubkey, version),
+    );
+    out.extend_from_slice(&sig);
+    out
+}
+
+pub fn decode_channel_handoff_offer(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    channel_pubkey: &[u8; 32],
+) -> Option<([u8; 32], [u8; 32], u64)> {
+    if bytes.len() != 137 || bytes[0] != HANDOFF_OFFER_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes[33..65]);
+    let version = u64::from_le_bytes(bytes[65..73].try_into().ok()?);
+    let sig: [u8; 64] = bytes[73..137].try_into().ok()?;
+    let vk = crypto::verifying_key_from_bytes(channel_pubkey)?;
+    if !crypto::verify(
+        &vk,
+        &handoff_offer_preimage(channel_id, &sender, &target, version),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((sender, target, version))
+}
+
+fn handoff_offer_preimage(
+    channel_id: &[u8; 16],
+    sender_pubkey: &[u8; 32],
+    target_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let mut pre = Vec::with_capacity(HANDOFF_OFFER_DOMAIN.len() + 16 + 32 + 32 + 8);
+    pre.extend_from_slice(HANDOFF_OFFER_DOMAIN);
+    pre.extend_from_slice(channel_id);
+    pre.extend_from_slice(sender_pubkey);
+    pre.extend_from_slice(target_pubkey);
+    pre.extend_from_slice(&version.to_le_bytes());
+    pre
+}
+
+pub fn encode_channel_handoff_ready(
+    sender_pubkey: &[u8; 32],
+    successor_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 32 + 8);
+    out.push(HANDOFF_READY_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(successor_pubkey);
+    out.extend_from_slice(&version.to_le_bytes());
+    out
+}
+
+pub fn decode_channel_handoff_ready(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], u64)> {
+    if bytes.len() != 73 || bytes[0] != HANDOFF_READY_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut successor = [0u8; 32];
+    successor.copy_from_slice(&bytes[33..65]);
+    let version = u64::from_le_bytes(bytes[65..73].try_into().ok()?);
+    Some((sender, successor, version))
+}
+
+/// Extra blob for a DHT handoff record: version, successor pubkey/id, flags.
+pub fn encode_handoff_extra(
+    version: u64,
+    successor_pubkey: &[u8; 32],
+    flags: u8,
+) -> Vec<u8> {
+    let successor_id = channel_id_from_pubkey(successor_pubkey);
+    let mut extra = Vec::with_capacity(8 + 32 + 16 + 1);
+    extra.extend_from_slice(&version.to_le_bytes());
+    extra.extend_from_slice(successor_pubkey);
+    extra.extend_from_slice(&successor_id);
+    extra.push(flags);
+    extra
+}
+
+pub fn decode_handoff_extra(extra: &[u8]) -> Option<(u64, [u8; 32], [u8; 16], u8)> {
+    if extra.len() != 8 + 32 + 16 + 1 {
+        return None;
+    }
+    let version = u64::from_le_bytes(extra[0..8].try_into().ok()?);
+    let mut successor_pubkey = [0u8; 32];
+    successor_pubkey.copy_from_slice(&extra[8..40]);
+    let mut successor_id = [0u8; 16];
+    successor_id.copy_from_slice(&extra[40..56]);
+    if channel_id_from_pubkey(&successor_pubkey) != successor_id {
+        return None;
+    }
+    Some((version, successor_pubkey, successor_id, extra[56]))
+}
+
+pub fn format_channel_file_message(digest: &[u8; 32], size: u64, name: &str) -> String {
+    format!(
+        "{CHANNEL_FILE_PREFIX}{}:{size}:{}",
+        hex::encode(digest),
+        truncate_utf8_owned(name, CHANNEL_FILE_NAME_MAX)
+    )
+}
+
+#[allow(dead_code)]
+pub fn parse_channel_file_message(text: &str) -> Option<([u8; 32], u64, String)> {
+    let rest = text.strip_prefix(CHANNEL_FILE_PREFIX)?;
+    let (hash_hex, rest) = rest.split_once(':')?;
+    let (size_str, name) = rest.split_once(':')?;
+    if hash_hex.len() != 64 || name.is_empty() {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    hex::decode_to_slice(hash_hex, &mut digest).ok()?;
+    let size: u64 = size_str.parse().ok()?;
+    if size == 0 || size > CHANNEL_FILE_MAX_BYTES as u64 {
+        return None;
+    }
+    Some((digest, size, name.to_string()))
+}
+
+fn truncate_utf8_owned(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Seal attachment bytes for local disk. Relays never see this; gossip
+/// chunks are sealed separately under the content key.
+pub fn seal_channel_file(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    digest: &[u8; 32],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
+    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let mut aad = Vec::with_capacity(FILE_AAD_DOMAIN.len() + 16 + 32);
+    aad.extend_from_slice(FILE_AAD_DOMAIN);
+    aad.extend_from_slice(channel_id);
+    aad.extend_from_slice(digest);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail for channel file");
+    let mut out = Vec::with_capacity(1 + GOSSIP_NONCE_LEN + encrypted.len());
+    out.push(1);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    out
+}
+
+pub fn open_channel_file(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    digest: &[u8; 32],
+    envelope: &[u8],
+) -> Option<Vec<u8>> {
+    if envelope.len() < 1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN || envelope[0] != 1 {
+        return None;
+    }
+    let mut aad = Vec::with_capacity(FILE_AAD_DOMAIN.len() + 16 + 32);
+    aad.extend_from_slice(FILE_AAD_DOMAIN);
+    aad.extend_from_slice(channel_id);
+    aad.extend_from_slice(digest);
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(&envelope[1..1 + GOSSIP_NONCE_LEN]),
+            Payload {
+                msg: &envelope[1 + GOSSIP_NONCE_LEN..],
+                aad: &aad,
+            },
+        )
+        .ok()
+}
+
+const CHANNEL_RELAY_ENVELOPE_VERSION: u8 = 1;
+/// `version(1) + channel_id(16) + target_id(16)` before the inner gossip body.
+pub const CHANNEL_RELAY_ENVELOPE_HEADER: usize = 1 + 16 + 16;
+
+/// Overlay-buddy relay envelope. The hop cannot decrypt `inner` (AEAD).
+pub fn encode_channel_relay_envelope(
+    channel_id: &[u8; 16],
+    target_id: &[u8; 16],
+    inner: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CHANNEL_RELAY_ENVELOPE_HEADER + inner.len());
+    out.push(CHANNEL_RELAY_ENVELOPE_VERSION);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(target_id);
+    out.extend_from_slice(inner);
+    out
+}
+
+pub fn decode_channel_relay_envelope(bytes: &[u8]) -> Option<([u8; 16], [u8; 16], &[u8])> {
+    if bytes.len() <= CHANNEL_RELAY_ENVELOPE_HEADER || bytes[0] != CHANNEL_RELAY_ENVELOPE_VERSION {
+        return None;
+    }
+    let mut channel_id = [0u8; 16];
+    channel_id.copy_from_slice(&bytes[1..17]);
+    let mut target_id = [0u8; 16];
+    target_id.copy_from_slice(&bytes[17..33]);
+    Some((channel_id, target_id, &bytes[33..]))
 }
 
 /// Sliding-window admit: true if `now` can be recorded without exceeding
@@ -1266,6 +1630,98 @@ mod tests {
             window,
             3
         ));
+    }
+
+    #[test]
+    fn handoff_key_differs_from_moderation_and_binds_id() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        assert_ne!(handoff_key(&a), moderation_key(&a));
+        assert_ne!(handoff_key(&a), handoff_key(&b));
+        assert_eq!(handoff_key(&a), handoff_key(&a));
+    }
+
+    #[test]
+    fn handoff_offer_requires_old_channel_key() {
+        let channel = ChannelIdentity::generate();
+        let sender = [0x11u8; 32];
+        let target = [0x22u8; 32];
+        let bytes = encode_channel_handoff_offer(
+            &channel.channel_id,
+            &channel.signing_key,
+            &sender,
+            &target,
+            9,
+        );
+        assert_eq!(
+            decode_channel_handoff_offer(&bytes, &channel.channel_id, &channel.pubkey),
+            Some((sender, target, 9))
+        );
+        let other = ChannelIdentity::generate();
+        assert!(decode_channel_handoff_offer(&bytes, &channel.channel_id, &other.pubkey).is_none());
+        assert!(decode_channel_handoff_offer(&bytes, &[0u8; 16], &channel.pubkey).is_none());
+    }
+
+    #[test]
+    fn handoff_extra_round_trip_binds_successor_id() {
+        let successor = ChannelIdentity::generate();
+        let extra = encode_handoff_extra(7, &successor.pubkey, HANDOFF_FLAG_KEEP_JOIN_SECRET);
+        let (version, pk, id, flags) = decode_handoff_extra(&extra).unwrap();
+        assert_eq!(version, 7);
+        assert_eq!(pk, successor.pubkey);
+        assert_eq!(id, successor.channel_id);
+        assert_eq!(flags, HANDOFF_FLAG_KEEP_JOIN_SECRET);
+        let mut broken = extra;
+        broken[40] ^= 0xFF;
+        assert!(decode_handoff_extra(&broken).is_none());
+    }
+
+    #[test]
+    fn file_offer_want_chunk_and_marker_round_trip() {
+        let sender = [0xAAu8; 32];
+        let digest = *blake3::hash(b"hello").as_bytes();
+        let offer = encode_channel_file_offer(&sender, 5, &digest, "note.txt");
+        let (pk, size, got, name) = decode_channel_file_offer(&offer).unwrap();
+        assert_eq!(pk, sender);
+        assert_eq!(size, 5);
+        assert_eq!(got, digest);
+        assert_eq!(name, "note.txt");
+        assert!(decode_channel_file_offer(&encode_channel_file_offer(
+            &sender,
+            CHANNEL_FILE_MAX_BYTES as u64 + 1,
+            &digest,
+            "x"
+        ))
+        .is_none());
+
+        let want = encode_channel_file_want(&sender, &digest);
+        assert_eq!(decode_channel_file_want(&want), Some((sender, digest)));
+
+        let chunk = encode_channel_file_chunk(&sender, &digest, 0, b"hello").unwrap();
+        let (pk, got, offset, data) = decode_channel_file_chunk(&chunk).unwrap();
+        assert_eq!(pk, sender);
+        assert_eq!(got, digest);
+        assert_eq!(offset, 0);
+        assert_eq!(data, b"hello");
+
+        let marker = format_channel_file_message(&digest, 5, "note.txt");
+        assert_eq!(
+            parse_channel_file_message(&marker),
+            Some((digest, 5, "note.txt".into()))
+        );
+    }
+
+    #[test]
+    fn sealed_channel_file_opens_with_matching_aad() {
+        let key = content_key(&[9u8; 32]);
+        let channel_id = [0x33u8; 16];
+        let digest = *blake3::hash(b"pic").as_bytes();
+        let sealed = seal_channel_file(&key, &channel_id, &digest, b"pic");
+        assert_eq!(
+            open_channel_file(&key, &channel_id, &digest, &sealed).as_deref(),
+            Some(b"pic".as_ref())
+        );
+        assert!(open_channel_file(&key, &[0u8; 16], &digest, &sealed).is_none());
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

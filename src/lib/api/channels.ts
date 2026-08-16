@@ -14,6 +14,8 @@ export interface ChannelInfo {
   unread: number;
   you_are_banned: boolean;
   you_are_moderator: boolean;
+  successor_id: string;
+  predecessor_id: string;
 }
 
 export interface ChannelMemberInfo {
@@ -122,4 +124,34 @@ export async function addChannelModerator(channelId: string, memberPubkey: strin
 
 export async function removeChannelModerator(channelId: string, memberPubkey: string): Promise<void> {
   return invoke('remove_channel_moderator', { channelId, memberPubkey });
+}
+
+export async function transferChannelOwnership(
+  channelId: string,
+  memberPubkey: string,
+): Promise<void> {
+  return invoke('transfer_channel_ownership', { channelId, memberPubkey });
+}
+
+export async function offerChannelFile(channelId: string, path: string): Promise<ChannelMessageInfo> {
+  return invoke('offer_channel_file', { channelId, path });
+}
+
+export async function requestChannelFile(channelId: string, digest: string): Promise<void> {
+  return invoke('request_channel_file', { channelId, digest });
+}
+
+export async function getChannelFile(
+  channelId: string,
+  digest: string,
+): Promise<{ file_name: string; contents: number[] }> {
+  return invoke('get_channel_file', { channelId, digest });
+}
+
+export async function saveChannelFile(
+  channelId: string,
+  digest: string,
+  dest: string,
+): Promise<void> {
+  return invoke('save_channel_file', { channelId, digest, dest });
 }

@@ -106,6 +106,11 @@ export async function initChannelsStore() {
         maybeToastChannelMessage(channelId, event.payload.message ?? '');
       }),
     );
+    registered.push(
+      await listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', () => {
+        refreshChannels().catch(() => {});
+      }),
+    );
     if (myEpoch !== storeEpoch) {
       for (const fn of registered) fn();
       return;

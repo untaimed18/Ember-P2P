@@ -1280,9 +1280,11 @@ mod lookup_filter_tests {
             epoch,
             &ticket_id,
             &alice.to_bytes(),
+            "friend",
+            None,
         )
         .unwrap();
-        let initiator = decrypt_relay_mailbox_envelope(
+        let (initiator, channel_id) = decrypt_relay_mailbox_envelope(
             &bob_hash,
             &bob.to_bytes(),
             &capability,
@@ -1291,6 +1293,7 @@ mod lookup_filter_tests {
         )
         .unwrap();
         assert_eq!(initiator, hashed_id(&alice_hash));
+        assert_eq!(channel_id, None);
         let mut tampered = envelope;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decrypt_relay_mailbox_envelope(
@@ -1348,10 +1351,13 @@ pub struct FriendRelayTicketOffer {
     pub initiator_token: String,
 }
 
-/// An unaccepted friend relay ticket visible only to its signed responder.
+/// An unaccepted friend or channel relay ticket visible only to its signed responder.
 pub struct PendingFriendRelayTicket {
     pub ticket_id: String,
     pub initiator_id: String,
+    /// Set when the mailbox envelope is a channel-capability offer. Friend
+    /// tickets keep this `None` and still require `friend_hashes` admission.
+    pub channel_id: Option<[u8; 16]>,
 }
 
 /// One bounded page of authenticated self-mailbox offers.
@@ -1376,6 +1382,8 @@ fn encrypt_relay_mailbox_envelope(
     epoch: i64,
     ticket_id: &str,
     secret_key: &[u8; 32],
+    purpose: &str,
+    channel_id: Option<&[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
     let key = crate::network::ember::crypto::derive_pairwise_capability(
         secret_key,
@@ -1384,14 +1392,18 @@ fn encrypt_relay_mailbox_envelope(
         epoch,
     )
     .ok_or_else(|| "could not derive responder mailbox key".to_string())?;
-    let plaintext = serde_json::to_vec(&serde_json::json!({
+    let mut body = serde_json::json!({
         "initiator_id": hashed_id(initiator_ember_hash),
         "initiator_pubkey": hex::encode(initiator_pubkey),
         "ticket_id": ticket_id,
-        "purpose": "friend",
+        "purpose": purpose,
         "epoch": epoch,
-    }))
-    .map_err(|e| format!("could not serialize relay mailbox offer: {e}"))?;
+    });
+    if let Some(channel_id) = channel_id {
+        body["channel_id"] = serde_json::Value::String(hex::encode(channel_id));
+    }
+    let plaintext = serde_json::to_vec(&body)
+        .map_err(|e| format!("could not serialize relay mailbox offer: {e}"))?;
     let responder_raw = sha256_id_raw(responder_ember_hash);
     let aad = relay_mailbox_aad(&responder_raw, capability);
     let mut nonce = [0u8; RELAY_MAILBOX_NONCE_LEN];
@@ -1421,7 +1433,7 @@ fn decrypt_relay_mailbox_envelope(
     capability: &[u8; 32],
     expected_ticket_id: &str,
     envelope: &[u8],
-) -> Result<String, String> {
+) -> Result<(String, Option<[u8; 16]>), String> {
     const HEADER: usize = 1 + 8 + 32 + RELAY_MAILBOX_NONCE_LEN;
     if envelope.len() < HEADER + 16 || envelope[0] != RELAY_MAILBOX_ENVELOPE_VERSION {
         return Err("invalid relay mailbox envelope".to_string());
@@ -1444,16 +1456,6 @@ fn decrypt_relay_mailbox_envelope(
     let responder_pubkey = signing_key_from_secret(responder_secret_key)
         .verifying_key()
         .to_bytes();
-    let expected_capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
-        responder_secret_key,
-        &sender_pubkey,
-        &responder_pubkey,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive relay mailbox capability".to_string())?;
-    if expected_capability != *capability {
-        return Err("relay mailbox capability mismatch".to_string());
-    }
     let aad = relay_mailbox_aad(&sha256_id_raw(responder_ember_hash), capability);
     let plaintext = XChaCha20Poly1305::new(ChaChaKey::from_slice(&key))
         .decrypt(
@@ -1467,15 +1469,48 @@ fn decrypt_relay_mailbox_envelope(
     let body: serde_json::Value = serde_json::from_slice(&plaintext)
         .map_err(|_| "invalid relay mailbox plaintext".to_string())?;
     let initiator_id = body["initiator_id"].as_str().unwrap_or_default();
-    if body["purpose"].as_str() != Some("friend")
-        || body["epoch"].as_i64() != Some(epoch)
+    if body["epoch"].as_i64() != Some(epoch)
         || body["ticket_id"].as_str() != Some(expected_ticket_id)
         || body["initiator_pubkey"].as_str() != Some(hex::encode(sender_pubkey).as_str())
         || !pubkey_matches_id(&sender_pubkey, initiator_id)
     {
         return Err("relay mailbox signed context mismatch".to_string());
     }
-    Ok(initiator_id.to_owned())
+    let purpose = body["purpose"].as_str().unwrap_or_default();
+    let channel_id = match purpose {
+        "friend" => {
+            let expected = crate::network::ember::crypto::derive_pairwise_presence_capability(
+                responder_secret_key,
+                &sender_pubkey,
+                &responder_pubkey,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive relay mailbox capability".to_string())?;
+            if expected != *capability {
+                return Err("relay mailbox capability mismatch".to_string());
+            }
+            None
+        }
+        "channel" => {
+            let mut channel_id = [0u8; 16];
+            hex::decode_to_slice(body["channel_id"].as_str().unwrap_or_default(), &mut channel_id)
+                .map_err(|_| "invalid channel relay mailbox id".to_string())?;
+            let expected = crate::network::ember::channel::derive_channel_presence_capability(
+                responder_secret_key,
+                &sender_pubkey,
+                &responder_pubkey,
+                &channel_id,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive channel relay mailbox capability".to_string())?;
+            if expected != *capability {
+                return Err("relay mailbox capability mismatch".to_string());
+            }
+            Some(channel_id)
+        }
+        _ => return Err("relay mailbox signed context mismatch".to_string()),
+    };
+    Ok((initiator_id.to_owned(), channel_id))
 }
 
 fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
@@ -1544,6 +1579,8 @@ pub async fn offer_friend_relay_ticket(
         epoch,
         &ticket_id,
         secret_key,
+        "friend",
+        None,
     )?;
     let nonce = random_nonce();
     let signed = build_relay_mailbox_offer_msg(
@@ -1584,6 +1621,110 @@ pub async fn offer_friend_relay_ticket(
     let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
     if returned_ticket_id != ticket_id {
         return Err("relay ticket offer acknowledgement mismatch".to_string());
+    }
+    let initiator_token = body["initiator_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    validate_ticket_response_field(&ticket_id, "ticket_id")?;
+    validate_ticket_response_field(&initiator_token, "initiator_token")?;
+    Ok(FriendRelayTicketOffer {
+        ticket_id,
+        initiator_token,
+    })
+}
+
+/// Offer a rendezvous WebSocket relay bound to a channel presence capability.
+/// Never uses the friend pairwise capability or `friend_hashes`.
+pub async fn offer_channel_relay_ticket(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    responder_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    channel_id: &[u8; 16],
+) -> Result<FriendRelayTicketOffer, String> {
+    require_https(base_url)?;
+    let initiator_id = hashed_id(initiator_ember_hash);
+    let responder_id = hashed_id(responder_ember_hash);
+    let initiator_raw = sha256_id_raw(initiator_ember_hash);
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let responder_pubkey = fetch_identity_pubkey_authenticated(
+        base_url,
+        responder_ember_hash,
+        initiator_ember_hash,
+        initiator_pubkey,
+        secret_key,
+    )
+    .await?
+    .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
+    let ts = current_timestamp();
+    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+    let capability = crate::network::ember::channel::derive_channel_presence_capability(
+        secret_key,
+        &responder_pubkey,
+        &responder_pubkey,
+        channel_id,
+        epoch,
+    )
+    .ok_or_else(|| "could not derive channel relay responder capability".to_string())?;
+    let mut ticket_raw = [0u8; 32];
+    OsRng.fill_bytes(&mut ticket_raw);
+    let ticket_id = hex::encode(ticket_raw);
+    let envelope = encrypt_relay_mailbox_envelope(
+        initiator_ember_hash,
+        initiator_pubkey,
+        responder_ember_hash,
+        &responder_pubkey,
+        &capability,
+        epoch,
+        &ticket_id,
+        secret_key,
+        "channel",
+        Some(channel_id),
+    )?;
+    let nonce = random_nonce();
+    let signed = build_relay_mailbox_offer_msg(
+        &initiator_raw,
+        &responder_raw,
+        &capability,
+        epoch,
+        &ticket_raw,
+        &envelope,
+        &nonce,
+        ts,
+    );
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "initiator_id": initiator_id,
+            "responder_id": responder_id,
+            "capability": hex::encode(capability),
+            "epoch": epoch,
+            "ticket_id": ticket_id,
+            "envelope": hex::encode(envelope),
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("channel relay ticket offer: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "channel relay ticket offer: status {}",
+            resp.status()
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("channel relay ticket offer bad body: {e}"))?;
+    let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
+    if returned_ticket_id != ticket_id {
+        return Err("channel relay ticket offer acknowledgement mismatch".to_string());
     }
     let initiator_token = body["initiator_token"]
         .as_str()
@@ -1683,23 +1824,26 @@ async fn parse_friend_relay_mailbox_response(
             Ok(envelope) => envelope,
             Err(_) => continue,
         };
-        let initiator_id = match decrypt_relay_mailbox_envelope(
+        match decrypt_relay_mailbox_envelope(
             responder_ember_hash,
             secret_key,
             &capability,
             &ticket_id,
             &envelope,
         ) {
-            Ok(id) => id,
+            Ok((id, channel_id)) => {
+                tickets.push(PendingFriendRelayTicket {
+                    ticket_id,
+                    initiator_id: id,
+                    channel_id,
+                });
+                continue;
+            }
             Err(error) => {
                 debug!("Ignoring unauthenticated relay mailbox item: {error}");
                 continue;
             }
         };
-        tickets.push(PendingFriendRelayTicket {
-            ticket_id,
-            initiator_id,
-        });
     }
     Ok(FriendRelayTicketPollPage { tickets })
 }

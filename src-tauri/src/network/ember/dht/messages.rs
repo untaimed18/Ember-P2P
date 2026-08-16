@@ -31,6 +31,9 @@ pub const MSG_STORE_BATCH: u8 = 0x0D;
 pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
 /// Channel gossip body. `0x0D` is already `STORE_BATCH`; this is the next free opcode.
 pub const MSG_CHANNEL_MSG: u8 = 0x0F;
+/// Ask a HighID overlay contact to forward a `CHANNEL_MSG` to a LowID target.
+/// Capability-bound rooms use this instead of the friend WebSocket broker.
+pub const MSG_CHANNEL_RELAY: u8 = 0x10;
 
 /// Records one `STORE_BATCH` may carry.
 ///
@@ -217,6 +220,11 @@ pub enum DhtPayload {
     /// Authenticated channel gossip. The DHT frame already binds the sender;
     /// the body is AEAD under the channel content key (see `ember::channel`).
     ChannelMsg {
+        body: Vec<u8>,
+    },
+    /// Opaque `CHANNEL_MSG` body plus channel/target ids. Relays cannot
+    /// decrypt the gossip; they only forward to a UDP session they already have.
+    ChannelRelay {
         body: Vec<u8>,
     },
     Unknown(Vec<u8>),
@@ -616,6 +624,20 @@ pub fn build_channel_msg(sender_id: EmberNodeId, request_id: u32, body: Vec<u8>)
     }
 }
 
+/// Ask `target` to be reached via this HighID hop. `body` is a relay envelope
+/// (`channel::encode_channel_relay_envelope`).
+pub fn build_channel_relay(sender_id: EmberNodeId, request_id: u32, body: Vec<u8>) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_CHANNEL_RELAY,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::ChannelRelay { body },
+        signature: [0u8; 64],
+    }
+}
+
 /// How many bytes `record` costs inside a `STORE_BATCH`: the 16-byte key, the
 /// 2-byte length prefix, the body, and the 64-byte record signature.
 pub fn batched_record_wire_len(record_len: usize) -> usize {
@@ -765,6 +787,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             buf
         }
         DhtPayload::ChannelMsg { body } => body.clone(),
+        DhtPayload::ChannelRelay { body } => body.clone(),
         DhtPayload::Unknown(data) => data.clone(),
     }
 }
@@ -1044,6 +1067,14 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 body: data.to_vec(),
             })
         }
+        MSG_CHANNEL_RELAY => {
+            if data.len() > MAX_DHT_PAYLOAD {
+                anyhow::bail!("CHANNEL_RELAY body exceeds max {MAX_DHT_PAYLOAD}");
+            }
+            Ok(DhtPayload::ChannelRelay {
+                body: data.to_vec(),
+            })
+        }
         _ => Ok(DhtPayload::Unknown(data.to_vec())),
     }
 }
@@ -1210,6 +1241,20 @@ mod tests {
         match decoded.payload {
             DhtPayload::ChannelMsg { body: got } => assert_eq!(got, body),
             other => panic!("expected ChannelMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_relay_round_trip() {
+        let (sk, id) = test_keypair();
+        let body = b"relay-envelope".to_vec();
+        let msg = build_channel_relay(id, 8, body.clone());
+        let encoded = encode_message(&msg, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        assert_eq!(decoded.msg_type, MSG_CHANNEL_RELAY);
+        match decoded.payload {
+            DhtPayload::ChannelRelay { body: got } => assert_eq!(got, body),
+            other => panic!("expected ChannelRelay, got {other:?}"),
         }
     }
 

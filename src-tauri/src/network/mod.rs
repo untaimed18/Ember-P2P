@@ -223,7 +223,30 @@ struct RendezvousRegisterResult {
 /// `friend_hashes`.
 struct ChannelNeighborLookupResult {
     peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
     endpoint: Option<(Ipv4Addr, u16)>,
+}
+
+/// Channel-scoped WebSocket relay events. Drained on the stats tick.
+enum ChannelRelayEvent {
+    Opened {
+        peer_pubkey: [u8; 32],
+        outbound_tx: mpsc::Sender<Vec<u8>>,
+    },
+    Frame {
+        peer_pubkey: [u8; 32],
+        body: Vec<u8>,
+    },
+    Closed {
+        peer_pubkey: [u8; 32],
+    },
+}
+
+struct ChannelFileAssembly {
+    name: String,
+    buf: Vec<u8>,
+    got: Vec<u8>,
+    received: usize,
 }
 
 struct FriendRelayTicketPollResult {
@@ -10076,6 +10099,15 @@ struct NetworkState {
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
+    channel_relay_outboxes: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    channel_relay_offer_at: HashMap<[u8; 32], std::time::Instant>,
+    /// In-flight FIND_VALUE of channel handoff keys (`search_id` → old id).
+    ember_channel_handoff_searches: HashMap<u32, [u8; 16]>,
+    ember_pending_channel_handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    channel_handoff_fetch_at: HashMap<[u8; 16], i64>,
+    /// Partial attachment reassembly (channel_id, blake3) → bytes.
+    channel_file_assembly: HashMap<([u8; 16], [u8; 32]), ChannelFileAssembly>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -10528,6 +10560,9 @@ async fn maybe_publish_channel_moderation(
         if !ch.is_owner {
             continue;
         }
+        if !ch.successor_id.is_empty() {
+            continue;
+        }
         let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
             continue;
         };
@@ -10574,6 +10609,129 @@ async fn maybe_publish_channel_moderation(
             drive_ember_publish(socket, state, publish_id).await;
             started += 1;
         }
+    }
+}
+
+const CHANNEL_HANDOFF_FETCH_PER_TICK: usize = 2;
+
+/// FIND_VALUE the owner-signed successor record. Separate from moderation:
+/// extra FIND_VALUE keys intersect by `file_hash`, and these records share
+/// that hash but live under different DHT keys.
+async fn maybe_refresh_channel_handoff(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if started >= CHANNEL_HANDOFF_FETCH_PER_TICK {
+            break;
+        }
+        if !ch.successor_id.is_empty() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        if state
+            .ember_channel_handoff_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let last = state
+            .channel_handoff_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::HANDOFF_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::handoff_key(&channel_id);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_handoff_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_handoff_fetch_at.insert(channel_id, now);
+        started += 1;
+    }
+}
+
+fn ingest_channel_handoff_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> Option<[u8; 16]> {
+    if db.chat_locked() {
+        return None;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return None;
+    };
+    let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
+        return None;
+    };
+    let mut best: Option<ember::dht::publish::ChannelHandoff> = None;
+    for blob in records {
+        let Some(parsed) =
+            ember::dht::publish::SignedRecord::parse_channel_handoff(blob, &channel_id)
+        else {
+            continue;
+        };
+        if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|cur| {
+            parsed.version > cur.version || parsed.timestamp > cur.timestamp
+        }) {
+            best = Some(parsed);
+        }
+    }
+    let Some(handoff) = best else {
+        return None;
+    };
+    let keep = handoff.flags & ember::channel::HANDOFF_FLAG_KEEP_JOIN_SECRET != 0;
+    let successor_pk = hex::encode(handoff.successor_pubkey);
+    let successor_id = hex::encode(handoff.successor_channel_id);
+    let seed = db
+        .load_handoff_pending_seed(&channel_id_hex, &successor_pk, handoff.version)
+        .ok()
+        .flatten();
+    if db
+        .apply_channel_handoff(
+            &channel_id_hex,
+            &successor_pk,
+            &successor_id,
+            handoff.version,
+            keep,
+            seed.as_ref(),
+        )
+        .unwrap_or(false)
+    {
+        Some(handoff.successor_channel_id)
+    } else {
+        None
     }
 }
 
@@ -10734,6 +10892,7 @@ fn spawn_channel_neighbor_lookup(
         }
         let _ = result_tx.send(ChannelNeighborLookupResult {
             peer_pubkey,
+            channel_id,
             endpoint,
         });
     });
@@ -10845,29 +11004,43 @@ async fn apply_channel_neighbor_lookup(
     socket: &UdpSocket,
     state: &mut NetworkState,
     result: ChannelNeighborLookupResult,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    relay_event_tx: &mpsc::UnboundedSender<ChannelRelayEvent>,
 ) {
     state
         .channel_neighbor_lookup_inflight
         .remove(&result.peer_pubkey);
-    let Some((ip, port)) = result.endpoint else {
-        return;
-    };
-    if state.external_ip == Some(ip) && port == advertised_udp_port(state) {
-        return;
+    if let Some((ip, port)) = result.endpoint {
+        if !(state.external_ip == Some(ip) && port == advertised_udp_port(state)) {
+            // Channel peers resolve over Ember UDP and must never enter the
+            // friend-privilege set. This path only DHT-PINGs.
+            let addr = SocketAddr::new(IpAddr::V4(ip), port);
+            let noise = state
+                .ember_channel_noise_keys
+                .get(&result.peer_pubkey)
+                .copied();
+            if let Some(noise_pub) = noise {
+                state
+                    .ember_noise_keys
+                    .insert((ip, port), (noise_pub, std::time::Instant::now()));
+            }
+            ping_ember_udp_peer(socket, state, addr, noise.as_ref()).await;
+            return;
+        }
     }
-    // Channel peers resolve over Ember UDP and must never enter the
-    // friend-privilege set. This path only DHT-PINGs.
-    let addr = SocketAddr::new(IpAddr::V4(ip), port);
-    let noise = state
-        .ember_channel_noise_keys
-        .get(&result.peer_pubkey)
-        .copied();
-    if let Some(noise_pub) = noise {
-        state
-            .ember_noise_keys
-            .insert((ip, port), (noise_pub, std::time::Instant::now()));
-    }
-    ping_ember_udp_peer(socket, state, addr, noise.as_ref()).await;
+    maybe_offer_channel_relay(
+        state,
+        settings,
+        ember_hash,
+        our_pubkey,
+        our_secret,
+        result.peer_pubkey,
+        result.channel_id,
+        relay_event_tx,
+    );
 }
 
 async fn ping_ember_udp_peer(
@@ -10890,6 +11063,186 @@ async fn ping_ember_udp_peer(
         ember::transport::OutgoingResult::Queued => {}
         ember::transport::OutgoingResult::Error(e) => {
             debug!("Ember channel neighbor: transport error pinging {addr}: {e}");
+        }
+    }
+}
+
+const CHANNEL_RELAY_OFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CHANNEL_RELAY_WS_MAGIC: &[u8; 4] = b"ECR1";
+const MAX_CHANNEL_RELAY_SESSIONS: usize = 8;
+
+fn maybe_offer_channel_relay(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    relay_event_tx: &mpsc::UnboundedSender<ChannelRelayEvent>,
+) {
+    if settings.rendezvous_url.is_empty() {
+        return;
+    }
+    if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+        return;
+    }
+    if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if state
+        .channel_relay_offer_at
+        .get(&peer_pubkey)
+        .is_some_and(|at| now.saturating_duration_since(*at) < CHANNEL_RELAY_OFFER_INTERVAL)
+    {
+        return;
+    }
+    state.channel_relay_offer_at.insert(peer_pubkey, now);
+    let rv_url = settings.rendezvous_url.clone();
+    let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
+    let event_tx = relay_event_tx.clone();
+    tokio::spawn(async move {
+        let offer = match rendezvous::offer_channel_relay_ticket(
+            &rv_url,
+            &ember_hash,
+            &peer_hash,
+            &our_pubkey,
+            &our_secret,
+            &channel_id,
+        )
+        .await
+        {
+            Ok(offer) => offer,
+            Err(e) => {
+                debug!("Ember channel relay offer failed: {e}");
+                return;
+            }
+        };
+        let deadline = tokio::time::Instant::now() + rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT;
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                debug!("Ember channel relay ticket was not accepted before timeout");
+                return;
+            }
+            tokio::time::sleep(remaining.min(delay)).await;
+            match rendezvous::friend_relay_ticket_accepted(
+                &rv_url,
+                &ember_hash,
+                &offer.ticket_id,
+                &our_secret,
+            )
+            .await
+            {
+                Ok(true) => break,
+                Ok(false) => delay = std::time::Duration::from_secs(1),
+                Err(e) => {
+                    if rendezvous::is_transient_relay_ticket_read_error(&e) {
+                        delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                    debug!("Ember channel relay ticket status failed: {e}");
+                    return;
+                }
+            }
+        }
+        match ember::relay::connect_server_relay(&rv_url, &offer.ticket_id, &offer.initiator_token)
+            .await
+        {
+            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, event_tx).await,
+            Err(e) => debug!("Ember channel relay join failed: {e}"),
+        }
+    });
+}
+
+async fn run_channel_relay_session(
+    ws: ember::relay::WsStream,
+    peer_pubkey: [u8; 32],
+    event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(ws);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(32);
+    if event_tx
+        .send(ChannelRelayEvent::Opened {
+            peer_pubkey,
+            outbound_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    if writer.write_all(CHANNEL_RELAY_WS_MAGIC).await.is_err() {
+        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+        return;
+    }
+    let mut magic = [0u8; 4];
+    if reader.read_exact(&mut magic).await.is_err() || magic != *CHANNEL_RELAY_WS_MAGIC {
+        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+        return;
+    }
+    let mut len_buf = [0u8; 4];
+    loop {
+        tokio::select! {
+            body = outbound_rx.recv() => {
+                let Some(body) = body else { break; };
+                if body.len() > ember::dht::messages::MAX_DHT_PAYLOAD {
+                    continue;
+                }
+                let len = (body.len() as u32).to_le_bytes();
+                if writer.write_all(&len).await.is_err() || writer.write_all(&body).await.is_err() {
+                    break;
+                }
+            }
+            read = reader.read_exact(&mut len_buf) => {
+                if read.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 || len > ember::dht::messages::MAX_DHT_PAYLOAD {
+                    break;
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+                if event_tx
+                    .send(ChannelRelayEvent::Frame {
+                        peer_pubkey,
+                        body,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+}
+
+async fn apply_channel_relay_event(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    event: ChannelRelayEvent,
+) {
+    match event {
+        ChannelRelayEvent::Opened {
+            peer_pubkey,
+            outbound_tx,
+        } => {
+            state.channel_relay_outboxes.insert(peer_pubkey, outbound_tx);
+        }
+        ChannelRelayEvent::Closed { peer_pubkey } => {
+            state.channel_relay_outboxes.remove(&peer_pubkey);
+        }
+        ChannelRelayEvent::Frame { peer_pubkey, body } => {
+            let from_id =
+                ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer_pubkey));
+            handle_inbound_channel_gossip(socket, state, db, app_handle, body, from_id).await;
         }
     }
 }
@@ -10944,6 +11297,7 @@ async fn fanout_channel_gossip_body(
         ember::channel::CHANNEL_NEIGHBOR_COUNT,
     );
     let mut targets = Vec::new();
+    let mut missing = Vec::new();
     for pk in &neighbors {
         let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
         if exclude == Some(node_id) {
@@ -10951,6 +11305,8 @@ async fn fanout_channel_gossip_body(
         }
         if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
             targets.push(contact);
+        } else {
+            missing.push(*pk);
         }
     }
     if targets.len() < ember::channel::CHANNEL_NEIGHBOR_COUNT {
@@ -10966,6 +11322,8 @@ async fn fanout_channel_gossip_body(
             }
             if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
                 targets.push(contact);
+            } else if !missing.contains(pk) {
+                missing.push(*pk);
             }
         }
     }
@@ -10973,6 +11331,84 @@ async fn fanout_channel_gossip_body(
         let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         send_ember_dht_frame(socket, state, &contact, &frame).await;
     }
+    for pk in &missing {
+        if let Some(tx) = state.channel_relay_outboxes.get(pk) {
+            let _ = tx.try_send(body.clone());
+        }
+    }
+    let still_missing: Vec<[u8; 32]> = missing
+        .into_iter()
+        .filter(|pk| !state.channel_relay_outboxes.contains_key(pk))
+        .collect();
+    if !still_missing.is_empty() {
+        overlay_forward_channel_gossip(socket, state, &gossip.channel_id, &body, &still_missing)
+            .await;
+    }
+}
+
+async fn overlay_forward_channel_gossip(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    channel_id: &[u8; 16],
+    body: &[u8],
+    missing: &[[u8; 32]],
+) {
+    let hops: Vec<ember::dht::EmberContact> = state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .filter(|c| {
+            !missing
+                .iter()
+                .any(|pk| ember::channel::channel_id_from_pubkey(pk) == c.node_id.0)
+        })
+        .take(3)
+        .collect();
+    for pk in missing {
+        let target = ember::channel::channel_id_from_pubkey(pk);
+        let envelope = ember::channel::encode_channel_relay_envelope(channel_id, &target, body);
+        let (_rid, frame) = state.ember_dht.build_channel_relay(envelope);
+        for hop in &hops {
+            send_ember_dht_frame(socket, state, hop, &frame).await;
+        }
+    }
+}
+
+async fn handle_inbound_channel_relay(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    body: Vec<u8>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let Some((channel_id, target_id, inner)) = ember::channel::decode_channel_relay_envelope(&body)
+    else {
+        return;
+    };
+    if !channel_gossip_inbound_ok(state, &from_id) {
+        let _ = state
+            .reputation
+            .record_event(&from_id.0, ember::reputation::ReputationEvent::ProtocolViolation);
+        return;
+    }
+    let local = state.ember_dht.local_id();
+    if target_id == local.0 {
+        handle_inbound_channel_gossip(socket, state, db, app_handle, inner.to_vec(), from_id)
+            .await;
+        return;
+    }
+    if let Some(contact) = state
+        .ember_dht
+        .routing()
+        .get_contact(&ember::dht::EmberNodeId(target_id))
+        .cloned()
+    {
+        let (_rid, frame) = state.ember_dht.build_channel_msg(inner.to_vec());
+        send_ember_dht_frame(socket, state, &contact, &frame).await;
+        return;
+    }
+    let _ = channel_id;
 }
 
 async fn handle_inbound_channel_gossip(
@@ -11009,6 +11445,100 @@ async fn handle_inbound_channel_gossip(
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         return;
     };
+    if let Some((sender_pk, size, digest, name)) =
+        ember::channel::decode_channel_file_offer(&plain)
+    {
+        apply_channel_file_offer(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &gossip,
+            from_id,
+            sender_pk,
+            size,
+            digest,
+            name,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, digest)) = ember::channel::decode_channel_file_want(&plain) {
+        apply_channel_file_want(
+            socket,
+            state,
+            db,
+            &ch,
+            &key,
+            &gossip,
+            from_id,
+            sender_pk,
+            digest,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, digest, offset, data)) =
+        ember::channel::decode_channel_file_chunk(&plain)
+    {
+        apply_channel_file_chunk(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &key,
+            &gossip,
+            from_id,
+            sender_pk,
+            digest,
+            offset,
+            data,
+        )
+        .await;
+        return;
+    }
+    let channel_pk = hex::decode(&ch.pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    if let Some((sender_pk, target_pk, version)) = channel_pk.and_then(|pk| {
+        ember::channel::decode_channel_handoff_offer(&plain, &gossip.channel_id, &pk)
+    }) {
+        apply_channel_handoff_offer(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &key,
+            &gossip,
+            from_id,
+            sender_pk,
+            target_pk,
+            version,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, successor_pk, version)) =
+        ember::channel::decode_channel_handoff_ready(&plain)
+    {
+        apply_channel_handoff_ready(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &gossip,
+            from_id,
+            sender_pk,
+            successor_pk,
+            version,
+        )
+        .await;
+        return;
+    }
     if let Some((sender_pk, since_ts)) = ember::channel::decode_channel_sync_request(&plain) {
         let sender_hex = hex::encode(sender_pk);
         if db
@@ -11110,6 +11640,372 @@ async fn handle_inbound_channel_gossip(
         }
         Err(e) => {
             debug!("Ember channel gossip: persist failed for {channel_id_hex}: {e}");
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+fn channel_file_disk_path(channel_id: &str, digest_hex: &str) -> std::path::PathBuf {
+    crate::storage::paths::resolve_data_dir()
+        .join("channel-files")
+        .join(channel_id)
+        .join(digest_hex)
+}
+
+async fn apply_channel_file_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    sender_pk: [u8; 32],
+    size: u64,
+    digest: [u8; 32],
+    name: String,
+) {
+    let sender_hex = hex::encode(sender_pk);
+    if db
+        .channel_member_is_banned(&ch.channel_id, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let name = crate::security::sanitize_filename(&name);
+    if name.is_empty() {
+        return;
+    }
+    let digest_hex = hex::encode(digest);
+    let _ = db.upsert_channel_attachment(
+        &ch.channel_id,
+        &digest_hex,
+        &name,
+        size as i64,
+        &sender_hex,
+        false,
+    );
+    let marker = ember::channel::format_channel_file_message(&digest, size, &name);
+    let msg_id_hex = hex::encode(gossip.msg_id);
+    if !db
+        .channel_message_exists(&ch.channel_id, &msg_id_hex)
+        .unwrap_or(false)
+    {
+        if let Ok(row_id) = db.insert_channel_message(
+            &ch.channel_id,
+            &sender_hex,
+            "received",
+            &marker,
+            &msg_id_hex,
+            gossip.timestamp,
+        ) {
+            let _ = app_handle.emit(
+                "ember:channel-message",
+                serde_json::json!({
+                    "id": row_id,
+                    "channel_id": ch.channel_id,
+                    "sender_pubkey": sender_hex,
+                    "direction": "received",
+                    "message": marker,
+                    "timestamp": gossip.timestamp,
+                }),
+            );
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn apply_channel_file_want(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    key: &[u8; 32],
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    sender_pk: [u8; 32],
+    digest: [u8; 32],
+) {
+    let sender_hex = hex::encode(sender_pk);
+    if db
+        .channel_member_is_banned(&ch.channel_id, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let digest_hex = hex::encode(digest);
+    if db
+        .channel_attachment_complete(&ch.channel_id, &digest_hex)
+        .unwrap_or(false)
+    {
+        if let Some(join) = channel_content_key(db, ch) {
+            let path = channel_file_disk_path(&ch.channel_id, &digest_hex);
+            if let Ok(sealed) = std::fs::read(&path) {
+                if let Some(plain) =
+                    ember::channel::open_channel_file(&join, &gossip.channel_id, &digest, &sealed)
+                {
+                    send_channel_file_chunks(socket, state, db, ch, key, &digest, &plain).await;
+                }
+            }
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn send_channel_file_chunks(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    key: &[u8; 32],
+    digest: &[u8; 32],
+    plain: &[u8],
+) {
+    let sender = state.local_ed25519_pubkey;
+    let mut offset = 0usize;
+    while offset < plain.len() {
+        if !channel_gossip_rate_ok(state) {
+            break;
+        }
+        let end = (offset + ember::channel::CHANNEL_FILE_CHUNK_SIZE).min(plain.len());
+        let Some(plain_chunk) = ember::channel::encode_channel_file_chunk(
+            &sender,
+            digest,
+            offset as u32,
+            &plain[offset..end],
+        ) else {
+            break;
+        };
+        let chunk_gossip = ember::channel::ChannelGossip::new_plaintext(
+            gossip_channel_id(ch),
+            key,
+            offset as u64 + 1,
+            &plain_chunk,
+            4,
+        );
+        let _ = remember_channel_gossip(state, chunk_gossip.msg_id);
+        fanout_channel_gossip_body(socket, state, db, chunk_gossip.encode(), None).await;
+        offset = end;
+    }
+}
+
+fn gossip_channel_id(ch: &crate::storage::database::StoredChannel) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    if let Ok(bytes) = hex::decode(&ch.channel_id) {
+        if bytes.len() == 16 {
+            id.copy_from_slice(&bytes);
+        }
+    }
+    id
+}
+
+async fn apply_channel_file_chunk(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    key: &[u8; 32],
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    sender_pk: [u8; 32],
+    digest: [u8; 32],
+    offset: u32,
+    data: &[u8],
+) {
+    let sender_hex = hex::encode(sender_pk);
+    if db
+        .channel_member_is_banned(&ch.channel_id, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let digest_hex = hex::encode(digest);
+    if db
+        .channel_attachment_complete(&ch.channel_id, &digest_hex)
+        .unwrap_or(false)
+    {
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+        return;
+    }
+    let meta = db
+        .get_channel_attachment(&ch.channel_id, &digest_hex)
+        .ok()
+        .flatten();
+    let size = meta.as_ref().map(|m| m.1 as u64).unwrap_or(0);
+    if size == 0 || size > ember::channel::CHANNEL_FILE_MAX_BYTES as u64 {
+        return;
+    }
+    let end = offset as usize + data.len();
+    if end as u64 > size {
+        return;
+    }
+    let entry = state
+        .channel_file_assembly
+        .entry((gossip.channel_id, digest))
+        .or_insert_with(|| ChannelFileAssembly {
+            name: meta.as_ref().map(|m| m.0.clone()).unwrap_or_default(),
+            buf: vec![0u8; size as usize],
+            got: vec![0u8; size as usize],
+            received: 0,
+        });
+    for (i, byte) in data.iter().enumerate() {
+        let idx = offset as usize + i;
+        if entry.got[idx] == 0 {
+            entry.got[idx] = 1;
+            entry.received = entry.received.saturating_add(1);
+        }
+        entry.buf[idx] = *byte;
+    }
+    if entry.received as u64 == size && *blake3::hash(&entry.buf).as_bytes() == digest {
+        let sealed =
+            ember::channel::seal_channel_file(key, &gossip.channel_id, &digest, &entry.buf);
+        let dir = channel_file_disk_path(&ch.channel_id, &digest_hex);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            crate::security::restrict_file_permissions(parent);
+        }
+        if crate::security::atomic_write(&dir, &sealed, true).is_ok() {
+            let _ = db.mark_channel_attachment_complete(&ch.channel_id, &digest_hex);
+            let _ = app_handle.emit(
+                "ember:channel-file",
+                serde_json::json!({
+                    "channel_id": ch.channel_id,
+                    "digest": digest_hex,
+                    "file_name": entry.name,
+                }),
+            );
+        }
+        state
+            .channel_file_assembly
+            .remove(&(gossip.channel_id, digest));
+    }
+    if state.channel_file_assembly.len() > 8 {
+        if let Some(oldest) = state.channel_file_assembly.keys().next().copied() {
+            state.channel_file_assembly.remove(&oldest);
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn apply_channel_handoff_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    key: &[u8; 32],
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    _sender_pk: [u8; 32],
+    target_pk: [u8; 32],
+    version: u64,
+) {
+    if target_pk == state.local_ed25519_pubkey {
+        let ident = match db.load_handoff_pending_row(&ch.channel_id) {
+            Ok(Some((_pk, ver, seed))) if ver == version => {
+                ember::channel::ChannelIdentity::from_seed(&seed)
+            }
+            _ => {
+                let ident = ember::channel::ChannelIdentity::generate();
+                let _ = db.store_handoff_pending_seed(
+                    &ch.channel_id,
+                    version,
+                    &hex::encode(ident.pubkey),
+                    &ident.seed(),
+                );
+                ident
+            }
+        };
+        let plain = ember::channel::encode_channel_handoff_ready(
+            &state.local_ed25519_pubkey,
+            &ident.pubkey,
+            version,
+        );
+        let reply = ember::channel::ChannelGossip::new_plaintext(
+            gossip.channel_id,
+            key,
+            version,
+            &plain,
+            ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+        );
+        let _ = remember_channel_gossip(state, reply.msg_id);
+        fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": ch.channel_id,
+                "phase": "ready",
+            }),
+        );
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn apply_channel_handoff_ready(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    sender_pk: [u8; 32],
+    successor_pk: [u8; 32],
+    version: u64,
+) {
+    if ch.is_owner {
+        if let Ok(Some((pending, pending_ver))) = db.channel_pending_handoff(&ch.channel_id) {
+            if pending.eq_ignore_ascii_case(&hex::encode(sender_pk)) && pending_ver == version {
+                if let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) {
+                    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+                    let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+                    let record = ember::dht::publish::SignedRecord::channel_handoff(
+                        version,
+                        successor_pk,
+                        gossip.channel_id,
+                        ident.pubkey,
+                        private,
+                        &ident.signing_key,
+                    );
+                    if let Some(publish_id) = state
+                        .ember_publish
+                        .start_publish(record, state.ember_dht.routing())
+                    {
+                        drive_ember_publish(socket, state, publish_id).await;
+                    }
+                    let keep = private;
+                    let successor_id = ember::channel::channel_id_from_pubkey(&successor_pk);
+                    let _ = db.apply_channel_handoff(
+                        &ch.channel_id,
+                        &hex::encode(successor_pk),
+                        &hex::encode(successor_id),
+                        version,
+                        keep,
+                        None,
+                    );
+                    let _ = app_handle.emit(
+                        "ember:channel-handoff",
+                        serde_json::json!({
+                            "channel_id": ch.channel_id,
+                            "successor_id": hex::encode(successor_id),
+                            "phase": "published",
+                        }),
+                    );
+                }
+            }
         }
     }
     if let Some(next) = gossip.decremented_ttl() {
@@ -14745,6 +15641,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
+    state.channel_relay_outboxes.clear();
+    state.channel_relay_offer_at.clear();
+    state.ember_channel_handoff_searches.clear();
+    state.ember_pending_channel_handoff.clear();
+    state.channel_handoff_fetch_at.clear();
+    state.channel_file_assembly.clear();
     state.channel_gossip_from_times.clear();
     state.channel_history_sync_at.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
@@ -15647,6 +16549,12 @@ pub async fn start_network(
         ember_channel_noise_keys: HashMap::new(),
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_relay_outboxes: HashMap::new(),
+        channel_relay_offer_at: HashMap::new(),
+        ember_channel_handoff_searches: HashMap::new(),
+        ember_pending_channel_handoff: Vec::new(),
+        channel_handoff_fetch_at: HashMap::new(),
+        channel_file_assembly: HashMap::new(),
     };
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -16423,6 +17331,8 @@ pub async fn start_network(
         mpsc::unbounded_channel::<RendezvousRegisterResult>();
     let (channel_neighbor_lookup_tx, mut channel_neighbor_lookup_rx) =
         mpsc::unbounded_channel::<ChannelNeighborLookupResult>();
+    let (channel_relay_event_tx, mut channel_relay_event_rx) =
+        mpsc::unbounded_channel::<ChannelRelayEvent>();
     let (friend_relay_ticket_poll_result_tx, mut friend_relay_ticket_poll_result_rx) =
         mpsc::unbounded_channel::<FriendRelayTicketPollResult>();
     let (friend_relay_ticket_session_done_tx, mut friend_relay_ticket_session_done_rx) =
@@ -23815,6 +24725,75 @@ pub async fn start_network(
                 // relationships. Filter offers locally, then keep at most the
                 // accepted-ticket capacity worth of join/session tasks alive.
                 for offer in offers {
+                    if let Some(channel_id) = offer.channel_id {
+                        if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+                            continue;
+                        }
+                        let members = channel_member_pubkeys(&db, &hex::encode(channel_id));
+                        let Some(peer_pubkey) = members.into_iter().find(|pk| {
+                            let hash = ember::channel::channel_id_from_pubkey(pk);
+                            rendezvous::hashed_id(&hash)
+                                .eq_ignore_ascii_case(&offer.initiator_id)
+                        }) else {
+                            tracing::debug!(
+                                "Ignoring channel relay ticket from an unknown member"
+                            );
+                            continue;
+                        };
+                        if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+                            continue;
+                        }
+                        let ticket_id = offer.ticket_id;
+                        if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
+                            continue;
+                        }
+                        let rv_url = settings.rendezvous_url.clone();
+                        let done_tx = friend_relay_ticket_session_done_tx.clone();
+                        let event_tx = channel_relay_event_tx.clone();
+                        let fc_our_ember_hash = ember_hash;
+                        tokio::spawn(async move {
+                            let responder_token = match tokio::time::timeout(
+                                rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
+                                rendezvous::accept_friend_relay_ticket(
+                                    &rv_url,
+                                    &fc_our_ember_hash,
+                                    &ticket_id,
+                                    &ed25519_secret_key,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(token)) => token,
+                                Ok(Err(e)) => {
+                                    tracing::debug!("Channel relay ticket accept failed: {e}");
+                                    let _ = done_tx.send(ticket_id);
+                                    return;
+                                }
+                                Err(_) => {
+                                    tracing::debug!("Channel relay ticket accept timed out");
+                                    let _ = done_tx.send(ticket_id);
+                                    return;
+                                }
+                            };
+                            match ember::relay::connect_server_relay(
+                                &rv_url,
+                                &ticket_id,
+                                &responder_token,
+                            )
+                            .await
+                            {
+                                Ok(ws) => {
+                                    run_channel_relay_session(ws, peer_pubkey, event_tx).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Channel relay ticket join failed: {e}");
+                                }
+                            }
+                            let _ = done_tx.send(ticket_id);
+                        });
+                        continue;
+                    }
+
                     if friend_relay_ticket_sessions_in_flight.len()
                         >= MAX_FRIEND_RELAY_TICKET_SESSIONS
                     {
@@ -31735,7 +32714,27 @@ pub async fn start_network(
                     }
                 }
                 while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
-                    apply_channel_neighbor_lookup(&udp_socket, &mut state, lookup).await;
+                    apply_channel_neighbor_lookup(
+                        &udp_socket,
+                        &mut state,
+                        lookup,
+                        &settings,
+                        ember_hash,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                        &channel_relay_event_tx,
+                    )
+                    .await;
+                }
+                while let Ok(event) = channel_relay_event_rx.try_recv() {
+                    apply_channel_relay_event(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &app_handle,
+                        event,
+                    )
+                    .await;
                 }
                 if settings.ember_native_enabled {
                     maybe_dial_channel_neighbors(
@@ -32382,6 +33381,7 @@ pub async fn start_network(
                     && state.ember_pending_keyword_results.is_empty()
                     && state.ember_pending_channel_presence.is_empty()
                     && state.ember_pending_channel_moderation.is_empty()
+                    && state.ember_pending_channel_handoff.is_empty()
                     // The batch publisher is on an entirely separate path from
                     // the maps above — `flush_ember_batch_publish` only ever
                     // writes `in_flight` — and `expire()` below is its only
@@ -32459,6 +33459,7 @@ pub async fn start_network(
                     }
                     state.ember_channel_presence_searches.remove(&search_id);
                     state.ember_channel_moderation_searches.remove(&search_id);
+                    state.ember_channel_handoff_searches.remove(&search_id);
                     // A publish-target lookup can end here rather than through
                     // `maybe_finish_ember_search`: if every send in its first
                     // batch fails, the whole shortlist goes back to Pending, so
@@ -32845,6 +33846,23 @@ pub async fn start_network(
                         }
                     }
                 }
+                if !state.ember_pending_channel_handoff.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_handoff);
+                    for (channel_id, records) in pending {
+                        if let Some(successor_id) =
+                            ingest_channel_handoff_records(&db, channel_id, &records)
+                        {
+                            let _ = app_handle.emit(
+                                "ember:channel-handoff",
+                                serde_json::json!({
+                                    "channel_id": hex::encode(channel_id),
+                                    "successor_id": hex::encode(successor_id),
+                                    "phase": "followed",
+                                }),
+                            );
+                        }
+                    }
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_search_timer' panicked: {}", describe_panic(&*__p));
@@ -32887,6 +33905,8 @@ pub async fn start_network(
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings)
                         .await;
                     maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)
+                        .await;
+                    maybe_refresh_channel_handoff(&udp_socket, &mut state, &db, &settings)
                         .await;
                 }
 
@@ -35781,6 +36801,12 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 state
                     .ember_pending_channel_moderation
                     .push((channel_id, records));
+            } else if let Some(channel_id) =
+                state.ember_channel_handoff_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_handoff
+                    .push((channel_id, records));
             }
         }
     }
@@ -38207,6 +39233,11 @@ async fn handle_ember_dht_message(
     if let Some(body) = inbound.channel_msg {
         if let Some(from_id) = inbound.sender_id {
             handle_inbound_channel_gossip(socket, state, db, app_handle, body, from_id).await;
+        }
+    }
+    if let Some(body) = inbound.channel_relay {
+        if let Some(from_id) = inbound.sender_id {
+            handle_inbound_channel_relay(socket, state, db, app_handle, body, from_id).await;
         }
     }
 }

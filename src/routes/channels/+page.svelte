@@ -20,6 +20,7 @@
     leaveChannel,
     listChannelMembers,
     removeChannelModerator,
+    transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
     type ChannelMemberInfo,
@@ -49,6 +50,8 @@
   let editingModeration = $state(false);
   let savingModeration = $state(false);
   let moderatingMember = $state<string | null>(null);
+  let transferTarget = $state<ChannelMemberInfo | null>(null);
+  let transferOpen = $state(false);
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   let selected = $derived(channelList.find((c) => c.channel_id === selectedId) ?? null);
@@ -107,10 +110,28 @@
       if (cancelled) fn();
       else unlistenModeration = fn;
     });
+    let unlistenHandoff: UnlistenFn | undefined;
+    listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', () => {
+      refreshChannels()
+        .then(() => {
+          if (selectedId) {
+            listChannelMembers(selectedId)
+              .then((mems) => {
+                members = mems;
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenHandoff = fn;
+    });
     return () => {
       cancelled = true;
       unlistenMembers?.();
       unlistenModeration?.();
+      unlistenHandoff?.();
     };
   });
 
@@ -286,6 +307,33 @@
     }
   }
 
+  function requestTransfer(member: ChannelMemberInfo) {
+    transferTarget = member;
+    transferOpen = true;
+  }
+
+  async function handleTransfer() {
+    if (!selectedId || !transferTarget) return;
+    try {
+      await transferChannelOwnership(selectedId, transferTarget.member_pubkey);
+      toastSuccess(m.channels_transfer_started());
+      await refreshChannels();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      transferTarget = null;
+    }
+  }
+
+  async function openSuccessor() {
+    const id = selected?.successor_id;
+    if (!id) return;
+    await refreshChannels().catch(() => {});
+    if ($channelsStore.some((c) => c.channel_id === id)) {
+      await selectChannel(id);
+    }
+  }
+
   function shortId(id: string): string {
     return id.slice(0, 8) + '\u2026';
   }
@@ -368,6 +416,9 @@
             >
               <span class="chan-name">{ch.name}</span>
               <span class="badge">{ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</span>
+              {#if ch.successor_id}
+                <span class="badge">{m.channels_transferred_badge()}</span>
+              {/if}
               {#if ch.unread > 0}
                 <span class="unread">{ch.unread}</span>
               {/if}
@@ -398,6 +449,12 @@
               <button class="ghost danger" onclick={() => (leaveOpen = true)}>{m.channels_leave()}</button>
             </div>
           </header>
+          {#if selected.successor_id}
+            <div class="successor-banner" role="status">
+              <span>{m.channels_successor_banner()}</span>
+              <button class="ghost" onclick={openSuccessor}>{m.channels_open_successor()}</button>
+            </div>
+          {/if}
           {#if selected.is_owner}
             <form
               class="moderation-form"
@@ -469,7 +526,7 @@
                         </button>
                       {/if}
                     {/if}
-                    {#if selected.is_owner && !mem.is_self && !mem.banned}
+                    {#if selected.is_owner && !mem.is_self && !mem.banned && !selected.successor_id}
                       {#if mem.moderator}
                         <button
                           class="ghost"
@@ -487,6 +544,13 @@
                           {m.channels_add_moderator()}
                         </button>
                       {/if}
+                      <button
+                        class="ghost"
+                        disabled={moderatingMember === mem.member_pubkey}
+                        onclick={() => requestTransfer(mem)}
+                      >
+                        {m.channels_transfer_ownership()}
+                      </button>
                     {/if}
                   </li>
                 {/each}
@@ -506,6 +570,17 @@
   confirmLabel={m.channels_leave()}
   danger
   onconfirm={handleLeave}
+/>
+
+<ConfirmDialog
+  bind:open={transferOpen}
+  title={m.channels_transfer_confirm()}
+  message={m.channels_transfer_confirm_body({
+    name: transferTarget?.nickname || shortId(transferTarget?.member_pubkey ?? ''),
+  })}
+  confirmLabel={m.channels_transfer_ownership()}
+  danger
+  onconfirm={handleTransfer}
 />
 
 <style>
@@ -618,6 +693,16 @@
   .topic { margin: 2px 0 0; font-size: 12px; color: var(--text-secondary); }
   .welcome { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); }
   .conv-actions { display: flex; gap: 8px; }
+  .successor-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
   .moderation-form {
     display: flex;
     flex-direction: column;

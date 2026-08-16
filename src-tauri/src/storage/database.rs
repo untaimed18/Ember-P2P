@@ -17,7 +17,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 30;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 31;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -60,6 +60,10 @@ pub struct StoredChannel {
     pub last_active: i64,
     pub member_count: i64,
     pub unread: i64,
+    /// Empty unless this room's owner published a successor mapping.
+    pub successor_id: String,
+    /// Empty unless we joined this room by following a handoff.
+    pub predecessor_id: String,
 }
 
 /// One member of a joined channel. `member_pubkey` is 64-char hex.
@@ -1464,6 +1468,55 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 30)?;
+            tx.commit()?;
+        }
+
+        if version < 31 {
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "successor_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "predecessor_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "pending_successor",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "pending_handoff_version",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_handoff_pending (
+                    old_channel_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    successor_pubkey TEXT NOT NULL,
+                    owner_seed TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS channel_attachments (
+                    channel_id TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    sender_pubkey TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, digest)
+                );",
+            )?;
+            set_version(&tx, 31)?;
             tx.commit()?;
         }
 
@@ -3620,7 +3673,8 @@ impl Database {
                     c.joined_at, c.last_active,
                     (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
                     (SELECT COUNT(*) FROM channel_messages msg
-                     WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received')
+                     WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
+                    c.successor_id, c.predecessor_id
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -3638,6 +3692,8 @@ impl Database {
                     last_active: row.get(8)?,
                     member_count: row.get(9)?,
                     unread: row.get(10)?,
+                    successor_id: row.get::<_, String>(11).unwrap_or_default(),
+                    predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3652,7 +3708,8 @@ impl Database {
                         c.joined_at, c.last_active,
                         (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
                         (SELECT COUNT(*) FROM channel_messages msg
-                         WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received')
+                         WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
+                        c.successor_id, c.predecessor_id
                  FROM channels c WHERE c.channel_id = ?1",
                 params![channel_id],
                 |row| {
@@ -3668,6 +3725,8 @@ impl Database {
                         last_active: row.get(8)?,
                         member_count: row.get(9)?,
                         unread: row.get(10)?,
+                        successor_id: row.get::<_, String>(11).unwrap_or_default(),
+                        predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
                     })
                 },
             )
@@ -3784,6 +3843,317 @@ impl Database {
             )?)),
             None => Ok(None),
         }
+    }
+
+    pub fn set_channel_pending_handoff(
+        &self,
+        channel_id: &str,
+        successor_member: &str,
+        version: u64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET pending_successor = ?2, pending_handoff_version = ?3
+             WHERE channel_id = ?1",
+            params![channel_id, successor_member, version as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_pending_handoff(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<(String, u64)>> {
+        let conn = self.conn.lock();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT pending_successor, pending_handoff_version FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(pk, ver)| {
+            if pk.is_empty() || ver <= 0 {
+                None
+            } else {
+                Some((pk, ver as u64))
+            }
+        }))
+    }
+
+    pub fn store_handoff_pending_seed(
+        &self,
+        old_channel_id: &str,
+        version: u64,
+        successor_pubkey: &str,
+        owner_seed: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let enc = Self::encrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            owner_seed,
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO channel_handoff_pending (old_channel_id, version, successor_pubkey, owner_seed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(old_channel_id) DO UPDATE SET
+                version = excluded.version,
+                successor_pubkey = excluded.successor_pubkey,
+                owner_seed = excluded.owner_seed,
+                created_at = excluded.created_at",
+            params![old_channel_id, version as i64, successor_pubkey, enc, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_handoff_pending_row(
+        &self,
+        old_channel_id: &str,
+    ) -> anyhow::Result<Option<(String, u64, [u8; 32])>> {
+        let stored: Option<(String, i64, String)> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT successor_pubkey, version, owner_seed FROM channel_handoff_pending
+                 WHERE old_channel_id = ?1",
+                params![old_channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+        };
+        let Some((pk, ver, enc)) = stored else {
+            return Ok(None);
+        };
+        let seed = Self::decrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            &enc,
+        )?;
+        Ok(Some((pk, ver as u64, seed)))
+    }
+
+    pub fn load_handoff_pending_seed(
+        &self,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        version: u64,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let Some((pk, ver, seed)) = self.load_handoff_pending_row(old_channel_id)? else {
+            return Ok(None);
+        };
+        if pk != successor_pubkey || ver != version {
+            return Ok(None);
+        }
+        Ok(Some(seed))
+    }
+
+    pub fn clear_handoff_pending(&self, old_channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![old_channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Follow an owner-signed handoff: create the successor room, copy local
+    /// history, and mark the old id as superseded. Never copies `owner_seed`
+    /// from the old row.
+    pub fn apply_channel_handoff(
+        &self,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        successor_channel_id: &str,
+        _version: u64,
+        keep_join_secret: bool,
+        successor_owner_seed: Option<&[u8; 32]>,
+    ) -> anyhow::Result<bool> {
+        let old = match self.get_channel(old_channel_id)? {
+            Some(ch) => ch,
+            None => return Ok(false),
+        };
+        if !old.successor_id.is_empty() {
+            if old.successor_id != successor_channel_id {
+                return Ok(false);
+            }
+            if let Some(seed) = successor_owner_seed {
+                if self.load_channel_owner_seed(successor_channel_id)?.is_none() {
+                    let enc = Self::encrypt_channel_secret(
+                        self.require_chat_key()?,
+                        successor_channel_id,
+                        "owner",
+                        seed,
+                    )?;
+                    let conn = self.conn.lock();
+                    conn.execute(
+                        "UPDATE channels SET is_owner = 1, owner_seed = ?2 WHERE channel_id = ?1",
+                        params![successor_channel_id, enc],
+                    )?;
+                }
+            }
+            let _ = self.clear_handoff_pending(old_channel_id);
+            return Ok(true);
+        }
+        if self.get_channel(successor_channel_id)?.is_some() {
+            // The owner may have created the successor row first (without the
+            // new seed). The named successor later installs the seed here —
+            // never by copying the old `owner_seed`.
+            if let Some(seed) = successor_owner_seed {
+                let enc = Self::encrypt_channel_secret(
+                    self.require_chat_key()?,
+                    successor_channel_id,
+                    "owner",
+                    seed,
+                )?;
+                let conn = self.conn.lock();
+                conn.execute(
+                    "UPDATE channels SET is_owner = 1, owner_seed = ?2 WHERE channel_id = ?1",
+                    params![successor_channel_id, enc],
+                )?;
+                conn.execute(
+                    "UPDATE channels SET successor_id = ?2, is_owner = 0, owner_seed = NULL,
+                         pending_successor = '', pending_handoff_version = 0
+                     WHERE channel_id = ?1",
+                    params![old_channel_id, successor_channel_id],
+                )?;
+            } else {
+                let conn = self.conn.lock();
+                conn.execute(
+                    "UPDATE channels SET successor_id = ?2, is_owner = 0, owner_seed = NULL,
+                         pending_successor = '', pending_handoff_version = 0
+                     WHERE channel_id = ?1",
+                    params![old_channel_id, successor_channel_id],
+                )?;
+            }
+            let _ = self.clear_handoff_pending(old_channel_id);
+            return Ok(true);
+        }
+        let join_secret = if keep_join_secret {
+            self.load_channel_join_secret(old_channel_id)?
+        } else {
+            let pk = hex::decode(successor_pubkey).ok().and_then(|b| <[u8; 32]>::try_from(b).ok());
+            pk.map(|p| crate::network::ember::channel::public_join_secret(&p))
+        };
+        self.insert_channel(
+            successor_channel_id,
+            successor_pubkey,
+            &old.name,
+            &old.visibility,
+            successor_owner_seed.is_some(),
+            successor_owner_seed,
+            join_secret.as_ref(),
+        )?;
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE channels SET predecessor_id = ?2, topic = ?3, welcome = ?4
+                 WHERE channel_id = ?1",
+                params![successor_channel_id, old_channel_id, old.topic, old.welcome],
+            )?;
+            conn.execute(
+                "UPDATE channels SET successor_id = ?2, is_owner = 0, owner_seed = NULL,
+                     pending_successor = '', pending_handoff_version = 0
+                 WHERE channel_id = ?1",
+                params![old_channel_id, successor_channel_id],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
+                 SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator
+                 FROM channel_members WHERE channel_id = ?1",
+                params![old_channel_id, successor_channel_id],
+            )?;
+        }
+        let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
+        for (id, sender, direction, message, timestamp, _read) in history.into_iter().rev() {
+            let msg_id = format!("handoff-{old_channel_id}-{id}");
+            let _ = self.insert_channel_message(
+                successor_channel_id,
+                &sender,
+                &direction,
+                &message,
+                &msg_id,
+                timestamp,
+            );
+        }
+        let _ = self.clear_handoff_pending(old_channel_id);
+        Ok(true)
+    }
+
+    pub fn upsert_channel_attachment(
+        &self,
+        channel_id: &str,
+        digest: &str,
+        file_name: &str,
+        file_size: i64,
+        sender_pubkey: &str,
+        complete: bool,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO channel_attachments
+                (channel_id, digest, file_name, file_size, sender_pubkey, complete, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(channel_id, digest) DO UPDATE SET
+                complete = MAX(complete, excluded.complete),
+                file_name = excluded.file_name",
+            params![
+                channel_id,
+                digest,
+                file_name,
+                file_size,
+                sender_pubkey,
+                if complete { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_attachment_complete(&self, channel_id: &str, digest: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let complete: Option<i64> = conn
+            .query_row(
+                "SELECT complete FROM channel_attachments WHERE channel_id = ?1 AND digest = ?2",
+                params![channel_id, digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(complete.unwrap_or(0) != 0)
+    }
+
+    pub fn mark_channel_attachment_complete(
+        &self,
+        channel_id: &str,
+        digest: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channel_attachments SET complete = 1 WHERE channel_id = ?1 AND digest = ?2",
+            params![channel_id, digest],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_channel_attachment(
+        &self,
+        channel_id: &str,
+        digest: &str,
+    ) -> anyhow::Result<Option<(String, i64, String, bool)>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT file_name, file_size, sender_pubkey, complete
+                 FROM channel_attachments WHERE channel_id = ?1 AND digest = ?2",
+                params![channel_id, digest],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn upsert_channel_member(
@@ -4035,7 +4405,7 @@ impl Database {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT channel_id FROM channels
-             WHERE presence_published_at <= ?1
+             WHERE presence_published_at <= ?1 AND successor_id = ''
              ORDER BY presence_published_at ASC",
         )?;
         let cutoff = now.saturating_sub(interval_secs);
@@ -5356,6 +5726,65 @@ mod tests {
 
         assert!(db.delete_channel(&channel_id).unwrap());
         assert!(db.list_channels().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channel_handoff_installs_successor_seed_without_copying_old() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-handoff-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let old = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let old_id = hex::encode(old.channel_id);
+        let new_id = hex::encode(successor.channel_id);
+        let old_pk = hex::encode(old.pubkey);
+        let new_pk = hex::encode(successor.pubkey);
+        let old_seed = old.seed();
+        let new_seed = successor.seed();
+        let join = [0x55u8; 32];
+
+        db.insert_channel(&old_id, &old_pk, "Lobby", "private", true, Some(&old_seed), Some(&join))
+            .unwrap();
+        let keep_id = "aa".repeat(16);
+        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10)
+            .unwrap();
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &new_pk, &new_id, 1, true, None)
+            .unwrap());
+        let old_row = db.get_channel(&old_id).unwrap().unwrap();
+        assert!(!old_row.is_owner);
+        assert_eq!(old_row.successor_id, new_id);
+        assert!(db.load_channel_owner_seed(&old_id).unwrap().is_none());
+        assert!(db.load_channel_owner_seed(&new_id).unwrap().is_none());
+        assert_eq!(db.load_channel_join_secret(&new_id).unwrap(), Some(join));
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &new_pk, &new_id, 1, true, Some(&new_seed))
+            .unwrap());
+        assert_eq!(db.load_channel_owner_seed(&new_id).unwrap(), Some(new_seed));
+        assert_ne!(db.load_channel_owner_seed(&new_id).unwrap(), Some(old_seed));
+        let new_row = db.get_channel(&new_id).unwrap().unwrap();
+        assert!(new_row.is_owner);
+        assert_eq!(new_row.predecessor_id, old_id);
+        let history = db.get_channel_messages(&new_id, 50, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].3, "keep me");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

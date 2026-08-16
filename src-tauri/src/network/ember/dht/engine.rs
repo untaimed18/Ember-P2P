@@ -126,6 +126,8 @@ pub struct DhtInbound {
     /// frame is already bound to `sender_id`; the body is AEAD under the
     /// channel content key and is handled by the network task.
     pub channel_msg: Option<Vec<u8>>,
+    /// Overlay relay envelope (`MSG_CHANNEL_RELAY`).
+    pub channel_relay: Option<Vec<u8>>,
 }
 
 /// What happened to one record offered to the local store.
@@ -508,6 +510,14 @@ impl EmberDht {
     pub fn build_channel_msg(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_channel_msg(self.local_id, request_id, body);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
+    }
+
+    /// Build a signed `CHANNEL_RELAY` frame for a HighID overlay hop.
+    pub fn build_channel_relay(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_channel_relay(self.local_id, request_id, body);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
     }
@@ -1137,6 +1147,9 @@ impl EmberDht {
             }
             DhtPayload::ChannelMsg { body } => {
                 out.channel_msg = Some(body);
+            }
+            DhtPayload::ChannelRelay { body } => {
+                out.channel_relay = Some(body);
             }
             other => {
                 // Unknown arrive here once peers speak them. We've already
