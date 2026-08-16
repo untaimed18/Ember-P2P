@@ -5561,7 +5561,7 @@ impl UploadHandler {
         let mut mesh_discovered_emitted = secure_v2_authenticated;
         if hello_caps.is_ember && secure_v2_authenticated {
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
-                if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
+                if hello_caps.tcp_port > 0 && !crate::security::is_bogus_v4(v4) {
                     let _ = self
                         .upload_event_tx
                         .send(UploadEvent {
@@ -9670,7 +9670,7 @@ impl UploadHandler {
                                     if hello_caps.is_ember && !mesh_discovered_emitted {
                                         if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                                             if hello_caps.tcp_port > 0
-                                                && !crate::security::is_special_use_v4(v4)
+                                                && !crate::security::is_bogus_v4(v4)
                                             {
                                                 let _ = self
                                                     .upload_event_tx
@@ -9917,7 +9917,7 @@ impl UploadHandler {
                             if hello_caps.is_ember {
                                 if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                                     if hello_caps.tcp_port > 0
-                                        && !crate::security::is_special_use_v4(v4)
+                                        && !crate::security::is_bogus_v4(v4)
                                     {
                                         let _ = self
                                             .upload_event_tx

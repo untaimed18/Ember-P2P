@@ -140,6 +140,9 @@ struct ShortlistEntry {
     contact: EmberContact,
     distance: EmberNodeId,
     state: NodeState,
+    /// Live eD2K-session peers. Kept past the k-cap and queried first so a
+    /// connected publisher is asked even when it is not XOR-closest to the key.
+    pinned: bool,
 }
 
 /// Type of iterative search.
@@ -223,6 +226,7 @@ impl IterativeSearch {
                     contact: c,
                     distance,
                     state: NodeState::Pending,
+                    pinned: false,
                 }
             })
             .collect();
@@ -263,21 +267,67 @@ impl IterativeSearch {
         }
 
         let mut batch = Vec::new();
-        for entry in &mut self.shortlist {
+        for prefer_pinned in [true, false] {
+            for entry in &mut self.shortlist {
+                if batch.len() >= can_send {
+                    break;
+                }
+                if entry.pinned != prefer_pinned {
+                    continue;
+                }
+                if entry.state == NodeState::Pending
+                    && !self.queried.contains(&entry.contact.node_id)
+                {
+                    entry.state = NodeState::InFlight;
+                    self.queried.insert(entry.contact.node_id);
+                    *self.attempts.entry(entry.contact.node_id).or_insert(0) += 1;
+                    let req_id = self.next_request_id;
+                    self.next_request_id = self.next_request_id.wrapping_add(1);
+                    self.pending_requests.insert(req_id, entry.contact.node_id);
+                    batch.push((entry.contact.clone(), req_id));
+                }
+            }
             if batch.len() >= can_send {
                 break;
             }
-            if entry.state == NodeState::Pending && !self.queried.contains(&entry.contact.node_id) {
-                entry.state = NodeState::InFlight;
-                self.queried.insert(entry.contact.node_id);
-                *self.attempts.entry(entry.contact.node_id).or_insert(0) += 1;
-                let req_id = self.next_request_id;
-                self.next_request_id = self.next_request_id.wrapping_add(1);
-                self.pending_requests.insert(req_id, entry.contact.node_id);
-                batch.push((entry.contact.clone(), req_id));
-            }
         }
         batch
+    }
+
+    /// Keep firsthand session peers on the shortlist even when they are not
+    /// among the k XOR-closest routing-table contacts.
+    ///
+    /// Keyword records on a LAN or island publisher never reach the public
+    /// walk unless that peer is asked directly.
+    pub fn seed_extra_contacts(&mut self, contacts: Vec<EmberContact>) -> usize {
+        let mut added = 0;
+        for contact in contacts {
+            if contact.node_id == self.target {
+                continue;
+            }
+            if let Some(existing) = self
+                .shortlist
+                .iter_mut()
+                .find(|e| e.contact.node_id == contact.node_id)
+            {
+                existing.pinned = true;
+                continue;
+            }
+            if self.queried.contains(&contact.node_id) {
+                continue;
+            }
+            let distance = self.target.distance(&contact.node_id);
+            self.shortlist.push(ShortlistEntry {
+                contact,
+                distance,
+                state: NodeState::Pending,
+                pinned: true,
+            });
+            added += 1;
+        }
+        self.shortlist
+            .sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
+        added
     }
 
     /// Process a FOUND_NODE / FOUND_VALUE response from a peer.
@@ -410,6 +460,7 @@ impl IterativeSearch {
                 contact,
                 distance,
                 state: NodeState::Pending,
+                pinned: false,
             });
         }
 
@@ -426,7 +477,7 @@ impl IterativeSearch {
             let mut kept = 0usize;
             self.shortlist.retain(|e| {
                 kept += 1;
-                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight
+                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight || e.pinned
             });
         }
 
@@ -649,6 +700,18 @@ impl SearchManager {
         );
         self.searches.insert(id, search);
         Some(id)
+    }
+
+    /// Pin firsthand session peers onto a search that has just started.
+    pub fn seed_extra_contacts(
+        &mut self,
+        search_id: u32,
+        contacts: Vec<EmberContact>,
+    ) -> usize {
+        self.searches
+            .get_mut(&search_id)
+            .map(|s| s.seed_extra_contacts(contacts))
+            .unwrap_or(0)
     }
 
     /// Fold records we already hold locally into a fresh `FIND_VALUE`.
@@ -1494,6 +1557,42 @@ mod tests {
             search.results.len(),
             2,
             "both distinct records kept, the wrong-key one dropped"
+        );
+    }
+
+    #[test]
+    fn seed_extra_contacts_are_queried_first_and_survive_the_k_trim() {
+        let local = make_id(0);
+        let target = make_id(0);
+        let rt = table_with_contacts(local, K_BUCKET_SIZE as u8);
+        let mut extra = make_contact(0xFE);
+        extra.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4672);
+
+        let mut sm = SearchManager::new();
+        let sid = sm
+            .start_find_value(target, vec![], &rt)
+            .expect("search slot");
+        assert_eq!(sm.seed_extra_contacts(sid, vec![extra.clone()]), 1);
+
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+        assert_eq!(
+            batch[0].0.node_id, extra.node_id,
+            "a connected session peer is asked before XOR-closest public nodes"
+        );
+
+        let responder = batch
+            .iter()
+            .find(|(c, _)| c.node_id != extra.node_id)
+            .expect("the first batch still includes a routing-table contact");
+        let closer: Vec<EmberContact> = (2..=(K_BUCKET_SIZE as u8 + 1)).map(make_contact).collect();
+        search.process_response(responder.1, &responder.0.node_id, closer, vec![]);
+        assert!(
+            search
+                .shortlist
+                .iter()
+                .any(|e| e.contact.node_id == extra.node_id && e.pinned),
+            "a pinned session peer must not be trimmed off by closer gossip"
         );
     }
 }
