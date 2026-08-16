@@ -159,6 +159,13 @@ export async function resetSpamFilter(): Promise<string> {
   return invoke('reset_spam_filter');
 }
 
+export async function rescoreSearchResults(
+  results: SearchResult[],
+  searchKeywords: string[],
+): Promise<SearchResult[]> {
+  return invoke('rescore_search_results', { results, searchKeywords });
+}
+
 export async function getDownloadHistoryStats(): Promise<DownloadHistoryStats> {
   return invoke('get_download_history_stats');
 }

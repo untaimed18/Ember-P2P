@@ -120,6 +120,8 @@ pub struct AppState {
     pub cached_shared_files: Arc<RwLock<Vec<FileInfo>>>,
     /// Search spam filter for scoring and marking spam results.
     pub spam_filter: Arc<RwLock<SpamFilter>>,
+    /// Peer/KAD file comments used for community "fake" votes during search enrich.
+    pub comment_manager: Arc<RwLock<crate::network::ed2k::comments::CommentManager>>,
     /// Live shared-folder list shared with the upload server so runtime
     /// add/remove folder changes are immediately reflected in the security check.
     pub upload_shared_folders: SharedFolderList,

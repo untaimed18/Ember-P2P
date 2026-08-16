@@ -198,7 +198,8 @@ pub async fn enrich_results_with_batch(
     let cleanup_strings = parse_cleanup_strings(&config.settings.filename_cleanups);
     drop(config);
 
-    let community = HashMap::new();
+    let cm = state.comment_manager.read().await;
+    let community = community_ratings_for(&*cm, results, spam_enabled, spam_profile);
     apply_search_enrichment_with_batch(
         results,
         &spam,
@@ -210,6 +211,37 @@ pub async fn enrich_results_with_batch(
         &community,
         use_batch_context,
     );
+}
+
+/// Community "fake" vote stats for a result batch. Shared by the streaming
+/// enrich path and the invoke return path so oneshot-only hashes are not
+/// scored without KAD/peer fake ratings.
+pub(crate) fn community_ratings_for(
+    cm: &crate::network::ed2k::comments::CommentManager,
+    results: &[SearchResult],
+    spam_enabled: bool,
+    spam_profile: SpamFilterProfile,
+) -> HashMap<String, CommunityRating> {
+    if !spam_enabled || spam_profile == SpamFilterProfile::Relaxed {
+        return HashMap::new();
+    }
+    results
+        .iter()
+        .filter_map(|r| {
+            let (fake, total) = cm.fake_rating_stats(&r.file.hash);
+            if total > 0 {
+                Some((
+                    r.file.hash.clone(),
+                    CommunityRating {
+                        fake_votes: fake,
+                        total_votes: total,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1101,6 +1133,56 @@ pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<Stri
         }
     }
     Ok("Spam filter learning data cleared.".to_string())
+}
+
+/// Re-score an existing search-result list under the current spam profile
+/// and community votes. Used when the user changes spam settings so rows
+/// already on screen pick up the new classification without a new search.
+#[tauri::command]
+pub async fn rescore_search_results(
+    state: tauri::State<'_, AppState>,
+    mut results: Vec<SearchResult>,
+    search_keywords: Vec<String>,
+) -> Result<Vec<SearchResult>, String> {
+    const MAX_RESCORE: usize = 15_000;
+    if results.len() > MAX_RESCORE {
+        return Err(coded_ctx(
+            "search_rescore_too_many",
+            format!("Too many results to rescore (max {MAX_RESCORE})"),
+            MAX_RESCORE,
+        ));
+    }
+    if search_keywords.len() > MAX_MARK_SPAM_KEYWORDS {
+        return Err(coded_ctx(
+            "search_spam_too_many_keywords",
+            format!("Too many search_keywords (max {MAX_MARK_SPAM_KEYWORDS})"),
+            MAX_MARK_SPAM_KEYWORDS,
+        ));
+    }
+    if search_keywords
+        .iter()
+        .any(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN)
+    {
+        return Err(coded_ctx(
+            "search_spam_keyword_too_long",
+            format!("a search_keyword exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes"),
+            MAX_MARK_SPAM_KEYWORD_LEN,
+        ));
+    }
+    let spam_enabled = {
+        let config = state.config.read().await;
+        config.settings.spam_filter_enabled
+    };
+    // No batch-local heuristics: this is a re-pass over already-shown rows,
+    // and same-name/many-hashes context can flip a clean streamed row to spam.
+    enrich_results_with_batch(&mut results, &state, &search_keywords, None, false).await;
+    if !spam_enabled {
+        for result in &mut results {
+            result.spam_rating = 0;
+            result.is_spam = false;
+        }
+    }
+    Ok(results)
 }
 
 /// Look up download history for a batch of file hashes.

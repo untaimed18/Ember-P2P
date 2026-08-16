@@ -89,12 +89,16 @@
     const list = searchResultsList;
     const tabId = $activeSearchTabId;
     const elapsed = Date.now() - resultsSyncedAt;
-    // Two things bypass the throttle. A tab switch, because the throttle
-    // exists to smooth one tab's stream and not to delay showing a different
-    // one. And the list getting shorter, which streaming never does — that is
-    // Clear Results, a tab closing, or the store shedding results at its cap,
-    // and the first two are direct user actions that must feel immediate.
-    if (tabId !== syncedTabId || list.length < syncedLength || elapsed >= RESULTS_SYNC_MIN_INTERVAL_MS) {
+    // Bypass the throttle on: tab switch; a shorter list (Clear / close / cap
+    // eviction); the 400ms interval; and the first 0→N fill. Empty states read
+    // this snapshot, so delaying the first hits until after search-complete
+    // flashes "No results" on a fast Ember complete.
+    if (
+      tabId !== syncedTabId ||
+      list.length < syncedLength ||
+      elapsed >= RESULTS_SYNC_MIN_INTERVAL_MS ||
+      (syncedLength === 0 && list.length > 0)
+    ) {
       syncVisibleResults(list, tabId);
     } else if (resultsSyncTimer === null) {
       resultsSyncTimer = setTimeout(() => {
@@ -436,6 +440,10 @@
     const net = (r.source_addresses ?? []).filter((a) => a && a !== 'local');
     return net.length === 0;
   }
+
+  function displayName(result: SearchResult): string {
+    return result.clean_name || result.file.name;
+  }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
       ?? 'balanced',
@@ -536,20 +544,22 @@
   }
 
   function getColumnText(result: SearchResult, column: FilterColumn): string {
-    const displayName = result.clean_name || result.file.name;
+    const name = displayName(result);
     switch (column) {
-      case 'name': return displayName;
+      case 'name': return name;
       case 'size': return formatSize(result.file.size);
-      case 'type': return result.file_type || result.file.extension || '';
+      case 'type': return `${resultTypeLabel(result)} ${result.file_type || result.file.extension || ''}`.trim();
       case 'sources': return String(result.availability);
-      case 'origin': return result.result_origin || '';
+      case 'origin': return `${originLabel(result.result_origin || '')} ${result.result_origin || ''}`.trim();
       case 'hash': return result.file.hash;
       case 'all':
         return [
-          displayName,
+          name,
           formatSize(result.file.size),
+          resultTypeLabel(result),
           result.file_type || result.file.extension || '',
           String(result.availability),
+          originLabel(result.result_origin || ''),
           result.result_origin || '',
           result.file.hash,
         ].join(' ');
@@ -1394,15 +1404,22 @@
         setTimeout(async () => {
           searchTimeouts.delete(requestId);
           try { await cancelSearch(requestId); } catch { /* best effort */ }
+          // Same discard protocol as Stop: rotate the id so the cancel
+          // oneshot cannot merge into this tab, keep streamed rows, and
+          // only show a timeout error when the tab is still empty.
+          searchInvokeSettled.add(requestId);
+          clearPendingSearchResults(requestId);
           patchSearchTabByRequestId(requestId, (tab) => {
             if (!tab.isSearching) return tab;
             return {
               ...tab,
+              requestId: newSearchNonce(),
               isSearching: false,
               progress: null,
-              error: m.search_timeout_error({ secs }),
+              error: tab.results.length > 0 ? null : m.search_timeout_error({ secs }),
             };
           });
+          forgetSettledRequest(requestId);
         }, secs * 1000),
       );
     };
@@ -1713,7 +1730,7 @@
         : networkAddresses.slice();
       const res = await startDownload(
         result.file.hash,
-        result.file.name,
+        displayName(result),
         result.file.size,
         peerIp,
         peerPort,
@@ -2012,7 +2029,7 @@
     }
     try {
       const link = await formatEd2kLink(
-        result.file.name,
+        displayName(result),
         result.file.size,
         result.file.hash,
         result.file.ember_file_hash,
@@ -2038,7 +2055,7 @@
     try {
       const text = await formatEd2kLinks(
         targets.map((r) => ({
-          name: r.file.name,
+          name: displayName(r),
           size: r.file.size,
           hash: r.file.hash,
           emberFileHash: r.file.ember_file_hash || undefined,
@@ -2103,10 +2120,10 @@
         const networkAddrs = (result.source_addresses ?? []).filter((a) => a && a !== 'local');
         if (!result.file.hash?.trim()) {
           failed++;
-          failures.push(`${result.file.name}: ${m.error_transfers_invalid_file_hash()}`);
+          failures.push(`${displayName(result)}: ${m.error_transfers_invalid_file_hash()}`);
           continue;
         }
-        if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
+        if (networkAddrs.length === 0 && isInLibraryOnly(result)) {
           skippedLocal++;
           continue;
         }
@@ -2127,7 +2144,7 @@
             : networkAddrs.slice();
           const res = await startDownload(
             result.file.hash,
-            result.file.name,
+            displayName(result),
             result.file.size,
             peerIp,
             peerPort,
@@ -2143,7 +2160,7 @@
         } catch (e) {
           failed++;
           const msg = translateError(e, m.search_bulk_download_failed());
-          failures.push(`${result.file.name}: ${msg}`);
+          failures.push(`${displayName(result)}: ${msg}`);
         }
       }
     }
@@ -2215,9 +2232,7 @@
     (filterMaxSize !== null ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
     (filterMinSources !== null ? 1 : 0) +
-    (filterMinComplete !== null ? 1 : 0) +
-    // Default is hide-spam on; count only when the user opted out.
-    (!hideSpam ? 1 : 0)
+    (filterMinComplete !== null ? 1 : 0)
   );
 
 </script>
@@ -2745,9 +2760,9 @@
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
-            class:in-library-row={result.result_origin?.includes('Local')}
-            class:history-completed-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'completed'}
-            class:history-cancelled-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'cancelled'}
+            class:in-library-row={isInLibraryOnly(result)}
+            class:history-completed-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'completed'}
+            class:history-cancelled-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
             ondblclick={() => { if (!blockingDl) download(result); }}
           >
@@ -2756,12 +2771,12 @@
                 type="checkbox"
                 checked={checkedKeys.has(rKey)}
                 onclick={(e) => { e.stopPropagation(); toggleCheck(rKey, idx, e.shiftKey); }}
-                aria-label={m.search_select_result({ name: result.clean_name || result.file.name })}
+                aria-label={m.search_select_result({ name: displayName(result) })}
               />
             </td>
-            <td class="col-name" title={result.clean_name || result.file.name}>
+            <td class="col-name" title={displayName(result)}>
               <div class="name-cell-wrap">
-                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{result.clean_name || result.file.name}</bdi></button>
+                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{displayName(result)}</bdi></button>
                 {#if dlTransfer}
                   <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
@@ -2853,7 +2868,7 @@
                   type="button"
                   disabled
                   title={m.search_action_already_in_library_title()}
-                  aria-label={m.search_action_already_in_library_aria({ name: result.clean_name || result.file.name })}
+                  aria-label={m.search_action_already_in_library_aria({ name: displayName(result) })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="3,8 7,12 13,4"/>
@@ -2865,7 +2880,7 @@
                   type="button"
                   disabled
                   title={m.search_action_already_downloading_title()}
-                  aria-label={m.search_action_already_downloading_aria({ name: result.clean_name || result.file.name })}
+                  aria-label={m.search_action_already_downloading_aria({ name: displayName(result) })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="8" cy="8" r="6.5"/>
@@ -2880,7 +2895,7 @@
                   onclick={(e) => { e.stopPropagation(); download(result); }}
                   disabled={downloadPending[rKey]}
                   title={m.search_action_download_title()}
-                  aria-label={m.search_action_download_aria({ name: result.clean_name || result.file.name })}
+                  aria-label={m.search_action_download_aria({ name: displayName(result) })}
                 >
                   {#if downloadPending[rKey]}
                     <span class="row-dl-spinner" aria-hidden="true"></span>
@@ -2921,8 +2936,10 @@
         {/if}
         <button
           role="menuitem"
-          disabled={!!getBlockingDownloadTransfer(contextMenu.result)}
-          title={getBlockingDownloadTransfer(contextMenu.result) ? m.search_action_already_downloading_title() : undefined}
+          disabled={isInLibraryOnly(contextMenu.result) || !!getBlockingDownloadTransfer(contextMenu.result)}
+          title={isInLibraryOnly(contextMenu.result)
+            ? m.search_action_already_in_library_title()
+            : getBlockingDownloadTransfer(contextMenu.result) ? m.search_action_already_downloading_title() : undefined}
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
@@ -2956,7 +2973,7 @@
           </button>
         </div>
         <div class="panel-body">
-          <div class="detail-row"><strong>{m.search_detail_name()}</strong> <bdi dir="auto">{selectedResult.file.name}</bdi></div>
+          <div class="detail-row"><strong>{m.search_detail_name()}</strong> <bdi dir="auto">{displayName(selectedResult)}</bdi></div>
           <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
           <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
           <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>

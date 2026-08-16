@@ -7733,6 +7733,69 @@ mod tests {
         assert!(results[0].media.is_none());
     }
 
+    #[test]
+    fn kad_complete_sources_takes_max_across_publishers() {
+        use crate::network::kad::types::{TAG_COMPLETE_SOURCES, TAG_FILESIZE, TAG_SOURCES};
+        let file_id = KadId([0x66; 16]);
+        let entry = |complete: u32, sources: u32| SearchResultEntry {
+            id: file_id,
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String("movie.mkv".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(1_000),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCES),
+                    value: TagValue::Uint32(sources),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_COMPLETE_SOURCES),
+                    value: TagValue::Uint32(complete),
+                },
+            ],
+        };
+        let results = convert_search_results(&[entry(50, 10), entry(80, 10)], |_| true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.complete_sources, 80, "swarm estimates must not sum");
+        assert_eq!(results[0].availability, 20, "TAG_SOURCES still sums");
+    }
+
+    #[test]
+    fn kad_search_omits_port_zero_source_addresses() {
+        use crate::network::kad::types::{TAG_FILESIZE, TAG_SOURCEIP, TAG_SOURCEPORT};
+        let entries = vec![SearchResultEntry {
+            id: KadId([0x77; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String("a.bin".to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(1),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEIP),
+                    value: TagValue::Uint32(u32::from_be_bytes([8, 8, 8, 8])),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEPORT),
+                    value: TagValue::Uint16(0),
+                },
+            ],
+        }];
+        let results = convert_search_results(&entries, |_| true);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].source_addresses.is_empty(),
+            "port 0 is not a connectable search source"
+        );
+    }
+
     /// `extract_kad_sources` must read the `"ember"` capability tag we
     /// emit in `kad/publish.rs::build_source_publish` and surface it as
     /// `is_ember_capable`. This is the linchpin of the broker dispatch
@@ -13767,29 +13830,10 @@ async fn enrich_and_emit_search_results(
     // result hash so the lookup in `apply_search_enrichment` uses the exact
     // same string with no normalization mismatch. Skipped when the filter is
     // off and for the `relaxed` profile, which is intentionally local-only.
-    let community: std::collections::HashMap<String, crate::search::spam::CommunityRating> =
-        if spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed {
-            let cm = comment_manager.read().await;
-            results
-                .iter()
-                .filter_map(|r| {
-                    let (fake, total) = cm.fake_rating_stats(&r.file.hash);
-                    if total > 0 {
-                        Some((
-                            r.file.hash.clone(),
-                            crate::search::spam::CommunityRating {
-                                fake_votes: fake,
-                                total_votes: total,
-                            },
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+    let community: std::collections::HashMap<String, crate::search::spam::CommunityRating> = {
+        let cm = comment_manager.read().await;
+        crate::commands::search::community_ratings_for(&*cm, &results, spam_enabled, spam_profile)
+    };
 
     {
         let spam = spam_filter.read().await;
@@ -14061,17 +14105,27 @@ fn start_kad_search(
 }
 
 fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
-    // Drop any in-flight Ember DHT keyword lookup bookkeeping and buffered
-    // results for this request (slice 10) so a superseded/cancelled search
-    // can't later emit stale Ember hits. The underlying `ember_search`
-    // entries are harmless once unmapped: completion finds no entry and is
-    // dropped.
+    // Drop in-flight Ember DHT keyword lookups for this request so a
+    // cancelled search stops walking (not just unmapping bookkeeping while
+    // FIND_VALUE continues until the 60s expiry).
+    let ember_sids: Vec<u32> = state
+        .ember_keyword_searches
+        .iter()
+        .filter(|(_, kw)| kw.request_id == request_id)
+        .map(|(sid, _)| *sid)
+        .collect();
     state
         .ember_keyword_searches
         .retain(|_, kw| kw.request_id != request_id);
     state
         .ember_pending_keyword_results
         .retain(|b| b.request_id != request_id);
+    for sid in ember_sids {
+        state.ember_search.remove(sid);
+        state
+            .ember_dht_search_requests
+            .retain(|_, r| r.search_id != sid);
+    }
 
     // Match by `request_id` across all three IPC-facing search kinds that
     // carry one (keyword `search_files`, plus `find_sources`/`find_notes`,
@@ -15889,6 +15943,7 @@ pub async fn start_network(
     uss_rtt_queue: crate::bandwidth::UssRttQueue,
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
     spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
+    comment_manager: Arc<RwLock<CommentManager>>,
 ) -> anyhow::Result<()> {
     // Do not bind KAD/eD2K/Ember sockets or start the upload listener while a
     // recovered/reset policy database is awaiting explicit acknowledgement.
@@ -16227,8 +16282,6 @@ pub async fn start_network(
         );
         Arc::new(parking_lot::RwLock::new(initial))
     };
-
-    let comment_manager = Arc::new(RwLock::new(CommentManager::new()));
 
     // Load the persisted server list from `<data_dir>/server.met` so
     // servers discovered via OP_SERVERLIST, manually added, or merged
@@ -29310,7 +29363,9 @@ pub async fn start_network(
                                             .rsplit_once('.')
                                             .map(|(_, ext)| ext.to_string())
                                             .unwrap_or_default();
-                                        let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD {
+                                        let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD
+                                            && sr.client_port > 0
+                                        {
                                             let ip = Ipv4Addr::from(sr.client_id.to_le_bytes());
                                             if is_search_source_safe(&state, ip) {
                                                 vec![format!("{}:{}", ip, sr.client_port)]
@@ -30772,7 +30827,9 @@ pub async fn start_network(
                                         .rsplit_once('.')
                                         .map(|(_, ext)| ext.to_string())
                                         .unwrap_or_default();
-                                    let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD {
+                                    let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD
+                                        && sr.client_port > 0
+                                    {
                                         let ip = Ipv4Addr::from(sr.client_id.to_le_bytes());
                                         if is_search_source_safe(&state, ip) {
                                             vec![format!("{}:{}", ip, sr.client_port)]
@@ -42385,10 +42442,8 @@ async fn handle_command_inner(
             // Taking first used to skip both, leaving the old tab spinning and
             // leftover UDP packets tagged under the new request.
             if let Some(active) = state.active_search_request.as_ref() {
-                if active.request_id != request_id {
-                    let prior_id = active.request_id;
-                    cancel_search_request(state, app_handle, prior_id);
-                }
+                let prior_id = active.request_id;
+                cancel_search_request(state, app_handle, prior_id);
             }
             state.active_search_request = None;
 
@@ -42639,7 +42694,9 @@ async fn handle_command_inner(
             // `search-complete` through `ember_pending`. Uses the longest
             // (most selective) keyword as the DHT walk key; remaining
             // keyword hashes ride on FIND_VALUE for peer-side file_hash
-            // intersection. Filename AND remains a defense-in-depth filter.
+            // intersection on AND-only queries (OR skips extras — that
+            // intersection would drop the non-matching half). Filename
+            // filtering remains defense-in-depth via `query_expr`.
             // Deliberately not gated on having contacts. With none the search
             // completes immediately from whatever the local store holds
             // rather than being skipped, which keeps a momentarily empty
@@ -42648,7 +42705,15 @@ async fn handle_command_inner(
                 let query = active_request.keywords.join(" ");
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {
-                    let extras: Vec<[u8; 16]> = hashed.iter().skip(1).map(|(h, _)| *h).collect();
+                    // AND-only: remaining keyword hashes ride on FIND_VALUE so
+                    // peers that hold those keys can intersect file hashes.
+                    // OR must not — that intersection is AND semantics and
+                    // drops the non-matching half at any peer that stored a
+                    // secondary key. Local `query_expr.matches` still applies.
+                    let extras = ember::dht::search::extra_keyword_hashes(
+                        &hashed,
+                        !query_expr.as_ref().is_some_and(|e| e.contains_or()),
+                    );
                     if let Some(search_id) = state.ember_search.start_find_value(
                         ember::dht::EmberNodeId(*primary_hash),
                         extras.clone(),
@@ -49109,7 +49174,7 @@ fn convert_search_results(
                 file_type = inferred;
             }
 
-            let source_addr = if source_ip != 0 {
+            let source_addr = if source_ip != 0 && source_port > 0 {
                 let ip = Ipv4Addr::from(source_ip.to_be_bytes());
                 if is_source_safe(ip) {
                     format!("{}:{}", ip, source_port)
@@ -49167,10 +49232,11 @@ fn convert_search_results(
                 .min(MAX_KAD_AVAILABILITY);
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
+            // TAG_COMPLETE_SOURCES is a swarm estimate from each publisher,
+            // not a partial count. Summing 50+50 inflates Complete / ranking;
+            // take max (same as cross-origin merge.rs). TAG_SOURCES still sums.
             let cs = complete_accum.entry(p.hash.clone()).or_insert(0);
-            *cs = cs
-                .saturating_add(p.complete_sources_tag)
-                .min(MAX_KAD_AVAILABILITY);
+            *cs = (*cs).max(p.complete_sources_tag).min(MAX_KAD_AVAILABILITY);
             existing.file.complete_sources = *cs;
 
             if name_spam_penalty(&p.name) < name_spam_penalty(&existing.file.name) {
