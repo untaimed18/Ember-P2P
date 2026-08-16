@@ -393,6 +393,29 @@
     }
   }
 
+  function kadSearchTypeLabel(type: string): string {
+    switch (type) {
+      case 'Node': return m.kad_search_type_node();
+      case 'Keyword': return m.kad_search_type_keyword();
+      case 'File': return m.kad_search_type_file();
+      case 'Notes': return m.kad_search_type_notes();
+      case 'Buddy': return m.kad_search_type_buddy();
+      case 'Store File': return m.kad_search_type_store_file();
+      case 'Store Keyword': return m.kad_search_type_store_keyword();
+      case 'Store Notes': return m.kad_search_type_store_notes();
+      default: return type;
+    }
+  }
+
+  function kadSearchNameLabel(name: string): string {
+    switch (name) {
+      case 'Keyword Search': return m.kad_search_name_keyword();
+      case 'Source Search': return m.kad_search_name_source();
+      case 'Find Buddy': return m.kad_search_name_buddy();
+      default: return name;
+    }
+  }
+
   // Single-letter sigils paired with the color so type can be parsed
   // without relying on hue (WCAG "use of color" — color must not be
   // the only visual means of conveying information).
@@ -840,7 +863,7 @@
                $networkStats.buddy_status.startsWith('connected') ? m.kad_buddy_connected() :
                $networkStats.buddy_status.startsWith('connecting') ? m.kad_buddy_connecting() :
                $networkStats.buddy_status.startsWith('serving') ? m.kad_buddy_serving() :
-               $networkStats.buddy_status}
+               m.common_unknown()}
             </span>
           </div>
         </div>
@@ -892,7 +915,12 @@
         // Matches the Cancel button: dismissing mid-request would strand
         // `bootstrapPending` (cleared only in handleBootstrap's finally), so a
         // reopen would show a spinner and a disabled submit for up to 90s.
-        if (e.key === 'Escape') { if (!bootstrapPending) closeBootstrap(); return; }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!bootstrapPending) closeBootstrap();
+          return;
+        }
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bootstrapPending) {
           e.preventDefault();
           void handleBootstrap();
@@ -1080,8 +1108,8 @@
               <tr>
                 <td>{search.id}</td>
                 <td class="contact-id" title={search.target}>{search.target.length > 16 ? search.target.slice(0, 16) + '…' : search.target}</td>
-                <td>{search.type}</td>
-                <td>{search.name || '—'}</td>
+                <td>{kadSearchTypeLabel(search.type)}</td>
+                <td>{kadSearchNameLabel(search.name) || '—'}</td>
                 <td>
                   <span class="badge {search.status}">
                     {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}

@@ -336,7 +336,7 @@
         case 'kad_found': msg = count === 1 ? m.transfers_src_kad_found_one() : m.transfers_src_kad_found_other({ count }); break;
         case 'kad_indirect': msg = count === 1 ? m.transfers_src_kad_indirect_one() : m.transfers_src_kad_indirect_other({ count }); break;
         case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
-        default: msg = d.kind; break;
+        default: msg = m.transfers_src_unknown(); break;
       }
       // Source-search events arrive per server / per KAD search and interleave
       // across channels, so the status must not be clobbered by a less-useful
@@ -3219,15 +3219,16 @@
 
 <svelte:document onclick={onDocClick} onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (ctxMenu) { closeCtx(); e.preventDefault(); }
-    else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); }
-    else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); }
-    else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
+    if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (columnMenu) { closeColumnMenu(); e.preventDefault(); e.stopPropagation(); }
     else {
       const openMore = document.querySelector('.toolbar-more[open]') as HTMLDetailsElement | null;
       if (openMore) {
         openMore.open = false;
         e.preventDefault();
+        e.stopPropagation();
       }
     }
     return;
@@ -5651,7 +5652,7 @@
   /* --- Context Menu --- */
   .context-menu {
     position: fixed;
-    z-index: 1000;
+    z-index: 9999;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

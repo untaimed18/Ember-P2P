@@ -1855,7 +1855,7 @@
 
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
-    if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); return; }
+    if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); e.stopPropagation(); return; }
 
     // Ignore shortcuts while a modal is open. Must run before Escape so a
     // discard/delete confirm isn't also treated as "deselect the row".
@@ -1880,11 +1880,13 @@
       if (typing && e.target === searchInputEl && searchQuery) {
         searchQuery = '';
         e.preventDefault();
+        e.stopPropagation();
         return;
       }
       if (!typing && selectedPath) {
         if (!requestSelectPath(null)) return;
         e.preventDefault();
+        e.stopPropagation();
         return;
       }
     }
@@ -2580,6 +2582,7 @@
         type="text"
         class="filter-search"
         placeholder={m.library_search_placeholder()}
+        aria-label={m.library_search_placeholder()}
         bind:value={searchQuery}
         bind:this={searchInputEl}
       />
@@ -2589,7 +2592,7 @@
         </button>
       {/if}
     </div>
-    <select class="filter-type" bind:value={typeFilter}>
+    <select class="filter-type" bind:value={typeFilter} aria-label={m.library_type_filter_aria()}>
       {#each typeFilterOptions as opt}
         <option value={opt}>{opt === 'All' ? m.library_all_types() : (
           opt === 'Audio' ? m.library_type_audio() :
@@ -2755,10 +2758,15 @@
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" bind:this={createCollectionOverlay} role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => {
-    if (e.target === e.currentTarget) closeCreateDialog();
+  <div class="modal-overlay" bind:this={createCollectionOverlay} role="dialog" aria-modal="true" aria-labelledby="create-coll-title" aria-busy={creatingCollection} tabindex="-1" onclick={(e) => {
+    if (e.target === e.currentTarget && !creatingCollection) closeCreateDialog();
   }} onkeydown={(e) => {
-    if (e.key === 'Escape') { closeCreateDialog(); return; }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!creatingCollection) closeCreateDialog();
+      return;
+    }
     trapTabKey(e, createCollectionModal);
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       if (!!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
@@ -2769,8 +2777,8 @@
   }}>
     <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
-        <span class="modal-title">{m.library_create_collection()}</span>
-        <button class="ghost modal-close" onclick={closeCreateDialog} aria-label={m.common_close()}><IconX size={15} /></button>
+        <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
+        <button class="ghost modal-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -2823,6 +2831,7 @@
             type="text"
             class="form-input coll-search-input"
             placeholder={m.library_coll_search_placeholder()}
+            aria-label={m.library_coll_search_placeholder()}
             bind:value={collectionSearch}
           />
         </div>
@@ -2847,7 +2856,7 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button class="ghost" onclick={closeCreateDialog}>{m.common_cancel()}</button>
+        <button class="ghost" onclick={closeCreateDialog} disabled={creatingCollection}>{m.common_cancel()}</button>
         <button
           disabled={!newCollName.trim() || selectedFileHashes.size === 0 || creatingCollection}
           onclick={handleCreateCollection}

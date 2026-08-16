@@ -131,6 +131,8 @@
         return;
       }
       if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
         showRecent = false;
         activeIndex = -1;
         return;

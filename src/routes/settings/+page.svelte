@@ -2217,7 +2217,7 @@
               <span class="toggle-title">{m.settings_auto_connect_server()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
               <span class="hint">{m.settings_auto_connect_server_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_connect_server} />
+            <ToggleSwitch bind:checked={settings.auto_connect_server} ariaLabel={m.settings_auto_connect_server()} />
           </div>
 
           <!--

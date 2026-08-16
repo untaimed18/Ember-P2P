@@ -41,8 +41,34 @@ export const navItems: NavItem[] = [
 ];
 
 /**
- * How many entries get an Alt+N shortcut. Single digits only, so anything
- * past the ninth entry is reachable by click alone — worth remembering when
- * reordering, since the last item silently loses its shortcut.
+ * How many entries get an Alt+N shortcut. Alt+1..9 map to the first nine
+ * items; Alt+0 maps to the tenth (Settings, today). Anything past that is
+ * click-only — worth remembering when reordering.
  */
-export const NAV_SHORTCUT_LIMIT = 9;
+export const NAV_SHORTCUT_LIMIT = 10;
+
+/** Digit shown in "Alt+N" for the item at `index` (0-based). */
+export function navShortcutDigit(index: number): string | null {
+  if (index < 0 || index >= NAV_SHORTCUT_LIMIT) return null;
+  return index === 9 ? '0' : String(index + 1);
+}
+
+/** 0-based nav index for a pressed digit key, or null if it isn't a nav shortcut. */
+export function navIndexFromDigitKey(key: string): number | null {
+  if (key === '0') return 9;
+  if (key.length === 1 && key >= '1' && key <= '9') return Number(key) - 1;
+  return null;
+}
+
+/**
+ * Resolve a sidebar Alt+N shortcut from a keydown event. Prefer the physical
+ * top-row `Digit*` code so Option/Alt still works on Apple layouts where
+ * `e.key` becomes a symbol (º, ¡, ™, …). Numpad is ignored: Windows Alt+Numpad
+ * is character entry.
+ */
+export function navIndexFromShortcutEvent(e: KeyboardEvent): number | null {
+  if (e.code.startsWith('Digit') && e.code.length === 6) {
+    return navIndexFromDigitKey(e.code.slice(5));
+  }
+  return navIndexFromDigitKey(e.key);
+}

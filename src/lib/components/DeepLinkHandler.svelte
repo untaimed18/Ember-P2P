@@ -405,7 +405,7 @@
   .deferred-link-notice {
     position: fixed;
     left: 18px;
-    bottom: 42px;
+    bottom: calc(var(--statusbar-height) + 10px);
     z-index: 9400;
     display: flex;
     align-items: center;

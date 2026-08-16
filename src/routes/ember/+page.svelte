@@ -133,6 +133,14 @@
     return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
   }
 
+  function emberSearchTypeLabel(type: string): string {
+    switch (type) {
+      case 'Node': return m.ember_dht_search_type_node();
+      case 'Value': return m.ember_dht_search_type_value();
+      default: return type;
+    }
+  }
+
   // Drive the join-progress timer off each diagnostics snapshot (a plain
   // function, not a reactive `$effect`, so there's no write-read feedback
   // loop on `joinTimedOut`). While active with zero verified contacts we
@@ -622,7 +630,7 @@
                 {#each searches as s (s.id)}
                   <tr>
                     <td>{s.id}</td>
-                    <td>{s.type}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
+                    <td>{emberSearchTypeLabel(s.type)}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
                     <td title={s.target}><code>{shortHex(s.target)}</code></td>
                     <td>{s.results}</td>
                     <td>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
