@@ -1257,6 +1257,17 @@ fn filter_already_sent_ranges(
     offsets.into_iter().filter(|r| !sent.contains(r)).collect()
 }
 
+/// Whether this `OP_REQUESTPARTS` should reset `SLOT_IDLE_TIMEOUT`.
+///
+/// Bytes on the wire are always activity. Ranges we skipped because they
+/// were already delivered this session (aMule padding in-flight blocks so
+/// every packet names three ranges) also count: the peer is still in the
+/// session. EOF / zero-length / unservable garbage must not (eMule Plus
+/// 1.2.5 used to pin the slot forever by re-asking ranges we filter out).
+fn requestparts_resets_idle(credited_bytes: u64, skipped_already_sent: usize) -> bool {
+    credited_bytes > 0 || skipped_already_sent > 0
+}
+
 /// Unique bytes delivered this session from the per-part served tally
 /// (re-requests do not inflate past each part's size).
 fn unique_served_bytes(served: &[u64], total_size: u64) -> u64 {
@@ -7737,24 +7748,22 @@ impl UploadHandler {
                     // is what made Transferred climb to 2–3× unique coverage.
                     let after_split = offsets.len();
                     offsets = filter_already_sent_ranges(offsets, &sent_blocks);
-                    if offsets.len() != after_split {
+                    let skipped_already_sent = after_split - offsets.len();
+                    if skipped_already_sent > 0 {
                         debug!(
                             target: "ember::upload_diag",
-                            "reqparts_skip_dup {peer_addr} skipped={} kept={}",
-                            after_split - offsets.len(),
+                            "reqparts_skip_dup {peer_addr} skipped={skipped_already_sent} kept={}",
                             offsets.len(),
                         );
                     }
 
                     // Diagnostic: summarise the batch shape for this REQUESTPARTS
                     // before we touch the disk. A peer sending REQUESTPARTS with
-                    // all ranges filtered away (past EOF, zero-length, etc.) lands
-                    // here with `offsets.is_empty()` and no bytes will move — the
-                    // `last_part_request` gauge below won't be bumped, so the
-                    // session will eventually time out via SLOT_IDLE_TIMEOUT. If
-                    // the field log shows these repeatedly followed by silence,
-                    // it's diagnosis-useful to see the raw count / ranges that
-                    // arrived from the peer.
+                    // all ranges filtered away as garbage (past EOF, zero-length)
+                    // lands here with `offsets.is_empty()` and no idle bump, so
+                    // SLOT_IDLE_TIMEOUT will eventually fire. aMule padding that
+                    // we skip as already-sent still resets the gauge below even
+                    // when nothing new is served.
                     let total_bytes_requested: u64 =
                         offsets.iter().map(|&(s, e)| e.saturating_sub(s)).sum();
                     debug!(
@@ -8322,14 +8331,10 @@ impl UploadHandler {
                     }
 
                     // Diagnostic: batch-level summary. `credited_bytes == 0`
-                    // means the peer's REQUESTPARTS produced no outgoing
-                    // bytes — every range was filtered (past EOF, zero-length,
-                    // or rejected by the part tracker) and `last_part_request`
-                    // will NOT be bumped, so the outer idle gate is still
-                    // ticking. That's the shape we need to see to distinguish
-                    // "peer sent garbage REQUESTPARTS and we correctly
-                    // ignored them, timeout imminent" from "we served bytes
-                    // normally, peer got them, timeout reset".
+                    // with no already-sent skips means every range was garbage
+                    // (past EOF, zero-length, or rejected by the part tracker)
+                    // and `last_part_request` will NOT be bumped. Already-sent
+                    // padding (aMule) still resets the idle gauge below.
                     debug!(
                         target: "ember::upload_diag",
                         "reqparts_out {peer_addr} credited={batch_credited_bytes}B \
@@ -8366,17 +8371,14 @@ impl UploadHandler {
                         self.slot_rates
                             .lock()
                             .insert(peer_addr, rate_tracker.smoothed_rate());
-                        // Bump the useful-activity gauge ONLY after bytes
-                        // actually flowed. The earlier "bump on REQUESTPARTS
-                        // arrival" approach was defeated by clients that
-                        // ship REQUESTPARTS for ranges we filter out (past
-                        // EOF, zero-length, parts we won't serve, parts
-                        // already-served-this-batch deduplicated, etc.) —
-                        // those still bumped the gauge even though nothing
-                        // moved on the wire, leaving the slot pinned
-                        // forever (eMule Plus 1.2.5 was the canonical
-                        // repro). Tying the bump to `batch_credited_bytes`
-                        // means only real progress resets the timer.
+                    }
+                    // Idle gauge: bytes on the wire always count. aMule
+                    // padding (ranges we already delivered this session)
+                    // also counts so a pipeline-full re-ask does not lose
+                    // the slot. EOF / zero-length / unservable garbage
+                    // still does not — that is the eMule Plus 1.2.5
+                    // pin-forever case this timer exists to break.
+                    if requestparts_resets_idle(batch_credited_bytes, skipped_already_sent) {
                         last_part_request = std::time::Instant::now();
                     }
 
@@ -10830,6 +10832,14 @@ mod unique_served_tests {
         let sent = HashSet::new();
         let offsets = vec![(0, 100), (100, 200)];
         assert_eq!(filter_already_sent_ranges(offsets.clone(), &sent), offsets);
+    }
+
+    #[test]
+    fn padding_only_requestparts_still_reset_idle_but_garbage_does_not() {
+        assert!(requestparts_resets_idle(1, 0));
+        assert!(requestparts_resets_idle(0, 3));
+        assert!(requestparts_resets_idle(180 * 1024, 2));
+        assert!(!requestparts_resets_idle(0, 0));
     }
 }
 

@@ -67,6 +67,9 @@ export function navIndexFromDigitKey(key: string): number | null {
  * is character entry.
  */
 export function navIndexFromShortcutEvent(e: KeyboardEvent): number | null {
+  // Windows Alt+Numpad is character entry (Alt+0169 → ©). Do not treat
+  // Numpad digits as sidebar shortcuts even though `e.key` is still "1"/"0".
+  if (e.code.startsWith('Numpad')) return null;
   if (e.code.startsWith('Digit') && e.code.length === 6) {
     return navIndexFromDigitKey(e.code.slice(5));
   }
