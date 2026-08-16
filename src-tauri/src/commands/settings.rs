@@ -1,4 +1,5 @@
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tracing::{info, warn};
 
 use crate::app_state::AppState;
@@ -146,6 +147,94 @@ fn merge_renderer_settings(
             error,
         )
     })
+}
+
+/// Download roots the OS picker handed us this session.
+///
+/// Changing the download folder grants the sandbox a new root and redirects
+/// every future download and `.part` file, so — exactly as with shared folders
+/// — the path has to come from a native picker rather than from whatever string
+/// the renderer submits. Session-scoped and tiny: a user picks a download
+/// folder once, if ever.
+fn picked_download_roots() -> &'static std::sync::Mutex<Vec<Vec<String>>> {
+    static PICKED: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    PICKED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Remembered in the same normalized form the change check below compares in,
+/// so a path can never be authorized and then fail to match itself.
+fn remember_picked_download_root(path: &std::path::Path) {
+    const MAX_REMEMBERED: usize = 16;
+    let key = normalized_path_components(path);
+    let mut picked = picked_download_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if picked.contains(&key) {
+        return;
+    }
+    if picked.len() >= MAX_REMEMBERED {
+        picked.remove(0);
+    }
+    picked.push(key);
+}
+
+fn download_root_was_picked(path: &std::path::Path) -> bool {
+    let key = normalized_path_components(path);
+    picked_download_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
+/// Open a trusted native directory picker for the download folder.
+///
+/// Mirrors `pick_shared_folder`: the renderer never gets to name the path that
+/// will be authorized. The selection is returned only so the Settings form and
+/// the setup wizard can display it before the user saves.
+#[tauri::command]
+pub async fn pick_download_folder(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Option<String>, String> {
+    if window.label() != "main" {
+        return Err(coded(
+            "settings_download_folder_picker_failed",
+            "The download folder can only be chosen from the main window",
+        ));
+    }
+    let picker_app = app.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        picker_app
+            .dialog()
+            .file()
+            .set_title("Choose where downloads are saved")
+            .blocking_pick_folder()
+            .map(|folder| {
+                folder.into_path().map_err(|error| {
+                    coded_ctx(
+                        "settings_download_folder_picker_failed",
+                        "Invalid selected folder",
+                        error,
+                    )
+                })
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| {
+        coded_ctx(
+            "settings_download_folder_picker_failed",
+            "Folder picker failed",
+            error,
+        )
+    })??;
+
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    remember_picked_download_root(&path);
+    Ok(Some(path.to_string_lossy().into_owned()))
 }
 
 fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
@@ -919,6 +1008,21 @@ pub async fn update_settings(
             && normalized_path_components(std::path::Path::new(&settings.download_folder))
                 != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
         {
+            // Moving the download folder approves a new sandbox root and
+            // redirects every future download, so the path must have come from
+            // `pick_download_folder`, not from whatever the renderer submitted.
+            // `shared_folders` is protected by being backend-owned outright;
+            // this one has to stay writable because the form saves it with
+            // everything else, so it is provenance that is checked instead.
+            // Only a *change* is gated: an unchanged path re-saved by a
+            // background caller (the UPnP auto-disable handler persists through
+            // here with no user present) never reaches this branch.
+            if !download_root_was_picked(std::path::Path::new(&settings.download_folder)) {
+                return Err(coded(
+                    "settings_download_folder_not_picked",
+                    "Choose the download folder with Browse before saving",
+                ));
+            }
             explicit_additions.push(settings.download_folder.clone());
         }
         let registry = state.approved_roots.clone();

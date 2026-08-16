@@ -7567,7 +7567,14 @@ async fn download_parts_from_source(
                             // below only fires every 2s, too laggy for the badge).
                             emit_source!("transferring", None, measured_speed);
                         }
-                        src_transferred += piece_len;
+                        // Only bytes that landed count as this source's
+                        // contribution: the sources list is read as "what did
+                        // this peer actually give me", and a peer re-sending
+                        // ranges we already hold could otherwise show an
+                        // arbitrarily large figure while writing nothing.
+                        // `speed_bytes` stays on wire bytes — duplicates really
+                        // did consume bandwidth, which is what a rate means.
+                        src_transferred += newly_written;
                         blocks_received_in_current_req += 1;
                         speed_bytes += piece_len;
                         // Attribute this wire response by absolute offset for
@@ -7764,7 +7771,9 @@ async fn download_parts_from_source(
                             info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                             got_any_data = true;
                         }
-                        src_transferred += piece_len;
+                        // Contribution, not wire bytes — see the uncompressed
+                        // path above.
+                        src_transferred += newly_written;
                         blocks_received_in_current_req += 1;
                         speed_bytes += piece_len;
                         // Receive bookkeeping only; gap-byte credit was added

@@ -239,19 +239,22 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   } catch {
     // Fall through to legacy path.
   }
+  const ta = document.createElement('textarea');
   try {
-    const ta = document.createElement('textarea');
     ta.value = text;
     ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
     document.body.appendChild(ta);
     ta.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
+    return document.execCommand('copy');
   } catch {
     return false;
+  } finally {
+    // `select()` and `execCommand` can both throw after the node is attached,
+    // and the catch used to return without detaching it — one orphaned
+    // off-screen textarea per failed attempt, for as long as the window lives.
+    ta.remove();
   }
 }
 
@@ -262,18 +265,19 @@ export async function readFromClipboard(): Promise<string | null> {
   } catch {
     // Fall through to legacy path.
   }
+  const ta = document.createElement('textarea');
   try {
-    const ta = document.createElement('textarea');
     ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
     document.body.appendChild(ta);
     ta.focus();
     const ok = document.execCommand('paste');
-    const text = ta.value;
-    document.body.removeChild(ta);
-    return ok ? text : null;
+    return ok ? ta.value : null;
   } catch {
     return null;
+  } finally {
+    // See `copyToClipboard`: detach on every path, thrown or not.
+    ta.remove();
   }
 }

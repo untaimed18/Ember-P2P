@@ -5,6 +5,7 @@
     downloadNodesDat,
     downloadIpfilter,
     openEmberWebsite,
+    pickDownloadFolder as pickDownloadFolderDialog,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
@@ -1092,10 +1093,11 @@
   async function pickDownloadFolder() {
     if (!settings) return;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({ directory: true, multiple: false });
+      // Backend picker: the chosen path is authorized where it is chosen, so
+      // saving a folder the renderer named on its own is refused.
+      const selected = await pickDownloadFolderDialog();
       if (selected) {
-        settings.download_folder = selected as string;
+        settings.download_folder = selected;
       }
     } catch (e) {
       // Surface the failure in the same toast row that other settings

@@ -124,15 +124,23 @@ pub struct KnownFileList {
     path_index: HashMap<String, KnownPathEntry>,
     dirty: bool,
     dirty_generation: u64,
+    authoritative: bool,
 }
 
 impl KnownFileList {
+    /// An empty placeholder — explicitly *not* an authoritative empty catalog.
+    ///
+    /// The network task starts with one of these and absorbs the real file from
+    /// a deferred background load, so between launch and that load the list
+    /// knows nothing about what is on disk. See [`Self::save`] for why that
+    /// distinction has to survive into the writer.
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
             path_index: HashMap::new(),
             dirty: false,
             dirty_generation: 0,
+            authoritative: false,
         }
     }
 
@@ -163,6 +171,9 @@ impl KnownFileList {
                 self.path_index.insert(path_key, entry);
             }
         }
+        // Absorbing a catalog that was actually read off disk is what makes
+        // this list safe to write back.
+        self.authoritative |= other.authoritative;
     }
 
     /// Strict loader used by security-policy and share-intent startup. Missing
@@ -178,7 +189,12 @@ impl KnownFileList {
         const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(list),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // No file is a real answer: this is a first run, and the empty
+                // catalog it produces is authoritative.
+                list.authoritative = true;
+                return Ok(list);
+            }
             Err(error) => return Err(error.into()),
         };
         if meta.len() > MAX_KNOWN_MET_BYTES {
@@ -190,6 +206,7 @@ impl KnownFileList {
         let data = std::fs::read(path)?;
         list.parse_known_met(&data)?;
         list.load_path_index(&path.with_file_name("known_paths.dat"));
+        list.authoritative = true;
         Ok(list)
     }
 
@@ -208,6 +225,11 @@ impl KnownFileList {
                 list
             }
             Err(e) => {
+                // Only a preserved copy makes the fresh list safe to write
+                // back: `save` refuses to overwrite a catalog it never read,
+                // and after a failed quarantine the damaged file on disk is
+                // the only copy of those hashes left.
+                let mut quarantined = false;
                 if path.exists() {
                     let backup = path.with_extension(format!(
                         "met.{}.corrupt",
@@ -217,6 +239,7 @@ impl KnownFileList {
                         warn!("Failed to preserve corrupt known.met: {backup_error}");
                     } else {
                         crate::security::restrict_file_permissions(&backup);
+                        quarantined = true;
                     }
                     warn!(
                         "Failed to load known.met: {e}; fail-closed share intent enabled (backup: {})",
@@ -229,7 +252,9 @@ impl KnownFileList {
                     warn!("Failed to persist fail-closed share intent: {intent_error}");
                     crate::storage::share_intent::force_unshared_all();
                 }
-                Self::new()
+                let mut list = Self::new();
+                list.authoritative = quarantined || !path.exists();
+                list
             }
         }
     }
@@ -796,6 +821,26 @@ impl KnownFileList {
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        // Refuse to write a catalog that was never read off disk over one that
+        // exists. The network task starts from `new()` and absorbs known.met
+        // from a deferred background load, so quitting (or completing a
+        // download, which dirties the list and arms the periodic writer) before
+        // that load lands would otherwise replace every hash, AICH root, Ember
+        // digest, share flag and all-time counter with the handful this process
+        // happens to know — or with nothing at all. A corrupt load lands here
+        // the same way, having deliberately returned an empty list.
+        //
+        // `save_nodes_dat` has guarded the same mistake for the routing table
+        // since long before this; known.met is the far more expensive file to
+        // rebuild, because every byte of it has to be re-hashed.
+        if !self.authoritative && path.exists() {
+            warn!(
+                "Skipping known.met save: the on-disk catalog was never loaded, so writing {} \
+                 record(s) now would discard it",
+                self.files.len()
+            );
+            return Ok(());
+        }
         let needs_i64 = self.files.values().any(|r| r.file_size > u32::MAX as u64);
         let mut buf = Vec::new();
         buf.write_u8(if needs_i64 {
@@ -1941,6 +1986,53 @@ mod tests {
                 "priority label {label} must survive an str->u8->str round trip"
             );
         }
+    }
+
+    /// The network task starts from `new()` and absorbs known.met from a
+    /// deferred background load. Quitting — or completing one download, which
+    /// dirties the list and arms the periodic writer — before that load lands
+    /// used to write the placeholder straight over the real catalog, costing
+    /// every hash, AICH root and all-time counter in it.
+    #[test]
+    fn an_unloaded_catalog_never_overwrites_the_one_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-met-placeholder-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+
+        // `load_checked` throughout: `load` reports a missing catalog to the
+        // process-wide share-intent store, which would leak into other tests.
+        let mut on_disk = KnownFileList::load_checked(&path).unwrap();
+        on_disk.add_or_update(sample_record());
+        on_disk.save(&path).unwrap();
+        assert_eq!(KnownFileList::load_checked(&path).unwrap().file_count(), 1);
+
+        // The pre-load placeholder, with one record picked up this session.
+        let mut placeholder = KnownFileList::new();
+        let mut second = sample_record();
+        second.file_hash = [9u8; 16];
+        placeholder.add_or_update(second);
+        placeholder.save(&path).unwrap();
+        assert_eq!(
+            KnownFileList::load_checked(&path).unwrap().file_count(),
+            1,
+            "the placeholder must not replace the catalog it never read"
+        );
+
+        // Once the deferred load is absorbed, saving is allowed again and
+        // keeps both the disk records and the ones learned this session.
+        placeholder.absorb_missing_from(KnownFileList::load_checked(&path).unwrap());
+        placeholder.save(&path).unwrap();
+        assert_eq!(
+            KnownFileList::load_checked(&path).unwrap().file_count(),
+            2,
+            "an absorbed catalog is authoritative and must write through"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

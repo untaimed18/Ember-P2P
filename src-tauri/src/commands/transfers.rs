@@ -1373,6 +1373,19 @@ pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<
                 e,
             )
         })?;
+        // Resolve through the sandbox like every other path the shell is handed
+        // (`open_file`, `open_transfer_file_location`). Without it this was the
+        // one reveal that followed the raw config string, so a download root
+        // retargeted by a junction — the case `verify_root` exists to revoke —
+        // would be opened anyway.
+        let dir = crate::security::filesystem::verify_existing_path(&dir, &[dl_folder.clone()])
+            .map_err(|e| {
+                coded_ctx(
+                    "transfers_invalid_path",
+                    "Invalid or changed download path",
+                    e,
+                )
+            })?;
         crate::security::filesystem::open_with_default_app(&dir).map_err(|e| {
             coded_ctx(
                 "transfers_open_explorer_failed",

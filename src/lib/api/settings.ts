@@ -51,6 +51,17 @@ export async function updateSettings(
   return result;
 }
 
+/** Open the native picker for the download folder, returning the chosen path
+ *  or `null` if the user cancelled.
+ *
+ *  The dialog runs in the backend so the chosen path is authorized there.
+ *  `update_settings` rejects a *changed* `download_folder` that did not come
+ *  from here, the same way shared folders can only be added through
+ *  `pick_shared_folder`. */
+export async function pickDownloadFolder(): Promise<string | null> {
+  return invoke<string | null>('pick_download_folder');
+}
+
 export async function downloadNodesDat(): Promise<NodesDatDownloadResult> {
   return invoke('download_nodes_dat');
 }

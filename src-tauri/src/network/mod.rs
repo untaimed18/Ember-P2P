@@ -1395,10 +1395,32 @@ fn record_ember_session_dht_contact(
 }
 
 fn ember_session_introduced(state: &NetworkState, ip: Ipv4Addr, udp_port: u16) -> bool {
-    state.ember_keyless_peers.contains_key(&(ip, udp_port))
+    if state.ember_keyless_peers.contains_key(&(ip, udp_port))
         || state.ember_session_dht_contacts.contains_key(&(ip, udp_port))
         || state.ember_transport.recently_dialled(IpAddr::V4(ip))
-        || state.known_ember_peers.keys().any(|(peer_ip, _)| *peer_ip == ip)
+    {
+        return true;
+    }
+    // `known_ember_peers` is keyed by TCP port, so it can only ever vouch for
+    // the host, not for the datagram's source port. Accept that as a last
+    // resort — it is what lets a LAN peer whose UDP port we never learned join
+    // the overlay — but only while we hold no UDP port for the host at all.
+    // Once we do, the exact-port checks above are the answer, and matching on
+    // the bare IP would exempt every *other* port on that machine from the IP
+    // filter for as long as the session lasts.
+    let hold_a_udp_port = state
+        .ember_keyless_peers
+        .keys()
+        .any(|(peer_ip, _)| *peer_ip == ip)
+        || state
+            .ember_session_dht_contacts
+            .keys()
+            .any(|(peer_ip, _)| *peer_ip == ip);
+    !hold_a_udp_port
+        && state
+            .known_ember_peers
+            .keys()
+            .any(|(peer_ip, _)| *peer_ip == ip)
 }
 
 fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::dht::EmberContact) {
@@ -39839,18 +39861,31 @@ async fn handle_udp_packet_inner(
                         if !part_path.exists() {
                             return None;
                         }
-                        Some((t.total_size, part_path))
+                        Some((t.id.clone(), t.total_size, part_path))
                     })
                 } else {
                     None
                 };
-                let partial_file = if let Some((total_size, part_path)) = partial_candidate {
-                    tokio::task::spawn_blocking(move || {
-                        let tracker = ed2k::part_tracker::PartTracker::new(total_size, &part_path);
-                        (total_size, tracker.serveable_parts())
-                    })
-                    .await
-                    .ok()
+                let partial_file = if let Some((transfer_id, total_size, part_path)) =
+                    partial_candidate
+                {
+                    // An active download already holds its tracker in memory, so
+                    // ask that first. Rebuilding one from `.part.met` put a disk
+                    // round trip inside the event loop for every reask a peer
+                    // sent, and the recv arm drains up to 20 datagrams per turn
+                    // before it returns to `select!`.
+                    match udp_reask_serveable_parts(state, &transfer_id).await {
+                        Some(parts) => Some((total_size, parts)),
+                        // Paused or queued: no live tracker, so fall back to the
+                        // sidecar on the blocking pool.
+                        None => tokio::task::spawn_blocking(move || {
+                            let tracker =
+                                ed2k::part_tracker::PartTracker::new(total_size, &part_path);
+                            (total_size, tracker.serveable_parts())
+                        })
+                        .await
+                        .ok(),
+                    }
                 } else {
                     None
                 };
