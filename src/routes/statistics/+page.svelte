@@ -656,7 +656,7 @@
   }
   .oh-row {
     display: grid;
-    grid-template-columns: 130px 1fr 90px;
+    grid-template-columns: max-content minmax(0, 1fr) 90px;
     align-items: center;
     gap: 10px;
   }

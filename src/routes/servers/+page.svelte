@@ -658,7 +658,16 @@
 </script>
 
 <svelte:document onclick={closeContextMenu} onkeydown={(e) => {
-  if (e.key === 'Escape' && ctxMenu) { closeContextMenu(); e.preventDefault(); e.stopPropagation(); }
+  if (e.key !== 'Escape') return;
+  if (ctxMenu) {
+    closeContextMenu();
+    e.preventDefault();
+    e.stopPropagation();
+  } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('server-filter-input') && serverFilter) {
+    serverFilter = '';
+    e.preventDefault();
+    e.stopPropagation();
+  }
 }} />
 
 <div class="page-header">

@@ -3229,6 +3229,14 @@
         openMore.open = false;
         e.preventDefault();
         e.stopPropagation();
+      } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('filter-input') && transferFilter) {
+        transferFilter = '';
+        e.preventDefault();
+        e.stopPropagation();
+      } else if (e.target instanceof HTMLInputElement && e.target.closest('.known-search') && knownFilter) {
+        knownFilter = '';
+        e.preventDefault();
+        e.stopPropagation();
       }
     }
     return;

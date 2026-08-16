@@ -580,6 +580,12 @@
           bind:value={searchQuery}
           placeholder={m.security_search_placeholder()}
           aria-label={m.security_search_placeholder()}
+          onkeydown={(e) => {
+            if (e.key !== 'Escape' || !searchQuery) return;
+            e.preventDefault();
+            e.stopPropagation();
+            searchQuery = '';
+          }}
         />
         {#if searchQuery}
           <button type="button" class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}><IconX size={12} /></button>

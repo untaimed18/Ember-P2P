@@ -2219,8 +2219,23 @@
 
 <svelte:document onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (contextMenu) { closeContextMenu(); e.preventDefault(); e.stopPropagation(); }
-    else if (selectedResultKey) { selectedResultKey = null; e.preventDefault(); e.stopPropagation(); }
+    if (showColumnMenu) {
+      showColumnMenu = false;
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (contextMenu) {
+      closeContextMenu();
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (e.target instanceof HTMLInputElement && e.target.id === 'filter-text' && filterTextInput) {
+      clearFilterText();
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (selectedResultKey) {
+      selectedResultKey = null;
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
