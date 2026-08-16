@@ -384,6 +384,11 @@ impl CreditManager {
     /// eMule persists this in cryptkey.dat; we use a data_dir file.
     pub fn load_or_create_keypair(&mut self, data_dir: &std::path::Path) {
         let key_path = data_dir.join("cryptkey.dat");
+        // A crash inside `atomic_write`'s Windows replace-fallback can leave the
+        // only copy under `cryptkey.dat.ember-replace-bak`. Treating that as a
+        // first run would mint a new SecIdent key and then `atomic_write` would
+        // restore the bak only to overwrite it with the replacement.
+        crate::security::recover_interrupted_replace(&key_path);
         if let Ok(raw) = std::fs::read(&key_path) {
             let was_protected = crate::storage::secret_store::is_protected(&raw);
             // Unwrap DPAPI at-rest protection; legacy plaintext passes through
@@ -1204,6 +1209,7 @@ impl CreditManager {
 
     /// Load credits from clients.met.
     pub fn load_from_file(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        crate::security::recover_interrupted_replace(path);
         let metadata = std::fs::metadata(path)?;
         if metadata.len() > 50 * 1024 * 1024 {
             tracing::warn!("clients.met too large ({} bytes), skipping", metadata.len());
@@ -2558,5 +2564,30 @@ mod tests {
             IdentState::Unknown,
             "legacy rows default to Unknown"
         );
+    }
+
+    #[test]
+    fn load_or_create_keypair_restores_interrupted_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-cryptkey-recover-{}-{}",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = CreditManager::new();
+        first.load_or_create_keypair(&dir);
+        let path = dir.join("cryptkey.dat");
+        let original = std::fs::read(&path).expect("keypair must be written");
+        let bak = path.with_file_name("cryptkey.dat.ember-replace-bak");
+        std::fs::rename(&path, &bak).unwrap();
+
+        let mut second = CreditManager::new();
+        second.load_or_create_keypair(&dir);
+        let restored = std::fs::read(&path).expect("bak must be restored to cryptkey.dat");
+        assert_eq!(
+            restored, original,
+            "interrupted replace must not mint a replacement SecIdent key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

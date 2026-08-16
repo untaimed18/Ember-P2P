@@ -64,7 +64,7 @@
   "ember_status_connecting": "正在連線…",
   "ember_status_no_peers": "找不到節點",
   "ember_status_connected_hint": "你已加入 Ember 網路，可以照常搜尋、下載和分享。",
-  "ember_enable_label": "啟用 Ember Network",
+  "ember_enable_label": "Ember Network",
   "ember_beta_lock_title": "測試期間必須開啟",
   "ember_beta_lock_body": "在 Ember 網路處於測試階段時，無法關閉 Ember DHT。",
   "ember_joining_hint": "正在尋找其他 Ember 使用者。第一次連線可能需要一兩分鐘。",

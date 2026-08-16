@@ -607,6 +607,7 @@ impl TransferManager {
             // per-session byte count for uploads.
             if transfer.direction == TransferDirection::Download {
                 transfer.transferred = transfer.total_size;
+                transfer.completed_size = transfer.total_size;
             }
             transfer.speed = 0;
             Self::clear_failure_context(&mut transfer);

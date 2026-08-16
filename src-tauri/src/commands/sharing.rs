@@ -1,13 +1,35 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
-use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Paths whose `hash_file_cancellable` is still running after the 5-minute
+/// scan timeout. The scan continues, but a later pass must not start a second
+/// blocking hash of the same file until the first drain completes.
+fn hashing_in_flight() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn try_claim_in_flight_hash(path: &str) -> bool {
+    hashing_in_flight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_string())
+}
+
+fn release_in_flight_hash(path: &str) {
+    hashing_in_flight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
 
 /// Maximum bytes for any single filesystem path accepted from the
 /// frontend. Mirrors `commands::settings::MAX_PATH_LEN` so the
@@ -1491,6 +1513,15 @@ pub async fn add_shared_folder(
             let file_temp_id = file.id.clone();
             let cf = cancel_flag.clone();
 
+            if !try_claim_in_flight_hash(&file.path) {
+                warn!(
+                    "Skipping hash of {} — a previous timed-out hash is still running",
+                    file.name
+                );
+                page_complete = false;
+                continue;
+            }
+
             debug!(
                 "Hashing file {}/{}: {}",
                 hashed_count + 1,
@@ -1592,6 +1623,7 @@ pub async fn add_shared_folder(
                         );
                         last_cache_refresh = std::time::Instant::now();
                     }
+                    release_in_flight_hash(&file.path);
                 }
                 Ok(Ok(Err(e))) => {
                     let msg = e.to_string();
@@ -1600,18 +1632,21 @@ pub async fn add_shared_folder(
                         was_cancelled = true;
                         let mut index = local_index.write().await;
                         index.abandon_hash_placeholder(&file_temp_id);
+                        release_in_flight_hash(&file.path);
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
                     index.abandon_hash_placeholder(&file_temp_id);
+                    release_in_flight_hash(&file.path);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
                     index.abandon_hash_placeholder(&file_temp_id);
+                    release_in_flight_hash(&file.path);
                 }
                 Err(_) => {
                     // One slow file must not end the scan. Cancelling the whole
@@ -1632,8 +1667,11 @@ pub async fn add_shared_folder(
                     // coordination/scan guards to that wait would block every
                     // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
+                    let timed_out_path = file.path.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = hash_task.await {
+                        let result = hash_task.await;
+                        release_in_flight_hash(&timed_out_path);
+                        if let Err(error) = result {
                             tracing::warn!(
                                 "Timed-out hash task for {timed_out_name} failed while draining: {error}"
                             );
@@ -2962,6 +3000,15 @@ pub async fn reload_shared_files(
             let file_temp_id = file.id.clone();
             let cf = cancel_flag.clone();
 
+            if !try_claim_in_flight_hash(&file.path) {
+                warn!(
+                    "Skipping reload hash of {} — a previous timed-out hash is still running",
+                    file.name
+                );
+                page_complete = false;
+                continue;
+            }
+
             debug!(
                 "Reload hashing {}/{}: {}",
                 hashed_count + 1,
@@ -3061,6 +3108,7 @@ pub async fn reload_shared_files(
                         );
                         last_cache_refresh = std::time::Instant::now();
                     }
+                    release_in_flight_hash(&file.path);
                 }
                 Ok(Ok(Err(e))) => {
                     let msg = e.to_string();
@@ -3069,18 +3117,21 @@ pub async fn reload_shared_files(
                         was_cancelled = true;
                         let mut index = local_index.write().await;
                         index.abandon_hash_placeholder(&file_temp_id);
+                        release_in_flight_hash(&file.path);
                         break;
                     }
                     warn!("Failed to hash {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
                     index.abandon_hash_placeholder(&file_temp_id);
+                    release_in_flight_hash(&file.path);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
                     page_complete = false;
                     let mut index = local_index.write().await;
                     index.abandon_hash_placeholder(&file_temp_id);
+                    release_in_flight_hash(&file.path);
                 }
                 Err(_) => {
                     // One slow file must not end the reload. Cancelling the whole
@@ -3100,8 +3151,11 @@ pub async fn reload_shared_files(
                     // coordination / scan guards to that wait would block every
                     // later reload and stall shutdown for the rest of the session.
                     let timed_out_name = file.name.clone();
+                    let timed_out_path = file.path.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = hash_task.await {
+                        let result = hash_task.await;
+                        release_in_flight_hash(&timed_out_path);
+                        if let Err(error) = result {
                             tracing::warn!(
                                 "Timed-out reload hash task for {timed_out_name} failed while draining: {error}"
                             );

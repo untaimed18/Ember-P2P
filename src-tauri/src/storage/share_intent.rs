@@ -165,6 +165,10 @@ impl ShareIntentStore {
 /// now absent or corrupt, the durable store enters fail-closed mode.
 pub fn initialize(data_dir: &Path) -> io::Result<Arc<ShareIntentStore>> {
     let path = data_dir.join(STATE_FILE);
+    // Same interrupt window as identity/cryptkey: a parked backup with nothing
+    // at `path` looks like a first run, and `persist_state` below would then
+    // restore the bak only to overwrite it with empty denied/allow sets.
+    crate::security::recover_interrupted_replace(&path);
     let state_existed = path.exists();
     let mut state = if state_existed {
         let data = std::fs::read(&path)?;
@@ -374,6 +378,29 @@ mod tests {
         let after_loss = initialize(&base).unwrap();
         assert!(after_loss.is_fail_closed());
         assert!(!after_loss.effective_shared(&[0x77; 16], true));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn initialize_restores_interrupted_replace_before_first_run_persist() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-share-intent-recover-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let hash = [0x7e; 16];
+        let first = initialize(&base).unwrap();
+        first.set_explicit_batch(&[(hash, false)]).unwrap();
+        assert!(!first.effective_shared(&hash, true));
+        let path = base.join("share_intent.json");
+        let bak = path.with_file_name("share_intent.json.ember-replace-bak");
+        std::fs::rename(&path, &bak).unwrap();
+        let restored = initialize(&base).unwrap();
+        assert!(
+            !restored.effective_shared(&hash, true),
+            "denied hashes parked in the replace backup must survive a missing live file"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 }

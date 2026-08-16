@@ -64,7 +64,7 @@
   "ember_status_connecting": "Подключение…",
   "ember_status_no_peers": "Пиры не найдены",
   "ember_status_connected_hint": "Вы в сети Ember. Ищите, скачивайте и делитесь файлами как обычно.",
-  "ember_enable_label": "Включить Ember Network",
+  "ember_enable_label": "Ember Network",
   "ember_beta_lock_title": "Обязательно на этапе бета",
   "ember_beta_lock_body": "Ember DHT нельзя отключить, пока сеть находится на бета-тестировании.",
   "ember_joining_hint": "Идёт поиск других пользователей Ember. Первое подключение может занять минуту-другую.",

@@ -199,7 +199,7 @@ pub async fn run_friend_session_over_transport(
     if !is_friend {
         anyhow::bail!(
             "remote peer {} is not in our friend list",
-            hex::encode(peer_ember_hash)
+            crate::security::short_hash(&peer_ember_hash)
         );
     }
 
@@ -216,7 +216,7 @@ pub async fn run_friend_session_over_transport(
             if reusable_secure_friend_session(existing, &peer_pk) {
                 info!(
                     "Friend session for {} already exists after secure handshake; reusing canonical outbound slot and closing duplicate dial",
-                    hex::encode(peer_ember_hash)
+                    crate::security::short_hash(&peer_ember_hash)
                 );
                 // Explicitly shut down any half-open work on this dial's
                 // transport by dropping reader/writer at return.
@@ -245,7 +245,7 @@ pub async fn run_friend_session_over_transport(
             Some(existing) if reusable_secure_friend_session(existing, &peer_pk) => {
                 info!(
                     "Friend session for {} already exists (post-handshake race); reusing winner and closing this dial",
-                    hex::encode(peer_ember_hash)
+                    crate::security::short_hash(&peer_ember_hash)
                 );
                 let reused = FriendSessionHandle {
                     session_id: existing.session_id(),
@@ -260,7 +260,7 @@ pub async fn run_friend_session_over_transport(
             Some(stale_or_mismatched) => {
                 debug!(
                     "Friend session slot for {} held by a stale or key-mismatched entry; closing and claiming it",
-                    hex::encode(peer_ember_hash)
+                    crate::security::short_hash(&peer_ember_hash)
                 );
                 stale_or_mismatched.close();
             }
@@ -292,7 +292,7 @@ pub async fn run_friend_session_over_transport(
         return Err(anyhow::Error::from(e).context("failed to send OP_EMBER_FRIEND_REQ"));
     }
 
-    info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
+    info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, crate::security::short_hash(&peer_ember_hash));
 
     let peer_user_hash = _peer_user_hash;
     let listen_port = if hello_caps.tcp_port > 0 {
@@ -380,7 +380,7 @@ pub async fn run_friend_session_over_transport(
                         info!(
                             "Friend session to {} ({}) was explicitly closed",
                             addr,
-                            hex::encode(peer_ember_hash)
+                            crate::security::short_hash(&peer_ember_hash)
                         );
                         break;
                     }
@@ -413,7 +413,7 @@ pub async fn run_friend_session_over_transport(
                             if !session_friend_hashes.read().await.contains(&peer_ember_hash) {
                                 info!(
                                     "Friend {} removed; dropping inbound packet and terminating secure session",
-                                    hex::encode(peer_ember_hash)
+                                    crate::security::short_hash(&peer_ember_hash)
                                 );
                                 break;
                             }
@@ -422,7 +422,7 @@ pub async fn run_friend_session_over_transport(
                                     if payload.len() > MAX_CHAT_WIRE_LEN {
                                         warn!(
                                             "Friend {} chat payload oversized ({} bytes); dropping without decrypt",
-                                            hex::encode(peer_ember_hash),
+                                            crate::security::short_hash(&peer_ember_hash),
                                             payload.len()
                                         );
                                     } else if let Some(msg) = decrypt_chat_payload(
@@ -446,7 +446,7 @@ pub async fn run_friend_session_over_transport(
                                         // another agent).
                                         warn!(
                                             "Friend {} chat decrypt failed (len={}); dropping ciphertext",
-                                            hex::encode(peer_ember_hash),
+                                            crate::security::short_hash(&peer_ember_hash),
                                             payload.len()
                                         );
                                     }
@@ -520,7 +520,7 @@ pub async fn run_friend_session_over_transport(
                                     } else {
                                         debug!(
                                             "Friend {} sent an unparseable OP_EMBER_XFER_REQ ({} bytes)",
-                                            hex::encode(peer_ember_hash),
+                                            crate::security::short_hash(&peer_ember_hash),
                                             payload.len()
                                         );
                                     }
@@ -552,7 +552,7 @@ pub async fn run_friend_session_over_transport(
                                     } else {
                                         debug!(
                                             "Friend {} sent an unparseable OP_EMBER_FILE_OFFER ({} bytes)",
-                                            hex::encode(peer_ember_hash),
+                                            crate::security::short_hash(&peer_ember_hash),
                                             payload.len()
                                         );
                                     }
@@ -601,11 +601,11 @@ pub async fn run_friend_session_over_transport(
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(
                                             "Friend {} sent unknown OP_EMBER_EXT sub-type {other:#04x}",
-                                            hex::encode(peer_ember_hash)
+                                            crate::security::short_hash(&peer_ember_hash)
                                         ),
                                         None => debug!(
                                             "Friend {} sent an empty OP_EMBER_EXT payload",
-                                            hex::encode(peer_ember_hash)
+                                            crate::security::short_hash(&peer_ember_hash)
                                         ),
                                     }
                                 }
@@ -639,7 +639,7 @@ pub async fn run_friend_session_over_transport(
                 }
                 _ = keepalive => {
                     if !session_friend_hashes.read().await.contains(&peer_ember_hash) {
-                        info!("Friend {} removed, terminating outbound session", hex::encode(peer_ember_hash));
+                        info!("Friend {} removed, terminating outbound session", crate::security::short_hash(&peer_ember_hash));
                         break;
                     }
                     // L8: stall check. Run BEFORE we send another
@@ -655,7 +655,7 @@ pub async fn run_friend_session_over_transport(
                         info!(
                             "Friend session to {} ({}) stalled — no inbound traffic in {:?}; disconnecting",
                             addr,
-                            hex::encode(peer_ember_hash),
+                            crate::security::short_hash(&peer_ember_hash),
                             last_inbound.elapsed(),
                         );
                         break;
@@ -683,7 +683,7 @@ pub async fn run_friend_session_over_transport(
                 debug!(
                     "Friend session to {} ended, but a newer session for {} is active; preserving it",
                     addr,
-                    hex::encode(peer_ember_hash)
+                    crate::security::short_hash(&peer_ember_hash)
                 );
             }
         }
@@ -699,7 +699,7 @@ pub async fn run_friend_session_over_transport(
         info!(
             "Friend session to {} ({}) ended",
             addr,
-            hex::encode(peer_ember_hash)
+            crate::security::short_hash(&peer_ember_hash)
         );
     });
 

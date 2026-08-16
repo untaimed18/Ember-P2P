@@ -12970,8 +12970,10 @@ struct EmberPublishRequest {
     /// count and consumes the pending entry so the real target is never
     /// faulted.
     node_id: ember::dht::EmberNodeId,
-    /// When the store went out, for the staleness sweep.
-    sent_at: std::time::Instant,
+    /// When this store must be treated as failed if still unanswered.
+    /// Queued-behind-handshake uses the longer FIND budget so a cold Noise
+    /// session is not expired before the STORE ever leaves.
+    deadline: std::time::Instant,
 }
 
 /// Context for an in-flight Ember DHT keyword search started on behalf of
@@ -16906,6 +16908,7 @@ pub async fn start_network(
             }
         }
         let clients_met = data_dir.join("clients.met");
+        crate::security::recover_interrupted_replace(&clients_met);
         if clients_met.exists() && cm.all_records().is_empty() {
             match cm.load_from_file(&clients_met) {
                 Ok(n) => info!("Loaded {n} credit records from clients.met"),
@@ -17140,6 +17143,8 @@ pub async fn start_network(
     // reset once we successfully reach `NetworkStatus::Connected`.
     let mut last_hardcoded_bootstrap_ts: i64 = 0;
     let mut hardcoded_bootstrap_backoff_shift: u32 = 0;
+    let mut last_sampled_bootstrap_ts: i64 = 0;
+    let mut sampled_bootstrap_backoff_shift: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     // Punch mailbox polling ticks fast but only *works* when there is something
     // to answer — see the arm's gate. The rendezvous server keeps a punch
@@ -24024,27 +24029,38 @@ pub async fn start_network(
                     }
 
                     // Query a sample of known contacts with BootstrapReq to discover
-                    // new peers from their routing tables.
-                    let bootstrap_sample_size = if table_size < 50 { 10 } else { 5 };
-                    let sample: Vec<KadContact> = {
-                        let target = KadId::random();
-                        state.routing_table.find_closest(&target, bootstrap_sample_size)
-                    };
-                    for contact in &sample {
-                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                        let msg = KadMessage::BootstrapReq;
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            state.flood_protection.track_request(addr, 0x01);
-                            let _ = send_kad_packet(
-                                &udp_socket,
-                                &packet,
-                                addr,
-                                &state,
-                                &contact.id,
-                            )
-                            .await;
+                    // new peers from their routing tables. Same exponential backoff
+                    // as the hardcoded seeds so a table stuck under 200 does not
+                    // re-hit the same contacts every 10s for the life of the process.
+                    let sample_interval =
+                        hardcoded_bootstrap_backoff_interval(sampled_bootstrap_backoff_shift);
+                    if now_ts - last_sampled_bootstrap_ts >= sample_interval {
+                        last_sampled_bootstrap_ts = now_ts;
+                        sampled_bootstrap_backoff_shift =
+                            sampled_bootstrap_backoff_shift.saturating_add(1);
+                        let bootstrap_sample_size = if table_size < 50 { 10 } else { 5 };
+                        let sample: Vec<KadContact> = {
+                            let target = KadId::random();
+                            state.routing_table.find_closest(&target, bootstrap_sample_size)
+                        };
+                        for contact in &sample {
+                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                            let msg = KadMessage::BootstrapReq;
+                            if let Ok(packet) = messages::encode_packet(&msg) {
+                                state.flood_protection.track_request(addr, 0x01);
+                                let _ = send_kad_packet(
+                                    &udp_socket,
+                                    &packet,
+                                    addr,
+                                    &state,
+                                    &contact.id,
+                                )
+                                .await;
+                            }
                         }
                     }
+                } else {
+                    sampled_bootstrap_backoff_shift = 0;
                 }
 
                 tokio::task::yield_now().await;
@@ -33509,7 +33525,7 @@ pub async fn start_network(
                 let stale_pubs: Vec<u32> = state
                     .ember_dht_publish_requests
                     .iter()
-                    .filter(|(_, r)| now.duration_since(r.sent_at) > EMBER_SEARCH_QUERY_TIMEOUT)
+                    .filter(|(_, r)| now >= r.deadline)
                     .map(|(wire_id, _)| *wire_id)
                     .collect();
 
@@ -35823,7 +35839,13 @@ fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
 }
 
 fn update_publish_manager_state(state: &mut NetworkState) {
-    state.publish_manager.firewalled = state.firewalled;
+    // Source/callback publishes follow TCP reachability, not the UPnP-cleared
+    // UI badge. A LowID or a TCP check that is not Open means peers cannot
+    // dial us, so we publish as firewalled even when the router mapping looks
+    // healthy.
+    state.publish_manager.firewalled = state.low_id
+        || state.firewall_checker.tcp_status()
+            != crate::network::kad::firewall::FirewallStatus::Open;
     state.publish_manager.use_extern_kad_port =
         matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
     state.publish_manager.udp_port = state.external_udp_port.unwrap_or(state.udp_port);
@@ -36342,8 +36364,13 @@ async fn handle_ember_native_udp_inner(
         state.ember_dht_overhead.record_download(data.len() as u64);
     }
 
+    let reply_overhead = if is_epx && outcome.app_payloads.is_empty() {
+        state.epx_overhead.clone()
+    } else {
+        state.ember_dht_overhead.clone()
+    };
     for pkt in &outcome.responses {
-        if let Err(e) = send_ember_udp(socket, pkt, from, &state.ember_dht_overhead).await {
+        if let Err(e) = send_ember_udp(socket, pkt, from, &reply_overhead).await {
             debug!("Ember transport: failed to send packet to {from}: {e}");
         }
     }
@@ -36658,16 +36685,18 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             continue;
         }
 
-        if search_type == ember::dht::search::SearchType::FindNode {
-            state.ember_diagnostics.ember_dht_find_nodes_sent = state
-                .ember_diagnostics
-                .ember_dht_find_nodes_sent
-                .saturating_add(1);
-        } else {
-            state.ember_diagnostics.ember_dht_find_values_sent = state
-                .ember_diagnostics
-                .ember_dht_find_values_sent
-                .saturating_add(1);
+        if !behind_handshake {
+            if search_type == ember::dht::search::SearchType::FindNode {
+                state.ember_diagnostics.ember_dht_find_nodes_sent = state
+                    .ember_diagnostics
+                    .ember_dht_find_nodes_sent
+                    .saturating_add(1);
+            } else {
+                state.ember_diagnostics.ember_dht_find_values_sent = state
+                    .ember_diagnostics
+                    .ember_dht_find_values_sent
+                    .saturating_add(1);
+            }
         }
         batch_sent = batch_sent.saturating_add(1);
         let budget = if behind_handshake {
@@ -37206,6 +37235,7 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
         let mut offset = 0usize;
         let mut frames_sent = 0usize;
         let mut records_sent = 0usize;
+        let mut charged = 0usize;
         // Records that can never be sent, as opposed to ones merely held over.
         let mut unsendable: Vec<EmberRecordRef> = Vec::new();
 
@@ -37234,6 +37264,7 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                 break;
             };
 
+            let mut behind_handshake = false;
             let sent = match state.ember_transport.prepare_outgoing(
                 contact.addr,
                 Some(&contact.noise_pub),
@@ -37251,7 +37282,10 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                         }
                     }
                 }
-                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Queued => {
+                    behind_handshake = true;
+                    true
+                }
                 ember::transport::OutgoingResult::Error(e) => {
                     debug!(
                         "Ember batch publish: transport error for {}: {e}",
@@ -37274,8 +37308,13 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
             offset += taken;
             frames_sent += 1;
             records_sent += taken;
-            stats.frames_sent += 1;
-            stats.records_sent += taken;
+            // Still track in-flight so a later ACK matches, but do not charge
+            // the per-peer send window until bytes actually left the socket.
+            if !behind_handshake {
+                stats.frames_sent += 1;
+                stats.records_sent += taken;
+                charged += taken;
+            }
             state.ember_batch_publish.in_flight.insert(
                 wire_req_id,
                 EmberBatchInFlight {
@@ -37288,7 +37327,7 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
 
         state
             .ember_batch_publish
-            .note_records_sent(node_id, flush_at, records_sent);
+            .note_records_sent(node_id, flush_at, charged);
 
         if offset < queued.len() {
             let tail = queued.split_off(offset);
@@ -37368,6 +37407,7 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
                 .ember_dht
                 .build_store(key, record_bytes.clone(), record_sig);
 
+        let mut behind_handshake = false;
         let send_ok = match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),
@@ -37387,8 +37427,13 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
                     }
                 }
             }
-            // Handshake already in flight; the frame is queued.
-            ember::transport::OutgoingResult::Queued => true,
+            // Handshake already in flight; the frame is queued. Give it the
+            // longer budget below so the 5s STORE sweep does not expire it
+            // before the session can flush.
+            ember::transport::OutgoingResult::Queued => {
+                behind_handshake = true;
+                true
+            }
             ember::transport::OutgoingResult::Error(e) => {
                 debug!(
                     "Ember DHT publish {publish_id}: transport error for {}: {e}",
@@ -37407,13 +37452,18 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
             continue;
         }
 
+        let budget = if behind_handshake {
+            EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
+        } else {
+            EMBER_SEARCH_QUERY_TIMEOUT
+        };
         state.ember_dht_publish_requests.insert(
             wire_req_id,
             EmberPublishRequest {
                 publish_id,
                 per_pub_req_id,
                 node_id: contact.node_id,
-                sent_at: std::time::Instant::now(),
+                deadline: std::time::Instant::now() + budget,
             },
         );
     }
@@ -38049,12 +38099,12 @@ async fn ask_ember_source_buddies(
                 .prepare_outgoing(buddy.addr, Some(&buddy.noise_pub), &frame)
             {
                 ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                |                 ember::transport::OutgoingResult::HandshakeStarted { packet } => {
                     send_ember_udp(socket, &packet, buddy.addr, &state.ember_dht_overhead)
                         .await
                         .is_ok()
                 }
-                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Queued => false,
                 ember::transport::OutgoingResult::Error(_) => false,
             };
         if sent {
@@ -44183,6 +44233,7 @@ async fn handle_command_inner(
 
             let payload = ember::transport::EmberControlMessage::Ping { nonce }.encode();
 
+            let mut sent_on_wire = false;
             match state
                 .ember_transport
                 .prepare_outgoing(addr, Some(&resolved_pubkey), &payload)
@@ -44195,6 +44246,7 @@ async fn handle_command_inner(
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
+                    sent_on_wire = true;
                 }
                 ember::transport::OutgoingResult::Queued => {
                     // Message queued behind an in-progress handshake;
@@ -44208,8 +44260,10 @@ async fn handle_command_inner(
                 }
             }
 
-            state.ember_diagnostics.ember_pings_sent =
-                state.ember_diagnostics.ember_pings_sent.saturating_add(1);
+            if sent_on_wire {
+                state.ember_diagnostics.ember_pings_sent =
+                    state.ember_diagnostics.ember_pings_sent.saturating_add(1);
+            }
 
             let (pong_tx, pong_rx) = oneshot::channel();
             state
@@ -44425,6 +44479,7 @@ async fn handle_command_inner(
 
             let (request_id, frame) = state.ember_dht.build_ping();
 
+            let mut sent_on_wire = false;
             match state
                 .ember_transport
                 .prepare_outgoing(addr, Some(&resolved_pubkey), &frame)
@@ -44437,6 +44492,7 @@ async fn handle_command_inner(
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
+                    sent_on_wire = true;
                 }
                 ember::transport::OutgoingResult::Queued => {}
                 ember::transport::OutgoingResult::Error(err) => {
@@ -44445,10 +44501,12 @@ async fn handle_command_inner(
                 }
             }
 
-            state.ember_diagnostics.ember_dht_pings_sent = state
-                .ember_diagnostics
-                .ember_dht_pings_sent
-                .saturating_add(1);
+            if sent_on_wire {
+                state.ember_diagnostics.ember_dht_pings_sent = state
+                    .ember_diagnostics
+                    .ember_dht_pings_sent
+                    .saturating_add(1);
+            }
 
             let (pong_tx, pong_rx) = oneshot::channel();
             state
@@ -44514,6 +44572,7 @@ async fn handle_command_inner(
             let target = ember::dht::EmberNodeId(target.unwrap_or_else(rand::random));
             let (request_id, frame) = state.ember_dht.build_find_node(target);
 
+            let mut sent_on_wire = false;
             match state
                 .ember_transport
                 .prepare_outgoing(addr, Some(&resolved_pubkey), &frame)
@@ -44526,6 +44585,7 @@ async fn handle_command_inner(
                         let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
                         return;
                     }
+                    sent_on_wire = true;
                 }
                 ember::transport::OutgoingResult::Queued => {}
                 ember::transport::OutgoingResult::Error(err) => {
@@ -44534,10 +44594,12 @@ async fn handle_command_inner(
                 }
             }
 
-            state.ember_diagnostics.ember_dht_find_nodes_sent = state
-                .ember_diagnostics
-                .ember_dht_find_nodes_sent
-                .saturating_add(1);
+            if sent_on_wire {
+                state.ember_diagnostics.ember_dht_find_nodes_sent = state
+                    .ember_diagnostics
+                    .ember_dht_find_nodes_sent
+                    .saturating_add(1);
+            }
 
             let (contacts_tx, contacts_rx) = oneshot::channel();
             state

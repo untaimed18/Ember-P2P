@@ -12,6 +12,20 @@ use super::types::*;
 /// contacts, far beyond what the routing table can use.
 const MAX_NODES_DAT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// IPs of [`default_bootstrap_contacts`]. Kept as a match so KAD IP-filter
+/// admission can exempt seeds without allocating the contact list on every
+/// datagram. Update both when a seed changes.
+pub fn is_default_bootstrap_ip(ip: Ipv4Addr) -> bool {
+    matches!(
+        ip.octets(),
+        [212, 63, 206, 35]
+            | [82, 141, 38, 69]
+            | [212, 63, 206, 36]
+            | [94, 23, 196, 180]
+            | [95, 217, 44, 50]
+    )
+}
+
 /// Well-known bootstrap nodes for the eMule KAD network.
 /// These are long-running public nodes that help new clients join.
 pub fn default_bootstrap_contacts() -> Vec<KadContact> {
@@ -393,4 +407,22 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     crate::security::atomic_write(path, &buf, false)?;
     info!("Saved {} contacts to nodes.dat", contacts.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bootstrap_ips_match_the_seed_list() {
+        for contact in default_bootstrap_contacts() {
+            assert!(
+                is_default_bootstrap_ip(contact.ip),
+                "{} must stay in sync with is_default_bootstrap_ip",
+                contact.ip
+            );
+        }
+        assert!(!is_default_bootstrap_ip(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_default_bootstrap_ip(Ipv4Addr::new(1, 1, 1, 1)));
+    }
 }
