@@ -2587,7 +2587,7 @@
         bind:this={searchInputEl}
       />
       {#if searchQuery}
-        <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}>
+        <button type="button" class="filter-clear-btn" onclick={() => (searchQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}>
           <IconX size={11} />
         </button>
       {/if}
@@ -2778,7 +2778,7 @@
     <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
-        <button class="ghost modal-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
+        <button type="button" class="modal-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -2973,10 +2973,17 @@
                 title={m.library_unshare_folder_title()}
                 aria-label={m.library_unshare_folder_title()}
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
-                  <circle cx="12" cy="12" r="9" />
-                  <line x1="7.2" y1="7.2" x2="16.8" y2="16.8" />
-                </svg>
+                <span class="tree-btn-idle" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                    <circle cx="18" cy="5" r="3" />
+                    <circle cx="6" cy="12" r="3" />
+                    <circle cx="18" cy="19" r="3" />
+                    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+                    <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+                    <line x1="4" y1="4" x2="20" y2="20" />
+                  </svg>
+                </span>
+                <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
               </button>
               <button
                 type="button"
@@ -2984,7 +2991,17 @@
                 onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
                 title={m.library_remove_folder_btn_title()}
                 aria-label={m.library_remove_folder_btn_title()}
-              ><IconX size={12} /></button>
+              >
+                <span class="tree-btn-idle" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    <line x1="10" y1="11" x2="10" y2="17" />
+                    <line x1="14" y1="11" x2="14" y2="17" />
+                  </svg>
+                </span>
+                <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
+              </button>
             </span>
           </div>
         </div>
@@ -3266,7 +3283,7 @@
             {/if}
           </span>
         </div>
-        <button class="ghost drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
+        <button type="button" class="drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <IconX size={15} />
         </button>
       </div>
@@ -3324,21 +3341,21 @@
               <span class="meta-label">{m.library_meta_hash()}</span>
               <span class="meta-value meta-hash">
                 <code title={selectedFile.hash}>{selectedFile.hash}</code>
-                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
+                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
               </span>
             {/if}
             {#if selectedFile.aich_hash}
               <span class="meta-label">{m.library_meta_aich()}</span>
               <span class="meta-value meta-hash">
                 <code title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
-                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
+                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
               </span>
             {/if}
             {#if selectedFile.ember_file_hash}
               <span class="meta-label">{m.library_meta_ember()}</span>
               <span class="meta-value meta-hash">
                 <code title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
-                <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.ember_file_hash, m.library_copied_ember()); }} title={m.library_meta_copy_ember()}>{m.common_copy()}</button>
+                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.ember_file_hash, m.library_copied_ember()); }} title={m.library_meta_copy_ember()}>{m.common_copy()}</button>
               </span>
             {/if}
           </div>
@@ -3465,7 +3482,7 @@
                     </button>
                   {/each}
                   {#if ourRating > 0}
-                    <button class="star-clear" onclick={() => ourRating = 0} title={m.library_clear_rating()}><IconX size={12} /></button>
+                    <button type="button" class="star-clear" onclick={() => ourRating = 0} title={m.library_clear_rating()} aria-label={m.library_clear_rating()}><IconX size={12} /></button>
                   {/if}
                 </div>
                 <div class="comment-input-row">
@@ -3626,7 +3643,7 @@
   .dnd-overlay {
     position: fixed;
     inset: 0;
-    z-index: 1000;
+    z-index: 9800;
     pointer-events: none;
     display: flex;
     align-items: center;
@@ -4038,17 +4055,39 @@
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
-  /* Stop-sharing / remove stay identifiable by glyph color, but don't fill
-     until hover — the old tinted squares competed with the folder name. */
-  .tree-btn.tree-unshare { color: var(--warning); }
-  .tree-btn.tree-unshare:hover {
-    color: var(--on-warning);
+  /* Rest: tinted chips with distinct glyphs (share-off vs trash). Hover/focus
+     fills the chip and swaps to a white X so the two actions stay readable
+     before you point at them, then match as confirm-style controls. */
+  .tree-btn .tree-btn-idle,
+  .tree-btn .tree-btn-confirm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tree-btn .tree-btn-confirm { display: none; }
+  .tree-btn:hover .tree-btn-idle,
+  .tree-btn:focus-visible .tree-btn-idle { display: none; }
+  .tree-btn:hover .tree-btn-confirm,
+  .tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
+  .tree-btn.tree-unshare {
+    color: var(--warning);
+    border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+  }
+  .tree-btn.tree-unshare:hover,
+  .tree-btn.tree-unshare:focus-visible {
+    color: #ffffff;
     border-color: var(--warning);
     background: var(--warning);
   }
-  .tree-btn.tree-remove { color: var(--danger); }
-  .tree-btn.tree-remove:hover {
-    color: var(--on-danger);
+  .tree-btn.tree-remove {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+  .tree-btn.tree-remove:hover,
+  .tree-btn.tree-remove:focus-visible {
+    color: #ffffff;
     border-color: var(--danger);
     background: var(--danger);
   }
@@ -4159,13 +4198,14 @@
     cursor: pointer;
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
+    background: none;
+    color: var(--text-secondary);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
     margin-top: 1px;
+    line-height: 1;
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
   .drawer-close:hover {
@@ -4416,8 +4456,8 @@
 
   .filter-clear-btn {
     border: none;
-    background: transparent;
-    color: var(--text-muted);
+    background: none;
+    color: var(--text-secondary);
     width: 20px;
     height: 20px;
     border-radius: 50%;
@@ -4427,6 +4467,7 @@
     justify-content: center;
     flex-shrink: 0;
     cursor: pointer;
+    line-height: 1;
   }
 
   .filter-clear-btn:hover {
@@ -4764,9 +4805,12 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
+    color: var(--text-secondary);
     flex-shrink: 0;
+    cursor: pointer;
+    line-height: 1.3;
   }
-  .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .copy-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-surface); }
   .meta-badges { display: inline-flex; gap: 4px; }
   /* Tinted-chip recipe matching the same badges in the file table
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
@@ -4870,9 +4914,11 @@
     background: none;
     border: none;
     cursor: pointer;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     margin-left: 4px;
-    padding: 2px;
+    padding: 0;
+    width: 20px;
+    height: 20px;
     border-radius: var(--radius-sm);
     line-height: 1;
   }
@@ -5097,7 +5143,7 @@
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: none;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
   .modal-close:hover {
@@ -5230,7 +5276,7 @@
       inset: 0 0 0 auto;
       width: min(90vw, 400px);
       min-width: 0;
-      z-index: 20;
+      z-index: 1100;
       box-shadow: var(--shadow-panel-left);
     }
   }

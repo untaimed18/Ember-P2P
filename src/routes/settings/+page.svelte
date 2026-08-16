@@ -1605,12 +1605,14 @@
           <div class="field">
             <span class="field-label">{m.settings_theme_label()}</span>
             <div class="theme-picker">
-              <button
-                class="theme-swatch"
-                class:selected={$theme === 'light'}
-                onclick={() => setTheme('light')}
-                aria-label={m.settings_theme_light_aria()}
-              >
+            <button
+              type="button"
+              class="theme-swatch"
+              class:selected={$theme === 'light'}
+              onclick={() => setTheme('light')}
+              aria-label={m.settings_theme_light_aria()}
+              aria-pressed={$theme === 'light'}
+            >
                 <div class="swatch-preview light-swatch">
                   <div class="swatch-sidebar"></div>
                   <div class="swatch-content">
@@ -1622,10 +1624,12 @@
                 <span class="swatch-label">{m.settings_theme_light()}</span>
               </button>
               <button
+                type="button"
                 class="theme-swatch"
                 class:selected={$theme === 'dark'}
                 onclick={() => setTheme('dark')}
                 aria-label={m.settings_theme_dark_aria()}
+                aria-pressed={$theme === 'dark'}
               >
                 <div class="swatch-preview dark-swatch">
                   <div class="swatch-sidebar"></div>

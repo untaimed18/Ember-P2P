@@ -161,7 +161,12 @@
 
   let totalOverhead = $derived(
     stats
-      ? stats.overhead_server + stats.overhead_kad + stats.overhead_source_exchange + stats.overhead_file_request
+      ? stats.overhead_server
+        + stats.overhead_kad
+        + stats.overhead_source_exchange
+        + stats.overhead_file_request
+        + (stats.overhead_epx ?? 0)
+        + (stats.overhead_ember_dht ?? 0)
       : 0
   );
 
@@ -171,13 +176,8 @@
   }
 
   // Render overhead rows in descending size so the biggest contributor
-  // sits at the top. Zero-byte categories used to be filtered out
-  // entirely, but that hid Source Exchange from anyone running on KAD/
-  // Ember without an active eD2K server connection (the SX counter is
-  // only fed by server-based source asking, not the actual peer-to-peer
-  // traffic — see backend `OverheadCategory::SourceExchange` sites).
-  // Showing all four categories at all times tells the user which
-  // pathway is contributing to overhead and which is silent.
+  // sits at the top. Zero-byte categories stay visible so a KAD/Ember
+  // session still shows which pathways are silent versus active.
   type OverheadRow = { key: string; label: string; value: number; cls: string };
   let overheadRows = $derived.by<OverheadRow[]>(() => {
     if (!stats) return [];
@@ -186,6 +186,8 @@
       { key: 'kad', label: m.stats_overhead_kad(), value: stats.overhead_kad, cls: 'oh-kad' },
       { key: 'srcex', label: m.stats_overhead_source_exchange(), value: stats.overhead_source_exchange, cls: 'oh-srcex' },
       { key: 'freq', label: m.stats_overhead_file_requests(), value: stats.overhead_file_request, cls: 'oh-freq' },
+      { key: 'epx', label: m.stats_overhead_epx(), value: stats.overhead_epx ?? 0, cls: 'oh-epx' },
+      { key: 'emberdht', label: m.stats_overhead_ember_dht(), value: stats.overhead_ember_dht ?? 0, cls: 'oh-ember-dht' },
     ];
     return rows.sort((a, b) => b.value - a.value);
   });
@@ -654,7 +656,7 @@
   }
   .oh-row {
     display: grid;
-    grid-template-columns: 120px 1fr 90px;
+    grid-template-columns: 130px 1fr 90px;
     align-items: center;
     gap: 10px;
   }
@@ -690,6 +692,9 @@
   .oh-kad    { background: var(--success); }
   .oh-srcex  { background: var(--warning); }
   .oh-freq   { background: var(--stat-ratio); }
+  .oh-epx    { background: var(--ember-color); }
+  .oh-ember-dht { background: #00838f; }
+  :global([data-theme="dark"]) .oh-ember-dht { background: #4db6ac; }
   .oh-empty {
     text-align: center;
     color: var(--text-muted);

@@ -37,17 +37,27 @@ pub struct TransferStats {
     pub overhead_kad: u64,
     pub overhead_source_exchange: u64,
     pub overhead_file_request: u64,
+    /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE` on eD2K TCP, plus
+    /// Ember-native UDP `ExchangeRequest` / `ExchangeData`). Split from
+    /// Source Exchange so classic SX and EPX can be read separately.
+    pub overhead_epx: u64,
+    /// Ember DHT application traffic: Noise-wrapped FIND/STORE/PING
+    /// frames, handshake packets that exist to carry them, and
+    /// Ember-native transport Ping/Pong on that same channel. Ember
+    /// UDP EPX is counted under `overhead_epx`, not here.
+    pub overhead_ember_dht: u64,
 }
 
 /// Lock-free counters that the ed2k upload / transfer / multi_source
 /// tasks bump on every peer-to-peer Source Exchange packet they send
-/// or receive (`OP_REQUESTSOURCES`, `OP_ANSWERSOURCES`, and Ember's
-/// `OP_EMBER_SOURCEEXCHANGE`). The network-loop's stats tick swaps
-/// them out into `StatsManager::add_overhead` so the SX bytes flow
-/// into `overhead_source_exchange` alongside the existing
-/// server-source-asking traffic. Without this the SX category was
-/// effectively zero for KAD/Ember-only sessions, even when the actual
-/// peer-to-peer source-exchange protocol was very active.
+/// or receive (`OP_REQUESTSOURCES` / `OP_ANSWERSOURCES` and the
+/// versioned SX2 variants). Ember `OP_EMBER_SOURCEEXCHANGE` is counted
+/// on [`StatsManager::epx_counters`] instead. The network-loop's stats
+/// tick swaps these out into `StatsManager::add_overhead` so the SX
+/// bytes flow into `overhead_source_exchange` alongside server
+/// source-asking traffic. Without this the SX category was effectively
+/// zero for KAD/Ember-only sessions, even when the actual peer-to-peer
+/// source-exchange protocol was very active.
 #[derive(Debug, Default)]
 pub struct SxOverheadCounters {
     pub upload_bytes: AtomicU64,
@@ -94,6 +104,8 @@ pub struct StatsManager {
     pub session_up_counter: Arc<AtomicU64>,
     pub sx_counters: SharedSxOverheadCounters,
     pub file_req_counters: SharedFileReqOverheadCounters,
+    pub epx_counters: SharedSxOverheadCounters,
+    pub ember_dht_counters: SharedSxOverheadCounters,
     pub kad_upload_bytes: SharedKadUploadOverhead,
     /// Monotonic session-start marker for connection-time accounting.
     /// `session_start_time` is a wall-clock timestamp kept for "session
@@ -120,16 +132,19 @@ impl StatsManager {
             session_up_counter: Arc::new(AtomicU64::new(0)),
             sx_counters: Arc::new(SxOverheadCounters::default()),
             file_req_counters: Arc::new(SxOverheadCounters::default()),
+            epx_counters: Arc::new(SxOverheadCounters::default()),
+            ember_dht_counters: Arc::new(SxOverheadCounters::default()),
             kad_upload_bytes: Arc::new(AtomicU64::new(0)),
             session_start_instant: std::time::Instant::now(),
         }
     }
 
-    /// Drain the lock-free peer-SX byte counters into `add_overhead` so
-    /// the bytes show up under the `Source Exchange` row on the
-    /// Statistics page. Call from the network loop's periodic stats
-    /// tick (same cadence as `refresh_rate`) so the UI sees fresh
-    /// totals without burdening every send/recv site with a Mutex.
+    /// Drain the lock-free peer-SX / file-request / EPX / Ember-DHT
+    /// byte counters into `add_overhead` so the bytes show up under
+    /// the matching rows on the Statistics page. Call from the network
+    /// loop's periodic stats tick (same cadence as `refresh_rate`) so
+    /// the UI sees fresh totals without burdening every send/recv site
+    /// with a Mutex.
     pub fn drain_sx_counters(&mut self) {
         let up = self.sx_counters.upload_bytes.swap(0, Ordering::Relaxed);
         let down = self.sx_counters.download_bytes.swap(0, Ordering::Relaxed);
@@ -172,6 +187,38 @@ impl StatsManager {
                 OverheadCategory::FileRequest,
                 OverheadDirection::Download,
                 freq_down,
+            );
+        }
+
+        let epx_up = self.epx_counters.upload_bytes.swap(0, Ordering::Relaxed);
+        let epx_down = self.epx_counters.download_bytes.swap(0, Ordering::Relaxed);
+        if epx_up > 0 {
+            self.add_overhead(OverheadCategory::Epx, OverheadDirection::Upload, epx_up);
+        }
+        if epx_down > 0 {
+            self.add_overhead(OverheadCategory::Epx, OverheadDirection::Download, epx_down);
+        }
+
+        let dht_up = self
+            .ember_dht_counters
+            .upload_bytes
+            .swap(0, Ordering::Relaxed);
+        let dht_down = self
+            .ember_dht_counters
+            .download_bytes
+            .swap(0, Ordering::Relaxed);
+        if dht_up > 0 {
+            self.add_overhead(
+                OverheadCategory::EmberDht,
+                OverheadDirection::Upload,
+                dht_up,
+            );
+        }
+        if dht_down > 0 {
+            self.add_overhead(
+                OverheadCategory::EmberDht,
+                OverheadDirection::Download,
+                dht_down,
             );
         }
     }
@@ -349,6 +396,12 @@ impl StatsManager {
                 self.stats.overhead_source_exchange =
                     self.stats.overhead_source_exchange.saturating_add(bytes)
             }
+            OverheadCategory::Epx => {
+                self.stats.overhead_epx = self.stats.overhead_epx.saturating_add(bytes)
+            }
+            OverheadCategory::EmberDht => {
+                self.stats.overhead_ember_dht = self.stats.overhead_ember_dht.saturating_add(bytes)
+            }
         }
     }
 
@@ -389,6 +442,17 @@ pub enum OverheadCategory {
     FileRequest,
     Server,
     SourceExchange,
+    /// Ember Peer Exchange: TCP `OP_EMBER_SOURCEEXCHANGE` and Ember-native
+    /// UDP `ExchangeRequest` / `ExchangeData`. Fed via
+    /// `StatsManager::epx_counters` (drained on the same 1s tick as
+    /// `sx_counters`) so upload/transfer/multi_source and the Ember UDP
+    /// path bump a lock-free atomic instead of taking the stats mutex
+    /// per packet.
+    Epx,
+    /// Ember DHT (FIND/STORE/PING and the Noise handshake / transport
+    /// Ping-Pong that carry those frames). Fed via
+    /// `StatsManager::ember_dht_counters`. Ember UDP EPX is `Epx`.
+    EmberDht,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -475,6 +539,33 @@ mod tests {
         // traffic must not double-count.
         mgr.drain_sx_counters();
         assert_eq!(mgr.stats.overhead_file_request, 128);
+    }
+
+    /// EPX and Ember DHT counters must land in their own rows — not SX
+    /// or KAD — and a second drain without new traffic must not
+    /// double-count.
+    #[test]
+    fn drain_sx_counters_also_drains_epx_and_ember_dht_overhead() {
+        let mut mgr = StatsManager::new();
+        mgr.epx_counters.record_upload(11);
+        mgr.epx_counters.record_download(22);
+        mgr.ember_dht_counters.record_upload(33);
+        mgr.ember_dht_counters.record_download(44);
+        assert_eq!(mgr.stats.overhead_epx, 0);
+        assert_eq!(mgr.stats.overhead_ember_dht, 0);
+
+        mgr.drain_sx_counters();
+
+        assert_eq!(mgr.stats.overhead_epx, 33);
+        assert_eq!(mgr.stats.overhead_ember_dht, 77);
+        assert_eq!(mgr.stats.overhead_source_exchange, 0);
+        assert_eq!(mgr.stats.overhead_kad, 0);
+        assert_eq!(mgr.stats.session_up_overhead, 44);
+        assert_eq!(mgr.stats.session_down_overhead, 66);
+
+        mgr.drain_sx_counters();
+        assert_eq!(mgr.stats.overhead_epx, 33);
+        assert_eq!(mgr.stats.overhead_ember_dht, 77);
     }
 
     #[test]

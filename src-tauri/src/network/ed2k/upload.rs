@@ -1709,10 +1709,13 @@ struct UploadHandler {
     /// behavior: all upload activity stops on disconnect).
     network_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free counter the per-connection upload tasks bump on every
-    /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES` /
-    /// `OP_EMBER_SOURCEEXCHANGE` packet. Drained on the network
-    /// loop's stats tick into `OverheadCategory::SourceExchange`.
+    /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES`
+    /// packet. Ember `OP_EMBER_SOURCEEXCHANGE` is counted on
+    /// `epx_overhead`. Drained on the network loop's stats tick into
+    /// `OverheadCategory::SourceExchange`.
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE`) wire bytes.
+    epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
@@ -2435,9 +2438,10 @@ pub async fn start_upload_server(
     upload_queue: UploadQueueRef,
     // Shared atomic counters for peer-to-peer Source Exchange overhead.
     // Each upload-side connection bumps these on inbound REQUESTSOURCES
-    // and outbound ANSWERSOURCES / EMBER_SOURCEEXCHANGE bytes; the
-    // network-loop drains them into the SourceExchange overhead row.
+    // and outbound ANSWERSOURCES bytes; the network-loop drains them
+    // into the SourceExchange overhead row. Ember EPX uses `epx_overhead`.
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     // Callback-serve requests from the network task (server `OP_CALLBACKREQUESTED`
     // and KAD buddy `OP_CALLBACK`): each asks us to dial a peer and serve it so a
     // firewalled LowID node can still upload. Drained in the accept `select!`.
@@ -2542,6 +2546,7 @@ pub async fn start_upload_server(
         ember_sessions,
         network_disconnected,
         sx_overhead,
+        epx_overhead,
     });
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -6189,7 +6194,7 @@ impl UploadHandler {
                         .is_ok()
                         {
                             last_epx_generation = current_gen;
-                            self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                            self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
                         }
                     }
                 }
@@ -9696,7 +9701,7 @@ impl UploadHandler {
                                                 last_epx_generation = gen;
                                                 last_epx_resend = std::time::Instant::now();
                                                 epx_sent_after_binding = true;
-                                                self.sx_overhead
+                                                self.epx_overhead
                                                     .record_upload((6 + epx_data.len()) as u64);
                                             }
                                         } else {
@@ -9779,7 +9784,7 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                     if hello_caps.is_ember && ember_hash_binding_verified =>
                 {
-                    self.sx_overhead.record_download((6 + payload.len()) as u64);
+                    self.epx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from uploading peer {peer_addr}");
                     } else {
@@ -9946,7 +9951,7 @@ impl UploadHandler {
                                         last_epx_generation = gen;
                                         last_epx_resend = std::time::Instant::now();
                                         epx_sent_after_binding = true;
-                                        self.sx_overhead
+                                        self.epx_overhead
                                             .record_upload((6 + epx_data.len()) as u64);
                                     }
                                 } else {

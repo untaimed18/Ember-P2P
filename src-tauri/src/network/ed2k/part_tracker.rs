@@ -1723,7 +1723,11 @@ mod tests {
         let file_size = PARTSIZE * 2;
         let wire_count = super::super::messages::ed2k_part_count_for_size(file_size);
         let known_met_count = super::super::hash::ed2k_known_met_part_hash_count(file_size);
-        assert_eq!(known_met_count, wire_count + 1, "fixture must exercise the sentinel");
+        assert_eq!(
+            known_met_count,
+            wire_count + 1,
+            "fixture must exercise the sentinel"
+        );
 
         let mut tracker = PartTracker::new(file_size, &part_path);
         tracker.set_file_hash([0xEE; 16]);

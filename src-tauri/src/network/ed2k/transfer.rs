@@ -322,12 +322,14 @@ pub struct Ed2kDownload {
     /// Expected Ember content BLAKE3 (slice 18). All-zero skips verify.
     pub ember_file_hash: [u8; 32],
     /// Lock-free counter that the per-source loop bumps on every
-    /// peer-to-peer Source Exchange packet (`OP_REQUESTSOURCES`,
-    /// `OP_ANSWERSOURCES`, and `OP_EMBER_SOURCEEXCHANGE`) it sends
-    /// or receives. Drained on the network loop's stats tick into
-    /// `OverheadCategory::SourceExchange` so the Statistics page
-    /// reflects real peer-SX traffic, not just server source-asking.
+    /// peer-to-peer Source Exchange packet (`OP_REQUESTSOURCES` /
+    /// `OP_ANSWERSOURCES` and SX2). Ember `OP_EMBER_SOURCEEXCHANGE`
+    /// is counted on `epx_overhead` instead. Drained on the network
+    /// loop's stats tick into `OverheadCategory::SourceExchange`.
     pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE`) wire bytes.
+    /// Drained into `OverheadCategory::Epx`.
+    pub epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     /// Same idea as `sx_overhead`, but for file-open/queue handshake bytes
     /// (hashset request/answer, StartUploadReq/AcceptUploadReq/QueueFull/
     /// QueueRanking). Drained into `OverheadCategory::FileRequest`.
@@ -752,7 +754,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(raw.is_finished(), "AbortOnDrop must abort the parked watcher");
+        assert!(
+            raw.is_finished(),
+            "AbortOnDrop must abort the parked watcher"
+        );
         assert!(
             !flag.load(std::sync::atomic::Ordering::Acquire),
             "an aborted watcher must not have set the mirrored flag"
@@ -851,7 +856,10 @@ mod tests {
         let raw = "Expected AICH hash mismatch: expected aa, got bb";
         assert!(is_expected_aich_mismatch(raw));
         assert!(!is_ember_blake3_mismatch(raw));
-        assert_eq!(summarize_error(raw, &classify_error(raw)), "AICH hash mismatch");
+        assert_eq!(
+            summarize_error(raw, &classify_error(raw)),
+            "AICH hash mismatch"
+        );
         assert!(
             !is_expected_aich_mismatch("Download hash mismatch for file: expected=x, got=y"),
             "ed2k mismatch must not be classified as an AICH pin failure"
@@ -1846,7 +1854,7 @@ impl Ed2kDownload {
                         && epx_packets_received
                             < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
                 {
-                    self.sx_overhead.record_download((6 + pl.len()) as u64);
+                    self.epx_overhead.record_download((6 + pl.len()) as u64);
                     epx_packets_received += 1;
                     info!(
                         "Received early EPX from {} during pre-control ({} bytes)",
@@ -2197,7 +2205,7 @@ impl Ed2kDownload {
                     &*epx_data,
                 )
                 .await;
-                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
                 initial_epx_sent_generation = Some(sent_gen);
             }
         }
@@ -2556,7 +2564,8 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                     if peer_is_ember && ember_hash_binding_verified =>
                 {
-                    self.sx_overhead.record_download((6 + payload.len()) as u64);
+                    self.epx_overhead
+                        .record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                     {
                         debug!("Ignoring excess EPX packet from {}", self.source_addr);
@@ -2730,7 +2739,7 @@ impl Ed2kDownload {
                                             .await
                                             .is_ok()
                                             {
-                                                self.sx_overhead
+                                                self.epx_overhead
                                                     .record_upload((6 + epx_data.len()) as u64);
                                                 initial_epx_sent_generation = Some(sent_gen);
                                             }
@@ -2825,7 +2834,7 @@ impl Ed2kDownload {
                                                 .await
                                                 .is_ok()
                                                 {
-                                                    self.sx_overhead
+                                                    self.epx_overhead
                                                         .record_upload((6 + epx_data.len()) as u64);
                                                     initial_epx_sent_generation = Some(sent_gen);
                                                 }
@@ -3781,7 +3790,7 @@ impl Ed2kDownload {
                                 .is_ok()
                                 {
                                     last_epx_generation = current_gen;
-                                    self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                    self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
                                 }
                             } else {
                                 // Empty payload is terminal for this generation
@@ -4362,7 +4371,8 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
                             if peer_is_ember && ember_hash_binding_verified =>
                         {
-                            self.sx_overhead.record_download((6 + payload.len()) as u64);
+                            self.epx_overhead
+                                .record_download((6 + payload.len()) as u64);
                             if epx_packets_received
                                 >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
                             {

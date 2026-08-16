@@ -475,10 +475,7 @@ async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_
     })
     .await
     {
-        Ok(Ok(path)) => tracing::info!(
-            "Preserved failed download partial as {}",
-            path.display()
-        ),
+        Ok(Ok(path)) => tracing::info!("Preserved failed download partial as {}", path.display()),
         Ok(Err(error)) => tracing::warn!("Failed to preserve partial for {transfer_id}: {error}"),
         Err(error) => tracing::warn!("Preserve-partial task failed for {transfer_id}: {error}"),
     }
@@ -1582,13 +1579,9 @@ pub async fn remove_transfer(
 ) -> Result<(), String> {
     let snapshot = {
         let manager = state.transfer_manager.read().await;
-        manager.get_transfer(&transfer_id).map(|t| {
-            (
-                t.status.clone(),
-                t.file_name.clone(),
-                t.direction.clone(),
-            )
-        })
+        manager
+            .get_transfer(&transfer_id)
+            .map(|t| (t.status.clone(), t.file_name.clone(), t.direction.clone()))
     };
     let promoted = {
         let mut manager = state.transfer_manager.write().await;

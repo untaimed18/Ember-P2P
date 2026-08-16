@@ -87,7 +87,7 @@
         {/if}
       </div>
       {#if !inProgress}
-        <button class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
+        <button type="button" class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
       {/if}
     </div>
 
@@ -205,16 +205,22 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+    background: none;
+    color: var(--text-secondary);
     cursor: pointer;
-    padding: 2px;
+    line-height: 1;
     border-radius: var(--radius-sm);
   }
 
   .notice-x:hover {
-    color: var(--text-primary);
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .notice-body {

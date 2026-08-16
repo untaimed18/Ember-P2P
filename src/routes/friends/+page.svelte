@@ -898,7 +898,7 @@
           {/if}
         </div>
       </div>
-      <button class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
+      <button type="button" class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
         {#if myHashCopied}
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="3 8 7 12 13 4"/>
@@ -1059,7 +1059,7 @@
             aria-label={m.common_search()}
           />
           {#if searchQuery}
-            <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}><IconX size={12} /></button>
+            <button type="button" class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}><IconX size={12} /></button>
           {/if}
         </div>
       {/if}
@@ -1714,7 +1714,7 @@
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -1960,7 +1960,7 @@
     position: absolute;
     right: 0;
     top: calc(100% + 4px);
-    z-index: 20;
+    z-index: 9999;
     min-width: 190px;
     padding: 4px;
     background: var(--bg-secondary);

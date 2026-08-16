@@ -555,7 +555,7 @@
             <div class="v pubkey-row">
               <code class="pubkey">{row.value || '—'}</code>
               {#if row.value}
-                <button type="button" class="copy-btn" onclick={() => copyText(row.value, row.key)} title={m.ember_copy()}>
+                <button type="button" class="copy-btn" onclick={() => copyText(row.value, row.key)} title={m.ember_copy()} aria-label={m.ember_copy()}>
                   {#if copiedKey === row.key}{m.ember_copied()}
                   {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
                   {:else}{m.ember_copy()}{/if}

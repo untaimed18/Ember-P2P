@@ -24,6 +24,8 @@ export interface TransferStats {
   overhead_kad: number;
   overhead_source_exchange: number;
   overhead_file_request: number;
+  overhead_epx: number;
+  overhead_ember_dht: number;
 }
 
 export async function getStatistics(): Promise<TransferStats> {

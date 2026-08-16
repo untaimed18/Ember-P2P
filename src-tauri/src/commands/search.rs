@@ -1241,7 +1241,12 @@ mod ed2k_paste_tests {
 
     #[test]
     fn a_multi_line_paste_yields_every_link() {
-        let text = format!("{}\n{}\n{}", link("a.bin", 1, 0xAA), link("b.bin", 2, 0xBB), link("c.bin", 3, 0xCC));
+        let text = format!(
+            "{}\n{}\n{}",
+            link("a.bin", 1, 0xAA),
+            link("b.bin", 2, 0xBB),
+            link("c.bin", 3, 0xCC)
+        );
         let batch = parse_ed2k_links(text).expect("parse");
         assert_eq!(batch.links.len(), 3);
         assert_eq!(batch.invalid, 0);
@@ -1254,7 +1259,11 @@ mod ed2k_paste_tests {
     fn blank_lines_and_crlf_are_not_counted_as_invalid() {
         // Clipboard content from a Windows text editor arrives CRLF-delimited
         // and usually has a trailing newline; neither is a malformed link.
-        let text = format!("{}\r\n\r\n{}\r\n", link("a.bin", 1, 0xAA), link("b.bin", 2, 0xBB));
+        let text = format!(
+            "{}\r\n\r\n{}\r\n",
+            link("a.bin", 1, 0xAA),
+            link("b.bin", 2, 0xBB)
+        );
         let batch = parse_ed2k_links(text).expect("parse");
         assert_eq!(batch.links.len(), 2);
         assert_eq!(batch.invalid, 0);
@@ -1262,7 +1271,10 @@ mod ed2k_paste_tests {
 
     #[test]
     fn unparseable_lines_are_reported_rather_than_dropped() {
-        let text = format!("{}\nnot a link\ned2k://|file|broken|\n", link("a.bin", 1, 0xAA));
+        let text = format!(
+            "{}\nnot a link\ned2k://|file|broken|\n",
+            link("a.bin", 1, 0xAA)
+        );
         let batch = parse_ed2k_links(text).expect("parse");
         assert_eq!(batch.links.len(), 1);
         assert_eq!(batch.invalid, 2);

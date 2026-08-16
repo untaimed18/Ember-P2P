@@ -515,6 +515,7 @@
               type="button"
               class="theme-card"
               class:selected={selectedTheme === 'dark'}
+              aria-pressed={selectedTheme === 'dark'}
               onclick={() => selectTheme('dark')}
             >
               <div class="theme-preview dark-preview">
@@ -531,6 +532,7 @@
               type="button"
               class="theme-card"
               class:selected={selectedTheme === 'light'}
+              aria-pressed={selectedTheme === 'light'}
               onclick={() => selectTheme('light')}
             >
               <div class="theme-preview light-preview">

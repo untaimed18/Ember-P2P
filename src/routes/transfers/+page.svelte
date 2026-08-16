@@ -4908,7 +4908,7 @@
     position: absolute;
     right: 0;
     top: calc(100% + 4px);
-    z-index: 20;
+    z-index: 9999;
     min-width: 160px;
     padding: 4px;
     background: var(--bg-secondary);
@@ -5798,16 +5798,20 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    width: 20px;
+    height: 20px;
     border: none;
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
-    padding: 0 2px;
+    padding: 0;
     border-radius: var(--radius-sm);
-    transition: color var(--transition-fast);
+    line-height: 1;
+    transition: color var(--transition-fast), background var(--transition-fast);
   }
   .known-search-clear:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
   .known-stats {
     display: inline-flex;

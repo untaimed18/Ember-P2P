@@ -494,6 +494,8 @@
   "stats_overhead_kad": "KAD",
   "stats_overhead_source_exchange": "源交换",
   "stats_overhead_file_requests": "文件请求",
+  "stats_overhead_epx": "EPX",
+  "stats_overhead_ember_dht": "Ember DHT",
   "stats_no_overhead": "尚无开销记录",
   "stats_session_down_overhead": "会话下载开销",
   "stats_session_up_overhead": "会话上传开销",

@@ -701,7 +701,7 @@
         rows="2"
         disabled={sending}
       ></textarea>
-      <button class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
+      <button type="button" class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
@@ -1051,6 +1051,7 @@
   .conv-send {
     width: 40px;
     height: 40px;
+    padding: 0;
     border: none;
     border-radius: 50%;
     background: var(--accent);
@@ -1060,6 +1061,7 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    line-height: 1;
     transition: background var(--transition-fast), opacity var(--transition-fast);
   }
 

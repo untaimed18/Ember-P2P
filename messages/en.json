@@ -497,6 +497,8 @@
   "stats_overhead_kad": "KAD",
   "stats_overhead_source_exchange": "Source Exchange",
   "stats_overhead_file_requests": "File Requests",
+  "stats_overhead_epx": "EPX",
+  "stats_overhead_ember_dht": "Ember DHT",
   "stats_no_overhead": "No overhead recorded yet",
   "stats_session_down_overhead": "Session Down Overhead",
   "stats_session_up_overhead": "Session Up Overhead",

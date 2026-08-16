@@ -471,7 +471,9 @@ mod tests {
     #[test]
     fn excludes_partials_and_backups_case_insensitively() {
         assert!(is_excluded_share_file_name(Path::new("movie.avi.part")));
-        assert!(is_excluded_share_file_name(Path::new("profile.emberbackup")));
+        assert!(is_excluded_share_file_name(Path::new(
+            "profile.emberbackup"
+        )));
         assert!(is_excluded_share_file_name(Path::new("Archive.BAK")));
     }
 

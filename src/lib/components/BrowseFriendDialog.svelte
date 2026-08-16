@@ -358,8 +358,8 @@
             <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
           </p>
         </div>
-        <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
-          <IconX size={14} />
+        <button type="button" class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
+          <IconX size={16} />
         </button>
       </div>
 
@@ -566,22 +566,26 @@
   }
 
   .browse-close {
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     flex-shrink: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+    font-weight: 500;
   }
 
   .browse-close:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .browse-body {
@@ -678,14 +682,16 @@
     right: 6px;
     width: 22px;
     height: 22px;
-    border: none;
+    padding: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
+    background: none;
+    color: var(--text-secondary);
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+    line-height: 1;
   }
 
   .browse-filter-clear:hover {
