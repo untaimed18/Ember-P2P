@@ -6709,10 +6709,14 @@ impl UploadHandler {
                                         transfer_id: tid,
                                         kind,
                                     }).await;
-                                    uploaded = 0;
-                                    served_bytes_per_part.clear();
-                                    sent_blocks.clear();
                                 }
+                                // Coverage is per-file. Clear even when no UI row
+                                // existed yet — otherwise a later REQUESTPARTS for
+                                // the new hash reuses the old file's sent_blocks.
+                                uploaded = 0;
+                                served_bytes_per_part.clear();
+                                sent_blocks.clear();
+                                cached_part_tracker = None;
                             }
                         }
                         current_file_hash = Some(hash);
@@ -7524,10 +7528,11 @@ impl UploadHandler {
                                             transfer_id: tid,
                                             kind,
                                         }).await;
-                                        uploaded = 0;
-                                        served_bytes_per_part.clear();
-                                        sent_blocks.clear();
                                     }
+                                    uploaded = 0;
+                                    served_bytes_per_part.clear();
+                                    sent_blocks.clear();
+                                    cached_part_tracker = None;
                                 }
                             }
                             current_file_hash = Some(requested);
@@ -9176,10 +9181,11 @@ impl UploadHandler {
                                             transfer_id: tid,
                                             kind,
                                         }).await;
-                                        uploaded = 0;
-                                        served_bytes_per_part.clear();
-                                        sent_blocks.clear();
                                     }
+                                    uploaded = 0;
+                                    served_bytes_per_part.clear();
+                                    sent_blocks.clear();
+                                    cached_part_tracker = None;
                                 }
                             }
                             current_file_hash = Some(mpreq.file_hash);

@@ -254,3 +254,26 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */
+export async function readFromClipboard(): Promise<string | null> {
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    // Fall through to legacy path.
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    const ok = document.execCommand('paste');
+    const text = ta.value;
+    document.body.removeChild(ta);
+    return ok ? text : null;
+  } catch {
+    return null;
+  }
+}

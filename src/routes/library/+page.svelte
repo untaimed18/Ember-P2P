@@ -1863,7 +1863,13 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) return;
+    if (createCollectionOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      return;
+    }
 
     const typing = isTypingTarget(e.target);
 
@@ -1875,7 +1881,9 @@
       return;
     }
 
-    // Escape clears the search if it's focused and has content; otherwise clears selection.
+    // Escape clears the search if it's focused and has content; otherwise
+    // clears selection. Always preventDefault when we handle it so ChatDock
+    // does not also collapse (its listener honours defaultPrevented).
     if (e.key === 'Escape') {
       if (typing && e.target === searchInputEl && searchQuery) {
         searchQuery = '';
@@ -1883,8 +1891,18 @@
         e.stopPropagation();
         return;
       }
+      if (commentDirty) {
+        requestSelectPath(null);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       if (!typing && selectedPath) {
-        if (!requestSelectPath(null)) return;
+        if (!requestSelectPath(null)) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
         e.preventDefault();
         e.stopPropagation();
         return;

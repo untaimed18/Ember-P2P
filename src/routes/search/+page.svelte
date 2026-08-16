@@ -1361,13 +1361,17 @@
     // any of KAD / server / Ember.
     const kadUp = $networkStats.status === 'connected';
     const serverUp = $serverStatus === 'connected';
+    const emberJoining = emberEnabled && emberContacts === 0 && !emberJoinTimedOut;
+    const emberReady = emberEnabled && (emberContacts > 0 || emberJoinTimedOut);
     const methodAllowed =
       method === 'kad' ? kadUp :
       method === 'server' ? serverUp :
-      method === 'ember' ? emberEnabled :
-      kadUp || serverUp || emberEnabled;
+      method === 'ember' ? emberReady :
+      kadUp || serverUp || emberReady;
     if (!methodAllowed) {
-      networkAlertOpen = true;
+      // The readiness hint already covers "Ember is still joining". Don't
+      // open a tab that will sit empty, and don't show the disconnected dialog.
+      if (!emberJoining) networkAlertOpen = true;
       return;
     }
     const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
@@ -1735,6 +1739,7 @@
     filterMinSources = null;
     filterMinComplete = null;
     filterColumn = 'all';
+    hideSpam = false;
     clearFilterText();
   }
 
@@ -2227,10 +2232,19 @@
       closeContextMenu();
       e.preventDefault();
       e.stopPropagation();
-    } else if (e.target instanceof HTMLInputElement && e.target.id === 'filter-text' && filterTextInput) {
-      clearFilterText();
-      e.preventDefault();
-      e.stopPropagation();
+    } else if (
+      e.target instanceof HTMLInputElement ||
+      e.target instanceof HTMLSelectElement
+    ) {
+      const id = e.target.id;
+      if (id === 'filter-text' && filterTextInput) {
+        clearFilterText();
+        e.preventDefault();
+        e.stopPropagation();
+      } else if (id.startsWith('filter-') || e.target.closest('.filter-bar')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
     } else if (selectedResultKey) {
       selectedResultKey = null;
       e.preventDefault();

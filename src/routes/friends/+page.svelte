@@ -740,6 +740,7 @@
     // nickname editor keep their own Escape handling.
     if (!document.querySelector('.card-more[open]')) return;
     closeCardMenus();
+    e.preventDefault();
     e.stopPropagation();
   }
 

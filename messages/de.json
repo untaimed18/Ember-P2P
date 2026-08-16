@@ -64,7 +64,7 @@
   "ember_status_connecting": "Verbinden…",
   "ember_status_no_peers": "Keine Peers gefunden",
   "ember_status_connected_hint": "Sie sind im Ember-Netzwerk. Suchen, herunterladen und teilen Sie wie gewohnt.",
-  "ember_enable_label": "Ember-Netzwerk aktivieren",
+  "ember_enable_label": "Ember-Netzwerk",
   "ember_beta_lock_title": "Während der Beta erforderlich",
   "ember_beta_lock_body": "Ember DHT kann nicht deaktiviert werden, solange das Netzwerk in der Betatestphase ist.",
   "ember_joining_hint": "Suche nach anderen Ember-Nutzern. Die erste Verbindung kann ein bis zwei Minuten dauern.",

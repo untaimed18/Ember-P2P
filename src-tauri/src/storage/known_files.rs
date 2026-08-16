@@ -171,6 +171,7 @@ impl KnownFileList {
     /// an authoritative empty share policy.
     pub fn load_checked(path: &Path) -> anyhow::Result<Self> {
         let mut list = Self::new();
+        crate::security::recover_interrupted_replace(path);
         // known.met is app-managed, but a corrupt or maliciously-swapped file
         // shouldn't be slurped wholesale. This ceiling bounds the worst-case
         // allocation while allowing millions of ordinary records.
@@ -986,6 +987,7 @@ impl KnownFileList {
     /// Load a companion path index so files can be matched by exact path
     /// after restart (the eMule known.met format only stores filenames).
     fn load_path_index(&mut self, path: &Path) {
+        crate::security::recover_interrupted_replace(path);
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => return,
@@ -1939,5 +1941,24 @@ mod tests {
                 "priority label {label} must survive an str->u8->str round trip"
             );
         }
+    }
+
+    #[test]
+    fn load_checked_restores_interrupted_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-met-recover-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut list = KnownFileList::new();
+        list.add_or_update(sample_record());
+        list.save(&path).unwrap();
+        let bak = path.with_file_name("known.met.ember-replace-bak");
+        std::fs::rename(&path, &bak).unwrap();
+        let loaded = KnownFileList::load_checked(&path).unwrap();
+        assert_eq!(loaded.file_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

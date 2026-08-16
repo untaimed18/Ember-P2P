@@ -1061,7 +1061,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.5.5</h3>
+      <h3>Get Ember 1.5.6</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1719,6 +1719,77 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-5-6">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.6" target="_blank" rel="noopener">Ember v1.5.6</a></h3>
+        <time class="release-date" datetime="2026-08-16">August 16, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.6" target="_blank" rel="noopener"><code>v1.5.6</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+
+        <ul>
+          <li><strong>The shared chrome is quieter.</strong> Buttons, toasts, the splash, Settings, and the tables share a softer palette and rounder corners. Dark mode uses layered charcoal instead of hard outlines, so panels separate by depth. Menus and dialogs sit above the chat dock and the status bar instead of disappearing under them</li>
+          <li><strong>Known Clients is two ledgers now.</strong> eD2K credits and Ember-bound peers used to share one list, so an Ember friend could show up as if they were an eD2K client with a blank hash. Each network has its own table</li>
+          <li><strong>Settings is on Alt+0,</strong> the same way the other pages already have a digit shortcut. Alt plus the numpad digit is ignored, so typing numbers with Num Lock on does not jump you around the app</li>
+          <li><strong>The Ember DHT specification matches this build.</strong> The protocol PDF is rebuilt from the same local fonts the rest of the docs use, with no wire change from 1.5.5</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Before you upgrade</h5>
+        <ul>
+          <li><strong>Same Ember network as 1.5.5.</strong> No protocol bump: 1.5.6 still speaks Ember DHT version 2. The library database is unchanged, so you can move between 1.5.5 and 1.5.6 in either direction</li>
+        </ul>
+
+        <h5>Connections and publishing</h5>
+        <ul>
+          <li><strong>KAD still publishes you as firewalled when TCP is not actually open.</strong> Clearing the Firewalled badge because UPnP mapped the port also used to change the KAD source record to HighID. Peers then tried to dial a port that could not accept connections. The badge can still go green; the publish type follows a LowID or a failed connect-back</li>
+          <li><strong>Bootstrap requests back off once the table is growing.</strong> Hardcoded seeds already slowed down. Sampling known contacts with <code>BootstrapReq</code> every ten seconds while the table was under 200 did not. That path uses the same backoff now</li>
+          <li><strong>The IP filter covers KAD while it is still loading,</strong> except for the handful of well-known seed IPs that have to answer or a first launch never starts. Random contacts wait until <code>ipfilter.dat</code> is applied; contacts already restored from <code>nodes.dat</code> stay</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>A peer that switches files mid-slot no longer keeps the old file&rsquo;s sent-block map.</strong> Progress was only reset when a UI row already existed, so a later request for the new hash could skip ranges that had never been sent for that file</li>
+          <li><strong>aMule-style padding no longer looks like a dead slot.</strong> Those clients re-ask for ranges we already sent, padded out to three. Ember counted that as idle and dropped the upload. Asking again for something already delivered now keeps the slot alive, without sending the same blocks twice</li>
+          <li><strong>A finished download&rsquo;s completed size matches the file size.</strong> Completing a row snapped transferred bytes to the full size but left the unique-coverage counter short, so the parts bar could disagree with 100%</li>
+          <li><strong>Paste link works when the async clipboard API is denied.</strong> Copy already had a fallback. Paste now tries the same path, and says so if the clipboard is unavailable instead of failing silently</li>
+          <li><strong>Upload rows show session bytes, not file size as if it were transferred.</strong> Size and Transferred were paired the way a download is. An upload almost never sends the whole file this session</li>
+          <li><strong>A live friend session stays live.</strong> Auto-connect used to treat an open session as stale and tear it down, which looked like the friend went offline while you were still talking</li>
+          <li><strong>Disk-full and a trusted AICH miss stop retrying forever.</strong> Those failures are not going to succeed on the next tick</li>
+          <li><strong>Remove from List keeps a failed partial.</strong> You can put the download back later instead of starting from zero</li>
+        </ul>
+
+        <h5>Search, library, and keyboard</h5>
+        <ul>
+          <li><strong>Escape no longer closes chat while it is dismissing page chrome.</strong> Column menus, filters, a dirty library comment, the stop-hashing banner, and the friends card menu now keep the dock open. The same contract was already applied to search columns, friends search, security, servers, and transfer filters</li>
+          <li><strong>Clear filters also turns Hide spam off.</strong> When spam hiding had emptied the table, that button did nothing because Hide spam is on by default and was not part of the reset</li>
+          <li><strong>Ember-only search waits until there is a peer, or the join attempt has timed out.</strong> Starting a tab against zero contacts produced a bare &ldquo;No results&rdquo; with no explanation. The joining hint was already on the page; the search itself now respects it</li>
+          <li><strong>A hash that timed out no longer overlaps a second hash of the same file.</strong> The scan moves on after five minutes, but the next pass skips that path until the abandoned read finishes</li>
+          <li><strong>Unsaved library comments ask before they disappear.</strong> Changing row no longer drops a comment you were still typing</li>
+        </ul>
+
+        <h5>Ember overlay</h5>
+        <ul>
+          <li><strong>A STORE still sitting behind a Noise handshake is not expired at five seconds.</strong> FIND already waited twelve. Publish used the short budget, so a first contact could be marked failed before the record ever left</li>
+          <li><strong>Queued batch stores no longer burn the send window.</strong> Handshake-queued frames were counted as delivered. The ACK path still tracks them; the rate window only charges bytes that actually went out</li>
+          <li><strong>EPX handshake replies count as EPX overhead.</strong> Incoming Exchange* already did. The automatic replies were billed to Ember DHT</li>
+          <li><strong>The Ember Network toggle says it is on,</strong> not &ldquo;Enable Ember Network&rdquo;, which was leftover from when it could still be switched off</li>
+        </ul>
+
+        <h5>Persistence</h5>
+        <ul>
+          <li><strong>An interrupted save no longer mints a new identity file.</strong> A crash in the Windows replace path can leave the only copy under a backup name. <code>cryptkey.dat</code>, share-intent, <code>known.met</code>, and <code>clients.met</code> restore that backup before treating a missing file as a first run. Without that, the next save could write empty or freshly generated data over the recovered original</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.6" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.6</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-5-5">
       <div class="release-header">

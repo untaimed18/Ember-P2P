@@ -18,7 +18,7 @@
   import { getPeerReputation, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
-    formatRemaining, formatRelativeTime, copyToClipboard,
+    formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -2179,7 +2179,12 @@
     if (pasteLinkBusy) return;
     pasteLinkBusy = true;
     try {
-      await queuePastedLinks(await navigator.clipboard.readText());
+      const text = await readFromClipboard();
+      if (text == null) {
+        transferError = m.kad_clipboard_unavailable();
+        return;
+      }
+      await queuePastedLinks(text);
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     } finally {

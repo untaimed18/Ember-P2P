@@ -142,11 +142,12 @@ impl IpFilterSnapshot {
     }
 
     /// KAD UDP / routing-table admission while `ipfilter.dat` may still be
-    /// loading. Unlike [`Self::is_blocked`], does **not** fail-closed when
-    /// `!ranges_ready` — that window would blackhole bootstrap replies and
-    /// reject every RT insert. Bogus/private rules still apply; once ranges
-    /// are ready, range matches apply. After load, `evict_filtered_contacts`
-    /// removes any contacts that should have been blocked.
+    /// loading. TCP [`Self::is_blocked`] fail-closes in that window. Failing
+    /// KAD the same way would drop every non-seed Hello and blackhole cold
+    /// start, so we still admit [`super::bootstrap::is_default_bootstrap_ip`]
+    /// seeds. Everything else waits until ranges are ready — `nodes.dat` is
+    /// already in the table by then, and `evict_filtered_contacts` still
+    /// runs after load. Bogus/private rules always apply.
     pub fn is_blocked_for_kad(&self, ip: Ipv4Addr) -> bool {
         if crate::security::is_bogus_v4(ip) {
             self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
@@ -155,6 +156,9 @@ impl IpFilterSnapshot {
         if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
             return true;
+        }
+        if self.enabled && !self.ranges_ready {
+            return !super::bootstrap::is_default_bootstrap_ip(ip);
         }
         if self.enabled && self.ranges_ready {
             let ip_u32 = u32::from(ip);
@@ -497,6 +501,9 @@ impl IpFilter {
         if self.block_private && crate::security::is_lan_or_cgnat_v4(ip) {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
+        }
+        if self.enabled && !self.ranges_ready {
+            return !super::bootstrap::is_default_bootstrap_ip(ip);
         }
         if self.enabled && self.ranges_ready {
             let ip_u32 = u32::from(ip);
@@ -1342,12 +1349,16 @@ mod tests {
         assert!(!filter.ranges_ready());
         // Peer gates still fail-closed…
         assert!(filter.is_blocked_readonly(Ipv4Addr::new(8, 8, 8, 8)));
-        // …but KAD UDP / RT insert must admit so bootstrap can proceed.
-        assert!(!filter.is_blocked_readonly_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        // Random public IPs wait until the filter file is applied.
+        assert!(filter.is_blocked_readonly_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        // Hardcoded seeds must still get through or cold start never starts.
+        let seed = Ipv4Addr::new(212, 63, 206, 35);
+        assert!(!filter.is_blocked_readonly_for_kad(seed));
         let snap = filter.create_shared_snapshot();
         let snap = snap.read().unwrap();
         assert!(snap.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!snap.is_blocked_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(snap.is_blocked_for_kad(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!snap.is_blocked_for_kad(seed));
         drop(snap);
 
         filter.mark_ranges_ready();

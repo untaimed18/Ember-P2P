@@ -64,7 +64,7 @@
   "ember_status_connecting": "Connecting…",
   "ember_status_no_peers": "No peers found",
   "ember_status_connected_hint": "You're on the Ember network. Search, download, and share as usual.",
-  "ember_enable_label": "Enable Ember Network",
+  "ember_enable_label": "Ember Network",
   "ember_beta_lock_title": "Required during beta",
   "ember_beta_lock_body": "Ember DHT cannot be disabled while the network is in beta testing.",
   "ember_joining_hint": "Looking for other Ember users. The first connection can take a minute or two.",

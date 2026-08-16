@@ -1120,6 +1120,12 @@ pub async fn cancel_browse_friend(
             "Invalid browse request",
         ));
     }
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded(
+            "peers_not_friend",
+            "Can only cancel a friend browse",
+        ));
+    }
     bounded_send(
         &state.network_tx,
         NetworkCommand::CancelBrowseFriend {
