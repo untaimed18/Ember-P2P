@@ -7,9 +7,8 @@ use ed25519_dalek::SigningKey;
 use tracing::{debug, trace, warn};
 
 use super::messages;
-use super::routing::RoutingTable;
 use super::search::keyword_hash;
-use super::{EmberContact, EmberNodeId, K_BUCKET_SIZE};
+use super::{EmberContact, EmberNodeId};
 use crate::network::ember::channel;
 use crate::network::ember::crypto;
 
@@ -933,24 +932,6 @@ impl PublishManager {
         }
     }
 
-    /// Start publishing a signed record. First finds the closest nodes to the key,
-    /// then stores on them.
-    /// Returns `None` when the active-publish cap is reached so the
-    /// caller can surface a "busy" state instead of unbounded growth.
-    ///
-    /// Table-local closest is only a fallback for tests and callers that have
-    /// no lookup cache. Production publish (library batch and PROXY_STORE)
-    /// passes the set [`start_publish_to`] so records land where searchers walk.
-    pub fn start_publish(
-        &mut self,
-        record: SignedRecord,
-        routing_table: &RoutingTable,
-    ) -> Option<u32> {
-        let dht_key = EmberNodeId(record.keyword_hash);
-        let targets = routing_table.find_closest_prefer_verified(&dht_key, K_BUCKET_SIZE);
-        self.start_publish_to(record, targets)
-    }
-
     /// Start a publish onto an already-resolved target set.
     ///
     /// Used by buddy `PROXY_STORE` and the harness so they share the same
@@ -1168,7 +1149,9 @@ mod tests {
         let record = SignedRecord::keyword("test", [0xAA; 16], [0xBB; 32], 1000, "file.txt", &sk);
 
         let mut pm = PublishManager::new();
-        let pub_id = pm.start_publish(record, &rt).expect("publish slot");
+        let dht_key = EmberNodeId(record.keyword_hash);
+        let targets = rt.find_closest_prefer_verified(&dht_key, super::super::K_BUCKET_SIZE);
+        let pub_id = pm.start_publish_to(record, targets).expect("publish slot");
 
         let op = pm.get_mut(pub_id).unwrap();
         let to_store = op.next_to_store();

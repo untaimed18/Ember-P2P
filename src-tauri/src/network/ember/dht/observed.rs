@@ -165,12 +165,7 @@ fn is_public_reporter(ip: IpAddr) -> bool {
 }
 
 fn is_public_v4(ip: Ipv4Addr) -> bool {
-    !ip.is_private()
-        && !ip.is_loopback()
-        && !ip.is_link_local()
-        && !ip.is_broadcast()
-        && !ip.is_unspecified()
-        && !ip.is_multicast()
+    !crate::security::is_special_use_v4(ip)
 }
 
 #[cfg(test)]
@@ -179,7 +174,7 @@ mod tests {
     use std::net::SocketAddrV4;
 
     fn addr(last: u8, port: u16) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, last), port))
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, last), port))
     }
 
     fn reporter(a: u8, b: u8, c: u8) -> IpAddr {
@@ -193,7 +188,7 @@ mod tests {
         assert!(votes.record_vote(target, reporter(203, 0, 1)).is_none());
         assert!(votes.record_vote(target, reporter(203, 0, 2)).is_none());
         assert!(votes.record_vote(target, reporter(203, 0, 1)).is_none());
-        let confirmed = votes.record_vote(target, reporter(198, 51, 100));
+        let confirmed = votes.record_vote(target, reporter(1, 1, 1));
         assert_eq!(confirmed, Some(target));
         assert_eq!(votes.confirmed(), Some(target));
     }
@@ -202,7 +197,7 @@ mod tests {
     fn rejects_private_reported_ip() {
         let mut votes = EmberObservedIpVotes::new();
         let private = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4672));
-        assert!(votes.record_vote(private, reporter(203, 0, 113)).is_none());
+        assert!(votes.record_vote(private, reporter(8, 8, 8)).is_none());
         assert!(votes.confirmed().is_none());
     }
 
@@ -211,6 +206,24 @@ mod tests {
         let mut votes = EmberObservedIpVotes::new();
         let target = addr(50, 4672);
         assert!(votes.record_vote(target, reporter(10, 0, 1)).is_none());
+        assert!(votes.confirmed().is_none());
+    }
+
+    #[test]
+    fn rejects_documentation_reported_ip() {
+        let mut votes = EmberObservedIpVotes::new();
+        let docs = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 50), 4672));
+        assert!(votes.record_vote(docs, reporter(8, 8, 8)).is_none());
+        assert!(votes.record_vote(docs, reporter(1, 1, 1)).is_none());
+        assert!(votes.record_vote(docs, reporter(9, 9, 9)).is_none());
+        assert!(votes.confirmed().is_none());
+    }
+
+    #[test]
+    fn rejects_cgnat_reported_ip() {
+        let mut votes = EmberObservedIpVotes::new();
+        let cgnat = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 1), 4672));
+        assert!(votes.record_vote(cgnat, reporter(8, 8, 8)).is_none());
         assert!(votes.confirmed().is_none());
     }
 
@@ -269,24 +282,24 @@ mod tests {
         let rival = addr(51, 4672);
         let now = Instant::now();
 
-        votes.record_vote_at(current, reporter(203, 0, 1), now);
-        votes.record_vote_at(current, reporter(198, 51, 1), now);
+        votes.record_vote_at(current, reporter(1, 0, 1), now);
+        votes.record_vote_at(current, reporter(1, 1, 1), now);
         assert_eq!(
-            votes.record_vote_at(current, reporter(192, 0, 1), now),
+            votes.record_vote_at(current, reporter(1, 2, 1), now),
             Some(current)
         );
 
-        votes.record_vote_at(rival, reporter(203, 0, 2), now);
-        votes.record_vote_at(rival, reporter(198, 51, 2), now);
+        votes.record_vote_at(rival, reporter(8, 8, 1), now);
+        votes.record_vote_at(rival, reporter(8, 8, 2), now);
         assert_eq!(
-            votes.record_vote_at(rival, reporter(192, 0, 2), now),
+            votes.record_vote_at(rival, reporter(9, 9, 1), now),
             None,
             "a 3-net rival must not overwrite a still-backed confirmation"
         );
         assert_eq!(votes.confirmed(), Some(current));
 
         assert_eq!(
-            votes.record_vote_at(rival, reporter(203, 113, 1), now),
+            votes.record_vote_at(rival, reporter(4, 4, 1), now),
             Some(rival),
             "strictly more distinct nets may take over"
         );
@@ -302,18 +315,18 @@ mod tests {
         let second = addr(51, 4672);
         let t0 = Instant::now();
 
-        votes.record_vote_at(first, reporter(203, 0, 1), t0);
-        votes.record_vote_at(first, reporter(198, 51, 1), t0);
+        votes.record_vote_at(first, reporter(1, 0, 1), t0);
+        votes.record_vote_at(first, reporter(1, 1, 1), t0);
         assert_eq!(
-            votes.record_vote_at(first, reporter(192, 0, 1), t0),
+            votes.record_vote_at(first, reporter(1, 2, 1), t0),
             Some(first)
         );
 
         let later = t0 + VOTE_TTL + Duration::from_secs(1);
-        votes.record_vote_at(second, reporter(203, 0, 2), later);
-        votes.record_vote_at(second, reporter(198, 51, 2), later);
+        votes.record_vote_at(second, reporter(8, 8, 1), later);
+        votes.record_vote_at(second, reporter(8, 8, 2), later);
         assert_eq!(
-            votes.record_vote_at(second, reporter(192, 0, 2), later),
+            votes.record_vote_at(second, reporter(9, 9, 1), later),
             Some(second),
             "after the old quorum lapses a new address may confirm"
         );
@@ -350,10 +363,10 @@ mod tests {
         let now = Instant::now();
         for i in 0..(MAX_TRACKED_ADDRS as u16 * 3) {
             let reported = SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(203, 0, 113, (i % 250) as u8 + 1),
+                Ipv4Addr::new(8, 8, 8, (i % 250) as u8 + 1),
                 4000 + i,
             ));
-            votes.record_vote_at(reported, reporter(198, 51, 100), now);
+            votes.record_vote_at(reported, reporter(1, 1, 1), now);
         }
         assert!(
             votes.votes.len() <= MAX_TRACKED_ADDRS,

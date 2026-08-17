@@ -755,6 +755,7 @@ pub fn run() {
                 config: Arc::new(RwLock::new(config)),
                 settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
                 restore_import_lock: Arc::new(tokio::sync::Mutex::new(())),
+                picked_backup: Arc::new(tokio::sync::Mutex::new(None)),
                 local_index: local_index.clone(),
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
@@ -1617,6 +1618,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::backup::export_backup,
+            commands::backup::pick_backup_file,
+            commands::backup::clear_picked_backup,
             commands::backup::preview_backup,
             commands::backup::import_backup,
             commands::backup::pending_restore_status,

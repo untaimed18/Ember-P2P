@@ -37,19 +37,29 @@ export interface PendingRestoreStatus {
   files: number;
 }
 
-/** Write an encrypted profile backup to `destPath` (must end in .emberbackup). */
-export async function exportBackup(destPath: string, passphrase: string): Promise<BackupSummary> {
-  return invoke('export_backup', { destPath, passphrase });
+/** Write an encrypted profile backup. The save location is chosen in a native dialog. */
+export async function exportBackup(passphrase: string): Promise<BackupSummary | null> {
+  return invoke('export_backup', { passphrase });
 }
 
-/** Decrypt and inspect a backup without changing anything on disk. */
-export async function previewBackup(sourcePath: string, passphrase: string): Promise<BackupPreview> {
-  return invoke('preview_backup', { sourcePath, passphrase });
+/** Native open-dialog for restore. Returns the display path, or null if cancelled. */
+export async function pickBackupFile(): Promise<string | null> {
+  return invoke('pick_backup_file');
 }
 
-/** Stage a backup's contents; they are swapped in during the next launch. */
-export async function importBackup(sourcePath: string, passphrase: string): Promise<RestoreSummary> {
-  return invoke('import_backup', { sourcePath, passphrase });
+/** Forget a previously picked restore file. */
+export async function clearPickedBackup(): Promise<void> {
+  return invoke('clear_picked_backup');
+}
+
+/** Decrypt and inspect the backup picked via `pickBackupFile`. */
+export async function previewBackup(passphrase: string): Promise<BackupPreview> {
+  return invoke('preview_backup', { passphrase });
+}
+
+/** Stage the picked backup; contents are swapped in during the next launch. */
+export async function importBackup(passphrase: string): Promise<RestoreSummary> {
+  return invoke('import_backup', { passphrase });
 }
 
 /** What the next launch will apply, if anything. */

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -786,6 +786,59 @@ mod tests {
             verify_hashset(&file_hash, &[part_hash], PARTSIZE),
             "single-hash path must not treat PARTSIZE file as small-file MD4(data)"
         );
+    }
+
+    #[test]
+    fn hashset2_aich_pins_when_it_matches_the_expected_root() {
+        let expected = [0x11u8; 20];
+        let mut pinned = None;
+        consider_hashset2_aich_pin(&mut pinned, Some(expected), None, 0, expected);
+        assert_eq!(pinned, Some(expected));
+    }
+
+    #[test]
+    fn hashset2_aich_does_not_first_wins_without_expected_or_votes() {
+        let mut pinned = None;
+        consider_hashset2_aich_pin(&mut pinned, None, None, 0, [0xAAu8; 20]);
+        assert!(pinned.is_none());
+    }
+
+    #[test]
+    fn hashset2_aich_requires_two_sources_when_expected_is_unknown() {
+        let root = [0xBBu8; 20];
+        let mut pinned = None;
+        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        assert!(pinned.is_none());
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        assert!(
+            pinned.is_none(),
+            "the same source repeating a root is still one vote"
+        );
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 1, root);
+        assert_eq!(pinned, Some(root));
+    }
+
+    #[test]
+    fn hashset2_aich_ignores_a_conflicting_root_when_expected_is_known() {
+        let expected = [0x11u8; 20];
+        let mut pinned = None;
+        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
+        consider_hashset2_aich_pin(
+            &mut pinned,
+            Some(expected),
+            Some(&mut votes),
+            0,
+            [0xFFu8; 20],
+        );
+        consider_hashset2_aich_pin(
+            &mut pinned,
+            Some(expected),
+            Some(&mut votes),
+            1,
+            [0xFFu8; 20],
+        );
+        assert!(pinned.is_none());
     }
 
     #[test]
@@ -2074,8 +2127,7 @@ impl Ed2kDownload {
                                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip()
                                             {
                                                 let peer_tcp = self.source_addr.port();
-                                                if peer_tcp > 0
-                                                    && !crate::security::is_bogus_v4(v4)
+                                                if peer_tcp > 0 && !crate::security::is_bogus_v4(v4)
                                                 {
                                                     let _ = event_tx
                                                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -2704,9 +2756,7 @@ impl Ed2kDownload {
                                     if peer_is_ember && !mesh_discovered_emitted {
                                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                                             let peer_tcp = self.source_addr.port();
-                                            if peer_tcp > 0
-                                                && !crate::security::is_bogus_v4(v4)
-                                            {
+                                            if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                                                 let _ = event_tx
                                                     .send(DownloadEvent::EmberPeerDiscovered {
                                                         ip: v4,
@@ -2799,8 +2849,7 @@ impl Ed2kDownload {
                                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip()
                                             {
                                                 let peer_tcp = self.source_addr.port();
-                                                if peer_tcp > 0
-                                                    && !crate::security::is_bogus_v4(v4)
+                                                if peer_tcp > 0 && !crate::security::is_bogus_v4(v4)
                                                 {
                                                     let _ = event_tx
                                                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -3001,15 +3050,23 @@ impl Ed2kDownload {
                                     }
                                     if aich_master_hash.is_none() {
                                         if let Some(root) = resp.aich_master_hash {
-                                            aich_master_hash = Some(root);
-                                            debug!(
-                                                "Got HashSet2 AICH data: master={}, parts={}",
-                                                hex::encode(root),
-                                                resp.aich_part_hashes
-                                                    .as_ref()
-                                                    .map(|p| p.len())
-                                                    .unwrap_or(0)
+                                            consider_hashset2_aich_pin(
+                                                &mut aich_master_hash,
+                                                self.expected_aich_master,
+                                                None,
+                                                0,
+                                                root,
                                             );
+                                            if aich_master_hash == Some(root) {
+                                                debug!(
+                                                    "Got HashSet2 AICH data: master={}, parts={}",
+                                                    hex::encode(root),
+                                                    resp.aich_part_hashes
+                                                        .as_ref()
+                                                        .map(|p| p.len())
+                                                        .unwrap_or(0)
+                                                );
+                                            }
                                         }
                                     }
                                 } else if resp.aich_master_hash.is_some() {
@@ -5569,6 +5626,40 @@ pub(super) fn verify_hashset(
     }
     let computed: [u8; 16] = Md4::digest(&combined).into();
     computed == *file_hash
+}
+
+/// Pin an AICH master from a HashSet2 whose MD4 hashset already verified.
+///
+/// Whole-file ed2k still gates completion, but a first-wins pin poisons
+/// recovery: later AICH answers are ignored if they disagree with the pin.
+/// Catalog `expected` is enough on its own. Otherwise a single source is
+/// not: two distinct `src_idx` values must advertise the same root. When
+/// `expected` is already known, a conflicting HashSet2 root is ignored even
+/// if several sources repeat it.
+pub(super) fn consider_hashset2_aich_pin(
+    pinned: &mut Option<[u8; 20]>,
+    expected: Option<[u8; 20]>,
+    votes: Option<&mut HashMap<[u8; 20], HashSet<usize>>>,
+    src_idx: usize,
+    root: [u8; 20],
+) {
+    if pinned.is_some() {
+        return;
+    }
+    if expected == Some(root) {
+        *pinned = Some(root);
+        return;
+    }
+    if expected.is_some() {
+        return;
+    }
+    let Some(votes) = votes else {
+        return;
+    };
+    votes.entry(root).or_default().insert(src_idx);
+    if votes.get(&root).map(|s| s.len()).unwrap_or(0) >= 2 {
+        *pinned = Some(root);
+    }
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {

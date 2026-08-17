@@ -51,6 +51,7 @@ use zeroize::Zeroizing;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::storage::{paths, secret_store};
+use tauri_plugin_dialog::DialogExt;
 
 const MAGIC: &[u8; 8] = b"EMBRBAK1";
 /// Container format. Bumped only for changes a v1 reader cannot parse.
@@ -721,18 +722,17 @@ fn validate_passphrase(passphrase: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reject paths that are obviously not a user's own document location. The
-/// user picked this path in a save dialog, so this guards against a degenerate
-/// or hostile frontend caller rather than against the user.
-fn validate_destination(raw: &str) -> Result<PathBuf, String> {
-    if raw.len() > MAX_PATH_LEN {
+/// Defense-in-depth after a native save dialog: refuse system directories and
+/// require `.emberbackup`. The dialog itself is the authorization; this does
+/// not accept a renderer-supplied path.
+fn validate_destination(path: &Path) -> Result<PathBuf, String> {
+    if path.to_string_lossy().len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "backup_invalid_destination",
             "File path is too long",
             format!("{MAX_PATH_LEN} bytes"),
         ));
     }
-    let path = PathBuf::from(raw);
     if !path.is_absolute() {
         return Err(coded(
             "backup_invalid_destination",
@@ -782,6 +782,55 @@ fn validate_destination(raw: &str) -> Result<PathBuf, String> {
     Ok(final_path)
 }
 
+fn ensure_backup_extension(mut path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case(BACKUP_EXTENSION) => path,
+        _ => {
+            path.set_extension(BACKUP_EXTENSION);
+            path
+        }
+    }
+}
+
+async fn pick_backup_save_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+    let default_name = format!(
+        "ember-backup-{}.{BACKUP_EXTENSION}",
+        chrono::Utc::now().format("%Y-%m-%d")
+    );
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Ember Backup", &[BACKUP_EXTENSION])
+            .set_file_name(default_name)
+            .blocking_save_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("backup_invalid_destination", "Invalid backup path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("backup_task_failed", "Backup dialog failed", e))?
+}
+
+async fn pick_backup_open_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Ember Backup", &[BACKUP_EXTENSION])
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("backup_invalid_source", "Invalid backup path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("backup_task_failed", "Backup dialog failed", e))?
+}
+
 /// Sibling scratch name for an in-progress export. Sits next to the
 /// destination so the final step is a same-volume rename.
 ///
@@ -807,15 +856,14 @@ fn partial_export_path(dest: &Path) -> PathBuf {
     ))
 }
 
-fn validate_source(raw: &str) -> Result<PathBuf, String> {
-    if raw.len() > MAX_PATH_LEN {
+fn validate_source(path: &Path) -> Result<PathBuf, String> {
+    if path.to_string_lossy().len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "backup_invalid_source",
             "File path is too long",
             format!("{MAX_PATH_LEN} bytes"),
         ));
     }
-    let path = PathBuf::from(raw);
     let canonical = path
         .canonicalize()
         .map_err(|e| coded_ctx("backup_invalid_source", "Cannot open that file", e))?;
@@ -825,18 +873,31 @@ fn validate_source(raw: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Native save-dialog export. The OS dialog *is* the authorization; this
+/// command never accepts a renderer-supplied path.
 #[tauri::command]
 pub async fn export_backup(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    dest_path: String,
+    passphrase: String,
+) -> Result<Option<BackupSummary>, String> {
+    validate_passphrase(&passphrase)?;
+    let Some(picked) = pick_backup_save_path(&app).await? else {
+        return Ok(None);
+    };
+    let dest = validate_destination(&ensure_backup_extension(picked))?;
+    Ok(Some(write_backup(&app, &state, dest, passphrase).await?))
+}
+
+async fn write_backup(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    dest: PathBuf,
     passphrase: String,
 ) -> Result<BackupSummary, String> {
-    validate_passphrase(&passphrase)?;
-    let dest = validate_destination(&dest_path)?;
     let db = state.db.clone();
     let app_version = app.package_info().version.to_string();
-    let data_dir = paths::resolve_data_dir_with_app(&app);
+    let data_dir = paths::resolve_data_dir_with_app(app);
     let passphrase = Zeroizing::new(passphrase);
 
     tokio::task::spawn_blocking(move || {
@@ -869,6 +930,37 @@ pub async fn export_backup(
     })
     .await
     .map_err(|e| coded_ctx("backup_task_failed", "Backup task failed", e))?
+}
+
+/// Native open-dialog for restore. Stores the canonical path server-side so
+/// preview/import cannot be aimed at an arbitrary readable file.
+#[tauri::command]
+pub async fn pick_backup_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let Some(picked) = pick_backup_open_path(&app).await? else {
+        return Ok(None);
+    };
+    let source = validate_source(&picked)?;
+    let display = source.to_string_lossy().into_owned();
+    *state.picked_backup.lock().await = Some(source);
+    Ok(Some(display))
+}
+
+#[tauri::command]
+pub async fn clear_picked_backup(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    *state.picked_backup.lock().await = None;
+    Ok(())
+}
+
+async fn require_picked_backup(state: &AppState) -> Result<PathBuf, String> {
+    state.picked_backup.lock().await.clone().ok_or_else(|| {
+        coded(
+            "backup_invalid_source",
+            "Choose a backup file before restoring",
+        )
+    })
 }
 
 // --- Restore ----------------------------------------------------------------
@@ -1083,10 +1175,10 @@ pub async fn discard_pending_restore(
 #[tauri::command]
 pub async fn preview_backup(
     app: tauri::AppHandle,
-    source_path: String,
+    state: tauri::State<'_, AppState>,
     passphrase: String,
 ) -> Result<BackupPreview, String> {
-    let source = validate_source(&source_path)?;
+    let source = require_picked_backup(&state).await?;
     let data_dir = paths::resolve_data_dir_with_app(&app);
     let passphrase = Zeroizing::new(passphrase);
 
@@ -1128,7 +1220,6 @@ pub async fn preview_backup(
 pub async fn import_backup(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    source_path: String,
     passphrase: String,
 ) -> Result<RestoreSummary, String> {
     // `restore-pending` has a fixed name because startup must discover it
@@ -1136,11 +1227,11 @@ pub async fn import_backup(
     // transaction so independent IPC calls cannot interleave files or delete
     // one another's incomplete directory.
     let _restore_import_guard = state.restore_import_lock.lock().await;
-    let source = validate_source(&source_path)?;
+    let source = require_picked_backup(&state).await?;
     let data_dir = paths::resolve_data_dir_with_app(&app);
     let passphrase = Zeroizing::new(passphrase);
 
-    tokio::task::spawn_blocking(move || {
+    let summary = tokio::task::spawn_blocking(move || {
         let staging = staging_dir(&data_dir);
         if staging.exists() {
             // Only a directory with a readable marker is a real pending
@@ -1191,7 +1282,9 @@ pub async fn import_backup(
         result
     })
     .await
-    .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))?
+    .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))??;
+    *state.picked_backup.lock().await = None;
+    Ok(summary)
 }
 
 /// Write the restored files into the staging directory, re-wrapping secrets
@@ -1642,10 +1735,10 @@ mod tests {
     fn destination_must_be_an_emberbackup_file() {
         let dir = scratch("dest");
         let bad = dir.join("profile.zip");
-        let err = validate_destination(&bad.to_string_lossy()).unwrap_err();
+        let err = validate_destination(&bad).unwrap_err();
         assert!(err.contains("backup_invalid_destination"), "{err}");
         let good = dir.join("profile.emberbackup");
-        assert!(validate_destination(&good.to_string_lossy()).is_ok());
+        assert!(validate_destination(&good).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
