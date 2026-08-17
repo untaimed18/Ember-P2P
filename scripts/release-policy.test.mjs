@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
@@ -49,6 +50,37 @@ function policyFixture() {
   return fixture;
 }
 
+/**
+ * A policy fixture in a throwaway git repository carrying exactly `tags`.
+ *
+ * The version-ahead ratchet reads `git tag` from the root it is handed, so a
+ * test that runs it against the real checkout gets opposite answers depending
+ * on where that checkout sits: on `main` the version is ahead of the newest
+ * tag, while the release workflow builds from the tag itself, where the version
+ * equals it. Owning the tags keeps both situations reachable from either one.
+ */
+function taggedFixture(tags) {
+  const fixture = policyFixture();
+  const git = (...args) =>
+    execFileSync("git", args, { cwd: fixture, stdio: "ignore" });
+  git("init", "--quiet");
+  git("add", "--all");
+  git(
+    "-c",
+    "user.email=tests@ember.invalid",
+    "-c",
+    "user.name=Ember policy tests",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--quiet",
+    "--message",
+    "policy fixture",
+  );
+  for (const tag of tags) git("tag", tag);
+  return fixture;
+}
+
 function writeManifestFixture(fixture, platformUrl) {
   const artifactPath = join(fixture, "Ember_1.2.3_x64-setup.nsis.zip");
   const artifact = Buffer.from("safe local updater fixture");
@@ -89,32 +121,74 @@ test("a branch ref is not mistaken for a release tag", () => {
   // non-release run with "expected vX.Y.Z, got main", which is why the
   // version-ahead ratchet had never actually run anywhere.
   const original = process.env.GITHUB_REF_NAME;
+  const fixture = taggedFixture(["v0.0.1"]);
   try {
-    for (const ref of ["main", "42/merge", "release-1.5.6"]) {
+    for (const ref of ["main", "42/merge", `release-${packageVersion}`]) {
       process.env.GITHUB_REF_NAME = ref;
-      const result = verifyReleasePolicy({ root });
+      const result = verifyReleasePolicy({ root: fixture });
       assert.equal(result.version, packageVersion);
-      if (result.latestTag) {
-        assert.equal(
-          result.versionAdvanced,
-          true,
-          `${ref} must leave the version-ahead comparison switched on`,
-        );
-      }
+      assert.equal(result.latestTag, "0.0.1");
+      assert.equal(
+        result.versionAdvanced,
+        true,
+        `${ref} must leave the version-ahead comparison switched on`,
+      );
     }
 
     // A real tag still selects release semantics: the version has to equal it,
     // so the ahead-of comparison is skipped rather than run against itself.
     process.env.GITHUB_REF_NAME = `v${packageVersion}`;
-    assert.equal(verifyReleasePolicy({ root }).versionAdvanced, false);
+    assert.equal(
+      verifyReleasePolicy({ root: fixture }).versionAdvanced,
+      false,
+    );
 
     // And a tag-shaped ref that disagrees with the manifests is still caught.
     process.env.GITHUB_REF_NAME = "v0.0.1";
-    assert.throws(() => verifyReleasePolicy({ root }), /release tag: expected/);
+    assert.throws(
+      () => verifyReleasePolicy({ root: fixture }),
+      /release tag: expected/,
+    );
   } finally {
     if (original === undefined) delete process.env.GITHUB_REF_NAME;
     else process.env.GITHUB_REF_NAME = original;
+    rmSync(fixture, { recursive: true, force: true });
   }
+});
+
+test("a release build is not failed by the tag it is releasing", () => {
+  // The release workflow checks out `vX.Y.Z`, so the declared version equals
+  // the newest tag. Asserting branch semantics against the live checkout meant
+  // this suite demanded the version be *ahead* of the tag being cut, and the
+  // v1.5.6 verify job failed here before a build or a signature ever started.
+  const original = process.env.GITHUB_REF_NAME;
+  const fixture = taggedFixture([`v${packageVersion}`]);
+  try {
+    process.env.GITHUB_REF_NAME = `v${packageVersion}`;
+    const result = verifyReleasePolicy({ root: fixture });
+    assert.equal(result.latestTag, packageVersion);
+    assert.equal(result.versionAdvanced, false);
+
+    // Off the tag the very same tree is a version that was already released,
+    // which is exactly what the ratchet exists to stop.
+    process.env.GITHUB_REF_NAME = "main";
+    assert.throws(
+      () => verifyReleasePolicy({ root: fixture }),
+      /is not ahead of the latest release tag/,
+    );
+  } finally {
+    if (original === undefined) delete process.env.GITHUB_REF_NAME;
+    else process.env.GITHUB_REF_NAME = original;
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("the real checkout passes in whichever context CI runs it", () => {
+  // Both CI workflows run this suite: `main` and pull requests off a tag, the
+  // release workflow on one. Neither may be a checkout the suite fails on.
+  const result = verifyReleasePolicy({ root });
+  assert.equal(result.version, packageVersion);
+  assert.equal(result.securityEpoch, 1);
 });
 
 test("security epoch stays aligned between workflow and updater", () => {
