@@ -591,10 +591,10 @@ impl EmberDht {
 
     /// Whether a record can ever be carried in a batch at all.
     ///
-    /// A single `STORE_RECORD` accepts a larger body than a batch can hold,
-    /// so a record between the two limits would stall a batch forever. The
-    /// publisher uses this to skip such a record rather than let it block the
-    /// ones behind it.
+    /// Admission is now the FOUND_VALUE pack budget, which also fits a
+    /// one-record batch, so a freshly stored body always returns true. Kept
+    /// so a stale queued record (or a future encoder bug) is skipped rather
+    /// than stalling every record behind it.
     pub fn record_fits_a_batch(record_len: usize) -> bool {
         /// The leading record-count byte every batch payload carries.
         const COUNT_BYTE: usize = 1;
@@ -989,7 +989,18 @@ impl EmberDht {
                         out.responses
                             .push(messages::encode_message(&ack, &self.signing_key, true));
                     }
-                    StoreOutcome::Replay => out.store_replay_rejected = true,
+                    StoreOutcome::Replay => {
+                        // Same as STORE_BATCH: a replay means we already hold
+                        // this exact signed record, which is what the publisher
+                        // wanted. Silence here made buddy PROXY_STORE fan-out
+                        // and any other single-STORE path time out a replica
+                        // that was already placed (lost ACK, overlapping
+                        // buddies, a retry inside the 60s window).
+                        out.store_replay_rejected = true;
+                        let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
+                        out.responses
+                            .push(messages::encode_message(&ack, &self.signing_key, true));
+                    }
                     // A record that fails to parse/verify, whose key does not
                     // match its content, or (for a non-firewalled source)
                     // whose claimed IP doesn't match the sender, is dropped
@@ -1992,6 +2003,73 @@ mod tests {
         assert_eq!(parsed.file_name, "ubuntu.iso");
         assert_eq!(parsed.file_size, 4096);
         assert_eq!(parsed.keyword_hash, key);
+    }
+
+    /// A second identical STORE_RECORD inside the replay window must still
+    /// STORE_ACK. Batch already treated replay as placed; the single-STORE
+    /// path used by buddy fan-out used to stay silent, so a lost ACK or a
+    /// retry retired a replica that was already sitting in the store.
+    #[test]
+    fn a_store_record_replay_still_acks() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(20, 4672);
+        let b_addr = addr(21, 4672);
+
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
+        let key = record.keyword_hash;
+        let (store_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        assert!(
+            b.handle_message(&store_bytes, a_addr, a_noise, 1000)
+                .stored_record
+        );
+
+        let replay = b.handle_message(&store_bytes, a_addr, a_noise, 1001);
+        assert!(
+            replay.store_replay_rejected,
+            "the identical signature is a replay"
+        );
+        assert!(
+            !replay.stored_record,
+            "replay is not a new store"
+        );
+        assert_eq!(
+            replay.responses.len(),
+            1,
+            "the publisher still needs a STORE_ACK"
+        );
+        let on_a = a.handle_message(&replay.responses[0], b_addr, b_noise, 1002);
+        assert_eq!(on_a.store_ack_request_id, Some(store_rid));
+        assert_eq!(b.store_stats(), (1, 1), "the live store is unchanged");
+    }
+
+    /// A record at the STORE body cap must still pack into FOUND_VALUE as a
+    /// singleton. That is the whole point of tying the two budgets together.
+    #[test]
+    fn a_max_size_store_record_is_served_on_find_value() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(20, 4672);
+
+        let name_budget =
+            messages::MAX_STORE_RECORD_BYTES - super::super::publish::RECORD_HEADER_LEN;
+        let name = "n".repeat(name_budget);
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, &name);
+        assert_eq!(record.data.len(), messages::MAX_STORE_RECORD_BYTES);
+        let key = record.keyword_hash;
+        let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        assert!(
+            b.handle_message(&store_bytes, a_addr, a_noise, 1000)
+                .stored_record
+        );
+
+        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(on_b.find_value_hit, "the max-size record must be answerable");
+        assert_eq!(on_b.responses.len(), 1);
     }
 
     /// A node holding more records under one keyword than a datagram can carry

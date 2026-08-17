@@ -547,6 +547,20 @@ impl DhtStore {
         created_at: i64,
         attributed_ip: Option<std::net::Ipv4Addr>,
     ) -> bool {
+        // A body that cannot pack into a FOUND_VALUE even as the only blob
+        // would store-but-hide: live under the key, skipped by the packer,
+        // and if every live record is oversized the peer answers FOUND_NODE
+        // as if the key were empty. Decode already refuses these; this
+        // covers store_own_record and restore, which never go through the wire.
+        if data.len() > super::messages::MAX_STORE_RECORD_BYTES {
+            debug!(
+                "DHT store: rejecting {}-byte record for key {} (max {})",
+                data.len(),
+                hex::encode(key),
+                super::messages::MAX_STORE_RECORD_BYTES
+            );
+            return false;
+        }
         if !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
@@ -1344,6 +1358,22 @@ mod tests {
         assert_eq!(store.key_count(), 8);
         assert!(store.get(&far).is_none());
         assert_eq!(store.reject_stats().key_cap, 1);
+    }
+
+    /// A body that cannot pack into a FOUND_VALUE even as the only blob must
+    /// not enter the store: that is the store-but-hide case, and store_own_record
+    /// / restore never pass through wire decode.
+    #[test]
+    fn an_unservable_record_body_is_refused() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let data = vec![0xCCu8; super::super::messages::MAX_STORE_RECORD_BYTES + 1];
+        let sig = sign(&sk, &data);
+        assert!(
+            !store.store([0x11; 16], data, sig, pk, now_ts()),
+            "a body past the FOUND_VALUE pack budget must not be stored"
+        );
+        assert_eq!(store.key_count(), 0);
     }
 
     /// The refusal above has to stay cheap. A flood aimed at distant keys is
