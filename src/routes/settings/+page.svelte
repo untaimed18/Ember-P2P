@@ -28,6 +28,8 @@
     discardPendingRestore,
     exportBackup,
     importBackup,
+    pickBackupFile,
+    clearPickedBackup,
     pendingRestoreStatus,
     previewBackup,
     type BackupPreview,
@@ -237,6 +239,7 @@
     restoreSource = null;
     restorePreview = null;
     restorePassphrase = '';
+    void clearPickedBackup();
   }
 
   async function handleExportBackup() {
@@ -245,25 +248,14 @@
       showBackupMsg(m.settings_backup_passphrase_mismatch(), true);
       return;
     }
-    let dest: string | null = null;
-    try {
-      const { save } = await import('@tauri-apps/plugin-dialog');
-      dest = await save({
-        defaultPath: `ember-backup-${new Date().toISOString().slice(0, 10)}.emberbackup`,
-        filters: [{ name: m.settings_backup_file_kind(), extensions: ['emberbackup'] }],
-      });
-    } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_export_failed()), true);
-      return;
-    }
-    if (!dest) return;
-    // Not every platform's save dialog appends the filter's extension, and the
-    // backend insists on it. Adding it here beats rejecting the user's choice.
-    if (!dest.toLowerCase().endsWith('.emberbackup')) dest = `${dest}.emberbackup`;
     backupBusy = true;
     showBackupMsg(m.settings_backup_exporting(), false);
     try {
-      const summary = await exportBackup(dest, backupPassphrase);
+      const summary = await exportBackup(backupPassphrase);
+      if (!summary) {
+        backupMessage = null;
+        return;
+      }
       backupPassphrase = '';
       backupPassphraseConfirm = '';
       showBackupMsg(
@@ -283,12 +275,7 @@
 
   async function handlePickBackupFile() {
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        multiple: false,
-        directory: false,
-        filters: [{ name: m.settings_backup_file_kind(), extensions: ['emberbackup'] }],
-      });
+      const selected = await pickBackupFile();
       if (typeof selected === 'string') {
         restoreSource = selected;
         restorePreview = null;
@@ -306,7 +293,7 @@
     backupBusy = true;
     showBackupMsg(m.settings_backup_reading(), false);
     try {
-      restorePreview = await previewBackup(restoreSource, restorePassphrase);
+      restorePreview = await previewBackup(restorePassphrase);
       backupMessage = null;
       if (restorePreview.schema_too_new) {
         showBackupMsg(m.settings_backup_schema_too_new(), true);
@@ -324,7 +311,7 @@
     backupBusy = true;
     showBackupMsg(m.settings_backup_restoring(), false);
     try {
-      restoreStaged = await importBackup(restoreSource, restorePassphrase);
+      restoreStaged = await importBackup(restorePassphrase);
       clearRestoreState();
       backupMessage = null;
       await refreshPendingRestore();

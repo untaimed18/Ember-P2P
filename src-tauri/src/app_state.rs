@@ -67,6 +67,9 @@ pub struct AppState {
     /// staging directory is intentionally stable so startup can find it, so
     /// overlapping imports must never write into it concurrently.
     pub restore_import_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Canonical path of a backup the user picked in a native open dialog.
+    /// Preview and import consume this rather than a renderer-supplied path.
+    pub picked_backup: Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
     pub local_index: Arc<RwLock<LocalIndex>>,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub transfer_manager: Arc<RwLock<TransferManager>>,

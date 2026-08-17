@@ -124,7 +124,7 @@ pub struct DhtInbound {
     /// A verified `PROXY_STORE` the caller should fan out via the normal
     /// publish driver (buddy-assisted firewalled source publish).
     /// Carries the wire `request_id` so the caller can ACK only after
-    /// `start_publish` succeeds.
+    /// `start_publish_to` succeeds.
     pub proxy_store_forward: Option<(u32, SignedRecord)>,
 }
 
@@ -1056,7 +1056,7 @@ impl EmberDht {
                 // bind the requester to the publisher identity
                 // (`sender_id == BLAKE3(publisher_key)`) so a third party
                 // cannot amplify someone else's record. ACK is deferred to
-                // the network loop until `start_publish` actually starts.
+                // the network loop until `start_publish_to` actually starts.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
                     let is_fw_source = parsed.record_type == RECORD_TYPE_SOURCE
                         && parsed

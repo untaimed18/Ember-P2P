@@ -95,12 +95,13 @@ impl FirewallChecker {
         self.external_ip_votes.clear();
         // Also drop the previously confirmed IP so this cycle must re-confirm
         // it. Without this a changed external IP (new ISP lease, reconnect)
-        // could stick forever: `handle_server_highid_response` keeps the old
-        // value on its `Some(existing)` branch, and a new IP that never reaches
-        // the 3-distinct-/24 KAD threshold would never replace it. Consumers
-        // (`external_ip()`) only ever overwrite `state.external_ip` on a fresh
-        // confirmation and never blank it, so the last-known IP is retained
-        // during the ~30s re-confirmation window.
+        // could stick forever: KAD votes only fill `state.external_ip` when it
+        // is still unset, so a stale KAD confirmation that never reaches the
+        // 3-distinct-/24 threshold again would never replace a previous vote.
+        // HighID/STUN remain authoritative and are not blanked here.
+        // Consumers (`external_ip()`) only ever overwrite `state.external_ip`
+        // on a fresh confirmation when it is still `None`, so the last-known
+        // IP is retained during the ~30s re-confirmation window.
         self.confirmed_external_ip = None;
         // Preserve external_udp_port from previous cycle so UDP firewall
         // probes can be dispatched immediately without waiting for new pongs.
@@ -143,12 +144,7 @@ impl FirewallChecker {
     /// and pass the reporter's source IP so we can enforce distinct-voter
     /// (distinct-/24) confirmation.
     pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr, reporter: Ipv4Addr) {
-        if reported_ip.is_private()
-            || reported_ip.is_loopback()
-            || reported_ip.is_unspecified()
-            || reported_ip.is_broadcast()
-            || reported_ip.is_link_local()
-        {
+        if crate::security::is_special_use_v4(reported_ip) {
             debug!("Ignoring private/reserved external IP vote: {reported_ip}");
             return;
         }
@@ -211,17 +207,12 @@ impl FirewallChecker {
 
     /// Trusted-source path: the ed2k server we're connected to told us our
     /// HighID. The server is one reporter so distinct-/24 voting can't
-    /// apply, but we still treat it as confirmatory evidence alongside
-    /// any KAD-side `handle_firewalled_response` votes. If we already have
-    /// a conflicting KAD-confirmed IP we keep ours (the log message
-    /// records the disagreement).
+    /// apply, but a TCP connect-back from a user-chosen server beats KAD
+    /// votes: three colluding /24s must not pin a bogus `external_ip` that
+    /// then blocks HighID from correcting it. RFC1918 is allowed (LAN
+    /// servers); documentation / class-E / loopback are not.
     pub fn handle_server_highid_response(&mut self, reported_ip: Ipv4Addr) {
-        if reported_ip.is_private()
-            || reported_ip.is_loopback()
-            || reported_ip.is_unspecified()
-            || reported_ip.is_broadcast()
-            || reported_ip.is_link_local()
-        {
+        if crate::security::is_bogus_v4(reported_ip) {
             return;
         }
         match self.confirmed_external_ip {
@@ -232,8 +223,9 @@ impl FirewallChecker {
             }
             Some(existing) if existing == reported_ip => {}
             Some(existing) => {
-                info!("Ed2k server reports a different external IP than KAD-confirmed; keeping KAD-confirmed value");
-                debug!("Server reported {reported_ip} vs KAD-confirmed {existing}");
+                info!("Ed2k server HighID replacing KAD-confirmed external IP");
+                debug!("Server reported {reported_ip} vs previous {existing}");
+                self.confirmed_external_ip = Some(reported_ip);
             }
         }
     }
@@ -446,5 +438,59 @@ mod tests {
         assert_eq!(fw.tcp_status(), FirewallStatus::Unknown);
         fw.note_tcp_firewalled();
         assert_eq!(fw.tcp_status(), FirewallStatus::Firewalled);
+    }
+
+    #[test]
+    fn firewalled_response_rejects_documentation_and_cgnat() {
+        let mut fw = FirewallChecker::new();
+        let reporters = [
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ];
+        for reporter in reporters {
+            fw.handle_firewalled_response(Ipv4Addr::new(203, 0, 113, 50), reporter);
+            fw.handle_firewalled_response(Ipv4Addr::new(100, 64, 0, 1), reporter);
+            fw.handle_firewalled_response(Ipv4Addr::new(240, 0, 0, 1), reporter);
+        }
+        assert!(fw.external_ip().is_none());
+    }
+
+    #[test]
+    fn server_highid_replaces_conflicting_kad_confirmation() {
+        let mut fw = FirewallChecker::new();
+        let kad = Ipv4Addr::new(203, 0, 113, 1);
+        let highid = Ipv4Addr::new(8, 8, 8, 8);
+        fw.handle_firewalled_response(kad, Ipv4Addr::new(1, 0, 0, 1));
+        fw.handle_firewalled_response(kad, Ipv4Addr::new(1, 1, 0, 1));
+        fw.handle_firewalled_response(kad, Ipv4Addr::new(1, 2, 0, 1));
+        assert!(
+            fw.external_ip().is_none(),
+            "documentation IPs must not confirm via KAD"
+        );
+
+        let kad_public = Ipv4Addr::new(4, 4, 4, 4);
+        fw.handle_firewalled_response(kad_public, Ipv4Addr::new(1, 0, 0, 1));
+        fw.handle_firewalled_response(kad_public, Ipv4Addr::new(1, 1, 0, 1));
+        fw.handle_firewalled_response(kad_public, Ipv4Addr::new(1, 2, 0, 1));
+        assert_eq!(fw.external_ip(), Some(kad_public));
+
+        fw.handle_server_highid_response(highid);
+        assert_eq!(fw.external_ip(), Some(highid));
+    }
+
+    #[test]
+    fn server_highid_rejects_bogus_addresses() {
+        let mut fw = FirewallChecker::new();
+        fw.handle_server_highid_response(Ipv4Addr::new(203, 0, 113, 1));
+        fw.handle_server_highid_response(Ipv4Addr::new(127, 0, 0, 1));
+        fw.handle_server_highid_response(Ipv4Addr::new(240, 0, 0, 1));
+        assert!(fw.external_ip().is_none());
+        fw.handle_server_highid_response(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(
+            fw.external_ip(),
+            Some(Ipv4Addr::new(10, 0, 0, 5)),
+            "LAN HighID from a local server is adoptable"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1493,10 +1493,11 @@ impl MultiSourceDownload {
             }
         };
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
-        // Seed from EPX/cache when available; otherwise first verified
-        // HashSet2 peer to provide a master wins (see HashSet2 handler).
-        let shared_aich_master: Arc<RwLock<Option<[u8; 20]>>> =
-            Arc::new(RwLock::new(self.trusted_aich_master));
+        // Seed from EPX/cache when available. HashSet2 pins only when the
+        // catalog expected root matches, or two distinct sources agree
+        // (see `consider_hashset2_aich_pin`).
+        let shared_aich_master =
+            SharedAichPin::new(self.trusted_aich_master, self.expected_aich_master);
         if self.trusted_aich_master.is_some() {
             debug!(
                 "Seeded trusted AICH master for multi-source download {}",
@@ -3887,6 +3888,24 @@ async fn install_verified_part_hashes(
     }
 }
 
+/// Transfer-scoped AICH master pin shared by every per-source download task.
+#[derive(Clone)]
+struct SharedAichPin {
+    master: Arc<RwLock<Option<[u8; 20]>>>,
+    expected: Option<[u8; 20]>,
+    votes: Arc<RwLock<HashMap<[u8; 20], HashSet<usize>>>>,
+}
+
+impl SharedAichPin {
+    fn new(trusted: Option<[u8; 20]>, expected: Option<[u8; 20]>) -> Self {
+        Self {
+            master: Arc::new(RwLock::new(trusted)),
+            expected,
+            votes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
 async fn download_parts_from_source(
     _src_idx: usize,
     source: &DownloadSource,
@@ -3902,7 +3921,7 @@ async fn download_parts_from_source(
     bw: Arc<BandwidthLimiter>,
     progress_tx: mpsc::Sender<(usize, i64)>,
     shared_part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
-    shared_aich_master: Arc<RwLock<Option<[u8; 20]>>>,
+    shared_aich_master: SharedAichPin,
     active_count: Arc<AtomicU32>,
     queued_count: Arc<AtomicU32>,
     source_mgr: Option<Arc<RwLock<SourceManager>>>,
@@ -5128,9 +5147,7 @@ async fn download_parts_from_source(
                                     if hello_caps.is_ember && !mesh_discovered_emitted {
                                         if let std::net::IpAddr::V4(v4) = addr.ip() {
                                             let peer_tcp = addr.port();
-                                            if peer_tcp > 0
-                                                && !crate::security::is_bogus_v4(v4)
-                                            {
+                                            if peer_tcp > 0 && !crate::security::is_bogus_v4(v4) {
                                                 if let Some(ref etx) = event_tx {
                                                     let _ = etx
                                                         .send(DownloadEvent::EmberPeerDiscovered {
@@ -6345,9 +6362,16 @@ async fn download_parts_from_source(
                                         .await;
                                     }
                                     if let Some(root) = resp.aich_master_hash {
-                                        let mut am = shared_aich_master.write().await;
-                                        if am.is_none() {
-                                            *am = Some(root);
+                                        {
+                                            let mut am = shared_aich_master.master.write().await;
+                                            let mut votes = shared_aich_master.votes.write().await;
+                                            super::transfer::consider_hashset2_aich_pin(
+                                                &mut am,
+                                                shared_aich_master.expected,
+                                                Some(&mut votes),
+                                                _src_idx,
+                                                root,
+                                            );
                                         }
                                         if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
                                             debug!(
@@ -7797,7 +7821,7 @@ async fn download_parts_from_source(
                         root_hash.copy_from_slice(&payload[18..38]);
                         let recovery_data = &payload[38..];
                         if ans_hash == *file_hash && ans_part == part_idx {
-                            let aich_master_hash = *shared_aich_master.read().await;
+                            let aich_master_hash = *shared_aich_master.master.read().await;
                             let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
                             if master_ok {
                                 aich_recovery_data = Some((root_hash, recovery_data.to_vec()));
@@ -8586,7 +8610,7 @@ async fn download_parts_from_source(
 
                         let mut recovery_bytes: Option<Vec<u8>> =
                             aich_recovery_data.as_ref().map(|(_, d)| d.clone());
-                        let master_opt = *shared_aich_master.read().await;
+                        let master_opt = *shared_aich_master.master.read().await;
                         if let Some(master_hash) = master_opt {
                             if recovery_bytes.is_none() && peer_supports_aich {
                                 let aich_should_try = if let std::net::IpAddr::V4(v4) = addr.ip() {

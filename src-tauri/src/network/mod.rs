@@ -549,9 +549,7 @@ fn apply_udp_mapping_keepalive(
         }
         state.stats.stun_keepalive_active = true;
         if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
-            if state.external_ip.is_none() {
-                set_external_ip(state, Some(ip));
-            }
+            adopt_stun_mapped_external_ip(state, ip);
         }
         return true;
     }
@@ -590,9 +588,7 @@ fn apply_udp_mapping_keepalive(
         .store(port, std::sync::atomic::Ordering::Relaxed);
 
     if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(mapped) {
-        if state.external_ip.is_none() {
-            set_external_ip(state, Some(ip));
-        }
+        adopt_stun_mapped_external_ip(state, ip);
         if state.nat_info.external_addr != Some(mapped) {
             state.nat_info.external_addr = Some(mapped);
             state.nat_info.last_probed = std::time::Instant::now();
@@ -748,9 +744,7 @@ fn apply_tcp_mapping_keepalive(
             state.external_tcp_port = Some(port);
             state.stats.public_tcp_port = port;
             if let Some(ip) = ember::mapping_keepalive::ipv4_from_mapped(addr) {
-                if state.external_ip.is_none() {
-                    set_external_ip(state, Some(ip));
-                }
+                adopt_stun_mapped_external_ip(state, ip);
             }
             update_publish_manager_state(state);
         } else {
@@ -1109,6 +1103,18 @@ fn check_and_record_udp_epx_rate(
 /// Returns the *previous* pubkey only when a conflicting advertise was
 /// rejected (caller may log a poison/rotation attempt). Returns `None`
 /// on first insert or same-key refresh.
+fn cache_bound_ember_noise_key(
+    map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    ip: Ipv4Addr,
+    udp_port: u16,
+    noise_pub: [u8; 32],
+) -> Option<[u8; 32]> {
+    if udp_port == 0 || noise_pub == [0u8; 32] || crate::security::is_bogus_v4(ip) {
+        return None;
+    }
+    record_ember_noise_key(map, ip, udp_port, noise_pub)
+}
+
 fn record_ember_noise_key(
     map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     ip: Ipv4Addr,
@@ -1233,7 +1239,9 @@ fn kad_bridge_candidates_at(
     }
     let mut candidates: Vec<(Ipv4Addr, u16, [u8; 32], std::time::Instant)> = noise_keys
         .iter()
-        .filter(|(key, _)| bridge_retry_due(attempted, key, now))
+        .filter(|(key, _)| {
+            !crate::security::is_bogus_v4(key.0) && bridge_retry_due(attempted, key, now)
+        })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
     candidates.sort_by(|a, b| b.3.cmp(&a.3));
@@ -1262,7 +1270,7 @@ fn harvest_ember_noise_keys(
         let Some(npub) = s.ember_noise_pub else {
             continue;
         };
-        if record_ember_noise_key(noise_keys, s.ip, s.udp_port, npub).is_some() {
+        if cache_bound_ember_noise_key(noise_keys, s.ip, s.udp_port, npub).is_some() {
             debug!(
                 "Ignoring conflicting KAD ember_npub for {}:{} (first-seen key pinned until TTL)",
                 s.ip, s.udp_port
@@ -1323,7 +1331,11 @@ fn xx_bridge_candidates_at(
     }
     let mut candidates: Vec<(Ipv4Addr, u16, std::time::Instant)> = keyless
         .iter()
-        .filter(|(key, _)| bridge_retry_due(attempted, key, now) && !noise_keys.contains_key(*key))
+        .filter(|(key, _)| {
+            !crate::security::is_bogus_v4(key.0)
+                && bridge_retry_due(attempted, key, now)
+                && !noise_keys.contains_key(*key)
+        })
         .map(|(key, seen)| (key.0, key.1, *seen))
         .collect();
     candidates.sort_by(|a, b| b.2.cmp(&a.2));
@@ -6275,11 +6287,10 @@ mod tests {
         ember_file_hash: [u8; 32],
         last_octet: u8,
     ) -> Vec<u8> {
-        let rec = ember::dht::publish::SignedRecord::source(
+        ember_source_blob_contact(
+            sk,
             file_hash,
             ember_file_hash,
-            1,
-            "shared.iso",
             ember::dht::publish::SourceContact {
                 ip: Ipv4Addr::new(1, 2, 3, last_octet),
                 tcp_port: 4662,
@@ -6287,6 +6298,21 @@ mod tests {
                 flags: 0,
                 noise_pub: [0u8; 32],
             },
+        )
+    }
+
+    fn ember_source_blob_contact(
+        sk: &ed25519_dalek::SigningKey,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        contact: ember::dht::publish::SourceContact,
+    ) -> Vec<u8> {
+        let rec = ember::dht::publish::SignedRecord::source(
+            file_hash,
+            ember_file_hash,
+            1,
+            "shared.iso",
+            contact,
             sk,
         );
         let mut blob = rec.data.clone();
@@ -7272,6 +7298,74 @@ mod tests {
         assert_eq!(content_hashes.get(&file_hash), Some(&honest_digest));
     }
 
+    #[test]
+    fn firewalled_source_records_do_not_cache_noise_keys() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let file_hash = [0x42u8; 16];
+        let victim = Ipv4Addr::new(8, 8, 8, 8);
+        let attacker_key = [0xAAu8; 32];
+        let blob = ember_source_blob_contact(
+            &sk,
+            file_hash,
+            [0u8; 32],
+            ember::dht::publish::SourceContact {
+                ip: victim,
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: ember::SOURCE_FLAG_FIREWALLED,
+                noise_pub: attacker_key,
+            },
+        );
+        let mut diag = crate::types::EmberDiagnostics::default();
+        let mut noise_keys = HashMap::new();
+        let mut content_hashes = HashMap::new();
+        let sources = parse_ember_source_records(
+            &[blob],
+            file_hash,
+            None,
+            &mut diag,
+            &mut noise_keys,
+            &mut content_hashes,
+        );
+        assert_eq!(sources.len(), 1);
+        assert!(
+            noise_keys.is_empty(),
+            "unbound firewalled contacts must not pin Noise keys"
+        );
+    }
+
+    #[test]
+    fn highid_source_records_cache_bound_noise_keys() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
+        let file_hash = [0x43u8; 16];
+        let ip = Ipv4Addr::new(8, 8, 4, 4);
+        let key = [0xBBu8; 32];
+        let blob = ember_source_blob_contact(
+            &sk,
+            file_hash,
+            [0u8; 32],
+            ember::dht::publish::SourceContact {
+                ip,
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: key,
+            },
+        );
+        let mut diag = crate::types::EmberDiagnostics::default();
+        let mut noise_keys = HashMap::new();
+        let mut content_hashes = HashMap::new();
+        parse_ember_source_records(
+            &[blob],
+            file_hash,
+            None,
+            &mut diag,
+            &mut noise_keys,
+            &mut content_hashes,
+        );
+        assert_eq!(lookup_ember_noise_key(&noise_keys, ip, 4672), Some(key));
+    }
+
     /// The digest seeded at `StartDownload` from the UI / known.met / a hash we
     /// computed ourselves outranks the DHT however many publishers disagree.
     #[test]
@@ -7470,6 +7564,65 @@ mod tests {
     }
 
     #[test]
+    fn cache_bound_ember_noise_key_rejects_bogus_and_zero_key() {
+        let mut map = HashMap::new();
+        let key = [0xAAu8; 32];
+        assert!(cache_bound_ember_noise_key(
+            &mut map,
+            Ipv4Addr::new(203, 0, 113, 1),
+            4672,
+            key
+        )
+        .is_none());
+        assert!(cache_bound_ember_noise_key(
+            &mut map,
+            Ipv4Addr::new(8, 8, 8, 8),
+            0,
+            key
+        )
+        .is_none());
+        assert!(cache_bound_ember_noise_key(
+            &mut map,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4672,
+            [0u8; 32]
+        )
+        .is_none());
+        assert!(map.is_empty());
+        assert!(cache_bound_ember_noise_key(
+            &mut map,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4672,
+            key
+        )
+        .is_none());
+        assert_eq!(lookup_ember_noise_key(&map, Ipv4Addr::new(8, 8, 8, 8), 4672), Some(key));
+    }
+
+    #[test]
+    fn stun_may_replace_a_kad_vote_but_not_a_live_highid() {
+        let stun = Ipv4Addr::new(8, 8, 8, 8);
+        let kad = Ipv4Addr::new(4, 4, 4, 4);
+        let highid = Ipv4Addr::new(1, 1, 1, 1);
+        assert!(should_adopt_stun_external_ip(None, stun, None));
+        assert!(should_adopt_stun_external_ip(Some(kad), stun, None));
+        assert!(
+            !should_adopt_stun_external_ip(Some(highid), stun, Some(highid)),
+            "a TCP HighID must not be displaced by a UDP STUN mapping"
+        );
+        assert!(!should_adopt_stun_external_ip(Some(stun), stun, None));
+        assert!(!should_adopt_stun_external_ip(
+            None,
+            Ipv4Addr::new(203, 0, 113, 1),
+            None
+        ));
+        assert!(
+            should_adopt_stun_external_ip(Some(kad), stun, Some(highid)),
+            "HighID that has not yet been applied must not block STUN from replacing KAD"
+        );
+    }
+
+    #[test]
     fn record_ember_noise_key_accepts_new_key_after_ttl() {
         let mut map = HashMap::new();
         let ip = Ipv4Addr::new(1, 2, 3, 4);
@@ -7524,6 +7677,19 @@ mod tests {
 
         // max == 0 → no work.
         assert!(kad_bridge_candidates(&map, &empty, 0).is_empty());
+    }
+
+    #[test]
+    fn kad_bridge_candidates_skip_documentation_addresses() {
+        let mut map: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let docs = Ipv4Addr::new(203, 0, 113, 50);
+        let ok = Ipv4Addr::new(8, 8, 8, 8);
+        record_ember_noise_key(&mut map, docs, 4672, [0xAA; 32]);
+        record_ember_noise_key(&mut map, ok, 4672, [0xBB; 32]);
+        let empty: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let picked = kad_bridge_candidates(&map, &empty, 8);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0, ok);
     }
 
     /// A peer we already hold a Noise key for must go through the 1-RTT IK
@@ -10503,6 +10669,9 @@ async fn send_ember_bridge_ping(
     udp_port: u16,
     noise_pub: Option<&[u8; 32]>,
 ) -> bool {
+    if crate::security::is_bogus_v4(ip) {
+        return false;
+    }
     let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
     let (_wire_req_id, frame) = state.ember_dht.build_ping();
     let sent = match state
@@ -20733,7 +20902,7 @@ pub async fn start_network(
                                     // dialed, so skip caching it.
                                     if let Some(npub) = s.ember_noise_pub {
                                         if s.udp_port != 0 {
-                                            if let Some(_pinned) = record_ember_noise_key(
+                                            if let Some(_pinned) = cache_bound_ember_noise_key(
                                                 &mut state.ember_noise_keys,
                                                 s.ip,
                                                 s.udp_port,
@@ -22503,8 +22672,11 @@ pub async fn start_network(
                     state.stats.tcp_status = format!("{:?}", tcp_status);
                     state.stats.udp_status = format!("{:?}", udp_status);
                     if let Some(ip) = state.firewall_checker.external_ip() {
-                        set_external_ip(&mut state, Some(ip));
-                        state.stats.external_ip = ip.to_string();
+                        // KAD votes fill a gap; they must not displace HighID or STUN.
+                        if state.external_ip.is_none() {
+                            set_external_ip(&mut state, Some(ip));
+                            state.stats.external_ip = ip.to_string();
+                        }
                     }
                     info!("Firewall check result: TCP={:?} UDP={:?} (ports tcp={} udp={})",
                         tcp_status, udp_status, state.tcp_port, state.udp_port);
@@ -28310,13 +28482,14 @@ pub async fn start_network(
                                         state.firewall_checker.handle_tcp_connect_back();
                                         let ip_bytes = client_id.to_le_bytes();
                                         let ext_ip = Ipv4Addr::from(ip_bytes);
-                                        if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
-                                            if state.external_ip.is_none()
-                                                || state.external_ip == Some(ext_ip)
-                                            {
-                                                set_external_ip(&mut state, Some(ext_ip));
-                                                state.stats.external_ip = ext_ip.to_string();
-                                            }
+                                        if !ext_ip.is_unspecified()
+                                            && !crate::security::is_bogus_v4(ext_ip)
+                                        {
+                                            // HighID is a TCP connect-back from a
+                                            // user-chosen server; it replaces a
+                                            // conflicting KAD/Ember vote.
+                                            set_external_ip(&mut state, Some(ext_ip));
+                                            state.stats.external_ip = ext_ip.to_string();
                                             state
                                                 .firewall_checker
                                                 .handle_server_highid_response(ext_ip);
@@ -28370,8 +28543,7 @@ pub async fn start_network(
                                             let ext_ip = Ipv4Addr::from(
                                                 server_reported_ip.to_le_bytes(),
                                             );
-                                            if !ext_ip.is_unspecified()
-                                                && !ext_ip.is_loopback()
+                                            if !crate::security::is_special_use_v4(ext_ip)
                                                 && state.external_ip.is_none()
                                             {
                                                 set_external_ip(&mut state, Some(ext_ip));
@@ -29344,18 +29516,16 @@ pub async fn start_network(
                             let ip_bytes = our_id.to_le_bytes();
                             let ext_ip = Ipv4Addr::from(ip_bytes);
                             info!("Server HighID reports our IP as {}", ext_ip);
-                            if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
+                            if !crate::security::is_bogus_v4(ext_ip) {
                                 let was_none = state.external_ip.is_none();
-                                if was_none {
-                                    set_external_ip(&mut state, Some(ext_ip));
-                                    state.stats.external_ip = ext_ip.to_string();
-                                    info!("External IP set from server HighID: {}", ext_ip);
-                                } else if state.external_ip == Some(ext_ip) {
-                                    set_external_ip(&mut state, Some(ext_ip));
-                                    state.stats.external_ip = ext_ip.to_string();
-                                } else {
-                                    info!("Server HighID IP {} differs from current external IP {:?} — not overwriting", ext_ip, state.external_ip);
+                                if state.external_ip != Some(ext_ip) {
+                                    info!(
+                                        "External IP set from server HighID: {} (was {:?})",
+                                        ext_ip, state.external_ip
+                                    );
                                 }
+                                set_external_ip(&mut state, Some(ext_ip));
+                                state.stats.external_ip = ext_ip.to_string();
                                 // Server HighID is a single trusted report; route it
                                 // through the dedicated 1-arg path rather than the
                                 // KAD-peer-vote path (which requires a reporter IP
@@ -29401,9 +29571,7 @@ pub async fn start_network(
                                 // firewalled status here beyond note_tcp_firewalled above;
                                 // this only teaches us our external IP.
                                 let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
-                                if !ext_ip.is_unspecified()
-                                    && !ext_ip.is_loopback()
-                                    && !ext_ip.is_private()
+                                if !crate::security::is_special_use_v4(ext_ip)
                                     && state.external_ip.is_none()
                                 {
                                     set_external_ip(&mut state, Some(ext_ip));
@@ -30729,6 +30897,10 @@ pub async fn start_network(
                 nat_probe_in_flight = false;
                 nat_probe_started_at = None;
                 nat_probe_packet_tx = None;
+                let probe_mapped_v4 = result.info.external_addr.and_then(|a| match a.ip() {
+                    std::net::IpAddr::V4(ip) => Some(ip),
+                    std::net::IpAddr::V6(_) => None,
+                });
                 state.nat_info = result.info;
                 // A STUN keep-alive-confirmed mapping is more current than
                 // whatever this probe found (or failed to find) — restore it
@@ -30751,19 +30923,10 @@ pub async fn start_network(
                 } else {
                     nat_probe_backoff_until = None;
                 }
-                // Adopt STUN-mapped IPv4 when we have no other confirmed public
-                // IP yet (Ember-only HighID path before KAD/eD2K learn one).
-                if state.external_ip.is_none() {
-                    if let Some(addr) = state.nat_info.external_addr {
-                        if let std::net::IpAddr::V4(ip) = addr.ip() {
-                            set_external_ip(&mut state, Some(ip));
-                            state.stats.external_ip = ip.to_string();
-                            info!(
-                                "NAT probe ({}): learned external IP {} via STUN",
-                                result.reason, ip
-                            );
-                        }
-                    }
+                // STUN may replace a KAD/Ember vote that won the startup race.
+                // A live HighID is left alone (TCP connect-back vs UDP mapping).
+                if let Some(ip) = probe_mapped_v4 {
+                    adopt_stun_mapped_external_ip(&mut state, ip);
                 }
                 if let Some(ext_ip) = state.external_ip {
                     if state.nat_info.apply_highid_fallback(
@@ -34009,6 +34172,57 @@ fn can_advertise_direct_udp_callback(state: &NetworkState) -> bool {
 /// The routing table is updated here too: KAD contact UDP keys are bound to our
 /// public address, so a table left on a stale IP would judge every stored key
 /// against the wrong one.
+/// HighID from a live ed2k server TCP connect-back, if it is a plausible IP.
+fn live_highid_external_ip(state: &NetworkState) -> Option<Ipv4Addr> {
+    if !state.server_connected || state.low_id {
+        return None;
+    }
+    if state.server_client_id < ed2k::server::LOWID_THRESHOLD {
+        return None;
+    }
+    let ip = Ipv4Addr::from(state.server_client_id.to_le_bytes());
+    if crate::security::is_bogus_v4(ip) {
+        return None;
+    }
+    Some(ip)
+}
+
+/// Whether a STUN-mapped IPv4 should become `external_ip`.
+///
+/// STUN is a first-party measurement and may replace a KAD/Ember vote that
+/// won the startup race. It must not replace a live HighID: that address was
+/// proven by TCP connect-back and can differ from the UDP mapping.
+fn should_adopt_stun_external_ip(
+    current: Option<Ipv4Addr>,
+    stun_ip: Ipv4Addr,
+    highid: Option<Ipv4Addr>,
+) -> bool {
+    if crate::security::is_bogus_v4(stun_ip) {
+        return false;
+    }
+    if current == Some(stun_ip) {
+        return false;
+    }
+    if let Some(highid) = highid {
+        if current == Some(highid) {
+            return false;
+        }
+    }
+    true
+}
+
+fn adopt_stun_mapped_external_ip(state: &mut NetworkState, ip: Ipv4Addr) {
+    if !should_adopt_stun_external_ip(state.external_ip, ip, live_highid_external_ip(state)) {
+        return;
+    }
+    info!(
+        "External IP set from STUN: {} (was {:?})",
+        ip, state.external_ip
+    );
+    set_external_ip(state, Some(ip));
+    state.stats.external_ip = ip.to_string();
+}
+
 fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
@@ -35178,7 +35392,12 @@ fn parse_ember_source_records(
             continue;
         }
         if sc.udp_port != 0 && sc.noise_pub != [0u8; 32] {
-            let _ = record_ember_noise_key(noise_keys, sc.ip, sc.udp_port, sc.noise_pub);
+            // Firewalled contacts skip the STORE IP-bind, so their claimed
+            // address is unauthenticated. Caching that (ip, udp) → noise_pub
+            // would let a publisher eclipse Noise_IK to a third party.
+            if sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
+                let _ = cache_bound_ember_noise_key(noise_keys, sc.ip, sc.udp_port, sc.noise_pub);
+            }
         }
         out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
     }
@@ -37166,7 +37385,7 @@ async fn handle_ember_dht_message(
 
     // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
     // source record out via the normal publish driver. ACK only after
-    // start_publish succeeds so the publisher is not told "ok" when the
+    // start_publish_to succeeds so the publisher is not told "ok" when the
     // local publish queue is full.
     if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
         let key = forward.keyword_hash;
@@ -39997,16 +40216,18 @@ async fn handle_udp_packet_inner(
             // `firewall_checker.tentative_ip()` (see below) without
             // mutating shared state.
             let prev_ip = state.external_ip;
-            if let Some(confirmed) = state.firewall_checker.external_ip() {
-                set_external_ip(state, Some(confirmed));
-                state.stats.external_ip = confirmed.to_string();
-                if prev_ip != Some(confirmed) {
-                    info!(
-                        "External IP changed: {:?} -> {} (KAD confirmed, {} votes)",
-                        prev_ip,
-                        confirmed,
-                        state.firewall_checker.ip_vote_count()
-                    );
+            if state.external_ip.is_none() {
+                if let Some(confirmed) = state.firewall_checker.external_ip() {
+                    set_external_ip(state, Some(confirmed));
+                    state.stats.external_ip = confirmed.to_string();
+                    if prev_ip != Some(confirmed) {
+                        info!(
+                            "External IP changed: {:?} -> {} (KAD confirmed, {} votes)",
+                            prev_ip,
+                            confirmed,
+                            state.firewall_checker.ip_vote_count()
+                        );
+                    }
                 }
             }
 
