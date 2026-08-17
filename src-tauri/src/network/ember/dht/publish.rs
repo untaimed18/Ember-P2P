@@ -6,11 +6,41 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use ed25519_dalek::SigningKey;
 use tracing::{debug, trace, warn};
 
+use super::messages;
 use super::routing::RoutingTable;
 use super::search::keyword_hash;
 use super::{EmberContact, EmberNodeId, K_BUCKET_SIZE};
 use crate::network::ember::channel;
 use crate::network::ember::crypto;
+
+/// Longest file name that still leaves a keyword or source record inside
+/// [`messages::MAX_STORE_RECORD_BYTES`], so we never sign a body a storer
+/// would accept and a `FOUND_VALUE` packer would then skip.
+fn max_encoded_name_bytes(has_source_contact: bool) -> usize {
+    let extra = if has_source_contact {
+        SOURCE_CONTACT_WIRE_LEN
+    } else {
+        0
+    };
+    messages::MAX_STORE_RECORD_BYTES
+        .saturating_sub(RECORD_HEADER_LEN)
+        .saturating_sub(extra)
+}
+
+/// Truncate `file_name` on a UTF-8 boundary so the encoded body fits the
+/// FOUND_VALUE pack budget.
+fn clamp_name_to_record_budget(file_name: &str, has_source_contact: bool) -> &str {
+    let max = max_encoded_name_bytes(has_source_contact);
+    let bytes = file_name.as_bytes();
+    if bytes.len() <= max {
+        return file_name;
+    }
+    let mut end = max;
+    while end > 0 && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
 
 /// Maximum concurrent publish operations.
 const MAX_ACTIVE_PUBLISHES: usize = 128;
@@ -377,8 +407,9 @@ impl SignedRecord {
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
+        let file_name = clamp_name_to_record_budget(file_name, source_contact.is_some());
         let name_bytes = file_name.as_bytes();
-        let name_len = name_bytes.len().min(u16::MAX as usize);
+        let name_len = name_bytes.len();
 
         let mut data = Vec::with_capacity(
             1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + SOURCE_CONTACT_WIRE_LEN,
@@ -906,10 +937,29 @@ impl PublishManager {
     /// then stores on them.
     /// Returns `None` when the active-publish cap is reached so the
     /// caller can surface a "busy" state instead of unbounded growth.
+    ///
+    /// Table-local closest is only a fallback for tests and callers that have
+    /// no lookup cache. Production publish (library batch and PROXY_STORE)
+    /// passes the set [`start_publish_to`] so records land where searchers walk.
     pub fn start_publish(
         &mut self,
         record: SignedRecord,
         routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        let dht_key = EmberNodeId(record.keyword_hash);
+        let targets = routing_table.find_closest_prefer_verified(&dht_key, K_BUCKET_SIZE);
+        self.start_publish_to(record, targets)
+    }
+
+    /// Start a publish onto an already-resolved target set.
+    ///
+    /// Used by buddy `PROXY_STORE` and the harness so they share the same
+    /// lookup-backed replica set as library keyword/source publish, instead of
+    /// storing only on whoever happens to sit in this node's table.
+    pub fn start_publish_to(
+        &mut self,
+        record: SignedRecord,
+        targets: Vec<EmberContact>,
     ) -> Option<u32> {
         if self.operations.len() >= MAX_ACTIVE_PUBLISHES {
             warn!(
@@ -918,9 +968,6 @@ impl PublishManager {
             );
             return None;
         }
-
-        let dht_key = EmberNodeId(record.keyword_hash);
-        let targets = routing_table.find_closest_prefer_verified(&dht_key, K_BUCKET_SIZE);
 
         if targets.len() < MIN_STORE_NODES {
             debug!(
@@ -1449,5 +1496,60 @@ mod tests {
             parsed_ok > 0,
             "the fuzz never produced a buffer that reached the channel record parsers"
         );
+    }
+
+    #[test]
+    fn start_publish_to_uses_the_supplied_targets_not_the_table() {
+        use super::super::routing::RoutingTable;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let local = EmberNodeId([0u8; 16]);
+        let rt = RoutingTable::new(local, false);
+        let supplied = EmberContact {
+            node_id: EmberNodeId([0x77; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 7, 1, 1)), 4662),
+            noise_pub: [0x77; 32],
+            ed25519_pub: [0x77; 32],
+            last_seen: chrono::Utc::now().timestamp(),
+            failed_queries: 0,
+        };
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::keyword("test", [0xAA; 16], [0xBB; 32], 1000, "file.txt", &sk);
+
+        let mut pm = PublishManager::new();
+        let pub_id = pm
+            .start_publish_to(record, vec![supplied.clone()])
+            .expect("publish slot");
+        let op = pm.get_mut(pub_id).unwrap();
+        let to_store = op.next_to_store();
+        assert_eq!(to_store.len(), 1);
+        assert_eq!(to_store[0].0.node_id, supplied.node_id);
+        assert!(
+            rt.find_closest_prefer_verified(&EmberNodeId([0xAA; 16]), 20)
+                .is_empty(),
+            "the table is empty; the target must have come from start_publish_to"
+        );
+    }
+
+    /// A huge filename used to produce a body the STORE decoder accepted and
+    /// the FOUND_VALUE packer skipped. Encode now clamps so we never sign
+    /// something a searcher cannot be served.
+    #[test]
+    fn a_huge_filename_is_clamped_to_the_found_value_budget() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let huge = "n".repeat(8 * 1024);
+        let record = SignedRecord::keyword("ubuntu", [0xAA; 16], [0xBB; 32], 1, &huge, &sk);
+        assert!(
+            record.data.len() <= super::super::messages::MAX_STORE_RECORD_BYTES,
+            "encoded body {} exceeds the pack budget",
+            record.data.len()
+        );
+        assert_eq!(
+            record.data.len(),
+            super::super::messages::MAX_STORE_RECORD_BYTES
+        );
+        assert!(record.file_name.len() < huge.len());
+        assert!(record.verify());
     }
 }

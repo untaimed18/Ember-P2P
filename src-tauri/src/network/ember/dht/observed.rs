@@ -78,18 +78,32 @@ impl EmberObservedIpVotes {
             }
         }
 
-        let entry = self.votes.entry(reported).or_default();
-        entry.nets.insert(net, now);
-        entry.last_update = Some(now);
-        let quorum = entry.nets.len() >= MIN_OBSERVED_IP_VOTES;
+        let new_count = {
+            let entry = self.votes.entry(reported).or_default();
+            entry.nets.insert(net, now);
+            entry.last_update = Some(now);
+            entry.nets.len()
+        };
+        let quorum = new_count >= MIN_OBSERVED_IP_VOTES;
 
         // Only a genuine transition counts. Re-assigning on every qualifying
         // vote meant whichever address was voted for most recently won, so an
         // attacker could displace a correct confirmation just by repeating
-        // themselves.
+        // themselves. A rival that merely ties the current quorum is the same
+        // trick with more hosts: three coordinated /24s must not overwrite an
+        // address that still has a live quorum. Switch only when nothing is
+        // confirmed (prune already dropped a lapsed one) or the new address
+        // has strictly more distinct nets.
         if quorum && self.confirmed != Some(reported) {
-            self.confirmed = Some(reported);
-            return Some(reported);
+            let current_count = self
+                .confirmed
+                .and_then(|addr| self.votes.get(&addr))
+                .map(|v| v.nets.len())
+                .unwrap_or(0);
+            if current_count == 0 || new_count > current_count {
+                self.confirmed = Some(reported);
+                return Some(reported);
+            }
         }
         None
     }
@@ -242,6 +256,68 @@ mod tests {
             "a repeat vote for the already-confirmed address is not a transition"
         );
         assert_eq!(votes.confirmed(), Some(target));
+    }
+
+    /// A rival address that only ties the live quorum must not displace it.
+    /// Three coordinated public nets used to overwrite `confirmed` on the
+    /// spot, which is enough to move the external IP used for reachability
+    /// and source advertise.
+    #[test]
+    fn a_tied_rival_quorum_does_not_displace_a_live_confirmation() {
+        let mut votes = EmberObservedIpVotes::new();
+        let current = addr(50, 4672);
+        let rival = addr(51, 4672);
+        let now = Instant::now();
+
+        votes.record_vote_at(current, reporter(203, 0, 1), now);
+        votes.record_vote_at(current, reporter(198, 51, 1), now);
+        assert_eq!(
+            votes.record_vote_at(current, reporter(192, 0, 1), now),
+            Some(current)
+        );
+
+        votes.record_vote_at(rival, reporter(203, 0, 2), now);
+        votes.record_vote_at(rival, reporter(198, 51, 2), now);
+        assert_eq!(
+            votes.record_vote_at(rival, reporter(192, 0, 2), now),
+            None,
+            "a 3-net rival must not overwrite a still-backed confirmation"
+        );
+        assert_eq!(votes.confirmed(), Some(current));
+
+        assert_eq!(
+            votes.record_vote_at(rival, reporter(203, 113, 1), now),
+            Some(rival),
+            "strictly more distinct nets may take over"
+        );
+        assert_eq!(votes.confirmed(), Some(rival));
+    }
+
+    /// Once the current confirmation's votes expire, a new address can
+    /// confirm with a fresh three-net quorum — the genuine IP-change case.
+    #[test]
+    fn a_new_address_confirms_after_the_old_quorum_expires() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let second = addr(51, 4672);
+        let t0 = Instant::now();
+
+        votes.record_vote_at(first, reporter(203, 0, 1), t0);
+        votes.record_vote_at(first, reporter(198, 51, 1), t0);
+        assert_eq!(
+            votes.record_vote_at(first, reporter(192, 0, 1), t0),
+            Some(first)
+        );
+
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(203, 0, 2), later);
+        votes.record_vote_at(second, reporter(198, 51, 2), later);
+        assert_eq!(
+            votes.record_vote_at(second, reporter(192, 0, 2), later),
+            Some(second),
+            "after the old quorum lapses a new address may confirm"
+        );
+        assert_eq!(votes.confirmed(), Some(second));
     }
 
     /// The quorum has to be contemporaneous: three votes spread across hours

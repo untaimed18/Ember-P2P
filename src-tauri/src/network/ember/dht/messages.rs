@@ -103,9 +103,37 @@ pub const MAX_UNFRAGMENTED_PAYLOAD: usize =
 /// read that as a timeout and charged the responder a failure, so after three
 /// of them a healthy, well-stocked storer was evicted from the routing table.
 pub const MAX_FOUND_VALUE_RECORD_BYTES: usize = MAX_UNFRAGMENTED_PAYLOAD - 16 - 2;
-/// Maximum STORE / PROXY_STORE record body size. Bounded by what can actually
-/// be delivered rather than a round number larger than the datagram cap.
-pub const MAX_STORE_RECORD_BYTES: usize = MAX_DELIVERABLE_PAYLOAD - 18;
+
+/// Length prefix each `FOUND_VALUE` blob carries on the wire.
+const FOUND_VALUE_BLOB_LEN_PREFIX: usize = 2;
+/// Publisher Ed25519 signature appended to a record body in a `FOUND_VALUE` blob.
+const FOUND_VALUE_BLOB_SIGNATURE_LEN: usize = 64;
+
+/// Maximum STORE / PROXY_STORE / STORE_BATCH record body size.
+///
+/// Bounded by what a `FOUND_VALUE` can pack even as the only blob in the
+/// reply (`2` length prefix + body + `64` signature). The deliverable (~4 KiB)
+/// cap used to admit bodies the unfragmented packer then skipped, so a huge
+/// filename could store-but-hide: live under the key, invisible to searchers,
+/// and if every live record was oversized the peer answered `FOUND_NODE` as
+/// if the key were empty.
+pub const MAX_STORE_RECORD_BYTES: usize = MAX_FOUND_VALUE_RECORD_BYTES
+    .saturating_sub(FOUND_VALUE_BLOB_LEN_PREFIX)
+    .saturating_sub(FOUND_VALUE_BLOB_SIGNATURE_LEN);
+
+/// Maximum `FOUND_VALUE` blob (`record_body || signature`). Distinct from
+/// [`MAX_STORE_RECORD_BYTES`], which is the body alone.
+pub const MAX_FOUND_VALUE_BLOB_BYTES: usize =
+    MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN;
+
+const _: () = assert!(
+    FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
+        <= MAX_FOUND_VALUE_RECORD_BYTES
+);
+const _: () = assert!(
+    1 + 16 + 2 + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
+        <= MAX_UNFRAGMENTED_PAYLOAD
+);
 
 // Address type flags
 const ADDR_IPV4: u8 = 0x04;
@@ -1045,9 +1073,9 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                     anyhow::bail!("FOUND_VALUE truncated (declared {record_count} records)");
                 }
                 let rlen = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-                if rlen > MAX_STORE_RECORD_BYTES {
+                if rlen > MAX_FOUND_VALUE_BLOB_BYTES {
                     anyhow::bail!(
-                        "FOUND_VALUE record length {rlen} exceeds max {MAX_STORE_RECORD_BYTES}"
+                        "FOUND_VALUE record length {rlen} exceeds max {MAX_FOUND_VALUE_BLOB_BYTES}"
                     );
                 }
                 offset += 2;
@@ -1647,5 +1675,72 @@ mod tests {
             "[2001:db8::1]:2000".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(decoded[1].node_id, contacts[1].node_id);
+    }
+
+    /// A STORE body that cannot pack into a FOUND_VALUE even as the only blob
+    /// must be refused at decode, or it stores-but-hides.
+    #[test]
+    fn a_store_body_over_the_found_value_budget_is_refused() {
+        let (sk, id) = test_keypair();
+        let too_big = vec![0u8; MAX_STORE_RECORD_BYTES + 1];
+        let msg = build_store_record(id, 1, [0xAB; 16], too_big, [0u8; 64]);
+        let encoded = encode_message(&msg, &sk, true);
+        assert!(decode_message(&encoded, true).is_err());
+
+        let fits = vec![0u8; MAX_STORE_RECORD_BYTES];
+        let msg = build_store_record(id, 2, [0xAB; 16], fits, [0u8; 64]);
+        let encoded = encode_message(&msg, &sk, true);
+        let decoded = decode_message(&encoded, true).expect("max-size body still decodes");
+        match decoded.payload {
+            DhtPayload::StoreRecord { record, .. } => {
+                assert_eq!(record.len(), MAX_STORE_RECORD_BYTES);
+            }
+            other => panic!("expected StoreRecord, got {other:?}"),
+        }
+    }
+
+    /// FOUND_VALUE blobs are body||signature, so the length prefix is 64
+    /// larger than the STORE body cap. Using MAX_STORE_RECORD_BYTES here
+    /// would reject a perfectly packable singleton.
+    #[test]
+    fn a_found_value_blob_at_the_store_body_cap_still_decodes() {
+        let (sk, id) = test_keypair();
+        let blob = vec![0u8; MAX_FOUND_VALUE_BLOB_BYTES];
+        let msg = DhtMessage {
+            version: EMBER_DHT_VERSION,
+            msg_type: MSG_FOUND_VALUE,
+            request_id: 1,
+            sender_id: id,
+            sender_pub_key: None,
+            payload: DhtPayload::FoundValue {
+                key: [0xCD; 16],
+                records: vec![blob],
+            },
+            signature: [0u8; 64],
+        };
+        let encoded = encode_message(&msg, &sk, true);
+        let decoded = decode_message(&encoded, true).expect("max blob decodes");
+        match decoded.payload {
+            DhtPayload::FoundValue { records, .. } => {
+                assert_eq!(records[0].len(), MAX_FOUND_VALUE_BLOB_BYTES);
+            }
+            other => panic!("expected FoundValue, got {other:?}"),
+        }
+
+        let too_big = vec![0u8; MAX_FOUND_VALUE_BLOB_BYTES + 1];
+        let msg = DhtMessage {
+            version: EMBER_DHT_VERSION,
+            msg_type: MSG_FOUND_VALUE,
+            request_id: 2,
+            sender_id: id,
+            sender_pub_key: None,
+            payload: DhtPayload::FoundValue {
+                key: [0xCD; 16],
+                records: vec![too_big],
+            },
+            signature: [0u8; 64],
+        };
+        let encoded = encode_message(&msg, &sk, true);
+        assert!(decode_message(&encoded, true).is_err());
     }
 }

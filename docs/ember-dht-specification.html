@@ -1129,6 +1129,12 @@ footer.doc-end {
   record_signature  64 B     Ed25519 over <span class="c-white">record</span> only
 </div>
 <p>
+  <code>MAX_STORE_RECORD_BYTES</code> is the largest body that still fits in a
+  <code>FOUND_VALUE</code> as the only blob (pack budget minus the 2-byte
+  length prefix and 64-byte publisher signature). A larger body would store
+  but never be served.
+</p>
+<p>
   <code>STORE_ACK</code> and <code>PROXY_STORE_ACK</code> carry the 16-byte key.
   <code>PROXY_STORE</code> asks a HighID buddy to fan the same publisher-signed
   source record out as ordinary <code>STORE_RECORD</code>s. The buddy’s ack
@@ -1293,7 +1299,7 @@ footer.doc-end {
   <tbody>
     <tr><td>MAX_RECORDS_PER_KEY</td><td>300</td><td>Refuse the newcomer (do not evict incumbents)</td></tr>
     <tr><td>MAX_RECORDS_PER_PUBLISHER_PER_KEY</td><td>45</td><td>Refuse; ~15% of the key, matching KAD’s ratio (150 of 1000)</td></tr>
-    <tr><td>MAX_KEYS</td><td>50,000</td><td>Refuse new keys</td></tr>
+    <tr><td>MAX_KEYS</td><td>50,000</td><td>Evict the furthest key by XOR-distance when the incoming key is closer; refuse a newcomer that is no closer than the furthest held key</td></tr>
     <tr><td>MAX_STORE_BYTES</td><td>48 MiB</td><td>Evict least valuable (furthest from our ID, then nearest expiry)</td></tr>
     <tr><td>Sources per IP (adaptive)</td><td>8 / 5 / 3</td><td>See NetworkScale; firewalled sources attributed to the forwarder</td></tr>
   </tbody>
@@ -1314,6 +1320,14 @@ footer.doc-end {
   the same cap to the same publisher key. A user sharing 200 files that share
   a common word gets 45 of them findable under that word, anywhere — and the
   same allowance applies to their own local store.
+</p>
+<p>
+  <code>MAX_KEYS</code> is not a hard admission freeze. When the map is full,
+  expired keys are dropped first; otherwise the furthest key from this node
+  (XOR-distance) is given up, and only when the incoming key is closer than
+  it. A flood of distant keys therefore cannot deny keys this node is
+  responsible for. Without a local ID there is no notion of responsibility,
+  and a full map refuses newcomers.
 </p>
 
 <h3>7.6 What a FOUND_VALUE blob is</h3>
@@ -1856,6 +1870,8 @@ footer.doc-end {
     <tr><td>TRANSPORT_OVERHEAD</td><td>27</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_UNFRAGMENTED_PAYLOAD</td><td>1253</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_FOUND_VALUE_RECORD_BYTES</td><td>1235</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_STORE_RECORD_BYTES</td><td>1169</td><td>dht/messages.rs — FOUND_VALUE singleton pack budget (1235 − 2 − 64)</td></tr>
+    <tr><td>MAX_FOUND_VALUE_BLOB_BYTES</td><td>1233</td><td>dht/messages.rs — body + 64-byte signature</td></tr>
     <tr><td>MAX_FIND_VALUE_KEYS</td><td>8</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_STORE_BATCH_RECORDS</td><td>64</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_FOUND_VALUE_RECORDS</td><td>300</td><td>dht/messages.rs</td></tr>
