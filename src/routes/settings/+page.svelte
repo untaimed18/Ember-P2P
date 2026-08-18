@@ -1462,6 +1462,24 @@
   $effect(() => {
     if (settings && settings.max_upload_speed === 0 && settings.uss_enabled) {
       settings.uss_enabled = false;
+      // A config that already violated the invariant on disk makes this clear
+      // ours, not an edit: `onMount` snapshots `originalSettings` before
+      // effects flush, so `hasUnsavedChanges` (a JSON diff against it) reported
+      // a phantom unsaved change on a page nobody had touched — enabling
+      // Discard and arming both the beforeunload and beforeNavigate guards.
+      // Fold it into the baseline the way the anti-leech toggle does, patching
+      // only this field. A user-driven switch to Unlimited leaves the baseline
+      // alone (its cap is still non-zero there), so that disable stays a real
+      // unsaved change and is persisted by Save.
+      untrack(() => {
+        if (!originalSettings) return;
+        try {
+          const base = JSON.parse(originalSettings) as AppSettings;
+          if (base.max_upload_speed !== 0 || !base.uss_enabled) return;
+          base.uss_enabled = false;
+          originalSettings = JSON.stringify(base);
+        } catch { /* malformed baseline; leave as-is */ }
+      });
     }
   });
 </script>

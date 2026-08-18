@@ -60,7 +60,7 @@ pub const MAX_PATTERN_LEN: usize = 256;
 /// Maximum AntiLeech.dat size accepted from disk. Real curated lists are
 /// kilobytes; this keeps a corrupted local file from being read fully into
 /// memory during startup or settings reload.
-pub const MAX_FILE_BYTES: u64 = 1 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Memory budget passed to the `regex` crate when compiling a pattern.
 /// 1 MiB is the crate's default, named here so it's auditable in one

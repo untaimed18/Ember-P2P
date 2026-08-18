@@ -57,7 +57,7 @@ fn normalize_hash(hash: &[u8; 16]) -> String {
 }
 
 fn io_other(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.into())
+    io::Error::other(message.into())
 }
 
 impl ShareIntentStore {

@@ -126,6 +126,10 @@ const MAX_SOURCE_ADDRS: usize = 500;
 /// (OP_FILESTATUS), and the most-sighted files on the network sit in the low
 /// thousands of sources, so `u16::MAX` is protocol-plausible and an order of
 /// magnitude above anything real: it never touches an honest row.
+///
+/// Pinned by `scripts/fixtures/merge-contract.json`, the shared source of truth
+/// this and the frontend's mirror in `src/lib/stores/search.ts` are both tested
+/// against (see `merge_contract_fixture` below).
 const MAX_PLAUSIBLE_SOURCES: u32 = u16::MAX as u32;
 
 #[inline]
@@ -528,6 +532,94 @@ mod tests {
             vec![sample("jj", u32::MAX, ORIGIN_SERVER_UDP)],
         );
         assert_eq!(merged[0].availability, MAX_PLAUSIBLE_SOURCES);
+    }
+
+    /// `src/lib/stores/search.ts` mirrors `result_key`, `combine_origin` and
+    /// `MAX_PLAUSIBLE_SOURCES` — it merges the streamed batches a second time,
+    /// per tab — and the two were held together only by a code comment.
+    /// `scripts/fixtures/merge-contract.json` is the shared source of truth for
+    /// the rules that must agree; `scripts/merge-contract.test.mjs` checks the
+    /// TypeScript side against the same file, so a divergence fails on whichever
+    /// side moved.
+    ///
+    /// Only genuinely shared rules are in the fixture. The deliberate
+    /// divergences stay out of it: the frontend takes `max` where `merge_into`
+    /// sums ed2k availability (the backend has already summed within a network),
+    /// it keeps the first name where `merge_search_vecs` elects one by vote, and
+    /// it does not cap `source_addresses`.
+    fn merge_contract_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/fixtures/merge-contract.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("merge-contract.json must be valid JSON")
+    }
+
+    #[test]
+    fn result_key_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        let cases = fixture["result_key_cases"]
+            .as_array()
+            .expect("fixture has result_key_cases");
+        assert!(cases.len() >= 5, "fixture lost its result_key cases");
+        for case in cases {
+            let f = &case["file"];
+            let mut r = sample("", 0, ORIGIN_KAD);
+            r.file.hash = f["hash"].as_str().expect("case hash").to_string();
+            r.file.id = f["id"].as_str().expect("case id").to_string();
+            r.file.path = f["path"].as_str().expect("case path").to_string();
+            r.file.name = f["name"].as_str().expect("case name").to_string();
+            r.file.size = f["size"].as_u64().expect("case size");
+            assert_eq!(
+                result_key(&r),
+                case["key"].as_str().expect("case key"),
+                "{}",
+                case["name"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
+    #[test]
+    fn combine_origin_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        let cases = fixture["combine_origin_cases"]
+            .as_array()
+            .expect("fixture has combine_origin_cases");
+        assert!(cases.len() >= 8, "fixture lost its combine_origin cases");
+        for case in cases {
+            let a = case["a"].as_str().expect("case a");
+            let b = case["b"].as_str().expect("case b");
+            assert_eq!(
+                combine_origin(a, b),
+                case["combined"].as_str().expect("case combined"),
+                "combine_origin({a:?}, {b:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn source_count_ceiling_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        assert_eq!(
+            u64::from(MAX_PLAUSIBLE_SOURCES),
+            fixture["max_plausible_sources"]
+                .as_u64()
+                .expect("fixture has max_plausible_sources"),
+            "the ceiling drifted from the shared contract"
+        );
+        let cases = fixture["clamp_source_count_cases"]
+            .as_array()
+            .expect("fixture has clamp_source_count_cases");
+        assert!(cases.len() >= 4, "fixture lost its clamp cases");
+        for case in cases {
+            let count = case["count"].as_u64().expect("case count");
+            let count = u32::try_from(count).expect("counts are u32 on the wire");
+            assert_eq!(
+                u64::from(clamp_source_count(count)),
+                case["clamped"].as_u64().expect("case clamped"),
+                "clamp_source_count({count})"
+            );
+        }
     }
 
     #[test]

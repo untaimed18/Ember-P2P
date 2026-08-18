@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod buddy;
+pub mod dht_common;
 pub mod firewall;
 pub mod ip_filter;
 pub mod legacy_challenge;

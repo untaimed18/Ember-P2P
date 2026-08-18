@@ -145,7 +145,7 @@ fn random_hex() -> String {
 }
 
 fn io_other(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.into())
+    io::Error::other(message.into())
 }
 
 fn configured_root_keys(configured_roots: &[String]) -> Vec<String> {
@@ -1860,6 +1860,24 @@ pub fn passive_type_agrees(declared_name: &str, actual_target: &Path) -> bool {
     declared == actual && PASSIVE_EXTENSIONS.contains(&actual.as_str())
 }
 
+/// Absolute path to a Windows system binary, e.g. `"explorer.exe"` or
+/// `r"System32\netsh.exe"`.
+///
+/// `CreateProcessW` searches the running executable's directory and the
+/// process working directory *before* `System32`, and the NSIS installer
+/// defaults to a per-user, user-writable install directory — so spawning any
+/// of these by bare name lets a same-user attacker who drops `explorer.exe`
+/// or `netsh.exe` next to `Ember.exe` run their code in our process context.
+/// Note that `explorer.exe` lives in `%SystemRoot%` itself while the rest
+/// live under `System32`, hence the caller-supplied relative path.
+#[cfg(windows)]
+pub(crate) fn windows_system_path(relative: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+    )
+    .join(relative)
+}
+
 #[cfg(windows)]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
@@ -1873,7 +1891,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
         ));
     }
     let clean = value.strip_prefix(r"\\?\").unwrap_or(value);
-    std::process::Command::new("explorer")
+    std::process::Command::new(windows_system_path("explorer.exe"))
         .raw_arg(format!(r#"/select,"{clean}""#))
         .spawn()?;
     Ok(())
@@ -1896,7 +1914,7 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
         Some(rest) => format!(r"\\{rest}"),
         None => value.strip_prefix(r"\\?\").unwrap_or(value).to_string(),
     };
-    opener::open(clean).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    opener::open(clean).map_err(|e| io::Error::other(e.to_string()))
 }
 
 #[cfg(not(target_os = "windows"))]

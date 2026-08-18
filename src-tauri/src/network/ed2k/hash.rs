@@ -30,7 +30,7 @@ pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     if file_size < PARTSIZE {
         0
     } else {
-        file_size.div_ceil(PARTSIZE) as usize + usize::from(file_size % PARTSIZE == 0)
+        file_size.div_ceil(PARTSIZE) as usize + usize::from(file_size.is_multiple_of(PARTSIZE))
     }
 }
 
@@ -303,7 +303,7 @@ pub fn ed2k_hash_bytes(data: &[u8]) -> String {
         chunk_hashes.extend_from_slice(&Md4::digest(chunk));
     }
 
-    if file_size % PARTSIZE == 0 {
+    if file_size.is_multiple_of(PARTSIZE) {
         let empty_hash = Md4::digest([]);
         chunk_hashes.extend_from_slice(&empty_hash);
     }

@@ -188,14 +188,47 @@
     // called `prevent_close`. Closing the dialog is enough.
   }
 
-  function initStores() {
-    return Promise.all([
-      initNetworkStore(),
-      initTransferStore(),
-      initSearchStore(),
-      initFriendsStore(),
-      loadAppSettings(),
-    ]);
+  /**
+   * Start every store; fail only on the ones the shell cannot run without.
+   *
+   * `Promise.all` made startup all-or-nothing. `initTransferStore` and
+   * `initFriendsStore` rethrow when an `await listen(...)` registration fails,
+   * and the `.catch` below then tears every store down behind the blocking
+   * `initError` screen — so one transient failure registering a friend-presence
+   * listener gated the whole app behind a manual retry. The non-essential
+   * stores each fail closed (they unlisten what they registered and reset their
+   * own `initialized` flag), so continuing leaves nothing half-wired, and
+   * `allSettled` also means every listener a store *did* register is in its
+   * `unlisteners` list before any `cleanup*` runs.
+   *
+   * Resolves with the reasons of the non-fatal failures so the caller can
+   * surface them once it knows the shell is still mounted.
+   */
+  async function initStores(): Promise<unknown[]> {
+    // Essential = what the app shell itself reads: the network store backs the
+    // status bar and both polls, and the settings cache gates the wizard, the
+    // close behavior and the update check below. The other three each back one
+    // feature — and transfers keeps its own `list_transfers` poll — so they
+    // degrade to a toast rather than a blank window.
+    const stores: Array<{ init: () => Promise<void>; essential: boolean }> = [
+      { init: initNetworkStore, essential: true },
+      { init: initTransferStore, essential: false },
+      { init: initSearchStore, essential: false },
+      { init: initFriendsStore, essential: false },
+      { init: loadAppSettings, essential: true },
+    ];
+    const outcomes = await Promise.allSettled(stores.map((s) => s.init()));
+    const degraded: unknown[] = [];
+    const fatal: unknown[] = [];
+    for (const [i, outcome] of outcomes.entries()) {
+      if (outcome.status !== 'rejected') continue;
+      // Log every failure before deciding, so an essential one doesn't hide
+      // the rest from the devtools console.
+      console.error('Store initialization failed:', outcome.reason);
+      (stores[i].essential ? fatal : degraded).push(outcome.reason);
+    }
+    if (fatal.length > 0) throw fatal[0];
+    return degraded;
   }
 
   // The `close-requested`, `config-corrupt-recovered`, and
@@ -393,11 +426,18 @@
     };
 
     initStores()
-      .then(async () => {
+      .then(async (degraded) => {
         if (mounted) {
           stopPoll = startStatsPoll();
           stopTransferPoll = startTransferPoll();
           initialized = true;
+          // A store that couldn't register its listeners keeps its feature
+          // degraded until the next launch, so say so — non-blockingly, since
+          // the rest of the app is usable. `layout_init_failed` is reused
+          // deliberately: its "restart the app" advice is the remedy here too.
+          if (degraded.length > 0) {
+            toastError(translateError(degraded[0], m.layout_init_failed()));
+          }
           try {
             // Only consume once we know the shell is still alive. The backend
             // command acknowledges+returns the count atomically — there is no

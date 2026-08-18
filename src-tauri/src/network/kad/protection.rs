@@ -774,7 +774,7 @@ impl FloodProtection {
                 let mut oldest_t: Option<Instant> = None;
                 for cand in [req_op, 0x44, 0x45] {
                     if let Some(&t) = self.request_times.get(&(ip, cand)) {
-                        if oldest_t.map_or(true, |ot| t < ot) {
+                        if oldest_t.is_none_or(|ot| t < ot) {
                             oldest_t = Some(t);
                             oldest_op = Some(cand);
                         }

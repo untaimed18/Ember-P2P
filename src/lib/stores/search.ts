@@ -58,6 +58,21 @@ function newTabId(): string {
   return `t-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }
 
+/*
+ * `resultKey`, `combineOrigin` and `MAX_PLAUSIBLE_SOURCES` below re-implement
+ * rules the backend already has in `src-tauri/src/search/merge.rs` (this store
+ * merges the streamed batches a second time, per tab).
+ * `scripts/fixtures/merge-contract.json` is the shared source of truth for the
+ * parts that must agree, and both sides are tested against it —
+ * `scripts/merge-contract.test.mjs` here, `merge_contract_fixture` there — so a
+ * divergence fails a test instead of shipping.
+ *
+ * That Node test cannot import this module (Svelte-app TypeScript, no bundler on
+ * that path), so it lifts these two function bodies out of the source text and
+ * runs them: keep them pure and closed over nothing, and keep their signatures
+ * on one line. The divergences from Rust *are* deliberate where commented
+ * (availability, filename, address cap) and are deliberately not in the fixture.
+ */
 function resultKey(result: SearchResult): string {
   if (result.file.hash) return result.file.hash;
   if (result.file.id?.startsWith('pending:')) return `nohash-id:${result.file.id}`;
@@ -79,8 +94,9 @@ function combineOrigin(a: string, b: string): string {
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
 
 /** Ranking ceiling for peer-reported counts, matching MAX_PLAUSIBLE_SOURCES in
- * merge.rs. ed2k carries this count as a u16 on the wire, so anything above it
- * is a claim no honest peer can make. */
+ * merge.rs (pinned by `scripts/fixtures/merge-contract.json`). ed2k carries this
+ * count as a u16 on the wire, so anything above it is a claim no honest peer can
+ * make. */
 const MAX_PLAUSIBLE_SOURCES = 65535;
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {

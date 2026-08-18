@@ -1295,7 +1295,19 @@ pub fn build_search_expression_with_node(
 /// (int64 meta) leaf. Used to skip UDP servers lacking `SRV_UDPFLG_LARGEFILES`,
 /// matching eMule's `m_b64BitSearchPacket` gate.
 pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
-    fn walk(data: &[u8], mut pos: usize) -> Option<(bool, usize)> {
+    /// Deepest boolean nesting the walk will follow. The `0x00` arm consumes
+    /// two bytes and recurses twice, so an N-byte run of `0x00` nests N/2 deep
+    /// — a stack overflow, which aborts the process and cannot be contained by
+    /// `panic = "unwind"`. Over-deep input is reported as unparseable, exactly
+    /// like every other malformed shape here. Nothing legitimate comes close:
+    /// `build_search_expression` emits a right-leaning AND chain over at most
+    /// a keyword tree plus four constraint leaves.
+    const MAX_EXPR_DEPTH: u32 = 32;
+
+    fn walk(data: &[u8], mut pos: usize, depth: u32) -> Option<(bool, usize)> {
+        if depth >= MAX_EXPR_DEPTH {
+            return None;
+        }
         if pos >= data.len() {
             return None;
         }
@@ -1308,8 +1320,8 @@ pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
                     return None;
                 }
                 pos += 1; // AND/OR/NOT
-                let (left_64, pos) = walk(data, pos)?;
-                let (right_64, pos) = walk(data, pos)?;
+                let (left_64, pos) = walk(data, pos, depth + 1)?;
+                let (right_64, pos) = walk(data, pos, depth + 1)?;
                 Some((left_64 || right_64, pos))
             }
             0x01 => {
@@ -1371,7 +1383,7 @@ pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
             _ => None,
         }
     }
-    walk(expr, 0).map(|(uses, _)| uses).unwrap_or(false)
+    walk(expr, 0, 0).map(|(uses, _)| uses).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1485,6 +1497,38 @@ mod search_expr_tests {
         assert!(search_expression_uses_64bit(&with_64));
         assert!(!search_expression_uses_64bit(&with_32));
         assert!(!search_expression_uses_64bit(&string_leaf("movie")));
+    }
+
+    fn u64_size_leaf() -> Vec<u8> {
+        let mut v = vec![0x08];
+        v.extend_from_slice(&((u32::MAX as u64) + 1).to_le_bytes());
+        v.push(ED2K_SEARCH_OP_LESS_EQUAL);
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.push(TAG_FILESIZE);
+        v
+    }
+
+    #[test]
+    fn deeply_nested_expression_is_rejected_instead_of_overflowing_the_stack() {
+        // Every two `0x00` bytes are one more level of boolean nesting, so this
+        // would recurse ~2000 deep without the depth cap. Must come back as
+        // "unparseable" (false) rather than abort the process.
+        let deep = vec![0x00u8; 4096];
+        assert!(!search_expression_uses_64bit(&deep));
+    }
+
+    #[test]
+    fn nesting_within_the_depth_limit_still_reaches_the_last_leaf() {
+        // Sixteen AND joints — far deeper than `build_search_expression` ever
+        // emits, still inside the budget, so the trailing int64 leaf is found.
+        let mut expr = Vec::new();
+        for _ in 0..16 {
+            expr.push(0x00);
+            expr.push(0x00);
+            expr.extend(string_leaf("a"));
+        }
+        expr.extend(u64_size_leaf());
+        assert!(search_expression_uses_64bit(&expr));
     }
 
     #[test]

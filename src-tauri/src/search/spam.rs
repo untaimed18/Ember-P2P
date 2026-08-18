@@ -983,7 +983,7 @@ impl SpamFilter {
             reasons.push(format!("Source IP seen in spam hits (+{SPAM_SOURCE_HIT})"));
         }
 
-        if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
+        if let Some(sip) = server_ip.and_then(extract_ip) {
             if self.db.spam_server_ips.contains(&sip) {
                 let total_sources = result
                     .source_addresses

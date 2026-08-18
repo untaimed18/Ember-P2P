@@ -676,45 +676,19 @@ impl Ed2kServerConnection {
         }
     }
 
-    /// Send a search request to the server (fire-and-forget).
-    /// The result will arrive asynchronously via `poll_messages()` as `ServerEvent::SearchResult`.
-    /// This does NOT block waiting for a response, so other server events continue flowing.
-    #[allow(dead_code)]
-    pub async fn send_search_async(&mut self, query: &str) -> anyhow::Result<()> {
-        let payload = build_search_request(query);
-        info!(
-            "Sending OP_SEARCHREQUEST ({} bytes payload) for query '{}'",
-            payload.len(),
-            query
-        );
-        self.write_packet(OP_SEARCHREQUEST, &payload).await?;
-        Ok(())
-    }
-
     /// Send a pre-built search expression (AND tree or single keyword) as
     /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
     /// format for reliable results across all eD2K servers.
+    ///
+    /// The result arrives asynchronously via `poll_messages()` as
+    /// `ServerEvent::SearchResult`; this does not block waiting for it, so
+    /// other server events continue flowing.
     pub async fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
         info!(
             "Sending OP_SEARCHREQUEST expression ({} bytes payload)",
             expr.len(),
         );
         self.write_packet(OP_SEARCHREQUEST, expr).await?;
-        Ok(())
-    }
-
-    /// Send a boolean search expression tree to the server.
-    #[allow(dead_code)]
-    pub async fn send_search_expression_async(
-        &mut self,
-        expr: &SearchExpression,
-    ) -> anyhow::Result<()> {
-        let payload = build_search_tree(expr);
-        info!(
-            "Sending OP_SEARCHREQUEST boolean tree ({} bytes payload)",
-            payload.len()
-        );
-        self.write_packet(OP_SEARCHREQUEST, &payload).await?;
         Ok(())
     }
 
@@ -1709,6 +1683,9 @@ fn write_uint32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+// The plain single-keyword OP_SEARCHREQUEST payload. Kept because
+// `existing_simple_search_unchanged` pins these bytes: live searches always
+// send the AND-tree form, so nothing outside the tests builds one.
 #[allow(dead_code)]
 fn build_search_request(query: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1723,7 +1700,10 @@ fn build_search_request(query: &str) -> Vec<u8> {
 // Boolean search tree support (L12)
 // ---------------------------------------------------------------------------
 
-// ED2K search comparison operators (SearchFile.h)
+// ED2K search comparison operators (SearchFile.h). `write_search_node` emits
+// only the two `_EQUAL` bounds; the rest complete the operator space so a new
+// `SearchExpression` variant does not have to re-derive the numbering from
+// eMule. Dead outside `cargo test` for the reason given on `SearchExpression`.
 #[allow(dead_code)]
 const ED2K_SEARCH_OP_EQUAL: u8 = 0x00;
 #[allow(dead_code)]
@@ -1737,7 +1717,8 @@ const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 0x04;
 #[allow(dead_code)]
 const ED2K_SEARCH_OP_NOTEQUAL: u8 = 0x05;
 
-// Wire-format node type bytes for the search tree
+// Wire-format node type bytes for the search tree. All read by
+// `write_search_node`, so they are dead only because it is.
 #[allow(dead_code)]
 const SEARCH_BOOL_AND: u8 = 0x00;
 #[allow(dead_code)]
@@ -1751,7 +1732,8 @@ const SEARCH_LEAF_META_STRING: u8 = 0x02;
 #[allow(dead_code)]
 const SEARCH_LEAF_META_UINT32: u8 = 0x03;
 
-// Single-byte tag-name IDs used inside search meta constraints
+// Single-byte tag-name IDs used inside search meta constraints. Read only by
+// `write_search_node`, same as the node bytes above.
 #[allow(dead_code)]
 const FT_FILESIZE_TAG: u8 = 0x02;
 #[allow(dead_code)]
@@ -1766,6 +1748,14 @@ const FT_SOURCES_TAG: u8 = 0x15;
 /// Operators carry two children (prefix notation on the wire: operator byte,
 /// then left subtree, then right subtree).  Leaf nodes encode either a plain
 /// search string or a typed meta-constraint (size, type, extension, sources).
+///
+/// Nothing in a release build constructs one: live searches serialize through
+/// [`crate::network::kad::messages::build_search_expression_with_node`], which
+/// also covers Kad and 64-bit size leaves, and go out via
+/// [`Ed2kServerConnection::send_search_expr_bytes`]. This tree and its helpers
+/// are kept because the `search_tree_*` tests pin the eD2K search wire format
+/// byte for byte, independently of that shared builder — which is what would
+/// catch the shared builder drifting away from what eD2K servers accept.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SearchExpression {
@@ -1782,6 +1772,8 @@ pub enum SearchExpression {
 
 /// Serialize a [`SearchExpression`] tree into the eMule search-request wire
 /// format suitable for use as the payload of an `OP_SEARCHREQUEST` packet.
+///
+/// Called by the `search_tree_*` tests only — see [`SearchExpression`].
 #[allow(dead_code)]
 pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1789,6 +1781,7 @@ pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
     buf
 }
 
+// Reached only through `build_search_tree`, and recursively from itself.
 #[allow(dead_code)]
 fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
     match expr {
@@ -1836,6 +1829,8 @@ fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
 }
 
 /// Find the largest byte index <= max_len that doesn't split a multi-byte UTF-8 codepoint.
+///
+/// Only `write_search_node` calls it.
 #[allow(dead_code)]
 fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
     let mut len = max_len.min(bytes.len());
@@ -1859,6 +1854,8 @@ fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
 }
 
 /// Wire format: `0x03 | value(u32 LE) | comparison_op(u8) | tag_name_len(u16 LE) | tag_name`
+///
+/// Only `write_search_node` calls it.
 #[allow(dead_code)]
 fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_UINT32);
@@ -1869,6 +1866,8 @@ fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: 
 }
 
 /// Wire format: `0x02 | value_len(u16 LE) | value | tag_name_len(u16 LE) | tag_name`
+///
+/// Only `write_search_node` calls it.
 #[allow(dead_code)]
 fn write_search_meta_string(buf: &mut Vec<u8>, value: &str, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_STRING);

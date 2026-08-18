@@ -339,7 +339,7 @@ pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
 /// connection slot is in use). Used by trickle-source rotation to confirm the
 /// slot it would free is actually contended before dropping a slow source.
 fn global_dl_conn_contended() -> bool {
-    GLOBAL_DL_CONN_LIMITER.get().map_or(false, |l| {
+    GLOBAL_DL_CONN_LIMITER.get().is_some_and(|l| {
         l.in_use.load(std::sync::atomic::Ordering::Acquire)
             >= l.desired_max.load(std::sync::atomic::Ordering::Acquire)
     })
@@ -703,8 +703,15 @@ fn injection_wait_action(
     InjectionWaitAction::Continue
 }
 
-/// RAII guard that clears `in_progress` flags on the part tracker when
-/// dropped, preventing stuck parts if a source task exits via `?` or `bail!`.
+/// RAII guard owning ONE source worker's per-part in-progress claims,
+/// releasing them on drop so a task that exits via `?` or `bail!` cannot
+/// leave a part stuck as "somebody is downloading this".
+///
+/// The tracker counts claims rather than storing a flag, and this guard is
+/// the only thing that increments or decrements it. `active` therefore
+/// doubles as the de-duplication set: the pipelined / resumed / stale-skip
+/// paths all re-claim the part they are already working on, and counting
+/// those again would leave a claim behind that nothing releases.
 struct InProgressGuard {
     tracker: Arc<RwLock<PartTracker>>,
     active: Vec<usize>,
@@ -718,14 +725,23 @@ impl InProgressGuard {
         }
     }
 
-    fn mark(&mut self, part_idx: usize) {
-        if !self.active.contains(&part_idx) {
-            self.active.push(part_idx);
+    /// Claim `part_idx` for this source. Idempotent per guard.
+    async fn claim(&mut self, part_idx: usize) {
+        if self.active.contains(&part_idx) {
+            return;
         }
+        self.tracker.write().await.claim_in_progress(part_idx);
+        self.active.push(part_idx);
     }
 
-    fn unmark(&mut self, part_idx: usize) {
-        self.active.retain(|&p| p != part_idx);
+    /// Release this source's claim on `part_idx` while the caller already
+    /// holds the tracker write guard, so the release lands in the same
+    /// critical section as the surrounding gap-map update.
+    fn release_locked(&mut self, part_idx: usize, tracker: &mut PartTracker) {
+        if let Some(pos) = self.active.iter().position(|&p| p == part_idx) {
+            self.active.swap_remove(pos);
+            tracker.release_in_progress(part_idx);
+        }
     }
 }
 
@@ -738,7 +754,7 @@ impl Drop for InProgressGuard {
         let cleared = {
             if let Ok(mut t) = self.tracker.try_write() {
                 for &p in &to_clear {
-                    t.set_in_progress(p, false);
+                    t.release_in_progress(p);
                 }
                 true
             } else {
@@ -750,10 +766,150 @@ impl Drop for InProgressGuard {
             tokio::spawn(async move {
                 let mut t = tracker.write().await;
                 for p in to_clear {
-                    t.set_in_progress(p, false);
+                    t.release_in_progress(p);
                 }
             });
         }
+    }
+}
+
+/// RAII holder for the gap sub-ranges one source worker has taken out of
+/// circulation while it writes them to disk.
+///
+/// The tracker write guard used to span `PartFileWriter::write().await` so
+/// that no other worker could claim the same gap between the
+/// `fillable_subranges` snapshot and the commit. But that write is an mpsc
+/// round-trip to a single per-file writer thread whose FIFO also carries
+/// other workers' `sync_data()` and 9.28 MB `hash_part_md4()` operations, so
+/// the exclusive hold could last an unrelated fsync or MD4 — and every
+/// tracker reader, including the main network event loop, queued behind it.
+///
+/// A reservation keeps the same anti-double-write invariant without the long
+/// hold: reserved sub-ranges are invisible to every other worker's
+/// `reserve_write_subranges` until they are committed or released. Releasing
+/// is mandatory on EVERY exit path — a leaked reservation is a gap no worker
+/// is ever allowed to fill again — hence RAII, mirroring `InProgressGuard`.
+struct WriteReservation {
+    tracker: Arc<RwLock<PartTracker>>,
+    reserved: Vec<(u64, u64)>,
+}
+
+impl WriteReservation {
+    async fn acquire(tracker: &Arc<RwLock<PartTracker>>, start: u64, end: u64) -> Self {
+        let reserved = tracker.write().await.reserve_write_subranges(start, end);
+        Self {
+            tracker: tracker.clone(),
+            reserved,
+        }
+    }
+
+    fn ranges(&self) -> &[(u64, u64)] {
+        &self.reserved
+    }
+
+    /// Commit the first `committed` sub-ranges (the ones that reached disk —
+    /// writes stop at the first failure, so the successes are always a
+    /// prefix) and hand the rest back, in one short critical section.
+    /// Returns the bytes the commit transitioned from missing to present.
+    async fn finish(&mut self, committed: usize) -> u64 {
+        if self.reserved.is_empty() {
+            return 0;
+        }
+        let reserved = std::mem::take(&mut self.reserved);
+        let mut newly_written = 0u64;
+        let mut t = self.tracker.write().await;
+        for (i, &(gs, ge)) in reserved.iter().enumerate() {
+            if i < committed {
+                newly_written = newly_written.saturating_add(t.commit_write_reservation(gs, ge));
+            } else {
+                t.release_write_reservation(gs, ge);
+            }
+        }
+        newly_written
+    }
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let to_release = std::mem::take(&mut self.reserved);
+        if let Ok(mut t) = self.tracker.try_write() {
+            for (s, e) in to_release {
+                t.release_write_reservation(s, e);
+            }
+            return;
+        }
+        let tracker = self.tracker.clone();
+        tokio::spawn(async move {
+            let mut t = tracker.write().await;
+            for (s, e) in to_release {
+                t.release_write_reservation(s, e);
+            }
+        });
+    }
+}
+
+/// Outcome of one reserve → write → commit cycle over a received block.
+struct GapWriteOutcome {
+    /// Sub-ranges that reached disk and were committed to the gap map.
+    written_subranges: Vec<(u64, u64)>,
+    /// Bytes the commit transitioned from missing to present.
+    newly_written: u64,
+    /// Cleared when a non-ENOSPC write error aborted the remaining
+    /// sub-ranges. Earlier successes are still committed.
+    write_ok: bool,
+    /// Set on ENOSPC. The caller raises its own `stage:insufficient_disk`
+    /// error — after the commit has already run, so bytes that did reach
+    /// disk are never left unrepresented in the gap map.
+    disk_full: Option<String>,
+}
+
+/// Write the still-missing sub-ranges of a received block with NO tracker
+/// lock held across the disk I/O. `label` distinguishes the compressed
+/// variant in the log line.
+async fn write_gap_subranges_ms(
+    tracker: &Arc<RwLock<PartTracker>>,
+    output: &super::write_coordinator::PartFileWriter,
+    start: u64,
+    data: &[u8],
+    src_idx: usize,
+    label: &str,
+) -> GapWriteOutcome {
+    let end = start.saturating_add(data.len() as u64);
+    let mut reservation = WriteReservation::acquire(tracker, start, end).await;
+    let mut written_subranges = Vec::with_capacity(reservation.ranges().len());
+    let mut write_ok = true;
+    let mut disk_full = None;
+
+    for &(gs, ge) in reservation.ranges() {
+        let off = (gs - start) as usize;
+        let len = (ge - gs) as usize;
+        match output.write(gs, data[off..off + len].to_vec()).await {
+            Ok(()) => written_subranges.push((gs, ge)),
+            Err(e) => {
+                tracing::warn!(
+                    "source {src_idx}: {label}disk write failed at start={gs} ({len} bytes): {e}"
+                );
+                if e.kind() == std::io::ErrorKind::StorageFull
+                    || super::transfer::is_disk_full_error(&e.to_string())
+                {
+                    disk_full = Some(e.to_string());
+                } else {
+                    write_ok = false;
+                }
+                break;
+            }
+        }
+    }
+
+    let newly_written = reservation.finish(written_subranges.len()).await;
+    GapWriteOutcome {
+        written_subranges,
+        newly_written,
+        write_ok,
+        disk_full,
     }
 }
 
@@ -1044,7 +1200,7 @@ async fn seed_fresh_part_queue_after_requeue(
         let t = tracker.read().await;
         (
             t.completed_parts().to_vec(),
-            t.in_progress.clone(),
+            t.in_progress_flags(),
             t.remaining_count(),
             t.part_count,
             t.part_gap_bytes_vec(),
@@ -1362,7 +1518,7 @@ impl MultiSourceDownload {
                 (
                     t.remaining_count() <= 3 && part_count > 1,
                     t.part_gap_bytes_vec(),
-                    t.in_progress.clone(),
+                    t.in_progress_flags(),
                 )
             };
 
@@ -1884,7 +2040,7 @@ impl MultiSourceDownload {
                         // don't penalize (and eventually evict) a good peer.
                         info!("Source {} ({}): stopped by user", src_idx, fail_ip);
                     } else {
-                        note_disk_full(&init_disk_full, &e);
+                        note_disk_full(&init_disk_full, e);
                         debug!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
                         let _ = fail_etx
                             .send(DownloadEvent::SourceDetail {
@@ -2075,7 +2231,7 @@ impl MultiSourceDownload {
                                 let cs = chunk_selector.read().await;
                                 let t = tracker.read().await;
                                 let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress.clone();
+                                let in_prog = t.in_progress_flags();
                                 let endgame_prefer =
                                     t.remaining_count() <= 3 && t.part_count > 1;
                                 let gap_bytes = t.part_gap_bytes_vec();
@@ -2317,7 +2473,7 @@ impl MultiSourceDownload {
                                 let cs = chunk_selector.read().await;
                                 let t = tracker.read().await;
                                 let completed = t.completed_parts().to_vec();
-                                let in_prog = t.in_progress.clone();
+                                let in_prog = t.in_progress_flags();
                                 let endgame_prefer =
                                     t.remaining_count() <= 3 && t.part_count > 1;
                                 let gap_bytes = t.part_gap_bytes_vec();
@@ -2819,7 +2975,7 @@ impl MultiSourceDownload {
                     let cs = chunk_selector.read().await;
                     let t = tracker.read().await;
                     let completed = t.completed_parts().to_vec();
-                    let in_prog = t.in_progress.clone();
+                    let in_prog = t.in_progress_flags();
                     let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
                     let gap_bytes = t.part_gap_bytes_vec();
                     let avail = if source.available_parts.is_empty() {
@@ -5272,7 +5428,7 @@ async fn download_parts_from_source(
         hello_caps.is_ember,
         hello_caps.mod_version,
         peer_ember_hash
-            .map(|h| hex::encode(h))
+            .map(hex::encode)
             .unwrap_or_else(|| "none".to_string()),
         ember_auth_verified
     );
@@ -5291,7 +5447,7 @@ async fn download_parts_from_source(
                 &mut *writer,
                 OP_EMULEPROT,
                 OP_EMBER_SOURCEEXCHANGE,
-                &*epx_data,
+                &epx_data,
             )
             .await;
             epx_overhead.record_upload((6 + epx_data.len()) as u64);
@@ -5626,7 +5782,7 @@ async fn download_parts_from_source(
                 .min(MAX_PEER_COMMENT_LEN);
             if clen
                 .checked_add(5)
-                .map_or(false, |need| _payload.len() >= need)
+                .is_some_and(|need| _payload.len() >= need)
             {
                 let comment = String::from_utf8_lossy(&_payload[5..5 + clen]).to_string();
                 if let Some(cm) = &comment_mgr {
@@ -5821,7 +5977,7 @@ async fn download_parts_from_source(
                                         &mut *writer,
                                         OP_EMULEPROT,
                                         OP_EMBER_SOURCEEXCHANGE,
-                                        &*epx_data,
+                                        &epx_data,
                                     )
                                     .await
                                     .is_ok()
@@ -5902,7 +6058,7 @@ async fn download_parts_from_source(
                                             &mut *writer,
                                             OP_EMULEPROT,
                                             OP_EMBER_SOURCEEXCHANGE,
-                                            &*epx_data,
+                                            &epx_data,
                                         )
                                         .await
                                         .is_ok()
@@ -6189,7 +6345,7 @@ async fn download_parts_from_source(
             let cs = cs.read().await;
             let t = tracker.read().await;
             let completed = t.completed_parts().to_vec();
-            let in_prog = t.in_progress.clone();
+            let in_prog = t.in_progress_flags();
             let remaining = t.remaining_count();
             let pc = t.part_count;
             let gap_bytes = t.part_gap_bytes_vec();
@@ -6230,10 +6386,7 @@ async fn download_parts_from_source(
                         _src_idx, p
                     );
                     drop(cs);
-                    let mut t = tracker.write().await;
-                    t.set_in_progress(p, true);
-                    drop(t);
-                    ip_guard.mark(p);
+                    ip_guard.claim(p).await;
                     filtered_parts.push(p);
                 }
             }
@@ -6313,7 +6466,7 @@ async fn download_parts_from_source(
                                 hashes.len(),
                                 _src_idx
                             );
-                            if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
+                            if super::transfer::verify_hashset(file_hash, &hashes, file_size) {
                                 install_verified_part_hashes(&shared_part_hashes, &tracker, hashes)
                                     .await;
                             } else {
@@ -6349,7 +6502,7 @@ async fn download_parts_from_source(
                                     .md4_hashes
                                     .as_ref()
                                     .map(|h| {
-                                        super::transfer::verify_hashset(&file_hash, h, file_size)
+                                        super::transfer::verify_hashset(file_hash, h, file_size)
                                     })
                                     .unwrap_or(false);
                                 if md4_ok {
@@ -6539,7 +6692,7 @@ async fn download_parts_from_source(
                 && elapsed >= QUEUE_DETACH_GRACE_SECS
                 && (active_count.load(Ordering::Relaxed) + queued_count.load(Ordering::Relaxed))
                     >= MAX_CONCURRENT_SOURCES as u32
-                && last_rank.map_or(false, |r| r > QUEUE_DETACH_RANK_THRESHOLD)
+                && last_rank.is_some_and(|r| r > QUEUE_DETACH_RANK_THRESHOLD)
             {
                 debug!(
                     "Source {} ({}) detaching under connection pressure at queue rank {:?} — keeping slot warm via reask",
@@ -6612,7 +6765,7 @@ async fn download_parts_from_source(
                     .min(MAX_PEER_COMMENT_LEN);
                 if clen
                     .checked_add(5)
-                    .map_or(false, |need| payload.len() >= need)
+                    .is_some_and(|need| payload.len() >= need)
                 {
                     let comment = String::from_utf8_lossy(&payload[5..5 + clen]).to_string();
                     if let Some(cm) = &comment_mgr {
@@ -6761,7 +6914,7 @@ async fn download_parts_from_source(
                             let cs = cs.read().await;
                             let t = tracker.read().await;
                             let completed = t.completed_parts().to_vec();
-                            let in_prog = t.in_progress.clone();
+                            let in_prog = t.in_progress_flags();
                             let remaining = t.remaining_count();
                             let part_count = t.part_count;
                             let gap_bytes = t.part_gap_bytes_vec();
@@ -6805,10 +6958,7 @@ async fn download_parts_from_source(
                                 if let Some(next) = next_part {
                                     if !part_queue.contains(&next) {
                                         part_queue.push(next);
-                                        let mut t = tracker.write().await;
-                                        t.set_in_progress(next, true);
-                                        drop(t);
-                                        ip_guard.mark(next);
+                                        ip_guard.claim(next).await;
                                         consecutive_stale_skips += 1;
                                         info!(
                                         "DIAG: source {} ({}) stale-queue extend: part {} was already complete, pulled fresh part {} (skip-cycle {}/{})",
@@ -6865,14 +7015,10 @@ async fn download_parts_from_source(
                 (all_blocks, batches, 0, needs_large_offsets)
             };
 
-            // Mark in_progress (idempotent — pipelined state already did this,
-            // and the same flag may be set by another source piling on for
-            // MAX_SOURCES_PER_PART-style behaviour).
-            {
-                let mut t = tracker.write().await;
-                t.set_in_progress(part_idx, true);
-            }
-            ip_guard.mark(part_idx);
+            // Claim the part (idempotent per source — the pipelined state
+            // already claimed it, and another source may hold its own claim
+            // for MAX_SOURCES_PER_PART-style piling on).
+            ip_guard.claim(part_idx).await;
 
             let (remaining, gap_rem) = {
                 let t = tracker.read().await;
@@ -7116,7 +7262,7 @@ async fn download_parts_from_source(
                                 &mut *writer,
                                 OP_EMULEPROT,
                                 OP_EMBER_SOURCEEXCHANGE,
-                                &*epx_data,
+                                &epx_data,
                             )
                             .await
                             .is_ok()
@@ -7491,50 +7637,26 @@ async fn download_parts_from_source(
                         // upload path then serves as "safe"), with corruption only caught
                         // at the final whole-file hash. Trimming the write to actual gaps
                         // preserves verified bytes; `fill_range` below stays idempotent.
-                        // Keep the tracker write guard across the serialized
-                        // disk write. Otherwise another source can fill the
-                        // same gap after our snapshot but before this await,
-                        // letting us overwrite its bytes and claim duplicate
-                        // credit. The writer never locks the tracker, so this
-                        // ordering cannot form a lock cycle.
-                        let (written_subranges, newly_written, write_ok) = {
-                            let mut t = tracker.write().await;
-                            let fill_subranges = t.fillable_subranges(start, end);
-                            let mut written_subranges = Vec::with_capacity(fill_subranges.len());
-                            let mut newly_written = 0u64;
-                            let mut write_ok = true;
-                            for &(gs, ge) in &fill_subranges {
-                                let off = (gs - start) as usize;
-                                let len = (ge - gs) as usize;
-                                match output.write(gs, data[off..off + len].to_vec()).await {
-                                    Ok(()) => {
-                                        // Commit each subrange while the tracker lock
-                                        // still excludes competing source workers. If
-                                        // a later disk write fails, every earlier
-                                        // successful write remains represented in the
-                                        // gap map instead of becoming untracked data.
-                                        newly_written =
-                                            newly_written.saturating_add(t.fill_range(gs, ge));
-                                        written_subranges.push((gs, ge));
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
-                                        );
-                                        if e.kind() == std::io::ErrorKind::StorageFull
-                                            || super::transfer::is_disk_full_error(&e.to_string())
-                                        {
-                                            anyhow::bail!(
-                                                "stage:insufficient_disk disk write failed: {e}"
-                                            );
-                                        }
-                                        write_ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            (written_subranges, newly_written, write_ok)
-                        };
+                        // The gap sub-ranges are RESERVED under the tracker
+                        // guard, written with no tracker lock held, then
+                        // committed under the guard again. Reserving is what
+                        // still stops another source filling the same gap
+                        // between our snapshot and the write (which would let
+                        // us overwrite its bytes and claim duplicate credit) —
+                        // see `WriteReservation` for why the guard can no
+                        // longer span the write itself.
+                        let gap_write =
+                            write_gap_subranges_ms(&tracker, &output, start, data, _src_idx, "")
+                                .await;
+                        if let Some(ref e) = gap_write.disk_full {
+                            anyhow::bail!("stage:insufficient_disk disk write failed: {e}");
+                        }
+                        let GapWriteOutcome {
+                            written_subranges,
+                            newly_written,
+                            write_ok,
+                            ..
+                        } = gap_write;
                         if newly_written > 0 {
                             // Account this transition exactly once, including
                             // successful subranges before a later write failure.
@@ -7715,42 +7837,30 @@ async fn download_parts_from_source(
                         // cross-part) compressed block must not clobber bytes we
                         // already have, including verified bytes of an adjacent part
                         // (which the upload path would then serve as "safe").
-                        let (written_subranges, newly_written, write_ok) = {
-                            let mut t = tracker.write().await;
-                            let fill_subranges = t.fillable_subranges(start, start + piece_len);
-                            let mut written_subranges = Vec::with_capacity(fill_subranges.len());
-                            let mut newly_written = 0u64;
-                            let mut write_ok = true;
-                            for &(gs, ge) in &fill_subranges {
-                                let off = (gs - start) as usize;
-                                let len = (ge - gs) as usize;
-                                match output
-                                    .write(gs, decompressed[off..off + len].to_vec())
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        newly_written =
-                                            newly_written.saturating_add(t.fill_range(gs, ge));
-                                        written_subranges.push((gs, ge));
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "source {_src_idx}: compressed disk write failed at start={gs} ({len} bytes): {e}"
-                                        );
-                                        if e.kind() == std::io::ErrorKind::StorageFull
-                                            || super::transfer::is_disk_full_error(&e.to_string())
-                                        {
-                                            anyhow::bail!(
-                                                "stage:insufficient_disk compressed disk write failed: {e}"
-                                            );
-                                        }
-                                        write_ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            (written_subranges, newly_written, write_ok)
-                        };
+                        // Reserve → write unlocked → commit, exactly as the
+                        // uncompressed path. Both paths must go through the
+                        // reservation set or one could still write over
+                        // sub-ranges the other has reserved and is writing.
+                        let gap_write = write_gap_subranges_ms(
+                            &tracker,
+                            &output,
+                            start,
+                            &decompressed,
+                            _src_idx,
+                            "compressed ",
+                        )
+                        .await;
+                        if let Some(ref e) = gap_write.disk_full {
+                            anyhow::bail!(
+                                "stage:insufficient_disk compressed disk write failed: {e}"
+                            );
+                        }
+                        let GapWriteOutcome {
+                            written_subranges,
+                            newly_written,
+                            write_ok,
+                            ..
+                        } = gap_write;
                         if newly_written > 0 {
                             let block_part = (start / PARTSIZE) as usize;
                             let credit = per_part_credit.entry(block_part).or_insert(0);
@@ -7822,7 +7932,7 @@ async fn download_parts_from_source(
                         let recovery_data = &payload[38..];
                         if ans_hash == *file_hash && ans_part == part_idx {
                             let aich_master_hash = *shared_aich_master.master.read().await;
-                            let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
+                            let master_ok = aich_master_hash == Some(root_hash);
                             if master_ok {
                                 aich_recovery_data = Some((root_hash, recovery_data.to_vec()));
                             } else {
@@ -8212,7 +8322,7 @@ async fn download_parts_from_source(
                                 .min(MAX_PEER_COMMENT_LEN);
                         if comment_len
                             .checked_add(5)
-                            .map_or(false, |need| payload.len() >= need)
+                            .is_some_and(|need| payload.len() >= need)
                         {
                             let comment =
                                 String::from_utf8_lossy(&payload[5..5 + comment_len]).to_string();
@@ -8425,11 +8535,7 @@ async fn download_parts_from_source(
                                     first_batch.len(), part_idx,
                                     queue_idx, part_queue.len(),
                                 );
-                                    {
-                                        let mut t = tracker.write().await;
-                                        t.set_in_progress(target_part_idx, true);
-                                    }
-                                    ip_guard.mark(target_part_idx);
+                                    ip_guard.claim(target_part_idx).await;
                                     // The pipelined state must reflect
                                     // exactly what bytes the peer will
                                     // send us next. We pipelined ONE
@@ -8546,11 +8652,10 @@ async fn download_parts_from_source(
             if peer_out_of_parts {
                 let snap = {
                     let mut t = tracker.write().await;
-                    t.set_in_progress(part_idx, false);
+                    ip_guard.release_locked(part_idx, &mut t);
                     t.snapshot_for_save()
                 };
                 spawn_save_snapshot(snap).await;
-                ip_guard.unmark(part_idx);
                 continue;
             }
 
@@ -8568,11 +8673,10 @@ async fn download_parts_from_source(
                     drop(t);
                     let snap = {
                         let mut t = tracker.write().await;
-                        t.set_in_progress(part_idx, false);
+                        ip_guard.release_locked(part_idx, &mut t);
                         t.snapshot_for_save()
                     };
                     save_snapshot_now(snap, "mismatched part").await;
-                    ip_guard.unmark(part_idx);
                     continue;
                 }
             }
@@ -8762,11 +8866,10 @@ async fn download_parts_from_source(
                 PartHashOutcome::AichNarrowed => {
                     let snap = {
                         let mut t = tracker.write().await;
-                        t.set_in_progress(part_idx, false);
+                        ip_guard.release_locked(part_idx, &mut t);
                         t.snapshot_for_save()
                     };
                     save_snapshot_now(snap, "AICH narrowed completion").await;
-                    ip_guard.unmark(part_idx);
                     // The pending bucket includes bytes from the AICH-invalidated
                     // blocks. Drop the whole part conservatively so those bytes
                     // cannot be credited if the retained ranges plus a later
@@ -8785,11 +8888,10 @@ async fn download_parts_from_source(
                         );
                         let snap = {
                             let mut t = tracker.write().await;
-                            t.set_in_progress(part_idx, false);
+                            ip_guard.release_locked(part_idx, &mut t);
                             t.snapshot_for_save()
                         };
                         save_snapshot_now(snap, "fsync failed before verify persist").await;
-                        ip_guard.unmark(part_idx);
                         per_part_credit.remove(&part_idx);
                         continue;
                     }
@@ -8800,11 +8902,10 @@ async fn download_parts_from_source(
                         // Flip the persistent verified flag so the upload path
                         // can serve this range (see is_range_safe_to_serve).
                         t.set_part_verified(part_idx);
-                        t.set_in_progress(part_idx, false);
+                        ip_guard.release_locked(part_idx, &mut t);
                         (ps, pe, t.snapshot_for_save())
                     };
                     save_snapshot_now(snap, "verified part").await;
-                    ip_guard.unmark(part_idx);
                     // D12: flush accumulated bytes to the credit ledger now
                     // that this peer's contribution went into a verified part.
                     // Per-part bucket: only credit bytes that landed in
@@ -8857,11 +8958,10 @@ async fn download_parts_from_source(
                         // progress correction for this part (using part_len);
                         // don't double-subtract here.
                         t.mark_incomplete(part_idx);
-                        t.set_in_progress(part_idx, false);
+                        ip_guard.release_locked(part_idx, &mut t);
                         (ps, pe, t.snapshot_for_save())
                     };
                     spawn_save_snapshot(snap).await;
-                    ip_guard.unmark(part_idx);
                     // D12: drop the per-part credit bucket for THIS part —
                     // the peer sent data that didn't verify, so no credit
                     // accrues for this part. With cross-part pipelining
@@ -8883,11 +8983,10 @@ async fn download_parts_from_source(
                 PartHashOutcome::Unverified => {
                     let snap = {
                         let mut t = tracker.write().await;
-                        t.set_in_progress(part_idx, false);
+                        ip_guard.release_locked(part_idx, &mut t);
                         t.snapshot_for_save()
                     };
                     spawn_save_snapshot(snap).await;
-                    ip_guard.unmark(part_idx);
                 }
             }
 
@@ -8917,7 +9016,7 @@ async fn download_parts_from_source(
                 let cs = cs.read().await;
                 let t = tracker.read().await;
                 let completed = t.completed_parts().to_vec();
-                let in_prog = t.in_progress.clone();
+                let in_prog = t.in_progress_flags();
                 let remaining = t.remaining_count();
                 let part_count = t.part_count;
                 let gap_bytes = t.part_gap_bytes_vec();
@@ -8972,15 +9071,12 @@ async fn download_parts_from_source(
                 if let Some(next) = next_part {
                     if !part_queue.contains(&next) {
                         part_queue.push(next);
-                        // Mark in_progress (idempotent — may already be
-                        // set by another source). `ip_guard.mark` records
-                        // that THIS source contributed to this part so
-                        // teardown unmarks correctly even when another
-                        // source also claimed it.
-                        let mut t = tracker.write().await;
-                        t.set_in_progress(next, true);
-                        drop(t);
-                        ip_guard.mark(next);
+                        // Add THIS source's claim on top of whatever another
+                        // source already holds. Claims are refcounted, so the
+                        // first of the two to tear down decrements to a
+                        // still-nonzero count and the part correctly stays
+                        // "in progress" for the one still transferring.
+                        ip_guard.claim(next).await;
                     }
                 } else {
                     // No remaining part is reachable from this source
@@ -8991,7 +9087,7 @@ async fn download_parts_from_source(
                     let (cur_remaining, cur_in_progress_count, cur_avail_intersect) = {
                         let t = tracker.read().await;
                         let r = t.remaining_count();
-                        let ip_count = t.in_progress.iter().filter(|&&v| v).count();
+                        let ip_count = t.in_progress_part_count();
                         let intersect = if source_available.is_empty() {
                             r
                         } else {
@@ -9267,7 +9363,7 @@ async fn pre_pipeline_next_part_ms(
         let t = tracker.read().await;
         (
             t.completed_parts().to_vec(),
-            t.in_progress.clone(),
+            t.in_progress_flags(),
             t.remaining_count(),
             t.part_count,
             t.part_gap_bytes_vec(),
@@ -9754,6 +9850,144 @@ pub async fn perform_outbound_hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::messages::PARTSIZE;
+
+    fn test_tracker(name: &str, file_size: u64) -> (Arc<RwLock<PartTracker>>, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-ms-{}-{}-{name}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tracker = Arc::new(RwLock::new(PartTracker::new(file_size, &path)));
+        (tracker, path)
+    }
+
+    /// M5: two sources may legitimately claim the same part (the endgame
+    /// fallback re-selects with every part treated as free). The claim used to
+    /// be a plain bool, so when source B's peer dropped, B's guard cleared the
+    /// flag while A was still transferring — `select_part` then handed part 1
+    /// to a third source, duplicating wire bytes and burning a connection
+    /// slot. Claims are now refcounted and each guard contributes exactly one.
+    #[tokio::test]
+    async fn one_sources_teardown_does_not_free_a_part_another_is_still_pulling() {
+        let (tracker, path) = test_tracker("claim-refcount", PARTSIZE * 2);
+        {
+            let mut a = InProgressGuard::new(tracker.clone());
+            let mut b = InProgressGuard::new(tracker.clone());
+            a.claim(1).await;
+            // The pipelined / stale-skip paths re-claim the part they are
+            // already on; a second increment here would outlive the guard.
+            a.claim(1).await;
+            b.claim(1).await;
+            assert!(tracker.read().await.is_in_progress(1));
+
+            drop(b);
+            assert!(
+                tracker.read().await.is_in_progress(1),
+                "part must stay in progress while source A is still pulling it"
+            );
+        }
+        let t = tracker.read().await;
+        assert!(!t.is_in_progress(1), "both guards gone, part is free again");
+        assert_eq!(t.in_progress_part_count(), 0);
+        drop(t);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    /// H1b: a reservation that is never committed — an early `?`, a `bail!`, or
+    /// the whole future being dropped on cancellation — must hand its range
+    /// back. A leaked reservation is a gap no worker is ever allowed to fill
+    /// again, which would permanently wedge that byte range.
+    #[tokio::test]
+    async fn a_dropped_reservation_hands_its_range_back_unwritten() {
+        let (tracker, path) = test_tracker("reserve-drop", 1000);
+        {
+            let reservation = WriteReservation::acquire(&tracker, 0, 400).await;
+            assert_eq!(reservation.ranges(), &[(0, 400)]);
+            assert_eq!(tracker.read().await.write_reservation_count(), 1);
+        }
+        {
+            let t = tracker.read().await;
+            assert_eq!(t.write_reservation_count(), 0);
+            assert_eq!(
+                t.gap_list(),
+                &[(0, 1000)],
+                "nothing was written, so nothing may be marked present"
+            );
+        }
+        assert_eq!(
+            tracker.write().await.reserve_write_subranges(0, 400),
+            vec![(0, 400)],
+            "the released range must be reservable again"
+        );
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    /// The reservation set is what replaces holding the tracker guard across
+    /// the disk write: two workers must never be handed the same bytes.
+    #[tokio::test]
+    async fn two_workers_cannot_reserve_the_same_subrange() {
+        let (tracker, path) = test_tracker("reserve-exclusive", 1000);
+        let first = WriteReservation::acquire(&tracker, 0, 400).await;
+        assert_eq!(first.ranges(), &[(0, 400)]);
+
+        let second = WriteReservation::acquire(&tracker, 200, 600).await;
+        assert_eq!(
+            second.ranges(),
+            &[(400, 600)],
+            "only the bytes outside the first reservation are writable"
+        );
+
+        let third = WriteReservation::acquire(&tracker, 100, 300).await;
+        assert!(
+            third.ranges().is_empty(),
+            "a block fully inside another worker's reservation is a duplicate"
+        );
+
+        drop(third);
+        drop(second);
+        drop(first);
+        assert_eq!(tracker.read().await.write_reservation_count(), 0);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    /// Error semantics of the two-phase write: the sub-ranges that reached
+    /// disk are committed to the gap map even when a later one fails, so
+    /// written bytes are never left untracked, and the rest go back.
+    #[tokio::test]
+    async fn a_partial_write_commits_the_prefix_and_releases_the_rest() {
+        let (tracker, path) = test_tracker("reserve-partial", 1000);
+        // Two gaps, so one received block yields two sub-ranges.
+        tracker.write().await.fill_range(400, 500);
+
+        let mut reservation = WriteReservation::acquire(&tracker, 0, 1000).await;
+        assert_eq!(reservation.ranges(), &[(0, 400), (500, 1000)]);
+
+        // The first sub-range reached disk; the second write failed.
+        assert_eq!(reservation.finish(1).await, 400);
+
+        let t = tracker.read().await;
+        assert_eq!(
+            t.gap_list(),
+            &[(500, 1000)],
+            "only the sub-range that reached disk is marked present"
+        );
+        assert_eq!(
+            t.write_reservation_count(),
+            0,
+            "the failed sub-range must be handed back, not leaked"
+        );
+        drop(t);
+
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
 
     fn build_sending_part_32(hash: [u8; 16], start: u32, end: u32, data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(24 + data.len());

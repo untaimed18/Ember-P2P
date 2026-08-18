@@ -74,12 +74,52 @@ pub mod logging {
         }
     }
 
+    /// Domain separation for the pseudonym key. Changing this string rotates
+    /// every token in every log written afterwards.
+    const PSEUDONYM_KEY_CONTEXT: &str = "ember.log.pseudonym.v1";
+
+    static PSEUDONYM_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    static PSEUDONYM_FALLBACK_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+    /// Bind the log pseudonyms to this profile's persisted identity, so
+    /// `<ip:…>` / `<id:…>` / `<path:…>` for the same address, file hash or path
+    /// come out identical in every future session. Seeding from `OsRng` per
+    /// process meant a user's log could not be lined up against an earlier one
+    /// (or against what they reported), which is most of the reason the tokens
+    /// exist at all.
+    ///
+    /// The key is `blake3::derive_key(PSEUDONYM_KEY_CONTEXT,
+    /// identity.ed25519_secret_key)`:
+    /// * It is not the identity key. BLAKE3's KDF mode is one-way and context
+    ///   bound, so the derived key discloses nothing about the signing key and
+    ///   is useless in any other BLAKE3 context.
+    /// * A token cannot be walked back to an IP or a path. Tokens are
+    ///   `keyed_hash(key, value)` truncated to 6 bytes and the key never leaves
+    ///   this process — it is never logged, emitted, or written to disk. The
+    ///   *secret* half of the keypair is the input on purpose: the public half
+    ///   is handed to every Ember peer we speak to, so deriving from it would
+    ///   let anyone holding a log plus our public key rebuild the key and
+    ///   enumerate the whole IPv4 space to undo `<ip:…>`.
+    /// * Two profiles have two keypairs, so the same IP pseudonymises
+    ///   differently in two users' logs — no cross-user correlation.
+    ///
+    /// Idempotent, first caller wins. The subscriber is installed long before
+    /// the identity is loaded (`lib::run` must be able to log a failure in
+    /// between), so anything written before this call is pseudonymised under a
+    /// throwaway per-process key and will not match the rest of the file. That
+    /// window ends before the network task starts, i.e. before any peer
+    /// address or shared-file hash can appear.
+    pub fn install_pseudonym_key(ed25519_secret_key: &[u8; 32]) {
+        let _ = PSEUDONYM_KEY.set(blake3::derive_key(PSEUDONYM_KEY_CONTEXT, ed25519_secret_key));
+    }
+
     fn pseudonym(value: &str) -> String {
-        static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-        let key = KEY.get_or_init(|| {
-            let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
-            key
+        let key = PSEUDONYM_KEY.get().unwrap_or_else(|| {
+            PSEUDONYM_FALLBACK_KEY.get_or_init(|| {
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                key
+            })
         });
         let digest = blake3::keyed_hash(key, value.as_bytes());
         hex::encode(&digest.as_bytes()[..6])
@@ -1376,7 +1416,7 @@ pub fn sanitize_filename(name: &str) -> String {
     };
 
     let safe = safe
-        .trim_end_matches(|c: char| c == '.' || c == ' ')
+        .trim_end_matches(['.', ' '])
         .to_string();
     if safe.is_empty() {
         return "unnamed_file".to_string();

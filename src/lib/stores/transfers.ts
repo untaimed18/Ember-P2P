@@ -773,6 +773,14 @@ export async function initTransferStore() {
     );
   } catch (e) {
     initialized = false;
+    // Registration is sequential, so a failure part-way through leaves the
+    // earlier subscriptions live. Dropping the handles here leaked them: the
+    // handlers stayed attached to a store the caller is about to treat as
+    // uninitialized, and a later retry stacked a second set on top,
+    // double-applying every progress event.
+    for (const u of registered) {
+      try { u(); } catch { /* ignore */ }
+    }
     throw e;
   }
   if (myEpoch !== storeEpoch) {

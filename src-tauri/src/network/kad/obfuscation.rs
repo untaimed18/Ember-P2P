@@ -133,7 +133,7 @@ pub fn try_decrypt_kad_packet(
         vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
         if let Some(result) =
-            try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data), receiver_verify_key)
+            try_decrypt_with_key(data, &md5::Md5::digest(vkey_data), receiver_verify_key)
         {
             return Some(result);
         }
@@ -144,7 +144,7 @@ pub fn try_decrypt_kad_packet(
     nid_data[..16].copy_from_slice(&local_kad_id.0);
     nid_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
     if let Some(result) =
-        try_decrypt_with_key(data, &md5::Md5::digest(&nid_data), receiver_verify_key)
+        try_decrypt_with_key(data, &md5::Md5::digest(nid_data), receiver_verify_key)
     {
         return Some(result);
     }
@@ -167,7 +167,7 @@ pub fn try_decrypt_kad_packet(
         vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
         if let Some(result) =
-            try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data), receiver_verify_key)
+            try_decrypt_with_key(data, &md5::Md5::digest(vkey_data), receiver_verify_key)
         {
             return Some(result);
         }
@@ -205,13 +205,13 @@ pub fn encrypt_kad_packet(
         let mut vkey_data = [0u8; 6];
         vkey_data[..4].copy_from_slice(&receiver_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
-        (md5::Md5::digest(&vkey_data), 0x02u8)
+        (md5::Md5::digest(vkey_data), 0x02u8)
     } else {
         // NodeID path (marker = 0x00)
         let mut key_data = [0u8; 18];
         key_data[..16].copy_from_slice(&target_kad_id.0);
         key_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
-        (md5::Md5::digest(&key_data), 0x00u8)
+        (md5::Md5::digest(key_data), 0x00u8)
     };
 
     let mut rc4 = Rc4State::new(&md5_hash);

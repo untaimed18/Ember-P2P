@@ -2,6 +2,7 @@ import { get, writable } from 'svelte/store';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
 import * as m from '$lib/paraglide/messages';
+import { translateError } from '$lib/i18n';
 
 // Shared auto-update state. Both the corner `UpdateNotice` banner and the
 // Settings → About card read and drive this single store, so a check started
@@ -240,10 +241,18 @@ async function disposePending(): Promise<void> {
   pending = false;
 }
 
+/**
+ * Decode a backend failure into a localized message.
+ *
+ * `secure_updater_*` returns coded envelopes like every other command path, so
+ * this must go through `translateError` rather than reading `.message`: an
+ * envelope is JSON, and surfacing it raw would put `{"__coded":…}` in front of
+ * the user. `translateError` also keeps the two older tiers working (bare
+ * legacy codes, and plain strings shown verbatim), so non-envelope failures —
+ * an IPC error, a thrown DOMException — read exactly as they did before.
+ */
 function toMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === 'string') return e;
-  return String(e);
+  return translateError(e);
 }
 
 /**
@@ -309,7 +318,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         date: found.date,
         downloaded: 0,
         total: null,
-        error: opts.silent ? null : (result.error ?? null),
+        error: opts.silent || !result.error ? null : toMessage(result.error),
         // Unknown/malformed epoch metadata must fail visible, never reuse a
         // potentially stale dismissal identity.
         dismissed: isUpdateDismissed(securityEpoch, found.version),
@@ -340,7 +349,10 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
       updater.update((s) => ({
         ...s,
         phase: 'error',
-        error: result.error ?? null,
+        // `secure_updater_check` reports failures in-band rather than
+        // rejecting, so this string is a coded envelope too and needs the same
+        // decoding as the `catch` path below.
+        error: result.error ? toMessage(result.error) : null,
       }));
       return false;
     }

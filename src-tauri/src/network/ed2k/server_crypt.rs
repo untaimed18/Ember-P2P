@@ -283,12 +283,12 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     key_buf[..PRIMESIZE_BYTES].copy_from_slice(&s_bytes);
 
     key_buf[PRIMESIZE_BYTES] = MAGICVALUE_REQUESTER;
-    let send_md5 = md5::Md5::digest(&key_buf);
+    let send_md5 = md5::Md5::digest(key_buf);
     let mut send_key = Rc4State::new(&send_md5);
     send_key.skip(RC4_DROP_BYTES);
 
     key_buf[PRIMESIZE_BYTES] = MAGICVALUE_SERVER;
-    let recv_md5 = md5::Md5::digest(&key_buf);
+    let recv_md5 = md5::Md5::digest(key_buf);
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
 
@@ -353,4 +353,255 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
         send_key,
         pending_handshake: resp_encrypted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Padding the server side sends inside Message 2, so the test drives the
+    /// `server_pad_len > 0` branch rather than only the zero-padding case a
+    /// hand-written stub would default to.
+    const SERVER_PAD_LEN: usize = 5;
+
+    /// The two RC4 keystreams the handshake derives from a shared secret,
+    /// returned as `(requester, server)` — the pair `connect_obfuscated` calls
+    /// `send_key` and `recv_key`, from the far side's point of view.
+    ///
+    /// Both come from the same MD5 over the same 96-byte secret and differ only
+    /// in the trailing magic byte, which is what makes the direction separation
+    /// worth a test of its own.
+    fn derive_keys(shared: &BigUint) -> (Rc4State, Rc4State) {
+        let mut key_buf = [0u8; PRIMESIZE_BYTES + 1];
+        key_buf[..PRIMESIZE_BYTES].copy_from_slice(&biguint_to_be_padded(shared, PRIMESIZE_BYTES));
+        let [requester, server] = [MAGICVALUE_REQUESTER, MAGICVALUE_SERVER].map(|magic| {
+            key_buf[PRIMESIZE_BYTES] = magic;
+            let mut key = Rc4State::new(&md5::Md5::digest(&key_buf));
+            key.skip(RC4_DROP_BYTES);
+            key
+        });
+        (requester, server)
+    }
+
+    /// What the far side managed to read out of the client's first write.
+    /// Returned to the test rather than asserted inside the spawned task, so a
+    /// mismatch fails the test instead of hanging it on a dead peer.
+    struct ServerObserved {
+        sync_magic: u32,
+        method: u8,
+        login: Vec<u8>,
+    }
+
+    /// Play the server half of the obfuscation handshake, then send one
+    /// encrypted packet back.
+    ///
+    /// Deliberately written against the wire format rather than against the
+    /// helpers in this module: a test that reuses the same code for both sides
+    /// would still pass if the recipe drifted away from what eMule's servers do.
+    async fn run_server_half(
+        mut socket: TcpStream,
+        login_len: usize,
+        packet: (u8, &[u8]),
+    ) -> ServerObserved {
+        // Message 1: semi-random marker, g^a, then a length-prefixed pad.
+        let mut head = [0u8; 1 + PRIMESIZE_BYTES + 1];
+        socket.read_exact(&mut head).await.unwrap();
+        let client_pad = head[1 + PRIMESIZE_BYTES] as usize;
+        if client_pad > 0 {
+            let mut discarded = vec![0u8; client_pad];
+            socket.read_exact(&mut discarded).await.unwrap();
+        }
+        let g_a = BigUint::from_bytes_be(&head[1..=PRIMESIZE_BYTES]);
+
+        let p = BigUint::from_bytes_be(&DH768_P);
+        // Fixed exponent: the client's is drawn from OsRng, so one deterministic
+        // side is enough and keeps a failure reproducible.
+        let b = BigUint::from_bytes_be(&[0x5Au8; DH_A_BITS / 8]);
+        let g_b = BigUint::from(2u32).modpow(&b, &p);
+        socket
+            .write_all(&biguint_to_be_padded(&g_b, PRIMESIZE_BYTES))
+            .await
+            .unwrap();
+
+        let (mut client_to_server, mut server_to_client) = derive_keys(&g_a.modpow(&b, &p));
+
+        // Message 2 tail: sync magic, the method tags, and padding, encrypted.
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
+        tail.push(ENM_OBFUSCATION);
+        tail.push(ENM_OBFUSCATION);
+        tail.push(SERVER_PAD_LEN as u8);
+        tail.extend(std::iter::repeat(0xABu8).take(SERVER_PAD_LEN));
+        let mut encrypted = vec![0u8; tail.len()];
+        server_to_client.process(&tail, &mut encrypted);
+        socket.write_all(&encrypted).await.unwrap();
+
+        // Message 3 arrives glued to the first login write, which is the whole
+        // point of `pending_handshake`.
+        let mut encrypted_response = [0u8; 6];
+        socket.read_exact(&mut encrypted_response).await.unwrap();
+        let mut response = [0u8; 6];
+        client_to_server.process(&encrypted_response, &mut response);
+        let response_pad = response[5] as usize;
+        if response_pad > 0 {
+            let mut encrypted_pad = vec![0u8; response_pad];
+            socket.read_exact(&mut encrypted_pad).await.unwrap();
+            let mut discarded = vec![0u8; response_pad];
+            client_to_server.process(&encrypted_pad, &mut discarded);
+        }
+        let mut encrypted_login = vec![0u8; login_len];
+        socket.read_exact(&mut encrypted_login).await.unwrap();
+        let mut login = vec![0u8; login_len];
+        client_to_server.process(&encrypted_login, &mut login);
+
+        let (opcode, payload) = packet;
+        let mut plain = Vec::with_capacity(6 + payload.len());
+        plain.push(0xE3);
+        plain.extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        plain.push(opcode);
+        plain.extend_from_slice(payload);
+        let mut encrypted_packet = vec![0u8; plain.len()];
+        server_to_client.process(&plain, &mut encrypted_packet);
+        socket.write_all(&encrypted_packet).await.unwrap();
+
+        ServerObserved {
+            sync_magic: u32::from_le_bytes([response[0], response[1], response[2], response[3]]),
+            method: response[4],
+            login,
+        }
+    }
+
+    /// Both sides reach the same secret from their own private exponent, and
+    /// each direction's keystream is readable by exactly the other end. The
+    /// login write also has to carry the buffered Message 3 in front of it: the
+    /// server reads them as one stream, so a client that sent the payload first
+    /// would desynchronize the RC4 keystream for the rest of the session.
+    #[tokio::test]
+    async fn the_dh_handshake_keys_both_directions_of_the_stream() {
+        const LOGIN: &[u8] = b"\xE3\x0B\x00\x00\x00\x01login-body";
+        const OPCODE: u8 = 0x38;
+        const PAYLOAD: &[u8] = b"server-said-this";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            run_server_half(socket, LOGIN.len(), (OPCODE, PAYLOAD)).await
+        });
+
+        let mut stream = connect_obfuscated(addr).await.unwrap();
+        stream.write_login(LOGIN).await.unwrap();
+        let (opcode, payload) = stream.read_packet().await.unwrap();
+        let observed = server.await.unwrap();
+
+        assert_eq!(
+            observed.sync_magic, MAGICVALUE_SYNC,
+            "the server must decrypt our Message 3 to the sync magic"
+        );
+        assert_eq!(observed.method, ENM_OBFUSCATION);
+        assert_eq!(
+            observed.login, LOGIN,
+            "the login payload must survive the client-to-server keystream"
+        );
+        assert_eq!(opcode, OPCODE);
+        assert_eq!(
+            payload, PAYLOAD,
+            "and the server-to-client keystream must be the one we derived"
+        );
+    }
+
+    /// The two directions are separated only by the trailing magic byte. If that
+    /// byte were dropped, or the roles swapped, both ends would still derive a
+    /// key and the handshake would still "succeed" — every packet after it would
+    /// simply be garbage, which is far harder to diagnose than a failed connect.
+    #[test]
+    fn a_key_from_the_other_direction_or_another_secret_reads_garbage() {
+        let shared = BigUint::from_bytes_be(&[0x7Cu8; PRIMESIZE_BYTES]);
+        let plain = b"OP_LOGINREQUEST body";
+
+        let (mut requester, _) = derive_keys(&shared);
+        let mut cipher = vec![0u8; plain.len()];
+        requester.process(plain, &mut cipher);
+
+        let (mut same_key, mut wrong_direction) = derive_keys(&shared);
+        let mut decrypted = vec![0u8; plain.len()];
+        same_key.process(&cipher, &mut decrypted);
+        assert_eq!(
+            decrypted.as_slice(),
+            plain.as_slice(),
+            "the derivation must be reproducible from the shared secret alone"
+        );
+
+        wrong_direction.process(&cipher, &mut decrypted);
+        assert_ne!(
+            decrypted.as_slice(),
+            plain.as_slice(),
+            "the server-direction key must not read the requester's stream"
+        );
+
+        let other_shared = BigUint::from_bytes_be(&[0x7Du8; PRIMESIZE_BYTES]);
+        let (mut other_secret, _) = derive_keys(&other_shared);
+        other_secret.process(&cipher, &mut decrypted);
+        assert_ne!(
+            decrypted.as_slice(),
+            plain.as_slice(),
+            "a secret that differs in one byte must not read the stream either"
+        );
+    }
+
+    /// The common case: a secret with leading zero bytes. `to_bytes_be` drops
+    /// them, and eMule's MD5 is taken over the full 96 bytes, so a secret that
+    /// happens to start with a zero byte would key a different stream on each
+    /// side if the padding were lost.
+    #[test]
+    fn a_short_value_is_left_padded_to_the_full_wire_width() {
+        let value = BigUint::from(0x0102_0304u32);
+        let padded = biguint_to_be_padded(&value, PRIMESIZE_BYTES);
+
+        assert_eq!(padded.len(), PRIMESIZE_BYTES);
+        assert!(
+            padded[..PRIMESIZE_BYTES - 4].iter().all(|byte| *byte == 0),
+            "the pad must go on the left"
+        );
+        assert_eq!(&padded[PRIMESIZE_BYTES - 4..], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(
+            BigUint::from_bytes_be(&padded),
+            value,
+            "padding must not change the value"
+        );
+    }
+
+    #[test]
+    fn a_value_exactly_the_wire_width_is_passed_through_unchanged() {
+        // Top bit set so the big-endian encoding cannot shrink below 96 bytes
+        // and quietly take the padding branch instead.
+        let bytes: Vec<u8> = (0..PRIMESIZE_BYTES).map(|i| i as u8 | 0x80).collect();
+        let value = BigUint::from_bytes_be(&bytes);
+
+        assert_eq!(biguint_to_be_padded(&value, PRIMESIZE_BYTES), bytes);
+    }
+
+    /// Both branches subtract lengths, on opposite sides of the same
+    /// comparison. With `overflow-checks` on, an off-by-one there is an
+    /// unsigned underflow panic mid-handshake rather than a wrong key, so the
+    /// equal-length and zero-width edges are worth pinning.
+    #[test]
+    fn an_oversized_value_keeps_its_low_bytes_and_stays_in_bounds() {
+        let mut bytes = vec![0xEEu8; PRIMESIZE_BYTES + 2];
+        bytes[0] = 0x01;
+        let oversized = BigUint::from_bytes_be(&bytes);
+
+        assert_eq!(
+            biguint_to_be_padded(&oversized, PRIMESIZE_BYTES),
+            &bytes[2..],
+            "the most significant bytes are the ones dropped"
+        );
+        assert_eq!(
+            biguint_to_be_padded(&BigUint::from(0u32), PRIMESIZE_BYTES),
+            vec![0u8; PRIMESIZE_BYTES],
+            "zero must still occupy the full width"
+        );
+        assert!(biguint_to_be_padded(&oversized, 0).is_empty());
+    }
 }

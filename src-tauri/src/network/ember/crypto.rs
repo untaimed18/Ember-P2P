@@ -1,4 +1,4 @@
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -342,7 +342,8 @@ pub fn derive_intro_presence_capability(owner_ed25519_pubkey: &[u8; 32], epoch: 
 
 /// Encrypt a friend-chat plaintext with a fresh random nonce.
 ///
-/// Wire layout: `version(1) || nonce(24) || ciphertext‖tag`.
+/// Wire layout: `version(1) || nonce(24) || ciphertext‖tag`, with the version
+/// byte bound in as AEAD associated data (see [`decrypt_chat_message`]).
 pub fn encrypt_chat_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
     let mut nonce_bytes = [0u8; CHAT_NONCE_LEN];
@@ -352,7 +353,13 @@ pub fn encrypt_chat_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     // impossible for XChaCha20-Poly1305 at chat-message sizes (there's no
     // realistic way to hit its ~256 GiB per-nonce plaintext limit here).
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &[CHAT_ENVELOPE_VERSION],
+            },
+        )
         .expect("XChaCha20-Poly1305 encryption cannot fail for chat-sized plaintext");
     let mut out = Vec::with_capacity(1 + CHAT_NONCE_LEN + ciphertext.len());
     out.push(CHAT_ENVELOPE_VERSION);
@@ -369,6 +376,13 @@ pub fn encrypt_chat_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 /// as if they were plaintext — the only safe legacy fallback is to
 /// re-attempt parsing the *original, un-decrypted* wire payload as
 /// plain UTF-8 (for interop with a peer that hasn't upgraded yet).
+///
+/// The version byte is passed as associated data, so it is covered by the
+/// Poly1305 tag rather than only by the equality test below. That test alone
+/// is enough while version 1 is the only format that exists, but the moment a
+/// version 2 is accepted an unauthenticated selector byte becomes a
+/// downgrade lever an on-path attacker can flip between two live formats.
+/// Binding it now costs nothing; binding it later would be an interop break.
 pub fn decrypt_chat_message(key: &[u8; 32], envelope: &[u8]) -> Option<Vec<u8>> {
     if envelope.len() < CHAT_ENVELOPE_OVERHEAD || envelope[0] != CHAT_ENVELOPE_VERSION {
         return None;
@@ -376,7 +390,15 @@ pub fn decrypt_chat_message(key: &[u8; 32], envelope: &[u8]) -> Option<Vec<u8>> 
     let nonce = XNonce::from_slice(&envelope[1..1 + CHAT_NONCE_LEN]);
     let ciphertext = &envelope[1 + CHAT_NONCE_LEN..];
     let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
-    cipher.decrypt(nonce, ciphertext).ok()
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &envelope[..1],
+            },
+        )
+        .ok()
 }
 
 /// Convenience wrapper: derive the shared key for `peer_ed25519_pubkey`
@@ -754,6 +776,38 @@ mod tests {
         let mut envelope = encrypt_chat_message(&key, b"hello");
         envelope[0] = 0x02;
         assert!(decrypt_chat_message(&key, &envelope).is_none());
+    }
+
+    #[test]
+    fn chat_message_version_byte_is_authenticated_as_aad() {
+        // `decrypt_chat_message`'s equality check would reject a flipped
+        // version byte on its own today, so open the AEAD directly: this
+        // asserts the byte is covered by the Poly1305 tag, which is the
+        // property that still has to hold once a version 2 exists and the
+        // equality check accepts more than one value.
+        let key = [0x07u8; 32];
+        let envelope = encrypt_chat_message(&key, b"bind the version byte");
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(&key));
+        let nonce = XNonce::from_slice(&envelope[1..1 + CHAT_NONCE_LEN]);
+        let ciphertext = &envelope[1 + CHAT_NONCE_LEN..];
+        assert!(cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[CHAT_ENVELOPE_VERSION],
+                },
+            )
+            .is_ok());
+        assert!(cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[CHAT_ENVELOPE_VERSION + 1],
+                },
+            )
+            .is_err());
     }
 
     #[test]

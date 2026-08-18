@@ -298,7 +298,7 @@ fn keyword_entry_has_min_content(tags: &[KadTag]) -> bool {
             && matches!(&t.value, TagValue::String(s) if !s.is_empty())
     });
     let has_filesize = tags.iter().any(|t| {
-        matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().map_or(false, |v| v > 0)
+        matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().is_some_and(|v| v > 0)
     });
     has_filename && has_filesize
 }
@@ -741,7 +741,7 @@ impl DhtStore {
             });
             match best {
                 Some((index, bytes)) => {
-                    if victim.map_or(true, |(_, _, best_bytes)| bytes > best_bytes) {
+                    if victim.is_none_or(|(_, _, best_bytes)| bytes > best_bytes) {
                         victim = Some((candidate, index, bytes));
                     }
                 }
@@ -796,7 +796,7 @@ impl DhtStore {
             .iter()
             .any(|t| matches!(&t.name, TagName::Id(TAG_SOURCETYPE)));
         let has_tcp_port = tags.iter().any(|t| {
-            matches!(&t.name, TagName::Id(TAG_SOURCEPORT)) && t.as_uint().map_or(false, |p| p > 0)
+            matches!(&t.name, TagName::Id(TAG_SOURCEPORT)) && t.as_uint().is_some_and(|p| p > 0)
         });
         if !has_source_type || !has_tcp_port {
             return self.compute_load();

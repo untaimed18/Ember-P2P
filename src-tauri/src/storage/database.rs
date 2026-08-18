@@ -150,7 +150,7 @@ impl Database {
         }
 
         let conn = Connection::open(db_path)?;
-        crate::security::restrict_file_permissions_checked(&db_path)?;
+        crate::security::restrict_file_permissions_checked(db_path)?;
         let chat_key = Self::load_or_create_chat_key(db_path, &conn)?;
 
         let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
@@ -182,7 +182,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
-            chat_key: chat_key.map(Zeroizing::new),
+            chat_key,
             corrupt_backup: None,
         };
         db.run_migrations()?;
@@ -204,7 +204,7 @@ impl Database {
     fn load_or_create_chat_key(
         db_path: &std::path::Path,
         conn: &Connection,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    ) -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
         let key_path = db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -238,12 +238,16 @@ impl Database {
                     );
                     return Ok(None);
                 }
-                let mut key = [0u8; 32];
+                // `Zeroizing` from the moment the key exists, not once it
+                // reaches the struct field: a bare `[u8; 32]` local is copied
+                // out by value on every return and never wiped, so the key
+                // stays readable in the freed stack frames of `Database::new`.
+                let mut key = Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&plaintext);
                 // Transparently wrap a legacy restricted plaintext key. Never
                 // rewrite a key that failed unprotect/validation.
                 if !was_protected {
-                    let protected = crate::storage::secret_store::protect(&key)?;
+                    let protected = crate::storage::secret_store::protect(key.as_slice())?;
                     crate::security::atomic_write(&key_path, &protected, true)?;
                 }
                 Ok(Some(key))
@@ -286,9 +290,9 @@ impl Database {
                     );
                     return Ok(None);
                 }
-                let mut key = [0u8; 32];
-                OsRng.fill_bytes(&mut key);
-                let protected = crate::storage::secret_store::protect(&key)?;
+                let mut key = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(key.as_mut_slice());
+                let protected = crate::storage::secret_store::protect(key.as_slice())?;
                 crate::security::atomic_write(&key_path, &protected, true)?;
                 Ok(Some(key))
             }

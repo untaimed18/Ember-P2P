@@ -306,7 +306,7 @@ fn recover_zip(
         let mut pos = range_start;
         while pos + ZIP_LOCAL_HEADER_SIZE as u64 <= range_end {
             steps = steps.wrapping_add(1);
-            if steps % 1024 == 0 {
+            if steps.is_multiple_of(1024) {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;
@@ -653,7 +653,7 @@ fn sanitize_zip_entry_name(raw: &[u8]) -> Vec<u8> {
     // Treat as UTF-8 lossily for component splitting; write out as bytes.
     let as_str = String::from_utf8_lossy(raw);
     let mut parts: Vec<String> = Vec::new();
-    for seg in as_str.split(|c: char| c == '/' || c == '\\') {
+    for seg in as_str.split(['/', '\\']) {
         if seg.is_empty() || seg == "." || seg == ".." {
             continue;
         }
@@ -817,7 +817,7 @@ fn recover_rar(
         let mut pos = range_start;
         while pos + 7 <= range_end {
             steps = steps.wrapping_add(1);
-            if steps % 1024 == 0 {
+            if steps.is_multiple_of(1024) {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;
@@ -834,7 +834,7 @@ fn recover_rar(
 
             let head_flags = u16::from_le_bytes([buf[3], buf[4]]);
             let head_size = u16::from_le_bytes([buf[5], buf[6]]) as u64;
-            if head_size < 32 || head_size > 4096 {
+            if !(32..=4096).contains(&head_size) {
                 pos += 1;
                 continue;
             }
@@ -863,7 +863,7 @@ fn recover_rar(
             let name_size = u16::from_le_bytes([header_data[26], header_data[27]]) as usize;
 
             // Validate compression method (0x30-0x35 = store to best)
-            if method < 0x30 || method > 0x35 {
+            if !(0x30..=0x35).contains(&method) {
                 pos += 1;
                 continue;
             }
@@ -1015,7 +1015,7 @@ fn recover_ace(
         let mut pos = range_start;
         while pos + 10 <= range_end {
             steps = steps.wrapping_add(1);
-            if steps % 1024 == 0 {
+            if steps.is_multiple_of(1024) {
                 budget.check(control)?;
             }
             input.seek(SeekFrom::Start(pos))?;
@@ -1027,7 +1027,7 @@ fn recover_ace(
             let _head_crc = u16::from_le_bytes([header_start[0], header_start[1]]);
             let head_size = u16::from_le_bytes([header_start[2], header_start[3]]) as u64;
 
-            if head_size < 10 || head_size > 4096 {
+            if !(10..=4096).contains(&head_size) {
                 pos += 1;
                 continue;
             }

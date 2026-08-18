@@ -237,7 +237,7 @@ impl TransferManager {
     }
 
     pub fn is_control_cancelled(&self, id: &str) -> bool {
-        self.controls.get(id).map_or(false, |c| c.is_cancelled())
+        self.controls.get(id).is_some_and(|c| c.is_cancelled())
     }
 
     fn get_transfer_mut(&mut self, id: &str) -> Option<&mut Transfer> {
@@ -1378,5 +1378,347 @@ impl TransferManager {
             promoted.push(t);
         }
         promoted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A download row shaped like the one `start_download` builds: no sources
+    /// discovered yet, normal priority, nothing on the wire.
+    fn download(id: &str) -> Transfer {
+        Transfer {
+            id: id.to_string(),
+            file_name: format!("{id}.bin"),
+            file_hash: format!("{id:_>32}"),
+            peer_id: String::new(),
+            peer_name: String::new(),
+            direction: TransferDirection::Download,
+            status: TransferStatus::Searching,
+            progress: 0.0,
+            speed: 0,
+            total_size: 4096,
+            transferred: 0,
+            completed_size: 0,
+            started_at: 1_700_000_000,
+            failure_reason: None,
+            failure_kind: None,
+            failure_stage: None,
+            priority: "normal".to_string(),
+            sources: 0,
+            active_sources: 0,
+            queued_sources: 0,
+            queue_rank: None,
+            last_seen_complete: None,
+            last_received: None,
+            health: TransferHealth::Healthy,
+            health_reason: None,
+            stalled_since: None,
+            category: String::new(),
+            wait_time: 0,
+            upload_time: 0,
+            a4af_sources: 0,
+            max_sources: 0,
+            preview_priority: false,
+            preview_ready: false,
+            ember_sources: 0,
+            client_software: String::new(),
+            country_code: None,
+            user_hash: None,
+            ember_hash: None,
+            expected_aich: None,
+            ember_file_hash: None,
+            completed_path: None,
+            up_part_status: None,
+            up_part_count: None,
+            up_peer_part_status: None,
+            ember_verified: false,
+        }
+    }
+
+    /// A download that has already found sources, so the waiting status it is
+    /// given on the way into the queue is `Queued` rather than `Searching`.
+    fn sourced(id: &str, sources: u32) -> Transfer {
+        let mut transfer = download(id);
+        transfer.sources = sources;
+        transfer.peer_id = "10.0.0.1:4662".to_string();
+        transfer
+    }
+
+    fn ids(transfers: &[Transfer]) -> Vec<&str> {
+        transfers.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    #[test]
+    fn completing_a_download_frees_its_slot_for_the_next_queued_one() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(sourced("a", 3)), "the first row fits the cap");
+        assert!(
+            !manager.enqueue(sourced("b", 3)),
+            "the second row must wait for the slot"
+        );
+
+        let promoted = manager.complete("a").expect("a known row must complete");
+
+        assert_eq!(ids(&promoted), ["b"], "the freed slot must be handed on");
+        assert!(!manager.active.contains_key("a"));
+        assert!(manager.active.contains_key("b"));
+        assert!(
+            manager.queue.is_empty(),
+            "a promoted row must leave the queue, not be duplicated into active"
+        );
+        let done = manager
+            .completed
+            .iter()
+            .find(|t| t.id == "a")
+            .expect("the completed row must be retained for the UI");
+        assert_eq!(done.status, TransferStatus::Completed);
+        assert_eq!(done.progress, 100.0);
+        assert_eq!(
+            done.transferred, done.total_size,
+            "a verified download is the whole file even if the last tick coalesced"
+        );
+        assert!(
+            manager.complete("a").is_none(),
+            "completing twice must not promote a second time"
+        );
+    }
+
+    /// `fail` promotes unconditionally, so the slot arithmetic has to come from
+    /// `active_download_count`: a queued row failing frees nothing, and must not
+    /// hand a second row the slot the running download still holds.
+    #[test]
+    fn failing_a_queued_row_does_not_displace_the_running_download() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.enqueue(sourced("b", 1));
+        manager.enqueue(sourced("c", 1));
+
+        let promoted = manager
+            .fail("b", "no sources", None, None)
+            .expect("a queued row still gets the Failed lifecycle");
+        assert!(
+            promoted.is_empty(),
+            "the running download's slot was never freed"
+        );
+        assert!(manager.active.contains_key("a"), "the running row is untouched");
+        assert_eq!(manager.active.len(), 1);
+
+        let promoted = manager
+            .fail("a", "disk error", Some("io".into()), Some("write".into()))
+            .expect("an active row fails and frees its slot");
+        assert_eq!(ids(&promoted), ["c"]);
+        let failed = manager
+            .completed
+            .iter()
+            .find(|t| t.id == "a")
+            .expect("the failed row must be retained");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("disk error"));
+        assert_eq!(failed.failure_kind.as_deref(), Some("io"));
+        assert_eq!(failed.speed, 0);
+        assert!(
+            manager.fail("nope", "x", None, None).is_none(),
+            "an unknown id must not promote anything"
+        );
+    }
+
+    /// The ring drains with `len() - 1000`, which underflows — and, with
+    /// `overflow-checks` on in release, panics — if it is ever reached below the
+    /// cap. Walk past the boundary and pin which rows survive.
+    #[test]
+    fn the_completed_ring_drops_its_oldest_rows_at_the_cap() {
+        let mut manager = TransferManager::new(1);
+        for i in 0..1005 {
+            let id = format!("t{i:04}");
+            manager.enqueue(download(&id));
+            manager.complete(&id).expect("each row completes in turn");
+        }
+
+        assert_eq!(manager.completed.len(), 1000, "the ring must cap at 1000");
+        assert_eq!(
+            manager.completed.first().unwrap().id, "t0005",
+            "the five oldest rows are the ones that go"
+        );
+        assert_eq!(manager.completed.last().unwrap().id, "t1004");
+    }
+
+    /// `fail` keeps its own copy of the same drain, so it needs its own case:
+    /// the two have to stay in step or one of them starts growing unbounded.
+    #[test]
+    fn the_completed_ring_caps_failed_rows_the_same_way() {
+        let mut manager = TransferManager::new(1);
+        for i in 0..1002 {
+            let id = format!("f{i:04}");
+            manager.enqueue(download(&id));
+            manager
+                .fail(&id, "boom", None, None)
+                .expect("each row fails in turn");
+        }
+
+        assert_eq!(manager.completed.len(), 1000);
+        assert_eq!(manager.completed.first().unwrap().id, "f0002");
+        assert_eq!(manager.completed.last().unwrap().id, "f1001");
+    }
+
+    /// One freed slot must produce exactly one promotion. Promoting twice
+    /// oversubscribes the concurrency cap; promoting zero times leaks the slot
+    /// until some unrelated event happens to call `promote_next` again.
+    #[test]
+    fn cancelling_a_running_download_refills_its_slot_exactly_once() {
+        let mut manager = TransferManager::new(2);
+        for id in ["a", "b", "c", "d"] {
+            manager.enqueue(sourced(id, 2));
+        }
+        assert_eq!(manager.active.len(), 2, "the cap admits two");
+
+        let promoted = manager.cancel("a");
+
+        assert_eq!(
+            ids(&promoted),
+            ["c"],
+            "the longest-queued row of equal priority goes first"
+        );
+        assert_eq!(manager.active.len(), 2, "no slot leaked, none oversubscribed");
+        assert!(!manager.active.contains_key("a"));
+        assert!(
+            !manager.queue.iter().any(|t| t.id == "c"),
+            "a promoted row must not remain queued as well"
+        );
+
+        assert!(
+            manager.cancel("d").is_empty(),
+            "cancelling a queued row frees no slot, so nothing may be promoted"
+        );
+        assert_eq!(manager.active.len(), 2);
+        assert!(manager.queue.is_empty());
+    }
+
+    /// Stop parks the row at the front of the queue as `Stopped`, which
+    /// `can_auto_run` rejects. A Cancel arriving afterwards — the ordinary
+    /// stop-then-delete sequence — must therefore find nothing to promote,
+    /// rather than handing the already-running row's slot out a second time.
+    #[test]
+    fn a_cancel_after_a_stop_does_not_promote_the_running_row_again() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 2));
+        manager.enqueue(sourced("b", 2));
+
+        let promoted = manager.stop("a");
+        assert_eq!(
+            ids(&promoted),
+            ["b"],
+            "stopping the running download hands its slot to the queue"
+        );
+        let stopped = manager
+            .queue
+            .iter()
+            .find(|t| t.id == "a")
+            .expect("Stop keeps the partial data queued, it does not delete it");
+        assert_eq!(stopped.status, TransferStatus::Stopped);
+        assert_eq!(stopped.speed, 0);
+
+        assert!(
+            manager.cancel("a").is_empty(),
+            "the stopped row held no slot, so its cancel promotes nothing"
+        );
+        assert!(!manager.queue.iter().any(|t| t.id == "a"));
+        assert_eq!(manager.active.len(), 1);
+        assert!(manager.active.contains_key("b"));
+    }
+
+    /// A `Failed` event that raced ahead of the user's Cancel used to leave a
+    /// red row in `completed` that nothing could clear, since Cancel only
+    /// looked at `active` and `queue`.
+    #[test]
+    fn cancelling_after_a_failure_event_clears_the_sticky_failed_row() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.fail("a", "connection reset", None, None);
+        assert!(manager.completed.iter().any(|t| t.id == "a"));
+
+        manager.cancel("a");
+
+        assert!(
+            !manager.completed.iter().any(|t| t.id == "a"),
+            "a cancelled transfer must not survive as a failed row"
+        );
+    }
+
+    /// What the UI shows while a download waits. "Searching" and "Queued" mean
+    /// different things to the user — nothing found yet versus found and
+    /// waiting behind other people — so the distinction is the source count,
+    /// not whether we happen to hold a slot.
+    #[test]
+    fn queued_wait_status_separates_searching_from_waiting_in_a_queue() {
+        let mut upload = download("u");
+        upload.direction = TransferDirection::Upload;
+        assert_eq!(
+            TransferManager::queued_wait_status(&upload),
+            TransferStatus::Active,
+            "uploads are not subject to the download queue"
+        );
+
+        assert_eq!(
+            TransferManager::queued_wait_status(&download("a")),
+            TransferStatus::Searching,
+            "no sources at all is a search, not a queue wait"
+        );
+
+        let mut queued_only = download("b");
+        queued_only.queued_sources = 2;
+        assert_eq!(
+            TransferManager::queued_wait_status(&queued_only),
+            TransferStatus::Searching,
+            "queue slots on peers we can no longer name are not a source yet"
+        );
+
+        let mut known_peer = download("c");
+        known_peer.peer_id = "10.0.0.1:4662".to_string();
+        known_peer.queued_sources = 2;
+        assert_eq!(
+            TransferManager::queued_wait_status(&known_peer),
+            TransferStatus::Queued,
+            "a named peer that has us in its queue is a queue wait"
+        );
+
+        let mut with_sources = download("d");
+        with_sources.sources = 4;
+        assert_eq!(
+            TransferManager::queued_wait_status(&with_sources),
+            TransferStatus::Queued
+        );
+    }
+
+    #[test]
+    fn enqueue_over_the_cap_shows_the_waiting_status_the_ui_expects() {
+        let mut manager = TransferManager::new(1);
+        assert!(manager.enqueue(download("a")));
+        assert!(!manager.enqueue(download("b")));
+        assert_eq!(
+            manager.queue.front().unwrap().status,
+            TransferStatus::Searching,
+            "a sourceless row must not claim to be queued behind anyone"
+        );
+
+        let mut paused = download("c");
+        paused.status = TransferStatus::Paused;
+        assert!(!manager.enqueue(paused));
+        assert_eq!(
+            manager.queue.iter().find(|t| t.id == "c").unwrap().status,
+            TransferStatus::Paused,
+            "a paused row keeps its status through the queue, or Resume loses it"
+        );
+
+        assert_eq!(
+            ids(&manager.set_max_concurrent(4)),
+            ["b"],
+            "raising the cap may only promote rows the user did not pause"
+        );
+        assert_eq!(
+            manager.queue.iter().find(|t| t.id == "c").unwrap().status,
+            TransferStatus::Paused
+        );
     }
 }

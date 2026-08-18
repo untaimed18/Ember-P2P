@@ -77,7 +77,24 @@ pub struct PartTracker {
     /// Byte-level gap list: missing ranges (start, end_exclusive).
     /// An empty list means the file is fully downloaded.
     gaps: Vec<(u64, u64)>,
-    pub in_progress: Vec<bool>,
+    /// Per-part count of source workers currently pulling that part.
+    ///
+    /// A count, not a flag: the endgame fallback in `multi_source`
+    /// deliberately re-selects with every part treated as free so a second
+    /// source can pile onto a part already in flight. With a plain bool,
+    /// whichever of the two tore down first cleared the *other* source's
+    /// claim, `select_part` then handed the part to a third source, and the
+    /// same bytes were pulled twice while a connection slot was wasted.
+    /// Claims are registered exactly once per source via `InProgressGuard`,
+    /// which also releases them on every task exit path, so the count
+    /// returns to zero when nothing is transferring.
+    in_progress_claims: Vec<u16>,
+    /// Gap sub-ranges a source worker has taken out of circulation while it
+    /// writes them to disk. Purely an exclusion set for the write path — the
+    /// gap list itself is untouched until the write is committed. See
+    /// `multi_source::WriteReservation` for why the tracker guard can no
+    /// longer be held across `PartFileWriter::write`.
+    write_reservations: Vec<(u64, u64)>,
     met_path: PathBuf,
     file_hash: [u8; 16],
     file_name: String,
@@ -136,7 +153,8 @@ impl PartTracker {
             } else {
                 Vec::new()
             },
-            in_progress: vec![false; part_count],
+            in_progress_claims: vec![0; part_count],
+            write_reservations: Vec::new(),
             met_path,
             file_hash: expected_file_hash,
             file_name: String::new(),
@@ -167,7 +185,8 @@ impl PartTracker {
             } else {
                 Vec::new()
             },
-            in_progress: vec![false; part_count],
+            in_progress_claims: vec![0; part_count],
+            write_reservations: Vec::new(),
             met_path,
             file_hash: [0u8; 16],
             file_name: String::new(),
@@ -717,10 +736,20 @@ impl PartTracker {
             }
             self.reset_to_incomplete();
         }
-        self.in_progress = vec![false; self.part_count];
+        self.in_progress_claims = vec![0; self.part_count];
+        self.write_reservations.clear();
     }
 
     fn load_inner(&mut self) -> anyhow::Result<()> {
+        // A crash inside `atomic_write`'s Windows replace-fallback parks the only
+        // copy under a fixed backup name and leaves nothing at `met_path`. `load`
+        // reads that absence as "nothing downloaded yet" and `reset_to_incomplete`
+        // restarts the download at 0%, after which the next save overwrites the
+        // parked copy — so the loss is silent and permanent. Every other state
+        // loader recovers first (`config.rs`, `identity.rs`, `known_files.rs`,
+        // `share_intent.rs`, `database.rs`, `credits.rs`, `filesystem.rs`); this
+        // one did not.
+        crate::security::recover_interrupted_replace(&self.met_path);
         let data = std::fs::read(&self.met_path)?;
         if data.len() < 4 {
             anyhow::bail!("part.met too small");
@@ -1021,10 +1050,122 @@ impl PartTracker {
         self.gaps.iter().map(|&(s, e)| e.saturating_sub(s)).sum()
     }
 
-    pub fn set_in_progress(&mut self, part_idx: usize, value: bool) {
-        if part_idx < self.part_count {
-            self.in_progress[part_idx] = value;
+    /// Whether any source worker currently claims `part_idx`. Production code
+    /// wants the whole bitmap ([`Self::in_progress_flags`]) for the chunk
+    /// selector; this is the single-part form used by tests.
+    #[allow(dead_code)]
+    pub fn is_in_progress(&self, part_idx: usize) -> bool {
+        self.in_progress_claims
+            .get(part_idx)
+            .is_some_and(|&count| count > 0)
+    }
+
+    /// Per-part "somebody is pulling this" bitmap, for `ChunkSelector`.
+    pub fn in_progress_flags(&self) -> Vec<bool> {
+        self.in_progress_claims.iter().map(|&c| c > 0).collect()
+    }
+
+    /// How many parts have at least one outstanding claim (diagnostics).
+    pub fn in_progress_part_count(&self) -> usize {
+        self.in_progress_claims.iter().filter(|&&c| c > 0).count()
+    }
+
+    /// Register one source's claim on `part_idx`. Must be paired 1:1 with
+    /// [`Self::release_in_progress`]; go through `multi_source`'s
+    /// `InProgressGuard` so a task that exits via `?`/`bail!` or is dropped
+    /// mid-await cannot leak a claim.
+    pub fn claim_in_progress(&mut self, part_idx: usize) {
+        if let Some(count) = self.in_progress_claims.get_mut(part_idx) {
+            *count = count.saturating_add(1);
         }
+    }
+
+    /// Drop one source's claim on `part_idx`. Saturating: `overflow-checks`
+    /// is on in release, so an unpaired release must not panic the worker.
+    pub fn release_in_progress(&mut self, part_idx: usize) {
+        if let Some(count) = self.in_progress_claims.get_mut(part_idx) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Take the gap sub-ranges of `[start, end)` out of circulation so the
+    /// caller can write them to disk without holding the tracker guard.
+    /// Sub-ranges another worker has already reserved are excluded, which is
+    /// what preserves the "never write bytes another worker is writing"
+    /// invariant that the long exclusive hold used to provide.
+    ///
+    /// Every returned sub-range MUST later be passed to
+    /// [`Self::commit_write_reservation`] or
+    /// [`Self::release_write_reservation`]: a reservation nobody hands back
+    /// is a gap no worker is ever allowed to fill again.
+    pub fn reserve_write_subranges(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let candidates = self.fillable_subranges(start, end);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let mut blocked: Vec<(u64, u64)> = self
+            .write_reservations
+            .iter()
+            .copied()
+            .filter(|&(rs, re)| rs < end && re > start)
+            .collect();
+        blocked.sort_unstable();
+
+        let mut granted: Vec<(u64, u64)> = Vec::with_capacity(candidates.len());
+        for (cs, ce) in candidates {
+            let mut cursor = cs;
+            for &(rs, re) in &blocked {
+                if re <= cursor || rs >= ce {
+                    continue;
+                }
+                if rs > cursor {
+                    granted.push((cursor, rs));
+                }
+                cursor = re;
+                if cursor >= ce {
+                    break;
+                }
+            }
+            if cursor < ce {
+                granted.push((cursor, ce));
+            }
+        }
+
+        // Reservations live only for the duration of one `PartFileWriter`
+        // round-trip and one worker only ever holds the sub-ranges of a
+        // single received block, so this list stays tiny. The cap is
+        // defence-in-depth: refusing to reserve past it just leaves those
+        // bytes as gaps to be re-requested, which is always safe.
+        const MAX_WRITE_RESERVATIONS: usize = 1024;
+        let room = MAX_WRITE_RESERVATIONS.saturating_sub(self.write_reservations.len());
+        granted.truncate(room);
+        self.write_reservations.extend(granted.iter().copied());
+        granted
+    }
+
+    /// Fold a written sub-range into the gap list and drop its reservation.
+    /// Returns the bytes this actually transitioned from missing to present.
+    pub fn commit_write_reservation(&mut self, start: u64, end: u64) -> u64 {
+        self.release_write_reservation(start, end);
+        self.fill_range(start, end)
+    }
+
+    /// Hand a reserved sub-range back unwritten, so it becomes selectable
+    /// again. The range stays a gap, so the bytes are simply re-requested.
+    pub fn release_write_reservation(&mut self, start: u64, end: u64) {
+        if let Some(pos) = self
+            .write_reservations
+            .iter()
+            .position(|&(s, e)| s == start && e == end)
+        {
+            self.write_reservations.swap_remove(pos);
+        }
+    }
+
+    /// Currently reserved write sub-ranges (tests / diagnostics).
+    #[allow(dead_code)]
+    pub fn write_reservation_count(&self) -> usize {
+        self.write_reservations.len()
     }
 
     pub fn delete_met(&self, allowed_roots: &[String]) {
@@ -1206,7 +1347,7 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             let pos = cursor.position() as usize;
             if pos
                 .checked_add(slen)
-                .map_or(true, |end| end > cursor.get_ref().len())
+                .is_none_or(|end| end > cursor.get_ref().len())
             {
                 anyhow::bail!("part.met string tag length exceeds data boundary");
             }
@@ -1419,6 +1560,82 @@ mod tests {
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }
 
+    /// M5: the per-part claim is refcounted, not a flag. The endgame fallback
+    /// in `multi_source` deliberately lets a second source pile onto a part
+    /// already in flight, and with a bool whichever source tore down first
+    /// cleared the other's claim — `select_part` then handed the part to a
+    /// third source and the same bytes were pulled twice. Releases saturate
+    /// because `overflow-checks` is on in release builds, so an unpaired
+    /// release must not panic a source worker.
+    #[test]
+    fn in_progress_claims_are_refcounted_and_saturate() {
+        let part_path = temp_part_path("claims");
+        let mut tracker = PartTracker::new(PARTSIZE * 3, &part_path);
+        assert!(!tracker.is_in_progress(1));
+
+        tracker.claim_in_progress(1);
+        tracker.claim_in_progress(1);
+        assert!(tracker.is_in_progress(1));
+        assert_eq!(tracker.in_progress_part_count(), 1);
+        assert_eq!(tracker.in_progress_flags(), vec![false, true, false]);
+
+        tracker.release_in_progress(1);
+        assert!(
+            tracker.is_in_progress(1),
+            "one source is still pulling this part"
+        );
+        tracker.release_in_progress(1);
+        assert!(!tracker.is_in_progress(1));
+
+        tracker.release_in_progress(1);
+        assert!(!tracker.is_in_progress(1));
+        assert_eq!(tracker.in_progress_part_count(), 0);
+
+        // Out-of-range indices are ignored rather than panicking.
+        tracker.claim_in_progress(99);
+        tracker.release_in_progress(99);
+        assert!(!tracker.is_in_progress(99));
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// H1b: the write path reserves gap sub-ranges instead of holding the
+    /// tracker guard across the disk write. A reserved range stays a gap
+    /// (nothing is on disk yet) but must be invisible to every other worker's
+    /// reservation, which is what still prevents two sources writing the same
+    /// bytes.
+    #[test]
+    fn reserved_subranges_are_excluded_from_other_reservations() {
+        let part_path = temp_part_path("reservations");
+        let mut tracker = PartTracker::new(1000, &part_path);
+
+        assert_eq!(tracker.reserve_write_subranges(100, 300), vec![(100, 300)]);
+        assert_eq!(
+            tracker.gap_list(),
+            &[(0, 1000)],
+            "reserving must not touch the gap list"
+        );
+
+        // An overlapping block may only take the un-reserved fringes...
+        assert_eq!(
+            tracker.reserve_write_subranges(0, 500),
+            vec![(0, 100), (300, 500)]
+        );
+        // ...and one fully inside a reservation gets nothing at all.
+        assert!(tracker.reserve_write_subranges(150, 250).is_empty());
+
+        assert_eq!(tracker.commit_write_reservation(100, 300), 200);
+        assert_eq!(tracker.gap_list(), &[(0, 100), (300, 1000)]);
+
+        tracker.release_write_reservation(0, 100);
+        tracker.release_write_reservation(300, 500);
+        assert_eq!(tracker.write_reservation_count(), 0);
+        // Released bytes never reached disk, so they stay reservable.
+        assert_eq!(tracker.reserve_write_subranges(0, 100), vec![(0, 100)]);
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
     #[test]
     fn save_and_reload_preserves_gap_state() {
         let part_path = temp_part_path("reload");
@@ -1437,6 +1654,46 @@ mod tests {
         assert_eq!(reloaded.gap_list(), &[(25, 75)]);
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// A crash inside `atomic_write`'s Windows replace-fallback leaves nothing
+    /// at `.part.met` and the only copy parked under the fixed
+    /// `.ember-replace-bak` name. Without a `recover_interrupted_replace` on the
+    /// load path that absence reads as "first run": the tracker resets to 0%,
+    /// and the next save overwrites the parked copy — silently discarding the
+    /// progress and verified bitmap of a download that may be many GB in.
+    #[test]
+    fn load_recovers_a_part_met_parked_by_an_interrupted_replace() {
+        let part_path = temp_part_path("interrupted-replace");
+        let met_path = part_path.with_extension("part.met");
+
+        let mut tracker = PartTracker::new(100, &part_path);
+        tracker.set_file_hash([0x11; 16]);
+        tracker.set_part_hashes(vec![[0x22; 16]]);
+        tracker.fill_range(0, 70);
+        tracker.save();
+        assert_eq!(tracker.completed_bytes(), 70);
+
+        // Reproduce the crash window: the destination has been moved aside and
+        // the replacement never landed.
+        let mut backup_name = met_path.file_name().unwrap().to_os_string();
+        backup_name.push(".ember-replace-bak");
+        let backup = met_path.with_file_name(backup_name);
+        std::fs::rename(&met_path, &backup).unwrap();
+        assert!(!met_path.exists());
+
+        let recovered = PartTracker::new(100, &part_path);
+        assert_eq!(
+            recovered.completed_bytes(),
+            70,
+            "progress must be recovered from the parked .part.met, not reset to 0%"
+        );
+        assert_eq!(recovered.gap_list(), &[(70, 100)]);
+        assert_eq!(recovered.file_hash, [0x11; 16]);
+        assert!(met_path.exists(), "the parked copy should be restored in place");
+
+        let _ = std::fs::remove_file(&met_path);
+        let _ = std::fs::remove_file(&backup);
     }
 
     /// `OP_FILESTATUS` advertising must match the serve gate: every

@@ -760,6 +760,34 @@ mod tests {
         .await;
         assert!(bad.is_err(), "pinned connect with wrong node id must fail");
 
+        // Callers that hold only the 32-byte identity secret (the punch dials,
+        // via `broker::punch_quic_pinned`) derive their DER material with
+        // `generate_self_signed_cert` instead of carrying it. Pin the property
+        // that composition relies on: a cert derived that way authenticates us
+        // to the peer and still pins the peer's node id exactly as strictly.
+        let (derived_cert, derived_key) =
+            generate_self_signed_cert(&client_key).expect("cert derivation from identity secret");
+        let via_identity = connect_pinned(
+            &client,
+            server_addr,
+            "ember",
+            Some((&derived_cert, &derived_key, server_node_id)),
+        )
+        .await
+        .expect("identity-derived pinned connect with correct node id should succeed");
+        drop(via_identity);
+        assert!(
+            connect_pinned(
+                &client,
+                server_addr,
+                "ember",
+                Some((&derived_cert, &derived_key, [0xFF; 16])),
+            )
+            .await
+            .is_err(),
+            "identity-derived pinned connect with wrong node id must fail"
+        );
+
         server_handle.abort();
     }
 }

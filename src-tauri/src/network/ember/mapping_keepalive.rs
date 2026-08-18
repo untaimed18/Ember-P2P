@@ -92,7 +92,7 @@ async fn tcp_stun_exchange(local_port: u16, server: &str) -> Result<SocketAddr, 
         .map_err(|_| "response header timeout".to_string())?
         .map_err(|e| format!("read header: {e}"))?;
     let body_len = u16::from_be_bytes([header[2], header[3]]) as usize;
-    if body_len % 4 != 0 {
+    if !body_len.is_multiple_of(4) {
         return Err(format!("invalid STUN body length {body_len}"));
     }
     let mut response = Vec::with_capacity(20 + body_len);

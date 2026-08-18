@@ -336,8 +336,8 @@ fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String>
 }
 
 fn shared_folder_paths_equal(a: &str, b: &str) -> bool {
-    crate::search::index::normalize_path_key(a).trim_end_matches(|c| c == '/' || c == '\\')
-        == crate::search::index::normalize_path_key(b).trim_end_matches(|c| c == '/' || c == '\\')
+    crate::search::index::normalize_path_key(a).trim_end_matches(['/', '\\'])
+        == crate::search::index::normalize_path_key(b).trim_end_matches(['/', '\\'])
 }
 
 fn shared_folder_changes(
@@ -1500,7 +1500,7 @@ pub async fn download_ipfilter(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| {
             coded_ctx(
@@ -1514,7 +1514,7 @@ pub async fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         // Unminimize first — `show()` doesn't restore from minimized on
         // Windows, only from the hidden state. Without this the tray-icon
@@ -1534,10 +1534,7 @@ pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn quit_app(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
     // hook in `lib::run` lets the destroy proceed even when the saved
     // behavior is "tray" or "ask". Exit is initiated via `app.exit(0)`,
@@ -1553,7 +1550,7 @@ pub async fn quit_app(
 /// ready. `swap(false)` makes the handoff one-shot while allowing a later
 /// native close to set the latch again.
 #[tauri::command]
-pub async fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+pub fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state
         .pending_close_request
         .swap(false, std::sync::atomic::Ordering::AcqRel))
@@ -1564,7 +1561,7 @@ pub async fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Re
 /// behind it has already been written and never runs again, so the notice has
 /// exactly one chance to reach the user.
 #[tauri::command]
-pub async fn take_pending_ember_default_on_notice(
+pub fn take_pending_ember_default_on_notice(
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
     Ok(state

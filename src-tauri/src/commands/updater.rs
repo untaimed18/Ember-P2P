@@ -26,6 +26,8 @@ use tokio::{
 };
 use url::{Host, Url};
 
+use crate::commands::errors::coded;
+
 const MANIFEST_MAX_BYTES: usize = 512 * 1024;
 const SIGNATURE_MAX_BYTES: usize = 16 * 1024;
 const ARTIFACT_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -1337,9 +1339,63 @@ async fn download_artifact(
     Ok(artifact)
 }
 
-fn public_failure(operation: &str, error: anyhow::Error) -> String {
-    tracing::warn!("Secure updater {operation} failed: {error:#}");
-    format!("Secure update {operation} failed. Please try again later.")
+/// Which updater operation a failure is being reported for.
+///
+/// An enum rather than the log label it used to be, so the label and the
+/// frontend error code cannot drift apart, and so every code stays a literal
+/// at its `coded()` call site: `scripts/error-codes.test.mjs` only scans
+/// construction sites, so a code threaded through a variable would slip past
+/// the ratchet that exists to keep these translated.
+#[derive(Clone, Copy)]
+enum UpdaterOperation {
+    Check,
+    Install,
+    /// Startup report of a hand-off that never produced the new version. The
+    /// frontend discards a failure here (nothing to say is not an error), so
+    /// this envelope is never displayed — it is coded anyway rather than
+    /// leaving one operation able to reach the UI untranslated if that ever
+    /// changes.
+    HandoffCheck,
+    InstallerLaunch,
+}
+
+/// Log the real cause and hand the UI a translatable, deliberately vague
+/// envelope. The underlying error is not carried as context: what fails here
+/// is signature/manifest/network internals the user cannot act on, and the
+/// original message kept them to the log for that reason.
+fn public_failure(operation: UpdaterOperation, error: anyhow::Error) -> String {
+    let (label, envelope) = match operation {
+        UpdaterOperation::Check => (
+            "check",
+            coded(
+                "updater_check_failed",
+                "Secure update check failed. Please try again later.",
+            ),
+        ),
+        UpdaterOperation::Install => (
+            "install",
+            coded(
+                "updater_install_failed",
+                "Secure update install failed. Please try again later.",
+            ),
+        ),
+        UpdaterOperation::HandoffCheck => (
+            "hand-off check",
+            coded(
+                "updater_handoff_check_failed",
+                "Secure update hand-off check failed. Please try again later.",
+            ),
+        ),
+        UpdaterOperation::InstallerLaunch => (
+            "installer launch",
+            coded(
+                "updater_launch_failed",
+                "Secure update installer launch failed. Please try again later.",
+            ),
+        ),
+    };
+    tracing::warn!("Secure updater {label} failed: {error:#}");
+    envelope
 }
 
 #[tauri::command]
@@ -1361,7 +1417,7 @@ pub async fn secure_updater_check(
             let mut pending = service.pending.lock().await;
             if let Err(error) = retain_only_pending_at_floor(&mut pending) {
                 pending.take();
-                return Err(public_failure("check", error));
+                return Err(public_failure(UpdaterOperation::Check, error));
             }
             Ok(SecureUpdateCheckResult {
                 // Re-offer retained metadata so the UI can restore Install even
@@ -1395,7 +1451,7 @@ pub async fn secure_updater_check(
             Ok(SecureUpdateCheckResult {
                 update: pending.as_ref().map(|pending| pending.info.clone()),
                 pending_retained: pending.is_some(),
-                error: Some(public_failure("check", error)),
+                error: Some(public_failure(UpdaterOperation::Check, error)),
             })
         }
     }
@@ -1410,21 +1466,25 @@ pub async fn secure_updater_install(
     let _operation = service.operation.lock().await;
     let mut pending = service.pending.lock().await;
     let Some(update) = pending.as_ref() else {
-        return Err("No verified update is ready to install.".to_string());
+        return Err(coded(
+            "updater_no_pending_update",
+            "No verified update is ready to install.",
+        ));
     };
     if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure("install", error))?
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
     {
         pending.take();
-        return Err(
-            "The previously checked update is older than the signed security floor. Check for updates again."
-                .to_string(),
-        );
+        return Err(coded(
+            "updater_pending_below_floor",
+            "The previously checked update is older than the signed security floor. Check for updates again.",
+        ));
     }
-    let config = embedded_updater_config().map_err(|error| public_failure("install", error))?;
+    let config = embedded_updater_config()
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
     let artifact = download_artifact(&update.platform, &config.public_key, &on_event)
         .await
-        .map_err(|error| public_failure("install", error))?;
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
     // Record the attempt and keep the verified bytes before handing them over.
     // `install` does not come back on success, so this is the only chance to
     // leave behind anything that a later launch could act on. A failure here is
@@ -1444,13 +1504,13 @@ pub async fn secure_updater_install(
     // Re-read after the long download as well. Another process may have
     // observed a newer signed floor while this process was downloading.
     if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure("install", error))?
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
     {
         pending.take();
-        return Err(
-            "A newer signed update was observed while downloading. Check for updates again."
-                .to_string(),
-        );
+        return Err(coded(
+            "updater_superseded_while_downloading",
+            "A newer signed update was observed while downloading. Check for updates again.",
+        ));
     }
     // `Update::install` never comes back on Windows: it hands the bundle to the
     // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
@@ -1487,10 +1547,10 @@ pub async fn secure_updater_install(
         // Distinct from `public_failure`: the teardown above already stopped
         // Ember's network services, so this process is no longer transferring
         // even though the window is still up.
-        return Err(
-            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers."
-                .to_string(),
-        );
+        return Err(coded(
+            "updater_install_failed_services_stopped",
+            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",
+        ));
     }
     pending.take();
     Ok(())
@@ -1516,7 +1576,8 @@ pub async fn secure_updater_install(
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
 ) -> Result<Option<UpdateHandoffReport>, String> {
-    let path = handoff_path(&app).map_err(|error| public_failure("hand-off check", error))?;
+    let path =
+        handoff_path(&app).map_err(|error| public_failure(UpdaterOperation::HandoffCheck, error))?;
     let record = match read_handoff(&path) {
         Ok(Some(record)) => record,
         Ok(None) => return Ok(None),
@@ -1557,7 +1618,7 @@ pub async fn secure_updater_handoff_status(
     let age = chrono::Utc::now()
         .timestamp()
         .saturating_sub(record.attempted_at);
-    if age > HANDOFF_MAX_AGE_SECS || age < 0 {
+    if !(0..=HANDOFF_MAX_AGE_SECS).contains(&age) {
         clear_handoff(&app);
         return Ok(None);
     }
@@ -1630,47 +1691,54 @@ pub async fn secure_updater_handoff_status(
 /// should be able to see it happen and answer whatever prompt appears.
 #[tauri::command]
 pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), String> {
-    let path = handoff_path(&app).map_err(|error| public_failure("installer launch", error))?;
-    let Some(record) =
-        read_handoff(&path).map_err(|error| public_failure("installer launch", error))?
+    let path = handoff_path(&app)
+        .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?;
+    let Some(record) = read_handoff(&path)
+        .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?
     else {
-        return Err("There is no staged installer to run.".to_string());
+        return Err(coded(
+            "updater_no_staged_installer",
+            "There is no staged installer to run.",
+        ));
     };
     // Re-establish what this actually is before deciding anything about it. The
     // record's own fields are not evidence — see `verified_handoff_claim`.
     let claim = verified_handoff_claim(&record).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
         clear_handoff(&app);
-        "The staged installer could not be verified against its signed manifest. Check for updates again."
-            .to_string()
+        coded(
+            "updater_staged_unverified",
+            "The staged installer could not be verified against its signed manifest. Check for updates again.",
+        )
     })?;
     // Anti-rollback next, exactly as the install path does it. Verified bytes are
     // not the same question as a permitted version, and a permitted version is
     // not the same question as a newer one.
     if !handoff_is_an_upgrade(&app, &claim) {
         clear_handoff(&app);
-        return Err(
-            "The staged update is not newer than the version already installed.".to_string(),
-        );
+        return Err(coded(
+            "updater_staged_not_newer",
+            "The staged update is not newer than the version already installed.",
+        ));
     }
     match handoff_meets_floor(&app, &claim)
-        .map_err(|error| public_failure("installer launch", error))?
+        .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?
     {
         Some(true) => {}
         Some(false) => {
             clear_handoff(&app);
-            return Err(
-                "The staged update is older than the signed security floor. Check for updates again."
-                    .to_string(),
-            );
+            return Err(coded(
+                "updater_staged_below_floor",
+                "The staged update is older than the signed security floor. Check for updates again.",
+            ));
         }
         // Refuse, but keep the bytes: a floor we cannot read is not evidence of a
         // rollback. See `handoff_meets_floor`.
         None => {
-            return Err(
-                "Ember has no record of the current update security level yet. Check for updates first."
-                    .to_string(),
-            );
+            return Err(coded(
+                "updater_no_security_floor",
+                "Ember has no record of the current update security level yet. Check for updates first.",
+            ));
         }
     }
     // A first pass before tearing the network stack down, so a staged copy that
@@ -1678,8 +1746,10 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // the check that authorises the launch.
     verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
-        "The staged installer is missing or no longer matches its signature. Check for updates again."
-            .to_string()
+        coded(
+            "updater_staged_installer_unusable",
+            "The staged installer is missing or no longer matches its signature. Check for updates again.",
+        )
     })?;
 
     // Same reasoning as the install path: the installer replaces files this
@@ -1715,8 +1785,10 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // either way: `msiexec` elevates through the Windows Installer service.
     let installer = verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
-        "The staged installer changed while Ember was closing down. Check for updates again."
-            .to_string()
+        coded(
+            "updater_staged_installer_changed",
+            "The staged installer changed while Ember was closing down. Check for updates again.",
+        )
     })?;
 
     let spawned = if claim.kind == "msi" {
@@ -1747,7 +1819,10 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
             // the file is would send the user off to run it by hand from an app
             // that looks healthy and is not; the install path spells the same
             // thing out for the same reason.
-            Err("Windows would not start the installer. It is saved in Ember's data folder under \"updates\" if you want to run it yourself. Ember stopped its network services for the update; restart Ember to resume transfers.".to_string())
+            Err(coded(
+                "updater_launch_failed_services_stopped",
+                "Windows would not start the installer. It is saved in Ember's data folder under \"updates\" if you want to run it yourself. Ember stopped its network services for the update; restart Ember to resume transfers.",
+            ))
         }
     }
 }

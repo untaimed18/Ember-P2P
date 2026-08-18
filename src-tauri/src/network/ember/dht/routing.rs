@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tracing::{debug, info, trace};
 
-use crate::network::kad::ip_filter;
+use crate::network::kad::{dht_common, ip_filter};
 
 use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
 
@@ -67,6 +67,27 @@ pub enum AddResult {
     Rejected,
 }
 
+/// The address the shared IP gate can judge, or `None` when the contact is
+/// disqualified before any policy applies.
+///
+/// Ember contacts carry a [`SocketAddr`] where KAD contacts carry a bare
+/// [`Ipv4Addr`], so these two checks have no counterpart on the KAD side and
+/// stay here rather than in [`dht_common`].
+fn judgeable_ip(addr: &SocketAddr) -> Option<Ipv4Addr> {
+    // Port 0 is not dialable, so such a contact could only ever fail.
+    if addr.port() == 0 {
+        return None;
+    }
+    match addr.ip() {
+        IpAddr::V4(v4) => Some(v4),
+        // Ember rides the shared KAD UDP socket, which is opened as
+        // AF_INET. Every send to a v6 destination fails with
+        // EAFNOSUPPORT, so admitting one just occupies a bucket slot with
+        // an address we can never reach.
+        IpAddr::V6(_) => None,
+    }
+}
+
 /// Ember DHT routing table: 128 buckets indexed by XOR distance bit position.
 pub struct RoutingTable {
     local_id: EmberNodeId,
@@ -76,11 +97,10 @@ pub struct RoutingTable {
     /// Global per-address counter, so one host cannot fill the table with
     /// contacts under many self-generated keypairs.
     global_ip_count: HashMap<IpAddr, usize>,
-    /// Whether LAN / CGNAT addresses are refused, mirroring the KAD table's
-    /// setting so both stacks honour the same user preference.
-    block_private_ips: bool,
-    /// The user's range filter (`ipfilter.dat`), shared with the network layer.
-    range_ip_filter: Option<ip_filter::SharedIpFilter>,
+    /// The LAN/CGNAT preference and the user's range filter (`ipfilter.dat`),
+    /// in the same shared form the KAD table uses, so both stacks honour the
+    /// same user preference through one implementation.
+    ip_gate: dht_common::IpAdmissionGate,
 }
 
 impl RoutingTable {
@@ -94,8 +114,7 @@ impl RoutingTable {
             buckets,
             global_subnet_count: HashMap::new(),
             global_ip_count: HashMap::new(),
-            block_private_ips,
-            range_ip_filter: None,
+            ip_gate: dht_common::IpAdmissionGate::new(block_private_ips),
         }
     }
 
@@ -122,16 +141,14 @@ impl RoutingTable {
     /// Share the user's range filter so blocked addresses are refused on
     /// admission, as [`crate::network::kad::routing::RoutingTable`] does.
     pub fn set_ip_filter(&mut self, filter: ip_filter::SharedIpFilter) {
-        self.range_ip_filter = Some(filter);
+        self.ip_gate.set_range_filter(filter);
     }
 
     /// Hot-update the LAN/CGNAT admission policy. Turning the block on also
     /// drops contacts already in the table that it now rejects, so the setting
     /// takes effect immediately rather than only for future contacts.
     pub fn set_block_private_ips(&mut self, block_private: bool) -> usize {
-        let enabling = block_private && !self.block_private_ips;
-        self.block_private_ips = block_private;
-        if enabling {
+        if self.ip_gate.set_block_private_ips(block_private) {
             self.evict_filtered_contacts()
         } else {
             0
@@ -146,71 +163,25 @@ impl RoutingTable {
     /// meant the user's IP filter applied to inbound traffic but not to
     /// anything we chose to contact ourselves.
     pub fn admits_addr(&self, addr: &SocketAddr) -> bool {
-        // Port 0 is not dialable, so such a contact could only ever fail.
-        if addr.port() == 0 {
-            return false;
-        }
-        let IpAddr::V4(v4) = addr.ip() else {
-            // Ember rides the shared KAD UDP socket, which is opened as
-            // AF_INET. Every send to a v6 destination fails with
-            // EAFNOSUPPORT, so admitting one just occupies a bucket slot with
-            // an address we can never reach.
+        let Some(v4) = judgeable_ip(addr) else {
             return false;
         };
-        if !ip_filter::is_valid_contact_ip(v4, self.block_private_ips) {
-            return false;
-        }
-        if let Some(filter) = &self.range_ip_filter {
-            match filter.read() {
-                Ok(snap) => {
-                    if snap.is_blocked_for_kad(v4) {
-                        return false;
-                    }
-                }
-                // A poisoned lock means we cannot consult the user's filter.
-                // Refusing the contact is the safe reading of "blocked unless
-                // known otherwise".
-                Err(_) => return false,
-            }
-        }
-        true
+        matches!(self.ip_gate.admits(v4), dht_common::Admission::Allowed)
     }
 
     /// Whether an address is *known* to be disallowed, as opposed to merely
     /// not confirmable.
     ///
     /// Admission and eviction want opposite answers when the filter cannot be
-    /// consulted. Refusing an unconfirmable newcomer costs one contact;
-    /// evicting on the same answer would empty the entire table the first
-    /// time the shared lock is poisoned. KAD draws the same distinction,
-    /// including during the startup fail-closed window: `is_blocked_for_kad`
-    /// treats every non-seed as blocked until `ipfilter.dat` is applied, and
-    /// Ember contacts are never Kad bootstrap seeds. Evicting against that
-    /// answer would wipe `nodes_ember.dat` on every launch.
+    /// consulted, and KAD draws the same distinction — the reasoning lives with
+    /// the shared gate, in
+    /// [`dht_common::IpAdmissionGate::is_definitely_blocked`]. An address this
+    /// table cannot judge at all is disallowed outright rather than handed to
+    /// the gate; see [`judgeable_ip`].
     fn definitely_blocked(&self, addr: &SocketAddr) -> bool {
-        if addr.port() == 0 {
-            return true;
-        }
-        let IpAddr::V4(v4) = addr.ip() else {
-            return true;
-        };
-        if !ip_filter::is_valid_contact_ip(v4, self.block_private_ips) {
-            return true;
-        }
-        match &self.range_ip_filter {
-            Some(filter) => match filter.read() {
-                Ok(snap) => {
-                    // Fail-closed is for inbound strangers, not for emptying a
-                    // table we restored before the file finished parsing.
-                    if snap.enabled && !snap.ranges_ready {
-                        return false;
-                    }
-                    snap.is_blocked(v4)
-                }
-                // Unreadable: keep what we have.
-                Err(_) => false,
-            },
-            None => false,
+        match judgeable_ip(addr) {
+            Some(v4) => self.ip_gate.is_definitely_blocked(v4),
+            None => true,
         }
     }
 
@@ -236,7 +207,7 @@ impl RoutingTable {
             .iter()
             .flat_map(|b| b.contacts.iter())
             .filter(|c| c.is_verified())
-            .filter(|c| now.saturating_sub(c.last_seen) >= max_age_secs)
+            .filter(|c| dht_common::is_stale(now, c.last_seen, max_age_secs))
             .filter(|c| !in_use.contains(&c.node_id))
             .map(|c| c.node_id)
             .collect();
@@ -256,18 +227,7 @@ impl RoutingTable {
     /// Drop contacts the current IP policy would no longer admit. Run after
     /// the filter is reloaded or the private-IP setting is turned on.
     pub fn evict_filtered_contacts(&mut self) -> usize {
-        let doomed: Vec<EmberNodeId> = self
-            .all_contacts()
-            .into_iter()
-            .filter(|c| self.definitely_blocked(&c.addr))
-            .map(|c| c.node_id)
-            .collect();
-        let mut removed = 0;
-        for id in &doomed {
-            if self.remove_contact(id) {
-                removed += 1;
-            }
-        }
+        let removed = dht_common::evict_blocked_contacts(self);
         // Same treatment for cached entries, using the same predicate so the
         // cache cannot hold addresses the table would refuse.
         let blocked_cached: Vec<(usize, EmberNodeId)> = self
@@ -881,14 +841,14 @@ impl RoutingTable {
         // `store_proximity_ok` on the storer side is strictly distance-based. A
         // non-zero `failed_queries` is normal mid-refresh anyway (see
         // `remove_stale`), and three strikes evicts outright.
-        verified.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        verified.sort_by_key(|a| a.0 .0);
         let mut out: Vec<EmberContact> = verified
             .into_iter()
             .take(count)
             .map(|(_, c)| c.clone())
             .collect();
         if out.len() < count {
-            leads.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+            leads.sort_by_key(|a| a.0 .0);
             out.extend(
                 leads
                     .into_iter()
@@ -926,7 +886,7 @@ impl RoutingTable {
             }
         }
 
-        all.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.sort_by_key(|a| a.0 .0);
         all.into_iter()
             .take(count)
             .map(|(_, c)| c.clone())
@@ -953,7 +913,7 @@ impl RoutingTable {
             .filter(|c| c.is_verified() && c.failed_queries < super::MAX_FAILED_QUERIES)
             .map(|c| (self.local_id.distance(&c.node_id), c))
             .collect();
-        verified.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        verified.sort_by_key(|a| a.0 .0);
         verified
             .into_iter()
             .take(max)
@@ -1031,7 +991,7 @@ impl RoutingTable {
     /// are dropped later by [`Self::evict_filtered_contacts`] once the list is
     /// ready.
     pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
-        let held = self.range_ip_filter.take();
+        let held = self.ip_gate.take_range_filter();
         let count = contacts.len();
         let mut added = 0;
         for contact in contacts {
@@ -1039,7 +999,7 @@ impl RoutingTable {
                 added += 1;
             }
         }
-        self.range_ip_filter = held;
+        self.ip_gate.restore_range_filter(held);
         debug!("Loaded {added}/{count} contacts into Ember routing table");
     }
 
@@ -1091,6 +1051,31 @@ impl RoutingTable {
         self.buckets[bucket_idx]
             .replacement_cache
             .push_back(contact);
+    }
+}
+
+/// Bucket-array storage for the shared IP-policy sweep.
+///
+/// [`RoutingTable::remove_contact`] is the right eviction hook rather than
+/// [`RoutingTable::evict_and_replace`]: a contact dropped on policy grounds
+/// should not pull a replacement in from the cache, because the same sweep is
+/// about to re-test the cache with the same predicate.
+impl dht_common::PolicyEvictable for RoutingTable {
+    type ContactId = EmberNodeId;
+
+    fn ip_gate(&self) -> &dht_common::IpAdmissionGate {
+        &self.ip_gate
+    }
+
+    fn resident_contacts(&self) -> Vec<(EmberNodeId, Option<Ipv4Addr>)> {
+        self.all_contacts()
+            .into_iter()
+            .map(|c| (c.node_id, judgeable_ip(&c.addr)))
+            .collect()
+    }
+
+    fn evict_contact(&mut self, id: &EmberNodeId) -> bool {
+        self.remove_contact(id)
     }
 }
 
