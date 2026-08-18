@@ -896,20 +896,23 @@ pub fn keyword_hash(keyword: &str) -> [u8; 16] {
 /// sorted by keyword length descending (longest / most selective first). The
 /// first entry is the primary DHT walk key; the rest ride on FIND_VALUE for
 /// peer-side `file_hash` intersection.
+///
+/// Tokenized by the same function that splits a filename on the publish side,
+/// so this cannot walk to a key no publisher ever wrote to. A DHT keyword index
+/// is only navigable when both ends agree where a word ends, and splitting on
+/// whitespace alone would hash `blade-runner` whole while the publisher stored
+/// `blade` and `runner`.
+///
+/// In practice the live callers pass terms [`crate::search::query`] has already
+/// tokenized with the same rules, so this is belt-and-braces rather than a
+/// behaviour change — but it is what keeps the two ends from drifting apart if
+/// a caller ever hands over a raw query.
 pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
-    let mut keywords: Vec<String> = query
-        .split_whitespace()
-        .filter(|w| w.len() >= 2)
-        .map(|w| w.to_lowercase())
-        .collect();
-
+    // Already lowercased and deduplicated (case-insensitively) by the
+    // tokenizer; this only imposes the most-selective-first ordering the
+    // primary/secondary split depends on.
+    let mut keywords = crate::network::kad::publish::extract_query_keywords(query);
     keywords.sort_by(|a, b| b.len().cmp(&a.len()));
-    // Not `dedup()`: it only collapses adjacent equals, and sorting by length
-    // alone can leave two copies of a keyword separated by a same-length one.
-    // A duplicate would spend one of the few FIND_VALUE key slots on a key
-    // already being queried.
-    let mut seen = std::collections::HashSet::new();
-    keywords.retain(|k| seen.insert(k.clone()));
 
     keywords
         .into_iter()
@@ -1320,9 +1323,66 @@ mod tests {
     #[test]
     fn compute_keyword_hashes_sorts_by_length() {
         let hashes = compute_keyword_hashes("a longer short");
-        assert_eq!(hashes.len(), 2); // "a" filtered out (< 2 chars)
+        assert_eq!(hashes.len(), 2); // "a" filtered out (under 3 bytes)
         assert_eq!(hashes[0].1, "longer"); // longest first
         assert_eq!(hashes[1].1, "short");
+    }
+
+    /// The publisher splits a filename on separators, so a query carrying one
+    /// has to be split the same way or it walks to a key nothing was stored
+    /// under.
+    #[test]
+    fn a_query_is_tokenized_exactly_like_the_filename_it_should_match() {
+        let published = crate::network::kad::publish::extract_keywords("Blade.Runner.2049.mkv");
+        let searched: Vec<String> = compute_keyword_hashes("Blade.Runner.2049")
+            .into_iter()
+            .map(|(_, kw)| kw)
+            .collect();
+        for token in ["blade", "runner", "2049"] {
+            assert!(
+                published.contains(&token.to_string()),
+                "publisher stores {token}"
+            );
+            assert!(
+                searched.contains(&token.to_string()),
+                "search must ask for {token}"
+            );
+        }
+    }
+
+    /// Pasting a filename into the search box is the ordinary case, so the key
+    /// it walks must be one the publisher of that filename wrote to.
+    #[test]
+    fn pasting_a_filename_walks_a_key_the_publisher_wrote_to() {
+        let name = "ubuntu-24.04-desktop.iso";
+        let publisher_keys: Vec<[u8; 16]> = crate::network::kad::publish::extract_keywords(name)
+            .iter()
+            .map(|kw| keyword_hash(kw))
+            .collect();
+        let primary = compute_keyword_hashes(name)
+            .first()
+            .map(|(hash, _)| *hash)
+            .expect("a filename yields at least one query key");
+        assert!(
+            publisher_keys.contains(&primary),
+            "the walked key must be one the publisher stored under"
+        );
+    }
+
+    /// The trailing-three-character strip exists to drop `.mkv` off a filename.
+    /// Applied to a query it would throw away the last word typed, which is
+    /// usually the most specific one.
+    #[test]
+    fn a_query_keeps_its_last_short_word() {
+        let searched: Vec<String> = compute_keyword_hashes("the big cat")
+            .into_iter()
+            .map(|(_, kw)| kw)
+            .collect();
+        assert_eq!(searched.len(), 3);
+        assert!(
+            searched.contains(&"cat".to_string()),
+            "the most specific word must survive"
+        );
     }
 
     #[test]

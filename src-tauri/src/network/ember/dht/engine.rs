@@ -99,6 +99,21 @@ pub struct DhtInbound {
     /// For a `PEER_LIST`, the `request_id` it answered plus the contacts
     /// it carried (also merged into the routing table).
     pub peer_list: Option<(u32, Vec<EmberContact>)>,
+    /// Unverified contacts carried on `ANNOUNCE_PEER` / `PEER_LIST` /
+    /// `FOUND_NODE`. Already offered to the public table; the caller may
+    /// also keep LAN/CGNAT ones in the session map and ping them now
+    /// rather than waiting for the next maintenance tick.
+    pub gossip_leads: Vec<EmberContact>,
+    /// Of those, how many were peers we did not already hold and the table
+    /// accepted.
+    pub gossip_new: u32,
+    /// Of those, how many the table turned away (IP policy, diversity caps).
+    ///
+    /// Split from `gossip_new` because a table that will not grow has three
+    /// very different explanations — nobody is telling us anything, they are
+    /// telling us only what we already have, or we are refusing what they
+    /// send — and the totals alone cannot separate them.
+    pub gossip_refused: u32,
     /// We learned (added) a new contact from this frame's signed sender.
     pub learned_contact: bool,
     /// The signed sender as a contact, even when the routing table refused
@@ -270,6 +285,12 @@ impl EmberDht {
     /// reloads `ipfilter.dat`.
     pub fn evict_filtered_contacts(&mut self) -> usize {
         self.routing.evict_filtered_contacts()
+    }
+
+    /// Admit cached leads the IP policy now allows. See
+    /// [`RoutingTable::promote_cached_contacts`].
+    pub fn promote_cached_contacts(&mut self) -> usize {
+        self.routing.promote_cached_contacts()
     }
 
     /// Insert a contact directly (manual harness seeding). Returns
@@ -462,11 +483,33 @@ impl EmberDht {
     /// its distance to itself is zero, so an unfiltered reply always led with
     /// the one contact it definitely already has — spending a slot of a
     /// response that is capped by both count and datagram size.
-    fn closest_excluding(&self, target: &EmberNodeId, asker: EmberNodeId) -> Vec<EmberContact> {
+    fn closest_excluding(
+        &self,
+        target: &EmberNodeId,
+        asker: EmberNodeId,
+        session_contacts: &[EmberContact],
+    ) -> Vec<EmberContact> {
         let mut closest = self
             .routing
             .find_closest(target, MAX_CONTACTS_PER_RESPONSE + 1);
         closest.retain(|c| c.node_id != asker);
+        // LAN/CGNAT session peers live beside the public table when
+        // `block_private_ips` is on. A neighbour on that island already
+        // reached us firsthand; handing them those contacts fills the
+        // island. They are never included for a public asker (the caller
+        // passes an empty slice).
+        for extra in session_contacts {
+            if closest.len() >= MAX_CONTACTS_PER_RESPONSE {
+                break;
+            }
+            if extra.node_id == asker || extra.node_id == self.local_id {
+                continue;
+            }
+            if closest.iter().any(|c| c.node_id == extra.node_id) {
+                continue;
+            }
+            closest.push(extra.clone());
+        }
         closest.truncate(MAX_CONTACTS_PER_RESPONSE);
         closest
     }
@@ -782,7 +825,8 @@ impl EmberDht {
     // ── Persistence (slice 7) ──
 
     /// Bulk-load persisted contacts (from `nodes_ember.dat`) into the
-    /// routing table at startup.
+    /// routing table at startup. Detaches the range filter for the pass so a
+    /// still-loading `ipfilter.dat` cannot refuse the whole bootstrap set.
     pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
         self.routing.load_contacts(contacts);
     }
@@ -913,6 +957,20 @@ impl EmberDht {
         self.store.mark_republish_due(key, signature);
     }
 
+    /// [`Self::handle_incoming`] with no session peers to offer. Every
+    /// production caller has a (possibly empty) slice to hand, so this is a
+    /// convenience for the tests that predate the parameter.
+    #[cfg(test)]
+    pub fn handle_message(
+        &mut self,
+        payload: &[u8],
+        from: SocketAddr,
+        remote_noise_pub: [u8; 32],
+        now: i64,
+    ) -> DhtInbound {
+        self.handle_incoming(payload, from, remote_noise_pub, now, &[])
+    }
+
     /// Handle one decrypted inbound DHT frame from `from` over a Noise
     /// session whose peer static key is `remote_noise_pub`. `now` is a
     /// unix timestamp used for contact freshness.
@@ -920,12 +978,18 @@ impl EmberDht {
     /// Every validly-signed frame teaches us a contact (Kademlia learns
     /// from all traffic). A `PING` additionally yields a signed `PONG`
     /// in `responses`.
-    pub fn handle_message(
+    ///
+    /// `session_contacts` tops `FIND_NODE` / `ANNOUNCE_PEER` / `FIND_VALUE`
+    /// misses up with firsthand session peers the public table refused. Pass
+    /// an empty slice for a public asker — those addresses are only ever
+    /// shared back onto the island they came from.
+    pub fn handle_incoming(
         &mut self,
         payload: &[u8],
         from: SocketAddr,
         remote_noise_pub: [u8; 32],
         now: i64,
+        session_contacts: &[EmberContact],
     ) -> DhtInbound {
         let mut out = DhtInbound::default();
 
@@ -989,7 +1053,7 @@ impl EmberDht {
             }
             DhtPayload::FindNode { target } => {
                 out.find_node_received = true;
-                let closest = self.closest_excluding(&target, msg.sender_id);
+                let closest = self.closest_excluding(&target, msg.sender_id, session_contacts);
                 let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                 out.responses
                     .push(messages::encode_message(&found, &self.signing_key, true));
@@ -1105,7 +1169,8 @@ impl EmberDht {
                 // the asker so both tables thicken without a FIND_NODE.
                 out.announce_peer_received = true;
                 Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
-                let closest = self.closest_excluding(&msg.sender_id, msg.sender_id);
+                let closest =
+                    self.closest_excluding(&msg.sender_id, msg.sender_id, session_contacts);
                 let peer_list = messages::build_peer_list(self.local_id, msg.request_id, closest);
                 out.responses.push(messages::encode_message(
                     &peer_list,
@@ -1149,7 +1214,7 @@ impl EmberDht {
                     // paths. `handle_message` adds the sender to the table
                     // before we get here, so a bare `find_closest` could spend
                     // one of only twenty slots telling a peer about itself.
-                    let closest = self.closest_excluding(&target, msg.sender_id);
+                    let closest = self.closest_excluding(&target, msg.sender_id, session_contacts);
                     let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                     out.responses
                         .push(messages::encode_message(&found, &self.signing_key, true));
@@ -1187,14 +1252,27 @@ impl EmberDht {
         contacts: &[EmberContact],
         out: &mut DhtInbound,
     ) {
+        out.gossip_leads.extend(contacts.iter().cloned());
         for contact in contacts {
-            if let AddResult::PingOldest {
-                addr,
-                node_id,
-                noise_pub,
-            } = routing.add_contact(contact.clone())
-            {
-                out.ping_oldest.push((addr, node_id, noise_pub));
+            // Read before the add: `add_contact` reports `Added` for a contact
+            // that was already resident, so the return value alone cannot tell
+            // "we learned someone" from "they told us what we already knew" —
+            // and those two mean opposite things when a table will not grow.
+            let known = routing.get_contact(&contact.node_id).is_some();
+            match routing.add_contact(contact.clone()) {
+                AddResult::PingOldest {
+                    addr,
+                    node_id,
+                    noise_pub,
+                } => out.ping_oldest.push((addr, node_id, noise_pub)),
+                AddResult::Added => {
+                    if !known {
+                        out.gossip_new = out.gossip_new.saturating_add(1);
+                    }
+                }
+                AddResult::Rejected => {
+                    out.gossip_refused = out.gossip_refused.saturating_add(1);
+                }
             }
         }
     }
@@ -1670,6 +1748,46 @@ mod tests {
     }
 
     #[test]
+    fn announce_to_a_lan_neighbour_includes_session_contacts() {
+        let mut a = EmberDht::new([20; 32], true);
+        let mut b = EmberDht::new([21; 32], true);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = SocketAddr::from(([192, 168, 1, 20], 4672));
+        let b_addr = SocketAddr::from(([192, 168, 1, 21], 4672));
+
+        let island = EmberDht::new([22; 32], true);
+        let lan = EmberContact {
+            node_id: island.local_id(),
+            addr: SocketAddr::from(([192, 168, 1, 50], 4672)),
+            noise_pub: [0xCC; 32],
+            ed25519_pub: island.ed25519_public_key(),
+            last_seen: 500,
+            failed_queries: 0,
+        };
+        assert!(
+            !b.add_contact(lan.clone()),
+            "block_private keeps LAN out of the public table"
+        );
+
+        let (rid, announce) = a.build_announce_peer(Vec::new());
+        let on_b = b.handle_incoming(&announce, a_addr, a_noise, 1000, std::slice::from_ref(&lan));
+        assert!(on_b.announce_peer_received);
+
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        let (got_rid, contacts) = on_a.peer_list.expect("PEER_LIST");
+        assert_eq!(got_rid, rid);
+        assert!(
+            contacts.iter().any(|c| c.node_id == lan.node_id),
+            "a LAN neighbour must hear about other session peers"
+        );
+        assert!(
+            on_a.gossip_leads.iter().any(|c| c.node_id == lan.node_id),
+            "PEER_LIST contacts must be visible as gossip leads"
+        );
+    }
+
+    #[test]
     fn handle_message_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11C_E11E);
@@ -2064,10 +2182,7 @@ mod tests {
             replay.store_replay_rejected,
             "the identical signature is a replay"
         );
-        assert!(
-            !replay.stored_record,
-            "replay is not a new store"
-        );
+        assert!(!replay.stored_record, "replay is not a new store");
         assert_eq!(
             replay.responses.len(),
             1,
@@ -2101,7 +2216,10 @@ mod tests {
 
         let (_frid, find_bytes) = a.build_find_value(vec![key]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
-        assert!(on_b.find_value_hit, "the max-size record must be answerable");
+        assert!(
+            on_b.find_value_hit,
+            "the max-size record must be answerable"
+        );
         assert_eq!(on_b.responses.len(), 1);
     }
 

@@ -182,7 +182,11 @@ impl RoutingTable {
     /// Admission and eviction want opposite answers when the filter cannot be
     /// consulted. Refusing an unconfirmable newcomer costs one contact;
     /// evicting on the same answer would empty the entire table the first
-    /// time the shared lock is poisoned. KAD draws the same distinction.
+    /// time the shared lock is poisoned. KAD draws the same distinction,
+    /// including during the startup fail-closed window: `is_blocked_for_kad`
+    /// treats every non-seed as blocked until `ipfilter.dat` is applied, and
+    /// Ember contacts are never Kad bootstrap seeds. Evicting against that
+    /// answer would wipe `nodes_ember.dat` on every launch.
     fn definitely_blocked(&self, addr: &SocketAddr) -> bool {
         if addr.port() == 0 {
             return true;
@@ -195,7 +199,14 @@ impl RoutingTable {
         }
         match &self.range_ip_filter {
             Some(filter) => match filter.read() {
-                Ok(snap) => snap.is_blocked_for_kad(v4),
+                Ok(snap) => {
+                    // Fail-closed is for inbound strangers, not for emptying a
+                    // table we restored before the file finished parsing.
+                    if snap.enabled && !snap.ranges_ready {
+                        return false;
+                    }
+                    snap.is_blocked(v4)
+                }
                 // Unreadable: keep what we have.
                 Err(_) => false,
             },
@@ -281,7 +292,77 @@ impl RoutingTable {
                 self.total_contacts()
             );
         }
+        let promoted = self.promote_cached_contacts();
+        if promoted > 0 {
+            info!(
+                "Ember DHT: admitted {promoted} cached contact(s) now that the IP policy can be \
+                 checked, {} in table",
+                self.total_contacts()
+            );
+        }
         removed
+    }
+
+    /// Move cached leads into free bucket slots when the current IP policy
+    /// admits them.
+    ///
+    /// The replacement cache is otherwise drained only by `evict_and_replace`,
+    /// which needs a resident contact to die first. Leads parked while the
+    /// filter was still loading would sit there indefinitely on a node whose
+    /// buckets have plenty of room — which is exactly the cold-start table
+    /// that needed them.
+    pub fn promote_cached_contacts(&mut self) -> usize {
+        let mut promoted = 0;
+        for idx in 0..self.buckets.len() {
+            // `scale()` walks the whole table, so do not pay for it on the
+            // 128 buckets that have nothing parked — which is all of them in
+            // steady state.
+            if self.buckets[idx].replacement_cache.is_empty() {
+                continue;
+            }
+            while !self.buckets[idx].is_full() {
+                let scale = self.scale();
+                let max_per_ip = scale.max_contacts_per_ip();
+                let max_subnet_global = scale.max_contacts_per_subnet_global();
+                let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
+                let bucket = &self.buckets[idx];
+                let chosen = (0..bucket.replacement_cache.len()).rev().find(|&i| {
+                    let candidate = &bucket.replacement_cache[i];
+                    if bucket.find(&candidate.node_id).is_some() {
+                        return false;
+                    }
+                    if !self.admits_addr(&candidate.addr) {
+                        return false;
+                    }
+                    let subnet = candidate.subnet_key();
+                    bucket.subnet_count(subnet) < max_subnet_bucket
+                        && self
+                            .global_subnet_count
+                            .get(&subnet)
+                            .copied()
+                            .unwrap_or(0)
+                            < max_subnet_global
+                        && self
+                            .global_ip_count
+                            .get(&candidate.addr.ip())
+                            .copied()
+                            .unwrap_or(0)
+                            < max_per_ip
+                });
+                let Some(i) = chosen else {
+                    break;
+                };
+                let contact = self.buckets[idx].replacement_cache.remove(i).unwrap();
+                *self
+                    .global_subnet_count
+                    .entry(contact.subnet_key())
+                    .or_insert(0) += 1;
+                *self.global_ip_count.entry(contact.addr.ip()).or_insert(0) += 1;
+                self.buckets[idx].contacts.push_back(contact);
+                promoted += 1;
+            }
+        }
+        promoted
     }
 
     pub fn total_contacts(&self) -> usize {
@@ -294,21 +375,36 @@ impl RoutingTable {
             return AddResult::Rejected;
         }
 
-        if !self.admits_addr(&contact.addr) {
-            trace!(
-                "Rejected contact {} at {} (IP policy)",
-                contact.node_id,
-                contact.addr
-            );
-            return AddResult::Rejected;
-        }
-
         let bucket_idx = match self.local_id.bucket_index(&contact.node_id) {
             Some(idx) => idx,
             None => return AddResult::Rejected,
         };
 
         if bucket_idx >= ID_BITS {
+            return AddResult::Rejected;
+        }
+
+        if !self.admits_addr(&contact.addr) {
+            // "Cannot confirm" is not "known bad". While `ipfilter.dat` is
+            // still parsing, `is_blocked_for_kad` calls every non-seed address
+            // blocked, and Ember peers are never Kad seeds — so dropping here
+            // discarded every lead learned during the window, permanently.
+            // A node whose table was thin at launch therefore threw away the
+            // gossip that would have refilled it and stayed thin.
+            //
+            // Park it in the replacement cache instead. `promote_cached_contacts`
+            // re-tests it once the ranges land, and `evict_filtered_contacts`
+            // clears the cache of anything genuinely blocked, so nothing enters
+            // the table without passing the real list.
+            if !self.definitely_blocked(&contact.addr) {
+                self.add_to_cache(bucket_idx, contact);
+                return AddResult::Rejected;
+            }
+            trace!(
+                "Rejected contact {} at {} (IP policy)",
+                contact.node_id,
+                contact.addr
+            );
             return AddResult::Rejected;
         }
 
@@ -925,8 +1021,17 @@ impl RoutingTable {
             .collect()
     }
 
-    /// Bulk-load contacts (e.g., from persisted nodes_ember.dat).
+    /// Bulk-load contacts (e.g., from persisted `nodes_ember.dat`).
+    ///
+    /// The range filter is detached for this pass. At startup it is fail-closed
+    /// until `ipfilter.dat` loads, and Ember addresses are never Kad bootstrap
+    /// seeds, so [`Self::admits_addr`] would refuse the entire file. Kad inserts
+    /// `nodes.dat` before attaching the filter for the same reason. Port 0,
+    /// non-v4, and the table's private/bogus rules still apply. Blocked ranges
+    /// are dropped later by [`Self::evict_filtered_contacts`] once the list is
+    /// ready.
     pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
+        let held = self.range_ip_filter.take();
         let count = contacts.len();
         let mut added = 0;
         for contact in contacts {
@@ -934,6 +1039,7 @@ impl RoutingTable {
                 added += 1;
             }
         }
+        self.range_ip_filter = held;
         debug!("Loaded {added}/{count} contacts into Ember routing table");
     }
 
@@ -991,6 +1097,7 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::kad::ip_filter::IpFilter;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn make_id(byte: u8) -> EmberNodeId {
@@ -1831,5 +1938,123 @@ mod tests {
         let mut rt2 = RoutingTable::new(local, false);
         rt2.load_contacts(contacts);
         assert_eq!(rt2.total_contacts(), 2);
+    }
+
+    /// `nodes_ember.dat` is restored while the IP filter is still fail-closed.
+    /// Ember contacts are not Kad bootstrap seeds, so ordinary admission would
+    /// refuse every address in the file. Restore must still seed the table, and
+    /// eviction must not wipe it until the real list is applied.
+    #[test]
+    fn restored_contacts_survive_a_fail_closed_ip_filter() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let filter = IpFilter::new(true, false);
+        rt.set_ip_filter(filter.create_shared_snapshot());
+
+        assert!(
+            matches!(rt.add_contact(make_contact(1, 4672)), AddResult::Rejected),
+            "newcomers still wait until ipfilter.dat is applied"
+        );
+
+        rt.load_contacts(vec![make_contact(1, 4672), make_contact(2, 4672)]);
+        assert_eq!(
+            rt.total_contacts(),
+            2,
+            "persist-restore must ignore the fail-closed range gate"
+        );
+        assert_eq!(
+            rt.evict_filtered_contacts(),
+            0,
+            "eviction must not treat fail-closed as a real block"
+        );
+        assert_eq!(rt.total_contacts(), 2);
+        assert!(
+            matches!(rt.add_contact(make_contact(3, 4672)), AddResult::Rejected),
+            "filter stays attached for later newcomers"
+        );
+    }
+
+    /// Gossip learned while `ipfilter.dat` is still parsing used to be dropped
+    /// outright, so a node whose table was thin at launch discarded the very
+    /// contacts that would have refilled it and stayed thin. Park it instead,
+    /// and admit it once the ranges land.
+    #[test]
+    fn gossip_refused_while_the_filter_loads_is_admitted_once_it_is_ready() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut filter = IpFilter::new(true, false);
+        rt.set_ip_filter(filter.create_shared_snapshot());
+
+        assert!(
+            matches!(rt.add_contact(make_contact(1, 4672)), AddResult::Rejected),
+            "it must not enter the table on an unconfirmable answer"
+        );
+        assert_eq!(rt.total_contacts(), 0);
+
+        filter.mark_ranges_ready();
+        rt.set_ip_filter(filter.create_shared_snapshot());
+        assert_eq!(rt.evict_filtered_contacts(), 0);
+        assert_eq!(rt.total_contacts(), 1, "the parked lead is admitted");
+        assert!(rt.get_contact(&make_id(1)).is_some());
+    }
+
+    /// The parking rule must not launder an address the list really blocks:
+    /// that would put it in the table the moment a slot opened.
+    #[test]
+    fn an_address_the_list_blocks_is_never_parked_for_later() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(80, 1, 1, 1),
+            Ipv4Addr::new(80, 1, 1, 1),
+            "blocked".to_string(),
+        );
+        filter.mark_ranges_ready();
+        rt.set_ip_filter(filter.create_shared_snapshot());
+
+        assert!(matches!(rt.add_contact(make_contact(1, 4672)), AddResult::Rejected));
+        assert_eq!(rt.promote_cached_contacts(), 0);
+        assert_eq!(rt.total_contacts(), 0);
+    }
+
+    /// Same for a LAN address while `block_private_ips` is on: that is a
+    /// settled policy answer, not a "cannot check yet".
+    #[test]
+    fn a_private_address_is_never_parked_while_block_private_is_on() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, true);
+        let lan = EmberContact {
+            node_id: make_id(7),
+            addr: SocketAddr::from(([192, 168, 1, 50], 4672)),
+            noise_pub: [7; 32],
+            ed25519_pub: [8; 32],
+            last_seen: 100,
+            failed_queries: 0,
+        };
+        assert!(matches!(rt.add_contact(lan), AddResult::Rejected));
+        assert_eq!(rt.promote_cached_contacts(), 0);
+        assert_eq!(rt.total_contacts(), 0);
+    }
+
+    #[test]
+    fn evict_drops_blocked_contacts_once_ranges_are_ready() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        rt.load_contacts(vec![make_contact(1, 4672), make_contact(2, 4672)]);
+        assert_eq!(rt.total_contacts(), 2);
+
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(80, 1, 1, 1),
+            Ipv4Addr::new(80, 1, 1, 1),
+            "blocked".to_string(),
+        );
+        filter.mark_ranges_ready();
+        rt.set_ip_filter(filter.create_shared_snapshot());
+
+        assert_eq!(rt.evict_filtered_contacts(), 1);
+        assert!(rt.get_contact(&make_id(1)).is_none());
+        assert!(rt.get_contact(&make_id(2)).is_some());
     }
 }

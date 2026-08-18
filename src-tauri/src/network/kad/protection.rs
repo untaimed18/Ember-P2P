@@ -29,6 +29,18 @@ const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 20;
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
 const MAX_PACKETS_PER_SEC_KNOWN: u32 = 40;
 
+/// The same caps, counted separately for Ember-native traffic.
+///
+/// Ember rides the shared KAD UDP socket, so both protocols arrive from the
+/// same address and used to draw on one counter. A peer running both is the
+/// normal case, and an ordinary KAD exchange with it — search results, publish
+/// acks, packed responses — could then spend the allowance Ember needed to
+/// finish a Noise handshake, so the DHT contact was never established. The
+/// budget per protocol is unchanged; only the accounting is split, and a
+/// spoofed flood still has to beat both windows.
+const MAX_EMBER_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
+const MAX_EMBER_PACKETS_PER_SEC_KNOWN: u32 = 40;
+
 /// Request opcodes whose responses are big enough to arrive packed. An
 /// outstanding one of these in `outgoing_requests` marks the source as
 /// answering us, which exempts it from the aggregate compressed budget in
@@ -211,6 +223,10 @@ fn is_request_opcode(opcode: u8) -> bool {
 
 pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
+    /// Per-IP window for Ember-native UDP, kept apart from `ip_counters` so
+    /// the two protocols sharing one socket cannot starve each other. See
+    /// [`MAX_EMBER_PACKETS_PER_SEC_KNOWN`].
+    ember_ip_counters: HashMap<IpAddr, (u32, Instant)>,
     /// Per-(IP, opcode) tracking within OPCODE_WINDOW_SECS
     opcode_counters: HashMap<(IpAddr, u8), (u32, Instant)>,
     /// Count of *outstanding* outgoing requests per (peer_ip, opcode).
@@ -247,6 +263,7 @@ pub struct FloodProtection {
     /// alongside each map so a full table can be evicted from in O(1)
     /// instead of scanning every entry — see `evict_idle`.
     ip_order: VecDeque<IpAddr>,
+    ember_ip_order: VecDeque<IpAddr>,
     opcode_order: VecDeque<(IpAddr, u8)>,
     outgoing_order: VecDeque<IpAddr>,
     compressed_order: VecDeque<IpAddr>,
@@ -254,13 +271,60 @@ pub struct FloodProtection {
     /// their own to fall back on — see [`FallbackCounters`]. The compressed
     /// table needs no shards: `global_compressed` is already its aggregate.
     ip_fallback: FallbackCounters,
+    ember_ip_fallback: FallbackCounters,
     opcode_fallback: FallbackCounters,
+}
+
+/// Charge one packet to a per-IP one-second window and report whether the
+/// source is now over `max_packets`.
+///
+/// Shared by the KAD and Ember windows so the two stay identical in behaviour
+/// — including the saturated-table degradation, where a source we already have
+/// a relationship with falls back to a shared shard rather than being refused
+/// outright. Dropping those would discard the very responses we asked for.
+fn over_per_ip_budget(
+    counters: &mut HashMap<IpAddr, (u32, Instant)>,
+    order: &mut VecDeque<IpAddr>,
+    fallback: &mut FallbackCounters,
+    ip: IpAddr,
+    max_packets: u32,
+    has_relationship: bool,
+    now: Instant,
+) -> bool {
+    if !counters.contains_key(&ip) {
+        if counters.len() >= MAX_IP_ENTRIES
+            && !evict_idle(counters, order, |(_, t)| {
+                now.saturating_duration_since(*t).as_secs() >= 1
+            })
+        {
+            if !has_relationship {
+                return true;
+            }
+            return fallback.over_budget(
+                ip,
+                now,
+                Duration::from_secs(1),
+                max_packets.saturating_mul(FALLBACK_SOURCES_PER_SHARD),
+            );
+        }
+        order.push_back(ip);
+    }
+    let entry = counters.entry(ip).or_insert((0, now));
+    if now.saturating_duration_since(entry.1).as_secs() >= 1 {
+        entry.0 = 1;
+        entry.1 = now;
+        false
+    } else {
+        entry.0 += 1;
+        entry.0 > max_packets
+    }
 }
 
 impl FloodProtection {
     pub fn new() -> Self {
         FloodProtection {
             ip_counters: HashMap::new(),
+            ember_ip_counters: HashMap::new(),
             opcode_counters: HashMap::new(),
             outgoing_requests: HashMap::new(),
             search_response_budgets: HashMap::new(),
@@ -270,12 +334,38 @@ impl FloodProtection {
             compressed_counters: HashMap::new(),
             global_compressed: (0, 0, Instant::now()),
             ip_order: VecDeque::new(),
+            ember_ip_order: VecDeque::new(),
             opcode_order: VecDeque::new(),
             outgoing_order: VecDeque::new(),
             compressed_order: VecDeque::new(),
             ip_fallback: FallbackCounters::new(),
+            ember_ip_fallback: FallbackCounters::new(),
             opcode_fallback: FallbackCounters::new(),
         }
+    }
+
+    /// Per-IP rate limit for Ember-native UDP, on its own window.
+    ///
+    /// There is no opcode layer: those limits are KAD-specific and a Noise
+    /// frame is opaque until it is decrypted. The Ember DHT applies its own
+    /// per-message budget after decryption.
+    pub fn check_ember_rate_limit(&mut self, ip: IpAddr, known_peer: bool) -> bool {
+        let now = Instant::now();
+        let max_packets = if known_peer {
+            MAX_EMBER_PACKETS_PER_SEC_KNOWN
+        } else {
+            MAX_EMBER_PACKETS_PER_SEC_UNKNOWN
+        };
+        let has_relationship = self.has_relationship(ip, known_peer);
+        over_per_ip_budget(
+            &mut self.ember_ip_counters,
+            &mut self.ember_ip_order,
+            &mut self.ember_ip_fallback,
+            ip,
+            max_packets,
+            has_relationship,
+            now,
+        )
     }
 
     /// True when we have a prior relationship with `ip`: it is in our routing
@@ -513,42 +603,24 @@ impl FloodProtection {
             MAX_PACKETS_PER_SEC_UNKNOWN
         };
 
-        // Layer 2: global per-IP per-second cap
-        if !self.ip_counters.contains_key(&ip) {
-            // K19: same idle-only eviction rationale as above; the window
-            // here is one second.
-            if self.ip_counters.len() >= MAX_IP_ENTRIES
-                && !evict_idle(&mut self.ip_counters, &mut self.ip_order, |(_, t)| {
-                    now.saturating_duration_since(*t).as_secs() >= 1
-                })
-            {
-                // Unlike Layer 1 this gate sees *responses* too, so denying
-                // every source without a slot drops the SearchRes and
-                // PublishRes answering our own requests — keyword search then
-                // silently returns nothing while a spoofed flood holds the
-                // table. Sources we have a relationship with degrade onto a
-                // shared counter; strangers are still refused.
-                if !self.has_relationship(ip, known_peer) {
-                    return true;
-                }
-                return self.ip_fallback.over_budget(
-                    ip,
-                    now,
-                    Duration::from_secs(1),
-                    max_packets.saturating_mul(FALLBACK_SOURCES_PER_SHARD),
-                );
-            }
-            self.ip_order.push_back(ip);
-        }
-        let entry = self.ip_counters.entry(ip).or_insert((0, now));
-        if now.saturating_duration_since(entry.1).as_secs() >= 1 {
-            entry.0 = 1;
-            entry.1 = now;
-            false
-        } else {
-            entry.0 += 1;
-            entry.0 > max_packets
-        }
+        // Layer 2: global per-IP per-second cap.
+        //
+        // Unlike Layer 1 this gate sees *responses* too, so denying every
+        // source without a slot drops the SearchRes and PublishRes answering
+        // our own requests — keyword search then silently returns nothing
+        // while a spoofed flood holds the table. Sources we have a
+        // relationship with degrade onto a shared counter; strangers are
+        // still refused. `over_per_ip_budget` owns that rule.
+        let has_relationship = self.has_relationship(ip, known_peer);
+        over_per_ip_budget(
+            &mut self.ip_counters,
+            &mut self.ip_order,
+            &mut self.ip_fallback,
+            ip,
+            max_packets,
+            has_relationship,
+            now,
+        )
     }
 
     /// Returns true if a packet from port 53 should be dropped (unencrypted).
@@ -740,6 +812,9 @@ impl FloodProtection {
         self.ip_counters
             .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
 
+        self.ember_ip_counters
+            .retain(|_, (_, last)| now.saturating_duration_since(*last).as_secs() < 60);
+
         self.opcode_counters.retain(|_, (_, last)| {
             now.saturating_duration_since(*last).as_secs() < OPCODE_WINDOW_SECS * 2
         });
@@ -771,6 +846,9 @@ impl FloodProtection {
         // so `evict_idle` never wastes probes on keys that no longer exist.
         let ip_counters = &self.ip_counters;
         self.ip_order.retain(|ip| ip_counters.contains_key(ip));
+        let ember_ip_counters = &self.ember_ip_counters;
+        self.ember_ip_order
+            .retain(|ip| ember_ip_counters.contains_key(ip));
         let opcode_counters = &self.opcode_counters;
         self.opcode_order
             .retain(|key| opcode_counters.contains_key(key));
@@ -793,6 +871,9 @@ impl FloodProtection {
             }
         }
         for (_, at) in self.ip_counters.values_mut() {
+            rewind(at, by);
+        }
+        for (_, at) in self.ember_ip_counters.values_mut() {
             rewind(at, by);
         }
         for (_, at) in self.opcode_counters.values_mut() {
@@ -1012,6 +1093,57 @@ mod kad_protection_tests {
     }
 
     /// K21: 11th compressed packet from same IP in 1s should be declined.
+    /// Ember rides the KAD socket, so both protocols arrive from one address.
+    /// While they shared a counter, an ordinary KAD exchange with a dual-stack
+    /// peer could spend the allowance Ember needed to finish its Noise
+    /// handshake with that same peer, and the DHT contact never formed.
+    #[test]
+    fn kad_traffic_does_not_spend_the_ember_budget() {
+        let mut fp = FloodProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30));
+
+        for i in 0..MAX_PACKETS_PER_SEC_UNKNOWN {
+            assert!(
+                !fp.check_rate_limit_with_opcode(ip, false, 0xFF),
+                "KAD packet {} is inside its own budget",
+                i + 1
+            );
+        }
+        assert!(
+            fp.check_rate_limit_with_opcode(ip, false, 0xFF),
+            "the KAD window is spent"
+        );
+
+        assert!(
+            !fp.check_ember_rate_limit(ip, false),
+            "Ember must still be able to hand shake with the same peer"
+        );
+    }
+
+    /// Splitting the counters must not hand out a free pass: the Ember window
+    /// enforces its own cap, and spending it leaves KAD unaffected.
+    #[test]
+    fn the_ember_budget_caps_a_flood_without_touching_kad() {
+        let mut fp = FloodProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
+
+        for i in 0..MAX_EMBER_PACKETS_PER_SEC_UNKNOWN {
+            assert!(
+                !fp.check_ember_rate_limit(ip, false),
+                "Ember packet {} is inside the budget",
+                i + 1
+            );
+        }
+        assert!(
+            fp.check_ember_rate_limit(ip, false),
+            "an Ember flood is still capped"
+        );
+        assert!(
+            !fp.check_rate_limit_with_opcode(ip, false, 0xFF),
+            "and KAD is independent in the other direction too"
+        );
+    }
+
     #[test]
     fn compressed_budget_enforced() {
         let mut fp = FloodProtection::new();
