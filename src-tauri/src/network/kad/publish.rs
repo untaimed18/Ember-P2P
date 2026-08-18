@@ -370,16 +370,6 @@ impl PublishManager {
             .count()
     }
 
-    /// Whether this node publishes any shared file to KAD.
-    ///
-    /// Gates the Ember rendezvous advert: a node already running the publish
-    /// rotation adds one more record to traffic it was sending anyway, whereas
-    /// a pure leecher would be generating KAD publish traffic solely to
-    /// advertise itself. Leechers can still look the rendezvous key up.
-    pub fn has_publishable_files(&self) -> bool {
-        !self.records.is_empty()
-    }
-
     /// Get files that need source republishing.
     pub fn files_needing_source_publish(&self) -> Vec<&PublishableFile> {
         let now = chrono::Utc::now().timestamp();
@@ -840,6 +830,27 @@ pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
 /// - Deduplicate (case-insensitive), keeping order of first occurrence
 /// - Remove last word if it's exactly 3 chars and 3 bytes (strips file extensions)
 pub fn extract_keywords(filename: &str) -> Vec<String> {
+    tokenize_keywords(filename, true)
+}
+
+/// The same tokenizer applied to a *search query*.
+///
+/// An index only works when both sides agree on what a word is. Search used to
+/// split on whitespace alone, so a query carrying any separator was hashed
+/// whole while the publisher had split it: `blade-runner` looked for one key,
+/// and `blade` and `runner` were where the record actually lived. Pasting a
+/// filename in was the worst case — `movie.mkv` never matched the `movie` the
+/// publisher stored.
+///
+/// The trailing-extension strip is the one rule that must *not* carry over. It
+/// exists to drop `.mkv` off a filename, and its test is "last token is exactly
+/// three characters" — which on a query like `the big cat` would throw away
+/// `cat`, the most specific word the user typed.
+pub fn extract_query_keywords(query: &str) -> Vec<String> {
+    tokenize_keywords(query, false)
+}
+
+fn tokenize_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
     let separator_chars = |c: char| -> bool {
         matches!(
             c,
@@ -869,7 +880,7 @@ pub fn extract_keywords(filename: &str) -> Vec<String> {
     let mut last_chars = 0usize;
     let mut last_bytes = 0usize;
 
-    for word in filename.split(separator_chars) {
+    for word in text.split(separator_chars) {
         let bytes = word.len();
         if bytes < 3 {
             continue;
@@ -883,7 +894,7 @@ pub fn extract_keywords(filename: &str) -> Vec<String> {
     }
 
     // eMule: if last word is 3 chars and 3 bytes and there are >1 words, pop it (extension)
-    if result.len() > 1 && last_chars == 3 && last_bytes == 3 {
+    if strip_trailing_extension && result.len() > 1 && last_chars == 3 && last_bytes == 3 {
         result.pop();
     }
 
@@ -927,17 +938,6 @@ mod tests {
         assert_eq!(ember_rendezvous_key(), expected);
         // Stable across calls, and distinct from the raw digest ordering.
         assert_eq!(ember_rendezvous_key(), ember_rendezvous_key());
-    }
-
-    /// The rendezvous advert is gated on already publishing something, so a
-    /// pure leecher never starts making KAD publish traffic purely to list
-    /// itself. It can still look the key up.
-    #[test]
-    fn has_publishable_files_tracks_the_shared_set() {
-        let mut p = make_publisher(false);
-        assert!(!p.has_publishable_files());
-        p.add_file(sample_file());
-        assert!(p.has_publishable_files());
     }
 
     /// The advert reuses the ordinary source-publish builder, so it must carry

@@ -163,9 +163,10 @@ impl IpFilterSnapshot {
     /// loading. TCP [`Self::is_blocked`] fail-closes in that window. Failing
     /// KAD the same way would drop every non-seed Hello and blackhole cold
     /// start, so we still admit [`super::bootstrap::is_default_bootstrap_ip`]
-    /// seeds. Everything else waits until ranges are ready — `nodes.dat` is
-    /// already in the table by then, and `evict_filtered_contacts` still
-    /// runs after load. Bogus/private rules always apply.
+    /// seeds. Everything else waits until ranges are ready — `nodes.dat` and
+    /// `nodes_ember.dat` are inserted before this snapshot is attached, and
+    /// `evict_filtered_contacts` still runs after load (skipping this window
+    /// so it cannot wipe those files). Bogus/private rules always apply.
     pub fn is_blocked_for_kad(&self, ip: Ipv4Addr) -> bool {
         if crate::security::is_bogus_v4(ip) {
             self.special_hit_counter.fetch_add(1, Ordering::Relaxed);
@@ -706,6 +707,7 @@ impl IpFilter {
         }
     }
 
+    #[cfg(test)]
     pub fn get_stats(&self) -> IpFilterStats {
         self.query_stats("", "range", true, 0, usize::MAX)
     }

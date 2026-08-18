@@ -15,14 +15,21 @@
 //!    result set — which is only ever looked up by a single keyword hash — is
 //!    narrowed to true matches on our side.
 //!
-//! To stay byte-for-byte compatible with the previous behavior, an
-//! operator-free query is tokenized by
-//! [`extract_keywords`](crate::network::kad::publish::extract_keywords) exactly
-//! as before and folded into the same left-leaning AND-tree; the boolean parser
-//! only engages when the query actually contains operators, quotes,
-//! parentheses, or a `-` negation.
+//! An operator-free query is tokenized by
+//! [`extract_query_keywords`](crate::network::kad::publish::extract_query_keywords)
+//! and folded into a left-leaning AND-tree; the boolean parser only engages
+//! when the query actually contains operators, quotes, parentheses, or a `-`
+//! negation. Both paths use the eMule separator set and 3-byte minimum, so the
+//! terms are the same words the publisher indexed the filename under.
+//!
+//! Note the query tokenizer, unlike the filename one, does **not** drop a
+//! trailing three-character word. That rule exists to strip `.mkv` off a
+//! filename; applied to a query it deleted the last word typed, so `linux mint
+//! iso` searched for `linux AND mint` on every network at once — and the
+//! boolean path never stripped, so quoting one word changed whether another
+//! was searched at all.
 
-use crate::network::kad::publish::extract_keywords;
+use crate::network::kad::publish::extract_query_keywords;
 
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_PARSE_DEPTH: usize = 64;
@@ -193,7 +200,7 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     let query = clamp_query(query);
     if !has_operators(query) {
         return fold_and(
-            extract_keywords(query)
+            extract_query_keywords(query)
                 .into_iter()
                 .map(QueryExpr::Term)
                 .collect(),
@@ -209,7 +216,7 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     // The boolean parse produced nothing usable (e.g. every term was too
     // short). Fall back to the plain tokenizer so the query still searches.
     fold_and(
-        extract_keywords(query)
+        extract_query_keywords(query)
             .into_iter()
             .map(QueryExpr::Term)
             .collect(),
@@ -629,6 +636,30 @@ mod tests {
                 Box::new(term("charlie"))
             )
         );
+    }
+
+    /// `extract_keywords` pops a trailing three-character token because on a
+    /// *filename* that is the extension. A query is not a filename: the last
+    /// word is usually the most specific thing the user typed.
+    #[test]
+    fn a_three_letter_last_word_survives_a_query() {
+        for (query, expected) in [
+            ("linux mint iso", vec!["linux", "mint", "iso"]),
+            ("star wars dvd", vec!["star", "wars", "dvd"]),
+            ("the big cat", vec!["the", "big", "cat"]),
+        ] {
+            let expr = parse(query).expect("query parses");
+            assert_eq!(expr.positive_terms(), expected, "query {query:?}");
+        }
+    }
+
+    /// The boolean path never stripped, so the two halves of the parser
+    /// disagreed: quoting one word changed whether another was searched at all.
+    #[test]
+    fn both_parser_paths_agree_on_a_three_letter_last_word() {
+        let plain = parse("ubuntu server iso").expect("plain parses");
+        let boolean = parse("ubuntu AND server AND iso").expect("boolean parses");
+        assert_eq!(plain.positive_terms(), boolean.positive_terms());
     }
 
     #[test]

@@ -654,6 +654,26 @@ pub struct EmberDiagnostics {
     /// Ember DHT `FIND_NODE` queries we received and answered this session.
     #[serde(default)]
     pub ember_dht_find_nodes_received: u32,
+    /// Contact-list replies (`PEER_LIST`) we received this session.
+    ///
+    /// Paired with [`Self::ember_dht_gossip_contacts`] this separates the two
+    /// reasons a table stops growing, which otherwise look identical from
+    /// outside: zero replies means our `ANNOUNCE_PEER` is going unanswered,
+    /// while replies carrying no contacts means the peers genuinely have
+    /// nobody to introduce.
+    #[serde(default)]
+    pub ember_dht_peer_lists_received: u32,
+    /// Contacts carried in inbound gossip (`PEER_LIST`, `FOUND_NODE`,
+    /// `ANNOUNCE_PEER`) this session, counted before admission — including
+    /// ones we already hold.
+    #[serde(default)]
+    pub ember_dht_gossip_contacts: u32,
+    /// Of those, peers we did not already hold and the table accepted.
+    #[serde(default)]
+    pub ember_dht_gossip_new: u32,
+    /// Of those, ones the table turned away on IP policy or diversity caps.
+    #[serde(default)]
+    pub ember_dht_gossip_refused: u32,
     /// Iterative Ember DHT lookups currently running (gauge, not a
     /// counter).
     #[serde(default)]

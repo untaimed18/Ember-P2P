@@ -1043,6 +1043,7 @@ impl SpamFilter {
         }
     }
 
+    #[cfg(test)]
     pub fn rate_result(
         &self,
         result: &SearchResult,
@@ -1556,9 +1557,15 @@ fn is_benchmarking_v4(v: std::net::Ipv4Addr) -> bool {
 }
 
 /// `2001:db8::/32` and RFC 9637 `3fff::/20`. `Ipv6Addr::is_documentation` is still unstable here.
+///
+/// The `/20` covers all 16 bits of the first group plus the top four of the
+/// second, so it is the *second* group that carries the mask. Masking the
+/// first group instead made the test unsatisfiable — `x & 0xfff0` clears the
+/// low nibble that `0x3fff` needs — so the whole range read as ordinary
+/// global unicast.
 fn is_documentation_v6(v: std::net::Ipv6Addr) -> bool {
     let s = v.segments();
-    (s[0] == 0x2001 && s[1] == 0x0db8) || (s[0] & 0xfff0) == 0x3fff
+    (s[0] == 0x2001 && s[1] == 0x0db8) || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
 }
 
 fn keyword_tokens(keywords: &[String]) -> HashSet<String> {
@@ -1881,6 +1888,27 @@ mod tests {
             "two sybil fakes scored {score}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// RFC 9637 reserved `3fff::/20` for documentation, and the mask that was
+    /// supposed to match it could never be satisfied, so those addresses were
+    /// treated as ordinary global unicast and learned as spam sources.
+    #[test]
+    fn documentation_ipv6_ranges_are_not_globally_routable() {
+        for doc in [
+            "2001:db8::1",
+            "3fff::1",
+            "3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(
+                !is_globally_routable_ip(doc),
+                "{doc} is documentation space"
+            );
+        }
+        // Just outside the /20, and a plain global address, must still pass.
+        for real in ["3fff:1000::1", "2606:4700:4700::1111"] {
+            assert!(is_globally_routable_ip(real), "{real} is routable");
+        }
     }
 
     #[test]
