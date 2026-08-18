@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
+use super::dht_common;
 use super::ip_filter;
 use super::types::*;
 
@@ -763,7 +764,7 @@ impl RoutingZone {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
-                if now.saturating_sub(c.last_seen) >= max_age_secs || c.is_expired() {
+                if dht_common::is_stale(now, c.last_seen, max_age_secs) || c.is_expired() {
                     ips_removed.push(c.ip);
                     false
                 } else {
@@ -1055,7 +1056,6 @@ pub struct RoutingTable {
     local_id: KadId,
     global_ip_count: HashMap<Ipv4Addr, u32>,
     global_subnet_count: HashMap<u32, u32>,
-    block_private_ips: bool,
     /// Our external IP in host-order u32 (for UDPKey sender verification).
     external_ip: Option<u32>,
     /// eMule `CKademlia::m_tBigTimer` — next time a zone may successfully fire RandomLookup.
@@ -1065,8 +1065,9 @@ pub struct RoutingTable {
     /// eMule InUse counter: contacts referenced by active searches should not
     /// be deleted from the routing table even if they go dead.
     in_use_contacts: HashMap<KadId, u32>,
-    /// Range-based IP filter shared with the network layer.
-    range_ip_filter: Option<ip_filter::SharedIpFilter>,
+    /// Private/LAN policy and the range-based IP filter shared with the network
+    /// layer, in the form the Ember DHT's routing table also uses.
+    ip_gate: dht_common::IpAdmissionGate,
 }
 
 impl RoutingTable {
@@ -1077,12 +1078,11 @@ impl RoutingTable {
             local_id,
             global_ip_count: HashMap::new(),
             global_subnet_count: HashMap::new(),
-            block_private_ips,
             external_ip: None,
             big_timer_global_deadline: now,
             next_zone_event_order: 1,
             in_use_contacts: HashMap::new(),
-            range_ip_filter: None,
+            ip_gate: dht_common::IpAdmissionGate::new(block_private_ips),
         }
     }
 
@@ -1100,7 +1100,7 @@ impl RoutingTable {
 
     /// Set the range-based IP filter for blocking contacts on insert.
     pub fn set_ip_filter(&mut self, filter: ip_filter::SharedIpFilter) {
-        self.range_ip_filter = Some(filter);
+        self.ip_gate.set_range_filter(filter);
     }
 
     /// Hot-update the private/LAN admission flag used by
@@ -1108,9 +1108,7 @@ impl RoutingTable {
     /// evict contacts that no longer pass the IP policy (and any that the
     /// shared range snapshot now blocks).
     pub fn set_block_private_ips(&mut self, block_private: bool) {
-        let enabling = block_private && !self.block_private_ips;
-        self.block_private_ips = block_private;
-        if enabling {
+        if self.ip_gate.set_block_private_ips(block_private) {
             self.evict_filtered_contacts();
         }
     }
@@ -1119,42 +1117,11 @@ impl RoutingTable {
     /// policy or by the shared `ipfilter.dat` snapshot. Used after
     /// filter reloads and when enabling private blocking at runtime.
     pub fn evict_filtered_contacts(&mut self) {
-        let to_remove: Vec<KadId> = self
-            .all_contacts()
-            .filter(|c| self.contact_ip_is_filtered(c.ip))
-            .map(|c| c.id)
-            .collect();
-        if to_remove.is_empty() {
+        let n = dht_common::evict_blocked_contacts(self);
+        if n == 0 {
             return;
         }
-        let n = to_remove.len();
-        for id in to_remove {
-            self.remove(&id);
-        }
         tracing::info!("KAD RT evicted {n} contact(s) blocked by IP filter policy");
-    }
-
-    fn contact_ip_is_filtered(&self, ip: Ipv4Addr) -> bool {
-        if !ip_filter::is_valid_contact_ip(ip, self.block_private_ips) {
-            return true;
-        }
-        if let Some(ref filter) = self.range_ip_filter {
-            match filter.read() {
-                Ok(snap) => {
-                    // Fail-closed while ranges load is for inbound peer gates only.
-                    // Evicting against that window would wipe the whole routing table.
-                    if snap.enabled && !snap.ranges_ready {
-                        return false;
-                    }
-                    snap.is_blocked(ip)
-                }
-                // Don't mass-evict on a poisoned lock — insert path already
-                // fails closed for new contacts.
-                Err(_) => false,
-            }
-        } else {
-            false
-        }
     }
 
     pub fn has_contact_ip(&self, ip: Ipv4Addr) -> bool {
@@ -1201,28 +1168,23 @@ impl RoutingTable {
         if !contact.is_kad2() {
             return false;
         }
-        if !ip_filter::is_valid_contact_ip(contact.ip, self.block_private_ips) {
-            return false;
-        }
-        if let Some(ref filter) = self.range_ip_filter {
-            match filter.read() {
-                Ok(snap) => {
-                    if snap.is_blocked_for_kad(contact.ip) {
-                        tracing::debug!(
-                            "RT reject {}: IP {} blocked by range filter",
-                            contact.id,
-                            contact.ip
-                        );
-                        return false;
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "IP filter lock poisoned, rejecting contact {} as a precaution",
-                        contact.id
-                    );
-                    return false;
-                }
+        match self.ip_gate.admits(contact.ip) {
+            dht_common::Admission::Allowed => {}
+            dht_common::Admission::BlockedByPolicy => return false,
+            dht_common::Admission::BlockedByRanges => {
+                tracing::debug!(
+                    "RT reject {}: IP {} blocked by range filter",
+                    contact.id,
+                    contact.ip
+                );
+                return false;
+            }
+            dht_common::Admission::FilterUnreadable => {
+                tracing::warn!(
+                    "IP filter lock poisoned, rejecting contact {} as a precaution",
+                    contact.id
+                );
+                return false;
             }
         }
         if contact.udp_port == 53 && contact.version <= KADEMLIA_VERSION5_48A {
@@ -1732,6 +1694,26 @@ impl RoutingTable {
 
         let modify = ancestor_contacts as f64 / (K_BUCKET_SIZE as f64 * 2.0);
         (2.0f64.powi(leaf_level as i32 - 2) * K_BUCKET_SIZE as f64 * modify) as u32
+    }
+}
+
+/// Zone-tree storage for the shared IP-policy sweep. `remove` is the right
+/// eviction hook rather than a per-bin retain: it keeps the global IP/subnet
+/// accounting consistent and falls back to a full leaf scan for a contact that
+/// a split re-homed away from its XOR-distance fast path (see `remove`).
+impl dht_common::PolicyEvictable for RoutingTable {
+    type ContactId = KadId;
+
+    fn ip_gate(&self) -> &dht_common::IpAdmissionGate {
+        &self.ip_gate
+    }
+
+    fn resident_contacts(&self) -> Vec<(KadId, Option<Ipv4Addr>)> {
+        self.all_contacts().map(|c| (c.id, Some(c.ip))).collect()
+    }
+
+    fn evict_contact(&mut self, id: &KadId) -> bool {
+        self.remove(id)
     }
 }
 

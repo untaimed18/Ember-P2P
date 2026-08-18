@@ -1055,7 +1055,19 @@ async fn punch_friend(
                 }
                 let peer_addr = SocketAddr::new(ip, info.port);
                 debug!("Friend punch: signed peer at {peer_addr} reports NAT {peer_nat:?}");
-                match super::super::ember::broker::punch_quic(endpoint, peer_addr, None).await {
+                // Pin to the friend's node id rather than accepting any Ed25519
+                // cert: `info.from_id` was matched against
+                // `hashed_id(&friend_ember_hash)` above and the pairwise
+                // capability checked, so the identity we expect is already
+                // established from a signed record before we dial.
+                match super::super::ember::broker::punch_quic_pinned(
+                    endpoint,
+                    peer_addr,
+                    secret_key,
+                    friend_ember_hash,
+                )
+                .await
+                {
                     Ok(streams) => {
                         crate::network::ember::relay::ack_punch(
                             rendezvous_url,

@@ -2,8 +2,15 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+use crate::security::filesystem::windows_system_path;
+
 const RULE_NAME_TCP: &str = "Ember P2P (TCP)";
 const RULE_NAME_UDP: &str = "Ember P2P (UDP)";
+
+/// Spawned by absolute path, never by bare name — see
+/// [`windows_system_path`] for the planted-binary hijack this avoids.
+const NETSH: &str = r"System32\netsh.exe";
+const POWERSHELL: &str = r"System32\WindowsPowerShell\v1.0\powershell.exe";
 
 /// Outcome of a single `add_firewall_rule` attempt — lets the
 /// orchestrator decide how to summarise N failures at the end (one
@@ -19,7 +26,7 @@ enum AddRuleOutcome {
 }
 
 fn firewall_rule_exists(rule_name: &str) -> bool {
-    Command::new("netsh")
+    Command::new(windows_system_path(NETSH))
         .args([
             "advfirewall",
             "firewall",
@@ -41,7 +48,7 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
         "Get-NetFirewallRule -DisplayName '{escaped_name}' -ErrorAction Stop | \
          Get-NetFirewallPortFilter | ForEach-Object {{ $_.LocalPort }}"
     );
-    if let Ok(output) = Command::new("powershell.exe")
+    if let Ok(output) = Command::new(windows_system_path(POWERSHELL))
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .output()
@@ -57,7 +64,7 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
     // Fallback for stripped-down Windows environments without the firewall
     // PowerShell module. Keep the legacy English parser rather than treating
     // every rule as stale.
-    let output = Command::new("netsh")
+    let output = Command::new(windows_system_path(NETSH))
         .args([
             "advfirewall",
             "firewall",
@@ -90,7 +97,7 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
 }
 
 fn delete_firewall_rule(rule_name: &str) {
-    let _ = Command::new("netsh")
+    let _ = Command::new(windows_system_path(NETSH))
         .args([
             "advfirewall",
             "firewall",
@@ -124,7 +131,7 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
         "profile=any".to_string(),
         format!("program={exe_path}"),
     ];
-    let result = Command::new("netsh")
+    let result = Command::new(windows_system_path(NETSH))
         .args(&args)
         .creation_flags(0x08000000)
         .output();

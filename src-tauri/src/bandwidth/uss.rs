@@ -174,7 +174,7 @@ impl UploadSpeedSense {
             if window.iter().all(|&p| p < self.initial_ping_ms) {
                 window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let mid = window.len() / 2;
-                let recent = if window.len() % 2 == 0 {
+                let recent = if window.len().is_multiple_of(2) {
                     (window[mid - 1] + window[mid]) / 2.0
                 } else {
                     window[mid]
@@ -309,7 +309,7 @@ impl UploadSpeedSense {
         let mut sorted: Vec<f64> = self.ping_history.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = sorted.len() / 2;
-        if sorted.len() % 2 == 0 {
+        if sorted.len().is_multiple_of(2) {
             (sorted[mid - 1] + sorted[mid]) / 2.0
         } else {
             sorted[mid]

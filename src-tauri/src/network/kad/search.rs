@@ -788,7 +788,7 @@ impl SearchState {
         // never reached the threshold while `sent_at` was in the future).
         let is_timed_out = |sent_at: i64| {
             let elapsed = now - sent_at;
-            elapsed < 0 || elapsed >= PENDING_TIMEOUT_SECS
+            !(0..PENDING_TIMEOUT_SECS).contains(&elapsed)
         };
         let timed_out: Vec<KadId> = self
             .pending_times

@@ -50,11 +50,7 @@ pub struct EmberNodeId(pub [u8; 16]);
 
 impl EmberNodeId {
     pub fn distance(&self, other: &EmberNodeId) -> EmberNodeId {
-        let mut d = [0u8; 16];
-        for i in 0..16 {
-            d[i] = self.0[i] ^ other.0[i];
-        }
-        EmberNodeId(d)
+        EmberNodeId(crate::network::kad::dht_common::xor16(&self.0, &other.0))
     }
 
     /// Return the index of the highest set bit (0..127), or None if distance is zero.

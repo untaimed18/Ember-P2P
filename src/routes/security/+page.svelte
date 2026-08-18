@@ -22,7 +22,7 @@
   import { setAppSettings } from '$lib/stores/settings';
   import IconX from '$lib/components/IconX.svelte';
 
-  let stats: IpFilterStats | null = $state(null);
+  let stats = $state<IpFilterStats | null>(null);
   let loading = $state(true);
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);

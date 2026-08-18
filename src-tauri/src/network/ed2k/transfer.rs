@@ -2254,7 +2254,7 @@ impl Ed2kDownload {
                     &mut writer,
                     OP_EMULEPROT,
                     OP_EMBER_SOURCEEXCHANGE,
-                    &*epx_data,
+                    &epx_data,
                 )
                 .await;
                 self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
@@ -2784,7 +2784,7 @@ impl Ed2kDownload {
                                                 &mut writer,
                                                 OP_EMULEPROT,
                                                 OP_EMBER_SOURCEEXCHANGE,
-                                                &*epx_data,
+                                                &epx_data,
                                             )
                                             .await
                                             .is_ok()
@@ -2878,7 +2878,7 @@ impl Ed2kDownload {
                                                     &mut writer,
                                                     OP_EMULEPROT,
                                                     OP_EMBER_SOURCEEXCHANGE,
-                                                    &*epx_data,
+                                                    &epx_data,
                                                 )
                                                 .await
                                                 .is_ok()
@@ -3841,7 +3841,7 @@ impl Ed2kDownload {
                                     &mut writer,
                                     OP_EMULEPROT,
                                     OP_EMBER_SOURCEEXCHANGE,
-                                    &*epx_data,
+                                    &epx_data,
                                 )
                                 .await
                                 .is_ok()
@@ -4371,7 +4371,7 @@ impl Ed2kDownload {
                                 .min(MAX_PEER_COMMENT_LEN);
                             if comment_len
                                 .checked_add(5)
-                                .map_or(false, |need| payload.len() >= need)
+                                .is_some_and(|need| payload.len() >= need)
                             {
                                 let comment = String::from_utf8_lossy(&payload[5..5 + comment_len])
                                     .to_string();
@@ -4411,7 +4411,7 @@ impl Ed2kDownload {
                                 recovery_data.len()
                             );
                             if ans_hash == self.file_hash && ans_part == part_idx {
-                                let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
+                                let master_ok = aich_master_hash == Some(root_hash);
                                 if master_ok {
                                     aich_recovery_data = Some((root_hash, recovery_data.to_vec()));
                                 } else {
@@ -5620,7 +5620,7 @@ pub(super) fn verify_hashset(
     for h in part_hashes {
         combined.extend_from_slice(h);
     }
-    if file_size > 0 && file_size % super::hash::PARTSIZE == 0 {
+    if file_size > 0 && file_size.is_multiple_of(super::hash::PARTSIZE) {
         let empty_hash: [u8; 16] = Md4::digest([]).into();
         combined.extend_from_slice(&empty_hash);
     }

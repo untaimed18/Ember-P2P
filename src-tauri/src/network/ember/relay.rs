@@ -943,8 +943,7 @@ pub fn verify_punch_register_proof(
 
 fn verify_punch_proof_freshness(register_ts: i64, epoch: i64, now: i64) -> Result<(), String> {
     let age = now.saturating_sub(register_ts);
-    if age > PUNCH_PROOF_TTL_SECS + PUNCH_PROOF_CLOCK_SKEW_SECS
-        || age < -PUNCH_PROOF_CLOCK_SKEW_SECS
+    if !(-PUNCH_PROOF_CLOCK_SKEW_SECS..=PUNCH_PROOF_TTL_SECS + PUNCH_PROOF_CLOCK_SKEW_SECS).contains(&age)
     {
         return Err(
             "punch proof: register timestamp is stale or too far in the future".to_string(),
@@ -1416,7 +1415,7 @@ impl AsyncRead for WsStream {
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                    return Poll::Ready(Err(std::io::Error::other(e)));
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
@@ -1441,10 +1440,10 @@ impl AsyncWrite for WsStream {
         match Sink::poll_ready(Pin::new(&mut self.inner), cx) {
             Poll::Ready(Ok(())) => match Sink::start_send(Pin::new(&mut self.inner), msg) {
                 Ok(()) => Poll::Ready(Ok(write_len)),
-                Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+                Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
             },
             Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                Poll::Ready(Err(std::io::Error::other(e)))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -1457,7 +1456,7 @@ impl AsyncWrite for WsStream {
         ) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                Poll::Ready(Err(std::io::Error::other(e)))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -1470,7 +1469,7 @@ impl AsyncWrite for WsStream {
         ) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                Poll::Ready(Err(std::io::Error::other(e)))
             }
             Poll::Pending => Poll::Pending,
         }

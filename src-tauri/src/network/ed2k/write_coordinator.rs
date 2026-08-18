@@ -135,7 +135,7 @@ impl PartFileWriter {
             tokio::task::spawn_blocking(move || open_file(&path_for_open, mode, &allowed_roots))
                 .await
                 .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {e}"))
+                    io::Error::other(format!("spawn_blocking: {e}"))
                 })??;
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
@@ -149,7 +149,7 @@ impl PartFileWriter {
             ))
             .spawn(move || writer_loop(file, &mut rx))
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("spawn writer thread: {e}"))
+                io::Error::other(format!("spawn writer thread: {e}"))
             })?;
 
         Ok(Self {
@@ -227,6 +227,19 @@ fn open_file(path: &Path, mode: OpenMode, allowed_roots: &[String]) -> io::Resul
             set_len_to,
             truncate_existing,
         } => {
+            // `<download_folder>/Temp` is otherwise only ever created during
+            // startup, which is best-effort because an unreachable download
+            // folder must not stop the app from launching (see `lib.rs`). Retry
+            // it here so a drive reconnected mid-session starts working without
+            // a restart. Best-effort on purpose: if this fails, the open below
+            // produces the real error. `open_or_create_approved` still performs
+            // every approved-root and reparse-point check on the final path, so
+            // creating the parent grants no additional reach.
+            if let Some(parent) = path.parent() {
+                if !parent.is_dir() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
             let (_verified, f) = crate::security::filesystem::open_or_create_approved(
                 path,
                 allowed_roots,

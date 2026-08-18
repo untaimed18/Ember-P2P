@@ -260,7 +260,7 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
 /// Return every pending deep link without removing it. The frontend must call
 /// `ack_pending_deep_link` only after the associated action has completed.
 #[tauri::command]
-pub async fn list_pending_deep_links(
+pub fn list_pending_deep_links(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PendingDeepLink>, String> {
     Ok(state.pending_deep_links.lock().clone())
@@ -269,7 +269,7 @@ pub async fn list_pending_deep_links(
 /// Compatibility alias for older frontends. It intentionally no longer drains
 /// the queue, so a setup-wizard relaunch cannot lose unacknowledged links.
 #[tauri::command]
-pub async fn take_pending_deep_links(
+pub fn take_pending_deep_links(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
     Ok(state

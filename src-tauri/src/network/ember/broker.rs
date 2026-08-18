@@ -156,6 +156,38 @@ pub async fn punch_quic(
     Ok((send, recv))
 }
 
+/// [`punch_quic`] for callers that hold their raw Ed25519 identity secret and
+/// the peer's already-authenticated Ember node id, rather than DER material.
+///
+/// `punch_quic`'s `pin` tuple wants *our* certificate and key in DER, which is
+/// one derivation removed from what punch call sites actually carry — the
+/// 32-byte identity secret. That gap is why those sites kept passing `None`
+/// even though they had proven the peer's identity moments earlier, leaving
+/// the connection bound to no particular node. It has already been got wrong
+/// in the other direction too, by passing raw identity key bytes through as if
+/// they were DER, which rustls rejected on every pinned attempt. Deriving the
+/// cert here (cheap and deterministic) makes the authenticated path the
+/// shorter one to write, so `None` stays reserved for genuine first contact.
+///
+/// `expected_node_id` must be the peer's Ember hash, which is
+/// `BLAKE3(ed25519_pub)[..16]` — the exact value `EmberCertVerifier` recomputes
+/// from the presented certificate's real SubjectPublicKeyInfo.
+pub async fn punch_quic_pinned(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+    our_secret_key: &[u8; 32],
+    expected_node_id: [u8; 16],
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    let (cert_der, key_der) = super::quic::generate_self_signed_cert(our_secret_key)
+        .map_err(|e| format!("could not derive our QUIC certificate: {e}"))?;
+    punch_quic(
+        endpoint,
+        addr,
+        Some((&cert_der, &key_der, expected_node_id)),
+    )
+    .await
+}
+
 /// Session counters for the LowID-to-LowID broker. Owned by
 /// `ConnectionBroker` so the state machine itself is the source of truth
 /// for what counts as an "attempt" or "failure" ??? consumers should

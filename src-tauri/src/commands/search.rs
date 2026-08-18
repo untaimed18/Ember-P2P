@@ -188,7 +188,7 @@ pub async fn enrich_results_with_batch(
     drop(config);
 
     let cm = state.comment_manager.read().await;
-    let community = community_ratings_for(&*cm, results, spam_enabled, spam_profile);
+    let community = community_ratings_for(&cm, results, spam_enabled, spam_profile);
     apply_search_enrichment_with_batch(
         results,
         &spam,

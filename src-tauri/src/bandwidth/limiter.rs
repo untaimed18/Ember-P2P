@@ -419,6 +419,14 @@ pub async fn start_token_refill(
     let mut uss = super::uss::UploadSpeedSense::new(0, max_up);
 
     let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
+    // Skip, not the default Burst. After a runtime stall Burst replays one
+    // iteration per missed tick; token balances survive that (they cap at
+    // 2*max), but `speed_tick_count` fires `uss.compute_limit()` once per
+    // simulated second against unchanged `ping_history`, and USS cuts 20% per
+    // call — so ~11 catch-up iterations collapse the upload cap to the
+    // `sanitize_min_upload` floor and it takes 15-20 real seconds to ramp back.
+    // Every timer in `network/mod.rs` sets Skip for the same reason.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
     let mut speed_tick_count: u64 = 0;

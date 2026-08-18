@@ -79,7 +79,7 @@ fn build_key(base_key: u32, direction_magic: u8, random_key_part: u16) -> [u8; 1
     key_data[0..4].copy_from_slice(&base_key.to_le_bytes());
     key_data[4] = direction_magic;
     key_data[5..7].copy_from_slice(&random_key_part.to_le_bytes());
-    Md5::digest(&key_data).into()
+    Md5::digest(key_data).into()
 }
 
 /// Pick a "semi-random not protocol marker" byte for the unencrypted

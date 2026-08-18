@@ -117,7 +117,17 @@ impl ChunkSelector {
         let t2 = 2 * t1;
         let t3 = 4 * t1;
 
-        let mut candidates: Vec<(usize, u32)> = Vec::new();
+        // Lexicographic priority key, every term "lower is better":
+        // `(zone, not_active, completion_score, rarity)`.
+        //
+        // These used to be summed into one scalar, which is NOT the order
+        // documented above: `completion_score` (0..100) already outvoted the
+        // 50-point active bonus, and once `total_sources` passed ~1000 the
+        // in-zone `freq` term swamped both, drifting scheduling toward raw
+        // rarity and leaving more partially-complete parts in flight on
+        // popular files. A tuple comparison makes the tie-break genuinely
+        // lexicographic and needs no weight normalisation.
+        let mut candidates: Vec<(usize, (u32, u8, u32, u32))> = Vec::new();
 
         for i in 0..part_count {
             if completed.get(i).copied().unwrap_or(false) {
@@ -141,7 +151,7 @@ impl ChunkSelector {
                 3 // common
             };
 
-            let active_bonus = if active_parts.contains(&i) { 0u32 } else { 50 };
+            let not_active = u8::from(!active_parts.contains(&i));
 
             // Nearest-to-completion: 0 (nearly done) .. 100 (empty part).
             // Parts with partial progress are preferred within the same zone.
@@ -152,26 +162,27 @@ impl ChunkSelector {
                 ((remaining * 100) / PARTSIZE).min(100) as u32
             };
 
-            // Lower score = higher priority
-            let score = if prefer_higher_availability {
-                let inv = (self.total_sources as u32).saturating_sub(freq);
-                zone * 500 + active_bonus + completion_score / 2 + inv
+            // Final tie-break only. Normally the rarest part wins; in the
+            // endgame the sense inverts, because piling onto a part many
+            // sources hold finishes the file sooner than chasing the rare one.
+            let rarity = if prefer_higher_availability {
+                (self.total_sources as u32).saturating_sub(freq)
             } else {
-                zone * 1000 + active_bonus + completion_score + u32::from(freq)
+                freq
             };
-            candidates.push((i, score));
+            candidates.push((i, (zone, not_active, completion_score, rarity)));
         }
 
         if candidates.is_empty() {
             return None;
         }
 
-        // Sort by score, then randomize among ties (eMule-style anti-herding)
-        candidates.sort_by_key(|&(_, score)| score);
-        let best_score = candidates[0].1;
+        // Sort by key, then randomize among ties (eMule-style anti-herding)
+        candidates.sort_by_key(|&(_, key)| key);
+        let best_key = candidates[0].1;
         let tie_count = candidates
             .iter()
-            .take_while(|&&(_, s)| s == best_score)
+            .take_while(|&&(_, k)| k == best_key)
             .count();
         if tie_count > 1 {
             use rand::Rng;
@@ -245,6 +256,80 @@ mod tests {
         );
 
         assert_eq!(selected, Some(2));
+    }
+
+    /// L1: the documented order is active first, THEN nearest-to-complete.
+    /// The old summed score gave the active chunk 50 points and completion up
+    /// to 100, so a nearly-finished inactive part outvoted a part a source was
+    /// already working on.
+    #[test]
+    fn active_chunk_outranks_a_nearer_to_complete_inactive_one() {
+        let selector = ChunkSelector {
+            part_frequency: vec![2, 2],
+            total_sources: 3,
+        };
+
+        // Part 0 is active but empty; part 1 is 90% done with nobody on it.
+        let gaps = vec![PARTSIZE, PARTSIZE / 10];
+
+        let selected = selector.select_part(
+            &[false, false],
+            &[false, false],
+            &[true, true],
+            &[0],
+            &gaps,
+            false,
+            false,
+        );
+
+        assert_eq!(selected, Some(0));
+    }
+
+    /// ...and frequency is only the last tie-break. With ~2000 sources the old
+    /// summed score let the in-zone `freq` term (up to `t1 - 1`) swamp both the
+    /// active bonus and the completion score, so scheduling drifted toward raw
+    /// rarity and left more half-finished parts in flight.
+    #[test]
+    fn frequency_only_breaks_ties_among_otherwise_equal_candidates() {
+        let popular = ChunkSelector {
+            part_frequency: vec![199, 0],
+            total_sources: 2000,
+        };
+        // Both parts land in the "very rare" zone (t1 = 200). Part 0 is nearly
+        // done but held by 199 sources; part 1 is empty and held by none.
+        let gaps = vec![PARTSIZE / 100, PARTSIZE];
+        assert_eq!(
+            popular.select_part(
+                &[false, false],
+                &[false, false],
+                &[true, true],
+                &[],
+                &gaps,
+                false,
+                false,
+            ),
+            Some(0),
+            "nearest-to-complete must outrank rarity"
+        );
+
+        // Same zone, none active, identical completion: now rarity decides.
+        let tied = ChunkSelector {
+            part_frequency: vec![7, 5, 9],
+            total_sources: 2000,
+        };
+        let equal_gaps = vec![PARTSIZE, PARTSIZE, PARTSIZE];
+        assert_eq!(
+            tied.select_part(
+                &[false, false, false],
+                &[false, false, false],
+                &[true, true, true],
+                &[],
+                &equal_gaps,
+                false,
+                false,
+            ),
+            Some(1),
+        );
     }
 
     #[test]

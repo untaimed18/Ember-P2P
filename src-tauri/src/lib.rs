@@ -1,3 +1,26 @@
+// Clippy baseline. These four families are deliberately accepted crate-wide so
+// the remaining warnings are ones worth acting on — the point is that a newly
+// introduced warning is visible rather than lost in a few hundred known ones.
+// Each is silenced for a specific reason, not for convenience:
+//
+// * `collapsible_if` is not fixable here at all. Collapsing `if a { if let
+//   Some(x) = b {} }` requires let-chains, which are edition 2024; this crate
+//   is edition 2021, and clippy's own autofix emits code that does not parse.
+// * `manual_div_ceil` fires on ceil-division over integer literals whose type
+//   is only fixed by later inference, where `.div_ceil()` does not resolve
+//   (E0689). The arithmetic is also load-bearing for ed2k part counts, so
+//   rewriting it by hand for style is a poor risk trade.
+// * `too_many_arguments` and `type_complexity` flag the eD2K/KAD wire-protocol
+//   surface, where the parameter lists and tuple shapes mirror packet layouts.
+//   Bundling them into structs would obscure the correspondence to the spec.
+//
+// Anything not listed here is expected to stay at zero; fix new warnings rather
+// than extending this list.
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+
 mod app_state;
 mod bandwidth;
 mod commands;
@@ -305,6 +328,12 @@ pub fn run() {
 
     let log_dir = data_dir.join("logs");
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Escape hatch for diagnosing a problem the pseudonymised log cannot
+    // explain: set `EMBER_VERBOSE_DIAGNOSTICS=1` (or `=true`) and both the
+    // console and file layers write raw peer IPs, file hashes, local paths and
+    // search text instead of `<ip:…>` / `<id:…>` / `<path:…>` / `<text:…>`
+    // tokens. Off by default and deliberately env-only: a log produced with
+    // this on must never be shared, so it must not be reachable from the UI.
     let verbose_diagnostics = std::env::var("EMBER_VERBOSE_DIAGNOSTICS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -332,8 +361,15 @@ pub fn run() {
             tracing_appender::rolling::RollingFileAppender::builder()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_prefix("ember.log")
+                // The `cleanup_old_logs` sweep above only ever runs at startup,
+                // so a client left running for months rotated one new
+                // `ember.log.<date>` per day with nothing pruning them until
+                // the next launch. Rotation-time pruning keeps the same 7-file
+                // bound enforced in-session; the startup sweep stays because it
+                // also removes files left by versions that predate this.
+                .max_log_files(7)
                 .build(&log_dir)
-                .map(|appender| tracing_appender::non_blocking(appender))
+                .map(tracing_appender::non_blocking)
                 .map_err(|error| error.to_string())
         }
         Err(error) => Err(error.to_string()),
@@ -541,13 +577,26 @@ pub fn run() {
             let settings = config.settings.clone();
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            // Best-effort, never fatal. A download folder on an unplugged USB
+            // drive, an offline NAS or an unmapped share makes these fail, and
+            // propagating that out of `setup` returns Err from `build()` — which
+            // exits the process before a window exists, with no dialog and no way
+            // for the user to correct the path. The condition also survives config
+            // load (`validate_settings` checks length and forbidden roots, not
+            // reachability), so it would repeat on every launch. Start anyway;
+            // `PartFileWriter::open` retries the creation when a download actually
+            // needs the directory, so a drive reconnected mid-session self-heals.
             if !settings.download_folder.is_empty() {
-                std::fs::create_dir_all(
-                    std::path::PathBuf::from(&settings.download_folder).join("Downloads"),
-                )?;
-                std::fs::create_dir_all(
-                    std::path::PathBuf::from(&settings.download_folder).join("Temp"),
-                )?;
+                for sub in ["Downloads", "Temp"] {
+                    let dir = std::path::PathBuf::from(&settings.download_folder).join(sub);
+                    if let Err(error) = std::fs::create_dir_all(&dir) {
+                        tracing::error!(
+                            "Could not create {}: {error}. Downloads will fail until the \
+                             folder is reachable or changed in Settings.",
+                            dir.display()
+                        );
+                    }
+                }
             }
             let mut configured_roots = settings.shared_folders.clone();
             if !settings.download_folder.is_empty() {
@@ -573,6 +622,10 @@ pub fn run() {
                     e
                 })?,
             );
+            // Earliest point at which the log pseudonyms can be made stable
+            // across restarts — the subscriber is installed before this so a
+            // failure in between still reaches the log file.
+            security::logging::install_pseudonym_key(&identity.ed25519_secret_key);
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
@@ -1551,31 +1604,33 @@ pub fn run() {
                 // offsets taken from ed2k, KAD and Ember frames, so an overflow
                 // panic on hostile input is exactly the case to contain.
                 let outcome = std::panic::AssertUnwindSafe(network::start_network(
-                    net_handle,
-                    network_rx,
-                    settings,
-                    net_identity,
-                    net_security_policy,
-                    net_index,
-                    net_fresh_part_hashes,
-                    net_db,
-                    net_transfers,
-                    net_bw,
-                    cached_peers_net,
-                    cached_stats_net,
-                    cached_contacts_net,
-                    cached_searches_net,
-                    cached_servers_net,
-                    cached_connected_server_net,
-                    cached_transfer_stats_net,
-                    cached_shared_files_net,
-                    upload_shared_folders,
-                    friend_hashes,
-                    mutual_friend_hashes,
-                    uss_rtt_queue,
-                    uss_enabled_flag,
-                    net_spam,
-                    net_comments,
+                    network::NetworkDeps {
+                        app_handle: net_handle,
+                        cmd_rx: network_rx,
+                        settings,
+                        identity: net_identity,
+                        security_policy: net_security_policy,
+                        local_index: net_index,
+                        fresh_part_hashes: net_fresh_part_hashes,
+                        db: net_db,
+                        transfer_manager: net_transfers,
+                        bandwidth_limiter: net_bw,
+                        shared_peers: cached_peers_net,
+                        shared_stats: cached_stats_net,
+                        shared_contacts: cached_contacts_net,
+                        shared_searches: cached_searches_net,
+                        shared_servers: cached_servers_net,
+                        shared_connected_server: cached_connected_server_net,
+                        shared_transfer_stats: cached_transfer_stats_net,
+                        shared_files: cached_shared_files_net,
+                        upload_shared_folders,
+                        friend_hashes,
+                        mutual_friend_hashes,
+                        uss_rtt_queue,
+                        uss_enabled_flag,
+                        spam_filter: net_spam,
+                        comment_manager: net_comments,
+                    },
                 ))
                 .catch_unwind()
                 .await;

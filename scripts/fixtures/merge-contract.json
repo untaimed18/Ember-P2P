@@ -1,0 +1,90 @@
+{
+  "description": [
+    "Shared source of truth for the search-result merge rules that the frontend",
+    "and the backend both implement: `resultKey`/`result_key`,",
+    "`combineOrigin`/`combine_origin` and the MAX_PLAUSIBLE_SOURCES ceiling.",
+    "src/lib/stores/search.ts merges streamed batches per tab, src-tauri/src/search/merge.rs",
+    "merges the lists it emits, and the two were kept aligned only by a comment.",
+    "Checked by scripts/merge-contract.test.mjs and by the fixture tests in merge.rs.",
+    "Only rules that MUST agree belong here. The deliberate divergences are out of",
+    "scope on purpose: Rust sums availability across ed2k-only origins while the",
+    "frontend takes the max (the backend already summed within a network), Rust",
+    "elects the filename by vote while the frontend keeps the first name it saw,",
+    "and only Rust caps source_addresses.",
+    "Origin cases stay within the ASCII origin labels: the two sides agree on",
+    "ordering there (JS sorts by UTF-16 code unit, Rust by byte)."
+  ],
+  "max_plausible_sources": 65535,
+  "result_key_cases": [
+    {
+      "name": "the ed2k hash wins over every fallback",
+      "file": {
+        "hash": "0123456789abcdef0123456789abcdef",
+        "id": "pending:7",
+        "path": "C:\\Downloads\\a.bin",
+        "name": "a.bin",
+        "size": 1024
+      },
+      "key": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "name": "a pending id outranks the path when there is no hash",
+      "file": {
+        "hash": "",
+        "id": "pending:7",
+        "path": "C:\\Downloads\\a.bin",
+        "name": "a.bin",
+        "size": 1024
+      },
+      "key": "nohash-id:pending:7"
+    },
+    {
+      "name": "the path is used when the id is not a pending row",
+      "file": {
+        "hash": "",
+        "id": "local-42",
+        "path": "/srv/share/movie.mkv",
+        "name": "movie.mkv",
+        "size": 733003776
+      },
+      "key": "nohash-path:/srv/share/movie.mkv"
+    },
+    {
+      "name": "name and size identify a row with no hash, id or path",
+      "file": { "hash": "", "id": "", "path": "", "name": "clip.avi", "size": 42 },
+      "key": "nohash:clip.avi:42"
+    },
+    {
+      "name": "an empty name and a zero size still produce a stable key",
+      "file": { "hash": "", "id": "", "path": "", "name": "", "size": 0 },
+      "key": "nohash::0"
+    },
+    {
+      "name": "sizes above 32 bits are not truncated or exponentiated",
+      "file": { "hash": "", "id": "", "path": "", "name": "big.iso", "size": 4294967296 },
+      "key": "nohash:big.iso:4294967296"
+    }
+  ],
+  "combine_origin_cases": [
+    { "a": "", "b": "", "combined": "" },
+    { "a": "KAD", "b": "", "combined": "KAD" },
+    { "a": "", "b": "KAD", "combined": "KAD" },
+    { "a": "Ember", "b": "Ember", "combined": "Ember" },
+    { "a": "KAD", "b": "Ember", "combined": "Ember · KAD" },
+    { "a": "Ember", "b": "KAD", "combined": "Ember · KAD" },
+    { "a": "Server", "b": "UDP", "combined": "Server · UDP" },
+    { "a": "UDP", "b": "Local", "combined": "Local · UDP" },
+    { "a": "Ember · KAD", "b": "Server", "combined": "Ember · KAD · Server" },
+    { "a": "Ember · KAD", "b": "KAD", "combined": "Ember · KAD" },
+    { "a": "KAD", "b": "KAD · Server", "combined": "KAD · Server" },
+    { "a": "Server · UDP", "b": "Local · Notes", "combined": "Local · Notes · Server · UDP" }
+  ],
+  "clamp_source_count_cases": [
+    { "count": 0, "clamped": 0 },
+    { "count": 1, "clamped": 1 },
+    { "count": 65534, "clamped": 65534 },
+    { "count": 65535, "clamped": 65535 },
+    { "count": 65536, "clamped": 65535 },
+    { "count": 4294967295, "clamped": 65535 }
+  ]
+}

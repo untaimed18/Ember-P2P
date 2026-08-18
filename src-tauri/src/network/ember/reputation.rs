@@ -138,7 +138,7 @@ impl PeerReputation {
     }
 
     pub fn is_banned(&self, now: u64) -> bool {
-        self.banned_until.map_or(false, |until| now < until)
+        self.banned_until.is_some_and(|until| now < until)
     }
 
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
@@ -280,7 +280,7 @@ impl ReputationManager {
     /// Check if a peer is currently banned.
     pub fn is_banned(&self, node_id: &[u8; 16]) -> bool {
         let now = now_secs();
-        self.peers.get(node_id).map_or(false, |p| p.is_banned(now))
+        self.peers.get(node_id).is_some_and(|p| p.is_banned(now))
     }
 
     /// Get full reputation record for a peer.
@@ -609,7 +609,7 @@ impl ReputationManager {
             removed += 1;
         }
         if removed < to_remove {
-            banned.sort_by(|a, b| a.1.cmp(&b.1));
+            banned.sort_by_key(|a| a.1);
             for (id, _) in banned.iter() {
                 if removed >= to_remove {
                     break;

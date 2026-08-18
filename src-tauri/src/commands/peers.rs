@@ -533,7 +533,7 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 }
 
 #[tauri::command]
-pub async fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
+pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
     Ok(format!(
         "ember2:{}:{}",
         hex::encode(state.identity.ember_hash),
@@ -1259,7 +1259,7 @@ pub async fn unban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> R
 }
 
 #[tauri::command]
-pub async fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
         .try_send(NetworkCommand::KadConnect)
@@ -1268,7 +1268,7 @@ pub async fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String
 }
 
 #[tauri::command]
-pub async fn kad_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub fn kad_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
         .try_send(NetworkCommand::KadDisconnect)
@@ -1428,10 +1428,7 @@ pub async fn get_kad_searches(
 /// invalid id or a completed search that has already been pruned both
 /// surface as `Ok(())` so the UI can refresh idempotently.
 #[tauri::command]
-pub async fn kad_cancel_search(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub fn kad_cancel_search(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let parsed: u64 = id
         .parse()
         .map_err(|_| coded("peers_invalid_search_id", "Invalid search id"))?;

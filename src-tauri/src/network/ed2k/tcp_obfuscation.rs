@@ -122,13 +122,13 @@ where
     // ReceiveKey: magic = MAGICVALUE_REQUESTER (0x22)
     key_buf[16] = MAGICVALUE_REQUESTER;
     key_buf[17..21].copy_from_slice(&rkp);
-    let recv_md5 = md5::Md5::digest(&key_buf);
+    let recv_md5 = md5::Md5::digest(key_buf);
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
 
     // SendKey: magic = MAGICVALUE_SERVER (0xCB)
     key_buf[16] = MAGICVALUE_SERVER;
-    let send_md5 = md5::Md5::digest(&key_buf);
+    let send_md5 = md5::Md5::digest(key_buf);
     let mut send_key = Rc4State::new(&send_md5);
     send_key.skip(RC4_DROP_BYTES);
 
@@ -211,12 +211,12 @@ where
     key_buf[..16].copy_from_slice(peer_user_hash);
     key_buf[16] = MAGICVALUE_REQUESTER;
     key_buf[17..21].copy_from_slice(&rkp);
-    let send_md5 = md5::Md5::digest(&key_buf);
+    let send_md5 = md5::Md5::digest(key_buf);
     let mut send_key = Rc4State::new(&send_md5);
     send_key.skip(RC4_DROP_BYTES);
 
     key_buf[16] = MAGICVALUE_SERVER;
-    let recv_md5 = md5::Md5::digest(&key_buf);
+    let recv_md5 = md5::Md5::digest(key_buf);
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
 

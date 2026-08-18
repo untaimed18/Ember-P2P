@@ -5,7 +5,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::network::ember::crypto;
 use crate::network::kad::types::KadId;
@@ -226,8 +226,17 @@ impl NodeIdentity {
                         }
 
                         if migrated {
-                            let updated = serde_json::to_vec_pretty(&id)?;
-                            let protected = crate::storage::secret_store::protect(&updated)?;
+                            // Both buffers are the Ed25519 and Noise private keys
+                            // in the clear — the serialized JSON always, and
+                            // `protect`'s output too on non-Windows builds where
+                            // it is a pass-through. A plain `Vec<u8>` leaves them
+                            // in freed heap for the rest of the process lifetime
+                            // and in any crash dump written afterwards; that is
+                            // the exact reason `secret_store::unprotect` hands
+                            // back `Zeroizing`.
+                            let updated = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
+                            let protected =
+                                Zeroizing::new(crate::storage::secret_store::protect(&updated)?);
                             crate::security::atomic_write(&path, &protected, true)?;
                         }
                         #[cfg(target_os = "windows")]
@@ -270,8 +279,8 @@ impl NodeIdentity {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let id = Self::generate();
-                let data = serde_json::to_vec_pretty(&id)?;
-                let protected = crate::storage::secret_store::protect(&data)?;
+                let data = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
+                let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
                 std::fs::create_dir_all(data_dir)?;
                 crate::security::atomic_write(&path, &protected, true)?;
                 #[cfg(target_os = "windows")]

@@ -20,7 +20,7 @@ const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfil
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 #[tauri::command]
-pub async fn get_security_policy_state(
+pub fn get_security_policy_state(
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::security::policy::SecurityPolicyStatus, String> {
     Ok(state.security_policy.status())

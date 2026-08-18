@@ -2873,7 +2873,7 @@ pub async fn start_upload_server(
                 // per-connection admission path (which only does the cheap
                 // age-based purge).
                 slot_check_ticks = slot_check_ticks.wrapping_add(1);
-                if slot_check_ticks % 30 == 0 {
+                if slot_check_ticks.is_multiple_of(30) {
                     server.purge_unshared_queue_entries().await;
                 }
             }
@@ -5568,7 +5568,7 @@ impl UploadHandler {
             hello_caps.is_ember,
             hello_caps.mod_version,
             peer_ember_hash
-                .map(|h| hex::encode(h))
+                .map(hex::encode)
                 .unwrap_or_else(|| "none".to_string()),
             ul_client_software
         );
@@ -6225,7 +6225,7 @@ impl UploadHandler {
                             &mut writer,
                             OP_EMULEPROT,
                             OP_EMBER_SOURCEEXCHANGE,
-                            &*epx_data,
+                            &epx_data,
                         )
                         .await
                         .is_ok()
@@ -6346,7 +6346,7 @@ impl UploadHandler {
                                     // Tie-break by earlier join_time to agree with
                                     // compute_queue_rank's FIFO tie ordering.
                                     if score > best_score
-                                        || (score == best_score && best_join.map_or(true, |bj| join_time < bj))
+                                        || (score == best_score && best_join.is_none_or(|bj| join_time < bj))
                                     {
                                         best_score = score;
                                         best_identity = Some(identity.clone());
@@ -7130,7 +7130,7 @@ impl UploadHandler {
                                 if connected || dialable {
                                     if score > best_ready_score
                                         || (score == best_ready_score
-                                            && best_ready_join.map_or(true, |bj| join_time < bj))
+                                            && best_ready_join.is_none_or(|bj| join_time < bj))
                                     {
                                         best_ready_score = score;
                                         best_ready_identity = Some(identity.clone());
@@ -9734,7 +9734,7 @@ impl UploadHandler {
                                                 &mut writer,
                                                 OP_EMULEPROT,
                                                 OP_EMBER_SOURCEEXCHANGE,
-                                                &*epx_data,
+                                                &epx_data,
                                             )
                                             .await
                                             .is_ok()
@@ -9984,7 +9984,7 @@ impl UploadHandler {
                                         &mut writer,
                                         OP_EMULEPROT,
                                         OP_EMBER_SOURCEEXCHANGE,
-                                        &*epx_data,
+                                        &epx_data,
                                     )
                                     .await
                                     .is_ok()

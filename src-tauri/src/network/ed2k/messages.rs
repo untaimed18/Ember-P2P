@@ -529,18 +529,16 @@ pub fn build_hello_answer_with_buddy_opts(
 /// clients it was written for.
 pub fn build_misc_options1() -> u32 {
     let no_view_shared_files = !share_browsing_allowed() as u32;
-    (1u32 << 29)   // AICH ver 1
+    ((1u32 << 29)   // AICH ver 1
     | (1u32 << 28)   // Unicode
     | (4u32 << 24)   // UDP ver 4
     | (1u32 << 20)   // Compression ver 1
     | (3u32 << 16)   // Secure ident ver 3
     | (4u32 << 12)   // Source exchange ver 4
     | (2u32 << 8)    // Extended requests ver 2
-    | (1u32 << 4)    // Comments ver 1
-    | (0u32 << 3)    // No peer cache
+    | (1u32 << 4))    // No peer cache
     | (no_view_shared_files << 2)
-    | (1u32 << 1)    // Multi-packet support
-    | (0u32 << 0) // Preview support
+    | (1u32 << 1) // Preview support
 }
 
 /// Compute CT_EMULE_MISCOPTIONS2 matching eMule BaseClient.cpp SendHelloTypePacket.
@@ -549,17 +547,16 @@ pub fn build_misc_options1() -> u32 {
 /// detection in eMule mods that reject unknown bits in reserved positions.
 pub fn build_misc_options2(options: &HelloOptions) -> u32 {
     let kad_version = options.kad_version as u32;
-    (1u32 << 13)       // uFileIdentifiers
+    ((1u32 << 13)       // uFileIdentifiers
     | ((options.supports_direct_udp_callback as u32) << 12)
     | ((options.supports_captcha as u32) << 11)
     | (1u32 << 10)       // uSupportsSourceEx2
     | ((options.requires_crypt_layer as u32) << 9)
     | ((options.requests_crypt_layer as u32) << 8)
-    | ((options.supports_crypt_layer as u32) << 7)
-    | (0u32 << 6)        // reserved
+    | ((options.supports_crypt_layer as u32) << 7))        // reserved
     | (1u32 << 5)        // uExtMultiPacket
     | (1u32 << 4)        // uSupportLargeFiles
-    | (kad_version << 0) // uKadVersion (bits 0-3)
+    | kad_version // uKadVersion (bits 0-3)
 }
 
 fn build_hello_inner(
@@ -727,11 +724,9 @@ pub fn build_emule_info(
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint8(2));
     // ET_FEATURES (0x27): bits 0-1 = SecureIdent level, bit 2 = preview,
     // bit 3 = SupportsCryptLayer, bit 4 = RequestsCryptLayer, bit 5 = RequiresCryptLayer
-    let features: u8 = 3        // SecIdent level 3
-        | (0 << 2)              // no preview
+    let features: u8 = 3              // no preview
         | ((obfuscation_enabled as u8) << 3)  // SupportsCryptLayer — must match Hello MISCOPTIONS2
-        | ((obfuscation_enabled as u8) << 4)  // RequestsCryptLayer — must match Hello MISCOPTIONS2
-        | (0 << 5); // no RequiresCryptLayer
+        | ((obfuscation_enabled as u8) << 4); // no RequiresCryptLayer
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint8(features));
 
     buf

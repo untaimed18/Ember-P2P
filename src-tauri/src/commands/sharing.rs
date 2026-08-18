@@ -127,6 +127,29 @@ static RELOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static RELOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static MEDIA_METADATA_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// How many further pages one `reload_shared_files` trigger may queue for
+/// itself while discovery keeps stopping at the per-folder file cap.
+///
+/// Discovery returns at most `MAX_DISCOVERED_FILES` files plus a resume cursor,
+/// and nothing advances that cursor on a timer: a 500k-file library needed one
+/// manual "Reload" per 100k files before pages 2..5 existed in `known.met` at
+/// all, and nothing told the user that. The ceiling is what keeps the
+/// self-rescheduling from degenerating into a permanent rescan loop — a folder
+/// that stays truncated converges by at most this many extra pages per trigger
+/// and then waits for the user, the FS watcher, or the next launch.
+const MAX_CHAINED_SCAN_PAGES: u32 = 8;
+
+/// Idle gap before a chained page starts. Deliberately long: this is
+/// catch-up nobody is waiting on, and the page just finished has its own hash
+/// pass to drain, so the app must be idle in between rather than scanning
+/// back-to-back.
+const CHAINED_SCAN_PAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Slice length for waiting out `CHAINED_SCAN_PAGE_DELAY`. Shutdown raises
+/// `bw_shutdown` and then joins the registered background scans with a 3s
+/// grace, so a single long sleep would make every exit pay that grace in full.
+const CHAINED_SCAN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 async fn remove_cancel_flag_if_current(
     flags: &Arc<RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
     key: &str,
@@ -510,7 +533,7 @@ async fn persist_priority_snapshot(
 fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
     let normalize = |path: &str| {
         crate::search::index::normalize_path_key(path)
-            .trim_end_matches(|c| c == '/' || c == '\\')
+            .trim_end_matches(['/', '\\'])
             .to_string()
     };
     normalize(a) == normalize(b)
@@ -2834,6 +2857,69 @@ pub async fn reload_shared_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    reload_shared_files_page(app, &state, MAX_CHAINED_SCAN_PAGES).await
+}
+
+/// Wait out the gap between chained pages, then run the next one.
+///
+/// Boxed because the chain is mutually recursive with
+/// [`reload_shared_files_page`], which needs one concrete future type to
+/// terminate the type cycle on.
+fn chained_scan_page(
+    app: tauri::AppHandle,
+    chained_pages_left: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let deadline = std::time::Instant::now() + CHAINED_SCAN_PAGE_DELAY;
+        loop {
+            {
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                // An explicit Stop must not be undone behind the user's back —
+                // the FS watcher declines a reload for the same reason — and
+                // shutdown raises `bw_shutdown` before joining the scans it
+                // tracks, so noticing it here is what keeps exit prompt.
+                if state.bw_shutdown.load(Ordering::Acquire)
+                    || state.hashing_paused.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(CHAINED_SCAN_POLL_INTERVAL).await;
+        }
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        if let Err(error) = reload_shared_files_page(app.clone(), &state, chained_pages_left).await
+        {
+            // Almost always the single-flight rejection: a reload the user or
+            // the FS watcher started in the gap now owns the remaining pages.
+            debug!("Chained shared-folder scan page did not start: {error}");
+        }
+    })
+}
+
+/// Register the next chained page as a tracked background scan so shutdown can
+/// abort it, instead of leaving an untracked task able to start a fresh scan
+/// while the exit flush is running.
+async fn schedule_chained_scan_page(app: tauri::AppHandle, chained_pages_left: u32) {
+    let handle = tokio::spawn(chained_scan_page(app.clone(), chained_pages_left));
+    if let Some(state) = app.try_state::<AppState>() {
+        state.register_background_scan(handle).await;
+    }
+}
+
+/// `chained_pages_left` is how many *further* truncated pages this trigger may
+/// queue for itself; see [`MAX_CHAINED_SCAN_PAGES`].
+async fn reload_shared_files_page(
+    app: tauri::AppHandle,
+    state: &AppState,
+    chained_pages_left: u32,
+) -> Result<(), String> {
     let reload_flight =
         crate::security::try_begin_single_flight(&RELOAD_IN_FLIGHT).ok_or_else(|| {
             coded(
@@ -2865,6 +2951,7 @@ pub async fn reload_shared_files(
     let config = state.config.clone();
     let scan_truncated = state.library_scan_truncated.clone();
     let discovery_folders = folders.clone();
+    let cursors_before_scan = scan_cursors.clone();
     let discovery_cursors = scan_cursors;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -3206,6 +3293,11 @@ pub async fn reload_shared_files(
             index.rebuild();
         }
 
+        // Gates the chained continuation below. A chained page re-reads the
+        // cursor from config, so it can only make progress if this page's
+        // cursor both moved and reached disk; otherwise it would rescan exactly
+        // what just ran.
+        let mut resume_point_advanced = false;
         if !was_cancelled && page_complete {
             let cursor_updates = discovery_cursor_updates
                 .into_iter()
@@ -3215,9 +3307,16 @@ pub async fn reload_shared_files(
                         .any(|active| paths_equal_ignore_case(active, folder))
                 })
                 .collect::<std::collections::HashMap<_, _>>();
+            let advanced = cursor_updates.iter().any(|(folder, next)| {
+                let key = crate::search::index::normalize_path_key(folder);
+                next.as_deref() != cursors_before_scan.get(&key).map(String::as_str)
+            });
             let app_state = app.state::<AppState>();
-            if let Err(error) = persist_scan_cursors(&app_state, &cursor_updates, false).await {
-                warn!("Shared-folder scan page was indexed but its resume cursor was not saved: {error}");
+            match persist_scan_cursors(&app_state, &cursor_updates, false).await {
+                Ok(()) => resume_point_advanced = advanced,
+                Err(error) => warn!(
+                    "Shared-folder scan page was indexed but its resume cursor was not saved: {error}"
+                ),
             }
         }
         refresh_file_cache(&local_index, &file_cache).await;
@@ -3264,6 +3363,18 @@ pub async fn reload_shared_files(
                 "done": true,
             }),
         );
+
+        // This page stopped at the cap, so the folder has more files that only
+        // a later page can reach. Queue that page ourselves — nothing else
+        // advances the cursor without the user pressing Reload again.
+        if discovery_truncated && resume_point_advanced && chained_pages_left > 0 {
+            info!(
+                "Shared-folder scan page hit the file cap; queueing the next page in {}s ({} left this pass)",
+                CHAINED_SCAN_PAGE_DELAY.as_secs(),
+                chained_pages_left,
+            );
+            schedule_chained_scan_page(app.clone(), chained_pages_left - 1).await;
+        }
         drop(scan_guard);
     });
 
@@ -3275,12 +3386,12 @@ pub async fn reload_shared_files(
 }
 
 #[tauri::command]
-pub async fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+pub fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.scanning_count.load(Ordering::Relaxed) > 0)
 }
 
 #[tauri::command]
-pub async fn get_library_scan_truncated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+pub fn get_library_scan_truncated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.library_scan_truncated.load(Ordering::Relaxed))
 }
 

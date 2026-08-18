@@ -230,7 +230,7 @@ impl IterativeSearch {
                 }
             })
             .collect();
-        shortlist.sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
+        shortlist.sort_by_key(|a| a.distance.0);
         shortlist.truncate(K_BUCKET_SIZE);
 
         Self {
@@ -326,7 +326,7 @@ impl IterativeSearch {
             added += 1;
         }
         self.shortlist
-            .sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
+            .sort_by_key(|a| a.distance.0);
         added
     }
 
@@ -472,7 +472,7 @@ impl IterativeSearch {
         // in-flight total and exceed ALPHA. Entries awaiting a reply are kept
         // regardless of rank, which bounds the list at K + ALPHA.
         self.shortlist
-            .sort_by(|a, b| a.distance.0.cmp(&b.distance.0));
+            .sort_by_key(|a| a.distance.0);
         if self.shortlist.len() > K_BUCKET_SIZE {
             let mut kept = 0usize;
             self.shortlist.retain(|e| {

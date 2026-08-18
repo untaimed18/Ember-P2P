@@ -165,11 +165,7 @@ impl KadId {
     }
 
     pub fn xor_distance(&self, other: &KadId) -> KadId {
-        let mut result = [0u8; KAD_ID_SIZE];
-        for i in 0..KAD_ID_SIZE {
-            result[i] = self.0[i] ^ other.0[i];
-        }
-        KadId(result)
+        KadId(super::dht_common::xor16(&self.0, &other.0))
     }
 
     /// Return the `i`-th 32-bit chunk of the 128-bit ID, matching eMule's
