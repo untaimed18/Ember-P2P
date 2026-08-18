@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "Bloque les plages IP connues comme indésirables via ipfilter.dat",
   "settings_download_ipfilter_btn": "Télécharger ipfilter.dat",
   "settings_filter_incoming_label": "Filtrer les connexions entrantes",
-  "settings_filter_incoming_hint": "Applique le filtre IP aux connexions entrantes des pairs. Les utilisateurs de VPN peuvent devoir le désactiver, car les IP de VPN apparaissent souvent dans les listes de filtres.",
+  "settings_filter_incoming_hint": "Appliquer le filtre IP uniquement aux connexions TCP d'envoi entrantes. Kad et eD2K UDP utilisent toujours la liste. Les utilisateurs de VPN peuvent devoir le désactiver, car les IP de VPN apparaissent souvent dans les listes de filtres.",
   "settings_block_private_label": "Bloquer les IP privées",
   "settings_block_private_hint": "Rejette 10.x, 192.168.x, etc. de la table de routage.",
   "settings_allow_shared_browse_label": "Autoriser l'exploration de mes partages",

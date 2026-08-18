@@ -13,6 +13,7 @@
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
+  import { notifySpamFilterReset } from '$lib/stores/search';
   import {
     getAntileechPatterns,
     setAntileechPatterns,
@@ -1068,6 +1069,7 @@
     spamResetting = true;
     try {
       await resetSpamFilter();
+      await notifySpamFilterReset();
       await refreshSpamStats();
       showSaveMsg(m.settings_spam_reset_success(), false, 3000);
     } catch (e: unknown) {

@@ -444,6 +444,16 @@ pub struct SearchResult {
     /// Where the hit came from: `KAD`, `Server`, `UDP`, `Local`, `Notes`, or combined (e.g. `KAD · Server`).
     #[serde(default)]
     pub result_origin: String,
+    /// eD2k server IP this hit was learned from (connected TCP server or UDP
+    /// reply source). Used when marking spam so server reputation can train,
+    /// and when explaining a row so the tooltip matches list scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_server_ip: Option<String>,
+    /// Reasons from the enrichment pass that set `spam_rating` / `is_spam`.
+    /// The search UI prefers this over a second one-off explain call, which
+    /// cannot reconstruct batch-local heuristics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spam_reasons: Vec<String>,
 }
 
 /// Response from [`crate::commands::transfers::start_download`].
@@ -989,14 +999,14 @@ pub struct AppSettings {
     /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
     #[serde(default = "default_true")]
     pub ip_filter_enabled: bool,
-    /// Apply IP filter ranges / private blocking to incoming peer
-    /// connections (upload server). Off by default: VPN IPs commonly
-    /// appear in ipfilter.dat "hosting" ranges, silently breaking
-    /// connectivity for a large portion of users. Outbound filtering
-    /// still applies, and the abuse tracker / ban list protect against
-    /// misbehaving inbound peers. Truly-unroutable "bogus" IPs
-    /// (loopback, multicast, documentation, class-E, …) are always
-    /// rejected inbound regardless of this toggle.
+    /// Apply IP filter ranges / private blocking to incoming TCP upload
+    /// connections only. Off by default: VPN IPs commonly appear in
+    /// ipfilter.dat "hosting" ranges, silently breaking connectivity for
+    /// a large portion of users. Kad and eD2K UDP still always consult the
+    /// list. Outbound filtering still applies, and the abuse tracker / ban
+    /// list protect against misbehaving inbound peers. Truly-unroutable
+    /// "bogus" IPs (loopback, multicast, documentation, class-E, …) are
+    /// always rejected inbound regardless of this toggle.
     #[serde(default)]
     pub filter_incoming_connections: bool,
     /// Answer standard ed2k "View Files" requests (`OP_ASKSHAREDFILES`) from

@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "通过 ipfilter.dat 屏蔽已知恶意 IP 段",
   "settings_download_ipfilter_btn": "下载 ipfilter.dat",
   "settings_filter_incoming_label": "筛选入站连接",
-  "settings_filter_incoming_hint": "对入站对等连接应用 IP 筛选。VPN 用户可能需要关闭此项，因为 VPN IP 常出现在筛选列表中。",
+  "settings_filter_incoming_hint": "仅对入站 TCP 上传连接应用 IP 筛选。Kad 和 eD2K UDP 仍始终使用该列表。VPN 用户可能需要关闭此项，因为 VPN IP 常出现在筛选列表中。",
   "settings_block_private_label": "屏蔽私有 IP",
   "settings_block_private_hint": "从路由表中拒绝 10.x、192.168.x 等地址。",
   "settings_allow_shared_browse_label": "允许浏览我的共享",

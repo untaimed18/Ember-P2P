@@ -93,6 +93,16 @@ fn validate_spam_payload(
     Ok(())
 }
 
+fn keywords_for_spam(search_query: Option<&str>, search_keywords: &[String]) -> Vec<String> {
+    if let Some(q) = search_query.map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = crate::search::query::positive_terms_from_query(q);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    search_keywords.to_vec()
+}
+
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(coded(
@@ -109,36 +119,12 @@ fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
 
 /// Apply spam scoring + filename cleanup + comment URL stripping to a
 /// batch of results, given pre-resolved configuration. Pure enrichment
-/// — no I/O, no locking. Used by both the synchronous `search_files`
-/// command path and the streaming network event loop.
-#[allow(clippy::too_many_arguments)]
-pub fn apply_search_enrichment(
-    results: &mut [SearchResult],
-    spam: &SpamFilter,
-    search_keywords: &[String],
-    server_ip: Option<&str>,
-    spam_enabled: bool,
-    spam_profile: SpamFilterProfile,
-    cleanup_strings: &[String],
-    community: &HashMap<String, CommunityRating>,
-) {
-    apply_search_enrichment_with_batch(
-        results,
-        spam,
-        search_keywords,
-        server_ip,
-        spam_enabled,
-        spam_profile,
-        cleanup_strings,
-        community,
-        true,
-    );
-}
-
-/// Like [`apply_search_enrichment`], but `use_batch_context: false` skips
-/// batch-local spam heuristics (same-name/many-hashes). Used for the invoke
-/// return path so a second scoring pass cannot flip already-streamed rows
-/// from clean → spam via a different batch context.
+/// — no I/O, no locking. Used by both the streaming network event loop
+/// and the invoke return / rescore paths.
+///
+/// `use_batch_context: false` skips analysing *this* slice as a fresh
+/// batch (same-name/many-hashes). Pass `precomputed_batch` when the
+/// caller has already absorbed results into a search-wide context.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_search_enrichment_with_batch(
     results: &mut [SearchResult],
@@ -150,11 +136,17 @@ pub fn apply_search_enrichment_with_batch(
     cleanup_strings: &[String],
     community: &HashMap<String, CommunityRating>,
     use_batch_context: bool,
+    precomputed_batch: Option<&BatchSpamContext>,
 ) {
-    let batch = if spam_enabled && spam_profile != SpamFilterProfile::Relaxed && use_batch_context {
-        BatchSpamContext::analyze(results)
+    let analyzed;
+    let batch: &BatchSpamContext = if let Some(pre) = precomputed_batch {
+        pre
+    } else if spam_enabled && spam_profile != SpamFilterProfile::Relaxed && use_batch_context {
+        analyzed = BatchSpamContext::analyze(results);
+        &analyzed
     } else {
-        BatchSpamContext::default()
+        analyzed = BatchSpamContext::default();
+        &analyzed
     };
     for result in results.iter_mut() {
         if spam_enabled {
@@ -162,9 +154,15 @@ pub fn apply_search_enrichment_with_batch(
                 .get(&result.file.hash)
                 .copied()
                 .unwrap_or_default();
-            result.spam_rating =
-                spam.rate_result(result, search_keywords, server_ip, spam_profile, cr, &batch);
-            result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
+            let details =
+                spam.explain_result(result, search_keywords, server_ip, spam_profile, cr, batch);
+            result.spam_rating = details.score;
+            result.is_spam = details.is_spam;
+            result.spam_reasons = details.reasons;
+        } else {
+            result.spam_rating = 0;
+            result.is_spam = false;
+            result.spam_reasons.clear();
         }
         result.clean_name = cleanup_filename(&result.file.name, cleanup_strings);
         if let Some(ref comment) = result.comment {
@@ -174,15 +172,6 @@ pub fn apply_search_enrichment_with_batch(
             }
         }
     }
-}
-
-pub async fn enrich_results(
-    results: &mut [SearchResult],
-    state: &AppState,
-    search_keywords: &[String],
-    server_ip: Option<&str>,
-) {
-    enrich_results_with_batch(results, state, search_keywords, server_ip, true).await;
 }
 
 pub async fn enrich_results_with_batch(
@@ -210,6 +199,7 @@ pub async fn enrich_results_with_batch(
         &cleanup_strings,
         &community,
         use_batch_context,
+        None,
     );
 }
 
@@ -452,7 +442,32 @@ pub async fn find_notes(
                 ));
             }
         };
-    enrich_results(&mut results, &state, &[], None).await;
+    {
+        let mut cm = state.comment_manager.write().await;
+        for r in &results {
+            let rating = r.rating.unwrap_or(0);
+            let comment = r.comment.clone().unwrap_or_default();
+            if rating == 0 && comment.is_empty() {
+                continue;
+            }
+            // Publisher identity: Kad notes put the full hex in `peer_id` and
+            // a display prefix in `peer_name`. Upsert by the full id so two
+            // publishers cannot collapse onto an 8-character prefix.
+            let user = if !r.peer_id.is_empty() {
+                r.peer_id.clone()
+            } else {
+                r.peer_name.clone()
+            };
+            cm.add_peer_comment(&r.file.hash, user, rating, comment, 1);
+        }
+    }
+    // Notes are comments, not search hits: skip spam scoring and batch heuristics.
+    enrich_results_with_batch(&mut results, &state, &[], None, false).await;
+    for result in &mut results {
+        result.spam_rating = 0;
+        result.is_spam = false;
+        result.spam_reasons.clear();
+    }
     Ok(results)
 }
 
@@ -911,6 +926,7 @@ pub async fn mark_spam(
     source_addresses: Vec<String>,
     search_keywords: Vec<String>,
     server_ip: Option<String>,
+    search_query: Option<String>,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
@@ -921,6 +937,7 @@ pub async fn mark_spam(
         &search_keywords,
         server_ip.as_deref(),
     )?;
+    let keywords = keywords_for_spam(search_query.as_deref(), &search_keywords);
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),
@@ -959,10 +976,12 @@ pub async fn mark_spam(
         is_spam: false,
         clean_name: String::new(),
         result_origin: String::new(),
+        origin_server_ip: server_ip.clone(),
+        spam_reasons: Vec::new(),
     };
     let save_data = {
         let mut spam = state.spam_filter.write().await;
-        spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
+        spam.mark_spam(&result, &keywords, server_ip.as_deref());
         spam.take_save_data()
     };
     // Persist off the IPC path so the UI isn't parked on disk I/O. In-memory
@@ -1032,6 +1051,9 @@ pub async fn explain_spam_result(
     source_addresses: Vec<String>,
     search_keywords: Vec<String>,
     server_ip: Option<String>,
+    search_query: Option<String>,
+    rating: Option<u8>,
+    result_origin: Option<String>,
 ) -> Result<SpamExplainResponse, String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
@@ -1042,6 +1064,8 @@ pub async fn explain_spam_result(
         &search_keywords,
         server_ip.as_deref(),
     )?;
+    let keywords = keywords_for_spam(search_query.as_deref(), &search_keywords);
+    let hash_for_comments = file_hash.clone();
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),
@@ -1073,31 +1097,39 @@ pub async fn explain_spam_result(
         availability: 0,
         file_type: String::new(),
         source_addresses,
-        rating: None,
+        rating,
         comment: None,
         media: None,
         spam_rating: 0,
         is_spam: false,
         clean_name: String::new(),
-        result_origin: String::new(),
+        result_origin: result_origin.unwrap_or_default(),
+        origin_server_ip: server_ip.clone(),
+        spam_reasons: Vec::new(),
     };
 
     let cfg = state.config.read().await;
     let profile = SpamFilterProfile::from_setting(&cfg.settings.spam_filter_profile);
     drop(cfg);
 
+    let community = {
+        let cm = state.comment_manager.read().await;
+        let (fake_votes, total_votes) = cm.fake_rating_stats(&hash_for_comments);
+        CommunityRating {
+            fake_votes,
+            total_votes,
+        }
+    };
+
     let spam = state.spam_filter.read().await;
-    // The standalone "why is this spam?" view scores a single result, so the
-    // batch-statistical and community signals (which need the full result set /
-    // comment manager) aren't available here — pass neutral values. The
-    // authoritative is_spam flag shown in the result list comes from the
-    // streaming enrichment path, which does include them.
+    // Batch-local heuristics still need the full result set; those reasons are
+    // stored on the row at enrich time (`spam_reasons`) and preferred by the UI.
     let details = spam.explain_result(
         &result,
-        &search_keywords,
+        &keywords,
         server_ip.as_deref(),
         profile,
-        CommunityRating::default(),
+        community,
         &BatchSpamContext::default(),
     );
     Ok(SpamExplainResponse {
@@ -1111,26 +1143,12 @@ pub async fn explain_spam_result(
 
 #[tauri::command]
 pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let save_data = {
+    {
         let mut spam = state.spam_filter.write().await;
         spam.reset();
-        spam.take_save_data()
-    };
-    if let Some((data, path, gen)) = save_data {
-        let ok = tokio::task::spawn_blocking(move || {
-            match crate::security::atomic_write(&path, data.as_bytes(), false) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("Failed to save spam filter after reset: {e}");
-                    false
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-        if ok {
-            state.spam_filter.write().await.mark_saved(gen);
-        }
+    }
+    if let Err(e) = SpamFilter::drain_saves(&state.spam_filter).await {
+        tracing::warn!("Failed to save spam filter after reset: {e}");
     }
     Ok("Spam filter learning data cleared.".to_string())
 }
@@ -1143,6 +1161,7 @@ pub async fn rescore_search_results(
     state: tauri::State<'_, AppState>,
     mut results: Vec<SearchResult>,
     search_keywords: Vec<String>,
+    search_query: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
     const MAX_RESCORE: usize = 15_000;
     if results.len() > MAX_RESCORE {
@@ -1169,17 +1188,20 @@ pub async fn rescore_search_results(
             MAX_MARK_SPAM_KEYWORD_LEN,
         ));
     }
+    let keywords = keywords_for_spam(search_query.as_deref(), &search_keywords);
     let spam_enabled = {
         let config = state.config.read().await;
         config.settings.spam_filter_enabled
     };
     // No batch-local heuristics: this is a re-pass over already-shown rows,
     // and same-name/many-hashes context can flip a clean streamed row to spam.
-    enrich_results_with_batch(&mut results, &state, &search_keywords, None, false).await;
+    // Per-row `origin_server_ip` still feeds server reputation.
+    enrich_results_with_batch(&mut results, &state, &keywords, None, false).await;
     if !spam_enabled {
         for result in &mut results {
             result.spam_rating = 0;
             result.is_spam = false;
+            result.spam_reasons.clear();
         }
     }
     Ok(results)

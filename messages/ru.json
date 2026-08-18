@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "Блокировать известные плохие IP-диапазоны через ipfilter.dat",
   "settings_download_ipfilter_btn": "Загрузить ipfilter.dat",
   "settings_filter_incoming_label": "Фильтровать входящие соединения",
-  "settings_filter_incoming_hint": "Применять IP-фильтр к входящим пиринговым соединениям. Пользователям VPN может потребоваться отключить это, так как VPN-IP часто попадают в списки фильтров.",
+  "settings_filter_incoming_hint": "Применять IP-фильтр только к входящим TCP-подключениям отдачи. Kad и eD2K UDP по-прежнему всегда используют список. Пользователям VPN может потребоваться отключить это, так как VPN-IP часто попадают в списки фильтров.",
   "settings_block_private_label": "Блокировать частные IP",
   "settings_block_private_hint": "Отклонять 10.x, 192.168.x и т. п. из таблицы маршрутизации.",
   "settings_allow_shared_browse_label": "Разрешить просмотр моих общих файлов",

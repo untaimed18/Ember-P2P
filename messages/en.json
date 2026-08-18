@@ -1993,7 +1993,7 @@
   "settings_ip_filter_hint": "Block known-bad IP ranges via ipfilter.dat",
   "settings_download_ipfilter_btn": "Download ipfilter.dat",
   "settings_filter_incoming_label": "Filter Incoming Connections",
-  "settings_filter_incoming_hint": "Apply IP filter to incoming peer connections. VPN users may need to disable this since VPN IPs often appear in filter lists.",
+  "settings_filter_incoming_hint": "Apply the IP filter to incoming TCP upload connections only. Kad and eD2K UDP still always use the list. VPN users may need to disable this since VPN IPs often appear in filter lists.",
   "settings_block_private_label": "Block Private IPs",
   "settings_block_private_hint": "Reject 10.x, 192.168.x, etc. from the routing table.",
   "settings_allow_shared_browse_label": "Allow Browsing My Shares",

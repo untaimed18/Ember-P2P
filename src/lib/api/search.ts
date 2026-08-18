@@ -123,10 +123,18 @@ export async function markSpam(
   fileName: string,
   fileSize: number,
   sourceAddresses: string[],
-  searchKeywords: string[],
-  serverIp?: string,
+  searchQuery: string,
+  serverIp?: string | null,
 ): Promise<void> {
-  return invoke('mark_spam', { fileHash, fileName, fileSize, sourceAddresses, searchKeywords, serverIp: serverIp ?? null });
+  return invoke('mark_spam', {
+    fileHash,
+    fileName,
+    fileSize,
+    sourceAddresses,
+    searchKeywords: [],
+    serverIp: serverIp ?? null,
+    searchQuery: searchQuery || null,
+  });
 }
 
 export async function markNotSpam(fileHash: string): Promise<void> {
@@ -142,16 +150,19 @@ export async function explainSpamResult(
   fileName: string,
   fileSize: number,
   sourceAddresses: string[],
-  searchKeywords: string[],
-  serverIp?: string,
+  searchQuery: string,
+  opts?: { serverIp?: string | null; rating?: number | null; resultOrigin?: string | null },
 ): Promise<SpamExplanation> {
   return invoke('explain_spam_result', {
     fileHash,
     fileName,
     fileSize,
     sourceAddresses,
-    searchKeywords,
-    serverIp: serverIp ?? null,
+    searchKeywords: [],
+    serverIp: opts?.serverIp ?? null,
+    searchQuery: searchQuery || null,
+    rating: opts?.rating ?? null,
+    resultOrigin: opts?.resultOrigin ?? null,
   });
 }
 
@@ -161,9 +172,9 @@ export async function resetSpamFilter(): Promise<string> {
 
 export async function rescoreSearchResults(
   results: SearchResult[],
-  searchKeywords: string[],
+  searchQuery: string,
 ): Promise<SearchResult[]> {
-  return invoke('rescore_search_results', { results, searchKeywords });
+  return invoke('rescore_search_results', { results, searchKeywords: [], searchQuery: searchQuery || null });
 }
 
 export async function getDownloadHistoryStats(): Promise<DownloadHistoryStats> {

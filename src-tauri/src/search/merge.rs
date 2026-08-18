@@ -250,6 +250,16 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.file.aich_hash.is_empty() && !incoming.file.aich_hash.is_empty() {
         existing.file.aich_hash = incoming.file.aich_hash;
     }
+    if existing.origin_server_ip.is_none() {
+        existing.origin_server_ip = incoming.origin_server_ip;
+    }
+    if incoming.is_spam && !existing.is_spam {
+        existing.spam_reasons = incoming.spam_reasons;
+    } else if incoming.spam_rating > existing.spam_rating {
+        existing.spam_reasons = incoming.spam_reasons;
+    }
+    existing.spam_rating = existing.spam_rating.max(incoming.spam_rating);
+    existing.is_spam = existing.is_spam || incoming.is_spam;
 }
 
 /// True when every non-empty origin part is an eD2k server/UDP label
@@ -385,6 +395,8 @@ mod tests {
             is_spam: false,
             clean_name: String::new(),
             result_origin: origin.into(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
         }
     }
 

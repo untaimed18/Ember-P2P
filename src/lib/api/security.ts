@@ -14,8 +14,18 @@ export interface IpFilterStats {
   /** False while an enabled filter has not finished (or failed) loading ranges. */
   ranges_ready: boolean;
   range_count: number;
+  /** Rows matching the current query, before offset/limit. */
+  matched_count?: number;
   total_hits: number;
   entries: IpFilterEntry[];
+}
+
+export interface IpFilterStatsQuery {
+  query?: string;
+  sort?: 'range' | 'hits' | 'description';
+  sortAsc?: boolean;
+  offset?: number;
+  limit?: number;
 }
 
 export type IpFilterApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -39,8 +49,14 @@ export async function acknowledgeSecurityPolicyReset(): Promise<void> {
   return invoke('acknowledge_security_policy_reset');
 }
 
-export async function getIpFilterStats(): Promise<IpFilterStats> {
-  return invoke('get_ip_filter_stats');
+export async function getIpFilterStats(opts?: IpFilterStatsQuery): Promise<IpFilterStats> {
+  return invoke('get_ip_filter_stats', {
+    query: opts?.query ?? '',
+    sort: opts?.sort ?? 'hits',
+    sortAsc: opts?.sortAsc ?? false,
+    offset: opts?.offset ?? 0,
+    limit: opts?.limit ?? 256,
+  });
 }
 
 export async function addIpFilterRange(

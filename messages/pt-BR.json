@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "Bloquear faixas de IP conhecidas como ruins via ipfilter.dat",
   "settings_download_ipfilter_btn": "Baixar ipfilter.dat",
   "settings_filter_incoming_label": "Filtrar Conexões de Entrada",
-  "settings_filter_incoming_hint": "Aplicar o filtro de IP às conexões de entrada de pares. Usuários de VPN talvez precisem desativar isso, pois IPs de VPN geralmente aparecem em listas de filtros.",
+  "settings_filter_incoming_hint": "Aplicar o filtro de IP apenas às conexões TCP de upload de entrada. Kad e eD2K UDP ainda usam sempre a lista. Usuários de VPN talvez precisem desativar isso, pois IPs de VPN geralmente aparecem em listas de filtros.",
   "settings_block_private_label": "Bloquear IPs Privados",
   "settings_block_private_hint": "Rejeitar 10.x, 192.168.x, etc. da tabela de roteamento.",
   "settings_allow_shared_browse_label": "Permitir Explorar Meus Compartilhamentos",

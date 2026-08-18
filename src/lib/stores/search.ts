@@ -28,6 +28,9 @@ export type SearchTab = {
 
 export const searchTabs = writable<SearchTab[]>([]);
 export const activeSearchTabId = writable<string | null>(null);
+/** Bumped when learned spam data is wiped so the search page can drop
+ *  tooltip caches that would otherwise outlive empty `spam_reasons`. */
+export const spamFilterEpoch = writable(0);
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
@@ -73,7 +76,7 @@ function combineOrigin(a: string, b: string): string {
 
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
  * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
-const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number }>();
+const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
 
 /** Ranking ceiling for peer-reported counts, matching MAX_PLAUSIBLE_SOURCES in
  * merge.rs. ed2k carries this count as a u16 on the wire, so anything above it
@@ -145,6 +148,14 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     media: hasMedia ? media : existing.media || incoming.media,
     spam_rating,
     is_spam,
+    origin_server_ip: existing.origin_server_ip || incoming.origin_server_ip,
+    spam_reasons: override?.reasons
+      ? override.reasons
+      : incoming.is_spam && (incoming.spam_reasons?.length ?? 0) > 0
+        ? incoming.spam_reasons
+        : existing.spam_reasons?.length
+          ? existing.spam_reasons
+          : incoming.spam_reasons,
     // `clean_name` is derived from whichever `file.name` its own row carried, so
     // it has to follow the name we kept above. Taking the incoming one while
     // `file.name` keeps the first meant the row could display one filename and
@@ -249,23 +260,45 @@ export function appendSearchResults(requestId: number, incoming: SearchResult[])
  * Only reallocates tabs/results that actually contain a match.
  * Records a user override so later stream merges cannot undo the choice.
  */
-export function patchSpamFlagByHash(fileHash: string, isSpam: boolean, spamRating: number) {
+export function patchSpamFlagByHash(
+  fileHash: string,
+  isSpam: boolean,
+  spamRating: number,
+  reasons?: string[],
+) {
   if (!fileHash) return;
-  spamUserOverrides.set(fileHash, { isSpam, spamRating });
+  spamUserOverrides.set(fileHash, { isSpam, spamRating, reasons });
   searchTabs.update((tabs) => {
     let anyChanged = false;
     const next = tabs.map((tab) => {
       const idx = tab.results.findIndex((r) => r.file.hash === fileHash);
       if (idx === -1) return tab;
       const current = tab.results[idx];
-      if (current.is_spam === isSpam && current.spam_rating === spamRating) return tab;
+      if (
+        current.is_spam === isSpam
+        && current.spam_rating === spamRating
+        && (reasons === undefined || sameReasons(current.spam_reasons, reasons))
+      ) {
+        return tab;
+      }
       anyChanged = true;
       const results = tab.results.slice();
-      results[idx] = { ...current, is_spam: isSpam, spam_rating: spamRating };
+      results[idx] = {
+        ...current,
+        is_spam: isSpam,
+        spam_rating: spamRating,
+        spam_reasons: reasons ?? current.spam_reasons,
+      };
       return { ...tab, results };
     });
     return anyChanged ? next : tabs;
   });
+}
+
+function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((v, i) => v === b[i]);
 }
 
 /** Ceiling on open search tabs, evicting oldest-first — the same bound
@@ -416,10 +449,9 @@ async function rescoreOpenTabs() {
   const tabs = get(searchTabs);
   for (const tab of tabs) {
     if (tab.results.length === 0) continue;
-    const keywords = tab.query.split(/\s+/).filter((w) => w.length > 0).slice(0, 32);
     const tabId = tab.id;
     try {
-      const scored = await rescoreSearchResults(tab.results, keywords);
+      const scored = await rescoreSearchResults(tab.results, tab.query);
       searchTabs.update((current) => {
         const i = current.findIndex((t) => t.id === tabId);
         if (i === -1) return current;
@@ -432,6 +464,7 @@ async function rescoreOpenTabs() {
             ...r,
             spam_rating: override?.spamRating ?? n.spam_rating,
             is_spam: override?.isSpam ?? n.is_spam,
+            spam_reasons: override?.reasons ?? n.spam_reasons,
           };
         });
         const next = [...current];
@@ -442,6 +475,13 @@ async function rescoreOpenTabs() {
       console.error('Failed to rescore search results:', e);
     }
   }
+}
+
+/** After Settings resets learned spam data: drop in-session marks and rescore open tabs. */
+export async function notifySpamFilterReset() {
+  spamUserOverrides.clear();
+  spamFilterEpoch.update((n) => n + 1);
+  await rescoreOpenTabs();
 }
 
 export async function initSearchStore() {
@@ -557,6 +597,7 @@ export function cleanupSearchStore() {
   flushScheduled = false;
   pendingByRequest.clear();
   spamUserOverrides.clear();
+  spamFilterEpoch.update((n) => n + 1);
   searchTabs.set([]);
   activeSearchTabId.set(null);
 }

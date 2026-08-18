@@ -37,7 +37,7 @@ const SPAM_PATTERN_MAX: u32 = 30;
 // "fake" is one of the strongest spam indicators eMule uses.
 const SPAM_FAKE_RATING_HIT: u32 = 40;
 const SPAM_FAKE_RATING_NEARHIT: u32 = 20;
-const FAKE_RATING_MIN_VOTES: u32 = 2;
+const FAKE_RATING_MIN_VOTES: u32 = 3;
 const FAKE_RATING_MAJORITY: f32 = 0.5;
 const FAKE_RATING_SOME: f32 = 0.25;
 
@@ -62,6 +62,11 @@ const BATCH_SOURCE_HOT_SHARE: f64 = 0.5;
 /// Only treat a source IP as hot once the batch is at least this large, so a
 /// handful of legitimate results that happen to share a seeder don't trip it.
 const BATCH_SOURCE_MIN_HITS: usize = 4;
+/// Caps so a pathological all-servers search cannot grow these maps unboundedly.
+const MAX_BATCH_NAME_KEYS: usize = 4_096;
+const MAX_BATCH_HASH_KEYS: usize = 4_096;
+const MAX_BATCH_SOURCE_KEYS: usize = 2_048;
+const MAX_BATCH_SNAPSHOTS: usize = 1_024;
 
 pub const SEARCH_SPAM_THRESHOLD: u32 = 60;
 pub const SEARCH_SPAM_THRESHOLD_AGGRESSIVE: u32 = 45;
@@ -136,79 +141,180 @@ pub struct CommunityRating {
 #[derive(Debug, Clone, Default)]
 pub struct BatchSpamContext {
     enabled: bool,
-    /// normalized filename -> number of distinct file hashes carrying it
-    name_hash_counts: HashMap<String, usize>,
-    /// file hash -> number of distinct normalized filenames advertised
-    hash_name_counts: HashMap<String, usize>,
+    /// normalized filename -> distinct file hashes carrying it
+    name_hashes: HashMap<String, HashSet<String>>,
+    /// file hash -> distinct normalized filenames advertised
+    hash_names: HashMap<String, HashSet<String>>,
+    /// source IPs referenced by results (Kad publisher-only rows skipped)
+    source_hits: HashMap<String, usize>,
+    result_count: usize,
     /// source IPs referenced by a suspiciously large share of the batch
     hot_source_ips: HashSet<String>,
+    /// Last-seen row fields for hashes already absorbed, so a later packet that
+    /// newly crosses a collision bar can upgrade earlier streamed rows.
+    snapshots: HashMap<String, StreamedSpamSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamedSpamSnapshot {
+    hash: String,
+    name: String,
+    size: u64,
+    source_addresses: Vec<String>,
+    result_origin: String,
+    origin_server_ip: Option<String>,
+    rating: Option<u8>,
 }
 
 impl BatchSpamContext {
     /// Analyse a batch of search results into reusable statistical signals.
     pub fn analyze(results: &[SearchResult]) -> Self {
-        let total = results.len();
-        if total < BATCH_MIN_RESULTS_FOR_STATS {
-            return Self::default();
-        }
+        let mut ctx = Self::default();
+        ctx.absorb(results);
+        ctx
+    }
 
-        let mut name_hashes: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut hash_names: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut source_hits: HashMap<String, usize> = HashMap::new();
-
+    /// Fold another packet into this context so same-name/many-hashes can be
+    /// seen across the whole search, not only inside one UDP/Kad emit.
+    pub fn absorb(&mut self, results: &[SearchResult]) {
         for r in results {
+            self.result_count = self.result_count.saturating_add(1);
             let name_norm = normalize_filename(&r.file.name);
             let hash = normalize_hash(&r.file.hash);
             if !name_norm.is_empty() && !hash.is_empty() {
-                name_hashes
-                    .entry(name_norm.clone())
-                    .or_default()
-                    .insert(hash.clone());
-                hash_names.entry(hash).or_default().insert(name_norm);
+                if self.name_hashes.contains_key(&name_norm)
+                    || self.name_hashes.len() < MAX_BATCH_NAME_KEYS
+                {
+                    self.name_hashes
+                        .entry(name_norm.clone())
+                        .or_default()
+                        .insert(hash.clone());
+                }
+                if self.hash_names.contains_key(&hash)
+                    || self.hash_names.len() < MAX_BATCH_HASH_KEYS
+                {
+                    self.hash_names
+                        .entry(hash.clone())
+                        .or_default()
+                        .insert(name_norm);
+                }
+                if self.snapshots.contains_key(&hash) || self.snapshots.len() < MAX_BATCH_SNAPSHOTS
+                {
+                    self.snapshots.insert(
+                        hash.clone(),
+                        StreamedSpamSnapshot {
+                            hash: hash.clone(),
+                            name: r.file.name.clone(),
+                            size: r.file.size,
+                            source_addresses: r.source_addresses.clone(),
+                            result_origin: r.result_origin.clone(),
+                            origin_server_ip: r.origin_server_ip.clone(),
+                            rating: r.rating,
+                        },
+                    );
+                }
             }
-            // Count each distinct source IP at most once per result so a single
-            // result listing the same IP twice doesn't inflate the share.
+            // Kad keyword hits often list the publishing node as the source.
+            // Counting that IP as "hot" flags a whole contact's honest results.
+            if origin_is_kad_publisher_only(&r.result_origin) {
+                continue;
+            }
             let mut seen: HashSet<String> = HashSet::new();
             for addr in &r.source_addresses {
                 if let Some(ip) = extract_ip(addr) {
-                    if seen.insert(ip.clone()) {
-                        *source_hits.entry(ip).or_insert(0) += 1;
+                    if !is_globally_routable_ip(&ip) {
+                        continue;
+                    }
+                    if self.source_hits.contains_key(&ip)
+                        || self.source_hits.len() < MAX_BATCH_SOURCE_KEYS
+                    {
+                        if seen.insert(ip.clone()) {
+                            *self.source_hits.entry(ip).or_insert(0) += 1;
+                        }
                     }
                 }
             }
         }
+        self.recompute();
+    }
 
-        let name_hash_counts = name_hashes.into_iter().map(|(k, v)| (k, v.len())).collect();
-        let hash_name_counts = hash_names.into_iter().map(|(k, v)| (k, v.len())).collect();
-
-        let threshold = ((total as f64) * BATCH_SOURCE_HOT_SHARE).ceil() as usize;
-        let min_hits = threshold.max(BATCH_SOURCE_MIN_HITS);
-        let hot_source_ips = source_hits
-            .into_iter()
-            .filter(|(_, c)| *c >= min_hits)
-            .map(|(ip, _)| ip)
-            .collect();
-
-        Self {
-            enabled: true,
-            name_hash_counts,
-            hash_name_counts,
-            hot_source_ips,
+    /// Hashes that currently participate in a name-many-hashes or hash-many-names
+    /// collision. Empty while `enabled` is false.
+    pub fn colliding_hashes(&self) -> HashSet<String> {
+        if !self.enabled {
+            return HashSet::new();
         }
+        let mut out = HashSet::new();
+        for (name, hashes) in &self.name_hashes {
+            if self.name_collision(name) {
+                out.extend(hashes.iter().cloned());
+            }
+        }
+        for (hash, names) in &self.hash_names {
+            if names.len() >= BATCH_HASH_DISTINCT_NAMES_MIN {
+                out.insert(hash.clone());
+            }
+        }
+        out
+    }
+
+    /// Earlier streamed rows whose name/hash just crossed a collision bar.
+    /// `skip` is the current packet (already scored against this context).
+    pub fn upgrade_rows(
+        &self,
+        prev_colliding: &HashSet<String>,
+        skip: &HashSet<String>,
+    ) -> Vec<SearchResult> {
+        let now = self.colliding_hashes();
+        let mut out = Vec::new();
+        for hash in now.difference(prev_colliding) {
+            if skip.contains(hash) {
+                continue;
+            }
+            if let Some(snap) = self.snapshots.get(hash) {
+                out.push(snap.to_search_result());
+            }
+        }
+        out
+    }
+
+    fn recompute(&mut self) {
+        self.enabled = self.result_count >= BATCH_MIN_RESULTS_FOR_STATS;
+        if !self.enabled {
+            self.hot_source_ips.clear();
+            return;
+        }
+        let threshold = ((self.result_count as f64) * BATCH_SOURCE_HOT_SHARE).ceil() as usize;
+        let min_hits = threshold.max(BATCH_SOURCE_MIN_HITS);
+        self.hot_source_ips = self
+            .source_hits
+            .iter()
+            .filter(|(_, c)| **c >= min_hits)
+            .map(|(ip, _)| ip.clone())
+            .collect();
     }
 
     fn name_collision(&self, name_norm: &str) -> bool {
         name_norm.chars().count() >= BATCH_MIN_NAME_LEN_FOR_COLLISION
-            && self.name_hash_counts.get(name_norm).copied().unwrap_or(0)
+            && self.name_hashes.get(name_norm).map(|s| s.len()).unwrap_or(0)
                 >= BATCH_NAME_DISTINCT_HASHES_MIN
     }
 
     fn hash_collision(&self, hash: &str) -> bool {
-        self.hash_name_counts.get(hash).copied().unwrap_or(0) >= BATCH_HASH_DISTINCT_NAMES_MIN
+        self.hash_names.get(hash).map(|s| s.len()).unwrap_or(0) >= BATCH_HASH_DISTINCT_NAMES_MIN
+    }
+
+    fn name_hash_count(&self, name_norm: &str) -> usize {
+        self.name_hashes.get(name_norm).map(|s| s.len()).unwrap_or(0)
+    }
+
+    fn hash_name_count(&self, hash: &str) -> usize {
+        self.hash_names.get(hash).map(|s| s.len()).unwrap_or(0)
     }
 
     fn source_concentrated(&self, result: &SearchResult) -> bool {
-        if self.hot_source_ips.is_empty() {
+        if self.hot_source_ips.is_empty() || origin_is_kad_publisher_only(&result.result_origin)
+        {
             return false;
         }
         result
@@ -216,6 +322,57 @@ impl BatchSpamContext {
             .iter()
             .filter_map(|a| extract_ip(a))
             .any(|ip| self.hot_source_ips.contains(&ip))
+    }
+}
+
+fn origin_is_kad_publisher_only(origin: &str) -> bool {
+    let upper = origin.to_ascii_uppercase();
+    upper.contains("KAD") && !upper.contains("SERVER") && !upper.contains("UDP")
+}
+
+impl StreamedSpamSnapshot {
+    fn to_search_result(&self) -> SearchResult {
+        SearchResult {
+            file: crate::types::FileInfo {
+                id: self.hash.clone(),
+                name: self.name.clone(),
+                path: String::new(),
+                size: self.size,
+                hash: self.hash.clone(),
+                aich_hash: String::new(),
+                ember_file_hash: String::new(),
+                extension: String::new(),
+                modified_at: 0,
+                priority: "normal".to_string(),
+                requests: 0,
+                accepted: 0,
+                bytes_transferred: 0,
+                alltime_requests: 0,
+                alltime_accepted: 0,
+                alltime_transferred: 0,
+                complete_sources: 0,
+                folder: String::new(),
+                shared: false,
+                friends_only: false,
+                shared_kad: false,
+                shared_ed2k: false,
+                shared_ember: false,
+            },
+            peer_id: String::new(),
+            peer_name: String::new(),
+            availability: 1,
+            file_type: String::new(),
+            source_addresses: self.source_addresses.clone(),
+            rating: self.rating,
+            comment: None,
+            media: None,
+            spam_rating: 0,
+            is_spam: false,
+            clean_name: String::new(),
+            result_origin: self.result_origin.clone(),
+            origin_server_ip: self.origin_server_ip.clone(),
+            spam_reasons: Vec::new(),
+        }
     }
 }
 
@@ -312,6 +469,21 @@ pub struct SpamExplanation {
     pub reasons: Vec<String>,
 }
 
+/// Per-hash undo record so Mark Not Spam can reverse the collateral that
+/// `mark_spam` wrote (filename, similar-name, size, source IPs). Absent on
+/// databases written before this field existed; those hashes can still be
+/// un-whitelisted by hash only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SpamMarkEntry {
+    pub hash: String,
+    pub filename: String,
+    pub similar_name: String,
+    pub size: u64,
+    pub source_ips: Vec<String>,
+    pub server_ip: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SpamDatabase {
@@ -323,6 +495,7 @@ pub struct SpamDatabase {
     pub spam_source_ips: FifoSet,
     pub spam_server_ips: FifoSet,
     pub udp_server_spam_ratios: HashMap<String, f32>,
+    pub spam_marks: Vec<SpamMarkEntry>,
 }
 
 pub struct SpamFilter {
@@ -417,16 +590,26 @@ impl SpamFilter {
                             }
                             db.spam_server_ips.truncate_oldest(MAX_SPAM_SERVER_IPS);
                             db.spam_source_ips.truncate_oldest(MAX_SPAM_SOURCE_IPS);
+                            let known_hashes = db.spam_hashes.clone();
+                            db.spam_marks.retain(|m| {
+                                let hash = normalize_hash(&m.hash);
+                                !hash.is_empty() && known_hashes.contains(&hash)
+                            });
+                            if db.spam_marks.len() > MAX_SPAM_HASHES {
+                                db.spam_marks.truncate(MAX_SPAM_HASHES);
+                            }
                             if db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
-                                let to_drop: Vec<String> = db
+                                let mut ranked: Vec<(String, f32)> = db
                                     .udp_server_spam_ratios
-                                    .keys()
-                                    .skip(MAX_SERVER_RATIOS)
-                                    .cloned()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), *v))
                                     .collect();
-                                for k in to_drop {
+                                ranked.sort_by(|a, b| {
+                                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let drop_n = ranked.len().saturating_sub(MAX_SERVER_RATIOS);
+                                for (k, _) in ranked.into_iter().take(drop_n) {
                                     db.udp_server_spam_ratios.remove(&k);
-                                    db.spam_server_ips.remove(&k);
                                 }
                             }
                             info!(
@@ -608,6 +791,7 @@ impl SpamFilter {
         let hash = normalize_hash(&result.file.hash);
         let name = &result.file.name;
         let size = result.file.size;
+        let server_ip = server_ip.or(result.origin_server_ip.as_deref());
         let threshold = Self::threshold_for_profile(profile);
         // The `relaxed` profile is deliberately local-only: it scores against
         // the user's own learned database and filename heuristics, but skips
@@ -629,10 +813,15 @@ impl SpamFilter {
 
         let mut score: u32 = 0;
         let mut reasons = Vec::new();
+        // Aggressive ×1.2 is for corroborated spam (hash, exact name, URL /
+        // strong token, batch name/hash collision). Similar-name + size of
+        // two legitimate ISOs must not cross the Aggressive threshold alone.
+        let mut strong_local = false;
 
         if self.db.spam_hashes.contains(&hash) {
             score += SPAM_FILEHASH_HIT;
             reasons.push(format!("Known spam hash (+{SPAM_FILEHASH_HIT})"));
+            strong_local = true;
         }
 
         let name_norm = normalize_filename(name);
@@ -645,6 +834,9 @@ impl SpamFilter {
                 };
                 score += bump;
                 reasons.push(format!("Exact spam filename match (+{bump})"));
+                if bump >= SPAM_FULLNAME_HIT {
+                    strong_local = true;
+                }
                 break;
             }
         }
@@ -717,9 +909,13 @@ impl SpamFilter {
             reasons.push(format!(
                 "Contains known fake/suspicious pattern (+{pattern_score})"
             ));
+            if fake_pattern_is_strong(name) {
+                strong_local = true;
+            }
         }
 
         // Community verdict: a file the network has voted "fake".
+        let mut community_applied = false;
         if network_signals && community.total_votes >= FAKE_RATING_MIN_VOTES {
             let frac = community.fake_votes as f32 / community.total_votes as f32;
             if frac >= FAKE_RATING_MAJORITY {
@@ -728,13 +924,26 @@ impl SpamFilter {
                     "Majority of community ratings are 'fake' ({}/{}, +{SPAM_FAKE_RATING_HIT})",
                     community.fake_votes, community.total_votes
                 ));
+                community_applied = true;
+                // ≥3-vote majority is enough corroboration for Aggressive ×1.2
+                // so a well-voted fake can hide; two sybils never reach here.
+                strong_local = true;
             } else if frac >= FAKE_RATING_SOME {
                 score += SPAM_FAKE_RATING_NEARHIT;
                 reasons.push(format!(
                     "Several community ratings are 'fake' ({}/{}, +{SPAM_FAKE_RATING_NEARHIT})",
                     community.fake_votes, community.total_votes
                 ));
+                community_applied = true;
             }
+        }
+        // Search-result FT_FILERATING / Kad note tag on the hit itself — a
+        // weak prior, not enough to hide a row on its own.
+        if network_signals && !community_applied && result.rating == Some(1) {
+            score += SPAM_FAKE_RATING_NEARHIT;
+            reasons.push(format!(
+                "Search result rated fake (+{SPAM_FAKE_RATING_NEARHIT})"
+            ));
         }
 
         // Intra-result-set statistical signals (coordinated poisoning).
@@ -743,15 +952,17 @@ impl SpamFilter {
                 score += SPAM_BATCH_NAME_MANY_HASHES_HIT;
                 reasons.push(format!(
                     "Same filename advertised under {} different hashes in this search (+{SPAM_BATCH_NAME_MANY_HASHES_HIT})",
-                    batch.name_hash_counts.get(&name_norm).copied().unwrap_or(0)
+                    batch.name_hash_count(&name_norm)
                 ));
+                strong_local = true;
             }
             if batch.hash_collision(&hash) {
                 score += SPAM_BATCH_HASH_MANY_NAMES_HIT;
                 reasons.push(format!(
                     "Same file advertised under {} different names in this search (+{SPAM_BATCH_HASH_MANY_NAMES_HIT})",
-                    batch.hash_name_counts.get(&hash).copied().unwrap_or(0)
+                    batch.hash_name_count(&hash)
                 ));
+                strong_local = true;
             }
             if batch.source_concentrated(result) {
                 score += SPAM_BATCH_SOURCE_CONCENTRATION_HIT;
@@ -808,7 +1019,7 @@ impl SpamFilter {
             }
         }
 
-        if profile == SpamFilterProfile::Aggressive {
+        if profile == SpamFilterProfile::Aggressive && strong_local {
             let boosted = (score as f32 * 1.2).round() as u32;
             if boosted > score {
                 reasons.push(format!(
@@ -827,7 +1038,7 @@ impl SpamFilter {
             score,
             threshold,
             profile: profile_name(profile),
-            is_spam: score >= threshold,
+            is_spam: Self::is_spam(score, profile),
             reasons,
         }
     }
@@ -864,6 +1075,14 @@ impl SpamFilter {
                 .spam_hashes
                 .insert(file_hash.clone(), MAX_SPAM_HASHES);
             self.db.not_spam_hashes.remove(&file_hash);
+            // Reverse collateral for the previous mark of this hash (re-mark)
+            // and for hashes FIFO-evicted by the insert above, *before* we
+            // learn this row's filename/IPs so a shared name is not dropped.
+            if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
+                let old = self.db.spam_marks.remove(pos);
+                self.drop_mark_collateral(&old);
+            }
+            self.drop_orphaned_marks();
         }
 
         let name = &result.file.name;
@@ -872,7 +1091,7 @@ impl SpamFilter {
             if self.db.spam_filenames.len() >= MAX_SPAM_FILENAMES {
                 self.db.spam_filenames.remove(0);
             }
-            self.db.spam_filenames.push(name_norm);
+            self.db.spam_filenames.push(name_norm.clone());
         }
 
         let stripped = name_without_keywords(name, search_keywords);
@@ -883,7 +1102,7 @@ impl SpamFilter {
             if self.db.spam_similar_names.len() >= MAX_SPAM_SIMILAR_NAMES {
                 self.db.spam_similar_names.remove(0);
             }
-            self.db.spam_similar_names.push(stripped);
+            self.db.spam_similar_names.push(stripped.clone());
         }
 
         if result.file.size > 0 && !self.db.spam_sizes.contains(&result.file.size) {
@@ -893,22 +1112,35 @@ impl SpamFilter {
             self.db.spam_sizes.push_back(result.file.size);
         }
 
+        let mut learned_ips: Vec<String> = Vec::new();
         for addr in result
             .source_addresses
             .iter()
             .take(MAX_SOURCE_IPS_PER_RESULT)
         {
             if let Some(ip) = extract_ip(addr) {
-                self.db.spam_source_ips.insert(ip, MAX_SPAM_SOURCE_IPS);
+                if !is_globally_routable_ip(&ip) {
+                    continue;
+                }
+                self.db
+                    .spam_source_ips
+                    .insert(ip.clone(), MAX_SPAM_SOURCE_IPS);
+                if !learned_ips.contains(&ip) {
+                    learned_ips.push(ip);
+                }
             }
         }
 
-        if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
+        let server_ip_owned = server_ip
+            .or(result.origin_server_ip.as_deref())
+            .and_then(extract_ip)
+            .filter(|ip| is_globally_routable_ip(ip));
+        if let Some(ref sip) = server_ip_owned {
             self.db
                 .spam_server_ips
                 .insert(sip.clone(), MAX_SPAM_SERVER_IPS);
 
-            let entry = self.db.udp_server_spam_ratios.entry(sip).or_insert(0.0);
+            let entry = self.db.udp_server_spam_ratios.entry(sip.clone()).or_insert(0.0);
             *entry = (*entry * 0.9 + 0.1).min(1.0);
             if self.db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
                 if let Some(lowest_key) = self
@@ -919,8 +1151,22 @@ impl SpamFilter {
                     .map(|(k, _)| k.clone())
                 {
                     self.db.udp_server_spam_ratios.remove(&lowest_key);
-                    self.db.spam_server_ips.remove(&lowest_key);
                 }
+            }
+        }
+
+        if !file_hash.is_empty() {
+            self.db.spam_marks.push(SpamMarkEntry {
+                hash: file_hash,
+                filename: name_norm,
+                similar_name: stripped,
+                size: result.file.size,
+                source_ips: learned_ips,
+                server_ip: server_ip_owned,
+            });
+            while self.db.spam_marks.len() > MAX_SPAM_HASHES {
+                let mark = self.db.spam_marks.remove(0);
+                self.drop_mark_collateral(&mark);
             }
         }
 
@@ -935,21 +1181,91 @@ impl SpamFilter {
             .not_spam_hashes
             .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
         self.db.spam_hashes.remove(&file_hash);
+        if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
+            let mark = self.db.spam_marks.remove(pos);
+            self.drop_mark_collateral(&mark);
+            self.rebuild_similar_name_features();
+        }
         self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
     }
 
+    /// Drop filename / similar-name / size / source IPs / server IP that this
+    /// mark added, but only when no remaining mark still references them.
+    fn drop_mark_collateral(&mut self, mark: &SpamMarkEntry) {
+        if !mark.filename.is_empty()
+            && !self
+                .db
+                .spam_marks
+                .iter()
+                .any(|m| m.filename == mark.filename)
+        {
+            self.db.spam_filenames.retain(|n| n != &mark.filename);
+        }
+        if !mark.similar_name.is_empty()
+            && !self
+                .db
+                .spam_marks
+                .iter()
+                .any(|m| m.similar_name == mark.similar_name)
+        {
+            self.db.spam_similar_names.retain(|n| n != &mark.similar_name);
+        }
+        if mark.size > 0 && !self.db.spam_marks.iter().any(|m| m.size == mark.size) {
+            self.db.spam_sizes.retain(|s| *s != mark.size);
+        }
+        for ip in &mark.source_ips {
+            if !self
+                .db
+                .spam_marks
+                .iter()
+                .any(|m| m.source_ips.iter().any(|o| o == ip))
+            {
+                self.db.spam_source_ips.remove(ip);
+            }
+        }
+        if let Some(sip) = &mark.server_ip {
+            let still_used = self
+                .db
+                .spam_marks
+                .iter()
+                .any(|m| m.server_ip.as_deref() == Some(sip.as_str()));
+            if !still_used {
+                self.db.udp_server_spam_ratios.remove(sip);
+                self.db.spam_server_ips.remove(sip);
+            }
+        }
+    }
+
+    /// Reverse collateral for marks whose hash left `spam_hashes` (FIFO cap).
+    fn drop_orphaned_marks(&mut self) {
+        let known = self.db.spam_hashes.clone();
+        let mut i = 0;
+        while i < self.db.spam_marks.len() {
+            if known.contains(&self.db.spam_marks[i].hash) {
+                i += 1;
+                continue;
+            }
+            let mark = self.db.spam_marks.remove(i);
+            self.drop_mark_collateral(&mark);
+        }
+    }
+
     /// Silently add a hash to the not-spam whitelist (e.g. on completed download).
     /// Does not save immediately; caller should ensure periodic save happens.
+    /// Does not override an explicit Mark Spam — finishing a fake must not
+    /// un-train the hash.
     pub fn auto_mark_not_spam(&mut self, file_hash: &str) {
         let file_hash = normalize_hash(file_hash);
-        if file_hash.is_empty() || self.db.not_spam_hashes.contains(&file_hash) {
+        if file_hash.is_empty()
+            || self.db.not_spam_hashes.contains(&file_hash)
+            || self.db.spam_hashes.contains(&file_hash)
+        {
             return;
         }
         self.db
             .not_spam_hashes
             .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
-        self.db.spam_hashes.remove(&file_hash);
         self.mark_dirty();
         debug!("Auto-marked completed download as not spam: {file_hash}");
     }
@@ -1015,7 +1331,7 @@ fn profile_name(profile: SpamFilterProfile) -> String {
 /// ("weak") tokens contribute only a small nudge because they also appear in
 /// many legitimate filenames. The total is capped at `SPAM_PATTERN_MAX` so a
 /// keyword-stuffed name can't dominate the overall score by itself.
-fn fake_pattern_score(filename: &str) -> u32 {
+pub(crate) fn fake_pattern_score(filename: &str) -> u32 {
     let lower = canonical_lower(filename);
 
     let mut score = 0u32;
@@ -1061,6 +1377,21 @@ fn fake_pattern_score(filename: &str) -> u32 {
     score += weak_hits.saturating_mul(SPAM_WEAK_TOKEN_HIT);
 
     score.min(SPAM_PATTERN_MAX)
+}
+
+fn fake_pattern_is_strong(filename: &str) -> bool {
+    let lower = canonical_lower(filename);
+    if FAKE_URL_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    let tokens: HashSet<String> = filename
+        .split(|c: char| TOKEN_DELIMITERS.contains(&c))
+        .filter(|t| !t.is_empty())
+        .map(canonical_lower)
+        .collect();
+    STRONG_FAKE_FILENAME_TOKENS
+        .iter()
+        .any(|t| tokens.contains(*t) || lower.contains(t))
 }
 
 /// Remove search keywords from a filename to isolate the non-keyword portion.
@@ -1185,6 +1516,51 @@ fn extract_ip(addr: &str) -> Option<String> {
     None
 }
 
+fn is_globally_routable_ip(ip: &str) -> bool {
+    let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(v) => {
+            !v.is_unspecified()
+                && !v.is_loopback()
+                && !v.is_private()
+                && !v.is_link_local()
+                && !v.is_broadcast()
+                && !v.is_documentation()
+                && !is_shared_v4(v)
+                && !is_benchmarking_v4(v)
+                && !v.is_multicast()
+        }
+        std::net::IpAddr::V6(v) => {
+            !v.is_unspecified()
+                && !v.is_loopback()
+                && !v.is_multicast()
+                && !v.is_unique_local()
+                && !v.is_unicast_link_local()
+                && !is_documentation_v6(v)
+        }
+    }
+}
+
+/// RFC 6598 CGNAT `100.64.0.0/10`. `Ipv4Addr::is_shared` is still unstable here.
+fn is_shared_v4(v: std::net::Ipv4Addr) -> bool {
+    let o = v.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+/// RFC 2544 benchmarking `198.18.0.0/15`. `Ipv4Addr::is_benchmarking` is still unstable here.
+fn is_benchmarking_v4(v: std::net::Ipv4Addr) -> bool {
+    let o = v.octets();
+    o[0] == 198 && (o[1] & 0xfe) == 18
+}
+
+/// `2001:db8::/32` and RFC 9637 `3fff::/20`. `Ipv6Addr::is_documentation` is still unstable here.
+fn is_documentation_v6(v: std::net::Ipv6Addr) -> bool {
+    let s = v.segments();
+    (s[0] == 0x2001 && s[1] == 0x0db8) || (s[0] & 0xfff0) == 0x3fff
+}
+
 fn keyword_tokens(keywords: &[String]) -> HashSet<String> {
     let mut out = HashSet::new();
     for kw in keywords {
@@ -1255,6 +1631,8 @@ mod tests {
             is_spam: false,
             clean_name: String::new(),
             result_origin: String::new(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
         }
     }
 
@@ -1481,5 +1859,225 @@ mod tests {
         }
         assert!(!filter.db.spam_server_ips.contains("9.9.9.9"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_fake_votes_are_not_enough() {
+        let dir = temp_dir("two-fakes");
+        let filter = SpamFilter::load(&dir);
+        let score = filter.rate_result(
+            &sample_result(&"4".repeat(32), "movie.avi"),
+            &[],
+            None,
+            SpamFilterProfile::Aggressive,
+            CommunityRating {
+                fake_votes: 2,
+                total_votes: 2,
+            },
+            &BatchSpamContext::default(),
+        );
+        assert!(
+            score < SEARCH_SPAM_THRESHOLD_AGGRESSIVE,
+            "two sybil fakes scored {score}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unmark_reverses_filename_and_source_learning() {
+        let dir = temp_dir("unmark");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "5".repeat(32);
+        let mut r = sample_result(&hash, "UniqueSpamNameXYZ.bin");
+        r.source_addresses = vec![
+            "8.8.8.8:4662".to_string(),
+            "192.168.1.9:4662".to_string(),
+            "100.64.1.1:4662".to_string(),
+            "198.18.1.1:4662".to_string(),
+        ];
+        filter.mark_spam(&r, &[], Some("9.9.9.9"));
+        assert!(filter.db.spam_filenames.iter().any(|n| n.contains("uniquespamnamexyz")));
+        assert!(filter.db.spam_source_ips.contains("8.8.8.8"));
+        assert!(
+            !filter.db.spam_source_ips.contains("192.168.1.9"),
+            "LAN source must not be learned"
+        );
+        assert!(
+            !filter.db.spam_source_ips.contains("100.64.1.1"),
+            "CGNAT source must not be learned"
+        );
+        assert!(
+            !filter.db.spam_source_ips.contains("198.18.1.1"),
+            "benchmarking-range source must not be learned"
+        );
+        filter.mark_not_spam(&hash);
+        assert!(!filter.db.spam_hashes.contains(&hash));
+        assert!(!filter.db.spam_filenames.iter().any(|n| n.contains("uniquespamnamexyz")));
+        assert!(!filter.db.spam_source_ips.contains("8.8.8.8"));
+        assert!(
+            !filter.db.spam_server_ips.contains("9.9.9.9"),
+            "unmark must drop the origin server when no other mark references it"
+        );
+        assert!(
+            !filter.db.udp_server_spam_ratios.contains_key("9.9.9.9"),
+            "unmark must drop the origin server ratio when no other mark references it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_mark_does_not_override_explicit_spam() {
+        let dir = temp_dir("auto-skip");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "6".repeat(32);
+        filter.mark_spam(&sample_result(&hash, "fake.bin"), &[], None);
+        filter.auto_mark_not_spam(&hash);
+        assert!(filter.db.spam_hashes.contains(&hash));
+        assert!(!filter.db.not_spam_hashes.contains(&hash));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn aggressive_similar_name_and_size_do_not_convict() {
+        let dir = temp_dir("agg-fp");
+        let mut filter = SpamFilter::load(&dir);
+        let marked = sized_result(
+            &"7".repeat(32),
+            "ubuntu-22.04-live-server-amd64.iso",
+            2_000_000_000,
+            &[],
+        );
+        filter.mark_spam(&marked, &["ubuntu".to_string()], None);
+
+        let sibling = sized_result(
+            &"8".repeat(32),
+            "ubuntu-24.04-live-server-amd64.iso",
+            2_000_000_000 + 1024,
+            &[],
+        );
+        let score = filter.rate_result(
+            &sibling,
+            &["ubuntu".to_string()],
+            None,
+            SpamFilterProfile::Aggressive,
+            CommunityRating::default(),
+            &BatchSpamContext::default(),
+        );
+        assert!(
+            score < SEARCH_SPAM_THRESHOLD_AGGRESSIVE,
+            "related ISO scored {score} under aggressive"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn origin_server_ip_on_the_row_trains_server_reputation() {
+        let dir = temp_dir("origin-sip");
+        let mut filter = SpamFilter::load(&dir);
+        let mut r = sample_result(&"9".repeat(32), "junk.bin");
+        r.origin_server_ip = Some("93.184.216.34".to_string());
+        filter.mark_spam(&r, &[], None);
+        assert!(filter.db.spam_server_ips.contains("93.184.216.34"));
+
+        let mut doc = sample_result(&"a".repeat(32), "doc.bin");
+        doc.origin_server_ip = Some("203.0.113.10".to_string());
+        filter.mark_spam(&doc, &[], None);
+        assert!(
+            !filter.db.spam_server_ips.contains("203.0.113.10"),
+            "IETF documentation-range IPs must not train server reputation"
+        );
+
+        let mut bench = sample_result(&"aa".repeat(16), "bench.bin");
+        bench.origin_server_ip = Some("198.18.0.1".to_string());
+        filter.mark_spam(&bench, &[], None);
+        assert!(
+            !filter.db.spam_server_ips.contains("198.18.0.1"),
+            "benchmarking-range IPs must not train server reputation"
+        );
+
+        let mut v6doc = sample_result(&"ab".repeat(16), "v6doc.bin");
+        v6doc.origin_server_ip = Some("2001:db8::1".to_string());
+        filter.mark_spam(&v6doc, &[], None);
+        assert!(
+            !filter.db.spam_server_ips.contains("2001:db8::1"),
+            "IPv6 documentation-range IPs must not train server reputation"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn three_fake_votes_flag_on_aggressive_not_balanced() {
+        let dir = temp_dir("three-fakes");
+        let filter = SpamFilter::load(&dir);
+        let community = CommunityRating {
+            fake_votes: 3,
+            total_votes: 3,
+        };
+        let result = sample_result(&"b".repeat(32), "movie.avi");
+        let agg = filter.explain_result(
+            &result,
+            &[],
+            None,
+            SpamFilterProfile::Aggressive,
+            community,
+            &BatchSpamContext::default(),
+        );
+        assert!(
+            agg.is_spam,
+            "majority fake should hide on aggressive, score {}",
+            agg.score
+        );
+        let bal = filter.explain_result(
+            &result,
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            community,
+            &BatchSpamContext::default(),
+        );
+        assert!(
+            !bal.is_spam,
+            "majority fake alone must stay under balanced, score {}",
+            bal.score
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hash_fifo_eviction_reverses_mark_collateral() {
+        let dir = temp_dir("orphan-marks");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "c".repeat(32);
+        filter.mark_spam(&sample_result(&hash, "OrphanNameXYZ.bin"), &[], None);
+        assert!(filter.db.spam_filenames.iter().any(|n| n.contains("orphannamexyz")));
+        filter.db.spam_hashes.remove(&hash);
+        filter.drop_orphaned_marks();
+        assert!(!filter.db.spam_filenames.iter().any(|n| n.contains("orphannamexyz")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn later_packet_upgrades_earlier_same_name_hashes() {
+        let poison = "Poisoned Movie Title 2026.mkv";
+        let mut ctx = BatchSpamContext::default();
+        let first = vec![
+            sized_result(&"1".repeat(32), poison, 1000, &[]),
+            sized_result(&"2".repeat(32), poison, 1001, &[]),
+        ];
+        ctx.absorb(&first);
+        let prev = ctx.colliding_hashes();
+        assert!(prev.is_empty(), "two rows are below the batch stats bar");
+
+        let mut rest = Vec::new();
+        for i in 2..8 {
+            rest.push(sized_result(&format!("{:032x}", i), poison, 1000 + i as u64, &[]));
+        }
+        ctx.absorb(&rest);
+        let skip: HashSet<String> = rest.iter().map(|r| r.file.hash.clone()).collect();
+        let upgrades = ctx.upgrade_rows(&prev, &skip);
+        let upgraded: HashSet<_> = upgrades.iter().map(|r| r.file.hash.clone()).collect();
+        assert!(upgraded.contains(&"1".repeat(32)));
+        assert!(upgraded.contains(&"2".repeat(32)));
+        assert!(!upgraded.contains(&format!("{:032x}", 2)));
     }
 }

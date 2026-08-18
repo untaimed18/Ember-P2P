@@ -178,6 +178,14 @@ impl QueryExpr {
     }
 }
 
+/// Positive keyword terms for spam scoring / learning, matching the network
+/// search path. Empty when the query does not parse to any positive term.
+pub fn positive_terms_from_query(query: &str) -> Vec<String> {
+    parse(query.trim())
+        .map(|e| e.positive_terms())
+        .unwrap_or_default()
+}
+
 /// Parse a raw user query into a [`QueryExpr`], or `None` when it yields no
 /// usable keyword (e.g. only sub-3-byte words). Operator-free queries are
 /// tokenized exactly like [`extract_keywords`] for full backward compatibility.

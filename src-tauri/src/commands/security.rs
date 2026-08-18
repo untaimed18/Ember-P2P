@@ -8,7 +8,10 @@ use zip::ZipArchive;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
-use crate::network::kad::ip_filter::{count_valid_entries, IpFilter, IpFilterStats};
+use crate::network::kad::ip_filter::{
+    canonicalize_p2b_to_dat, count_valid_entries, sniff_ipfilter_ext, IpFilter, IpFilterStats,
+    MAX_STATS_PAGE,
+};
 use crate::network::NetworkCommand;
 use tauri_plugin_dialog::DialogExt;
 
@@ -309,12 +312,29 @@ mod tests {
 #[tauri::command]
 pub async fn get_ip_filter_stats(
     state: tauri::State<'_, AppState>,
+    query: Option<String>,
+    sort: Option<String>,
+    sort_asc: Option<bool>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 ) -> Result<IpFilterStats, String> {
     let (tx, rx) = oneshot::channel();
+    let query = query.unwrap_or_default();
+    let sort = sort.unwrap_or_else(|| "hits".to_string());
+    let sort_asc = sort_asc.unwrap_or(false);
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(MAX_STATS_PAGE).min(MAX_STATS_PAGE).max(1);
 
     state
         .network_tx
-        .try_send(NetworkCommand::GetIpFilterStats { tx })
+        .try_send(NetworkCommand::GetIpFilterStats {
+            query,
+            sort,
+            sort_asc,
+            offset,
+            limit,
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     tokio::time::timeout(CMD_TIMEOUT, rx)
@@ -711,12 +731,27 @@ pub async fn update_ipfilter_from_url(
         bytes
     };
 
-    // Validate before writing anything — a user-supplied URL is even less
-    // trustworthy than the hard-coded default, and the same silent-wipe risk
-    // applies (see the comment in `download_and_load_ipfilter`).
+    // Sniff P2B magic / URL suffix. Always counting as "dat" dropped
+    // PeerGuardian binary downloads (zero text entries) and writing a
+    // raw `.p2b` over `ipfilter.dat` would be lost on the next launch.
+    let source = url.clone();
     let (filter_bytes, entry_count) = tokio::task::spawn_blocking(move || {
-        let entry_count = count_valid_entries(&filter_bytes, "dat");
-        (filter_bytes, entry_count)
+        let ext = sniff_ipfilter_ext(&filter_bytes, &source);
+        let entry_count = count_valid_entries(&filter_bytes, ext);
+        if entry_count == 0 {
+            return Ok((filter_bytes, 0usize));
+        }
+        let filter_bytes = if ext == "p2b" {
+            canonicalize_p2b_to_dat(&filter_bytes).ok_or_else(|| {
+                coded(
+                    "security_ipfilter_no_valid_entries",
+                    "Downloaded file does not contain any valid IP filter entries — keeping the existing filter",
+                )
+            })?
+        } else {
+            filter_bytes
+        };
+        Ok::<_, String>((filter_bytes, entry_count))
     })
     .await
     .map_err(|e| {
@@ -725,7 +760,7 @@ pub async fn update_ipfilter_from_url(
             "Validation task failed",
             e,
         )
-    })?;
+    })??;
     if entry_count == 0 {
         return Err(coded(
             "security_ipfilter_no_valid_entries",
