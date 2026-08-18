@@ -10,12 +10,23 @@ use tracing::{info, warn};
 /// import time and then loading as an empty filter.
 const MAX_TEXT_FILTER_LINE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_FILTER_LINES: usize = 5_000_000;
+/// Same cap the download/import commands use. Local `.dat`/`.p2p` loads
+/// used to be unbounded; a no-newline multi-GB file would still be fully
+/// buffered by `read_until`.
+const MAX_TEXT_FILTER_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// Hard cap on one `get_ip_filter_stats` page so the Security IPC path
+/// cannot serialize tens of thousands of rows.
+pub const MAX_STATS_PAGE: usize = 256;
 
 #[derive(Debug)]
 struct IpRange {
     start: u32,
     end: u32,
     description: String,
+    /// eMule access level. Blocked rows are `< 127`; permit rows are kept
+    /// only so a manual add/remove can rewrite `ipfilter.dat` without
+    /// dropping 127+ exceptions.
+    access_level: u32,
     /// Atomic so [`IpFilter::is_blocked_readonly`] (and shared-snapshot
     /// collection) can attribute hits without `&mut self`.
     hits: AtomicU64,
@@ -27,6 +38,7 @@ impl Clone for IpRange {
             start: self.start,
             end: self.end,
             description: self.description.clone(),
+            access_level: self.access_level,
             hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
         }
     }
@@ -38,8 +50,14 @@ impl IpRange {
             start,
             end,
             description,
+            access_level: 0,
             hits: AtomicU64::new(0),
         }
+    }
+
+    fn with_level(mut self, access_level: u32) -> Self {
+        self.access_level = access_level;
+        self
     }
 
     fn hit_count(&self) -> u64 {
@@ -187,12 +205,19 @@ pub struct IpFilterStats {
     /// ranges — peer paths fail-closed in that window.
     pub ranges_ready: bool,
     pub range_count: usize,
+    /// Rows matching the current stats query (before offset/limit).
+    #[serde(default)]
+    pub matched_count: usize,
     pub total_hits: u64,
     pub entries: Vec<IpFilterEntry>,
 }
 
 pub struct IpFilter {
     blocked_ranges: Vec<IpRange>,
+    /// Level ≥ 127 rows from the last dat load. Not consulted by
+    /// [`Self::is_blocked`]; serialized back on manual rewrite so allow-
+    /// exceptions survive Add/Remove.
+    permit_ranges: Vec<IpRange>,
     enabled: bool,
     block_private: bool,
     /// See [`IpFilterSnapshot::ranges_ready`].
@@ -215,6 +240,7 @@ impl IpFilter {
     pub fn new(enabled: bool, block_private: bool) -> Self {
         IpFilter {
             blocked_ranges: Vec::new(),
+            permit_ranges: Vec::new(),
             enabled,
             block_private,
             // Disabled ⇒ nothing to load. Enabled ⇒ fail closed until the
@@ -323,14 +349,9 @@ impl IpFilter {
     /// real-world "ipfilter.dat" downloads sometimes ship that format under
     /// a `.dat` name.
     fn load_dat_file(&mut self, path: &Path) -> Option<usize> {
-        // K20: ipfilter.dat can legitimately be tens of MB and
-        // pathologically-large files (from buggy crawlers or
-        // malicious downloads) can be gigabytes. Read the file
-        // line-by-line with a hard per-line cap instead of
-        // slurping the whole thing into memory as a UTF-8
-        // String. A single oversized line gets dropped, not the
-        // entire file.
-        use std::io::BufRead;
+        if text_filter_file_too_large(path) {
+            return None;
+        }
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
@@ -340,22 +361,19 @@ impl IpFilter {
         };
         let mut reader = std::io::BufReader::new(file);
         let mut new_ranges = Vec::new();
+        let mut permit_ranges = Vec::new();
         let mut count = 0usize;
         let mut overlong_drops = 0usize;
         let mut io_failed = false;
         let mut raw_line = Vec::new();
         for lineno in 0..MAX_TEXT_FILTER_LINES {
-            raw_line.clear();
-            // Read raw bytes rather than `BufRead::lines()`: the latter
-            // hard-errors (and this loop used to abort entirely) on the
-            // first byte sequence that isn't valid UTF-8. Real-world
-            // ipfilter.dat mirrors occasionally carry a stray non-UTF8 byte
-            // in a description field; one bad byte at line 30,000 of 60,000
-            // shouldn't silently discard the other 30,000 good ranges. We
-            // decode lossily instead, matching `count_valid_entries`'s
-            // tolerance so pre-flight validation and the real load agree.
-            let read = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(n) => n,
+            match read_filter_line(&mut reader, &mut raw_line) {
+                Ok(None) => break,
+                Ok(Some(false)) => {
+                    overlong_drops += 1;
+                    continue;
+                }
+                Ok(Some(true)) => {}
                 Err(e) => {
                     warn!(
                         "Stopping ipfilter.dat parse after I/O error at line {}: {e}",
@@ -364,25 +382,26 @@ impl IpFilter {
                     io_failed = true;
                     break;
                 }
-            };
-            if read == 0 {
-                break; // EOF
-            }
-            if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
-                overlong_drops += 1;
-                continue;
             }
             let line = String::from_utf8_lossy(&raw_line);
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                 continue;
             }
-            if let Some(range) = parse_ipfilter_line(line) {
-                new_ranges.push(range);
-                count += 1;
-            } else if let Some(range) = parse_p2p_line(line) {
-                new_ranges.push(range);
-                count += 1;
+            match parse_ipfilter_line(line) {
+                Some(ParsedIpFilterLine::Block(range)) => {
+                    new_ranges.push(range);
+                    count += 1;
+                }
+                Some(ParsedIpFilterLine::Permit(range)) => {
+                    permit_ranges.push(range);
+                }
+                None => {
+                    if let Some(range) = parse_p2p_line(line) {
+                        new_ranges.push(range);
+                        count += 1;
+                    }
+                }
             }
         }
         if overlong_drops > 0 {
@@ -390,15 +409,15 @@ impl IpFilter {
                 "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_TEXT_FILTER_LINE_BYTES} bytes"
             );
         }
-        // Mid-file I/O failure: keep the previous range list rather than
-        // committing a truncated parse as if it were a successful load.
         if io_failed {
             return None;
         }
 
+        self.replace_permit_ranges(permit_ranges);
         let final_count = self.commit_ranges(new_ranges);
         info!(
-            "Loaded {count} IP filter entries ({final_count} ranges after merge) from {}",
+            "Loaded {count} IP filter entries ({final_count} ranges after merge, {} permit rows) from {}",
+            self.permit_ranges.len(),
             path.display()
         );
         Some(final_count)
@@ -423,6 +442,11 @@ impl IpFilter {
             }
         }
         self.blocked_ranges = merged;
+    }
+
+    fn replace_permit_ranges(&mut self, mut permits: Vec<IpRange>) {
+        permits.sort_by_key(|r| r.start);
+        self.permit_ranges = permits;
     }
 
     pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
@@ -533,15 +557,9 @@ impl IpFilter {
     /// replace that stable startup path; otherwise the next launch would
     /// dispatch their bytes to the text parser and lose every range.
     pub fn canonical_dat_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.blocked_ranges.len().saturating_mul(48));
-        for range in &self.blocked_ranges {
+        fn dat_line(range: &IpRange) -> Vec<u8> {
             let start = Ipv4Addr::from(range.start);
             let end = Ipv4Addr::from(range.end);
-            // Carry the real description through. This is now also the
-            // save path for manual add/remove, and stamping every row
-            // "Ember imported range" would erase the labels of a
-            // downloaded list the moment the user blocks one address.
-            // Newlines would split one row into two unparseable ones.
             let description = range.description.replace(['\r', '\n'], " ");
             let description = description.trim();
             let description = if description.is_empty() {
@@ -549,7 +567,16 @@ impl IpFilter {
             } else {
                 description
             };
-            bytes.extend_from_slice(format!("{start} - {end} , 000 , {description}\n").as_bytes());
+            let level = range.access_level.min(255);
+            format!("{start} - {end} , {level:03} , {description}\n").into_bytes()
+        }
+
+        let mut rows: Vec<&IpRange> = self.blocked_ranges.iter().collect();
+        rows.extend(self.permit_ranges.iter());
+        rows.sort_by_key(|r| r.start);
+        let mut bytes = Vec::with_capacity(rows.len().saturating_mul(48));
+        for range in rows {
+            bytes.extend_from_slice(&dat_line(range));
         }
         bytes
     }
@@ -581,13 +608,19 @@ impl IpFilter {
     /// ipfilter.dat load finishes and the live filter may already hold
     /// user-added ranges from AddIpRange during the load window.
     pub fn merge_ranges_from(&mut self, other: &IpFilter) {
-        if other.blocked_ranges.is_empty() {
-            return;
+        if !other.blocked_ranges.is_empty() {
+            self.blocked_ranges
+                .extend(other.blocked_ranges.iter().cloned());
+            self.blocked_ranges.sort_by_key(|r| r.start);
+            self.merge_overlapping();
         }
-        self.blocked_ranges
-            .extend(other.blocked_ranges.iter().cloned());
-        self.blocked_ranges.sort_by_key(|r| r.start);
-        self.merge_overlapping();
+        if !other.permit_ranges.is_empty() {
+            self.permit_ranges
+                .extend(other.permit_ranges.iter().cloned());
+            self.permit_ranges.sort_by_key(|r| r.start);
+            self.permit_ranges
+                .dedup_by(|a, b| a.start == b.start && a.end == b.end);
+        }
     }
 
     /// Create a shared snapshot for use by the upload handler.
@@ -613,84 +646,135 @@ impl IpFilter {
     /// its live hit counters (range and special) so an in-flight settings
     /// change or reload doesn't drop pending upload-path hits.
     pub fn update_shared_snapshot(&self, shared: &SharedIpFilter) {
-        if let Ok(mut snap) = shared.write() {
-            let pending: std::collections::HashMap<(u32, u32), u64> = snap
-                .ranges
-                .iter()
-                .zip(snap.range_hits.iter())
-                .filter_map(|(&(start, end), counter)| {
-                    let n = counter.load(Ordering::Relaxed);
-                    (n > 0).then_some(((start, end), n))
-                })
-                .collect();
+        let mut snap = shared.write().unwrap_or_else(|e| e.into_inner());
+        let pending: std::collections::HashMap<(u32, u32), u64> = snap
+            .ranges
+            .iter()
+            .zip(snap.range_hits.iter())
+            .filter_map(|(&(start, end), counter)| {
+                let n = counter.load(Ordering::Relaxed);
+                (n > 0).then_some(((start, end), n))
+            })
+            .collect();
 
-            snap.ranges = self
-                .blocked_ranges
-                .iter()
-                .map(|r| (r.start, r.end))
-                .collect();
-            snap.range_hits = snap
-                .ranges
-                .iter()
-                .map(|&(start, end)| {
-                    AtomicU64::new(pending.get(&(start, end)).copied().unwrap_or(0))
-                })
-                .collect();
-            snap.enabled = self.enabled;
-            snap.block_private = self.block_private;
-            snap.ranges_ready = self.ranges_ready;
-        }
+        snap.ranges = self
+            .blocked_ranges
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        snap.range_hits = snap
+            .ranges
+            .iter()
+            .map(|&(start, end)| AtomicU64::new(pending.get(&(start, end)).copied().unwrap_or(0)))
+            .collect();
+        snap.enabled = self.enabled;
+        snap.block_private = self.block_private;
+        snap.ranges_ready = self.ranges_ready;
     }
 
     /// Collect hits from the shared snapshot into the totals, preserving the
     /// range-vs-special split and attributing range hits to matching entries
     /// so the Security page Hits column stays in sync with the header total.
     pub fn collect_shared_hits(&self, shared: &SharedIpFilter) {
-        if let Ok(snap) = shared.read() {
-            let range_hits = snap.hit_counter.swap(0, Ordering::Relaxed);
-            if range_hits > 0 {
-                self.total_range_hits
-                    .fetch_add(range_hits, Ordering::Relaxed);
-            }
-            let special_hits = snap.special_hit_counter.swap(0, Ordering::Relaxed);
-            if special_hits > 0 {
-                self.total_special_hits
-                    .fetch_add(special_hits, Ordering::Relaxed);
-            }
+        let snap = shared.read().unwrap_or_else(|e| e.into_inner());
+        let range_hits = snap.hit_counter.swap(0, Ordering::Relaxed);
+        if range_hits > 0 {
+            self.total_range_hits
+                .fetch_add(range_hits, Ordering::Relaxed);
+        }
+        let special_hits = snap.special_hit_counter.swap(0, Ordering::Relaxed);
+        if special_hits > 0 {
+            self.total_special_hits
+                .fetch_add(special_hits, Ordering::Relaxed);
+        }
 
-            for (i, counter) in snap.range_hits.iter().enumerate() {
-                let n = counter.swap(0, Ordering::Relaxed);
-                if n == 0 {
-                    continue;
-                }
-                let Some(&(start, end)) = snap.ranges.get(i) else {
-                    continue;
-                };
-                if let Some(range) = self
-                    .blocked_ranges
-                    .iter()
-                    .find(|r| r.start == start && r.end == end)
-                {
-                    range.add_hits(n);
-                }
+        for (i, counter) in snap.range_hits.iter().enumerate() {
+            let n = counter.swap(0, Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            let Some(&(start, end)) = snap.ranges.get(i) else {
+                continue;
+            };
+            if let Some(range) = self
+                .blocked_ranges
+                .iter()
+                .find(|r| r.start == start && r.end == end)
+            {
+                range.add_hits(n);
             }
         }
     }
 
     pub fn get_stats(&self) -> IpFilterStats {
+        self.query_stats("", "range", true, 0, usize::MAX)
+    }
+
+    /// Page of blocked ranges for the Security UI. `limit` is clamped to
+    /// [`MAX_STATS_PAGE`] except when `usize::MAX` is passed (tests / full dump).
+    pub fn query_stats(
+        &self,
+        query: &str,
+        sort: &str,
+        sort_asc: bool,
+        offset: usize,
+        limit: usize,
+    ) -> IpFilterStats {
         let per_range_hits: u64 = self.blocked_ranges.iter().map(|r| r.hit_count()).sum();
         let atomic_range_hits = self.total_range_hits.load(Ordering::Relaxed);
         let special_hits = self.total_special_hits.load(Ordering::Relaxed);
         let total_hits = atomic_range_hits.max(per_range_hits) + special_hits;
 
-        let entries: Vec<IpFilterEntry> = self
-            .blocked_ranges
-            .iter()
-            .map(|r| IpFilterEntry {
-                start_ip: Ipv4Addr::from(r.start).to_string(),
-                end_ip: Ipv4Addr::from(r.end).to_string(),
-                description: r.description.clone(),
-                hits: r.hit_count(),
+        let q = query.trim().to_ascii_lowercase();
+        let mut idxs: Vec<usize> = (0..self.blocked_ranges.len())
+            .filter(|&i| {
+                if q.is_empty() {
+                    return true;
+                }
+                let r = &self.blocked_ranges[i];
+                let start = Ipv4Addr::from(r.start).to_string();
+                let end = Ipv4Addr::from(r.end).to_string();
+                start.contains(&q)
+                    || end.contains(&q)
+                    || r.description.to_ascii_lowercase().contains(&q)
+            })
+            .collect();
+
+        match sort {
+            "hits" => idxs.sort_by(|&a, &b| {
+                self.blocked_ranges[a]
+                    .hit_count()
+                    .cmp(&self.blocked_ranges[b].hit_count())
+            }),
+            "description" => idxs.sort_by(|&a, &b| {
+                self.blocked_ranges[a]
+                    .description
+                    .cmp(&self.blocked_ranges[b].description)
+            }),
+            _ => idxs.sort_by(|&a, &b| self.blocked_ranges[a].start.cmp(&self.blocked_ranges[b].start)),
+        }
+        if !sort_asc {
+            idxs.reverse();
+        }
+
+        let matched_count = idxs.len();
+        let page_limit = if limit == usize::MAX {
+            matched_count
+        } else {
+            limit.clamp(1, MAX_STATS_PAGE)
+        };
+        let entries = idxs
+            .into_iter()
+            .skip(offset)
+            .take(page_limit)
+            .map(|i| {
+                let r = &self.blocked_ranges[i];
+                IpFilterEntry {
+                    start_ip: Ipv4Addr::from(r.start).to_string(),
+                    end_ip: Ipv4Addr::from(r.end).to_string(),
+                    description: r.description.clone(),
+                    hits: r.hit_count(),
+                }
             })
             .collect();
 
@@ -699,6 +783,7 @@ impl IpFilter {
             block_private: self.block_private,
             ranges_ready: self.ranges_ready,
             range_count: self.blocked_ranges.len(),
+            matched_count,
             total_hits,
             entries,
         }
@@ -734,10 +819,9 @@ impl IpFilter {
 
     /// Load a PeerGuardian .p2p text file (format: "Description: IP1 - IP2")
     pub fn load_p2p_file(&mut self, path: &Path) -> Option<usize> {
-        // Mirror the ipfilter.dat path: stream line-by-line with hard
-        // per-line and total-line caps instead of slurping the whole file
-        // into a String. A malicious/buggy multi-gigabyte list can't OOM us.
-        use std::io::BufRead;
+        if text_filter_file_too_large(path) {
+            return None;
+        }
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
@@ -753,12 +837,13 @@ impl IpFilter {
         let mut io_failed = false;
         let mut raw_line = Vec::new();
         for lineno in 0..MAX_TEXT_FILTER_LINES {
-            raw_line.clear();
-            // Lossy byte-level read, not `BufRead::lines()` — see
-            // `load_dat_file` for why a single non-UTF8 byte must not abort
-            // the whole parse.
-            let read = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(n) => n,
+            match read_filter_line(&mut reader, &mut raw_line) {
+                Ok(None) => break,
+                Ok(Some(false)) => {
+                    overlong_drops += 1;
+                    continue;
+                }
+                Ok(Some(true)) => {}
                 Err(e) => {
                     warn!(
                         "Stopping .p2p parse after I/O error at line {}: {e}",
@@ -767,13 +852,6 @@ impl IpFilter {
                     io_failed = true;
                     break;
                 }
-            };
-            if read == 0 {
-                break; // EOF
-            }
-            if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
-                overlong_drops += 1;
-                continue;
             }
             let line = String::from_utf8_lossy(&raw_line);
             let line = line.trim();
@@ -792,6 +870,7 @@ impl IpFilter {
             return None;
         }
 
+        self.replace_permit_ranges(Vec::new());
         let final_count = self.commit_ranges(new_ranges);
         info!(
             "Loaded {count} entries ({final_count} ranges after merge) from .p2p file {}",
@@ -868,6 +947,7 @@ impl IpFilter {
             }
         }
 
+        self.replace_permit_ranges(Vec::new());
         let final_count = self.commit_ranges(new_ranges);
         info!(
             "Loaded {count} entries ({final_count} ranges after merge) from .p2b file {}",
@@ -909,6 +989,120 @@ pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
     true
 }
 
+fn text_filter_file_too_large(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_TEXT_FILTER_FILE_BYTES => {
+            warn!(
+                "IP filter text file too large ({} bytes), refusing to load",
+                meta.len()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Read one text-filter line, capping the buffer at
+/// [`MAX_TEXT_FILTER_LINE_BYTES`]. Returns `Ok(None)` on EOF,
+/// `Ok(Some(true))` when `buf` holds a line (without the newline), and
+/// `Ok(Some(false))` when an overlong line was discarded.
+fn read_filter_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    use std::io::{BufRead, Read};
+    buf.clear();
+    let n = {
+        let mut limited = reader.take(MAX_TEXT_FILTER_LINE_BYTES as u64 + 1);
+        limited.read_until(b'\n', buf)?
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+    let overlong = n == MAX_TEXT_FILTER_LINE_BYTES + 1 && buf.last() != Some(&b'\n');
+    if overlong {
+        let mut discard = Vec::new();
+        let _ = reader.read_until(b'\n', &mut discard)?;
+        buf.clear();
+        return Ok(Some(false));
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    Ok(Some(true))
+}
+
+/// Guess the parser a download should use. Magic wins over the URL so a
+/// `.dat` link that actually serves PeerGuardian binary is not counted
+/// with the text parser (and then written over `ipfilter.dat` as garbage).
+pub fn sniff_ipfilter_ext(data: &[u8], source: &str) -> &'static str {
+    if is_p2b_magic(data) {
+        return "p2b";
+    }
+    let lower = source.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    if path.ends_with(".p2b") {
+        "p2b"
+    } else if path.ends_with(".p2p") {
+        "p2p"
+    } else {
+        "dat"
+    }
+}
+
+fn is_p2b_magic(data: &[u8]) -> bool {
+    data.len() >= 7 && &data[0..4] == b"\xff\xff\xff\xff" && &data[4..7] == b"P2B"
+}
+
+/// Convert a PeerGuardian `.p2b` payload into the canonical `ipfilter.dat`
+/// text the startup loader expects.
+pub fn canonicalize_p2b_to_dat(data: &[u8]) -> Option<Vec<u8>> {
+    let ranges = parse_p2b_bytes(data)?;
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut filter = IpFilter::new(false, false);
+    filter.replace_permit_ranges(Vec::new());
+    filter.commit_ranges(ranges);
+    Some(filter.canonical_dat_bytes())
+}
+
+fn parse_p2b_bytes(data: &[u8]) -> Option<Vec<IpRange>> {
+    if data.len() < 8 || !is_p2b_magic(data) {
+        return None;
+    }
+    let version = data[7];
+    if version != 1 && version != 2 {
+        return None;
+    }
+
+    let mut pos = 8;
+    let mut new_ranges = Vec::new();
+    while pos < data.len() {
+        let name_end = data[pos..].iter().position(|&b| b == 0);
+        let name_end = match name_end {
+            Some(e) => pos + e,
+            None => break,
+        };
+        let desc = String::from_utf8_lossy(&data[pos..name_end]).to_string();
+        pos = name_end + 1;
+        if pos + 8 > data.len() {
+            break;
+        }
+        let start = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let end = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        if start <= end {
+            new_ranges.push(IpRange::new(start, end, desc));
+        }
+    }
+    Some(new_ranges)
+}
+
 fn parse_p2p_line(line: &str) -> Option<IpRange> {
     let colon_pos = line.rfind(':')?;
     let description = line[..colon_pos].trim().to_string();
@@ -926,15 +1120,20 @@ fn parse_p2p_line(line: &str) -> Option<IpRange> {
 
 /// Parse an IP address string, handling leading zeros (e.g., "003.000.000.000")
 /// which are common in ipfilter.dat files but rejected by Rust's Ipv4Addr parser.
+/// Empty octets (`1..3.4`) are rejected — they used to collapse to `0`.
 fn parse_ip_lenient(s: &str) -> Option<Ipv4Addr> {
     let s = s.trim();
     // Try direct parse first (fast path for IPs without leading zeros)
     if let Ok(ip) = s.parse::<Ipv4Addr>() {
         return Some(ip);
     }
+    let octets: Vec<&str> = s.split('.').collect();
+    if octets.len() != 4 || octets.iter().any(|octet| octet.is_empty()) {
+        return None;
+    }
     // Strip leading zeros from each octet and retry
-    let stripped: String = s
-        .split('.')
+    let stripped: String = octets
+        .into_iter()
         .map(|octet| {
             let trimmed = octet.trim_start_matches('0');
             if trimmed.is_empty() {
@@ -955,16 +1154,19 @@ fn parse_ip_lenient(s: &str) -> Option<Ipv4Addr> {
 /// `>= 128` cutoff this used to apply (which wrongly blocked level-127 entries).
 const IPFILTER_BLOCK_LEVEL: u32 = 127;
 
-fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
+#[derive(Debug)]
+enum ParsedIpFilterLine {
+    Block(IpRange),
+    Permit(IpRange),
+}
+
+fn parse_ipfilter_line(line: &str) -> Option<ParsedIpFilterLine> {
     let parts: Vec<&str> = line.splitn(3, ',').collect();
     if parts.len() < 2 {
         return None;
     }
 
     let access_level: u32 = parts[1].trim().parse().ok()?;
-    if access_level >= IPFILTER_BLOCK_LEVEL {
-        return None;
-    }
 
     let description = if parts.len() >= 3 {
         parts[2].trim().to_string()
@@ -987,7 +1189,12 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         return None;
     }
 
-    Some(IpRange::new(start, end, description))
+    let range = IpRange::new(start, end, description).with_level(access_level);
+    if access_level >= IPFILTER_BLOCK_LEVEL {
+        Some(ParsedIpFilterLine::Permit(range))
+    } else {
+        Some(ParsedIpFilterLine::Block(range))
+    }
 }
 
 /// Count how many valid IP-filter entries `data` contains, without
@@ -1025,20 +1232,28 @@ fn count_text_entries(data: &[u8], try_dat_format: bool) -> usize {
         .split_inclusive(|&b| b == b'\n')
         .take(MAX_TEXT_FILTER_LINES)
     {
-        if raw_line.len() > MAX_TEXT_FILTER_LINE_BYTES {
+        // Match `read_filter_line`: the cap is on content, not the
+        // terminating newline `split_inclusive` leaves in place.
+        let content = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if content.len() > MAX_TEXT_FILTER_LINE_BYTES {
             continue;
         }
         // Lossy decoding matches the tolerance real ipfilter.dat downloads
         // need (non-UTF8 bytes occasionally show up in description fields);
         // a strict UTF-8 requirement here would make this validator
         // *stricter* than the loader it's meant to predict.
-        let line = String::from_utf8_lossy(raw_line);
+        let line = String::from_utf8_lossy(content);
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
             continue;
         }
         let is_valid = if try_dat_format {
-            parse_ipfilter_line(line).is_some() || parse_p2p_line(line).is_some()
+            match parse_ipfilter_line(line) {
+                Some(ParsedIpFilterLine::Block(_)) => true,
+                Some(ParsedIpFilterLine::Permit(_)) => false,
+                None => parse_p2p_line(line).is_some(),
+            }
         } else {
             parse_p2p_line(line).is_some()
         };
@@ -1220,25 +1435,25 @@ mod tests {
         assert_eq!(filter.range_count(), 0);
     }
 
+    fn parse_block(line: &str) -> IpRange {
+        match parse_ipfilter_line(line) {
+            Some(ParsedIpFilterLine::Block(range)) => range,
+            other => panic!("expected block row, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_parse_ipfilter_dat_format() {
         // Standard emule ipfilter.dat format
         let line1 = "1.0.0.0 - 1.0.0.255 , 000 , Test Range";
-        let r1 = parse_ipfilter_line(line1);
-        assert!(r1.is_some(), "Failed to parse standard ipfilter.dat line");
-        let r1 = r1.unwrap();
+        let r1 = parse_block(line1);
         assert_eq!(r1.start, u32::from(Ipv4Addr::new(1, 0, 0, 0)));
         assert_eq!(r1.end, u32::from(Ipv4Addr::new(1, 0, 0, 255)));
         assert_eq!(r1.description, "Test Range");
 
         // With leading zeros (common in ipfilter.dat files)
         let line2 = "003.000.000.000 - 003.255.255.255 , 000 , IANA-ARIN";
-        let r2 = parse_ipfilter_line(line2);
-        assert!(
-            r2.is_some(),
-            "Failed to parse ipfilter.dat line with leading zeros"
-        );
-        let r2 = r2.unwrap();
+        let r2 = parse_block(line2);
         assert_eq!(r2.start, u32::from(Ipv4Addr::new(3, 0, 0, 0)));
         assert_eq!(r2.end, u32::from(Ipv4Addr::new(3, 255, 255, 255)));
         assert_eq!(r2.description, "IANA-ARIN");
@@ -1247,28 +1462,35 @@ mod tests {
         let line3 = "3.0.0.0 - 3.255.255.255 , 000 , IANA-ARIN";
         let r3 = parse_ipfilter_line(line3);
         assert!(
-            r3.is_some(),
+            matches!(r3, Some(ParsedIpFilterLine::Block(_))),
             "Failed to parse ipfilter.dat line without leading zeros"
         );
 
         // Access level boundary: eMule blocks `level < 127`, permits `>= 127`.
         assert!(
-            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 128 , Allowed").is_none(),
-            "Should skip access level 128"
+            matches!(
+                parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 128 , Allowed"),
+                Some(ParsedIpFilterLine::Permit(_))
+            ),
+            "Level 128 is a permit row"
         );
         assert!(
-            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 127 , Allowed").is_none(),
-            "Level 127 is permitted in eMule and must be skipped"
+            matches!(
+                parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 127 , Allowed"),
+                Some(ParsedIpFilterLine::Permit(_))
+            ),
+            "Level 127 is permitted in eMule and must be kept as a permit"
         );
         assert!(
-            parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 126 , Blocked").is_some(),
+            matches!(
+                parse_ipfilter_line("1.0.0.0 - 1.0.0.255 , 126 , Blocked"),
+                Some(ParsedIpFilterLine::Block(_))
+            ),
             "Level 126 is below the filter level and must be kept"
         );
 
         // Single-host entry (no dash) is treated as a /32.
-        let host = parse_ipfilter_line("1.2.3.4 , 0 , Single host");
-        assert!(host.is_some(), "Failed to parse single-host ipfilter entry");
-        let host = host.unwrap();
+        let host = parse_block("1.2.3.4 , 0 , Single host");
         assert_eq!(host.start, u32::from(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(host.end, u32::from(Ipv4Addr::new(1, 2, 3, 4)));
 
@@ -1576,5 +1798,112 @@ mod tests {
 
         let _ = std::fs::remove_file(source);
         let _ = std::fs::remove_file(persisted);
+    }
+
+    #[test]
+    fn parse_ip_lenient_rejects_empty_octets() {
+        assert!(
+            parse_ipfilter_line("1..3.4 - 1.0.3.4 , 0 , bad").is_none(),
+            "empty octets must not collapse to 0"
+        );
+        assert!(parse_ip_lenient("1..3.4").is_none());
+        assert!(parse_ip_lenient("1.2.3").is_none());
+        assert_eq!(
+            parse_ip_lenient("003.000.000.001"),
+            Some(Ipv4Addr::new(3, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn permit_rows_survive_canonical_rewrite() {
+        let path = unique_temp_path("permit.dat");
+        std::fs::write(
+            &path,
+            "1.0.0.0 - 1.0.0.255 , 000 , Blocked\n\
+             8.8.8.8 - 8.8.8.8 , 127 , Google DNS\n",
+        )
+        .unwrap();
+
+        let mut filter = IpFilter::new(true, false);
+        assert_eq!(filter.load_from_file(&path), Some(1));
+        assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1)));
+        assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+
+        let rewritten = unique_temp_path("permit-rewritten.dat");
+        std::fs::write(&rewritten, filter.canonical_dat_bytes()).unwrap();
+        let text = std::fs::read_to_string(&rewritten).unwrap();
+        assert!(text.contains("127"), "permit level must be written back");
+
+        let mut reloaded = IpFilter::new(true, false);
+        assert_eq!(reloaded.load_from_file(&rewritten), Some(1));
+        assert!(reloaded.is_blocked(Ipv4Addr::new(1, 0, 0, 1)));
+        assert!(!reloaded.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+        let again = String::from_utf8(reloaded.canonical_dat_bytes()).unwrap();
+        assert!(again.contains("127"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rewritten);
+    }
+
+    #[test]
+    fn count_valid_entries_ignores_permit_rows() {
+        let data = b"1.0.0.0 - 1.0.0.255 , 000 , Blocked\n8.8.8.8 - 8.8.8.8 , 127 , Permit\n";
+        assert_eq!(count_valid_entries(data, "dat"), 1);
+        assert_eq!(
+            count_valid_entries(b"8.8.8.8 - 8.8.8.8 , 127 , Permit only\n", "dat"),
+            0
+        );
+    }
+
+    #[test]
+    fn query_stats_pages_and_filters() {
+        let mut filter = IpFilter::new(true, false);
+        filter.mark_ranges_ready();
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "alpha".to_string(),
+        );
+        filter.add_range(
+            Ipv4Addr::new(2, 0, 0, 0),
+            Ipv4Addr::new(2, 0, 0, 255),
+            "beta".to_string(),
+        );
+        filter.add_range(
+            Ipv4Addr::new(3, 0, 0, 0),
+            Ipv4Addr::new(3, 0, 0, 255),
+            "gamma".to_string(),
+        );
+        filter.is_blocked(Ipv4Addr::new(3, 0, 0, 1));
+        filter.is_blocked(Ipv4Addr::new(3, 0, 0, 2));
+
+        let page = filter.query_stats("", "hits", false, 0, 1);
+        assert_eq!(page.matched_count, 3);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].description, "gamma");
+        assert_eq!(page.range_count, 3);
+
+        let search = filter.query_stats("beta", "range", true, 0, 256);
+        assert_eq!(search.matched_count, 1);
+        assert_eq!(search.entries[0].description, "beta");
+    }
+
+    #[test]
+    fn sniff_ipfilter_ext_prefers_p2b_magic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\xff\xff\xff\xffP2B");
+        data.push(1);
+        assert_eq!(sniff_ipfilter_ext(&data, "https://example.com/ipfilter.dat"), "p2b");
+        assert_eq!(
+            sniff_ipfilter_ext(b"1.0.0.0 - 1.0.0.255 , 0 , x\n", "https://x/list.p2p?dl=1"),
+            "p2p"
+        );
+        assert_eq!(sniff_ipfilter_ext(b"not binary", "https://x/ipfilter.dat"), "dat");
+        assert!(canonicalize_p2b_to_dat(&data).is_none());
+        data.extend_from_slice(b"desc\0");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&10u32.to_be_bytes());
+        let dat = canonicalize_p2b_to_dat(&data).expect("p2b should canonicalize");
+        assert!(String::from_utf8_lossy(&dat).contains("0.0.0.1"));
     }
 }

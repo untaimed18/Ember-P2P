@@ -191,6 +191,8 @@ impl LocalIndex {
                     is_spam: false,
                     clean_name: String::new(),
                     result_origin: ORIGIN_LOCAL.to_string(),
+                    origin_server_ip: None,
+                    spam_reasons: Vec::new(),
                 })
             })
             .collect()

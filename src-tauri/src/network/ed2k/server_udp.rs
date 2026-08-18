@@ -815,14 +815,15 @@ fn apply_udp_uint_tag(
         0x30 => *complete_source_count = value.min(u32::MAX as u64) as u32,
         0xD3 if value > 0 => media.duration = Some(value as u32),
         0xD4 if value > 0 => media.bitrate = Some(value as u32),
-        // eMule file ratings are 0..=5. Clamp rather than `as u8`-truncate so a
-        // bogus server value lands at the top of the range instead of wrapping
-        // to an arbitrary point inside it (truncation mapped 256 to 0 and 261 to
-        // 5). No security delta either way — a server can simply send 5.
-        0xF7 => *rating = Some(value.min(5) as u8),
+        // FT_FILERATING is the low byte (`1..=5`). Packed DWORDs also carry a
+        // vote count in the upper bytes; clamping the whole integer with
+        // `min(5)` mapped those to five stars.
+        0xF7 => *rating = super::comments::unpack_file_rating(value),
         _ if is("bitrate") && value > 0 => media.bitrate = Some(value as u32),
         _ if is("length") && value > 0 => media.duration = Some(value as u32),
-        _ if is("filerating") || is("rating") => *rating = Some(value.min(5) as u8),
+        _ if is("filerating") || is("rating") => {
+            *rating = super::comments::unpack_file_rating(value)
+        }
         _ => {}
     }
 }

@@ -1987,20 +1987,20 @@ impl ServerResultTags {
         // same tag ids does (`server_udp.rs::apply_udp_uint_tag`), so an
         // oversized wire value lands somewhere predictable instead of wrapping
         // into an arbitrary one (a truncated 256 reads as 0 stars, 261 as 5).
-        // Note the direction for the 0..=5 star ratings: `min(5)` maps *every*
-        // out-of-range value to the maximum, so the clamp inflates where
-        // truncation would have deflated. That costs nothing — a server that
-        // wants to claim five stars can just send 5 — and keeps the field
-        // inside the range the UI renders.
+        // FT_FILERATING is the low byte (`1..=5`); packed DWORDs also carry a
+        // vote count in the upper bytes, so clamping the whole integer with
+        // `min(5)` used to map those to five stars.
         match name_id {
             0x15 => self.source_count = value.min(u32::MAX as u64) as u32,
             0x30 => self.complete_sources = value.min(u32::MAX as u64) as u32,
             0xD3 if value > 0 => self.media.duration = Some(value as u32),
             0xD4 if value > 0 => self.media.bitrate = Some(value as u32),
-            0xF7 => self.rating = Some(value.min(5) as u8),
+            0xF7 => self.rating = super::comments::unpack_file_rating(value),
             _ if is("bitrate") && value > 0 => self.media.bitrate = Some(value as u32),
             _ if is("length") && value > 0 => self.media.duration = Some(value as u32),
-            _ if (is("filerating") || is("rating")) => self.rating = Some(value.min(5) as u8),
+            _ if (is("filerating") || is("rating")) => {
+                self.rating = super::comments::unpack_file_rating(value)
+            }
             _ => {}
         }
     }

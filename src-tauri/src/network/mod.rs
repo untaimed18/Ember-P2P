@@ -5977,6 +5977,8 @@ mod tests {
             is_spam: false,
             clean_name: String::new(),
             result_origin: "KAD".to_string(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
         }
     }
 
@@ -6000,6 +6002,7 @@ mod tests {
             server_ip: None,
             server_result_count: 0,
             streamed_hashes: std::collections::HashSet::new(),
+            batch_spam: crate::search::spam::BatchSpamContext::default(),
         }
     }
 
@@ -8468,6 +8471,11 @@ pub enum NetworkCommand {
         tx: Option<oneshot::Sender<Result<(), String>>>,
     },
     GetIpFilterStats {
+        query: String,
+        sort: String,
+        sort_asc: bool,
+        offset: usize,
+        limit: usize,
         tx: oneshot::Sender<IpFilterStats>,
     },
     AddIpRange {
@@ -9286,6 +9294,9 @@ struct ActiveSearchRequest {
     /// a pathological all-servers global search from growing this
     /// unboundedly for the lifetime of one search.
     streamed_hashes: std::collections::HashSet<String>,
+    /// Cross-packet spam batch context for this search (same-name/many-hashes
+    /// across UDP/Kad/server pages, not only inside one emit).
+    batch_spam: crate::search::spam::BatchSpamContext,
 }
 
 /// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, the set
@@ -9296,6 +9307,30 @@ struct ActiveSearchRequest {
 /// deduped against a later repeat of itself). That's strictly better than
 /// giving up on dedup entirely once the cap is reached.
 const MAX_STREAMED_HASHES_SOFT_CAP: usize = 20_000;
+
+fn take_search_batch_spam(
+    state: &NetworkState,
+    request_id: u64,
+) -> crate::search::spam::BatchSpamContext {
+    state
+        .active_search_request
+        .as_ref()
+        .filter(|a| a.request_id == request_id)
+        .map(|a| a.batch_spam.clone())
+        .unwrap_or_default()
+}
+
+fn store_search_batch_spam(
+    state: &mut NetworkState,
+    request_id: u64,
+    batch: crate::search::spam::BatchSpamContext,
+) {
+    if let Some(active) = state.active_search_request.as_mut() {
+        if active.request_id == request_id {
+            active.batch_spam = batch;
+        }
+    }
+}
 
 /// Borrows the batch: the streaming enrichment path emits every batch it is
 /// about to hand back to its caller, and these vectors are long runs of
@@ -12333,6 +12368,7 @@ async fn enrich_and_emit_search_results(
     min_availability: Option<u32>,
     keywords: &[String],
     server_ip: Option<&str>,
+    accumulated_batch: Option<&mut crate::search::spam::BatchSpamContext>,
 ) -> Vec<SearchResult> {
     if results.is_empty() {
         return Vec::new();
@@ -12343,18 +12379,61 @@ async fn enrich_and_emit_search_results(
     let cleanup_strings =
         crate::search::cleanup::parse_cleanup_strings(&settings.filename_cleanups);
 
-    // Community verdict per result (peer/KAD "fake" votes). Keyed by the raw
-    // result hash so the lookup in `apply_search_enrichment` uses the exact
-    // same string with no normalization mismatch. Skipped when the filter is
-    // off and for the `relaxed` profile, which is intentionally local-only.
+    if let Some(sip) = server_ip {
+        for result in &mut results {
+            if result.origin_server_ip.is_none() {
+                result.origin_server_ip = Some(sip.to_string());
+            }
+        }
+    }
+
+    let mut upgrades = Vec::new();
+    let analyzed_batch;
+    let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
+        if let Some(acc) = accumulated_batch {
+            let prev_colliding = acc.colliding_hashes();
+            acc.absorb(&results);
+            if spam_enabled
+                && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
+            {
+                let skip: std::collections::HashSet<String> = results
+                    .iter()
+                    .map(|r| r.file.hash.trim().to_ascii_lowercase())
+                    .collect();
+                upgrades = acc.upgrade_rows(&prev_colliding, &skip);
+            }
+            Some(&*acc)
+        } else if spam_enabled
+            && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed
+        {
+            analyzed_batch = crate::search::spam::BatchSpamContext::analyze(&results);
+            Some(&analyzed_batch)
+        } else {
+            None
+        };
+
     let community: std::collections::HashMap<String, crate::search::spam::CommunityRating> = {
         let cm = comment_manager.read().await;
-        crate::commands::search::community_ratings_for(&*cm, &results, spam_enabled, spam_profile)
+        let mut map = crate::commands::search::community_ratings_for(
+            &*cm,
+            &results,
+            spam_enabled,
+            spam_profile,
+        );
+        if !upgrades.is_empty() {
+            map.extend(crate::commands::search::community_ratings_for(
+                &*cm,
+                &upgrades,
+                spam_enabled,
+                spam_profile,
+            ));
+        }
+        map
     };
 
     {
         let spam = spam_filter.read().await;
-        crate::commands::search::apply_search_enrichment(
+        crate::commands::search::apply_search_enrichment_with_batch(
             &mut results,
             &spam,
             keywords,
@@ -12363,7 +12442,25 @@ async fn enrich_and_emit_search_results(
             spam_profile,
             &cleanup_strings,
             &community,
+            false,
+            batch_for_score,
         );
+        if !upgrades.is_empty() {
+            crate::commands::search::apply_search_enrichment_with_batch(
+                &mut upgrades,
+                &spam,
+                keywords,
+                server_ip,
+                spam_enabled,
+                spam_profile,
+                &cleanup_strings,
+                &community,
+                false,
+                batch_for_score,
+            );
+            upgrades.retain(|r| r.is_spam);
+            results.append(&mut upgrades);
+        }
     }
 
     // Auto-redemption: if a server's results came back mostly clean, decay its
@@ -12815,6 +12912,97 @@ async fn handle_server_disconnect(
             .upload_disconnected
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Tear down an already-up eD2K session whose IP is now blocked.
+///
+/// First-launch merge admits servers while `!ranges_ready` so `server.met`
+/// is not wiped. Auto-connect waits; a manual Connect in that window can
+/// still be up when the parse finishes. `remove_filtered` drops the list
+/// row — this drops the live TCP session too. No-op while fail-closed.
+async fn disconnect_connected_server_if_ip_filtered(
+    state: &mut NetworkState,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    app_handle: &tauri::AppHandle,
+    filter_servers_by_ip: bool,
+) {
+    if !filter_servers_by_ip {
+        return;
+    }
+    if state.ip_filter.is_enabled() && !state.ip_filter.ranges_ready() {
+        return;
+    }
+    if !state.server_connected && state.server_connection.is_none() {
+        return;
+    }
+    let Some(addr) = state.server_addr else {
+        return;
+    };
+    let ipv4 = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4,
+            None => return,
+        },
+    };
+    if !state.ip_filter.is_blocked(ipv4) {
+        return;
+    }
+    let ip = ipv4.to_string();
+    let port = addr.port();
+    warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
+    emit_server_log(
+        app_handle,
+        &format!("Server {ip}:{port} blocked by IP filter"),
+    );
+    if let Some(conn) = state.server_connection.take() {
+        conn.disconnect().await;
+    }
+    handle_server_disconnect(
+        state,
+        shared_server_addr,
+        app_handle,
+        "blocked by IP filter",
+    )
+    .await;
+    if state.server_auto_reconnect {
+        abandon_server_auto_reconnect(
+            state,
+            app_handle,
+            &format!("preferred server {ip}:{port} blocked by IP filter"),
+        );
+    }
+}
+
+/// Drop blocked servers from `server.met` and disconnect if the live
+/// session is now in the list. Safe to call after any range load/reload.
+async fn apply_server_ip_filter(
+    state: &mut NetworkState,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    app_handle: &tauri::AppHandle,
+    filter_servers_by_ip: bool,
+) {
+    if !filter_servers_by_ip {
+        return;
+    }
+    let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+    if removed > 0 {
+        let met_path = state.data_dir.join("server.met");
+        spawn_save_server_met(
+            &state.server_list,
+            met_path,
+            &state.server_met_save_generation,
+            &state.server_met_save_lock,
+        );
+        info!("Removed {removed} IP-filtered servers from server list");
+    }
+    disconnect_connected_server_if_ip_filtered(
+        state,
+        shared_server_addr,
+        app_handle,
+        filter_servers_by_ip,
+    )
+    .await;
 }
 
 /// Max preferred-server connect failures before auto-reconnect stops and the
@@ -14348,7 +14536,7 @@ fn apply_network_settings(
     if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
         state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
         let mut load_ready = true;
-        if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
+        if new_settings.ip_filter_enabled && !state.ip_filter.has_loaded_ranges() {
             let default_path = state.data_dir.join("ipfilter.dat");
             if default_path.exists() {
                 match state.ip_filter.load_from_file(&default_path) {
@@ -16190,7 +16378,6 @@ pub async fn start_network(
                     break;
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
-                    let prev_filter_servers = settings.filter_servers_by_ip;
                     apply_network_settings(
                         &mut state,
                         &mut settings,
@@ -16210,15 +16397,14 @@ pub async fn start_network(
                         .write()
                         .await
                         .set_max_per_file(settings.max_sources_per_file);
-                    if settings.filter_servers_by_ip && !prev_filter_servers {
-                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-                        if removed > 0 {
-                            let met_path = state.data_dir.join("server.met");
-                            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
-                            info!(
-                                "Removed {removed} servers blocked by IP filter (toggle enabled)"
-                            );
-                        }
+                    if settings.filter_servers_by_ip {
+                        apply_server_ip_filter(
+                            &mut state,
+                            &shared_server_addr,
+                            &app_handle,
+                            true,
+                        )
+                        .await;
                     }
                 }
                 cmd => {
@@ -16302,29 +16488,38 @@ pub async fn start_network(
                     Ok(loads) => {
                         // Preserve enable/private flags and any ranges the
                         // user added while the deferred load was in flight.
-                        let live_enabled = state.ip_filter.is_enabled();
-                        let live_block_private = state.ip_filter.blocks_private();
-                        let mut loaded = loads.ip_filter;
-                        // Capture before set_enabled(true), which clears ranges_ready.
-                        let deferred_load_ready = loaded.ranges_ready();
-                        loaded.merge_ranges_from(&state.ip_filter);
-                        loaded.set_enabled(live_enabled);
-                        loaded.set_block_private(live_block_private);
-                        if live_enabled {
-                            if deferred_load_ready {
-                                loaded.mark_ranges_ready();
-                            } else {
-                                warn!(
-                                    "Deferred IP filter load failed; leaving fail-closed until a successful reload"
-                                );
+                        // If ReloadIpFilter (or a manual add that loaded the
+                        // file) already replaced the live list, do not write
+                        // the stale startup snapshot back over it.
+                        if state.ip_filter.has_loaded_ranges() {
+                            info!(
+                                "Deferred IP filter load skipped: live filter already loaded"
+                            );
+                        } else {
+                            let live_enabled = state.ip_filter.is_enabled();
+                            let live_block_private = state.ip_filter.blocks_private();
+                            let mut loaded = loads.ip_filter;
+                            // Capture before set_enabled(true), which clears ranges_ready.
+                            let deferred_load_ready = loaded.ranges_ready();
+                            loaded.merge_ranges_from(&state.ip_filter);
+                            loaded.set_enabled(live_enabled);
+                            loaded.set_block_private(live_block_private);
+                            if live_enabled {
+                                if deferred_load_ready {
+                                    loaded.mark_ranges_ready();
+                                } else {
+                                    warn!(
+                                        "Deferred IP filter load failed; leaving fail-closed until a successful reload"
+                                    );
+                                }
                             }
+                            state.ip_filter = loaded;
+                            state
+                                .ip_filter
+                                .update_shared_snapshot(&state.shared_ip_filter);
+                            state.routing_table.evict_filtered_contacts();
+                            state.ember_dht.evict_filtered_contacts();
                         }
-                        state.ip_filter = loaded;
-                        state
-                            .ip_filter
-                            .update_shared_snapshot(&state.shared_ip_filter);
-                        state.routing_table.evict_filtered_contacts();
-                        state.ember_dht.evict_filtered_contacts();
                         known_files.absorb_missing_from(loads.known_files);
                         hydrate_ember_publish_schedule(
                             &known_files,
@@ -16341,15 +16536,13 @@ pub async fn start_network(
                             state.aich_root_map.entry(k).or_insert(v);
                         }
                         if settings.filter_servers_by_ip {
-                            let removed =
-                                state.server_list.remove_filtered(&mut state.ip_filter);
-                            if removed > 0 {
-                                let met_path = state.data_dir.join("server.met");
-                                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
-                                info!(
-                                    "Removed {removed} IP-filtered servers from server list"
-                                );
-                            }
+                            apply_server_ip_filter(
+                                &mut state,
+                                &shared_server_addr,
+                                &app_handle,
+                                true,
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -17276,7 +17469,6 @@ pub async fn start_network(
                     // (obfuscation toggle, USS toggle, max-uploads slider all
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
-                        let prev_filter_servers = settings.filter_servers_by_ip;
                         apply_network_settings(
                             &mut state,
                             &mut settings,
@@ -17296,15 +17488,14 @@ pub async fn start_network(
                             .write()
                             .await
                             .set_max_per_file(settings.max_sources_per_file);
-                        if settings.filter_servers_by_ip && !prev_filter_servers {
-                            let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-                            if removed > 0 {
-                                let met_path = state.data_dir.join("server.met");
-                                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
-                                info!(
-                                    "Removed {removed} servers blocked by IP filter (toggle enabled)"
-                                );
-                            }
+                        if settings.filter_servers_by_ip {
+                            apply_server_ip_filter(
+                                &mut state,
+                                &shared_server_addr,
+                                &app_handle,
+                                true,
+                            )
+                            .await;
                         }
                     }
                     Some(cmd) => {
@@ -20418,6 +20609,8 @@ pub async fn start_network(
                             let (min_size, max_size, file_extension, min_availability) =
                                 filter_ctx.unwrap_or((None, None, None, None));
                             if !batch.is_empty() {
+                                let mut batch_spam =
+                                    take_search_batch_spam(&state, pending_request_id);
                                 let emitted = enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
@@ -20432,7 +20625,13 @@ pub async fn start_network(
                                     min_availability,
                                     &pending_keywords,
                                     None,
+                                    Some(&mut batch_spam),
                                 ).await;
+                                store_search_batch_spam(
+                                    &mut state,
+                                    pending_request_id,
+                                    batch_spam,
+                                );
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == pending_request_id {
                                         mark_streamed_hashes(active, &emitted);
@@ -27831,6 +28030,8 @@ pub async fn start_network(
                                         is_spam: false,
                                         clean_name: String::new(),
                                         result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                                        origin_server_ip: None,
+                                        spam_reasons: Vec::new(),
                                         }
                                     }).collect();
 
@@ -27926,6 +28127,8 @@ pub async fn start_network(
                                                 request_id,
                                                 &mut search_results,
                                             );
+                                            let mut batch_spam =
+                                                take_search_batch_spam(&state, request_id);
                                             let emitted = enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
@@ -27940,7 +28143,9 @@ pub async fn start_network(
                                                 min_availability,
                                                 &kws,
                                                 srv_ip.as_deref(),
+                                                Some(&mut batch_spam),
                                             ).await;
+                                            store_search_batch_spam(&mut state, request_id, batch_spam);
                                             let skip_hashes = {
                                                 let idx = local_index.read().await;
                                                 let mgr = transfer_manager.read().await;
@@ -29300,6 +29505,8 @@ pub async fn start_network(
                                         is_spam: false,
                                         clean_name: String::new(),
                                         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+                                        origin_server_ip: None,
+                                        spam_reasons: Vec::new(),
                                     }
                                 }).collect();
                                 // Extracted into owned values (rather than an `as_ref()`
@@ -29334,6 +29541,8 @@ pub async fn start_network(
                                         request_id,
                                         &mut search_results,
                                     );
+                                    let mut batch_spam = take_search_batch_spam(&state, request_id);
+                                    let udp_server_ip = addr.ip().to_string();
                                     let emitted = enrich_and_emit_search_results(
                                         &app_handle,
                                         &spam_filter,
@@ -29347,8 +29556,10 @@ pub async fn start_network(
                                         file_extension.as_deref(),
                                         min_availability,
                                         &kws,
-                                        None,
+                                        Some(&udp_server_ip),
+                                        Some(&mut batch_spam),
                                     ).await;
+                                    store_search_batch_spam(&mut state, request_id, batch_spam);
                                     let skip_hashes = {
                                         let idx = local_index.read().await;
                                         let mgr = transfer_manager.read().await;
@@ -29408,7 +29619,9 @@ pub async fn start_network(
                                 std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
                             };
                             if let Some(ipv4) = server_ipv4 {
-                                if state.ip_filter.is_blocked(ipv4) {
+                                let skip_fail_closed = state.ip_filter.is_enabled()
+                                    && !state.ip_filter.ranges_ready();
+                                if !skip_fail_closed && state.ip_filter.is_blocked(ipv4) {
                                     warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
                                     emit_server_log(&app_handle, &format!("Server {ip}:{port} blocked by IP filter"));
                                     conn.disconnect().await;
@@ -32249,6 +32462,7 @@ pub async fn start_network(
                             &mut results,
                         );
                         if !results.is_empty() {
+                            let mut batch_spam = take_search_batch_spam(&state, request_id);
                             let emitted = enrich_and_emit_search_results(
                                 &app_handle,
                                 &spam_filter,
@@ -32263,8 +32477,10 @@ pub async fn start_network(
                                 min_availability,
                                 &keywords,
                                 None,
+                                Some(&mut batch_spam),
                             )
                             .await;
+                            store_search_batch_spam(&mut state, request_id, batch_spam);
                             if let Some(active) = state.active_search_request.as_mut() {
                                 if active.request_id == request_id {
                                     mark_streamed_hashes(active, &emitted);
@@ -35551,6 +35767,8 @@ fn build_ember_keyword_results(
                     is_spam: false,
                     clean_name: String::new(),
                     result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+                    origin_server_ip: None,
+                    spam_reasons: Vec::new(),
                 };
                 dedup.insert(rec.file_hash, (sr, publisher_digests));
             }
@@ -37809,7 +38027,13 @@ async fn handle_udp_packet_inner(
             }
         },
     };
-    if state.ip_filter.is_blocked_readonly_for_kad(from_ipv4) {
+    let udp_blocked = match data.first().copied() {
+        Some(OP_EDONKEYHEADER) | Some(OP_EMULEPROT) => {
+            state.ip_filter.is_blocked_readonly(from_ipv4)
+        }
+        _ => state.ip_filter.is_blocked_readonly_for_kad(from_ipv4),
+    };
+    if udp_blocked {
         debug!("Dropping UDP packet from blocked IP {from}");
         return;
     }
@@ -40000,7 +40224,7 @@ async fn handle_udp_packet_inner(
                         }
                     }
                     TagName::Id(TAG_FILERATING) => {
-                        if let TagValue::Uint8(r) = tag.value {
+                        if let Some(r) = kad_tag_file_rating(tag) {
                             note_rating = r;
                         }
                     }
@@ -40016,7 +40240,7 @@ async fn handle_udp_packet_inner(
             note_comment = crate::security::sanitize_remote_text(&note_comment, 4096);
             if note_rating > 0 || !note_comment.is_empty() {
                 let hash_hex = target.to_hex();
-                let peer_name = sender_id.to_hex()[..8].to_string();
+                let publisher_id = sender_id.to_hex();
                 use ed2k::comments::rating_name;
                 debug!(
                     "Received peer note for {}: rating={} ({})",
@@ -40026,7 +40250,7 @@ async fn handle_udp_packet_inner(
                 );
                 state.comment_manager.write().await.add_peer_comment(
                     &hash_hex,
-                    peer_name,
+                    publisher_id,
                     note_rating,
                     note_comment,
                     1,
@@ -40789,6 +41013,7 @@ async fn handle_command_inner(
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
                 streamed_hashes: std::collections::HashSet::new(),
+                batch_spam: crate::search::spam::BatchSpamContext::default(),
             };
 
             // Parse the raw query into a boolean keyword tree (implicit AND,
@@ -43479,17 +43704,13 @@ async fn handle_command_inner(
                         state.ip_filter.range_count(),
                     );
                     if settings.filter_servers_by_ip {
-                        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
-                        if removed > 0 {
-                            let met_path = state.data_dir.join("server.met");
-                            spawn_save_server_met(
-                                &state.server_list,
-                                met_path,
-                                &state.server_met_save_generation,
-                                &state.server_met_save_lock,
-                            );
-                            info!("Removed {removed} servers blocked by updated IP filter");
-                        }
+                        apply_server_ip_filter(
+                            state,
+                            shared_server_addr,
+                            app_handle,
+                            true,
+                        )
+                        .await;
                     }
                     Ok(())
                 }
@@ -43509,9 +43730,22 @@ async fn handle_command_inner(
             }
         }
 
-        NetworkCommand::GetIpFilterStats { tx } => {
+        NetworkCommand::GetIpFilterStats {
+            query,
+            sort,
+            sort_asc,
+            offset,
+            limit,
+            tx,
+        } => {
             state.ip_filter.collect_shared_hits(&state.shared_ip_filter);
-            let _ = tx.send(state.ip_filter.get_stats());
+            let _ = tx.send(state.ip_filter.query_stats(
+                &query,
+                &sort,
+                sort_asc,
+                offset,
+                limit,
+            ));
         }
 
         NetworkCommand::AddIpRange {
@@ -43533,6 +43767,13 @@ async fn handle_command_inner(
                     "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
                     state.ip_filter.range_count()
                 );
+                apply_server_ip_filter(
+                    state,
+                    shared_server_addr,
+                    app_handle,
+                    settings.filter_servers_by_ip,
+                )
+                .await;
             }
         }
 
@@ -43635,6 +43876,13 @@ async fn handle_command_inner(
             if enabled {
                 state.routing_table.evict_filtered_contacts();
                 state.ember_dht.evict_filtered_contacts();
+                apply_server_ip_filter(
+                    state,
+                    shared_server_addr,
+                    app_handle,
+                    settings.filter_servers_by_ip,
+                )
+                .await;
             }
             info!("IP filter enabled: {enabled}");
         }
@@ -47132,24 +47380,17 @@ async fn handle_upload_event(
 }
 
 fn name_spam_penalty(name: &str) -> usize {
-    let lower = name.to_lowercase();
-    let mut score = 0;
-    for pat in [
-        "http://",
-        "https://",
-        "www.",
-        ".com/",
-        ".org/",
-        ".net/",
-        "download at",
-        "powered by",
-    ] {
-        if lower.contains(pat) {
-            score += 10;
-        }
-    }
-    score += name.matches('[').count().saturating_sub(1) * 3;
-    score
+    crate::search::spam::fake_pattern_score(name) as usize
+        + name.matches('[').count().saturating_sub(1) * 3
+}
+
+fn kad_tag_file_rating(tag: &kad::types::KadTag) -> Option<u8> {
+    let raw = tag
+        .uint32_value()
+        .map(|v| v as u64)
+        .or_else(|| tag.uint16_value().map(|v| v as u64))
+        .or_else(|| tag.uint8_value().map(|v| v as u64))?;
+    crate::network::ed2k::comments::unpack_file_rating(raw)
 }
 
 fn convert_search_results(
@@ -47353,22 +47594,10 @@ fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_FILERATING) => {
-                        if let Some(v) = tag.uint32_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint16_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint8_value() {
-                            rating = Some(v);
-                        }
+                        rating = kad_tag_file_rating(tag);
                     }
                     TagName::Str(s) if s == "filerating" => {
-                        if let Some(v) = tag.uint32_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint16_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint8_value() {
-                            rating = Some(v);
-                        }
+                        rating = kad_tag_file_rating(tag);
                     }
                     TagName::Id(TAG_DESCRIPTION) => {
                         if let Some(s) = tag.string_value() {
@@ -47572,6 +47801,8 @@ fn convert_search_results(
                     is_spam: false,
                     clean_name: String::new(),
                     result_origin: crate::search::merge::ORIGIN_KAD.to_string(),
+                    origin_server_ip: None,
+                    spam_reasons: Vec::new(),
                 },
             );
         }
@@ -47622,13 +47853,7 @@ fn convert_note_search_results(
                         }
                     }
                     TagName::Id(TAG_FILERATING) => {
-                        if let Some(v) = tag.uint32_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint16_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint8_value() {
-                            rating = Some(v);
-                        }
+                        rating = kad_tag_file_rating(tag);
                     }
                     TagName::Id(TAG_DESCRIPTION) => {
                         if let Some(s) = tag.string_value() {
@@ -47636,13 +47861,7 @@ fn convert_note_search_results(
                         }
                     }
                     TagName::Str(s) if s == "filerating" => {
-                        if let Some(v) = tag.uint32_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint16_value() {
-                            rating = Some(v as u8);
-                        } else if let Some(v) = tag.uint8_value() {
-                            rating = Some(v);
-                        }
+                        rating = kad_tag_file_rating(tag);
                     }
                     TagName::Str(s) if s == "description" => {
                         if let Some(s) = tag.string_value() {
@@ -47706,6 +47925,8 @@ fn convert_note_search_results(
                 is_spam: false,
                 clean_name: String::new(),
                 result_origin: crate::search::merge::ORIGIN_NOTES.to_string(),
+                origin_server_ip: None,
+                spam_reasons: Vec::new(),
             })
         })
         .collect()

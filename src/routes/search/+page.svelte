@@ -19,6 +19,7 @@
     patchSpamFlagByHash,
     searchTabs,
     setActiveSearchTab,
+    spamFilterEpoch,
     type SearchTab,
   } from '$lib/stores/search';
   import { networkStats, serverStatus } from '$lib/stores/network';
@@ -366,9 +367,6 @@
     if (!selectedResultKey) return null;
     return searchResultsList.find((r) => resultKey(r) === selectedResultKey) ?? null;
   });
-  let selectedSpam = $derived.by(() =>
-    selectedResult ? spamExplainCache[resultKey(selectedResult)] : undefined
-  );
   let notes: SearchResult[] = $state([]);
   let loadingNotes = $state(false);
   let noteRating = $state(0);
@@ -381,6 +379,16 @@
   let spamExplainPending = $state<Record<string, boolean>>({});
   let spamExplainErrors = $state<Record<string, string>>({});
   let spamTooltipKey = $state<string | null>(null);
+
+  $effect(() => {
+    void $spamFilterEpoch;
+    untrack(() => {
+      spamExplainCache = {};
+      spamExplainPending = {};
+      spamExplainErrors = {};
+      spamExplainError = null;
+    });
+  });
   const FILE_TYPES = [
     { value: '', get label() { return m.search_filetype_any(); } },
     { value: 'Audio', get label() { return m.library_type_audio(); } },
@@ -942,6 +950,47 @@
     };
   });
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
+
+  function currentSearchQuery(): string {
+    return activeTab?.query ?? '';
+  }
+
+  function explanationFromResult(result: SearchResult): SpamExplanation | null {
+    if (!result.spam_reasons?.length) return null;
+    return {
+      score: result.spam_rating ?? 0,
+      threshold: spamThreshold,
+      profile: spamProfile,
+      is_spam: !!result.is_spam,
+      reasons: result.spam_reasons,
+    };
+  }
+
+  function rowIsCleanOfSpam(result: SearchResult): boolean {
+    return !result.is_spam && (result.spam_rating ?? 0) === 0 && !(result.spam_reasons?.length);
+  }
+
+  function spamExplainFor(result: SearchResult): SpamExplanation | undefined {
+    const stored = explanationFromResult(result);
+    if (stored) return stored;
+    // After a filter reset, rows come back with empty reasons. Don't revive
+    // a pre-reset tooltip from the IPC cache.
+    if (rowIsCleanOfSpam(result)) return undefined;
+    return spamExplainCache[resultKey(result)];
+  }
+
+  function explainOpts(result: SearchResult) {
+    return {
+      serverIp: result.origin_server_ip ?? null,
+      rating: result.rating ?? null,
+      resultOrigin: result.result_origin ?? null,
+    };
+  }
+
+  let selectedSpam = $derived.by(() => {
+    if (!selectedResult) return undefined;
+    return spamExplainFor(selectedResult);
+  });
 
   function hasSearchFilters(filters: import('$lib/api/search').SearchFilters | undefined, fileType?: string): boolean {
     return !!(
@@ -1525,7 +1574,7 @@
     const requestId = ++notesRequestId;
     const fileHash = result.file.hash;
     const key = resultKey(result);
-    const keywords = (activeTab?.query ?? '').split(/\s+/).filter((w) => w.length > 0);
+    const query = currentSearchQuery();
 
     // Load notes and spam explanation independently so one slow request
     // does not block the other from rendering in the details panel.
@@ -1550,14 +1599,19 @@
 
     void (async () => {
       try {
-        const cached = spamExplainCache[key];
-        if (cached) return;
+        const cached = explanationFromResult(result)
+          ?? (rowIsCleanOfSpam(result) ? undefined : spamExplainCache[key]);
+        if (cached) {
+          setSpamCache(key, cached);
+          return;
+        }
         const explain = await explainSpamResult(
           result.file.hash,
           result.file.name,
           result.file.size,
           result.source_addresses,
-          keywords,
+          query,
+          explainOpts(result),
         );
         if (!selectedResult || selectedResult.file.hash !== fileHash || requestId !== notesRequestId) return;
         setSpamCache(key, explain);
@@ -1573,12 +1627,17 @@
     })();
   }
 
-  function currentSearchKeywords(): string[] {
-    return (activeTab?.query ?? '').split(/\s+/).filter((w) => w.length > 0);
-  }
-
   async function ensureSpamExplanation(result: SearchResult): Promise<void> {
     const key = resultKey(result);
+    const stored = explanationFromResult(result);
+    if (stored) {
+      setSpamCache(key, stored);
+      return;
+    }
+    if (rowIsCleanOfSpam(result)) {
+      delete spamExplainCache[key];
+      return;
+    }
     if (spamExplainCache[key] || spamExplainPending[key]) return;
     spamExplainPending[key] = true;
     delete spamExplainErrors[key];
@@ -1588,7 +1647,8 @@
         result.file.name,
         result.file.size,
         result.source_addresses,
-        currentSearchKeywords(),
+        currentSearchQuery(),
+        explainOpts(result),
       );
       setSpamCache(key, explain);
     } catch (e: unknown) {
@@ -1780,9 +1840,9 @@
   }
 
   async function handleMarkSpam(result: SearchResult) {
-    const keywords = (activeTab?.query ?? '').split(/\s+/).filter(w => w.length > 0);
     const prevSpam = result.is_spam;
     const prevRating = result.spam_rating ?? 0;
+    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
     const gen = (spamToggleGen.get(hash) ?? 0) + 1;
     spamToggleGen.set(hash, gen);
@@ -1790,16 +1850,23 @@
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, true, spamThreshold);
+    patchSpamFlagByHash(hash, true, spamThreshold, ['Manually marked as spam']);
     clearSpamExplainForResult(result);
     try {
-      await markSpam(hash, result.file.name, result.file.size, result.source_addresses, keywords);
+      await markSpam(
+        hash,
+        result.file.name,
+        result.file.size,
+        result.source_addresses,
+        currentSearchQuery(),
+        result.origin_server_ip,
+      );
       // A newer mark/unmark superseded this request — leave its optimistic state.
       if (spamToggleGen.get(hash) !== gen) return;
     } catch (e) {
       console.error('Failed to mark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating);
+        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
         addToast('error', m.search_failed_mark_spam());
       }
     }
@@ -1808,12 +1875,13 @@
   async function handleMarkNotSpam(result: SearchResult) {
     const prevSpam = result.is_spam;
     const prevRating = result.spam_rating ?? 0;
+    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
     const gen = (spamToggleGen.get(hash) ?? 0) + 1;
     spamToggleGen.set(hash, gen);
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, false, 0);
+    patchSpamFlagByHash(hash, false, 0, ['Manually marked as not spam']);
     clearSpamExplainForResult(result);
     try {
       await markNotSpam(hash);
@@ -1821,7 +1889,7 @@
     } catch (e) {
       console.error('Failed to unmark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating);
+        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
         addToast('error', m.search_failed_unmark_spam());
       }
     }
@@ -2756,6 +2824,7 @@
           {@const dlTransfer = getDownloadTransfer(result)}
           {@const blockingDl = getBlockingDownloadTransfer(result)}
           {@const originText = originLabel(result.result_origin || '')}
+          {@const spamExplain = spamExplainFor(result)}
           <tr
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
@@ -2802,12 +2871,12 @@
                           <div class="spam-tooltip-title">{m.search_spam_evaluating()}</div>
                         {:else if spamExplainErrors[resultKey(result)]}
                           <div class="spam-tooltip-title">{spamExplainErrors[resultKey(result)]}</div>
-                        {:else if spamExplainCache[resultKey(result)]}
+                        {:else if spamExplain}
                           <div class="spam-tooltip-title">
-                            {m.search_spam_score({ score: spamExplainCache[resultKey(result)].score, threshold: spamExplainCache[resultKey(result)].threshold, profile: spamExplainCache[resultKey(result)].profile })}
+                            {m.search_spam_score({ score: spamExplain.score, threshold: spamExplain.threshold, profile: spamExplain.profile })}
                           </div>
                           <ul>
-                            {#each spamExplainCache[resultKey(result)].reasons.slice(0, 4) as reason}
+                            {#each spamExplain.reasons.slice(0, 4) as reason}
                               <li>{reason}</li>
                             {/each}
                           </ul>
@@ -2929,11 +2998,8 @@
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
       <div class="context-menu" role="menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
-        {#if contextMenu.result.is_spam}
-          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
-        {:else}
-          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
-        {/if}
+        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
+        <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
         <button
           role="menuitem"
           disabled={isInLibraryOnly(contextMenu.result) || !!getBlockingDownloadTransfer(contextMenu.result)}

@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "Blocca intervalli IP noti come dannosi tramite ipfilter.dat",
   "settings_download_ipfilter_btn": "Scarica ipfilter.dat",
   "settings_filter_incoming_label": "Filtra connessioni in entrata",
-  "settings_filter_incoming_hint": "Applica il filtro IP alle connessioni peer in entrata. Gli utenti VPN potrebbero doverlo disattivare perché gli IP VPN compaiono spesso negli elenchi filtri.",
+  "settings_filter_incoming_hint": "Applica il filtro IP solo alle connessioni TCP di upload in ingresso. Kad ed eD2K UDP usano comunque sempre l'elenco. Gli utenti VPN potrebbero doverlo disattivare perché gli IP VPN compaiono spesso negli elenchi filtri.",
   "settings_block_private_label": "Blocca IP privati",
   "settings_block_private_hint": "Rifiuta 10.x, 192.168.x, ecc. dalla tabella di routing.",
   "settings_allow_shared_browse_label": "Consenti esplorazione delle mie condivisioni",

@@ -196,6 +196,10 @@ export interface SearchResult {
   clean_name: string;
   /** KAD, Server, UDP, Local, Notes, or combined labels from the backend */
   result_origin?: string;
+  /** Connected eD2k server or UDP reply IP this hit was scored against. */
+  origin_server_ip?: string | null;
+  /** Reasons from the enrich pass; preferred over a one-off explain call. */
+  spam_reasons?: string[];
 }
 
 export interface StartDownloadResponse {

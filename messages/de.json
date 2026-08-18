@@ -1990,7 +1990,7 @@
   "settings_ip_filter_hint": "Bekannte schädliche IP-Bereiche über ipfilter.dat blockieren",
   "settings_download_ipfilter_btn": "ipfilter.dat herunterladen",
   "settings_filter_incoming_label": "Eingehende Verbindungen filtern",
-  "settings_filter_incoming_hint": "IP-Filter auf eingehende Peer-Verbindungen anwenden. VPN-Benutzer müssen dies möglicherweise deaktivieren, da VPN-IPs oft in Filterlisten erscheinen.",
+  "settings_filter_incoming_hint": "IP-Filter nur auf eingehende TCP-Upload-Verbindungen anwenden. Kad- und eD2K-UDP verwenden die Liste weiterhin immer. VPN-Benutzer müssen dies möglicherweise deaktivieren, da VPN-IPs oft in Filterlisten erscheinen.",
   "settings_block_private_label": "Private IPs blockieren",
   "settings_block_private_hint": "10.x, 192.168.x usw. aus der Routingtabelle ablehnen.",
   "settings_allow_shared_browse_label": "Durchsuchen meiner Freigaben erlauben",

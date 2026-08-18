@@ -61,76 +61,51 @@
   let sortAsc = $state(false);
 
   // IP filter lists can easily contain tens of thousands of ranges
-  // (the default nipfilter.dat is ~60k rows). Virtualized scrolling
-  // replaces the old 50-per-page pagination so users can scroll the
-  // whole list without repeatedly clicking "Next". Fixed row height
-  // keeps the math simple and is already what the table CSS enforces.
+  // (the default nipfilter.dat is ~60k rows). The backend pages at
+  // 256 rows; virtualized scrolling maps that window onto the full
+  // matched height so we never serialize the whole list over IPC.
   const IP_ROW_HEIGHT = 28;
   const IP_OVERSCAN = 15;
+  const IP_STATS_PAGE = 256;
   let ipScrollContainer: HTMLDivElement | undefined = $state();
   let ipScrollTop = $state(0);
   let ipViewportHeight = $state(400);
+  let listOffset = $state(0);
 
-  let filteredEntries = $derived.by(() => {
-    if (!stats) return [];
-    let entries = [...stats.entries];
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      entries = entries.filter(
-        (e) =>
-          e.start_ip.includes(q) ||
-          e.end_ip.includes(q) ||
-          e.description.toLowerCase().includes(q)
-      );
-    }
-    // Parse a dotted-quad IPv4 into a 32-bit unsigned key suitable
-    // for ordering. Any non-numeric octet falls back to the lexical
-    // path below, which guarantees a total order even on garbage
-    // input (otherwise `NaN - NaN === NaN` propagates and
-    // `Array.sort` produces an unstable, undefined permutation).
-    const ipKey = (s: string): number | null => {
-      const parts = s.split('.');
-      if (parts.length !== 4) return null;
-      let acc = 0;
-      for (const part of parts) {
-        const n = Number(part);
-        if (!Number.isFinite(n) || n < 0 || n > 255) return null;
-        acc = acc * 256 + n;
-      }
-      return acc;
-    };
-    entries.sort((a, b) => {
-      let cmp = 0;
-      if (sortBy === 'hits') cmp = a.hits - b.hits;
-      else if (sortBy === 'description') cmp = a.description.localeCompare(b.description);
-      else {
-        const ka = ipKey(a.start_ip);
-        const kb = ipKey(b.start_ip);
-        if (ka !== null && kb !== null) {
-          cmp = ka - kb;
-        } else {
-          cmp = a.start_ip.localeCompare(b.start_ip);
-        }
-      }
-      return sortAsc ? cmp : -cmp;
-    });
-    return entries;
-  });
+  let matchedCount = $derived(stats?.matched_count ?? 0);
 
   let virtualIps = $derived.by(() => {
-    const total = filteredEntries.length;
-    if (total === 0) return { visible: [], startIdx: 0, topPad: 0, bottomPad: 0 };
-    const firstVisible = Math.floor(ipScrollTop / IP_ROW_HEIGHT);
-    const visibleCount = Math.ceil(ipViewportHeight / IP_ROW_HEIGHT);
-    const startIdx = Math.max(0, firstVisible - IP_OVERSCAN);
-    const endIdx = Math.min(total, firstVisible + visibleCount + IP_OVERSCAN);
+    const total = matchedCount;
+    if (!stats || total === 0) return { visible: [], startIdx: 0, topPad: 0, bottomPad: 0 };
+    const startIdx = listOffset;
+    const endIdx = startIdx + stats.entries.length;
     return {
-      visible: filteredEntries.slice(startIdx, endIdx),
+      visible: stats.entries,
       startIdx,
       topPad: startIdx * IP_ROW_HEIGHT,
-      bottomPad: (total - endIdx) * IP_ROW_HEIGHT,
+      bottomPad: Math.max(0, total - endIdx) * IP_ROW_HEIGHT,
     };
   });
+
+  function desiredListOffset(): number {
+    const firstVisible = Math.floor(ipScrollTop / IP_ROW_HEIGHT);
+    const raw = Math.max(0, firstVisible - IP_OVERSCAN);
+    const total = stats?.matched_count ?? 0;
+    if (total <= 0) return 0;
+    return Math.min(raw, Math.max(0, total - 1));
+  }
+
+  function windowCoversViewport(): boolean {
+    if (!stats) return false;
+    const total = stats.matched_count ?? 0;
+    if (total === 0) return true;
+    if (stats.entries.length === 0) return false;
+    const firstVisible = Math.floor(ipScrollTop / IP_ROW_HEIGHT);
+    const visibleCount = Math.max(1, Math.ceil(ipViewportHeight / IP_ROW_HEIGHT));
+    const lastVisible = firstVisible + visibleCount;
+    const winEnd = listOffset + stats.entries.length;
+    return firstVisible >= listOffset && lastVisible <= winEnd;
+  }
 
   $effect(() => {
     if (!ipScrollContainer) return;
@@ -146,15 +121,39 @@
 
   // Reset scroll to top when the filter/sort reshapes the list so the
   // user isn't looking at arbitrary rows from the previous ordering.
+  let searchSortPrimed = false;
   $effect(() => {
     void searchQuery; void sortBy; void sortAsc;
     untrack(() => {
       if (ipScrollContainer) ipScrollContainer.scrollTop = 0;
       ipScrollTop = 0;
+      if (!searchSortPrimed) {
+        searchSortPrimed = true;
+        return;
+      }
+      scheduleStatsFetch({ offset: 0, debounceMs: 150 });
+    });
+  });
+
+  $effect(() => {
+    void ipScrollTop;
+    void ipViewportHeight;
+    untrack(() => {
+      if (!stats) return;
+      if (windowCoversViewport()) return;
+      scheduleStatsFetch({ quiet: true, offset: desiredListOffset(), debounceMs: 50 });
     });
   });
 
   let unmounted = false;
+  let fetchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function scheduleStatsFetch(opts: { quiet?: boolean; offset?: number; debounceMs: number }) {
+    clearTimeout(fetchTimer);
+    fetchTimer = setTimeout(() => {
+      void loadStats(opts);
+    }, opts.debounceMs);
+  }
 
   onMount(() => {
     void (async () => {
@@ -169,7 +168,7 @@
         await loadStats();
       }
     })();
-    return () => { unmounted = true; clearTimeout(flashTimer); };
+    return () => { unmounted = true; clearTimeout(flashTimer); clearTimeout(fetchTimer); };
   });
 
   let loadStatsSeq = 0;
@@ -179,13 +178,19 @@
   // preserve the optimistic switch state and let the toggle's own post-write
   // reload reconcile the authoritative value.
   let togglesInFlight = 0;
-  async function loadStats() {
+  async function loadStats(opts?: { quiet?: boolean; offset?: number }) {
     if (unmounted) return;
     // Only the latest invocation commits, so overlapping refreshes (mount plus
     // the several post-action reloads) can't clobber newer stats out of order.
     const seq = ++loadStatsSeq;
-    loading = true;
-    error = null;
+    const quiet = opts?.quiet === true;
+    const total = stats?.matched_count ?? 0;
+    let offset = opts?.offset ?? 0;
+    if (total > 0) offset = Math.min(offset, Math.max(0, total - 1));
+    if (!quiet) {
+      loading = true;
+      error = null;
+    }
 
     // The network task only starts serving commands after its full startup,
     // which runs UPnP gateway discovery (bounded to ~5s) concurrently with the
@@ -202,8 +207,15 @@
     let lastErr: unknown = null;
     for (let attempt = 0; ; attempt++) {
       try {
-        const result = await getIpFilterStats();
+        const result = await getIpFilterStats({
+          query: searchQuery,
+          sort: sortBy,
+          sortAsc,
+          offset,
+          limit: IP_STATS_PAGE,
+        });
         if (unmounted || seq !== loadStatsSeq) return;
+        listOffset = offset;
         if (togglesInFlight > 0 && stats) {
           stats = { ...result, enabled: stats.enabled, block_private: stats.block_private };
         } else {
@@ -220,7 +232,7 @@
         if (unmounted || seq !== loadStatsSeq) return;
       }
     }
-    error = toErrorMsg(lastErr);
+    if (!quiet) error = toErrorMsg(lastErr);
     loading = false;
   }
 
@@ -476,7 +488,7 @@
     >
       {showUrlForm ? m.security_cancel_url() : m.security_from_url()}
     </button>
-    <button class="ghost" onclick={loadStats}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => void loadStats({ offset: listOffset })}>{m.common_refresh()}</button>
   </div>
 </div>
 
@@ -592,13 +604,13 @@
         {/if}
       </div>
       <span class="result-count">
-        {filteredEntries.length === 1
+        {matchedCount === 1
           ? m.security_range_count_one()
-          : m.security_range_count_other({ count: filteredEntries.length.toLocaleString() })}
+          : m.security_range_count_other({ count: matchedCount.toLocaleString() })}
       </span>
     </div>
 
-    {#if filteredEntries.length === 0 && !searchQuery.trim()}
+    {#if matchedCount === 0 && !searchQuery.trim()}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <path d="M12 2l7 4v6c0 4.4-3 8.5-7 10-4-1.5-7-5.6-7-10V6l7-4z"></path>
@@ -606,7 +618,7 @@
         <p>{m.security_empty_no_ranges()}</p>
         <p class="sub">{m.security_empty_no_ranges_sub()}</p>
       </div>
-    {:else if filteredEntries.length === 0}
+    {:else if matchedCount === 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <circle cx="11" cy="11" r="8"></circle>

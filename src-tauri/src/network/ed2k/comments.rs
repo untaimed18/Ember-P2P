@@ -10,6 +10,19 @@ pub const RATING_FAIR: u8 = 3;
 pub const RATING_GOOD: u8 = 4;
 pub const RATING_EXCELLENT: u8 = 5;
 
+/// Unpack eMule `FT_FILERATING` / `TAG_FILERATING`. The rating is the low
+/// byte (`1..=5`, `1` = fake). Packed DWORDs also carry a vote count in the
+/// upper bytes; clamping the whole integer with `min(5)` mapped those to
+/// five stars.
+pub fn unpack_file_rating(value: u64) -> Option<u8> {
+    let rating = (value & 0xFF) as u8;
+    if rating == 0 {
+        None
+    } else {
+        Some(rating.min(RATING_EXCELLENT))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileComment {
     pub user_name: String,
@@ -70,11 +83,14 @@ impl CommentManager {
             comment
         };
         let entry = self.comments.entry(file_hash.to_string()).or_default();
-        if entry
+        if let Some(existing) = entry
             .peer_comments
-            .iter()
-            .any(|c| c.user_name == user_name && c.comment == comment)
+            .iter_mut()
+            .find(|c| c.user_name == user_name)
         {
+            existing.rating = rating.min(RATING_EXCELLENT);
+            existing.comment = comment;
+            existing.origin = origin;
             return;
         }
         if entry.peer_comments.len() >= MAX_COMMENTS_PER_FILE {
@@ -132,6 +148,12 @@ impl CommentManager {
             Some(info) => {
                 let mut fake = 0u32;
                 let mut total = 0u32;
+                if info.our_rating > 0 {
+                    total += 1;
+                    if info.our_rating == RATING_FAKE {
+                        fake += 1;
+                    }
+                }
                 for c in &info.peer_comments {
                     if c.rating > 0 {
                         total += 1;
@@ -164,5 +186,40 @@ pub fn rating_name(rating: u8) -> &'static str {
         RATING_GOOD => "Good",
         RATING_EXCELLENT => "Excellent",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_user_replaces_previous_comment() {
+        let mut cm = CommentManager::new();
+        cm.add_peer_comment("aa", "alice".into(), RATING_FAKE, "one".into(), 0);
+        cm.add_peer_comment("aa", "alice".into(), RATING_EXCELLENT, "two".into(), 0);
+        let (fake, total) = cm.fake_rating_stats("aa");
+        assert_eq!(total, 1);
+        assert_eq!(fake, 0);
+        assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 1);
+    }
+
+    #[test]
+    fn our_fake_rating_counts() {
+        let mut cm = CommentManager::new();
+        cm.set_our_comment("bb", RATING_FAKE, "nope".into());
+        let (fake, total) = cm.fake_rating_stats("bb");
+        assert_eq!((fake, total), (1, 1));
+    }
+
+    #[test]
+    fn unpack_file_rating_uses_low_byte() {
+        assert_eq!(unpack_file_rating(0), None);
+        assert_eq!(unpack_file_rating(1), Some(RATING_FAKE));
+        assert_eq!(unpack_file_rating(4), Some(RATING_GOOD));
+        assert_eq!(unpack_file_rating(5), Some(RATING_EXCELLENT));
+        assert_eq!(unpack_file_rating(0x0000_0401), Some(RATING_FAKE));
+        assert_eq!(unpack_file_rating(0x0000_0104), Some(RATING_GOOD));
+        assert_eq!(unpack_file_rating(99), Some(RATING_EXCELLENT));
     }
 }

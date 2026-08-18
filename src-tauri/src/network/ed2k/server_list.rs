@@ -304,10 +304,19 @@ impl ServerList {
     }
 
     /// Check if a server IP is blocked by the IP filter, matching eMule's FilterServerByIP.
+    ///
+    /// While the filter is enabled but `ipfilter.dat` has not finished loading,
+    /// peer paths fail-closed. Applying that same gate here would drop every
+    /// public server from `server.met` on first launch and then persist the
+    /// empty list. Admit until ranges are ready; `remove_filtered` runs after
+    /// the deferred load.
     pub fn is_ip_filtered(
         ip_str: &str,
         ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
     ) -> bool {
+        if ip_filter.is_enabled() && !ip_filter.ranges_ready() {
+            return false;
+        }
         if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
             ip_filter.is_blocked(addr)
         } else {
@@ -1508,5 +1517,22 @@ mod tests {
             found,
             "cleared cooldowns should make the failed High server eligible again"
         );
+    }
+
+    #[test]
+    fn is_ip_filtered_admits_public_ips_while_fail_closed() {
+        let mut filter = crate::network::kad::ip_filter::IpFilter::new(true, false);
+        assert!(!filter.ranges_ready());
+        assert!(
+            !ServerList::is_ip_filtered("8.8.8.8", &mut filter),
+            "fail-closed must not empty server.met on first launch"
+        );
+        filter.mark_ranges_ready();
+        filter.add_range(
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(8, 8, 8, 8),
+            "blocked".to_string(),
+        );
+        assert!(ServerList::is_ip_filtered("8.8.8.8", &mut filter));
     }
 }
