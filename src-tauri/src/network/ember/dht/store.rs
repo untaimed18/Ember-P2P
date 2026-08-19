@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use tracing::debug;
@@ -49,6 +49,35 @@ const MAX_KEYS: usize = 50_000;
 /// rather than refusing the newcomer, so a full store still tracks the keys
 /// we are most responsible for.
 const MAX_STORE_BYTES: usize = 48 * 1024 * 1024;
+
+/// Distinct keys one publisher may hold before admission and eviction treat it
+/// as crowding everyone else out.
+///
+/// Our node ID leads every frame we send, so a publisher can mint keys at any
+/// XOR distance from it just by varying the low bytes — there is no hash to
+/// grind — and both [`DhtStore::make_room_for_key`] and
+/// [`DhtStore::enforce_byte_budget`] rank purely by that distance. Without a
+/// share bound, one identity filling the map with keys a hair from our ID makes
+/// every honest key look further away than everything held: the key cap then
+/// refuses honest keys outright and the byte budget evicts honest records in
+/// the flooder's favour.
+///
+/// An eighth of the map, which no honest remote publisher approaches. A record
+/// only lands here when we are among the k closest to its key, so one peer
+/// holding 6,250 of our 50,000 keys means either a library the rest of the
+/// network is far better placed to hold or a publisher steering keys at us.
+///
+/// This can only ever *withhold* space, never move it — the same discipline
+/// [`MAX_RECORDS_PER_PUBLISHER_PER_KEY`] records above, for the same reason.
+/// Identity is a free keypair, so any rule that lets a publisher holding little
+/// displace one holding much is an eviction primitive rather than fairness. It
+/// follows that a Sybil spending one keypair per key is not bounded by this at
+/// all; bounding that still needs something scarcer than a keypair.
+const MAX_KEYS_PER_PUBLISHER: usize = MAX_KEYS / 8;
+
+/// The same share of [`MAX_STORE_BYTES`], so the memory budget cannot be taken
+/// with few keys and large records instead of many small ones.
+const MAX_BYTES_PER_PUBLISHER: usize = MAX_STORE_BYTES / 8;
 
 /// What one resident record costs the budget.
 ///
@@ -182,6 +211,145 @@ pub struct DhtRecord {
     pub republish_due: bool,
 }
 
+/// What one publisher currently occupies.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PublisherLoad {
+    /// Distinct keys it holds at least one record under.
+    keys: usize,
+    /// Resident bytes, charged exactly as the store-wide total is.
+    bytes: usize,
+}
+
+/// Per-publisher occupancy of the store, kept so [`MAX_KEYS_PER_PUBLISHER`] and
+/// [`MAX_BYTES_PER_PUBLISHER`] can be answered without scanning 50,000 keys on
+/// the store hot path.
+///
+/// Every path that inserts, replaces, evicts, expires or drops a record goes
+/// through [`Self::charge`] / [`Self::discharge`], and nothing else may touch
+/// the map. That single rule is the whole safety argument: admission depends on
+/// these counts, so drift is permanent in either direction — too high refuses an
+/// honest publisher for the life of the process, too low retires the bound
+/// silently.
+///
+/// Deliberately not `Default`: a zero share reads as "everyone is over their
+/// share", which is the one value that must never be reachable by accident.
+struct PublisherIndex {
+    load: HashMap<[u8; 32], PublisherLoad>,
+    /// How many publishers are currently past a share, so "is anyone crowding
+    /// the store?" stays O(1) on the refusal path.
+    over_share: usize,
+    key_share: usize,
+    byte_share: usize,
+    /// Our own publisher key, never counted as crowding. The shares exist to
+    /// stop one *remote* identity taking the store, and `store_own_record`
+    /// files our own records through this same path, so counting them would
+    /// make a large local library refuse itself — and our own search reads our
+    /// own store first.
+    local: Option<[u8; 32]>,
+    /// Set by a scan that found no key held solely by over-share publishers,
+    /// cleared by any charge or discharge. Without it, a flood arriving while
+    /// one publisher sits over its share buys a full scan per refused record —
+    /// exactly what `furthest_key_distance` exists to prevent for distance.
+    no_crowding_victim: bool,
+}
+
+impl PublisherIndex {
+    fn new(key_share: usize, byte_share: usize) -> Self {
+        Self {
+            load: HashMap::new(),
+            over_share: 0,
+            key_share,
+            byte_share,
+            local: None,
+            no_crowding_victim: false,
+        }
+    }
+
+    /// Whether `publisher` is holding more of the store than its share.
+    fn over_share(&self, publisher: &[u8; 32]) -> bool {
+        if self.local.as_ref() == Some(publisher) {
+            return false;
+        }
+        self.load
+            .get(publisher)
+            .is_some_and(|l| l.keys >= self.key_share || l.bytes >= self.byte_share)
+    }
+
+    /// Whether anyone at all is. O(1), so the refusal path can ask per record.
+    fn anyone_over_share(&self) -> bool {
+        self.over_share > 0
+    }
+
+    /// Note a record entering the store. `first_under_key` is whether this
+    /// publisher held nothing else under that key.
+    fn charge(&mut self, publisher: &[u8; 32], bytes: usize, first_under_key: bool) {
+        self.no_crowding_victim = false;
+        let counted = self.local.as_ref() != Some(publisher);
+        let (key_share, byte_share) = (self.key_share, self.byte_share);
+        let load = self.load.entry(*publisher).or_default();
+        let was = counted && (load.keys >= key_share || load.bytes >= byte_share);
+        load.bytes = load.bytes.saturating_add(bytes);
+        if first_under_key {
+            load.keys = load.keys.saturating_add(1);
+        }
+        let now = counted && (load.keys >= key_share || load.bytes >= byte_share);
+        if now && !was {
+            self.over_share = self.over_share.saturating_add(1);
+        }
+    }
+
+    /// Note a record leaving it. `last_under_key` is whether that was this
+    /// publisher's last record under that key.
+    fn discharge(&mut self, publisher: &[u8; 32], bytes: usize, last_under_key: bool) {
+        self.no_crowding_victim = false;
+        let counted = self.local.as_ref() != Some(publisher);
+        let (key_share, byte_share) = (self.key_share, self.byte_share);
+        let Some(load) = self.load.get_mut(publisher) else {
+            return;
+        };
+        let was = counted && (load.keys >= key_share || load.bytes >= byte_share);
+        load.bytes = load.bytes.saturating_sub(bytes);
+        if last_under_key {
+            load.keys = load.keys.saturating_sub(1);
+        }
+        let now = counted && (load.keys >= key_share || load.bytes >= byte_share);
+        if was && !now {
+            self.over_share = self.over_share.saturating_sub(1);
+        }
+        // Dropping spent entries is what bounds the map by the resident record
+        // set rather than by every publisher ever seen.
+        if load.keys == 0 && load.bytes == 0 {
+            self.load.remove(publisher);
+        }
+    }
+
+    fn set_local(&mut self, publisher: [u8; 32]) {
+        self.local = Some(publisher);
+        self.recount();
+    }
+
+    #[cfg(test)]
+    fn set_shares(&mut self, key_share: usize, byte_share: usize) {
+        self.key_share = key_share;
+        self.byte_share = byte_share;
+        self.recount();
+    }
+
+    /// Re-derive `over_share` after a change to what "over share" means.
+    fn recount(&mut self) {
+        let local = self.local;
+        let (key_share, byte_share) = (self.key_share, self.byte_share);
+        self.over_share = self
+            .load
+            .iter()
+            .filter(|(publisher, load)| {
+                local.as_ref() != Some(*publisher)
+                    && (load.keys >= key_share || load.bytes >= byte_share)
+            })
+            .count();
+    }
+}
+
 /// Local DHT key-value store for Ember DHT.
 ///
 /// Stores signed records indexed by 16-byte keys (BLAKE3 hashes of keywords,
@@ -189,6 +357,8 @@ pub struct DhtRecord {
 /// sources for the same file).
 pub struct DhtStore {
     entries: HashMap<[u8; 16], Vec<DhtRecord>>,
+    /// Who holds how much of `entries`. See [`PublisherIndex`].
+    publisher_index: PublisherIndex,
     /// Current permissiveness of the abuse limits, refreshed from the routing
     /// table. Defaults to the most permissive tier so a store used before the
     /// scale is known never rejects a legitimate record.
@@ -258,6 +428,7 @@ impl DhtStore {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            publisher_index: PublisherIndex::new(MAX_KEYS_PER_PUBLISHER, MAX_BYTES_PER_PUBLISHER),
             scale: scale::NetworkScale::Bootstrap,
             republish_cursor: None,
             bytes: 0,
@@ -317,6 +488,12 @@ impl DhtStore {
         self.local_id = Some(local_id);
     }
 
+    /// Tell the store which publisher key is our own, so the per-publisher
+    /// shares never apply to records we authored. See [`PublisherIndex::local`].
+    pub fn set_local_publisher_key(&mut self, publisher_key: [u8; 32]) {
+        self.publisher_index.set_local(publisher_key);
+    }
+
     /// Resident record bytes. The observable side of the byte budget, kept
     /// for the tests that pin eviction and for diagnostics.
     #[allow(dead_code)]
@@ -339,11 +516,28 @@ impl DhtStore {
         self.key_budget = budget;
     }
 
-    /// Drop a key and everything under it, keeping the byte total in step.
+    /// Shrink the per-publisher shares so the fairness bound can be exercised
+    /// without minting thousands of keys. Left at the production values by the
+    /// budget setters above on purpose: those shrink the *store*, and a share
+    /// that shrank with it would make a lone publisher in a tiny test store
+    /// look like it was crowding the network out.
+    #[cfg(test)]
+    fn set_publisher_shares_for_test(&mut self, keys: usize, bytes: usize) {
+        self.publisher_index.set_shares(keys, bytes);
+    }
+
+    /// Drop a key and everything under it, keeping the byte total and the
+    /// per-publisher index in step.
     fn drop_key(&mut self, key: &[u8; 16]) {
         if let Some(records) = self.entries.remove(key) {
+            // One key slot per publisher, however many records it held here.
+            let mut released: HashSet<[u8; 32]> = HashSet::new();
             for record in records {
-                self.bytes = self.bytes.saturating_sub(record_cost(record.data.len()));
+                let cost = record_cost(record.data.len());
+                self.bytes = self.bytes.saturating_sub(cost);
+                let last = released.insert(record.publisher_key);
+                self.publisher_index
+                    .discharge(&record.publisher_key, cost, last);
             }
         }
         self.serve_cursor.remove(key);
@@ -357,12 +551,14 @@ impl DhtStore {
     /// spreading records over random keys could therefore fill the map and
     /// deny service for the keys that actually belong here.
     ///
-    /// Expired keys go first, being free. Otherwise the furthest key from us
-    /// is given up, and only when the incoming key is closer than it. That
-    /// ordering is what makes the eviction safe rather than a new lever: a
-    /// flood of distant keys finds nothing it is allowed to displace, while a
-    /// key we are genuinely responsible for always finds room.
-    fn make_room_for_key(&mut self, incoming: &[u8; 16]) -> bool {
+    /// Expired keys go first, being free. Then a key held only by publishers
+    /// past their share, since those slots were taken by crowding rather than
+    /// by responsibility. Otherwise the furthest key from us is given up, and
+    /// only when the incoming key is closer than it. That ordering is what
+    /// makes the eviction safe rather than a new lever: a flood of distant keys
+    /// finds nothing it is allowed to displace, while a key we are genuinely
+    /// responsible for always finds room.
+    fn make_room_for_key(&mut self, incoming: &[u8; 16], publisher: &[u8; 32]) -> bool {
         if self.entries.len() < self.key_budget {
             return true;
         }
@@ -371,12 +567,26 @@ impl DhtStore {
         let Some(local) = self.local_id else {
             return false;
         };
+        // A publisher already holding its share of the map gets no further key
+        // slot, whatever the distance says. Refusal only, never displacement —
+        // see MAX_KEYS_PER_PUBLISHER.
+        if self.publisher_index.over_share(publisher) {
+            return false;
+        }
         let incoming_distance = xor_distance(&local.0, incoming);
 
         // The O(1) refusal that keeps a flood cheap. Safe because the bound
         // over-estimates: anything it rejects, a full scan would reject too.
+        //
+        // Stood down only while someone is over their share and the last scan
+        // did find a key we may take from them, because then distance is no
+        // longer the only thing that decides. `no_crowding_victim` is what keeps
+        // that from handing a flooder a full scan per refused record.
         if let Some(bound) = self.furthest_key_distance {
-            if incoming_distance >= bound {
+            if incoming_distance >= bound
+                && (!self.publisher_index.anyone_over_share()
+                    || self.publisher_index.no_crowding_victim)
+            {
                 return false;
             }
         }
@@ -398,12 +608,24 @@ impl DhtStore {
             }
         }
 
-        // Furthest key to evict, and the next-furthest to seed the bound with
-        // once it is gone — both from a single pass.
+        // Furthest key to evict, the next-furthest to seed the bound with once
+        // it is gone, and the furthest key held *only* by publishers past their
+        // share — all from a single pass. The per-record test is skipped
+        // entirely when nobody is over share, which is the normal case.
         let mut furthest: Option<([u8; 16], [u8; 16])> = None;
         let mut runner_up: Option<[u8; 16]> = None;
-        for key in self.entries.keys() {
+        let mut crowding: Option<([u8; 16], [u8; 16])> = None;
+        let index = &self.publisher_index;
+        let look_for_crowding = index.anyone_over_share();
+        for (key, records) in self.entries.iter() {
             let distance = xor_distance(&local.0, key);
+            if look_for_crowding
+                && !records.is_empty()
+                && crowding.is_none_or(|(_, held)| distance > held)
+                && records.iter().all(|r| index.over_share(&r.publisher_key))
+            {
+                crowding = Some((*key, distance));
+            }
             match furthest {
                 Some((_, current)) if distance > current => {
                     runner_up = Some(current);
@@ -416,6 +638,24 @@ impl DhtStore {
                 }
                 None => furthest = Some((*key, distance)),
             }
+        }
+
+        // Giving up a crowding publisher's key ahead of our own furthest is
+        // what stops one identity that filled the map from locking every honest
+        // key out: it holds those slots only because it chose keys next to our
+        // ID, which is free to do. The incoming publisher is under its share
+        // (checked above), so this can never be used to strip an incumbent.
+        if let Some((victim, _)) = crowding {
+            self.drop_key(&victim);
+            debug!(
+                "DHT store at the {}-key cap: gave up {} from a publisher over its share",
+                self.key_budget,
+                hex::encode(victim)
+            );
+            return true;
+        }
+        if look_for_crowding {
+            self.publisher_index.no_crowding_victim = true;
         }
 
         let Some((furthest_key, furthest_distance)) = furthest else {
@@ -464,24 +704,34 @@ impl DhtStore {
         // the key's distance, so the choice of which key to give up is the
         // only one distance can decide. Expiry then picks the order within a
         // key.
-        let mut ranked: Vec<([u8; 16], [u8; 16])> = self
+        let index = &self.publisher_index;
+        let crowded = index.anyone_over_share();
+        let mut ranked: Vec<([u8; 16], bool, [u8; 16])> = self
             .entries
-            .keys()
-            .filter(|key| *key != spare)
-            .map(|key| {
+            .iter()
+            .filter(|(key, _)| *key != spare)
+            .map(|(key, records)| {
                 let distance = match local {
                     Some(id) => xor_distance(&id.0, key),
                     None => [0u8; 16],
                 };
-                (*key, distance)
+                // Keys held only by publishers past their share go first,
+                // whatever the distance. Ranking on distance alone made the
+                // budget an eviction primitive: our own ID is public, so a
+                // flooder can mint keys nearer to us than any honest one and
+                // have every honest record dropped in its favour.
+                let crowding = crowded
+                    && !records.is_empty()
+                    && records.iter().all(|r| index.over_share(&r.publisher_key));
+                (*key, crowding, distance)
             })
             .collect();
-        // Furthest from us first: those are the keys other nodes are best
-        // placed to serve.
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        // Crowding first, then furthest from us: those are the keys other nodes
+        // are best placed to serve.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
 
         let mut dropped = 0usize;
-        'keys: for (key, _) in ranked {
+        'keys: for (key, _, _) in ranked {
             let Some(records) = self.entries.get_mut(&key) else {
                 continue;
             };
@@ -497,7 +747,13 @@ impl DhtStore {
                     break;
                 };
                 let victim = records.remove(soonest);
-                self.bytes = self.bytes.saturating_sub(record_cost(victim.data.len()));
+                let cost = record_cost(victim.data.len());
+                self.bytes = self.bytes.saturating_sub(cost);
+                let last = !records
+                    .iter()
+                    .any(|r| r.publisher_key == victim.publisher_key);
+                self.publisher_index
+                    .discharge(&victim.publisher_key, cost, last);
                 dropped += 1;
             }
             if records.is_empty() {
@@ -604,7 +860,7 @@ impl DhtStore {
         }
 
         if !self.entries.contains_key(&key) {
-            if !self.make_room_for_key(&key) {
+            if !self.make_room_for_key(&key, &publisher_key) {
                 self.key_cap_rejections = self.key_cap_rejections.saturating_add(1);
                 debug!(
                     "DHT store full ({} keys) and holds nothing further away than {}; rejecting",
@@ -684,6 +940,11 @@ impl DhtStore {
                 "byte counter fell behind resident records"
             );
             self.bytes = self.bytes + new_len - old_len.min(self.bytes);
+            // A replacement, so the publisher's key count is unchanged and only
+            // the byte charge moves.
+            self.publisher_index
+                .discharge(&publisher_key, old_len, false);
+            self.publisher_index.charge(&publisher_key, new_len, false);
             self.enforce_byte_budget(&key);
             return true;
         }
@@ -712,15 +973,25 @@ impl DhtStore {
         // this one could dedupe against cannot itself be lapsed, because
         // `store_attributed` has already refused anything whose age exceeds its TTL.
         let mut reclaimed = 0usize;
+        let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
         records.retain(|r| {
             if r.expires_at <= now {
-                reclaimed += record_cost(r.data.len());
+                let cost = record_cost(r.data.len());
+                reclaimed += cost;
+                lapsed.push((r.publisher_key, cost));
                 false
             } else {
                 true
             }
         });
         self.bytes = self.bytes.saturating_sub(reclaimed);
+        // A publisher gives up its key slot once, however many of its records
+        // under this key lapsed together.
+        let mut released: HashSet<[u8; 32]> = HashSet::new();
+        for (author, cost) in lapsed {
+            let last = !records.iter().any(|r| r.publisher_key == author) && released.insert(author);
+            self.publisher_index.discharge(&author, cost, last);
+        }
 
         // Per-IP cap on source records, mirroring KAD's MAX_SOURCES_PER_IP.
         // A source record names an address to download from, so without this
@@ -787,8 +1058,12 @@ impl DhtStore {
             return false;
         }
 
-        self.bytes += record_cost(record.data.len());
+        let cost = record_cost(record.data.len());
+        self.bytes += cost;
         records.push(record);
+        // `mine` was counted a few lines up, before the push, so zero there
+        // means this record is what puts the publisher on this key.
+        self.publisher_index.charge(&publisher_key, cost, mine == 0);
         self.enforce_byte_budget(&key);
         true
     }
@@ -822,19 +1097,34 @@ impl DhtStore {
         let mut total_removed = 0;
 
         let mut freed = 0usize;
+        // Collected rather than applied in place: the closure cannot reach the
+        // index while `entries` is being retained.
+        let mut released: Vec<([u8; 32], usize, bool)> = Vec::new();
         self.entries.retain(|_, records| {
             let before = records.len();
+            let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
             records.retain(|r| {
                 let live = r.expires_at > now;
                 if !live {
-                    freed += record_cost(r.data.len());
+                    let cost = record_cost(r.data.len());
+                    freed += cost;
+                    lapsed.push((r.publisher_key, cost));
                 }
                 live
             });
             total_removed += before - records.len();
+            let mut gave_up_key: HashSet<[u8; 32]> = HashSet::new();
+            for (author, cost) in lapsed {
+                let last = !records.iter().any(|r| r.publisher_key == author)
+                    && gave_up_key.insert(author);
+                released.push((author, cost, last));
+            }
             !records.is_empty()
         });
         self.bytes = self.bytes.saturating_sub(freed);
+        for (author, cost, last) in released {
+            self.publisher_index.discharge(&author, cost, last);
+        }
         self.serve_cursor
             .retain(|k, _| self.entries.contains_key(k));
 
@@ -1133,6 +1423,43 @@ impl DhtStore {
         (keys, records)
     }
 
+    /// Re-derive the per-publisher index from `entries` and assert it matches.
+    ///
+    /// The index is maintained incrementally on every mutation path, and
+    /// admission depends on it, so a drift that goes unnoticed is permanent.
+    /// This is the check that makes "audit every mutation site" verifiable
+    /// rather than a claim.
+    #[cfg(test)]
+    fn assert_publisher_index_consistent(&self) {
+        let mut expected: HashMap<[u8; 32], PublisherLoad> = HashMap::new();
+        for records in self.entries.values() {
+            let mut counted: HashSet<[u8; 32]> = HashSet::new();
+            for r in records {
+                let load = expected.entry(r.publisher_key).or_default();
+                load.bytes += record_cost(r.data.len());
+                if counted.insert(r.publisher_key) {
+                    load.keys += 1;
+                }
+            }
+        }
+        assert_eq!(
+            self.publisher_index.load.len(),
+            expected.len(),
+            "the index tracks {} publishers, the store holds records from {}",
+            self.publisher_index.load.len(),
+            expected.len()
+        );
+        for (publisher, want) in &expected {
+            let got = self.publisher_index.load.get(publisher).copied();
+            assert_eq!(
+                got,
+                Some(*want),
+                "index drifted for publisher {}",
+                hex::encode(publisher)
+            );
+        }
+    }
+
     /// Snapshot of live keys for the diagnostic UI. Sorted by record count
     /// descending, capped at `max`.
     pub fn snapshot(&self, max: usize) -> Vec<DhtStoreEntry> {
@@ -1371,6 +1698,236 @@ mod tests {
         assert_eq!(store.key_count(), 8);
         assert!(store.get(&far).is_none());
         assert_eq!(store.reject_stats().key_cap, 1);
+    }
+
+    /// Our node ID leads every frame we send, so a publisher can mint keys a
+    /// hair from it by varying the low bytes — no hash to grind — and the key
+    /// cap ranks purely by that distance. Once the map is full those keys make
+    /// every honest key look further away than everything held. A publisher
+    /// already at its share gets no further slot, however close it aims.
+    #[test]
+    fn a_publisher_at_its_share_gets_no_more_key_slots() {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        store.set_key_budget_for_test(8);
+        store.set_publisher_shares_for_test(4, usize::MAX);
+
+        let (hog, hog_pk) = keypair();
+        // Half the map to one publisher, half spread across distinct ones, all
+        // at the same distance so only the share can decide anything.
+        for i in 0..8u8 {
+            let mut key = [0x20u8; 16];
+            key[15] = i;
+            let data = vec![i];
+            if i < 4 {
+                assert!(store.store(key, data.clone(), sign(&hog, &data), hog_pk, now_ts()));
+            } else {
+                let (sk, pk) = keypair();
+                assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
+            }
+        }
+        assert_eq!(store.key_count(), 8, "the map has to be full to be in play");
+
+        // A key right against our ID — closer than everything held, so distance
+        // alone would have displaced an honest key for it.
+        let near = [0u8; 16];
+        let data = vec![0xAAu8];
+        assert!(
+            !store.store(near, data.clone(), sign(&hog, &data), hog_pk, now_ts()),
+            "a publisher over its share must be refused however close its key is"
+        );
+        assert_eq!(store.key_count(), 8, "and nothing may be displaced for it");
+        assert_eq!(store.reject_stats().key_cap, 1);
+        store.assert_publisher_index_consistent();
+    }
+
+    /// The other half of the same rule, and what makes it more than a refusal:
+    /// a publisher that filled the map holds those slots only because choosing
+    /// keys next to us is free, so when room is needed its keys go before an
+    /// honest publisher's. Otherwise being closer stays a way to displace
+    /// honest records, which is the whole trick.
+    #[test]
+    fn a_crowding_publisher_loses_a_key_before_an_honest_one() {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        store.set_key_budget_for_test(8);
+        store.set_publisher_shares_for_test(4, usize::MAX);
+
+        let (hog, hog_pk) = keypair();
+        let mut hog_keys = Vec::new();
+        for i in 0..4u8 {
+            let mut key = [0u8; 16];
+            key[15] = i;
+            hog_keys.push(key);
+            let data = vec![i];
+            assert!(store.store(key, data.clone(), sign(&hog, &data), hog_pk, now_ts()));
+        }
+        let mut honest_keys = Vec::new();
+        for i in 4..8u8 {
+            let mut key = [0x40u8; 16];
+            key[15] = i;
+            honest_keys.push(key);
+            let (sk, pk) = keypair();
+            let data = vec![i];
+            assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
+        }
+
+        // Further from us than everything held, so the distance rule alone
+        // refuses it outright.
+        let far = [0xFFu8; 16];
+        let (newcomer, newcomer_pk) = keypair();
+        let data = vec![0xEEu8];
+        assert!(
+            store.store(far, data.clone(), sign(&newcomer, &data), newcomer_pk, now_ts()),
+            "a crowding publisher's key is the one to give up"
+        );
+        assert_eq!(store.key_count(), 8);
+        for key in &honest_keys {
+            assert!(
+                store.get(key).is_some(),
+                "no honest key may be displaced for it"
+            );
+        }
+        assert_eq!(
+            hog_keys.iter().filter(|k| store.get(k).is_some()).count(),
+            3,
+            "exactly one of the crowding publisher's keys should have gone"
+        );
+        store.assert_publisher_index_consistent();
+    }
+
+    /// The byte budget ranks the same way, so a fill from keys chosen next to
+    /// our ID evicted honest records rather than the flooder's own.
+    #[test]
+    fn the_byte_budget_drops_a_crowding_publisher_before_an_honest_one() {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        store.set_publisher_shares_for_test(4, usize::MAX);
+
+        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 1024];
+        store.set_byte_budget_for_test(record_cost(body.len()) * 8);
+
+        let (hog, hog_pk) = keypair();
+        let hog_sig = sign(&hog, &body);
+        let mut hog_keys = Vec::new();
+        for i in 0..4u8 {
+            let mut key = [0u8; 16];
+            key[15] = i;
+            hog_keys.push(key);
+            assert!(store.store(key, body.clone(), hog_sig, hog_pk, now_ts()));
+        }
+        let mut honest_keys = Vec::new();
+        for i in 4..8u8 {
+            let mut key = [0x40u8; 16];
+            key[15] = i;
+            honest_keys.push(key);
+            let (sk, pk) = keypair();
+            assert!(store.store(key, body.clone(), sign(&sk, &body), pk, now_ts()));
+        }
+
+        // One more record takes the store over budget, so eviction has to pick
+        // a victim.
+        let (last, last_pk) = keypair();
+        assert!(store.store([0x7Fu8; 16], body.clone(), sign(&last, &body), last_pk, now_ts()));
+
+        for key in &honest_keys {
+            assert!(
+                store.get_live(key).len() == 1,
+                "an honest publisher's record must survive a crowding publisher's"
+            );
+        }
+        assert!(
+            hog_keys.iter().filter(|k| !store.get_live(k).is_empty()).count() < 4,
+            "the crowding publisher is what the budget should have come out of"
+        );
+        assert!(store.byte_len() <= store.byte_budget);
+        store.assert_publisher_index_consistent();
+    }
+
+    /// Admission depends on the per-publisher index, so a drift in it is
+    /// permanent: too high refuses an honest publisher for the life of the
+    /// process, too low retires the bound silently. Churn a store through every
+    /// path that moves a record and re-derive the index from scratch each time.
+    #[test]
+    fn the_publisher_index_survives_every_path_that_moves_a_record() {
+        use super::super::publish::SignedRecord;
+
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+
+        // Several publishers, several files each, sharing keywords so keys hold
+        // records from more than one author.
+        for word in ["ubuntu", "debian", "fedora"] {
+            for p in 0..4u8 {
+                let sk = SigningKey::from_bytes(&[p + 1; 32]);
+                for f in 0..3u8 {
+                    let mut file = [0u8; 16];
+                    file[0] = p;
+                    file[1] = f;
+                    let rec = SignedRecord::keyword(word, file, [0u8; 32], 100, "f.iso", &sk);
+                    assert!(store.store(
+                        rec.keyword_hash,
+                        rec.data.clone(),
+                        rec.signature,
+                        rec.publisher_key,
+                        rec.timestamp,
+                    ));
+                }
+            }
+        }
+        assert_eq!(store.total_records(), 36);
+        store.assert_publisher_index_consistent();
+
+        // A republish replaces in place: the byte charge moves, the key count
+        // must not.
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let again =
+            SignedRecord::keyword("ubuntu", [0u8; 16], [0u8; 32], 100, "a-longer-name.iso", &sk);
+        assert!(store.store(
+            again.keyword_hash,
+            again.data.clone(),
+            again.signature,
+            again.publisher_key,
+            again.timestamp,
+        ));
+        assert_eq!(store.total_records(), 36, "a republish is not a new record");
+        store.assert_publisher_index_consistent();
+
+        // Expiry, taking some of a publisher's records under a key but not all.
+        for records in store.entries.values_mut() {
+            for (i, r) in records.iter_mut().enumerate() {
+                if i % 3 == 0 {
+                    r.expires_at = Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        assert!(store.expire() > 0);
+        store.assert_publisher_index_consistent();
+
+        // Byte eviction, which takes records one at a time and drops a key once
+        // it empties.
+        store.set_byte_budget_for_test(store.byte_len() / 2);
+        let (spare, spare_pk) = keypair();
+        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 512];
+        assert!(store.store([0x7Fu8; 16], body.clone(), sign(&spare, &body), spare_pk, now_ts()));
+        store.assert_publisher_index_consistent();
+
+        // The key cap, which drops whole keys at once.
+        assert!(store.key_count() > 0);
+        store.set_key_budget_for_test(store.key_count());
+        let (closest, closest_pk) = keypair();
+        let near = vec![super::super::publish::RECORD_TYPE_KEYWORD, 3];
+        assert!(store.store([0u8; 16], near.clone(), sign(&closest, &near), closest_pk, now_ts()));
+        store.assert_publisher_index_consistent();
+
+        // And a restore, which files records back through this same path.
+        let saved = store.persistable(1000);
+        let mut restored = DhtStore::new();
+        restored.set_local_id(EmberNodeId([0u8; 16]));
+        assert!(restored.restore(saved) > 0);
+        restored.assert_publisher_index_consistent();
     }
 
     /// A body that cannot pack into a FOUND_VALUE even as the only blob must

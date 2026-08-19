@@ -122,6 +122,24 @@ impl ResponseOutcome {
     };
 }
 
+/// Why a query will never be answered, which decides whether the node may be
+/// asked again inside this search.
+///
+/// The distinction is about the caller, not the node. Returning a node with
+/// attempts left to `Pending` only means anything if something is going to
+/// drive the search again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFailure {
+    /// The query reached the wire and its deadline passed. The 1 Hz sweep that
+    /// reports it drives the search again immediately afterwards, so a node put
+    /// back on the queue really does get asked.
+    TimedOut,
+    /// The query never left this process — transport error, unroutable
+    /// address, unusable `noise_pub`. No wire request is registered for it, so
+    /// no deadline exists that could expire and re-drive the walk.
+    NotSent,
+}
+
 /// State of a node in the search shortlist.
 #[derive(Debug, Clone, PartialEq)]
 enum NodeState {
@@ -508,6 +526,24 @@ impl IterativeSearch {
     /// so one lost datagram does not permanently remove it from this search.
     /// See [`MAX_QUERY_ATTEMPTS`].
     pub fn mark_failed(&mut self, request_id: u32) -> Option<EmberNodeId> {
+        self.mark_failed_with(request_id, QueryFailure::TimedOut)
+    }
+
+    /// [`Self::mark_failed`] for a caller that can say whether a retry is
+    /// actually coming.
+    ///
+    /// [`QueryFailure::NotSent`] leaves the entry `Failed` even with attempts
+    /// to spare. The send-failure path registers no wire request, so no
+    /// deadline will ever expire and re-drive the search: a node returned to
+    /// `Pending` there is work `check_complete` keeps seeing as outstanding
+    /// forever. A one-entry shortlist — the shape of a handful-of-nodes
+    /// deployment — then held its search slot and its waiter until the
+    /// whole-search backstop, two minutes later.
+    pub fn mark_failed_with(
+        &mut self,
+        request_id: u32,
+        failure: QueryFailure,
+    ) -> Option<EmberNodeId> {
         let failed = self.pending_requests.remove(&request_id);
         if let Some(node_id) = failed {
             let spent = self
@@ -515,7 +551,7 @@ impl IterativeSearch {
                 .get(&node_id)
                 .copied()
                 .unwrap_or(MAX_QUERY_ATTEMPTS);
-            let retryable = spent < MAX_QUERY_ATTEMPTS;
+            let retryable = failure == QueryFailure::TimedOut && spent < MAX_QUERY_ATTEMPTS;
             for entry in &mut self.shortlist {
                 if entry.contact.node_id == node_id {
                     entry.state = if retryable {
@@ -636,10 +672,19 @@ impl IterativeSearch {
     }
 
     /// Get the closest responded nodes (useful for FIND_NODE results).
+    ///
+    /// Capped at k. The shortlist keeps pinned session peers past rank k and
+    /// `next_to_query` asks them first, so a walk that exhausts its shortlist
+    /// can leave more than k entries `Responded`. `network/mod.rs` files this
+    /// set as the key's publish targets and trusts it for hours, so without the
+    /// cap a record fans out past `K_EMBER_REPLICAS`. The shortlist is ordered
+    /// by distance, so what drops off is the farthest — the nodes likeliest to
+    /// refuse the store on proximity anyway.
     pub fn closest_responded(&self) -> Vec<EmberContact> {
         self.shortlist
             .iter()
             .filter(|e| e.state == NodeState::Responded)
+            .take(K_BUCKET_SIZE)
             .map(|e| e.contact.clone())
             .collect()
     }
@@ -1280,6 +1325,120 @@ mod tests {
         let retry = search.next_to_query();
         assert_eq!(retry.len(), 1, "the node is eligible again");
         assert_eq!(retry[0].0.node_id, peer.node_id);
+    }
+
+    /// Only if something is going to ask again. The send-failure path registers
+    /// no wire request, so no deadline exists to expire and re-drive the walk —
+    /// a node put back on `Pending` there is work `check_complete` sees as
+    /// outstanding forever, and a one-entry shortlist held its search slot and
+    /// its waiter until the whole-search backstop two minutes later.
+    #[test]
+    fn a_query_that_never_reached_the_wire_ends_a_one_peer_search() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let (_, first) = search.next_to_query().remove(0);
+        assert_eq!(
+            search.mark_failed_with(first, QueryFailure::NotSent),
+            Some(peer.node_id)
+        );
+        assert!(
+            MAX_QUERY_ATTEMPTS > 1,
+            "the point is that the node still had an attempt to spare"
+        );
+        assert!(
+            search.complete,
+            "a walk nothing will re-drive has to finish on the spot"
+        );
+        assert!(
+            search.next_to_query().is_empty(),
+            "and must not queue a retry no one is going to send"
+        );
+    }
+
+    /// The other arm has to keep the retry, since the deadline sweep that
+    /// reports a timeout drives the search again straight afterwards.
+    #[test]
+    fn a_timed_out_query_is_still_retried_when_asked_for_explicitly() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let (_, first) = search.next_to_query().remove(0);
+        assert_eq!(
+            search.mark_failed_with(first, QueryFailure::TimedOut),
+            Some(peer.node_id)
+        );
+        assert!(!search.complete, "one miss must not end a one-peer search");
+        let retry = search.next_to_query();
+        assert_eq!(retry.len(), 1, "the node is eligible again");
+        assert_eq!(retry[0].0.node_id, peer.node_id);
+    }
+
+    /// A publish-target lookup resolves through `closest_responded`, and
+    /// `network/mod.rs` files that set as the key's replicas for hours. Pinned
+    /// session peers are kept past rank k and asked first, so a walk that has
+    /// to exhaust its shortlist — which a dead contact at the head forces, and
+    /// that is not rare — leaves more than k nodes responded and fans the
+    /// record out past `K_EMBER_REPLICAS`.
+    #[test]
+    fn a_lookup_resolves_with_at_most_k_nodes() {
+        let target = make_id(0x00);
+        let rt = table_with_contacts(make_id(0xFF), K_BUCKET_SIZE as u8);
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        // Connected session peers, pinned exactly as `start_ember_find_node`
+        // does, and far enough out to sit past the k-trim.
+        let extras: Vec<EmberContact> = (0..4).map(|i| make_contact(0xF0 + i)).collect();
+        assert_eq!(sm.seed_extra_contacts(sid, extras), 4);
+
+        let search = sm.get_mut(sid).unwrap();
+        // The closest contact never answers, so the head can never be
+        // `Responded` and convergence cannot fire: the walk exhausts instead.
+        let dead_head = make_id(0x40);
+        let mut responded = 0usize;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for (contact, req_id) in batch {
+                if contact.node_id == dead_head {
+                    search.mark_failed(req_id);
+                } else {
+                    search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                    responded += 1;
+                }
+            }
+        }
+
+        assert!(
+            responded > K_BUCKET_SIZE,
+            "the walk has to leave more than k nodes responded for this to bite, \
+             got {responded}"
+        );
+        let resolved = search.closest_responded();
+        assert_eq!(
+            resolved.len(),
+            K_BUCKET_SIZE,
+            "a lookup must not resolve with more replicas than a key is meant to have"
+        );
+        assert!(
+            !resolved.iter().any(|c| c.node_id == make_id(0xF3)),
+            "and the entries dropped must be the farthest ones"
+        );
     }
 
     /// Retry has to be bounded, or a dead node keeps a search alive forever.

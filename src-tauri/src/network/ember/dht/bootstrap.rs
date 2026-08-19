@@ -9,6 +9,14 @@ use super::{EmberContact, EmberNodeId};
 
 const NODES_EMBER_MAGIC: u32 = 0x454D_4233; // "EMB3" in LE
 const NODES_EMBER_VERSION: u8 = 1;
+/// Contacts `load_nodes` will parse from one file, whatever its header claims.
+///
+/// Same reasoning as [`MAX_PERSISTED_RECORDS`], and taken from the same place —
+/// the ceiling the save path is called with — so the two cannot drift. The
+/// header field is a `u16`, so without this a hand-edited or corrupt file buys
+/// 65,535 parse iterations, as many Ed25519 point decompressions and as many
+/// `add_contact` calls, all on the startup path.
+const MAX_PERSISTED_CONTACTS: usize = crate::network::EMBER_PERSIST_MAX_CONTACTS;
 
 /// Persist the routing table to `nodes_ember.dat`.
 ///
@@ -85,7 +93,14 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
         anyhow::bail!("Unsupported nodes_ember.dat version {version}");
     }
 
-    let count = cursor.read_u16::<LittleEndian>()? as usize;
+    let declared = cursor.read_u16::<LittleEndian>()? as usize;
+    if declared > MAX_PERSISTED_CONTACTS {
+        warn!(
+            "nodes_ember.dat declares {declared} contacts, more than this build writes; \
+             reading the first {MAX_PERSISTED_CONTACTS}"
+        );
+    }
+    let count = declared.min(MAX_PERSISTED_CONTACTS);
     let mut contacts = Vec::with_capacity(count);
     // Contacts dropped because their persisted Ed25519 key was unusable. Tracked
     // separately so the truncation check below doesn't misfire when we
@@ -447,6 +462,47 @@ mod tests {
         );
         assert!(loaded.iter().all(|c| c.last_seen == 0));
         assert!(loaded.iter().all(|c| !c.is_verified()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The header count is a `u16` and the save path never writes more than
+    /// `EMBER_PERSIST_MAX_CONTACTS`, so anything above that is a corrupt or
+    /// hand-edited file asking the startup path for up to 65,535 key
+    /// decompressions and `add_contact` calls.
+    #[test]
+    fn a_file_declaring_more_contacts_than_we_write_is_capped() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_overlong");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        // Distinct real keypairs: the loader re-derives each id from its key,
+        // and duplicates would be indistinguishable from a shorter file.
+        let overlong: Vec<EmberContact> = (0..(MAX_PERSISTED_CONTACTS as u16 + 5))
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..2].copy_from_slice(&i.to_le_bytes());
+                let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+                EmberContact {
+                    node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(
+                        &vk,
+                    )),
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 2, 3)), 4662 + i),
+                    noise_pub: [1u8; 32],
+                    ed25519_pub: vk.to_bytes(),
+                    last_seen: 1000,
+                    failed_queries: 0,
+                }
+            })
+            .collect();
+        save_nodes(&path, &overlong).unwrap();
+
+        let loaded = load_nodes(&path).unwrap();
+        assert_eq!(
+            loaded.len(),
+            MAX_PERSISTED_CONTACTS,
+            "the loader must stop at the ceiling the save path writes under"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

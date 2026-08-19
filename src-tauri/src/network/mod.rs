@@ -1154,24 +1154,57 @@ fn lookup_ember_noise_key_at(
 /// bootstrap for the rest of the session while continuously re-learning the
 /// very peers it needed, and the maintenance gate stayed open the whole time
 /// so it looked healthy.
-const EMBER_BRIDGE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+///
+/// That fix left a flat five-minute window, which is poorly matched to the
+/// causes it lists: a dropped datagram or a peer that blinked resolves in
+/// seconds, not minutes. On a small overlay the cost is the whole join — a node
+/// holding two candidates spent one ping on each and then sat silent, so a
+/// session shorter than five minutes got exactly one chance per peer. Retry
+/// quickly at first and back off to the original ceiling, mirroring
+/// [`ember_rendezvous_retry_secs`], which solves the same problem for the
+/// rendezvous lookup.
+///
+/// Retrying sooner is close to free: the bridge only runs below
+/// [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts, it is capped at
+/// [`EMBER_KAD_BRIDGE_MAX_PINGS`] per cycle, and the maintenance tick that
+/// drives it is itself 60 seconds — so that is the real floor no matter what
+/// this returns.
+const EMBER_BRIDGE_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Whether a bridge peer may be pinged now: either never attempted, or its
-/// last attempt is older than [`EMBER_BRIDGE_RETRY_AFTER`].
+/// Ceiling on the backoff, unchanged from the flat window it replaces, so a
+/// genuinely dead peer settles at exactly the rate it always did.
+const EMBER_BRIDGE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long to leave a bridge peer alone after `failed_attempts` unanswered
+/// pings. Doubles from [`EMBER_BRIDGE_RETRY_FIRST`] up to
+/// [`EMBER_BRIDGE_RETRY_MAX`].
+fn bridge_retry_after(failed_attempts: u32) -> std::time::Duration {
+    let doublings = failed_attempts.saturating_sub(1).min(8);
+    let secs = EMBER_BRIDGE_RETRY_FIRST
+        .as_secs()
+        .saturating_mul(1u64 << doublings)
+        .min(EMBER_BRIDGE_RETRY_MAX.as_secs());
+    std::time::Duration::from_secs(secs)
+}
+
+/// Whether a bridge peer may be pinged now: either never attempted, or its last
+/// attempt is older than the backoff its attempt count has earned.
 fn bridge_retry_due(
-    attempted: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     key: &(Ipv4Addr, u16),
     now: std::time::Instant,
 ) -> bool {
     match attempted.get(key) {
         None => true,
-        Some(at) => now.duration_since(*at) >= EMBER_BRIDGE_RETRY_AFTER,
+        Some((at, failed_attempts)) => {
+            now.duration_since(*at) >= bridge_retry_after(*failed_attempts)
+        }
     }
 }
 
 fn kad_bridge_candidates(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
-    attempted: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
     kad_bridge_candidates_at(noise_keys, attempted, max, std::time::Instant::now())
@@ -1181,7 +1214,7 @@ fn kad_bridge_candidates(
 /// testable without sleeping.
 fn kad_bridge_candidates_at(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
-    attempted: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
@@ -1276,7 +1309,7 @@ fn record_ember_keyless_peer(
 fn xx_bridge_candidates(
     keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
-    attempted: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
 ) -> Vec<(Ipv4Addr, u16)> {
     xx_bridge_candidates_at(
@@ -1292,7 +1325,7 @@ fn xx_bridge_candidates(
 fn xx_bridge_candidates_at(
     keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
-    attempted: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
 ) -> Vec<(Ipv4Addr, u16)> {
@@ -8013,7 +8046,7 @@ mod tests {
         record_ember_noise_key(&mut map, c.0, c.1, [0xCC; 32]);
 
         // Nothing attempted yet → freshest-first, capped at `max`.
-        let empty: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
         let picked = kad_bridge_candidates(&map, &empty, 2);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), c); // freshest first
@@ -8022,7 +8055,7 @@ mod tests {
 
         // Mark C attempted → it drops out, leaving B then A.
         let mut attempted = HashMap::new();
-        attempted.insert(c, std::time::Instant::now());
+        attempted.insert(c, (std::time::Instant::now(), 1u32));
         let picked = kad_bridge_candidates(&map, &attempted, 8);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), b);
@@ -8039,7 +8072,7 @@ mod tests {
         let ok = Ipv4Addr::new(8, 8, 8, 8);
         record_ember_noise_key(&mut map, docs, 4672, [0xAA; 32]);
         record_ember_noise_key(&mut map, ok, 4672, [0xBB; 32]);
-        let empty: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
         let picked = kad_bridge_candidates(&map, &empty, 8);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].0, ok);
@@ -8084,7 +8117,7 @@ mod tests {
         );
 
         let mut attempted = HashMap::new();
-        attempted.insert(b, std::time::Instant::now());
+        attempted.insert(b, (std::time::Instant::now(), 1u32));
         assert_eq!(
             xx_bridge_candidates(&keyless, &keys, &attempted, 8),
             vec![a]
@@ -8108,14 +8141,14 @@ mod tests {
 
         let attempt_at = std::time::Instant::now();
         let mut attempted = HashMap::new();
-        attempted.insert(peer, attempt_at);
+        attempted.insert(peer, (attempt_at, 1u32));
 
         // Just after the attempt the bridge moves on to other peers.
-        let soon = attempt_at + std::time::Duration::from_secs(60);
+        let soon = attempt_at + std::time::Duration::from_secs(30);
         assert!(kad_bridge_candidates_at(&keys, &attempted, 8, soon).is_empty());
 
         // Past the window it is eligible again.
-        let later = attempt_at + EMBER_BRIDGE_RETRY_AFTER;
+        let later = attempt_at + EMBER_BRIDGE_RETRY_FIRST;
         let picked = kad_bridge_candidates_at(&keys, &attempted, 8, later);
         assert_eq!(picked.len(), 1);
         assert_eq!((picked[0].0, picked[0].1), peer);
@@ -8126,6 +8159,45 @@ mod tests {
         assert_eq!(
             xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, later),
             vec![peer]
+        );
+    }
+
+    /// The first retry has to be quick — the causes it exists for (a dropped
+    /// datagram, a peer that blinked, a NAT that needed a punch) clear in
+    /// seconds. A peer that keeps ignoring us must still settle at the old flat
+    /// rate rather than being probed forever.
+    #[test]
+    fn bridge_retry_backs_off_from_one_maintenance_tick_to_the_old_ceiling() {
+        assert_eq!(bridge_retry_after(1), EMBER_BRIDGE_RETRY_FIRST);
+        assert_eq!(bridge_retry_after(2), EMBER_BRIDGE_RETRY_FIRST * 2);
+        assert_eq!(bridge_retry_after(3), EMBER_BRIDGE_RETRY_FIRST * 4);
+        assert_eq!(bridge_retry_after(4), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(50), EMBER_BRIDGE_RETRY_MAX);
+        // Saturating rather than shifting past the width of the counter.
+        assert_eq!(bridge_retry_after(u32::MAX), EMBER_BRIDGE_RETRY_MAX);
+        // A peer with no recorded attempt is due immediately.
+        assert_eq!(bridge_retry_after(0), EMBER_BRIDGE_RETRY_FIRST);
+    }
+
+    /// Each unanswered ping must lengthen the next wait. Overwriting the entry
+    /// instead of incrementing would pin every peer at the first interval and
+    /// re-probe a dead one every maintenance tick forever.
+    #[test]
+    fn repeated_bridge_failures_lengthen_the_window() {
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let peer = (Ipv4Addr::new(10, 0, 0, 9), 4672u16);
+        record_ember_noise_key(&mut keys, peer.0, peer.1, [0xEE; 32]);
+
+        let at = std::time::Instant::now();
+        let mut attempted = HashMap::new();
+        attempted.insert(peer, (at, 3u32));
+
+        // Two doublings in: one tick is no longer enough.
+        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST)
+            .is_empty());
+        assert_eq!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST * 4).len(),
+            1
         );
     }
 
@@ -10629,13 +10701,31 @@ struct NetworkState {
     /// did not need one, and it hides exactly the open-port nodes that make the
     /// best relays for everyone else. See [`ember_udp_reachable`].
     ember_udp_reachable_at: Option<i64>,
-    /// KAD-bridge bootstrap bookkeeping (slice 13): when the maintenance loop
-    /// last DHT-pinged each KAD-learned Ember peer, so the bridge moves
-    /// through the `ember_noise_keys` cache instead of re-pinging the same
-    /// freshest few every cycle, while still retrying a peer after
-    /// [`EMBER_BRIDGE_RETRY_AFTER`] so one lost ping isn't final. Only
-    /// consulted while the table is still sparse.
-    ember_kad_bridge_attempted: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// KAD-bridge bootstrap bookkeeping (slice 13): when the bridge last
+    /// DHT-pinged each KAD-learned Ember peer and how many of those pings have
+    /// gone unanswered, so it moves through the `ember_noise_keys` cache
+    /// instead of re-pinging the same freshest few every cycle, while still
+    /// retrying a peer — after [`bridge_retry_after`], which lengthens with the
+    /// count — so one lost ping isn't final. Cleared for a peer as soon as it
+    /// sends us anything, so proven-reachable peers never carry a backoff.
+    /// Only consulted while the table is still sparse.
+    ember_kad_bridge_attempted: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
+
+    /// When the 1 Hz cold-start bridge pass last ran, so it keeps its own
+    /// spacing rather than inheriting the maintenance tick's per-cycle budget.
+    /// See [`EMBER_BRIDGE_FAST_INTERVAL`].
+    ember_bridge_fast_at: Option<std::time::Instant>,
+
+    /// Start of the current one-second gossip-probe window and how many probes
+    /// it has spent, so a per-tick budget cannot be re-granted to every inbound
+    /// frame. See `probe_ember_gossip_leads`.
+    ember_gossip_probe_window: (std::time::Instant, usize),
+
+    /// Session store-ack/fail totals as of the previous Ember publish
+    /// heartbeat, so that line can report a per-cycle delta next to the total
+    /// instead of printing a lifetime counter among per-cycle ones.
+    ember_publish_beat_acked: u32,
+    ember_publish_beat_failed: u32,
     /// Per-peer rate limit for UDP EPX `ExchangeData` ingestion —
     /// `(accepted_count_in_window, window_start)`. Unlike TCP EPX, which
     /// resets `MAX_EPX_PACKETS_PER_CONNECTION` naturally when the TCP
@@ -13081,9 +13171,13 @@ async fn send_ember_bridge_ping(
     // means of converting a lead on our own transport hiccup. A lost or
     // unanswered ping still counts — that is what the window is for.
     if dialled {
-        state
+        let now = std::time::Instant::now();
+        let entry = state
             .ember_kad_bridge_attempted
-            .insert((ip, udp_port), std::time::Instant::now());
+            .entry((ip, udp_port))
+            .or_insert((now, 0));
+        entry.0 = now;
+        entry.1 = entry.1.saturating_add(1);
     }
     if sent {
         state.ember_diagnostics.ember_dht_kad_bridge_pings = state
@@ -13183,6 +13277,20 @@ async fn probe_ember_gossip_leads(
     } else {
         EMBER_MAINT_MAX_PINGS
     };
+    // The budget is shared across a one-second window rather than granted per
+    // call. These constants are sized as *per maintenance tick* allowances, but
+    // this runs once per inbound ANNOUNCE_PEER / PEER_LIST / FOUND_NODE, each of
+    // which may carry `MAX_CONTACTS_PER_RESPONSE` fresh keypairs — so the
+    // per-contact dedup below never fires and the effective probe rate became
+    // frame-rate times budget, aimed at addresses the sender chooses.
+    let now = std::time::Instant::now();
+    if now.duration_since(state.ember_gossip_probe_window.0) >= std::time::Duration::from_secs(1) {
+        state.ember_gossip_probe_window = (now, 0);
+    }
+    let budget = budget.saturating_sub(state.ember_gossip_probe_window.1);
+    if budget == 0 {
+        return;
+    }
     let mut sent = 0usize;
     for contact in leads {
         if sent >= budget {
@@ -13192,6 +13300,12 @@ async fn probe_ember_gossip_leads(
             continue;
         }
         if contact.noise_pub == [0u8; 32] || contact.addr.port() == 0 {
+            continue;
+        }
+        // A gossiped address is one the sender named, so the user's own filter
+        // has to apply before we dial it — `is_bogus_v4` alone let `ipfilter.dat`
+        // be bypassed for every address learned this way.
+        if !state.ember_dht.routing().admits_addr(&contact.addr) {
             continue;
         }
         if state
@@ -13258,6 +13372,8 @@ async fn probe_ember_gossip_leads(
                 .ember_dht_liveness_pings_sent
                 .saturating_add(1);
             sent += 1;
+            state.ember_gossip_probe_window.1 =
+                state.ember_gossip_probe_window.1.saturating_add(1);
         }
     }
 }
@@ -14073,6 +14189,79 @@ fn ember_rendezvous_retry_secs(empty_streak: u32) -> i64 {
         .min(EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS)
 }
 
+/// Start the Ember rendezvous lookup if every gate allows it, reporting whether
+/// a search was actually started.
+///
+/// Other Ember nodes advertise themselves under a well-known KAD key, and a
+/// plain source lookup there returns them with the Noise keys the DHT bridge
+/// needs. That makes this the only cold-join path Ember has when
+/// `nodes_ember.dat` is empty or stale and no eD2K session has produced an
+/// Ember-capable peer.
+///
+/// Extracted from the 60-second maintenance tick so the 1 Hz search timer can
+/// drive it too. Owned by one tick alone it could not work on a cold start: the
+/// maintenance timer's first evaluation lands within a tenth of a second of
+/// launch, when `kad_has_fresh_contact` is necessarily false because KAD has
+/// not received a packet yet, and the next evaluation is a full minute later.
+/// Any session shorter than that never looked anyone up at all, and a node with
+/// no reachable seeds could not rejoin no matter how long it ran.
+fn maybe_start_ember_rendezvous_lookup(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    ember_native_enabled: bool,
+) -> bool {
+    // Cheapest gates first: this is re-evaluated every second while the table
+    // is cold, so the O(n) table scans below must stay behind O(1) rejects.
+    if !ember_native_enabled || state.ember_rendezvous_search.is_some() {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now.saturating_sub(state.ember_rendezvous_looked_up_at)
+        <= ember_rendezvous_retry_secs(state.ember_rendezvous_empty_streak)
+    {
+        return false;
+    }
+    // Ahead of the table walk below: on a cold start this is false for the first
+    // several seconds, and it is the reject this runs into every tick.
+    //
+    // A table loaded from `nodes.dat` is not the same as a live KAD: at startup
+    // it is full of contacts nothing has spoken to yet, and a lookup against
+    // those spends a 60-second search slot to return nothing. Worse, that empty
+    // result now counts against the retry backoff, so a miss caused by KAD
+    // simply not being up yet slows the next real attempt. Requiring recent KAD
+    // traffic keeps the timestamp and the streak untouched until a lookup can
+    // actually succeed.
+    if !kad_has_fresh_contact(state) {
+        return false;
+    }
+    // Gated on the same table size the bridge uses, so this stops once we are
+    // self-sufficient and gossip takes over.
+    if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        return false;
+    }
+    let key = kad::publish::ember_rendezvous_key();
+    let closest = state
+        .routing_table
+        .find_closest_prefer_verified(&key, SEARCH_INITIAL_CONTACTS);
+    if closest.is_empty() {
+        return false;
+    }
+    let sid = start_kad_search(
+        state,
+        app_handle,
+        key,
+        SearchType::FindSource { file_size: 0 },
+        closest,
+    );
+    if sid == SearchId(0) {
+        return false;
+    }
+    state.ember_rendezvous_search = Some(sid);
+    state.ember_rendezvous_looked_up_at = now;
+    info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+    true
+}
+
 /// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
 /// peer cache can't burst the DHT with handshakes in one tick.
 ///
@@ -14084,6 +14273,27 @@ fn ember_rendezvous_retry_secs(empty_streak: u32) -> i64 {
 /// rate the node is already willing to ping at made the join needlessly slow, and
 /// the bridge switching itself off at k contacts bounds the whole thing anyway.
 const EMBER_KAD_BRIDGE_MAX_PINGS: usize = EMBER_MAINT_MAX_PINGS_STARVED;
+
+/// Ping budget and minimum spacing for the cold-start bridge pass the 1 Hz
+/// timer drives, which must be far smaller than the per-cycle budget above.
+///
+/// That constant is a *per-maintenance-cycle* cap, and its whole point is that a
+/// large peer cache "can't burst the DHT with handshakes in one tick". Handing
+/// the same 32 to a caller that runs every second would sustain 32 handshakes
+/// per second: both feeding caches hold up to `MAX_KNOWN_EMBER_NOISE_KEYS` /
+/// `MAX_KNOWN_EMBER_PEERS` (500 each), so the pool is nowhere near spent after
+/// one pass, and the Noise_XX half is the slow 2-RTT handshake against exactly
+/// the LowID peers least likely to answer. That fills the transport's 512-slot
+/// pending-handshake table and starts evicting handshakes belonging to the
+/// searches a cold join depends on — the burst would degrade the thing it is
+/// meant to accelerate.
+///
+/// The latency is the bug, not the rate. Four pings every five seconds is
+/// ~0.8/s against the maintenance path's 32-per-60s (~0.53/s), the same order of
+/// magnitude, while the first dial still lands about a second after the
+/// rendezvous lookup that found the peer instead of up to a minute later.
+const EMBER_BRIDGE_FAST_MAX_PINGS: usize = 4;
+const EMBER_BRIDGE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many contacts `nodes_ember.dat` keeps. Matching KAD's 200: enough to
 /// rejoin from cold even if most have churned, without persisting the whole
@@ -17590,7 +17800,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_store_loaded: false,
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
-        ember_kad_bridge_attempted: HashMap::new(),
+            ember_kad_bridge_attempted: HashMap::new(),
+            ember_bridge_fast_at: None,
+            ember_gossip_probe_window: (std::time::Instant::now(), 0),
+            ember_publish_beat_acked: 0,
+            ember_publish_beat_failed: 0,
         ember_udp_epx_rate: HashMap::new(),
         ember_udp_epx_req_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
@@ -23421,11 +23635,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             (0, Vec::new())
                         };
                         let established = ember_established_addrs(&state);
+                        // Measured across the harvest: reporting the cache size
+                        // credited this lookup with every key the session had
+                        // already learned, so on a warm cache a lookup that
+                        // harvested nothing still logged a large number — the
+                        // opposite of what the only cold-join diagnostic needs
+                        // to say.
+                        let keys_before = state.ember_noise_keys.len();
                         harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers, &established);
+                        let keys_learned = state.ember_noise_keys.len().saturating_sub(keys_before);
                         note_ember_rendezvous_lookup(&mut state, peers.len());
                         info!(
                             "Ember rendezvous lookup finished: {found} advertised peer(s), \
-                             {} after dropping self, {} dialable Noise key(s) cached",
+                             {} after dropping self, {keys_learned} new dialable Noise key(s) \
+                             ({} cached in total)",
                             peers.len(),
                             state.ember_noise_keys.len()
                         );
@@ -26116,6 +26339,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let in_flight = state.ember_batch_publish.in_flight.len();
                     let unplaced = state.ember_publish_unplaced.len();
                     let pass = state.ember_publish_pass;
+                    let acked_at_last_beat = state.ember_publish_beat_acked;
+                    let failed_at_last_beat = state.ember_publish_beat_failed;
+                    state.ember_publish_beat_acked =
+                        state.ember_diagnostics.ember_dht_stores_acked;
+                    state.ember_publish_beat_failed =
+                        state.ember_diagnostics.ember_dht_stores_failed;
                     // An empty overlay short-circuits both publishers before
                     // they count what is due, so the usual stats would print
                     // a row of zeros that reads as "nothing to publish" when
@@ -26134,8 +26363,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             "Ember publish cycle: contacts={contacts} ({verified} verified), \
                              due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \
                              in-flight={in_flight}, sent={} in {} frame(s), behind handshake={} \
-                             in {} frame(s), held over={}, dropped={}, re-armed={}, acked={}, \
-                             failed={}",
+                             in {} frame(s), held over={}, dropped={}, re-armed={}, \
+                             acked={} of {} total, failed={} of {} total",
                             pass.due,
                             pass.selected,
                             pass.flush.records_sent,
@@ -26145,7 +26374,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             pass.flush.records_carried,
                             pass.flush.records_dropped,
                             pass.flush.records_rearmed,
+                            // Every other field on this line is per-cycle
+                            // (`ember_publish_pass` is reset just below), but
+                            // these two counters are session totals, so a cycle
+                            // that acked nothing read as though it had acked
+                            // thousands. Report the delta and keep the total.
+                            state
+                                .ember_diagnostics
+                                .ember_dht_stores_acked
+                                .saturating_sub(acked_at_last_beat),
                             state.ember_diagnostics.ember_dht_stores_acked,
+                            state
+                                .ember_diagnostics
+                                .ember_dht_stores_failed
+                                .saturating_sub(failed_at_last_beat),
                             state.ember_diagnostics.ember_dht_stores_failed,
                         );
                     }
@@ -34208,7 +34450,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &state.ember_keyword_publish_unix,
                     &mut known_files,
                 );
-                if known_files.is_dirty() && !known_met_save_in_flight {
+                // `is_authoritative` gates the attempt because this interval's
+                // first tick fires immediately, roughly half a second before the
+                // deferred known.met load lands. Without it every launch spent a
+                // blocking task and the save lock on a write `save` then refused,
+                // and reported the refusal back as `Ok(false)` — indistinguishable
+                // from a genuine known_paths.dat durability failure, so the arm
+                // below logged "save completed but companion was not durable"
+                // immediately after `save` had logged that it skipped. Nothing was
+                // lost either way (the catalog stays dirty and the next tick, by
+                // which time the load has landed, writes it), but the pair of
+                // contradictory warnings described a failure that never happened.
+                // The `|| !exists` arm mirrors `save`'s own condition, which
+                // refuses only when *both* hold. Gating on `is_authoritative`
+                // alone would also block a genuine first run — where there is no
+                // catalog on disk to protect and `save` would have written
+                // happily — and because `authoritative` is only ever set by the
+                // deferred load's absorb, a panic in that task would then skip
+                // every periodic save for the rest of the session.
+                if known_files.is_dirty()
+                    && (known_files.is_authoritative()
+                        || !state.data_dir.join("known.met").exists())
+                    && !known_met_save_in_flight
+                {
                     let ownership = state
                         .known_met_save_lock
                         .clone()
@@ -34605,6 +34869,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             _ = ember_flush_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Ahead of the empty-queue return: `prune_sent_window` otherwise
+                // only ever runs from inside the flush, which writes the window
+                // entries at its end — so the last flush before a node stops
+                // publishing leaves its tail resident for the rest of the
+                // session. Bounded either way by one window's destinations, but
+                // it should be bounded by the prune, not by the table size.
+                state
+                    .ember_batch_publish
+                    .prune_sent_window(std::time::Instant::now());
                 if state.ember_batch_publish.queued.is_empty() {
                     return;
                 }
@@ -34617,6 +34890,57 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             _ = ember_search_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Cold join, and deliberately ahead of the idle guard below: a
+                // node that cannot reach anyone has nothing in flight, so it
+                // takes the early return every tick. The 60-second maintenance
+                // tick owns this gate in steady state, but it evaluates first at
+                // t≈0 — before KAD has decoded a single packet, so
+                // `kad_has_fresh_contact` is false — and not again for a full
+                // minute. That left the one cold-join path unused for the first
+                // minute of every launch, and unused entirely by any session
+                // shorter than that.
+                //
+                // Self-limiting: `looked_up_at` is only non-zero once a lookup
+                // has actually started, after which this stops re-checking for
+                // the rest of the session and the maintenance tick takes over.
+                if state.ember_rendezvous_looked_up_at == 0 {
+                    maybe_start_ember_rendezvous_lookup(
+                        &mut state,
+                        &app_handle,
+                        settings.ember_native_enabled,
+                    );
+                }
+
+                // And dial what that lookup finds, for the same reason. The
+                // bridge belongs to the 60-second maintenance tick, but the
+                // lookup feeding it completes mid-interval, so a node that had
+                // just learned the only peers it could reach waited out the rest
+                // of the minute before trying them — 46s of a measured cold
+                // start. Restricted to the starved case so a healthy node keeps
+                // bridging on the maintenance cadence, and to its own small
+                // budget and spacing so shortening the *latency* does not also
+                // multiply the ping *rate* — see `EMBER_BRIDGE_FAST_MAX_PINGS`.
+                // Gates are ordered cheapest first because this runs every
+                // second; `verified_len` walks the table, so it goes last.
+                if settings.ember_native_enabled
+                    && (!state.ember_noise_keys.is_empty()
+                        || !state.ember_keyless_peers.is_empty())
+                    && state
+                        .ember_bridge_fast_at
+                        .is_none_or(|at| at.elapsed() >= EMBER_BRIDGE_FAST_INTERVAL)
+                    && state.ember_dht.routing().verified_len()
+                        < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+                {
+                    state.ember_bridge_fast_at = Some(std::time::Instant::now());
+                    run_ember_kad_bridge(
+                        &udp_socket,
+                        &mut state,
+                        false,
+                        EMBER_BRIDGE_FAST_MAX_PINGS,
+                    )
+                    .await;
+                }
+
                 // Cheap when idle: the maps are empty unless an iterative
                 // lookup, a publish, or a maintenance liveness ping is in
                 // flight.
@@ -35182,45 +35506,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
 
                 // Nothing to bridge from means nobody has crossed our path yet.
-                // Ask KAD directly: other Ember nodes advertise themselves under
-                // a well-known key, and a plain source lookup there returns them
-                // with the Noise keys the bridge needs. Gated on the same table
-                // size the bridge uses, so this stops once we are self-sufficient
-                // and gossip takes over.
-                let rendezvous_now = chrono::Utc::now().timestamp();
-                if settings.ember_native_enabled
-                    && state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
-                    && state.ember_rendezvous_search.is_none()
-                    && rendezvous_now.saturating_sub(state.ember_rendezvous_looked_up_at)
-                        > ember_rendezvous_retry_secs(state.ember_rendezvous_empty_streak)
-                {
-                    let key = kad::publish::ember_rendezvous_key();
-                    let closest = state
-                        .routing_table
-                        .find_closest_prefer_verified(&key, SEARCH_INITIAL_CONTACTS);
-                    // A table loaded from `nodes.dat` is not the same as a live
-                    // KAD: at startup it is full of contacts nothing has spoken
-                    // to yet, and a lookup against those spends a 60-second
-                    // search slot to return nothing. Worse, that empty result
-                    // now counts against the retry backoff, so a miss caused by
-                    // KAD simply not being up yet slows the next real attempt.
-                    // Requiring recent KAD traffic keeps the timestamp and the
-                    // streak untouched until a lookup can actually succeed.
-                    if !closest.is_empty() && kad_has_fresh_contact(&state) {
-                        let sid = start_kad_search(
-                            &mut state,
-                            &app_handle,
-                            key,
-                            SearchType::FindSource { file_size: 0 },
-                            closest,
-                        );
-                        if sid != SearchId(0) {
-                            state.ember_rendezvous_search = Some(sid);
-                            state.ember_rendezvous_looked_up_at = rendezvous_now;
-                            info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
-                        }
-                    }
-                }
+                // Ask KAD directly for other Ember nodes. The 1 Hz search timer
+                // drives the same helper until the first lookup starts, because
+                // this tick cannot: its first evaluation is too early for KAD to
+                // be up and its second is a minute later.
+                maybe_start_ember_rendezvous_lookup(
+                    &mut state,
+                    &app_handle,
+                    settings.ember_native_enabled,
+                );
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_maintenance_timer' panicked: {}", describe_panic(&*__p));
@@ -38028,10 +38322,23 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             // Couldn't get the query out — fail this shortlist entry so
             // the search doesn't wait on a node we never reached, and treat a
             // contact we cannot even transmit to the same way maintenance does.
+            //
+            // `NotSent`, not the default timeout semantics: those deliberately
+            // return a retryable entry to `Pending` because the deadline sweep
+            // re-drives the search afterwards. Nothing re-drives this path — we
+            // never registered a wire request to time out — so leaving the entry
+            // pending stalled the whole walk. With a one-entry shortlist (the
+            // small overlay this actually runs on) a single ENETUNREACH held the
+            // search, and its waiter, until the 120s backstop reaped it.
             let failed = state
                 .ember_search
                 .get_mut(search_id)
-                .and_then(|s| s.mark_failed(per_search_req_id));
+                .and_then(|s| {
+                    s.mark_failed_with(
+                        per_search_req_id,
+                        ember::dht::search::QueryFailure::NotSent,
+                    )
+                });
             if let Some(node_id) = failed {
                 fault_ember_contact(state, &node_id, "unreachable");
             }
@@ -39680,6 +39987,75 @@ async fn start_ember_source_search(
     true
 }
 
+/// Dial Ember peers we know of but have never spoken to, so the signed `PONG`
+/// can teach us a verified contact through the normal inbound path.
+///
+/// Two sources feed it. KAD source publishes carry a peer's Noise key but not
+/// its Ed25519 key or node ID, so we cannot build a contact directly — we
+/// DHT-`PING` `(addr, noise_pub)` on the 1-RTT Noise_IK path instead. A live
+/// eD2K client session is an introduction too, and one worth taking even when
+/// the public table is full, because a LAN or island 1.5.x peer would otherwise
+/// never be DHT-pinged and `FIND_VALUE` would never ask it; those go over
+/// Noise_XX. Returns how many pings went out.
+///
+/// The IK pass self-disables once the table is bootstrapped so steady-state KAD
+/// traffic does not spray DHT pings. `force` (the dev-panel button) bypasses
+/// that size gate.
+///
+/// Split out of [`run_ember_maintenance`] so the 1 Hz search timer can drive it
+/// during a cold join. Owned by the 60-second maintenance tick alone, it was
+/// always a tick behind the thing that feeds it: the rendezvous lookup caches
+/// Noise keys mid-interval, so a node that had just discovered the only peers
+/// it could reach sat on them for the rest of the minute — 46 seconds of it in
+/// a measured cold start. Re-running it is close to free once the candidates
+/// are spent, because `bridge_retry_due` holds every attempted peer until its
+/// backoff expires and the extra passes just build an empty candidate list.
+async fn run_ember_kad_bridge(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    force: bool,
+    max_pings: usize,
+) -> usize {
+    let mut sent = 0usize;
+    // The budget has to be charged against peers *dialled*, not datagrams that
+    // left. `send_ember_bridge_ping` returns false for a local send error too,
+    // and a run of those would otherwise leave `max_pings` untouched and hand
+    // the XX pass a full second budget — up to twice the documented cap in one
+    // call, spent on the slower 2-RTT handshake.
+    let mut dialled = 0usize;
+    if force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        let candidates = kad_bridge_candidates(
+            &state.ember_noise_keys,
+            &state.ember_kad_bridge_attempted,
+            max_pings,
+        );
+        for (ip, port, noise_pub) in candidates {
+            dialled += 1;
+            if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
+                sent += 1;
+            }
+        }
+    }
+    let xx_budget = max_pings.saturating_sub(dialled);
+    let xx_candidates = xx_bridge_candidates(
+        &state.ember_keyless_peers,
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        xx_budget,
+    );
+    let mut xx_sent = 0usize;
+    for (ip, port) in xx_candidates {
+        if send_ember_bridge_ping(socket, state, ip, port, None).await {
+            xx_sent += 1;
+            sent += 1;
+        }
+    }
+    if sent > 0 {
+        debug!("Ember bridge: pinged {sent} peer(s) to seed the DHT ({xx_sent} over Noise_XX)");
+    }
+    sent
+}
+
 /// Run one Ember DHT maintenance cycle (slice 6): refresh stale buckets,
 /// liveness-ping stale contacts, and republish locally-stored records to
 /// the current closest nodes. Each task is bounded per cycle and, unless
@@ -39696,50 +40072,9 @@ async fn run_ember_maintenance(
 ) -> EmberMaintenanceResult {
     let mut result = EmberMaintenanceResult::default();
 
-    // 0) KAD-bridge bootstrap (slice 13). While the table is still sparse,
-    //    fold in Ember peers learned from the live KAD network. KAD source
-    //    publishes carry the peer's Noise key but not its Ed25519 key /
-    //    node ID, so we can't build a contact directly — instead we DHT-PING
-    //    (addr, noise_pub) and let the signed PONG teach us the verified
-    //    contact through the normal inbound path. Self-disables once the
-    //    table is bootstrapped, so steady-state KAD traffic doesn't spray
-    //    DHT pings. `force` (the dev-panel button) bypasses the size gate so
-    //    the bridge can be exercised on demand.
-    if force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
-        let candidates = kad_bridge_candidates(
-            &state.ember_noise_keys,
-            &state.ember_kad_bridge_attempted,
-            EMBER_KAD_BRIDGE_MAX_PINGS,
-        );
-        for (ip, port, noise_pub) in candidates {
-            if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
-                result.kad_bridge_pings_sent += 1;
-            }
-        }
-    }
-    // eD2K XX-bridge: a live client session is an introduction even when the
-    // public table is already full. Without this, a LAN or island 1.5.x peer
-    // is never DHT-pinged and FIND_VALUE never asks it.
-    let xx_budget = EMBER_KAD_BRIDGE_MAX_PINGS.saturating_sub(result.kad_bridge_pings_sent);
-    let xx_candidates = xx_bridge_candidates(
-        &state.ember_keyless_peers,
-        &state.ember_noise_keys,
-        &state.ember_kad_bridge_attempted,
-        xx_budget,
-    );
-    let mut xx_sent = 0usize;
-    for (ip, port) in xx_candidates {
-        if send_ember_bridge_ping(socket, state, ip, port, None).await {
-            xx_sent += 1;
-            result.kad_bridge_pings_sent += 1;
-        }
-    }
-    if result.kad_bridge_pings_sent > 0 {
-        debug!(
-            "Ember bridge: pinged {} peer(s) to seed the DHT ({xx_sent} over Noise_XX)",
-            result.kad_bridge_pings_sent
-        );
-    }
+    // 0) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
+    result.kad_bridge_pings_sent =
+        run_ember_kad_bridge(socket, state, force, EMBER_KAD_BRIDGE_MAX_PINGS).await;
 
     // 0a) Disconnect detection. If nothing has spoken to us for a long
     //     stretch the table we hold is probably stale (laptop resumed, link
@@ -40181,6 +40516,17 @@ async fn handle_ember_dht_message(
     // silence is what triggers a re-bootstrap in the maintenance loop.
     if inbound.sender_id.is_some() {
         state.ember_last_inbound = Some(now);
+        // It also proves *this* peer is reachable, so it must not keep an
+        // unanswered-ping count. The bridge does not exclude peers we already
+        // hold a contact for, so a peer that answers is re-dialled on every
+        // expiry and was accumulating strikes for pings it had in fact
+        // answered — pushing the peers most likely to respond out to the 300s
+        // ceiling. That is exactly backwards, and it bit hardest right after a
+        // staleness eviction, when re-bridging a known-good peer is the fastest
+        // way back.
+        if let std::net::IpAddr::V4(v4) = from.ip() {
+            state.ember_kad_bridge_attempted.remove(&(v4, from.port()));
+        }
     }
     if let Some(contact) = inbound.sender_contact.clone() {
         remember_ember_session_dht_contact(state, contact);

@@ -14,7 +14,7 @@
 //! That keeps the protocol logic unit-testable without a live socket or
 //! a `NetworkState`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use ed25519_dalek::SigningKey;
 use tracing::trace;
 
 use super::messages::{self, DhtPayload};
-use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE};
+use super::publish::{source_key, SignedRecord, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE};
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -33,6 +33,37 @@ use crate::network::ember::SOURCE_FLAG_FIREWALLED;
 /// keyword republish still gets through.
 const STORE_SIG_REPLAY_TTL: Duration = Duration::from_secs(60);
 const MAX_STORE_SIG_CACHE: usize = 50_000;
+
+/// How long an accepted `PROXY_STORE` forward is assumed to still be occupying
+/// a publish slot. `network::mod` hands each one to the publish driver, where an
+/// operation lives at most `PUBLISH_TIMEOUT_SECS`, so anything admitted longer
+/// ago than this has certainly finished or timed out.
+const PROXY_FORWARD_INFLIGHT: Duration = Duration::from_secs(30);
+
+/// Proxy forwards that may be in flight at once, across every sender.
+///
+/// A forward is the most expensive thing an authenticated peer can ask for:
+/// one inbound datagram becomes a `STORE_RECORD` to each of `K_EMBER_REPLICAS`
+/// nodes and holds one of `MAX_ACTIVE_PUBLISHES` (128) publish slots until it
+/// completes. A quarter of the slots is enough for every buddy we would
+/// plausibly serve and leaves proxied work unable to starve our own publishes.
+/// Since a slot lives at most [`PROXY_FORWARD_INFLIGHT`], counting what was
+/// admitted inside that window bounds what can be alive now — which is how the
+/// engine enforces a concurrency limit without ever seeing a completion.
+const MAX_PROXY_FORWARDS_IN_FLIGHT: usize = 32;
+
+/// Window the per-sender proxy allowance is measured over.
+const PROXY_FORWARD_WINDOW: Duration = Duration::from_secs(60);
+
+/// Proxy forwards accepted from one sender per [`PROXY_FORWARD_WINDOW`].
+///
+/// A firewalled peer asks its buddies to fan out one source record per file it
+/// is republishing, on a two-hour cadence spread over the minute ticks in it,
+/// and `network::mod` sends each round to three buddies. That covers a library
+/// of roughly two thousand files without this ever firing. A peer past it is
+/// only paced on the favour: its own direct source publish is untouched, since
+/// a firewalled source record is accepted from any address.
+const MAX_PROXY_FORWARDS_PER_SENDER: usize = 24;
 
 /// Share of the liveness-ping budget held for unverified leads when there are
 /// enough verified contacts due to spend the whole thing. One in four: enough
@@ -175,9 +206,24 @@ pub struct EmberDht {
     /// Recently-seen STORE signatures (`blake3(publisher||sig)` → time)
     /// for slice-14 replay collapse.
     store_sig_seen: HashMap<[u8; 32], Instant>,
+    /// Insertion order of `store_sig_seen`, so evicting at capacity is O(1)
+    /// instead of a `min_by_key` over the whole cache on every store — work an
+    /// attacker could buy per record simply by keeping the cache full. Entries
+    /// the TTL sweep removed linger here until the sweep prunes them too, so a
+    /// pop skips ids the map no longer holds.
+    store_sig_order: VecDeque<[u8; 32]>,
+    /// Ceiling on `store_sig_seen`. A field rather than a constant so the
+    /// eviction order can be exercised without signing 50,000 records.
+    store_sig_cache_max: usize,
     /// When `store_sig_seen` was last swept, so the scan runs on a schedule
     /// rather than once per record of every oversized batch.
     store_sig_swept_at: Option<Instant>,
+    /// When we accepted each recent `PROXY_STORE` forward, and who asked for
+    /// it, oldest first. [`Self::accept_proxy_forward`] admits at most
+    /// [`MAX_PROXY_FORWARDS_IN_FLIGHT`] per [`PROXY_FORWARD_INFLIGHT`] and
+    /// prunes past [`PROXY_FORWARD_WINDOW`], which bounds the queue without a
+    /// separate size cap.
+    proxy_forwards: VecDeque<(Instant, EmberNodeId)>,
     /// Inbound STORE records refused before they reached the store: the
     /// publisher signature did not parse, or the DHT key did not match the
     /// record's own content key.
@@ -204,6 +250,9 @@ impl EmberDht {
         // The store ranks records by how responsible we are for their key
         // when it has to free space.
         store.set_local_id(local_id);
+        // And it holds our own records to a different standard than a remote
+        // publisher's — see `DhtStore::set_local_publisher_key`.
+        store.set_local_publisher_key(signing_key.verifying_key().to_bytes());
         Self {
             routing: RoutingTable::new(local_id, block_private_ips),
             store,
@@ -211,7 +260,10 @@ impl EmberDht {
             local_id,
             next_request_id: 1,
             store_sig_seen: HashMap::new(),
+            store_sig_order: VecDeque::new(),
+            store_sig_cache_max: MAX_STORE_SIG_CACHE,
             store_sig_swept_at: None,
+            proxy_forwards: VecDeque::new(),
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
@@ -366,32 +418,50 @@ impl EmberDht {
         // an unconditional size check meant a single 64-record `STORE_BATCH`
         // could walk a 25,000-entry map 64 times — and nothing expires inside
         // one batch, so 63 of those scans could not free anything.
+        //
+        // The timer is the only gate. Adding "and the map is more than half
+        // full" left up to 25,000 lapsed entries resident indefinitely on a
+        // quiet node, and those are exactly what the size-capped eviction below
+        // then has to evict live entries around.
         let sweep_due = self
             .store_sig_swept_at
             .is_none_or(|at| now_inst.duration_since(at) >= STORE_SIG_REPLAY_TTL);
-        if sweep_due && self.store_sig_seen.len() > MAX_STORE_SIG_CACHE / 2 {
+        if sweep_due {
             self.store_sig_seen
                 .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
+            let live = &self.store_sig_seen;
+            self.store_sig_order.retain(|k| live.contains_key(k));
             self.store_sig_swept_at = Some(now_inst);
         }
-        // A replay only counts as one if we still hold what it stands for. This
-        // cache is keyed on the signature alone and is cleared by TTL or size
-        // pressure — never by eviction — so a record the byte budget or a
-        // key-cap displacement had already dropped still classified as a
-        // replay, and `STORE_BATCH` set its accepted bit on the strength of
-        // "we already hold this exact record". The publisher then retired a
-        // file counting a replica that was gone.
-        let is_replay = self
+        if self
             .store_sig_seen
             .get(&sig_key)
             .is_some_and(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
-            && self
-                .store
-                .get_live(&key)
-                .iter()
-                .any(|held| held.signature == record_signature);
-        if is_replay {
-            return StoreOutcome::Replay;
+        {
+            let held = self.store.get_live(&key);
+            // A replay only counts as one if we still hold what it stands for.
+            // This cache is keyed on the signature alone and is cleared by TTL
+            // or size pressure — never by eviction — so a record the byte
+            // budget or a key-cap displacement had already dropped still
+            // classified as a replay, and `STORE_BATCH` set its accepted bit on
+            // the strength of "we already hold this exact record". The
+            // publisher then retired a file counting a replica that was gone.
+            let still_held = held.iter().any(|h| h.signature == record_signature);
+            // The other way a seen signature stops being held is the publisher
+            // superseding it with a republish. That is not an eviction to make
+            // good: `DhtStore::store` finds the newer copy, keeps it, and
+            // reports success — so every replay of the retired copy was
+            // reported as a fresh store, re-armed this cache entry, and paid a
+            // second Ed25519 verification for the privilege.
+            let superseded = !still_held
+                && held.iter().any(|h| {
+                    h.publisher_key == parsed.publisher_key
+                        && file_hash_from_record_data(&h.data) == Some(parsed.file_hash)
+                        && h.created_at > parsed.timestamp
+                });
+            if still_held || superseded {
+                return StoreOutcome::Replay;
+            }
         }
 
         // A firewalled source's declared address is exempt from the bind
@@ -410,6 +480,18 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        // For a keyword record the word itself is not carried, so `keyword_hash`
+        // cannot be recomputed and the check above is all there is. A source
+        // record's key *is* derivable from its own signed body — the publisher
+        // derived it as `source_key(file_hash)` — so anything else is a record
+        // filed where it does not belong. That matters beyond tidiness: the key
+        // is what decides XOR distance, and distance is what the store's key cap
+        // and byte budget rank evictions by, so a free choice of key is a choice
+        // of which of our records to displace.
+        if parsed.record_type == RECORD_TYPE_SOURCE && key != source_key(&parsed.file_hash) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
         if !self.store_proximity_ok(&key) {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
             return StoreOutcome::Rejected;
@@ -425,22 +507,73 @@ impl EmberDht {
             // At capacity, make room rather than stopping: silently declining to
             // record a signature turns off replay collapse for exactly the
             // publishers arriving during a flood, which is when it earns its
-            // keep. The oldest entry is the one closest to ageing out anyway.
-            if self.store_sig_seen.len() >= MAX_STORE_SIG_CACHE {
-                if let Some(oldest) = self
-                    .store_sig_seen
-                    .iter()
-                    .min_by_key(|(_, seen)| **seen)
-                    .map(|(k, _)| *k)
-                {
-                    self.store_sig_seen.remove(&oldest);
+            // keep. The oldest entry is the one closest to ageing out anyway,
+            // and taking it from the front of the insertion order keeps that
+            // choice O(1) — the flood that fills the cache must not also buy a
+            // scan of it per record.
+            if self.store_sig_seen.len() >= self.store_sig_cache_max {
+                while let Some(oldest) = self.store_sig_order.pop_front() {
+                    if self.store_sig_seen.remove(&oldest).is_some() {
+                        break;
+                    }
                 }
             }
-            self.store_sig_seen.insert(sig_key, now_inst);
+            if self.store_sig_seen.insert(sig_key, now_inst).is_none() {
+                self.store_sig_order.push_back(sig_key);
+            }
             StoreOutcome::Stored
         } else {
             StoreOutcome::Rejected
         }
+    }
+
+    /// Whether we should take on one more `PROXY_STORE` fan-out for `sender`,
+    /// charging it against the proxy budgets if so.
+    ///
+    /// The frame is authenticated and the record is bound to the sender's own
+    /// publisher key, which stops a third party amplifying *someone else's*
+    /// record — but nothing there stops a peer amplifying its own. The caller
+    /// turns each accepted forward into a `STORE_RECORD` to up to
+    /// `K_EMBER_REPLICAS` nodes and one of `MAX_ACTIVE_PUBLISHES` publish slots,
+    /// so an unmetered version lets any peer holding a Noise session convert one
+    /// datagram into twenty and occupy the publish driver indefinitely.
+    ///
+    /// There is no buddy-agreement state anywhere in the Ember DHT — no set of
+    /// peers we agreed to proxy for — so this cannot be answered by asking who
+    /// is entitled to the favour. What is bounded instead is the work: how much
+    /// one peer may ask for, and how much may be outstanding at all.
+    fn accept_proxy_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
+        while let Some((at, _)) = self.proxy_forwards.front() {
+            if now.duration_since(*at) < PROXY_FORWARD_WINDOW {
+                break;
+            }
+            self.proxy_forwards.pop_front();
+        }
+        let in_flight = self
+            .proxy_forwards
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) < PROXY_FORWARD_INFLIGHT)
+            .count();
+        if in_flight >= MAX_PROXY_FORWARDS_IN_FLIGHT {
+            return false;
+        }
+        let from_sender = self
+            .proxy_forwards
+            .iter()
+            .filter(|(_, id)| *id == sender)
+            .count();
+        if from_sender >= MAX_PROXY_FORWARDS_PER_SENDER {
+            return false;
+        }
+        self.proxy_forwards.push_back((now, sender));
+        true
+    }
+
+    /// Shrink the replay cache so its eviction order can be exercised without
+    /// signing [`MAX_STORE_SIG_CACHE`] records.
+    #[cfg(test)]
+    fn set_sig_cache_max_for_test(&mut self, max: usize) {
+        self.store_sig_cache_max = max;
     }
 
     /// Keep the store's abuse limits in step with the routing table, which is
@@ -1148,6 +1281,10 @@ impl EmberDht {
                 // (`sender_id == BLAKE3(publisher_key)`) so a third party
                 // cannot amplify someone else's record. ACK is deferred to
                 // the network loop until `start_publish_to` actually starts.
+                //
+                // `accept_proxy_forward` is what stops a peer amplifying its
+                // *own* record without limit, and is charged last so only a
+                // frame that would otherwise have been honoured spends budget.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
                     let is_fw_source = parsed.record_type == RECORD_TYPE_SOURCE
                         && parsed
@@ -1158,7 +1295,12 @@ impl EmberDht {
                         crypto::node_id_from_ed25519_bytes(&parsed.publisher_key)
                             .map(|id| EmberNodeId(id) == msg.sender_id)
                             .unwrap_or(false);
-                    if is_fw_source && key == parsed.keyword_hash && publisher_is_sender {
+                    if is_fw_source
+                        && key == parsed.keyword_hash
+                        && key == source_key(&parsed.file_hash)
+                        && publisher_is_sender
+                        && self.accept_proxy_forward(msg.sender_id, Instant::now())
+                    {
                         out.proxy_store_forward = Some((msg.request_id, parsed));
                     }
                 }
@@ -2455,6 +2597,328 @@ mod tests {
             flags: 0,
             noise_pub: [0x44; 32],
         }
+    }
+
+    /// A firewalled source contact, which is what both the buddy proxy path and
+    /// the key-binding tests need: it exempts the record from the
+    /// anti-reflection address bind, so those tests exercise the check they are
+    /// about rather than that one.
+    fn firewalled_contact_at(last: u8) -> SourceContact {
+        SourceContact {
+            flags: SOURCE_FLAG_FIREWALLED,
+            ..source_contact_at(last)
+        }
+    }
+
+    /// A source record body signed under a `keyword_hash` of our choosing.
+    ///
+    /// `SignedRecord::source` always derives the key from the file hash, so
+    /// there is no other way to express the thing under test: a validly signed
+    /// source record filed somewhere its own file hash does not lead.
+    fn source_record_under_key(
+        sk: &ed25519_dalek::SigningKey,
+        key: [u8; 16],
+        file_hash: [u8; 16],
+        contact: SourceContact,
+    ) -> (Vec<u8>, [u8; 64]) {
+        let name = b"planted.mkv";
+        let mut data = Vec::new();
+        data.push(RECORD_TYPE_SOURCE);
+        data.extend_from_slice(&key);
+        data.extend_from_slice(&file_hash);
+        data.extend_from_slice(&[0u8; 32]);
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&sk.verifying_key().to_bytes());
+        data.extend_from_slice(&chrono::Utc::now().timestamp().to_le_bytes());
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(&contact.ip.octets());
+        data.extend_from_slice(&contact.tcp_port.to_le_bytes());
+        data.extend_from_slice(&contact.udp_port.to_le_bytes());
+        data.push(contact.flags);
+        data.extend_from_slice(&contact.noise_pub);
+        let signature = crypto::sign(sk, &data);
+        (data, signature)
+    }
+
+    /// The same record body re-dated and re-signed, which is what a republish
+    /// looks like on the wire. `SignedRecord::keyword` always stamps "now", so
+    /// a test cannot otherwise hold two copies of one record minutes apart.
+    fn redated(
+        sk: &ed25519_dalek::SigningKey,
+        record: &SignedRecord,
+        at: i64,
+    ) -> (Vec<u8>, [u8; 64]) {
+        let mut data = record.data.clone();
+        data[105..113].copy_from_slice(&at.to_le_bytes());
+        let signature = crypto::sign(sk, &data);
+        (data, signature)
+    }
+
+    /// A source record's DHT key is derivable from its own signed body —
+    /// `source_key(file_hash)` is how the publisher derived it — and nothing
+    /// recomputed it, so a publisher could file one anywhere. That is not only
+    /// a way to plant records under unrelated keys: the key is what decides XOR
+    /// distance, and distance is what the store ranks evictions by, so a free
+    /// choice of key is a choice of which of our records to displace.
+    #[test]
+    fn a_source_record_may_only_live_under_the_key_its_file_hash_derives() {
+        let mut a = dht(64);
+        let mut b = dht(65);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(40, 4672);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[64u8; 32]);
+        let file_hash = [0x5A; 16];
+        let contact = firewalled_contact_at(40);
+
+        let planted = [0xEE; 16];
+        let (data, sig) = source_record_under_key(&sk, planted, file_hash, contact);
+        let (_rid, frame) = a.build_store(planted, data, sig);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        assert!(
+            !on_b.stored_record,
+            "a source record filed away from source_key(file_hash) must be refused"
+        );
+        assert!(on_b.responses.is_empty(), "no STORE_ACK on rejection");
+        assert_eq!(b.store_stats(), (0, 0));
+
+        // The publisher's own derivation is untouched, so a well-formed record
+        // still stores.
+        let derived = source_key(&file_hash);
+        let (data, sig) = source_record_under_key(&sk, derived, file_hash, contact);
+        let (_rid, frame) = a.build_store(derived, data, sig);
+        assert!(
+            b.handle_message(&frame, a_addr, a_noise, 1001).stored_record,
+            "the key the file hash derives must still be accepted"
+        );
+    }
+
+    /// The same binding on the proxy path, which fans the record out to up to
+    /// `K_EMBER_REPLICAS` nodes on the publisher's behalf and so would place a
+    /// misfiled record on twenty peers rather than one.
+    #[test]
+    fn proxy_store_rejects_a_source_record_filed_under_a_chosen_key() {
+        let mut publisher = dht(92);
+        let mut buddy = dht(93);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[92u8; 32]);
+        let planted = [0xC3; 16];
+        let (data, sig) = source_record_under_key(&sk, planted, [0x7B; 16], firewalled_contact_at(92));
+        let (_rid, frame) = publisher.build_proxy_store(planted, data, sig);
+        let on_buddy = buddy.handle_message(&frame, addr(92, 4672), [0xAA; 32], 2000);
+        assert!(
+            on_buddy.proxy_store_forward.is_none(),
+            "a misfiled source record must not be amplified"
+        );
+    }
+
+    /// `PROXY_STORE` admits any peer holding a Noise session whose record is
+    /// its own: binding the publisher to the sender stops a third party
+    /// amplifying *someone else's* record but does nothing about a peer
+    /// amplifying its own. Each accepted forward becomes a `STORE_RECORD` to up
+    /// to `K_EMBER_REPLICAS` nodes and one publish slot, so an unmetered
+    /// version turns one datagram into twenty on demand.
+    #[test]
+    fn a_buddy_cannot_amplify_its_own_records_without_limit() {
+        let mut publisher = dht(88);
+        let mut buddy = dht(89);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(88, 4672);
+        let contact = firewalled_contact_at(88);
+
+        let mut accepted = 0usize;
+        for i in 0..(MAX_PROXY_FORWARDS_PER_SENDER + 8) {
+            let mut file = [0u8; 16];
+            file[0] = i as u8;
+            let record = publisher.build_source_record(file, [0u8; 32], 42, "buddy.mkv", contact);
+            let (_rid, frame) = publisher.build_proxy_store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+            );
+            if buddy
+                .handle_message(&frame, pub_addr, pub_noise, 2000)
+                .proxy_store_forward
+                .is_some()
+            {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, MAX_PROXY_FORWARDS_PER_SENDER,
+            "one peer's fan-out favours have to be paced"
+        );
+
+        // The allowance is per sender, so an honest buddy is not punished for a
+        // noisy one it shares nothing with but our attention.
+        let mut other = dht(90);
+        let record =
+            other.build_source_record([0x90; 16], [0u8; 32], 42, "other.mkv", firewalled_contact_at(90));
+        let (_rid, frame) =
+            other.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(
+            buddy
+                .handle_message(&frame, addr(90, 4672), [0x90; 32], 2001)
+                .proxy_store_forward
+                .is_some(),
+            "a second buddy must not inherit the first's spent allowance"
+        );
+    }
+
+    /// Each accepted forward also holds one of `MAX_ACTIVE_PUBLISHES` slots for
+    /// as long as the publish runs, so the outstanding total needs its own
+    /// bound: enough buddies asking at once would otherwise starve our own
+    /// publishes without any single one of them misbehaving. The engine never
+    /// sees a completion, but a slot lives at most `PUBLISH_TIMEOUT_SECS`, so
+    /// what was admitted inside that window is what can still be alive.
+    #[test]
+    fn outstanding_proxy_forwards_are_bounded_across_all_senders() {
+        let mut buddy = dht(120);
+        let mut accepted = 0usize;
+        for seed in 130..190u8 {
+            let mut publisher = dht(seed);
+            let record = publisher.build_source_record(
+                [seed; 16],
+                [0u8; 32],
+                42,
+                "s.mkv",
+                firewalled_contact_at(seed),
+            );
+            let (_rid, frame) = publisher.build_proxy_store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+            );
+            if buddy
+                .handle_message(&frame, addr(seed, 4672), [seed; 32], 3000)
+                .proxy_store_forward
+                .is_some()
+            {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, MAX_PROXY_FORWARDS_IN_FLIGHT,
+            "proxied work must never be able to take the whole publish driver"
+        );
+        assert!(
+            MAX_PROXY_FORWARDS_IN_FLIGHT * 2 < 128,
+            "and the bound has to sit well under MAX_ACTIVE_PUBLISHES to mean anything"
+        );
+    }
+
+    /// Records are public, so an old copy can be harvested from a FOUND_VALUE
+    /// and replayed. Once its publisher has superseded it the signature cache
+    /// still holds the entry but the store no longer holds the record, so the
+    /// replay reached `store`, hit the newer-copy guard, and was reported as a
+    /// fresh store — an ACK for a record we did not take, a re-armed cache
+    /// entry, and two Ed25519 verifications, on demand.
+    #[test]
+    fn a_replay_of_a_record_its_publisher_superseded_is_not_a_fresh_store() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(20, 4672);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
+        let base = SignedRecord::keyword("ubuntu", [9u8; 16], [0u8; 32], 4096, "u.iso", &sk);
+        let key = base.keyword_hash;
+        let (old_data, old_sig) = redated(&sk, &base, base.timestamp - 300);
+        let (new_data, new_sig) = redated(&sk, &base, base.timestamp);
+
+        let (_rid, old_frame) = a.build_store(key, old_data, old_sig);
+        assert!(
+            b.handle_message(&old_frame, a_addr, a_noise, 1000)
+                .stored_record
+        );
+        let (_rid, new_frame) = a.build_store(key, new_data, new_sig);
+        assert!(
+            b.handle_message(&new_frame, a_addr, a_noise, 1001)
+                .stored_record,
+            "the republish supersedes the copy the cache entry stands for"
+        );
+
+        let replay = b.handle_message(&old_frame, a_addr, a_noise, 1002);
+        assert!(
+            !replay.stored_record,
+            "a superseded copy must not be reported as stored"
+        );
+        assert!(
+            replay.store_replay_rejected,
+            "a signature we have already seen whose record is gone for good is a replay"
+        );
+        assert_eq!(
+            replay.responses.len(),
+            1,
+            "the sender still needs its STORE_ACK"
+        );
+        assert_eq!(b.store_stats(), (1, 1), "and the live store is untouched");
+    }
+
+    /// At capacity the cache used to choose its victim with a `min_by_key` over
+    /// up to `MAX_STORE_SIG_CACHE` entries — work a flooder buys per record
+    /// simply by keeping it full. Eviction is O(1) now and still takes the
+    /// oldest entry: an arbitrary choice would let a flooder keep its own
+    /// signature resident while everyone else's fell out.
+    #[test]
+    fn the_replay_cache_evicts_its_oldest_entry() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(20, 4672);
+        b.set_sig_cache_max_for_test(4);
+
+        let mut frames = Vec::new();
+        for i in 0..5u8 {
+            let record =
+                a.build_keyword_record(&format!("word{i}"), [i; 16], [0u8; 32], 10, "f.iso");
+            let (_rid, frame) =
+                a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&frame, a_addr, a_noise, 1000).stored_record,
+                "record {i} should store"
+            );
+            frames.push(frame);
+        }
+        assert_eq!(b.store_sig_seen.len(), 4, "the cache must stay at its cap");
+        assert_eq!(
+            b.store_sig_order.len(),
+            b.store_sig_seen.len(),
+            "the insertion order must not accumulate ids the cache no longer holds"
+        );
+
+        assert!(
+            b.handle_message(&frames[0], a_addr, a_noise, 1001)
+                .stored_record,
+            "the oldest signature is the one that went"
+        );
+        assert!(
+            b.handle_message(&frames[4], a_addr, a_noise, 1002)
+                .store_replay_rejected,
+            "a signature still in the cache is still collapsed"
+        );
+    }
+
+    /// The sweep was gated on the cache being over half full as well as on the
+    /// timer, so up to 25,000 lapsed entries could sit resident on a quiet node
+    /// — and those are exactly what the size cap then evicts live entries
+    /// around.
+    #[test]
+    fn the_replay_cache_is_swept_on_the_timer_not_on_its_size() {
+        let mut a = dht(20);
+        let mut b = dht(21);
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 10, "u.iso");
+        let (_rid, frame) =
+            a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(
+            b.handle_message(&frame, addr(20, 4672), [0xAA; 32], 1000)
+                .stored_record
+        );
+        assert!(
+            b.store_sig_swept_at.is_some(),
+            "a nearly-empty cache must still be swept, or lapsed entries never leave it"
+        );
     }
 
     #[test]
