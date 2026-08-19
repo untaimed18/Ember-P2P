@@ -660,20 +660,25 @@ impl CreditManager {
     }
 
     /// eMule credit ratio formula from CClientCredits::GetScoreRatio.
-    /// Returns 1.0 for bad identity states when crypto is available.
+    /// Returns 1.0 for `Failed` / `BadGuy` / `Needed` when crypto is available
+    /// (`IS_IDFAILED` / `IS_IDBADGUY` / `IS_IDNEEDED`). `Unknown`
+    /// (`IS_NOTAVAILABLE`) is floored only when the peer advertised a SecIdent
+    /// public key and then failed to complete the exchange.
     pub fn get_score_ratio(&self, user_hash: &[u8; 16], current_ip: u32) -> f64 {
         let record = match self.credits.get(user_hash) {
             Some(r) => r,
             None => return MIN_CREDIT_RATIO,
         };
         let ident = self.get_current_ident_state(user_hash, current_ip);
-        if self.crypto_available
-            && matches!(
-                ident,
-                IdentState::Failed | IdentState::BadGuy | IdentState::Needed
-            )
-        {
-            return MIN_CREDIT_RATIO;
+        if self.crypto_available {
+            let floor = match ident {
+                IdentState::Failed | IdentState::BadGuy | IdentState::Needed => true,
+                IdentState::Unknown => !record.public_key.is_empty(),
+                IdentState::Verified => false,
+            };
+            if floor {
+                return MIN_CREDIT_RATIO;
+            }
         }
 
         // eMule: if downloaded < 1MB, return 1.0 (no credits for trivial transfers)
@@ -766,11 +771,25 @@ impl CreditManager {
     /// Returns true if this peer has uploaded significant data to us (>1 MB),
     /// meaning we're actively benefiting from their uploads and they deserve
     /// a queue score bonus (eMule download-bonus equivalent).
-    pub fn has_download_bonus(&self, user_hash: &[u8; 16]) -> bool {
-        self.credits
-            .get(user_hash)
-            .map(|r| r.downloaded > 1_048_576)
-            .unwrap_or(false)
+    ///
+    /// When SecIdent is available the bonus is withheld from `Failed` /
+    /// `BadGuy` / `Needed`, and from `Unknown` only when the peer advertised
+    /// a public key and then failed to complete the exchange — matching
+    /// eMule leaving `IS_NOTAVAILABLE` on the ratio formula.
+    pub fn has_download_bonus(&self, user_hash: &[u8; 16], current_ip: u32) -> bool {
+        let record = match self.credits.get(user_hash) {
+            Some(r) if r.downloaded > 1_048_576 => r,
+            _ => return false,
+        };
+        if self.crypto_available {
+            match self.get_current_ident_state(user_hash, current_ip) {
+                IdentState::Verified => true,
+                IdentState::Unknown if record.public_key.is_empty() => true,
+                _ => false,
+            }
+        } else {
+            true
+        }
     }
 
     pub fn create_signature_for_peer(

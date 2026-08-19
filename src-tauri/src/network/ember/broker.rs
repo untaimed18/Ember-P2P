@@ -61,6 +61,7 @@ impl std::fmt::Debug for BrokerConnection {
             .field("source_ip", &self.source_ip)
             .field("source_port", &self.source_port)
             .field("method", &self.method)
+            .field("relay_addr", &self.relay_addr)
             .finish()
     }
 }
@@ -88,7 +89,12 @@ struct ConnectionAttempt {
     /// Which relay this attempt was handed to, so its outcome can be charged
     /// back to that candidate. Without this the broker learned nothing from a
     /// failure and would pick the same dead relay again immediately.
-    relay: Option<(Ipv4Addr, u16)>,
+    ///
+    /// The third element is the ERAT signer's Ed25519 pubkey. Two candidates
+    /// can claim the same IP:port (a forged attestation does not prove
+    /// possession), so success and failure must be charged to the signer we
+    /// actually picked, not to the first row at that address.
+    relay: Option<(Ipv4Addr, u16, [u8; 32])>,
 }
 
 impl ConnectionAttempt {
@@ -357,6 +363,7 @@ impl ConnectionBroker {
         let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
         let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
         let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
+        let relay = relay_candidate.map(|c| (c.ip, c.port, c.attestation.ed25519_pubkey));
 
         let attempt = ConnectionAttempt {
             transfer_id: transfer_id.to_string(),
@@ -366,7 +373,7 @@ impl ConnectionBroker {
             phase: start_phase,
             started: now,
             phase_started: now,
-            relay: relay_addr,
+            relay,
         };
 
         info!(
@@ -399,8 +406,8 @@ impl ConnectionBroker {
             debug!("Broker: relay failed for {attempt_key}: {reason}");
             self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
             if relay_at_fault {
-                if let Some((ip, port)) = attempt.relay {
-                    self.penalise_relay_candidate(ip, port);
+                if let Some((ip, port, pubkey)) = attempt.relay {
+                    self.penalise_relay_candidate(ip, port, &pubkey);
                 }
             }
             emit_event(
@@ -418,7 +425,7 @@ impl ConnectionBroker {
     /// Called when a relay succeeds.
     pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
-            if let Some((ip, port)) = attempt.relay {
+            if let Some((ip, port, pubkey)) = attempt.relay {
                 // Clears the count rather than decrementing it: a relay that
                 // just carried a connection has proved itself, and occasional
                 // failures against a working relay should not accumulate into
@@ -426,9 +433,18 @@ impl ConnectionBroker {
                 if let Some(c) = self
                     .relay_candidates
                     .iter_mut()
-                    .find(|c| c.ip == ip && c.port == port)
+                    .find(|c| {
+                        c.ip == ip
+                            && c.port == port
+                            && c.attestation.ed25519_pubkey == pubkey
+                    })
                 {
                     c.failures = 0;
+                    c.relay_sessions += 1;
+                    debug!(
+                        "Broker: incremented relay_sessions for {}:{} to {}",
+                        ip, port, c.relay_sessions
+                    );
                 }
             }
         }
@@ -444,12 +460,10 @@ impl ConnectionBroker {
     /// [`Self::pick_relay_candidate`] — no sessions carried, freshly seen — so
     /// before this, one peer forwarding a handful of them could take over every
     /// choice, fail each time, and be chosen again straight away.
-    fn penalise_relay_candidate(&mut self, ip: Ipv4Addr, port: u16) {
-        let Some(idx) = self
-            .relay_candidates
-            .iter()
-            .position(|c| c.ip == ip && c.port == port)
-        else {
+    fn penalise_relay_candidate(&mut self, ip: Ipv4Addr, port: u16, pubkey: &[u8; 32]) {
+        let Some(idx) = self.relay_candidates.iter().position(|c| {
+            c.ip == ip && c.port == port && c.attestation.ed25519_pubkey == *pubkey
+        }) else {
             return;
         };
         self.relay_candidates[idx].failures = self.relay_candidates[idx].failures.saturating_add(1);
@@ -487,11 +501,14 @@ impl ConnectionBroker {
         let port = attestation.relay_port;
         let expires_at_unix = attestation.expires_at_unix;
         let attestation_hash = super::relay_attestation_hash(&attestation);
-        if let Some(existing) = self
-            .relay_candidates
-            .iter_mut()
-            .find(|c| c.ip == ip && c.port == port)
-        {
+        // Refresh only the same signer at this address. An ERAT does not
+        // prove possession of the IP, so a different pubkey must not
+        // overwrite identity, `failures`, or `introduced_by`.
+        if let Some(existing) = self.relay_candidates.iter_mut().find(|c| {
+            c.ip == ip
+                && c.port == port
+                && c.attestation.ed25519_pubkey == attestation.ed25519_pubkey
+        }) {
             existing.attestation_hash = attestation_hash;
             existing.attestation = attestation;
             existing.ember_hash = ember_hash;
@@ -679,21 +696,6 @@ impl ConnectionBroker {
                 a.source_port,
             )
         })
-    }
-
-    /// Increment the relay session count for a relay candidate after a successful relay.
-    pub fn increment_relay_sessions(&mut self, ip: Ipv4Addr, port: u16) {
-        if let Some(candidate) = self
-            .relay_candidates
-            .iter_mut()
-            .find(|c| c.ip == ip && c.port == port)
-        {
-            candidate.relay_sessions += 1;
-            debug!(
-                "Broker: incremented relay_sessions for {}:{} to {}",
-                ip, port, candidate.relay_sessions
-            );
-        }
     }
 
     /// Transition an attempt to the RelayConnect phase.
@@ -959,7 +961,7 @@ mod tests {
         );
 
         // One failure is enough to send it behind the relay that works.
-        broker.penalise_relay_candidate(bogus, 4662);
+        broker.penalise_relay_candidate(bogus, 4662, &[0u8; 32]);
         assert_eq!(
             broker.pick_relay_candidate().map(|c| c.ip),
             Some(working),
@@ -968,7 +970,7 @@ mod tests {
 
         // And it is dropped rather than lingering to be retried for ever.
         for _ in 1..ConnectionBroker::MAX_CANDIDATE_FAILURES {
-            broker.penalise_relay_candidate(bogus, 4662);
+            broker.penalise_relay_candidate(bogus, 4662, &[0u8; 32]);
         }
         assert!(
             !broker.relay_candidates.iter().any(|c| c.ip == bogus),
@@ -1029,7 +1031,7 @@ mod tests {
         let ip = Ipv4Addr::new(203, 0, 113, 9);
 
         broker.add_relay_candidate(attestation(ip, 4662, fresh), None, None);
-        broker.penalise_relay_candidate(ip, 4662);
+        broker.penalise_relay_candidate(ip, 4662, &[0u8; 32]);
         broker.add_relay_candidate(attestation(ip, 4662, fresh + 60), None, None);
 
         assert_eq!(
@@ -1039,6 +1041,98 @@ mod tests {
                 .find(|c| c.ip == ip)
                 .map(|c| c.failures),
             Some(1)
+        );
+    }
+
+    /// A forged ERAT for an honest relay's address is a *second* row, not a
+    /// refresh. Failure must be charged to the signer we picked, or the
+    /// honest row is burned toward eviction while the forged one stays at
+    /// `failures: 0` and keeps winning the pick.
+    #[tokio::test]
+    async fn forged_attestation_at_an_honest_address_does_not_take_the_honest_failures() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let fresh = unix_now() + 600;
+        let ip = Ipv4Addr::new(198, 51, 100, 9);
+        let honest_pk = [1u8; 32];
+        let forged_pk = [2u8; 32];
+
+        let mut honest = attestation(ip, 4662, fresh);
+        honest.ed25519_pubkey = honest_pk;
+        broker.add_relay_candidate(honest, None, None);
+        // `pick_relay_candidate` ranks `last_seen` in whole seconds, so two
+        // inserts in the same second are a tie and the first (honest) row
+        // wins. Give it sessions so the unused forged row is selected the
+        // same way a fabricated ERAT outranks a working relay on the
+        // live path.
+        if let Some(c) = broker
+            .relay_candidates
+            .iter_mut()
+            .find(|c| c.attestation.ed25519_pubkey == honest_pk)
+        {
+            c.relay_sessions = 2;
+        }
+
+        let mut forged = attestation(ip, 4662, fresh);
+        forged.ed25519_pubkey = forged_pk;
+        broker.add_relay_candidate(forged, None, None);
+
+        assert_eq!(broker.relay_candidate_count(), 2);
+        assert_eq!(
+            broker
+                .pick_relay_candidate()
+                .map(|c| c.attestation.ed25519_pubkey),
+            Some(forged_pk),
+            "precondition: the unused forged row wins the pick"
+        );
+
+        broker
+            .attempt_low_to_low(
+                "t-forge",
+                [7u8; 16],
+                Ipv4Addr::new(10, 0, 0, 2),
+                4662,
+                NatType::Symmetric,
+                Some("5.6.7.8:9999".parse().unwrap()),
+            )
+            .await;
+        broker
+            .relay_failed("t-forge:10.0.0.2:4662", "handshake failed", true)
+            .await;
+
+        assert_eq!(
+            broker
+                .relay_candidates
+                .iter()
+                .find(|c| c.attestation.ed25519_pubkey == honest_pk)
+                .map(|c| c.failures),
+            Some(0)
+        );
+        assert_eq!(
+            broker
+                .relay_candidates
+                .iter()
+                .find(|c| c.attestation.ed25519_pubkey == forged_pk)
+                .map(|c| c.failures),
+            Some(1)
+        );
+
+        for _ in 1..ConnectionBroker::MAX_CANDIDATE_FAILURES {
+            broker.penalise_relay_candidate(ip, 4662, &forged_pk);
+        }
+        assert!(
+            broker
+                .relay_candidates
+                .iter()
+                .any(|c| c.attestation.ed25519_pubkey == honest_pk),
+            "the honest relay must survive the forged row's failures"
+        );
+        assert!(
+            !broker
+                .relay_candidates
+                .iter()
+                .any(|c| c.attestation.ed25519_pubkey == forged_pk),
+            "the forged row must be the one evicted"
         );
     }
 

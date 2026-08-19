@@ -44,6 +44,32 @@ const TCP_STUN_SERVERS: &[&str] = &[
     "global.stun.twilio.com:3478",
 ];
 
+/// Cap on each `lookup_host`. Matched to [`STUN_TIMEOUT`]: a cold Windows
+/// resolver on a lossy link retries `getaddrinfo` at roughly 1 s then 2 s,
+/// so exceeding 2 s is a normal-but-slow outcome rather than a hang.
+/// Each target is independently bounded; `tcp_mapping_cycle` has no shared
+/// STUN/connect budget. The real constraint is the network loop's
+/// `MAPPING_KA_WATCHDOG` (90 s). Realistic worst case is
+/// 3 × (5 + 8) + 4 × (5 + 5) = 79 s (three TCP-hold DNS+connect timeouts,
+/// then four TCP-STUN DNS+connect timeouts), still inside that watchdog.
+/// `tokio::time::timeout` cancels the future, not the `getaddrinfo` call
+/// running on a blocking thread — that thread stays occupied until the OS
+/// gives up. Bounded, not a leak.
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn lookup_ipv4(
+    host: impl tokio::net::ToSocketAddrs,
+    label: &str,
+) -> Result<SocketAddr, String> {
+    let mut resolved = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(host))
+        .await
+        .map_err(|_| format!("DNS {label}: timed out"))?
+        .map_err(|e| format!("DNS {label}: {e}"))?;
+    resolved
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| format!("No IPv4 for {label}"))
+}
+
 /// Discover the TCP server-reflexive endpoint using a real TCP STUN
 /// transaction sourced from Ember's TCP listener port.
 pub async fn tcp_stun_mapped_addr_on_port(local_port: u16) -> Option<SocketAddr> {
@@ -60,11 +86,7 @@ pub async fn tcp_stun_mapped_addr_on_port(local_port: u16) -> Option<SocketAddr>
 }
 
 async fn tcp_stun_exchange(local_port: u16, server: &str) -> Result<SocketAddr, String> {
-    let server_addr: SocketAddr = tokio::net::lookup_host(server)
-        .await
-        .map_err(|e| format!("DNS {server}: {e}"))?
-        .find(|a| a.is_ipv4())
-        .ok_or_else(|| format!("No IPv4 for {server}"))?;
+    let server_addr = lookup_ipv4(server, server).await?;
 
     let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
     tcp.set_reuseaddr(true)
@@ -138,16 +160,10 @@ pub(crate) async fn stun_keepalive_with_replies(
     server_index: usize,
 ) -> Option<SocketAddr> {
     let (txn_id, request, server) = stun_keepalive_request(server_index);
-    let server_addr: SocketAddr = match tokio::net::lookup_host(server).await {
-        Ok(mut iter) => match iter.find(|a| a.is_ipv4()) {
-            Some(a) => a,
-            None => {
-                debug!("STUN keepalive: no IPv4 for {server}");
-                return None;
-            }
-        },
+    let server_addr = match lookup_ipv4(server, server).await {
+        Ok(addr) => addr,
         Err(e) => {
-            debug!("STUN keepalive DNS {server}: {e}");
+            debug!("STUN keepalive {e}");
             return None;
         }
     };
@@ -197,11 +213,7 @@ async fn open_tcp_mapping_hold(local_port: u16) -> Option<TcpStream> {
 }
 
 async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpStream, String> {
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS {host}: {e}"))?
-        .filter(|a| a.is_ipv4());
-    let remote = addrs.next().ok_or_else(|| format!("No IPv4 for {host}"))?;
+    let remote = lookup_ipv4((host, port), host).await?;
 
     let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
     tcp.set_reuseaddr(true)

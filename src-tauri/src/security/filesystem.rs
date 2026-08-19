@@ -1878,6 +1878,17 @@ pub(crate) fn windows_system_path(relative: &str) -> std::path::PathBuf {
     .join(relative)
 }
 
+/// Rewrite a `canonicalize`d Windows path for Shell APIs. `\\?\C:\...` loses
+/// the prefix; `\\?\UNC\server\share` must become `\\server\share`, not the
+/// relative-looking `UNC\server\share` that a naive `\\?\` strip produces.
+#[cfg(any(windows, test))]
+fn strip_extended_path_prefix(value: &str) -> String {
+    match value.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => value.strip_prefix(r"\\?\").unwrap_or(value).to_string(),
+    }
+}
+
 #[cfg(windows)]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
@@ -1890,7 +1901,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
             "path contains unsupported characters",
         ));
     }
-    let clean = value.strip_prefix(r"\\?\").unwrap_or(value);
+    let clean = strip_extended_path_prefix(value);
     std::process::Command::new(windows_system_path("explorer.exe"))
         .raw_arg(format!(r#"/select,"{clean}""#))
         .spawn()?;
@@ -1910,10 +1921,7 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     let value = path
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
-    let clean = match value.strip_prefix(r"\\?\UNC\") {
-        Some(rest) => format!(r"\\{rest}"),
-        None => value.strip_prefix(r"\\?\").unwrap_or(value).to_string(),
-    };
+    let clean = strip_extended_path_prefix(value);
     opener::open(clean).map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -2020,6 +2028,26 @@ mod tests {
         ));
         assert!(!passive_type_agrees("script.ps1", Path::new("script.ps1")));
         assert!(!passive_type_agrees("page.html", Path::new("page.html")));
+    }
+
+    #[test]
+    fn strip_extended_path_prefix_rewrites_unc_and_drive_paths() {
+        assert_eq!(
+            strip_extended_path_prefix(r"\\?\UNC\server\share\file.txt"),
+            r"\\server\share\file.txt"
+        );
+        assert_eq!(
+            strip_extended_path_prefix(r"\\?\C:\Users\a\file.txt"),
+            r"C:\Users\a\file.txt"
+        );
+        assert_eq!(
+            strip_extended_path_prefix(r"C:\Users\a\file.txt"),
+            r"C:\Users\a\file.txt"
+        );
+        assert_eq!(
+            strip_extended_path_prefix(r"\\server\share\file.txt"),
+            r"\\server\share\file.txt"
+        );
     }
 
     #[test]

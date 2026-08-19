@@ -167,7 +167,7 @@ impl CompressedPartAccumulator {
             .bytes;
         self.pending_bytes = self.pending_bytes.saturating_sub(packed.len());
         let decompressed = decompress_compressed_part_bounded(&packed, expected_len)?;
-        if decompressed.is_empty() || decompressed.len() > expected_len {
+        if decompressed.len() != expected_len {
             anyhow::bail!("decompressed part is outside its requested range");
         }
         Ok(Some(decompressed))
@@ -177,6 +177,103 @@ impl CompressedPartAccumulator {
         if let Some(entry) = self.pending.remove(&start) {
             self.pending_bytes = self.pending_bytes.saturating_sub(entry.bytes.len());
         }
+    }
+}
+
+/// Silence budget for one outstanding request-range.
+///
+/// A dropped `AddReqBlock` never produces a packet, so this is a
+/// no-traffic timer, not a full-block-completion timer. 30 s is 3× the
+/// inter-packet gap of a 1 KB/s trickle (10 KiB slices) and sits 30 s
+/// inside the 60 s first-data timeout / 70 s inside `DOWNLOADTIMEOUT_SECS`
+/// (100 s), so a discarded request is retried with budget left to wait
+/// for the replacement. Any overlapping packet refreshes the deadline,
+/// so a healthy 4 KB/s sender finishing a 180 KiB block (~45 s) is not
+/// expired between slices.
+pub(super) const OUTSTANDING_RANGE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OutstandingRange {
+    pub start: u64,
+    pub end: u64,
+    expires_at: std::time::Instant,
+}
+
+impl OutstandingRange {
+    pub fn new(start: u64, end: u64) -> Self {
+        Self {
+            start,
+            end,
+            expires_at: std::time::Instant::now() + OUTSTANDING_RANGE_TTL,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.expires_at = std::time::Instant::now() + OUTSTANDING_RANGE_TTL;
+    }
+}
+
+pub(super) fn push_outstanding_batch(
+    outstanding: &mut Vec<OutstandingRange>,
+    batch: &[(u64, u64)],
+) {
+    outstanding.extend(
+        batch
+            .iter()
+            .copied()
+            .map(|(s, e)| OutstandingRange::new(s, e)),
+    );
+}
+
+/// Drop ranges whose deadline has passed. Returns the expired byte count so
+/// callers that track `total_sent_bytes` can shrink the budget; the bytes
+/// themselves were never taken out of the gap map (write reservations are
+/// acquired only when data arrives), so this does not double-release.
+pub(super) fn expire_outstanding_ranges(outstanding: &mut Vec<OutstandingRange>) -> u64 {
+    let now = std::time::Instant::now();
+    let mut expired_bytes = 0u64;
+    outstanding.retain(|r| {
+        if r.expires_at <= now {
+            expired_bytes = expired_bytes.saturating_add(r.end.saturating_sub(r.start));
+            false
+        } else {
+            true
+        }
+    });
+    expired_bytes
+}
+
+pub(super) fn refresh_outstanding_range(outstanding: &mut [OutstandingRange], pkt_start: u64) {
+    if let Some(r) = outstanding
+        .iter_mut()
+        .find(|r| pkt_start >= r.start && pkt_start < r.end)
+    {
+        r.touch();
+    }
+}
+
+/// Mark a requested `(start, end)` range complete when a packet's exclusive
+/// end matches it (eMule `nEndPos == cur_block->block->EndOffset` after the
+/// inclusive conversion). eMule also requires `lenWritten > 0` before
+/// completing a range; we still count a duplicate (no-op write) as complete
+/// so range-driven refill cannot stall. Returns true only the first time so
+/// subsequent packets cannot drive another refill. A non-completing overlap
+/// refreshes the range deadline so a slow-but-live sender is not expired.
+pub(super) fn take_completed_outstanding_range(
+    outstanding: &mut Vec<OutstandingRange>,
+    pkt_start: u64,
+    pkt_end: u64,
+) -> bool {
+    if let Some(i) = outstanding
+        .iter()
+        .position(|r| pkt_start >= r.start && pkt_start < r.end && pkt_end == r.end)
+    {
+        outstanding.swap_remove(i);
+        true
+    } else {
+        refresh_outstanding_range(outstanding, pkt_start);
+        false
     }
 }
 
@@ -3780,6 +3877,7 @@ impl Ed2kDownload {
                 }
 
                 // Send initial batch of requests to fill the pipeline
+                let mut outstanding_ranges: Vec<OutstandingRange> = Vec::new();
                 while sent_idx < batches.len() && sent_idx < max_outstanding {
                     let batch = &batches[sent_idx];
                     let (req_payload, req_proto, req_op) = if needs_i64 {
@@ -3797,10 +3895,11 @@ impl Ed2kDownload {
                     };
                     write_packet_async(&mut writer, req_proto, req_op, &req_payload).await?;
                     total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                    push_outstanding_batch(&mut outstanding_ranges, batch);
                     sent_idx += 1;
                 }
 
-                // Track how many blocks received per request for pipeline refill
+                // Track completed requested ranges (not packets) for pipeline refill
                 let mut blocks_received_in_current_req: usize = 0;
                 let mut completed_reqs: usize = 0;
                 let mut pending_compressed = CompressedPartAccumulator::default();
@@ -3872,45 +3971,93 @@ impl Ed2kDownload {
                     let read_outcome = if let Some(packet) = auth_deferred.pop_front() {
                         Ok(Ok(packet))
                     } else {
-                        tokio::select! {
-                            biased;
-                            // User Stop/Cancel (or a network disconnect) landed
-                            // while we're actively downloading from this callback
-                            // source. Mirror eMule's CPartFile::PauseFile: send
-                            // OP_CANCELTRANSFER so the uploader frees our slot
-                            // immediately rather than waiting to notice the dropped
-                            // TCP socket. Best-effort + time-boxed, then bail.
-                            // Fires on Pause too (eMule's PauseFile notifies every
-                            // DS_DOWNLOADING source); the Failed handler ignores the
-                            // resulting unwind because the transfer is already
-                            // marked Paused.
-                            _ = self.control.wait_cancel_or_pause() => {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(400),
-                                    write_packet_async(
-                                        &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                    ),
-                                ).await;
-                                // This callback/single-source path isn't registered in
-                                // `tracker_registry` (only multi-source downloads are), so
-                                // `PauseDownload`'s `save_registered_part_tracker` is a
-                                // no-op here and the task is `abort()`'d right after this
-                                // command returns — without an explicit save here, up to
-                                // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
-                                // on the in-flight part would be silently lost on pause.
-                                super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
-                                anyhow::bail!("cancelled by user");
+                        let mut read_fut = std::pin::pin!(read_packet_async(&mut reader));
+                        let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
+                        let mut expire_tick =
+                            tokio::time::interval(std::time::Duration::from_secs(2));
+                        expire_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        expire_tick.tick().await;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                // User Stop/Cancel (or a network disconnect) landed
+                                // while we're actively downloading from this callback
+                                // source. Mirror eMule's CPartFile::PauseFile: send
+                                // OP_CANCELTRANSFER so the uploader frees our slot
+                                // immediately rather than waiting to notice the dropped
+                                // TCP socket. Best-effort + time-boxed, then bail.
+                                // Fires on Pause too (eMule's PauseFile notifies every
+                                // DS_DOWNLOADING source); the Failed handler ignores the
+                                // resulting unwind because the transfer is already
+                                // marked Paused.
+                                _ = self.control.wait_cancel_or_pause() => {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(400),
+                                        write_packet_async(
+                                            &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                        ),
+                                    ).await;
+                                    // This callback/single-source path isn't registered in
+                                    // `tracker_registry` (only multi-source downloads are), so
+                                    // `PauseDownload`'s `save_registered_part_tracker` is a
+                                    // no-op here and the task is `abort()`'d right after this
+                                    // command returns — without an explicit save here, up to
+                                    // `PERIODIC_SAVE_INTERVAL` (60s) of gap-tracking progress
+                                    // on the in-flight part would be silently lost on pause.
+                                    super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
+                                    anyhow::bail!("cancelled by user");
+                                }
+                                res = &mut read_fut => break Ok(res),
+                                _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
+                                _ = expire_tick.tick() => {
+                                    let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                                    if expired == 0 {
+                                        continue;
+                                    }
+                                    total_sent_bytes = total_sent_bytes.saturating_sub(expired);
+                                    while sent_idx < batches.len()
+                                        && outstanding_ranges.len()
+                                            < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                                    {
+                                        let batch = &batches[sent_idx];
+                                        let (req_payload, req_proto, req_op) = if needs_i64 {
+                                            (
+                                                build_request_parts_i64(&self.file_hash, batch),
+                                                OP_EMULEPROT,
+                                                OP_REQUESTPARTS_I64,
+                                            )
+                                        } else {
+                                            (
+                                                build_request_parts(&self.file_hash, batch),
+                                                OP_EDONKEYHEADER,
+                                                OP_REQUESTPARTS,
+                                            )
+                                        };
+                                        write_packet_async(
+                                            &mut writer, req_proto, req_op, &req_payload,
+                                        )
+                                        .await?;
+                                        total_sent_bytes +=
+                                            batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                                        push_outstanding_batch(&mut outstanding_ranges, batch);
+                                        sent_idx += 1;
+                                    }
+                                    if total_received >= total_sent_bytes {
+                                        break Err(());
+                                    }
+                                    hard_deadline = tokio::time::Instant::now() + read_timeout;
+                                    continue;
+                                }
                             }
-                            r = tokio::time::timeout(
-                                read_timeout,
-                                read_packet_async(&mut reader),
-                            ) => r,
                         }
                     };
                     let (proto, opcode, payload) = match read_outcome {
                         Ok(Ok(pkt)) => pkt,
                         Ok(Err(e)) => return Err(e.into()),
-                        Err(_) => {
+                        Err(()) => {
+                            if total_received >= total_sent_bytes {
+                                continue;
+                            }
                             let _ = write_packet_async(
                                 &mut writer,
                                 OP_EDONKEYHEADER,
@@ -4065,7 +4212,13 @@ impl Ed2kDownload {
                             // compares it against what the peer announced it would send.
                             total_received += piece_len;
                             downloaded += newly_written;
-                            blocks_received_in_current_req += 1;
+                            if take_completed_outstanding_range(
+                                &mut outstanding_ranges,
+                                start,
+                                end,
+                            ) {
+                                blocks_received_in_current_req += 1;
+                            }
                             speed_measure_bytes += newly_written;
 
                             // D12: defer credit until the part verifies. Credit only
@@ -4134,6 +4287,7 @@ impl Ed2kDownload {
                                 compressed,
                             )?
                             else {
+                                refresh_outstanding_range(&mut outstanding_ranges, start);
                                 continue;
                             };
 
@@ -4214,7 +4368,13 @@ impl Ed2kDownload {
                             // the round-exit check) but no new data.
                             total_received += piece_len;
                             downloaded += newly_written;
-                            blocks_received_in_current_req += 1;
+                            if take_completed_outstanding_range(
+                                &mut outstanding_ranges,
+                                start,
+                                start + piece_len,
+                            ) {
+                                blocks_received_in_current_req += 1;
+                            }
                             speed_measure_bytes += newly_written;
 
                             // D12: defer credit until the part verifies. Credit only
@@ -4603,7 +4763,11 @@ impl Ed2kDownload {
                         }
                     }
 
-                    // When a request's worth of blocks is complete, send the next one
+                    // When a request's worth of requested ranges is complete, send the next one
+                    let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                    if expired > 0 {
+                        total_sent_bytes = total_sent_bytes.saturating_sub(expired);
+                    }
                     let blocks_in_current_batch = if completed_reqs < batches.len() {
                         batches[completed_reqs].len()
                     } else {
@@ -4612,8 +4776,14 @@ impl Ed2kDownload {
                     if blocks_received_in_current_req >= blocks_in_current_batch {
                         blocks_received_in_current_req = 0;
                         completed_reqs += 1;
-                        // Pipeline refill: send next request if available
-                        if sent_idx < batches.len() {
+                        // Pipeline refill: send next request if available, but
+                        // never grow past max_outstanding (eMule
+                        // CreateBlockRequests: pending > 2 * blockCount).
+                        if sent_idx < batches.len()
+                            && sent_idx.saturating_sub(completed_reqs) < max_outstanding
+                            && outstanding_ranges.len()
+                                <= 2 * max_outstanding * MAX_BLOCKS_PER_REQUEST
+                        {
                             let batch = &batches[sent_idx];
                             let (req_payload, req_proto, req_op) = if needs_i64 {
                                 (
@@ -4631,6 +4801,32 @@ impl Ed2kDownload {
                             write_packet_async(&mut writer, req_proto, req_op, &req_payload)
                                 .await?;
                             total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                            push_outstanding_batch(&mut outstanding_ranges, batch);
+                            sent_idx += 1;
+                        }
+                    } else if expired > 0 {
+                        while sent_idx < batches.len()
+                            && outstanding_ranges.len()
+                                < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                        {
+                            let batch = &batches[sent_idx];
+                            let (req_payload, req_proto, req_op) = if needs_i64 {
+                                (
+                                    build_request_parts_i64(&self.file_hash, batch),
+                                    OP_EMULEPROT,
+                                    OP_REQUESTPARTS_I64,
+                                )
+                            } else {
+                                (
+                                    build_request_parts(&self.file_hash, batch),
+                                    OP_EDONKEYHEADER,
+                                    OP_REQUESTPARTS,
+                                )
+                            };
+                            write_packet_async(&mut writer, req_proto, req_op, &req_payload)
+                                .await?;
+                            total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                            push_outstanding_batch(&mut outstanding_ranges, batch);
                             sent_idx += 1;
                         }
                     }

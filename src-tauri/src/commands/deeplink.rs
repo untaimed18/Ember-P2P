@@ -1,4 +1,6 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -159,7 +161,7 @@ fn pending_queue_path(app: &AppHandle) -> std::path::PathBuf {
     crate::storage::paths::resolve_data_dir_with_app(app).join(PENDING_QUEUE_FILE)
 }
 
-fn persist_pending_queue(app: &AppHandle, entries: &[PendingDeepLink]) -> Result<(), String> {
+fn persist_pending_queue(path: &Path, entries: &[PendingDeepLink]) -> Result<(), String> {
     let data = serde_json::to_vec(entries).map_err(|e| {
         coded_ctx(
             "deeplink_queue_serialize_failed",
@@ -167,8 +169,51 @@ fn persist_pending_queue(app: &AppHandle, entries: &[PendingDeepLink]) -> Result
             e,
         )
     })?;
-    crate::security::atomic_write(&pending_queue_path(app), &data, true)
+    crate::security::atomic_write(path, &data, true)
         .map_err(|e| coded_ctx("deeplink_queue_save_failed", "Deep-link queue error", e))
+}
+
+/// Serializes durable queue writes. Each writer clones the live in-memory
+/// queue under this lock so a late dispatch persist cannot overwrite a
+/// completed ack.
+fn pending_queue_persist_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+/// Persist the current in-memory queue. When `ack_id` is set, the durable
+/// snapshot excludes that entry and the in-memory queue is updated only
+/// after the write succeeds, so a failed write leaves the entry queued.
+fn persist_live_pending_queue(
+    app: &AppHandle,
+    queue: &parking_lot::Mutex<Vec<PendingDeepLink>>,
+    ack_id: Option<&str>,
+) -> Result<(), String> {
+    persist_live_pending_queue_at(&pending_queue_path(app), queue, ack_id)
+}
+
+fn persist_live_pending_queue_at(
+    path: &Path,
+    queue: &parking_lot::Mutex<Vec<PendingDeepLink>>,
+    ack_id: Option<&str>,
+) -> Result<(), String> {
+    let _persist_guard = pending_queue_persist_lock().lock();
+    let snapshot = {
+        let pending = queue.lock();
+        match ack_id {
+            Some(id) => pending
+                .iter()
+                .filter(|entry| entry.id != id)
+                .cloned()
+                .collect(),
+            None => pending.clone(),
+        }
+    };
+    persist_pending_queue(path, &snapshot)?;
+    if let Some(id) = ack_id {
+        queue.lock().retain(|entry| entry.id != id);
+    }
+    Ok(())
 }
 
 /// Load a bounded durable queue before `AppState` is managed. Corrupt queues
@@ -222,23 +267,34 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
     }
 
     if let Some(state) = app.try_state::<AppState>() {
-        let mut pending = state.pending_deep_links.lock();
-        for p in payloads {
-            if pending.len() >= MAX_PENDING {
-                tracing::warn!("Dropping deep link; pending buffer full ({MAX_PENDING})");
-                break;
+        let queue = state.pending_deep_links.clone();
+        let mut enqueued = false;
+        {
+            let mut pending = queue.lock();
+            for p in payloads {
+                if pending.len() >= MAX_PENDING {
+                    tracing::warn!("Dropping deep link; pending buffer full ({MAX_PENDING})");
+                    break;
+                }
+                let sequence = NEXT_PENDING_ID.fetch_add(1, Ordering::Relaxed);
+                pending.push(PendingDeepLink {
+                    id: format!(
+                        "{:x}-{sequence:x}",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ),
+                    payload: p,
+                });
+                enqueued = true;
             }
-            let sequence = NEXT_PENDING_ID.fetch_add(1, Ordering::Relaxed);
-            pending.push(PendingDeepLink {
-                id: format!(
-                    "{:x}-{sequence:x}",
-                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                ),
-                payload: p,
-            });
         }
-        if let Err(error) = persist_pending_queue(app, &pending) {
-            tracing::warn!("Failed to persist deep-link queue: {error}");
+        if enqueued {
+            let app_for_persist = app.clone();
+            // Detached: the window proc must return before the fsync completes.
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = persist_live_pending_queue(&app_for_persist, &queue, None) {
+                    tracing::warn!("Failed to persist deep-link queue: {error}");
+                }
+            }));
         }
     } else {
         // AppState isn't managed yet (very early startup). This shouldn't
@@ -286,21 +342,16 @@ pub async fn ack_pending_deep_link(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let mut pending = state.pending_deep_links.lock();
-    let updated: Vec<PendingDeepLink> = pending
-        .iter()
-        .filter(|entry| entry.id != id)
-        .cloned()
-        .collect();
-    if updated.len() == pending.len() {
-        return Ok(());
+    {
+        let pending = state.pending_deep_links.lock();
+        if !pending.iter().any(|entry| entry.id == id) {
+            return Ok(());
+        }
     }
-    // The durable file is the source of truth across a process restart.
-    // Persist the post-ack snapshot before changing the in-memory queue so a
-    // failed write leaves this entry eligible for a safe acknowledgement
-    // retry rather than silently losing it.
-    persist_pending_queue(&app, &updated)?;
-    *pending = updated;
+    let queue = state.pending_deep_links.clone();
+    tokio::task::spawn_blocking(move || persist_live_pending_queue(&app, &queue, Some(&id)))
+        .await
+        .map_err(|e| coded_ctx("deeplink_queue_save_failed", "Deep-link queue error", e))??;
     Ok(())
 }
 
@@ -469,5 +520,64 @@ mod tests {
         assert!(
             collection_path_from_pending(&pending, &"a".repeat(MAX_PENDING_ID_LEN + 1)).is_err()
         );
+    }
+
+    fn sample_pending(id: &str) -> PendingDeepLink {
+        PendingDeepLink {
+            id: id.to_string(),
+            payload: "ed2k://|file|example.iso|1|0123456789abcdef0123456789abcdef|/".to_string(),
+        }
+    }
+
+    fn load_persisted_queue(path: &Path) -> Vec<PendingDeepLink> {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn acked_id_is_not_resurrected_by_dispatch_persist() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-deeplink-persist-{}-{}",
+            std::process::id(),
+            NEXT_PENDING_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending_deep_links.json");
+
+        let queue = parking_lot::Mutex::new(vec![
+            sample_pending("ack-me"),
+            sample_pending("keep-me"),
+        ]);
+        persist_live_pending_queue_at(&path, &queue, Some("ack-me")).unwrap();
+        let after_ack = load_persisted_queue(&path);
+        assert!(after_ack.iter().all(|entry| entry.id != "ack-me"));
+        assert!(after_ack.iter().any(|entry| entry.id == "keep-me"));
+        assert!(queue.lock().iter().all(|entry| entry.id != "ack-me"));
+
+        persist_live_pending_queue_at(&path, &queue, None).unwrap();
+        let after_dispatch = load_persisted_queue(&path);
+        assert!(after_dispatch.iter().all(|entry| entry.id != "ack-me"));
+        assert_eq!(after_dispatch.len(), 1);
+        assert_eq!(after_dispatch[0].id, "keep-me");
+
+        for _ in 0..8 {
+            let queue =
+                parking_lot::Mutex::new(vec![sample_pending("ack-me"), sample_pending("keep-me")]);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    persist_live_pending_queue_at(&path, &queue, Some("ack-me")).unwrap();
+                });
+                scope.spawn(|| {
+                    persist_live_pending_queue_at(&path, &queue, None).unwrap();
+                });
+            });
+            let on_disk = load_persisted_queue(&path);
+            assert!(
+                on_disk.iter().all(|entry| entry.id != "ack-me"),
+                "acked id reappeared on disk"
+            );
+            assert!(queue.lock().iter().all(|entry| entry.id != "ack-me"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -153,13 +153,14 @@ pub fn create_preview_file(
             let to_read = (remaining as usize).min(COPY_BUFFER_SIZE);
             let n = src.read(&mut buf[..to_read])?;
             if n == 0 {
-                tracing::warn!(
-                    "Preview: unexpected EOF copying range [{}, {}), {} bytes remaining",
+                drop(dst);
+                let _ = std::fs::remove_file(&preview_path);
+                anyhow::bail!(
+                    "unexpected EOF copying preview range [{}, {}), {} bytes remaining",
                     range.start,
                     range.end,
                     remaining
                 );
-                break;
             }
             dst.write_all(&buf[..n])?;
             remaining -= n as u64;

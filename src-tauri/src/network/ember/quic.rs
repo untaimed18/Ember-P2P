@@ -130,7 +130,9 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
     // Require inbound peers to present a well-formed Ember cert and prove
     // possession of its key (handshake signature is verified). Symmetric to
     // the client-side EmberCertVerifier — closes the "accept any client"
-    // gap. Node-identity auth still rests on the TCP Ed25519 PoP layer.
+    // gap. This side does not pin a client cert to a node_id; identity that
+    // gates privilege is Noise IK on `secure_stream`, and friend access is
+    // gated by `secure_v2_authenticated`.
     let client_verifier = Arc::new(EmberClientCertVerifier { supported_algs });
     let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
@@ -300,10 +302,19 @@ pub fn connection_node_id(connection: &quinn::Connection) -> Option<[u8; 16]> {
 /// `verify_tls1{2,3}_signature` below) using the active crypto provider's
 /// algorithms — so the channel is cryptographically bound to a peer that
 /// actually holds the cert's private key. For the unpinned smoke-check
-/// path, that still doesn't prove the key belongs to a *specific*
-/// node_id; the node_id↔key binding there is established out-of-band by
-/// the eMule/Ember TCP layer's mutual Ed25519 proof-of-possession, on
-/// which file-transfer integrity solely depends in that case.
+/// path (`expected_node_id: None`), that still doesn't prove the key
+/// belongs to a *specific* node_id, and not every dial is pinned: the
+/// relay's `connect_relay_target` calls `endpoint.connect` with no pin,
+/// which is acceptable because the relay is untrusted by design and the
+/// only traffic that crosses it is an anonymous LowID eD2K transfer whose
+/// integrity rests on MD4/AICH part verification, not on this channel.
+/// Friend *file* transfers never cross this relay: `EmberXferMethod`
+/// offers only `ConnectBack | Punch`, and both run Noise IK. (A friend
+/// session can still fall back to the rendezvous WSS relay via
+/// `relay_friend`; that is a different transport and never reaches this
+/// verifier.) A relay operator — or anyone MITM-ing this unpinned hop —
+/// can see and alter the bridged eD2K bytes; no privilege is granted
+/// without `secure_v2_authenticated`.
 #[derive(Debug)]
 struct EmberCertVerifier {
     expected_node_id: Option<[u8; 16]>,
@@ -368,8 +379,11 @@ impl rustls::client::danger::ServerCertVerifier for EmberCertVerifier {
 /// clients to present a well-formed Ember self-signed cert and proves they
 /// hold its private key (the handshake signature is verified). This makes the
 /// QUIC channel mutually key-authenticated instead of accepting any client.
-/// As on the client side, binding a cert key to a specific node_id is the
-/// job of the TCP Ed25519 proof-of-possession, not this verifier.
+/// This verifier never pins a client cert to a node_id — inbound QUIC has
+/// no expected peer id to pin against. Binding a presented key to a specific
+/// identity is Noise IK on `secure_stream` (friend punches and
+/// `connect_and_serve` when `secure_friend_ember_hash` is known). Friend
+/// access is gated by `secure_v2_authenticated`, not by this verifier.
 #[derive(Debug)]
 struct EmberClientCertVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -619,14 +633,14 @@ pub async fn build_server_client_endpoint(
 /// carry a SubjectPublicKeyInfo that hashes to `expected_peer_node_id` (see
 /// `EmberCertVerifier`) — true MITM-safe per-peer authentication. When `pin`
 /// is `None`, the endpoint's default (unpinned smoke-test) client config is
-/// used. `None` is the graceful fallback for broker/relay candidates
-/// discovered via unauthenticated rendezvous/EPX, where the target's Ember node
-/// id isn't known at QUIC-connect time — the KAD source record advertises the
-/// peer's Noise public key, not its `ember_hash`, and the node↔key binding is
-/// established out-of-band by the eMule/Ember TCP Ed25519 proof-of-possession.
-/// Callers that *do* know the target node id pass `Some` to upgrade the
-/// channel to authenticated pinning without any change to this transport
-/// layer.
+/// used. `None` is the graceful fallback when the target's Ember node id
+/// isn't known at QUIC-connect time — notably a broker/relay candidate whose
+/// ERAT did not carry `ember_hash`. That smoke check does not bind the cert
+/// key to a node_id. Callers that *do* know the target pass `Some`: friend
+/// punches via `punch_quic_pinned`, and peer-relay dials when
+/// `relay_ember_hash` is present. Where identity gates privilege, the live
+/// binding is Noise IK on `secure_stream`; friend access is gated by
+/// `secure_v2_authenticated`.
 pub async fn connect_pinned(
     endpoint: &Endpoint,
     addr: SocketAddr,

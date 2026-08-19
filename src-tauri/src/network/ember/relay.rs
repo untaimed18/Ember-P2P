@@ -1493,6 +1493,24 @@ async fn read_relay_control(
         .map_err(|e| format!("{context}: {e}"))
 }
 
+async fn write_relay_control(
+    send: &mut quinn::SendStream,
+    buffer: &[u8],
+    context: &str,
+) -> Result<(), String> {
+    match tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(buffer)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            let _ = send.reset(0u32.into());
+            Err(format!("{context}: {e}"))
+        }
+        Err(_) => {
+            let _ = send.reset(0u32.into());
+            Err(format!("{context}: timed out"))
+        }
+    }
+}
+
 /// A relay target must be a globally-routable IPv4 unicast address.
 ///
 /// The relay dials whatever `target_ip:target_port` the initiator puts in the
@@ -1853,7 +1871,7 @@ pub async fn run_quic_accept_loop(
                     );
                     // Echo reject when we can (session id is in the header).
                     let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                    let _ = init_send.write_all(&reject).await;
+                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
                     return;
                 }
 
@@ -1875,7 +1893,8 @@ pub async fn run_quic_accept_loop(
                         Err(reason) => {
                             debug!("QUIC accept: refusing relay request from {remote}: {reason}");
                             let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
-                            let _ = init_send.write_all(&reject).await;
+                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
+                                .await;
                             return;
                         }
                     };
@@ -1887,7 +1906,7 @@ pub async fn run_quic_accept_loop(
                         verified.target_ip, verified.target_port
                     );
                     let reject = build_relay_reject(peer_session_id, REJECT_BAD_TARGET);
-                    let _ = init_send.write_all(&reject).await;
+                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
                     return;
                 }
 
@@ -1915,9 +1934,7 @@ pub async fn run_quic_accept_loop(
                 };
                 if let Some(reason) = reject_reason {
                     let reject = build_relay_reject(peer_session_id, reason);
-                    let _ =
-                        tokio::time::timeout(RELAY_CONTROL_TIMEOUT, init_send.write_all(&reject))
-                            .await;
+                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
                     return;
                 }
 
@@ -1950,11 +1967,8 @@ pub async fn run_quic_accept_loop(
                         Some(sid) => sid,
                         None => {
                             let reject = build_relay_reject(peer_session_id, REJECT_CAPACITY);
-                            let _ = tokio::time::timeout(
-                                RELAY_CONTROL_TIMEOUT,
-                                init_send.write_all(&reject),
-                            )
-                            .await;
+                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
+                                .await;
                             debug!("QUIC accept: at capacity, rejected relay from {remote}");
                             return;
                         }
@@ -1962,7 +1976,9 @@ pub async fn run_quic_accept_loop(
                 };
 
                 let accept_msg = build_relay_accept(peer_session_id);
-                if let Err(e) = init_send.write_all(&accept_msg).await {
+                if let Err(e) =
+                    write_relay_control(&mut init_send, &accept_msg, "send ACCEPT").await
+                {
                     debug!("QUIC accept: failed to send ACCEPT to {remote}: {e}");
                     mgr.lock().await.remove_session(session_id);
                     return;
@@ -1985,28 +2001,45 @@ pub async fn run_quic_accept_loop(
                     Ok(Err(e)) => {
                         info!("Relay session {session_id}: target connect failed: {e}");
                         let close = build_relay_close(peer_session_id);
-                        let _ = init_send.write_all(&close).await;
+                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
                         mgr.lock().await.remove_session(session_id);
                         return;
                     }
                     Err(_) => {
                         info!("Relay session {session_id}: target connect timed out");
                         let close = build_relay_close(peer_session_id);
-                        let _ = init_send.write_all(&close).await;
+                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
                         mgr.lock().await.remove_session(session_id);
                         return;
                     }
                 };
 
-                {
+                let session_present = {
                     let mut mgr_lock = mgr.lock().await;
                     if let Some(session) = mgr_lock.get_session_mut(session_id) {
                         session.mark_active();
+                        info!(
+                            "Relay session {session_id}: bridging ({} active sessions)",
+                            mgr_lock.active_count()
+                        );
+                        true
+                    } else {
+                        false
                     }
-                    info!(
-                        "Relay session {session_id}: bridging ({} active sessions)",
-                        mgr_lock.active_count()
-                    );
+                };
+                if !session_present {
+                    // Cleanup can reap the slot while ACCEPT/target-connect
+                    // is still in flight; bridging without it would leave
+                    // the later `remove_session` as a no-op. Same CLOSE as
+                    // the target-connect failure paths: the initiator already
+                    // returned from ACCEPT and treats the stream as eD2K, so
+                    // CLOSE is abort signalling rather than a parsed control
+                    // frame, matching those siblings.
+                    let close = build_relay_close(peer_session_id);
+                    let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
+                    let _ = init_send.finish();
+                    let _ = tgt_send.finish();
+                    return;
                 }
 
                 let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;

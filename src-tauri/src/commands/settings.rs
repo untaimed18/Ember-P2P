@@ -1040,19 +1040,20 @@ pub async fn update_settings(
         // that is merely offline (unplugged drive, disconnected share) must
         // keep its record, which `build_next` retains on `NotFound`, rather
         // than be re-captured and lost.
-        let mut reapprovals = Vec::new();
-        if reapprove_download_root
-            && !settings.download_folder.is_empty()
-            && std::fs::symlink_metadata(&settings.download_folder).is_ok()
-            && registry
-                .verify_root(std::path::Path::new(&settings.download_folder))
-                .is_err()
-        {
-            tracing::info!("Re-approving download folder on an explicit settings save");
-            reapprovals.push(settings.download_folder.clone());
-        }
+        let download_folder = settings.download_folder.clone();
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
+            let mut reapprovals = Vec::new();
+            if reapprove_download_root
+                && !download_folder.is_empty()
+                && std::fs::symlink_metadata(&download_folder).is_ok()
+                && registry
+                    .verify_root(std::path::Path::new(&download_folder))
+                    .is_err()
+            {
+                tracing::info!("Re-approving download folder on an explicit settings save");
+                reapprovals.push(download_folder);
+            }
             persist_with_root_transaction(
                 registry,
                 &roots,

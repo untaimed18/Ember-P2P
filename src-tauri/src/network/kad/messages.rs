@@ -710,27 +710,6 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
 
         KADEMLIA_FIREWALLED_ACK_RES => Ok(KadMessage::FirewalledAckRes),
 
-        // Legacy Kad1.0 opcodes - decode into equivalent Kad2 messages where possible
-        KADEMLIA_BOOTSTRAP_REQ_OLD => Ok(KadMessage::BootstrapReq),
-        KADEMLIA_BOOTSTRAP_RES_OLD => {
-            let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let take = count.min(200);
-            if count > 200 {
-                tracing::debug!(
-                    "KAD BOOTSTRAP_RES (old) declared {count} contacts, capping parse to 200"
-                );
-            }
-            let mut contacts = Vec::with_capacity(take);
-            for _ in 0..take {
-                contacts.push(KadContact::read_from(cursor)?);
-            }
-            Ok(KadMessage::BootstrapRes {
-                sender_id: KadId::zero(),
-                tcp_port: 0,
-                version: 1,
-                contacts,
-            })
-        }
         // Legacy Kad1 search/publish responses are still seen in the wild —
         // must be matched before the IgnoredLegacy catch-all below.
         KADEMLIA_SEARCH_RES_OLD | KADEMLIA_SEARCH_NOTES_RES_OLD => {
@@ -764,7 +743,9 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             })
         }
 
-        KADEMLIA_HELLO_REQ_OLD
+        KADEMLIA_BOOTSTRAP_REQ_OLD
+        | KADEMLIA_BOOTSTRAP_RES_OLD
+        | KADEMLIA_HELLO_REQ_OLD
         | KADEMLIA_HELLO_RES_OLD
         | KADEMLIA_REQ_OLD
         | KADEMLIA_RES_OLD
@@ -1989,5 +1970,74 @@ mod buddy_hash_wire_tests {
             err.to_string().contains("exceeds size limit"),
             "size-limit rejection must be final, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_opcode_tests {
+    use super::*;
+
+    fn packet(opcode: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![OP_KADEMLIAHEADER, opcode];
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// eMule's Kad1 drop list. A live decode of `0x00`/`0x08` would restore
+    /// the reflection primitive those opcodes used to implement.
+    const DROPPED: [u8; 11] = [
+        KADEMLIA_BOOTSTRAP_REQ_OLD,      // 0x00
+        KADEMLIA_BOOTSTRAP_RES_OLD,      // 0x08
+        KADEMLIA_HELLO_REQ_OLD,          // 0x10
+        KADEMLIA_HELLO_RES_OLD,          // 0x18
+        KADEMLIA_REQ_OLD,                // 0x20
+        KADEMLIA_RES_OLD,                // 0x28
+        KADEMLIA_SEARCH_REQ_OLD,         // 0x30
+        KADEMLIA_SEARCH_NOTES_REQ_OLD,   // 0x32
+        KADEMLIA_PUBLISH_REQ_OLD,        // 0x40
+        KADEMLIA_PUBLISH_NOTES_REQ_OLD,  // 0x42
+        KADEMLIA_PUBLISH_NOTES_RES_OLD,  // 0x4A
+    ];
+
+    #[test]
+    fn dropped_kad1_opcodes_decode_as_ignored_legacy() {
+        assert_eq!(
+            DROPPED,
+            [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x32, 0x40, 0x42, 0x4A]
+        );
+        for opcode in DROPPED {
+            match decode_packet(&packet(opcode, &[])).unwrap() {
+                KadMessage::IgnoredLegacy { opcode: decoded } => {
+                    assert_eq!(decoded, opcode, "0x{opcode:02X} must keep its wire opcode");
+                }
+                other => panic!("0x{opcode:02X} must be IgnoredLegacy, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn live_kad1_response_opcodes_still_decode() {
+        // eMule still dispatches 0x38 / 0x3A / 0x48; empty-result / bare-target
+        // bodies are enough to prove they did not fall into IgnoredLegacy.
+        let empty_search = {
+            let mut body = vec![0u8; 16];
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body
+        };
+        match decode_packet(&packet(KADEMLIA_SEARCH_RES_OLD, &empty_search)).unwrap() {
+            KadMessage::SearchRes { results, .. } => assert!(results.is_empty()),
+            other => panic!("0x38 must decode as SearchRes, got {other:?}"),
+        }
+        match decode_packet(&packet(KADEMLIA_SEARCH_NOTES_RES_OLD, &empty_search)).unwrap() {
+            KadMessage::SearchRes { results, .. } => assert!(results.is_empty()),
+            other => panic!("0x3A must decode as SearchRes, got {other:?}"),
+        }
+        match decode_packet(&packet(KADEMLIA_PUBLISH_RES_OLD, &[0u8; 16])).unwrap() {
+            KadMessage::PublishRes { load, request_ack, .. } => {
+                assert_eq!(load, 0);
+                assert!(!request_ack);
+            }
+            other => panic!("0x48 must decode as PublishRes, got {other:?}"),
+        }
     }
 }

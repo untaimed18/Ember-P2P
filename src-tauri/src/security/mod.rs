@@ -1422,24 +1422,67 @@ pub fn sanitize_filename(name: &str) -> String {
         return "unnamed_file".to_string();
     }
 
-    // Prevent Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+    // Prevent Windows reserved names (CON, PRN, AUX, NUL, COM0-9, LPT0-9).
     // This has to run last, on the trimmed and truncated name: Windows drops
     // trailing dots and spaces when it resolves a path, so "CON " names the
     // console device exactly as "CON" does. Comparing before the trim let the
     // trim produce the very name this check exists to prevent, and the result
     // reaches ShellExecute/Explorer through `open_with_default_app` and
     // `reveal_in_file_manager`, which do resolve device names.
-    let upper = safe.to_uppercase();
-    let base = upper.split('.').next().unwrap_or("");
-    let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if reserved.contains(&base) {
+    if is_reserved_windows_device_name(&safe) {
         return format!("_{safe}");
     }
 
     safe
+}
+
+/// DOS device detection as Windows applies it to a final path component:
+/// take the stem (before the first `.`), trim trailing spaces and dots from
+/// that stem, and compare. The whole-name trim above does not catch an
+/// interior trailing space such as `COM1 .txt`, and `char::to_uppercase`
+/// does not map the ISO-8859-1 superscript digits ¹ ² ³ that Microsoft
+/// documents as reserved COM#/LPT# forms.
+fn is_reserved_windows_device_name(name: &str) -> bool {
+    let mut stem = String::new();
+    for c in name.chars() {
+        if c == '.' {
+            break;
+        }
+        let as_digit = match c {
+            '\u{00B9}' => '1',
+            '\u{00B2}' => '2',
+            '\u{00B3}' => '3',
+            other => other,
+        };
+        stem.extend(as_digit.to_uppercase());
+    }
+    matches!(
+        stem.trim_end_matches(['.', ' ']),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM0"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT0"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 /// Render a peer hash for logs without leaking the full identifier. Returns
@@ -1656,6 +1699,30 @@ mod tests {
         // An ordinary name only loses its trailing space.
         assert_eq!(sanitize_filename("report.txt "), "report.txt");
         assert_eq!(sanitize_filename("console.txt "), "console.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_superscript_zero_and_interior_space_devices() {
+        // Interior trailing space on the stem: Windows strips it during device
+        // detection, so "COM1 .txt" is COM1 even though the whole-name trim
+        // leaves the space (it is not at the end of the full filename).
+        assert_eq!(sanitize_filename("COM1 .txt"), "_COM1 .txt");
+        assert_eq!(sanitize_filename("LPT1 .txt"), "_LPT1 .txt");
+        // ISO-8859-1 superscript digits are digits in COM# / LPT#.
+        assert_eq!(sanitize_filename("COM¹.txt"), "_COM¹.txt");
+        assert_eq!(sanitize_filename("COM².txt"), "_COM².txt");
+        assert_eq!(sanitize_filename("COM³.txt"), "_COM³.txt");
+        assert_eq!(sanitize_filename("LPT¹.txt"), "_LPT¹.txt");
+        assert_eq!(sanitize_filename("LPT²"), "_LPT²");
+        assert_eq!(sanitize_filename("LPT³.txt"), "_LPT³.txt");
+        assert_eq!(sanitize_filename("com¹ .txt"), "_com¹ .txt");
+        // COM0 / LPT0 exist as DOS devices (Serial0 / parallel).
+        assert_eq!(sanitize_filename("COM0.txt"), "_COM0.txt");
+        assert_eq!(sanitize_filename("LPT0"), "_LPT0");
+        // Neighbours that are not device names stay intact.
+        assert_eq!(sanitize_filename("COM10.txt"), "COM10.txt");
+        assert_eq!(sanitize_filename("LPT10"), "LPT10");
+        assert_eq!(sanitize_filename("console.txt"), "console.txt");
     }
 
     #[test]
