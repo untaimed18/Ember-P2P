@@ -480,6 +480,59 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
     Ok(buf)
 }
 
+/// Result of a successful classic `/register`. Presence-layer intro and
+/// pairwise posts are reported here so callers can treat "on the server"
+/// as distinct from "friends can look us up".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistrationOutcome {
+    pub intro_ok: bool,
+    pub pairwise_attempted: usize,
+    pub pairwise_failed: usize,
+}
+
+impl RegistrationOutcome {
+    pub(crate) fn pairwise_succeeded(&self) -> usize {
+        self.pairwise_attempted.saturating_sub(self.pairwise_failed)
+    }
+
+    /// Every pairwise POST we issued failed (and we issued at least one).
+    pub(crate) fn all_pairwise_failed(&self) -> bool {
+        self.pairwise_attempted > 0 && self.pairwise_failed == self.pairwise_attempted
+    }
+
+    /// Lookup tries intro first, then pairwise, and skips 404s. Existing
+    /// friends are treated as blocked only when *both* paths missed: intro
+    /// failed and every pairwise attempt failed. Intro-only failure degrades
+    /// one-sided friend-code adds.
+    ///
+    /// `pairwise_attempted == 0` is *not* treated as blocked. That count
+    /// conflates "no friends" with "friends exist but none have exchanged a
+    /// v2 identity key" (`get_friend_public_keys` yields nothing for hash-only
+    /// relationships). In the latter case an intro failure does hide us from
+    /// everyone, but this helper still returns false — matching prior
+    /// behavior, not a claim that hash-only friends can still find us.
+    pub(crate) fn existing_friends_blocked(&self) -> bool {
+        !self.intro_ok && self.all_pairwise_failed()
+    }
+
+    /// Diagnosable reason when presence was incomplete. `None` is full
+    /// success. The frontend currently only keys off `discoverable` and
+    /// `initial`; callers attach this so a later UI can surface degraded
+    /// states without treating them as outright failure.
+    pub(crate) fn degraded_reason(&self) -> Option<&'static str> {
+        let intro_bad = !self.intro_ok;
+        let pairwise_any = self.pairwise_failed > 0;
+        match (intro_bad, self.all_pairwise_failed(), pairwise_any) {
+            (false, false, false) => None,
+            (true, false, false) => Some("intro_presence_failed"),
+            (false, false, true) => Some("pairwise_presence_partial"),
+            (false, true, _) => Some("pairwise_presence_failed"),
+            (true, false, true) => Some("presence_partial"),
+            (true, true, _) => Some("presence_registration_failed"),
+        }
+    }
+}
+
 /// Register our presence with the rendezvous server.
 ///
 /// `pubkey` and `secret_key` are the node's Ed25519 identity keypair —
@@ -496,6 +549,15 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 /// unreachable host). Callers must therefore wait until the firewall
 /// checker / KAD probe has produced a confirmed IPv4 address before
 /// invoking this function.
+///
+/// `Ok` means the classic `/register` POST succeeded — the node is on
+/// the server and later heartbeats / courtesy unregister should run.
+/// The protocol probe runs *before* that POST, so a probe failure is
+/// `Err` with nothing registered (404/405/410/501/426 still fall back
+/// to LegacyV3 rather than failing). Intro and pairwise presence are
+/// reported on [`RegistrationOutcome`] rather than collapsed into that
+/// boolean: lookup does not depend on the intro entry, and a pairwise
+/// miss is what actually hides us from the affected friends.
 pub async fn register(
     base_url: &str,
     ember_hash: &[u8; 16],
@@ -504,8 +566,14 @@ pub async fn register(
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     friend_identities: &[([u8; 16], [u8; 32])],
-) -> Result<(), String> {
+) -> Result<RegistrationOutcome, String> {
     require_https(base_url)?;
+    // Probe *before* the mutating POST. A later `?` on GET /v4/protocol used
+    // to return Err after `/register` had already succeeded, so the caller
+    // treated a registered node as unregistered and retried the POST every
+    // 10s. Failure here now genuinely means we never registered. 404/405/410/
+    // 501/426 still map to LegacyV3 inside `negotiate_protocol`.
+    let protocol = negotiate_protocol(base_url).await?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
     let id_raw = sha256_id_raw(ember_hash);
@@ -531,15 +599,16 @@ pub async fn register(
         // Don't leak the hashed friend ID or our public IP at `info!` level:
         // user-facing logs should not deanonymize the identity. Keep a terse
         // success message at info and the identifying bits at debug.
-        info!("Rendezvous: registration succeeded on port {port}");
         debug!("Rendezvous: registered {}… (ip={})", &id[..8], external_ip);
         let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
-        let protocol = negotiate_protocol(base_url).await?;
         // Friend-code intro presence: public to holders of our ember2: code.
         // Registered before pairwise entries so one-sided Add Friend can find us.
+        // Lookup tries intro *and* pairwise and skips 404, so a failed intro
+        // only degrades friend-code adds — existing friends still resolve
+        // via pairwise. Report it on the outcome; do not fail the register.
         let intro_capability =
             crate::network::ember::crypto::derive_intro_presence_capability(pubkey, epoch);
-        if let Err(error) = register_capability_presence(
+        let intro_ok = match register_capability_presence(
             base_url,
             &intro_capability,
             epoch,
@@ -553,12 +622,19 @@ pub async fn register(
         )
         .await
         {
-            debug!("Intro presence registration failed: {error}");
-        }
+            Ok(()) => true,
+            Err(error) => {
+                warn!("Intro presence registration failed: {error}");
+                false
+            }
+        };
         // Public presence is never indexed by the stable Friend ID. Register
         // one opaque rotating capability for each friend whose public key is
         // available; old/hash-only relationships simply fail closed until a
         // v2 identity exchange supplies that key.
+        let mut pairwise_attempted = 0usize;
+        let mut pairwise_failed = 0usize;
+        let mut last_pairwise_error: Option<String> = None;
         for (_, friend_pubkey) in friend_identities {
             let Some(capability) =
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
@@ -570,6 +646,7 @@ pub async fn register(
             else {
                 continue;
             };
+            pairwise_attempted += 1;
             if let Err(error) = register_capability_presence(
                 base_url,
                 &capability,
@@ -584,10 +661,39 @@ pub async fn register(
             )
             .await
             {
-                debug!("Pairwise presence registration failed: {error}");
+                pairwise_failed += 1;
+                last_pairwise_error = Some(error);
             }
         }
-        Ok(())
+        if let Some(error) = last_pairwise_error {
+            if pairwise_failed == pairwise_attempted {
+                warn!(
+                    "Rendezvous: all {pairwise_attempted} pairwise presence registration(s) failed (last error: {error})"
+                );
+            } else {
+                warn!(
+                    "Rendezvous: {pairwise_failed}/{pairwise_attempted} pairwise presence registration(s) failed (last error: {error})"
+                );
+            }
+        }
+        let outcome = RegistrationOutcome {
+            intro_ok,
+            pairwise_attempted,
+            pairwise_failed,
+        };
+        if outcome.existing_friends_blocked() {
+            debug!(
+                "Rendezvous: registered on port {port}, but intro and all pairwise presence registrations failed — existing friends cannot resolve us"
+            );
+        } else if !intro_ok || pairwise_failed > 0 {
+            debug!(
+                "Rendezvous: registered on port {port} with degraded presence (intro_ok={intro_ok}, pairwise {}/{pairwise_attempted})",
+                outcome.pairwise_succeeded()
+            );
+        } else {
+            info!("Rendezvous: registration succeeded on port {port}");
+        }
+        Ok(outcome)
     } else {
         let status = resp.status();
         Err(format!("rendezvous register returned {status}"))
@@ -1106,6 +1212,51 @@ fn is_routable_public_v4(ip: Ipv4Addr) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod registration_outcome_tests {
+    use super::RegistrationOutcome;
+
+    fn outcome(intro_ok: bool, attempted: usize, failed: usize) -> RegistrationOutcome {
+        RegistrationOutcome {
+            intro_ok,
+            pairwise_attempted: attempted,
+            pairwise_failed: failed,
+        }
+    }
+
+    #[test]
+    fn intro_only_failure_does_not_block_existing_friends() {
+        assert!(!outcome(false, 3, 0).existing_friends_blocked());
+        assert!(!outcome(false, 0, 0).existing_friends_blocked());
+        assert_eq!(
+            outcome(false, 3, 0).degraded_reason(),
+            Some("intro_presence_failed")
+        );
+    }
+
+    #[test]
+    fn total_pairwise_failure_blocks_only_when_intro_also_missed() {
+        assert!(outcome(false, 4, 4).existing_friends_blocked());
+        assert!(!outcome(true, 4, 4).existing_friends_blocked());
+        assert_eq!(
+            outcome(false, 4, 4).degraded_reason(),
+            Some("presence_registration_failed")
+        );
+        assert_eq!(
+            outcome(true, 4, 4).degraded_reason(),
+            Some("pairwise_presence_failed")
+        );
+    }
+
+    #[test]
+    fn partial_pairwise_failure_is_degraded_not_blocked() {
+        let o = outcome(false, 5, 2);
+        assert!(!o.existing_friends_blocked());
+        assert_eq!(o.pairwise_succeeded(), 3);
+        assert_eq!(o.degraded_reason(), Some("presence_partial"));
+    }
 }
 
 #[cfg(test)]

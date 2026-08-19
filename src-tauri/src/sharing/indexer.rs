@@ -63,7 +63,18 @@ const SENSITIVE_SHARE_FILE_NAMES: &[&str] = &[
     ".pypirc",
     ".pgpass",
     ".dockercfg",
+    // Ember profile material. `is_excluded_share_location` only matches the
+    // live data directory; a copy elsewhere would be hashed and announced.
+    "identity.json",
+    "cryptkey.dat",
+    "chat-history.key",
+    EMBER_DB_BASENAME,
 ];
+
+/// Live SQLite file. `storage/database.rs` hard-codes this name with no
+/// exported constant. Sidecars (`-wal`, `-shm`) and corrupt-open backups
+/// (`ember.db.<timestamp>.corrupt`) are matched from this same base.
+const EMBER_DB_BASENAME: &str = "ember.db";
 
 /// Extensions that only ever carry private keys or key stores. Unlike the
 /// basenames above these are unambiguous, so any file with one is excluded.
@@ -87,6 +98,10 @@ pub fn is_excluded_share_file_name(path: &Path) -> bool {
         // `.env.local`, `.env.production`, … are the same secret with an
         // environment suffix.
         || name.starts_with(".env.")
+        || is_sensitive_share_name_variant(&name, EMBER_DB_BASENAME)
+        || is_sensitive_share_name_variant(&name, "identity.json")
+        || is_sensitive_share_name_variant(&name, "cryptkey.dat")
+        || is_sensitive_share_name_variant(&name, "chat-history.key")
     {
         return true;
     }
@@ -113,6 +128,13 @@ pub fn is_excluded_share_file_name(path: &Path) -> bool {
         // archives written before this rule are dropped on the next scan too.
         || name.ends_with(".emberbackup")
         || name.ends_with(".partial")
+}
+
+/// App-created copies of a denylisted base (`-wal`, `.*.corrupt`,
+/// `.ember-replace-bak`). The `.`/`-` separator avoids `identity.jsonl`.
+fn is_sensitive_share_name_variant(name: &str, base: &str) -> bool {
+    name.strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'))
 }
 
 /// True when any component of `path` is a directory discovery refuses to
@@ -460,6 +482,23 @@ mod tests {
             "release.jks",
             "debug.keystore",
             "client.PFX",
+            "identity.json",
+            "Identity.JSON",
+            "cryptkey.dat",
+            "chat-history.key",
+            "ember.db",
+            "ember.db-wal",
+            "ember.db-shm",
+            "Ember.DB-WAL",
+            "ember.db.20260819120000.corrupt",
+            "ember.db.20260819120000.1.corrupt",
+            "Ember.DB.20260819120000.corrupt",
+            "ember.db.20260819120000.corrupt-wal",
+            "identity.json.corrupt",
+            "Identity.JSON.corrupt",
+            "identity.json.ember-replace-bak",
+            "cryptkey.dat.20260819120000.corrupt",
+            "chat-history.key.ember-replace-bak",
         ] {
             assert!(
                 is_excluded_share_file_name(&Path::new(r"C:\Users\me\Documents").join(name)),
@@ -479,13 +518,16 @@ mod tests {
 
     #[test]
     fn allows_ordinary_files_that_merely_mention_credentials() {
-        // The denylist is whole-basename, so real content keeps its name.
+        // Whole-basename (or an app-owned base plus `.`/`-`), so real content
+        // that merely contains these words stays shareable.
         for name in [
             "credentials-explained.mp4",
             "my_credentials_list.txt",
             "id_rsa.pub",
             "environment.txt",
             "keynote deck.key",
+            "ember.database.sql",
+            "identity.jsonl",
         ] {
             assert!(
                 !is_excluded_share_file_name(&Path::new(r"C:\Users\me\Videos").join(name)),

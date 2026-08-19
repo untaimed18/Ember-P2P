@@ -58,7 +58,7 @@ pub(crate) struct UpnpMaintainResult {
 pub(crate) struct RendezvousRegisterResult {
     pub(crate) generation: u64,
     pub(crate) initial: bool,
-    pub(crate) result: Result<(), String>,
+    pub(crate) result: Result<rendezvous::RegistrationOutcome, String>,
 }
 
 pub(crate) struct FriendRelayTicketPollResult {

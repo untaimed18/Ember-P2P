@@ -211,6 +211,15 @@ const MAX_FRIEND_RELAY_TICKET_SESSIONS: usize = 8;
 const PERIODIC_SAVE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
 const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
+/// Realistic worst-case STUN/TCP-hold cycle is 79s: 3×(5+8) + 4×(5+5)
+/// (DNS+connect timeouts on three TCP-hold targets then four TCP STUN
+/// servers). Pathological (every STUN write/read stage also times out) is
+/// ~139s: 3×(5+8) + 4×(5+5+5+5+5). 90s is not sized to wait that out — a
+/// cycle still running then has already missed four
+/// `MAPPING_KEEPALIVE_INTERVAL`s (20s) and cannot hold a NAT mapping open.
+/// Abandoning it is intentional (~1s cost); the generation guard discards
+/// the late result.
+const MAPPING_KA_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(90);
 const RENDEZVOUS_REGISTER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn spawn_nat_probe(
@@ -321,6 +330,26 @@ fn advertised_tcp_port_from(
         .filter(|port| *port != 0)
         .or(stun_port)
         .unwrap_or(configured_tcp_port)
+}
+
+/// Port captured for `OP_LOGINREQUEST` *before* session teardown clears
+/// `low_id`. That flag is evidence our own forward is not carrying traffic;
+/// capturing after it is cleared would advertise the UPnP port that just
+/// earned the LowID.
+fn capture_advertised_tcp_port_then_reset_low_id(
+    upnp_tcp_port: Option<u16>,
+    external_tcp_port: Option<u16>,
+    configured_tcp_port: u16,
+    low_id: &mut bool,
+) -> u16 {
+    let tcp_port = advertised_tcp_port_from(
+        upnp_tcp_port,
+        external_tcp_port,
+        configured_tcp_port,
+        *low_id,
+    );
+    *low_id = false;
+    tcp_port
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
@@ -2698,6 +2727,34 @@ fn should_refresh_presence(
     since_last_register
         .map(|elapsed| elapsed >= std::time::Duration::from_secs(PRESENCE_HEARTBEAT_SECS))
         .unwrap_or(true)
+}
+
+/// Payload for `ember:friend-discoverable` after a successful classic
+/// `/register`. Extra fields (`intro_ok`, pairwise counts, `reason`) are
+/// ignored by the current frontend; `discoverable` stays true whenever
+/// existing friends can still resolve us so the no-grace-period banner
+/// is not tripped by a degraded-but-working intro failure.
+fn friend_discoverable_event(
+    outcome: &rendezvous::RegistrationOutcome,
+    initial: bool,
+) -> serde_json::Value {
+    let discoverable = !outcome.existing_friends_blocked();
+    let mut payload = serde_json::json!({
+        "discoverable": discoverable,
+        "intro_ok": outcome.intro_ok,
+        "pairwise_attempted": outcome.pairwise_attempted,
+        "pairwise_failed": outcome.pairwise_failed,
+    });
+    if let Some(reason) = outcome.degraded_reason() {
+        payload["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    // The friends store treats `discoverable: false` + `initial: true` as
+    // confirmed failure and skips its 90s grace period. Only attach
+    // `initial` in that genuine blocked case.
+    if !discoverable {
+        payload["initial"] = serde_json::Value::Bool(initial);
+    }
+    payload
 }
 
 /// Pure half of [`request_friend_transfer`]: decide whether to ask `friend` for
@@ -5705,6 +5762,81 @@ mod tests {
         ));
     }
 
+    fn outcome(intro_ok: bool, attempted: usize, failed: usize) -> rendezvous::RegistrationOutcome {
+        rendezvous::RegistrationOutcome {
+            intro_ok,
+            pairwise_attempted: attempted,
+            pairwise_failed: failed,
+        }
+    }
+
+    #[test]
+    fn intro_failure_does_not_claim_friends_cannot_find_you() {
+        // Existing friends still resolve via pairwise; friend-code adds are
+        // degraded. The payload must not trip the frontend's no-grace banner
+        // (`discoverable: false` + `initial: true`).
+        let payload = friend_discoverable_event(&outcome(false, 3, 0), true);
+        assert_eq!(payload["discoverable"], serde_json::json!(true));
+        assert!(payload.get("initial").is_none());
+        assert_eq!(payload["reason"], serde_json::json!("intro_presence_failed"));
+        assert_eq!(payload["intro_ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn intro_failure_with_no_friends_is_degraded_not_fatal() {
+        let payload = friend_discoverable_event(&outcome(false, 0, 0), true);
+        assert_eq!(payload["discoverable"], serde_json::json!(true));
+        assert!(payload.get("initial").is_none());
+        assert_eq!(payload["reason"], serde_json::json!("intro_presence_failed"));
+    }
+
+    #[test]
+    fn total_pairwise_and_intro_failure_is_undiscoverable() {
+        let payload = friend_discoverable_event(&outcome(false, 4, 4), true);
+        assert_eq!(payload["discoverable"], serde_json::json!(false));
+        assert_eq!(payload["initial"], serde_json::json!(true));
+        assert_eq!(
+            payload["reason"],
+            serde_json::json!("presence_registration_failed")
+        );
+        // A later heartbeat with the same blocked outcome must not skip the
+        // frontend's 90s grace period (`initial === true` is the tripwire).
+        let heartbeat = friend_discoverable_event(&outcome(false, 4, 4), false);
+        assert_eq!(heartbeat["discoverable"], serde_json::json!(false));
+        assert_eq!(heartbeat["initial"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn total_pairwise_failure_with_intro_still_discoverable() {
+        let payload = friend_discoverable_event(&outcome(true, 4, 4), false);
+        assert_eq!(payload["discoverable"], serde_json::json!(true));
+        assert!(payload.get("initial").is_none());
+        assert_eq!(
+            payload["reason"],
+            serde_json::json!("pairwise_presence_failed")
+        );
+    }
+
+    #[test]
+    fn partial_pairwise_failure_stays_discoverable() {
+        let payload = friend_discoverable_event(&outcome(true, 5, 2), true);
+        assert_eq!(payload["discoverable"], serde_json::json!(true));
+        assert_eq!(
+            payload["reason"],
+            serde_json::json!("pairwise_presence_partial")
+        );
+        assert_eq!(payload["pairwise_attempted"], serde_json::json!(5));
+        assert_eq!(payload["pairwise_failed"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn full_success_has_no_reason() {
+        let payload = friend_discoverable_event(&outcome(true, 2, 0), true);
+        assert_eq!(payload["discoverable"], serde_json::json!(true));
+        assert!(payload.get("reason").is_none());
+        assert!(payload.get("initial").is_none());
+    }
+
     #[test]
     fn disconnected_startup_does_not_admit_mapping_probes() {
         assert!(!mapping_probe_allowed_by_activity(
@@ -5797,6 +5929,19 @@ mod tests {
         // forward stays advertised rather than dropping to a port nobody has
         // suggested is reachable.
         assert_eq!(advertised_tcp_port_from(Some(4662), None, 4662, true), 4662);
+    }
+
+    #[test]
+    fn login_tcp_port_is_captured_before_session_reset_clears_low_id() {
+        let mut low_id = true;
+        let port = capture_advertised_tcp_port_then_reset_low_id(
+            Some(4662),
+            Some(51234),
+            4662,
+            &mut low_id,
+        );
+        assert_eq!(port, 51234);
+        assert!(!low_id);
     }
 
     #[test]
@@ -10751,6 +10896,11 @@ struct NetworkState {
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
+    /// Last successful `/register` had intro *and* every pairwise presence
+    /// miss, so existing keyed friends cannot resolve us. Kept in sync with
+    /// the `ember:friend-discoverable` event; `IsFriendDiscoverable` is
+    /// `rendezvous_registered && !last_presence_blocked`.
+    last_presence_blocked: bool,
     /// Invalidates late initial/heartbeat results after timeout/disconnect.
     rendezvous_register_generation: u64,
     /// Last time we registered with the rendezvous server (for heartbeat)
@@ -13263,24 +13413,13 @@ fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &TransferHealthUp
     );
 }
 
-async fn handle_server_disconnect(
-    state: &mut NetworkState,
-    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
-    reason: &str,
-) {
-    debug!("Server connection lost: {reason}");
-    emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
-    if let Some(handle) = state.pending_server_connect.take() {
-        handle.abort();
-    }
+/// Clear per-session eD2K identity and in-flight TCP search state. Does not
+/// touch `udp_search_queue` (throttled global multi-server search) or the
+/// connection fields.
+fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
     state.server_poll_count = 0;
     state.server_search_more_needed = false;
     state.server_search_more_requests = 0;
-    state.udp_search_queue.clear();
-    state.server_connected = false;
-    state.server_connection = None;
-    state.server_addr = None;
     state.low_id = false;
     state.server_client_id = 0;
     // A new connection (even to the same server) is a fresh session that
@@ -13290,7 +13429,6 @@ async fn handle_server_disconnect(
     // "unchanged" when the new server session has never seen it.
     state.last_offer_files_signature = None;
     state.offered_ed2k_hashes.clear();
-    *shared_server_addr.write().await = None;
     if let Some(mut pending) = state.pending_server_search.take() {
         let request_id = pending.request_id;
         if let Some(tx) = pending.tx.take() {
@@ -13319,6 +13457,25 @@ async fn handle_server_disconnect(
             maybe_finish_active_search(state, app_handle, rid);
         }
     }
+}
+
+async fn handle_server_disconnect(
+    state: &mut NetworkState,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    app_handle: &tauri::AppHandle,
+    reason: &str,
+) {
+    debug!("Server connection lost: {reason}");
+    emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
+    if let Some(handle) = state.pending_server_connect.take() {
+        handle.abort();
+    }
+    state.udp_search_queue.clear();
+    state.server_connected = false;
+    state.server_connection = None;
+    state.server_addr = None;
+    reset_ed2k_server_session(state, app_handle);
+    *shared_server_addr.write().await = None;
     state.stats.server_status = "disconnected".to_string();
     let _ = app_handle.emit(
         "server-status-changed",
@@ -13450,6 +13607,22 @@ fn abandon_server_auto_reconnect(
     emit_server_auto_connect_failed(app_handle, detail);
 }
 
+/// Capture the TCP port for `OP_LOGINREQUEST`, then run session teardown.
+/// `reset_ed2k_server_session` clears `low_id`; the capture must happen first.
+fn capture_advertised_tcp_port_then_reset_ed2k_session(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+) -> u16 {
+    let tcp_port = capture_advertised_tcp_port_then_reset_low_id(
+        state.upnp_tcp_port,
+        state.external_tcp_port,
+        state.tcp_port,
+        &mut state.low_id,
+    );
+    reset_ed2k_server_session(state, app_handle);
+    tcp_port
+}
+
 /// Establish a new eD2K server connection to `ip`:`port`, tearing down any
 /// existing connection/pending attempt first. Shared by
 /// `NetworkCommand::ConnectToServer` (Servers page) and
@@ -13483,25 +13656,24 @@ async fn initiate_server_connect(
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
     }
-    if let Some(conn) = state.server_connection.take() {
+    let tcp_port = if let Some(conn) = state.server_connection.take() {
         emit_server_log(app_handle, "Disconnecting from current server...");
         conn.disconnect().await;
         state.server_connected = false;
         state.server_addr = None;
         *shared_server_addr.write().await = None;
         state.stats.server_status = "disconnected".to_string();
-        // See `handle_server_disconnect`: the next connection is a
-        // fresh session that hasn't seen any offer we sent before.
-        state.last_offer_files_signature = None;
-        state.offered_ed2k_hashes.clear();
+        let tcp_port = capture_advertised_tcp_port_then_reset_ed2k_session(state, app_handle);
         let _ = app_handle.emit(
             "server-status-changed",
             serde_json::json!({ "status": "disconnected" }),
         );
-    }
+        tcp_port
+    } else {
+        advertised_tcp_port(state)
+    };
     let user_hash = state.user_hash;
     let nickname = settings.nickname.clone();
-    let tcp_port = advertised_tcp_port(state);
     let obf_port = state
         .server_list
         .servers()
@@ -13809,6 +13981,68 @@ async fn ensure_ipfilter_loaded(state: &mut NetworkState) {
             state.ip_filter.mark_loaded_from_disk();
         }
         None => warn!("Could not read ipfilter.dat before a manual range change"),
+    }
+}
+
+/// Parse `ipfilter.dat` on the blocking pool when the filter is toggled on
+/// without a prior disk load. The live filter stays fail-closed until this
+/// succeeds; a zero-range or unreadable file leaves it that way.
+async fn load_ipfilter_on_enable(state: &mut NetworkState) {
+    if !state.ip_filter.is_enabled() || state.ip_filter.has_loaded_ranges() {
+        return;
+    }
+    let path = state.data_dir.join("ipfilter.dat");
+    if !path.exists() {
+        state.ip_filter.mark_ranges_ready();
+        state
+            .ip_filter
+            .update_shared_snapshot(&state.shared_ip_filter);
+        return;
+    }
+    let block_private = state.ip_filter.blocks_private();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let mut fresh = IpFilter::new(true, block_private);
+        match fresh.load_from_file(&path) {
+            Some(n @ 1..) => {
+                info!("Loaded {n} IP filter entries on enable");
+                Some(fresh)
+            }
+            Some(0) => {
+                warn!(
+                    "ipfilter.dat contained no valid ranges on enable; leaving fail-closed until a successful reload"
+                );
+                None
+            }
+            None => {
+                warn!(
+                    "Failed to read ipfilter.dat on enable; leaving fail-closed until a successful reload"
+                );
+                None
+            }
+        }
+    })
+    .await;
+    match loaded {
+        Ok(Some(fresh)) => {
+            state.ip_filter.merge_ranges_from(&fresh);
+            state.ip_filter.mark_loaded_from_disk();
+            state.ip_filter.mark_ranges_ready();
+            info!(
+                "IP filter enable load installed ({} ranges after merge)",
+                state.ip_filter.range_count()
+            );
+            state
+                .ip_filter
+                .update_shared_snapshot(&state.shared_ip_filter);
+            state.routing_table.evict_filtered_contacts();
+            state.ember_dht.evict_filtered_contacts();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            error!(
+                "IP filter enable load task panicked: {e}; keeping previous filter"
+            );
+        }
     }
 }
 
@@ -14904,7 +15138,7 @@ fn apply_network_settings(
     settings: &mut AppSettings,
     mut new_settings: AppSettings,
     _app_handle: &tauri::AppHandle,
-) {
+) -> bool {
     let stun_was_enabled = state.stun_keepalive_enabled;
     state.stun_keepalive_enabled = new_settings.stun_keepalive_enabled;
     if !new_settings.stun_keepalive_enabled {
@@ -14953,31 +15187,16 @@ fn apply_network_settings(
         state.pending_uss_pings.clear();
         state.uss_missed_pongs = 0;
     }
+    let mut needs_ipfilter_load = false;
     if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
         state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
         let mut load_ready = true;
         if new_settings.ip_filter_enabled && !state.ip_filter.has_loaded_ranges() {
             let default_path = state.data_dir.join("ipfilter.dat");
             if default_path.exists() {
-                match state.ip_filter.load_from_file(&default_path) {
-                    Some(n @ 1..) => info!(
-                        "Loaded {n} IP filter entries on enable ({} ranges after merge)",
-                        state.ip_filter.range_count()
-                    ),
-                    Some(0) => {
-                        warn!(
-                            "ipfilter.dat contained no valid ranges on enable; leaving fail-closed until a successful reload"
-                        );
-                        state.ip_filter.mark_ranges_not_ready();
-                        load_ready = false;
-                    }
-                    None => {
-                        warn!(
-                            "Failed to read ipfilter.dat on enable; leaving fail-closed until a successful reload"
-                        );
-                        load_ready = false;
-                    }
-                }
+                // Realistic lists take 150ms–2s; parse on the blocking pool.
+                needs_ipfilter_load = true;
+                load_ready = false;
             }
         }
         // Clear fail-closed only after a successful load or intentional empty/absent.
@@ -15024,6 +15243,7 @@ fn apply_network_settings(
         new_settings.ember_native_enabled,
     );
     *settings = new_settings;
+    needs_ipfilter_load
 }
 
 /// Everything [`start_network`] needs from the rest of the application.
@@ -15741,6 +15961,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             !settings.auto_connect_kad && !settings.auto_connect_server,
         )),
         rendezvous_registered: false,
+        last_presence_blocked: false,
         rendezvous_register_generation: 0,
         rendezvous_last_register: None,
         outbound_session_tasks: HashMap::new(),
@@ -16598,6 +16819,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut mapping_ka_server_index: usize = 0;
     let mut udp_map_ka_in_flight = false;
     let mut tcp_map_ka_in_flight = false;
+    let mut udp_map_ka_started_at: Option<tokio::time::Instant> = None;
+    let mut tcp_map_ka_started_at: Option<tokio::time::Instant> = None;
+    let mut udp_map_ka_gen: Option<u64> = None;
+    let mut tcp_map_ka_gen: Option<u64> = None;
     // Whether *any* keep-alive contribution (confirmed UDP mapping, applied
     // TCP mapping, or a successful TCP hold) succeeded for the current
     // generation. Reset when a new round starts; checked once both the UDP
@@ -16881,12 +17106,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     break;
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
-                    apply_network_settings(
+                    if apply_network_settings(
                         &mut state,
                         &mut settings,
                         new_settings,
                         &app_handle,
-                    );
+                    ) {
+                        load_ipfilter_on_enable(&mut state).await;
+                    }
                     state
                         .relay_manager
                         .lock()
@@ -17115,6 +17342,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             let count = incomplete.len();
             info!("Resuming {count} incomplete downloads from previous session");
             let dl_folder = settings.download_folder.clone();
+            let mut restore_db_writes: Vec<Transfer> = Vec::new();
             for mut transfer in incomplete {
                 // Hash-failed downloads are restored only to keep their Temp
                 // `.part` owned (orphan sweep). Do not auto-start them.
@@ -17183,12 +17411,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let tx = dl_event_tx.clone();
                         transfer.status = TransferStatus::Verifying;
                         transfer.speed = 0;
-                        if let Err(e) = db.save_transfer(&transfer) {
-                            warn!(
-                                "DB save_transfer failed for verifying transfer {}: {e}",
-                                transfer.id
-                            );
-                        }
+                        restore_db_writes.push(transfer.clone());
                         {
                             let mut mgr = transfer_manager.write().await;
                             mgr.active.insert(tid.clone(), transfer);
@@ -17279,12 +17502,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                             transfer.status = TransferStatus::Verifying;
                             transfer.speed = 0;
-                            if let Err(e) = db.save_transfer(&transfer) {
-                                warn!(
-                                    "DB save_transfer failed for verifying transfer {}: {e}",
-                                    transfer.id
-                                );
-                            }
+                            restore_db_writes.push(transfer.clone());
                             {
                                 let mut mgr = transfer_manager.write().await;
                                 mgr.active.insert(tid.clone(), transfer);
@@ -17346,12 +17564,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
 
                 TransferManager::normalize_restored_incomplete_download(&mut transfer);
-                if let Err(e) = db.save_transfer(&transfer) {
-                    tracing::warn!(
-                        "Failed to persist normalized restored download {}: {e}",
-                        transfer.id
-                    );
-                }
+                restore_db_writes.push(transfer.clone());
 
                 let active_now = {
                     let mut mgr = transfer_manager.write().await;
@@ -17413,6 +17626,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             },
                         });
                     }
+                }
+            }
+            if !restore_db_writes.is_empty() {
+                let db_restore = db.clone();
+                let writer = tokio::task::spawn_blocking(move || {
+                    for transfer in restore_db_writes {
+                        if let Err(e) = db_restore.save_transfer(&transfer) {
+                            if transfer.status == TransferStatus::Verifying {
+                                warn!(
+                                    "DB save_transfer failed for verifying transfer {}: {e}",
+                                    transfer.id
+                                );
+                            } else {
+                                warn!(
+                                    "Failed to persist normalized restored download {}: {e}",
+                                    transfer.id
+                                );
+                            }
+                        }
+                    }
+                });
+                if let Err(e) = writer.await {
+                    warn!("Restore DB write batch failed: {e}");
                 }
             }
             // Startup rows now occupy the manager and pending network map;
@@ -17972,12 +18208,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // (obfuscation toggle, USS toggle, max-uploads slider all
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
-                        apply_network_settings(
+                        if apply_network_settings(
                             &mut state,
                             &mut settings,
                             new_settings,
                             &app_handle,
-                        );
+                        ) {
+                            load_ipfilter_on_enable(&mut state).await;
+                        }
                         state
                             .relay_manager
                             .lock()
@@ -25171,70 +25409,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     cbs.retain(|_, v| !v.is_empty());
                 }
 
-                // Expire friend connect-back requests the friend never
-                // answered with an actual connection, releasing their sources
-                // so ordinary retry resumes. The cooldown that stops us
-                // re-asking immediately lives in `friend_xfer_attempts`, so the
-                // entry is kept (not removed) until the cooldown also lapses.
-                {
-                    let now = std::time::Instant::now();
-                    let timed_out: Vec<(([u8; 16], [u8; 16]), String)> = state
-                        .friend_xfer_attempts
-                        .iter()
-                        .filter(|(_, attempt)| {
-                            now.saturating_duration_since(attempt.sent_at).as_secs()
-                                >= FRIEND_XFER_ATTEMPT_TIMEOUT_SECS
-                        })
-                        .map(|(key, attempt)| (*key, attempt.transfer_id.clone()))
-                        .collect();
-                    for (key, transfer_id) in timed_out {
-                        if state
-                            .per_file_sources
-                            .get(&transfer_id)
-                            .is_some_and(|pfs| !pfs.friend_connect_sources(now).is_empty())
-                        {
-                            state.friend_xfer_stats.timed_out =
-                                state.friend_xfer_stats.timed_out.saturating_add(1);
-                            info!(
-                                "Friend {} never connected back for {}; releasing source",
-                                hex::encode(key.0),
-                                hex::encode(key.1)
-                            );
-                            drop_pending_friend_callback(&pending_kad_callbacks, key.0, key.1).await;
-                            release_friend_connect_sources(
-                                &mut state,
-                                &transfer_manager,
-                                &app_handle,
-                                &transfer_id,
-                            )
-                            .await;
-                        }
-                        // Past the retry ceiling the entry is useless: drop it
-                        // so a much later attempt (after the friend has been
-                        // offline and come back) starts from a clean slate
-                        // instead of being permanently refused.
-                        if state
-                            .friend_xfer_attempts
-                            .get(&key)
-                            .is_some_and(|a| a.attempts >= FRIEND_XFER_MAX_ATTEMPTS)
-                            && now
-                                .saturating_duration_since(
-                                    state.friend_xfer_attempts[&key].sent_at,
-                                )
-                                .as_secs()
-                                >= FRIEND_XFER_COOLDOWN_SECS * 4
-                        {
-                            state.friend_xfer_attempts.remove(&key);
-                        }
-                    }
-                }
-
                 // Drop friend bindings and request records for transfers that no
                 // longer exist, so neither map accumulates over a long session.
                 // Attempts below the retry ceiling are otherwise never removed
-                // (the ceiling cleanup above only fires at max attempts), and a
-                // client that downloads from friends all day would grow one
-                // entry per `(friend, file)` forever.
+                // (the ceiling cleanup on source_retry_timer only fires at max
+                // attempts), and a client that downloads from friends all day
+                // would grow one entry per `(friend, file)` forever.
                 {
                     let mgr = transfer_manager.read().await;
                     state
@@ -25696,7 +25876,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             ember::broker::BrokerEvent::ConnectionReady(conn) => {
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
                                 let method = conn.method;
-                                let relay_addr = conn.relay_addr;
                                 let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
 
                                 // The broker stream is freshly established and
@@ -25704,9 +25883,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 // hole-punch / relay), so the peer's upload
                                 // listener is waiting to RECEIVE our eMule Hello
                                 // before it will answer. Greet it here with the
-                                // client Hello (plain — the QUIC/Noise transport
-                                // already encrypts, so eMule RC4 obfuscation is
-                                // redundant), then hand the worker a properly
+                                // client Hello (plain — a hole-punched QUIC hop
+                                // is end-to-end encrypted, and on the relay path
+                                // RC4 obfuscation would not help anyway: the
+                                // relay terminates QUIC and bridges cleartext,
+                                // so integrity there rests on MD4/AICH part
+                                // verification), then hand the worker a properly
                                 // greeted stream carrying the peer's real
                                 // capabilities. Without this the worker adopts an
                                 // ungreeted stream with default (ext_ver=0) caps
@@ -25784,11 +25966,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.mark_succeeded(&key, method);
-                                    if method == ember::broker::ConnectionMethod::PeerRelay {
-                                        if let Some((relay_ip, relay_port)) = relay_addr {
-                                            broker.increment_relay_sessions(relay_ip, relay_port);
-                                        }
-                                    }
                                 }
                             }
                             ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
@@ -28123,6 +28300,62 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 pd.priority = effective_u32;
                             }
                             debug!("Auto-priority for {tid}: {src_count} sources -> {effective} ({})", effective_u32);
+                        }
+                    }
+                }
+
+                // The 60s friend-xfer gate is only useful if expiry runs at or
+                // below 60s; evaluating it only on cleanup_timer's 300s tick
+                // left a second file free to arm another FriendEmber callback.
+                {
+                    let now = std::time::Instant::now();
+                    let timed_out: Vec<(([u8; 16], [u8; 16]), String)> = state
+                        .friend_xfer_attempts
+                        .iter()
+                        .filter(|(_, attempt)| {
+                            now.saturating_duration_since(attempt.sent_at).as_secs()
+                                >= FRIEND_XFER_ATTEMPT_TIMEOUT_SECS
+                        })
+                        .map(|(key, attempt)| (*key, attempt.transfer_id.clone()))
+                        .collect();
+                    for (key, transfer_id) in timed_out {
+                        if state
+                            .per_file_sources
+                            .get(&transfer_id)
+                            .is_some_and(|pfs| !pfs.friend_connect_sources(now).is_empty())
+                        {
+                            state.friend_xfer_stats.timed_out =
+                                state.friend_xfer_stats.timed_out.saturating_add(1);
+                            info!(
+                                "Friend {} never connected back for {}; releasing source",
+                                hex::encode(key.0),
+                                hex::encode(key.1)
+                            );
+                            drop_pending_friend_callback(&pending_kad_callbacks, key.0, key.1).await;
+                            release_friend_connect_sources(
+                                &mut state,
+                                &transfer_manager,
+                                &app_handle,
+                                &transfer_id,
+                            )
+                            .await;
+                        }
+                        // Past the retry ceiling the entry is useless: drop it
+                        // so a much later attempt (after the friend has been
+                        // offline and come back) starts from a clean slate
+                        // instead of being permanently refused.
+                        if state
+                            .friend_xfer_attempts
+                            .get(&key)
+                            .is_some_and(|a| a.attempts >= FRIEND_XFER_MAX_ATTEMPTS)
+                            && now
+                                .saturating_duration_since(
+                                    state.friend_xfer_attempts[&key].sent_at,
+                                )
+                                .as_secs()
+                                >= FRIEND_XFER_COOLDOWN_SECS * 4
+                        {
+                            state.friend_xfer_attempts.remove(&key);
                         }
                     }
                 }
@@ -31729,40 +31962,50 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             Some(result) = udp_map_ka_result_rx.recv() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                // Always clear in-flight so a slow cycle cannot permanently
-                // stall keep-alive after the timer advances generation.
-                udp_map_ka_in_flight = false;
-                udp_map_ka_packet_tx = None;
-                if result.generation != state.mapping_ka_generation {
+                // Flags/sender are keyed by this cycle's local generation.
+                // `mapping_ka_generation` can be bumped by
+                // `reset_stun_keepalive_session` (STUN toggle / KAD
+                // disconnect) without touching those locals; a matching
+                // local generation must still release them so the timer
+                // is not stuck until the 90s watchdog. Payload is applied
+                // only while the global generation still matches, so a
+                // superseded cycle cannot re-populate advertise ports.
+                if Some(result.generation) != udp_map_ka_gen {
                     return;
                 }
-                if let Some(mapped) = result.mapped {
-                    if apply_udp_mapping_keepalive(&mut state, mapped, &app_handle) {
-                        mapping_ka_cycle_success = true;
-                        // Confirmed (1:1 or 2-hit stable) — this is the
-                        // freshest known-good mapping, so it always wins
-                        // over whatever a NAT probe last found. A later
-                        // probe result restores this too (see
-                        // nat_probe_result_rx / stun_udp_mapping_active).
-                        // Deliberately does NOT set nat_type here — see the
-                        // matching comment in apply_udp_mapping_keepalive's
-                        // 1:1 branch for why inferring PortRestricted from a
-                        // keep-alive confirmation defeats the dedicated
-                        // NAT-type probe (and therefore auto-suspend).
-                        state.nat_info.external_addr = Some(mapped);
-                        // Friend dials read the address from here, and the
-                        // hole-punch is skipped outright while it is `None`.
-                        // The re-mapped branch of `apply_udp_mapping_keepalive`
-                        // publishes it, but the 1:1 branch — the common
-                        // outcome, and one that lands within seconds of
-                        // startup — used to leave friends waiting for the
-                        // dedicated probe to finish before punch was possible.
-                        {
-                            let mut ctx = state
-                                .friend_nat_context
-                                .write()
-                                .unwrap_or_else(|p| p.into_inner());
-                            ctx.external_addr = Some(mapped);
+                udp_map_ka_in_flight = false;
+                udp_map_ka_started_at = None;
+                udp_map_ka_gen = None;
+                udp_map_ka_packet_tx = None;
+                if result.generation == state.mapping_ka_generation {
+                    if let Some(mapped) = result.mapped {
+                        if apply_udp_mapping_keepalive(&mut state, mapped, &app_handle) {
+                            mapping_ka_cycle_success = true;
+                            // Confirmed (1:1 or 2-hit stable) — this is the
+                            // freshest known-good mapping, so it always wins
+                            // over whatever a NAT probe last found. A later
+                            // probe result restores this too (see
+                            // nat_probe_result_rx / stun_udp_mapping_active).
+                            // Deliberately does NOT set nat_type here — see the
+                            // matching comment in apply_udp_mapping_keepalive's
+                            // 1:1 branch for why inferring PortRestricted from a
+                            // keep-alive confirmation defeats the dedicated
+                            // NAT-type probe (and therefore auto-suspend).
+                            state.nat_info.external_addr = Some(mapped);
+                            // Friend dials read the address from here, and the
+                            // hole-punch is skipped outright while it is `None`.
+                            // The re-mapped branch of `apply_udp_mapping_keepalive`
+                            // publishes it, but the 1:1 branch — the common
+                            // outcome, and one that lands within seconds of
+                            // startup — used to leave friends waiting for the
+                            // dedicated probe to finish before punch was possible.
+                            {
+                                let mut ctx = state
+                                    .friend_nat_context
+                                    .write()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                ctx.external_addr = Some(mapped);
+                            }
                         }
                     }
                 }
@@ -31783,48 +32026,56 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             Some(result) = tcp_map_ka_result_rx.recv() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                tcp_map_ka_in_flight = false;
-                if result.generation != state.mapping_ka_generation {
+                // Same local-vs-global split as the UDP arm: release this
+                // cycle's in-flight flag even after an external generation
+                // bump, but do not apply a superseded mapped port or fire a
+                // LowID remap reconnect from that payload.
+                if Some(result.generation) != tcp_map_ka_gen {
                     return;
                 }
-                if apply_tcp_mapping_keepalive(&mut state, result.hold_ok, result.mapped, &app_handle) {
-                    mapping_ka_cycle_success = true;
-                }
-                // A reconnect that fails just falls back to the existing
-                // backoff-driven auto-reconnect (which will use the
-                // now-current `advertised_tcp_port` anyway) — see
-                // `should_reconnect_for_tcp_remap` for the full rationale.
-                let cooldown_elapsed = state
-                    .last_tcp_remap_reconnect_at
-                    .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
-                // Deliberately not gated on UPnP: a LowID session is exactly
-                // where a UPnP forward has been shown not to work, and
-                // `advertised_tcp_port` already falls back to the STUN port in
-                // that state, so this reconnect re-logs in on a port that has
-                // not been tried yet rather than re-sending the same one.
-                if should_reconnect_for_tcp_remap(
-                    state.low_id,
-                    state.server_connected,
-                    state.pending_server_connect.is_some(),
-                    state.external_tcp_port,
-                    state.server_login_tcp_port,
-                    cooldown_elapsed,
-                ) {
-                    if let Some(addr) = state.server_addr {
-                        info!(
-                            "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",
-                            state.external_tcp_port, state.server_login_tcp_port
-                        );
-                        state.last_tcp_remap_reconnect_at = Some(std::time::Instant::now());
-                        initiate_server_connect(
-                            &mut state,
-                            &settings,
-                            &app_handle,
-                            &shared_server_addr,
-                            addr.ip().to_string(),
-                            addr.port(),
-                        )
-                        .await;
+                tcp_map_ka_in_flight = false;
+                tcp_map_ka_started_at = None;
+                tcp_map_ka_gen = None;
+                if result.generation == state.mapping_ka_generation {
+                    if apply_tcp_mapping_keepalive(&mut state, result.hold_ok, result.mapped, &app_handle) {
+                        mapping_ka_cycle_success = true;
+                    }
+                    // A reconnect that fails just falls back to the existing
+                    // backoff-driven auto-reconnect (which will use the
+                    // now-current `advertised_tcp_port` anyway) — see
+                    // `should_reconnect_for_tcp_remap` for the full rationale.
+                    let cooldown_elapsed = state
+                        .last_tcp_remap_reconnect_at
+                        .is_none_or(|at| at.elapsed() >= TCP_REMAP_RECONNECT_COOLDOWN);
+                    // Deliberately not gated on UPnP: a LowID session is exactly
+                    // where a UPnP forward has been shown not to work, and
+                    // `advertised_tcp_port` already falls back to the STUN port in
+                    // that state, so this reconnect re-logs in on a port that has
+                    // not been tried yet rather than re-sending the same one.
+                    if should_reconnect_for_tcp_remap(
+                        state.low_id,
+                        state.server_connected,
+                        state.pending_server_connect.is_some(),
+                        state.external_tcp_port,
+                        state.server_login_tcp_port,
+                        cooldown_elapsed,
+                    ) {
+                        if let Some(addr) = state.server_addr {
+                            info!(
+                                "STUN keepalive: public TCP port confirmed as {:?} (server has {:?}) while LowID — reconnecting to eD2k server for a fresh HighID check",
+                                state.external_tcp_port, state.server_login_tcp_port
+                            );
+                            state.last_tcp_remap_reconnect_at = Some(std::time::Instant::now());
+                            initiate_server_connect(
+                                &mut state,
+                                &settings,
+                                &app_handle,
+                                &shared_server_addr,
+                                addr.ip().to_string(),
+                                addr.port(),
+                            )
+                            .await;
+                        }
                     }
                 }
                 if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
@@ -31872,9 +32123,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.stun_ka_tcp_stable_hits = 0;
                 }
                 // Wait for any in-flight cycle; retry soon (not a full extra
-                // interval) so a slow STUN/TCP hold (worst case up to ~70s:
-                // multiple timed-out TCP hold targets/STUN servers tried
-                // serially) delays the next round by as little as possible.
+                // interval) so a slow STUN/TCP hold delays the next round by
+                // as little as possible. Realistic worst case is 79s
+                // (3×(5+8)+4×(5+5) DNS+connect timeouts). Pathological
+                // (~139s: every STUN write/read stage also times out) is
+                // abandoned at 90s on purpose — a cycle still running then
+                // has already missed four 20s keep-alive intervals.
                 if udp_map_ka_in_flight || tcp_map_ka_in_flight {
                     next_mapping_ka_at = now + std::time::Duration::from_secs(1);
                     return;
@@ -31888,6 +32142,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 mapping_ka_cycle_success = false;
                 let gen = state.mapping_ka_generation;
                 udp_map_ka_in_flight = true;
+                udp_map_ka_started_at = Some(tokio::time::Instant::now());
+                udp_map_ka_gen = Some(gen);
                 udp_map_ka_packet_tx = Some(spawn_udp_mapping_keepalive(
                     udp_socket.clone(),
                     udp_map_ka_result_tx.clone(),
@@ -31896,6 +32152,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ));
                 mapping_ka_server_index = mapping_ka_server_index.wrapping_add(1);
                 tcp_map_ka_in_flight = true;
+                tcp_map_ka_started_at = Some(tokio::time::Instant::now());
+                tcp_map_ka_gen = Some(gen);
                 let tcp_port = state.tcp_port;
                 let tx = tcp_map_ka_result_tx.clone();
                 tokio::spawn(async move {
@@ -31925,15 +32183,36 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 rendezvous_register_in_flight = false;
                 rendezvous_register_started_at = None;
                 match result.result {
-                    Ok(()) => {
+                    Ok(outcome) => {
+                        // Classic `/register` succeeded. Latch registered *and*
+                        // `friend_presence_initial_done` even when intro
+                        // presence failed: existing friends still resolve via
+                        // pairwise, and leaving the latch unset would retry
+                        // the full 1+1+N mutation sequence every 10s.
                         state.rendezvous_registered = true;
+                        state.last_presence_blocked = outcome.existing_friends_blocked();
                         state.rendezvous_last_register = Some(std::time::Instant::now());
                         if result.initial {
                             state.friend_presence_initial_done = true;
                         }
+                        if state.last_presence_blocked {
+                            warn!(
+                                "Rendezvous: registered, but intro and all {} pairwise presence registration(s) failed — existing friends cannot resolve us (initial={})",
+                                outcome.pairwise_attempted,
+                                result.initial
+                            );
+                        } else if !outcome.intro_ok || outcome.pairwise_failed > 0 {
+                            debug!(
+                                "Rendezvous: registered with degraded presence intro_ok={} pairwise {}/{} (initial={})",
+                                outcome.intro_ok,
+                                outcome.pairwise_succeeded(),
+                                outcome.pairwise_attempted,
+                                result.initial
+                            );
+                        }
                         let _ = app_handle.emit(
                             "ember:friend-discoverable",
-                            serde_json::json!({ "discoverable": true }),
+                            friend_discoverable_event(&outcome, result.initial),
                         );
                     }
                     Err(e) => {
@@ -31943,6 +32222,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             debug!("Rendezvous heartbeat failed: {e}");
                         }
                         state.rendezvous_registered = false;
+                        state.last_presence_blocked = false;
                         state.rendezvous_last_register = None;
                         let _ = app_handle.emit(
                             "ember:friend-discoverable",
@@ -33381,14 +33661,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if reputation_save_in_flight
                     && timed_out(reputation_save_started_at, PERIODIC_SAVE_WATCHDOG)
                 {
-                    warn!("Watchdog: reputation save exceeded timeout; allowing next retry");
-                    reputation_save_in_flight = false;
-                    reputation_save_started_at = None;
+                    warn!(
+                        "Watchdog: reputation save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
+                    );
                 }
                 if known2_save_in_flight && timed_out(known2_save_started_at, PERIODIC_SAVE_WATCHDOG) {
-                    warn!("Watchdog: known2_64.met save exceeded timeout; allowing next retry");
-                    known2_save_in_flight = false;
-                    known2_save_started_at = None;
+                    warn!(
+                        "Watchdog: known2_64.met save exceeded timeout; suppressing overlapping retry until serialized writer finishes"
+                    );
                 }
                 if upnp_maintain_in_flight
                     && timed_out(upnp_maintain_started_at, PERIODIC_SAVE_WATCHDOG)
@@ -33407,6 +33687,25 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     nat_probe_backoff_until = Some(
                         tokio::time::Instant::now() + std::time::Duration::from_secs(300),
                     );
+                }
+                if (udp_map_ka_in_flight
+                    && timed_out(udp_map_ka_started_at, MAPPING_KA_WATCHDOG))
+                    || (tcp_map_ka_in_flight
+                        && timed_out(tcp_map_ka_started_at, MAPPING_KA_WATCHDOG))
+                {
+                    warn!(
+                        "Watchdog: STUN mapping keepalive exceeded timeout; allowing next retry"
+                    );
+                    state.mapping_ka_generation =
+                        state.mapping_ka_generation.wrapping_add(1);
+                    udp_map_ka_in_flight = false;
+                    tcp_map_ka_in_flight = false;
+                    udp_map_ka_started_at = None;
+                    tcp_map_ka_started_at = None;
+                    udp_map_ka_gen = None;
+                    tcp_map_ka_gen = None;
+                    udp_map_ka_packet_tx = None;
+                    state.stats.stun_keepalive_active = false;
                 }
 
                 if !state.pending_downloads.is_empty()
@@ -34243,12 +34542,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .ember_dht
         .persistable_records(EMBER_PERSIST_MAX_RECORDS);
     let store_ember_path = state.data_dir.join("store_ember.dat");
-    if let Err(e) = ember::dht::bootstrap::save_store(
-        &store_ember_path,
-        &ember_records,
-        state.ember_store_loaded,
-    ) {
-        error!("Failed to save store_ember.dat on shutdown: {e}");
+    let ember_store_loaded = state.ember_store_loaded;
+    if tokio::time::Instant::now() >= shutdown_deadline {
+        error!(
+            "Shutdown deadline exhausted before store_ember.dat save; shutdown result is explicitly truncated"
+        );
+    } else {
+        let writer = tokio::task::spawn_blocking(move || {
+            ember::dht::bootstrap::save_store(
+                &store_ember_path,
+                &ember_records,
+                ember_store_loaded,
+            )
+        });
+        match tokio::time::timeout_at(shutdown_deadline, writer).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => error!("Failed to save store_ember.dat on shutdown: {e}"),
+            Ok(Err(e)) => error!("store_ember.dat shutdown writer failed: {e}"),
+            Err(_) => error!(
+                "Shutdown deadline exhausted joining store_ember.dat writer; shutdown result is explicitly truncated"
+            ),
+        }
     }
 
     // Drain any in-flight periodic statistics save before the final write.
@@ -34486,13 +34800,26 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
         let known2_path = state.data_dir.join("known2_64.met");
-        if let Err(e) = ed2k::aich::save_known2_met(&known2_path, &state.aich_hash_sets) {
-            error!("Failed to save known2_64.met on shutdown: {e}");
-        } else {
-            info!(
-                "Saved {} AICH hash sets to known2_64.met",
-                state.aich_hash_sets.len()
+        let hash_sets = state.aich_hash_sets.clone();
+        let hash_set_count = hash_sets.len();
+        if tokio::time::Instant::now() >= shutdown_deadline {
+            error!(
+                "Shutdown deadline exhausted before known2_64.met save; shutdown result is explicitly truncated"
             );
+        } else {
+            let writer = tokio::task::spawn_blocking(move || {
+                ed2k::aich::save_known2_met(&known2_path, &hash_sets)
+            });
+            match tokio::time::timeout_at(shutdown_deadline, writer).await {
+                Ok(Ok(Ok(()))) => info!(
+                    "Saved {hash_set_count} AICH hash sets to known2_64.met"
+                ),
+                Ok(Ok(Err(e))) => error!("Failed to save known2_64.met on shutdown: {e}"),
+                Ok(Err(e)) => error!("known2_64.met shutdown writer failed: {e}"),
+                Err(_) => error!(
+                    "Shutdown deadline exhausted joining known2_64.met writer; shutdown result is explicitly truncated"
+                ),
+            }
         }
     }
     if let Some(mut handle) = credit_flush_handle.take() {
@@ -35369,7 +35696,12 @@ async fn send_udp_firewall_probe_request(
     )
     .await?;
 
-    let (proto, opcode, _) = read_ed2k_packet_simple(&mut reader).await?;
+    let (proto, opcode, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_ed2k_packet_simple(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("HelloAnswer timeout from {addr}"))??;
     if proto != OP_EDONKEYHEADER || opcode != ed2k::messages::OP_HELLOANSWER {
         anyhow::bail!(
             "expected HelloAnswer from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X}"

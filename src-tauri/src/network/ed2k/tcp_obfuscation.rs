@@ -195,6 +195,30 @@ where
     Ok(NegotiationResult::Obfuscated { recv_key, send_key })
 }
 
+/// I/O under the same deadline the rest of this handshake uses.
+///
+/// One shared bound, not a fresh timeout per read: a peer that drip-feeds a
+/// byte at a time would otherwise stall for `N * timeout`. The handshake sits
+/// in the single `pending_outgoing_buddy` slot and in a
+/// `firewall_connect_semaphore` permit, and this crate never sets a TCP
+/// keepalive or `SO_RCVTIMEO`, so one unbounded `read_exact` parks those
+/// scarce resources indefinitely.
+async fn io_at_deadline<F, T>(
+    deadline: tokio::time::Instant,
+    fut: F,
+    what: &str,
+) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    tokio::time::timeout_at(deadline, fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out")))?
+}
+
+/// Wall-clock budget for the entire outgoing TCP obfuscation handshake.
+const OUTGOING_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
 pub async fn negotiate_outgoing<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -232,13 +256,36 @@ where
     let mut encrypted = vec![0u8; plain.len()];
     send_key.process(&plain, &mut encrypted);
 
-    writer.write_u8(semi_random_not_protocol_marker()).await?;
-    writer.write_u32_le(random_key_part).await?;
-    writer.write_all(&encrypted).await?;
-    writer.flush().await?;
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(OUTGOING_HANDSHAKE_TIMEOUT_SECS);
+
+    io_at_deadline(
+        deadline,
+        writer.write_u8(semi_random_not_protocol_marker()),
+        "outgoing obfuscation marker",
+    )
+    .await?;
+    io_at_deadline(
+        deadline,
+        writer.write_u32_le(random_key_part),
+        "outgoing obfuscation key part",
+    )
+    .await?;
+    io_at_deadline(
+        deadline,
+        writer.write_all(&encrypted),
+        "outgoing obfuscation handshake",
+    )
+    .await?;
+    io_at_deadline(deadline, writer.flush(), "outgoing obfuscation flush").await?;
 
     let mut enc_magic = [0u8; 4];
-    reader.read_exact(&mut enc_magic).await?;
+    io_at_deadline(
+        deadline,
+        reader.read_exact(&mut enc_magic),
+        "outgoing obfuscation magic",
+    )
+    .await?;
     let mut dec_magic = [0u8; 4];
     recv_key.process(&enc_magic, &mut dec_magic);
     if u32::from_le_bytes(dec_magic) != MAGICVALUE_SYNC {
@@ -249,7 +296,12 @@ where
     }
 
     let mut enc_tags = [0u8; 2];
-    reader.read_exact(&mut enc_tags).await?;
+    io_at_deadline(
+        deadline,
+        reader.read_exact(&mut enc_tags),
+        "outgoing obfuscation tags",
+    )
+    .await?;
     let mut dec_tags = [0u8; 2];
     recv_key.process(&enc_tags, &mut dec_tags);
     if dec_tags[0] != ENM_OBFUSCATION {
@@ -261,7 +313,12 @@ where
     let response_pad_len = dec_tags[1] as usize;
     if response_pad_len > 0 {
         let mut enc_pad = vec![0u8; response_pad_len];
-        reader.read_exact(&mut enc_pad).await?;
+        io_at_deadline(
+            deadline,
+            reader.read_exact(&mut enc_pad),
+            "outgoing obfuscation padding",
+        )
+        .await?;
         let mut dec_pad = vec![0u8; response_pad_len];
         recv_key.process(&enc_pad, &mut dec_pad);
     }

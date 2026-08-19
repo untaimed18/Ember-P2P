@@ -2610,7 +2610,7 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::IsFriendDiscoverable { tx } => {
-            let _ = tx.send(state.rendezvous_registered);
+            let _ = tx.send(state.rendezvous_registered && !state.last_presence_blocked);
         }
 
         NetworkCommand::GetOnlineFriends { tx } => {
@@ -3255,6 +3255,7 @@ async fn handle_command_inner(
             state.first_publish_done = false;
             state.kad_initial_source_burst_done = false;
             state.friend_presence_initial_done = false;
+            state.last_presence_blocked = false;
             state.friend_search_initial_done = false;
             state.friend_search_started_at = None;
             state.rendezvous_register_generation =

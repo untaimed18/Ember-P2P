@@ -346,6 +346,17 @@ impl PartTracker {
         }
     }
 
+    /// Drop verified/complete state for every part that extends past
+    /// `readable_len` on disk. A truncated `.part` must not keep its
+    /// `.part.met` verified bits — `set_len` would zero-fill the tail and
+    /// `is_range_safe_to_serve` would then hand those zeros to peers.
+    pub fn invalidate_unreadable(&mut self, readable_len: u64) {
+        if readable_len < self.file_size {
+            self.invalidate_range(readable_len, self.file_size);
+            self.file_hash_verified = false;
+        }
+    }
+
     /// How many bytes of `[start, end)` are still missing (overlap the gap
     /// list). Read-only mirror of the overlap math in `fill_range`. A return
     /// of 0 means every byte in the range is already on disk — writing it
@@ -738,6 +749,22 @@ impl PartTracker {
         }
         self.in_progress_claims = vec![0; self.part_count];
         self.write_reservations.clear();
+        self.sync_to_on_disk_part_length();
+    }
+
+    /// If the `.part` file exists but is shorter than `file_size`, drop
+    /// verified bits and re-open gaps for every part that extends past the
+    /// readable byte count. Missing files are left to the resume reset
+    /// path (tests also load `.part.met` without a data file).
+    fn sync_to_on_disk_part_length(&mut self) {
+        let part_path = match self.met_path.file_stem() {
+            Some(stem) => self.met_path.with_file_name(stem),
+            None => return,
+        };
+        let Ok(meta) = std::fs::metadata(&part_path) else {
+            return;
+        };
+        self.invalidate_unreadable(meta.len());
     }
 
     fn load_inner(&mut self) -> anyhow::Result<()> {
@@ -1018,7 +1045,9 @@ impl PartTracker {
         // resumes. Corruption is still caught when the download worker next
         // verifies a part, and `set_part_verified` only flips after a live
         // MD4 match. Upload serving further requires `is_part_complete` via
-        // `is_range_safe_to_serve`.
+        // `is_range_safe_to_serve`. After restore, `load` also drops
+        // verified/complete state for parts that extend past the on-disk
+        // `.part` length so a truncated file cannot be served as verified.
         if let Some(bytes) = verified_bitmap_bytes {
             self.part_verified = vec![false; self.part_count];
             for i in 0..self.part_count {

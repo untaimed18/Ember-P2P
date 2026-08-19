@@ -204,7 +204,6 @@ fn is_request_opcode(opcode: u8) -> bool {
     matches!(
         opcode,
         0x01 // KADEMLIA2_BOOTSTRAP_REQ
-        | 0x08 // legacy BootstrapReq
         | 0x11 // KADEMLIA2_HELLO_REQ
         | 0x21 // KADEMLIA2_REQ
         | 0x33 // KADEMLIA2_SEARCH_KEY_REQ

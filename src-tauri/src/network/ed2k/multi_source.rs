@@ -25,7 +25,10 @@ use super::part_tracker::PartTracker;
 use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
 use super::transfer::CompressedPartAccumulator;
-use super::transfer::{is_filtered_source_ip, DownloadEvent};
+use super::transfer::{
+    expire_outstanding_ranges, is_filtered_source_ip, push_outstanding_batch,
+    refresh_outstanding_range, take_completed_outstanding_range, DownloadEvent, OutstandingRange,
+};
 
 /// Shared registry of active download trackers so the shutdown path can
 /// persist `.part.met` files even when download tasks are aborted.
@@ -166,6 +169,32 @@ const MAX_PEER_COMMENT_LEN: usize = 8 * 1024;
 /// Module-level so the cross-part pipelining helpers below the per-source
 /// download function can refer to it without re-declaring.
 const MAX_BLOCKS_PER_REQUEST: usize = 3;
+
+async fn write_part_request_batch<W>(
+    writer: &mut W,
+    file_hash: &[u8; 16],
+    batch: &[(u64, u64)],
+    needs_i64: bool,
+) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    use super::messages::{OP_EDONKEYHEADER, OP_EMULEPROT, OP_REQUESTPARTS, OP_REQUESTPARTS_I64};
+    let (req_payload, req_proto, req_op) = if needs_i64 {
+        (
+            super::messages::build_request_parts_i64(file_hash, batch),
+            OP_EMULEPROT,
+            OP_REQUESTPARTS_I64,
+        )
+    } else {
+        (
+            super::messages::build_request_parts(file_hash, batch),
+            OP_EDONKEYHEADER,
+            OP_REQUESTPARTS,
+        )
+    };
+    write_packet_async_ms(writer, req_proto, req_op, &req_payload).await
+}
 
 /// Persist a snapshot after releasing the tracker lock. The shared
 /// per-path coordinator in `part_tracker` preserves snapshot order.
@@ -6856,8 +6885,10 @@ async fn download_parts_from_source(
         batches: Vec<Vec<(u64, u64)>>,
         sent_idx: usize,
         needs_i64: bool,
+        outstanding_ranges: Vec<OutstandingRange>,
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
+    let mut pending_compressed = CompressedPartAccumulator::default();
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -6980,40 +7011,52 @@ async fn download_parts_from_source(
             consecutive_stale_skips = 0;
 
             let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
-            let mut pending_compressed = CompressedPartAccumulator::default();
 
             // Either resume from a pre-pipelined state (the previous
             // iteration's send-ahead already shipped the first batch
             // for this part) or compute fresh.
             let pipelined_for_this = pipelined_next.take().filter(|p| p.part_idx == part_idx);
             let resumed = pipelined_for_this.is_some();
-            let (all_blocks, batches, mut sent_idx, needs_i64) = if let Some(p) = pipelined_for_this
-            {
-                (p.all_blocks, p.batches, p.sent_idx, p.needs_i64)
-            } else {
-                let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
-                let batches: Vec<Vec<(u64, u64)>> = all_blocks
-                    .chunks(MAX_BLOCKS_PER_REQUEST)
-                    .map(|c| c.to_vec())
-                    .collect();
-                let needs_large_offsets = all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                if needs_large_offsets && !peer_supports_large_files {
-                    // Gating `needs_i64` on the peer's capability alone sent
-                    // the 32-bit request anyway, and `build_request_parts`
-                    // clamps with `min(u32::MAX)` behind a `debug_assert`
-                    // that does nothing in release — so both ends of a
-                    // past-4 GiB range collapsed to 0xFFFFFFFF and the peer
-                    // was asked for zero bytes. It sends nothing, we burn the
-                    // whole initial-data budget plus the re-assert rounds
-                    // holding a connection slot, and the source stays in the
-                    // pool to be re-dialled after its cooldown. Refuse it up
-                    // front: it genuinely cannot serve this range.
-                    anyhow::bail!(
-                        "source does not support large files but part {part_idx} lies past 4 GiB"
-                    );
-                }
-                (all_blocks, batches, 0, needs_large_offsets)
-            };
+            let (all_blocks, batches, mut sent_idx, needs_i64, mut outstanding_ranges) =
+                if let Some(p) = pipelined_for_this {
+                    (
+                        p.all_blocks,
+                        p.batches,
+                        p.sent_idx,
+                        p.needs_i64,
+                        p.outstanding_ranges,
+                    )
+                } else {
+                    let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
+                    let batches: Vec<Vec<(u64, u64)>> = all_blocks
+                        .chunks(MAX_BLOCKS_PER_REQUEST)
+                        .map(|c| c.to_vec())
+                        .collect();
+                    let needs_large_offsets =
+                        all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                    if needs_large_offsets && !peer_supports_large_files {
+                        // Gating `needs_i64` on the peer's capability alone sent
+                        // the 32-bit request anyway, and `build_request_parts`
+                        // clamps with `min(u32::MAX)` behind a `debug_assert`
+                        // that does nothing in release — so both ends of a
+                        // past-4 GiB range collapsed to 0xFFFFFFFF and the peer
+                        // was asked for zero bytes. It sends nothing, we burn the
+                        // whole initial-data budget plus the re-assert rounds
+                        // holding a connection slot, and the source stays in the
+                        // pool to be re-dialled after its cooldown. Refuse it up
+                        // front: it genuinely cannot serve this range.
+                        anyhow::bail!(
+                            "source does not support large files but part {part_idx} lies past 4 GiB"
+                        );
+                    }
+                    (
+                        all_blocks,
+                        batches,
+                        0,
+                        needs_large_offsets,
+                        Vec::new(),
+                    )
+                };
 
             // Claim the part (idempotent per source — the pipelined state
             // already claimed it, and another source may hold its own claim
@@ -7081,6 +7124,7 @@ async fn download_parts_from_source(
                     _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
                 }
                 write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
+                push_outstanding_batch(&mut outstanding_ranges, batch);
                 sent_idx += 1;
             }
 
@@ -7314,14 +7358,12 @@ async fn download_parts_from_source(
                 // that looked healthy while the transfer-level health
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
-                let hard_deadline = tokio::time::Instant::now() + read_timeout;
+                let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
                 let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> =
                     if let Some(packet) = auth_deferred.pop_front() {
                         Ok(Ok(packet))
                     } else {
                         let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
-                        let timeout_fut = tokio::time::sleep_until(hard_deadline);
-                        tokio::pin!(timeout_fut);
                         let mut stall_check =
                             tokio::time::interval(std::time::Duration::from_secs(2));
                         stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7362,7 +7404,7 @@ async fn download_parts_from_source(
                                 // classification that the rest of the receive
                                 // loop uses.
                                 res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                                _ = &mut timeout_fut => break Err(()),
+                                _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
                                 _ = stall_check.tick() => {
                                     // Emit a fresh `transferring` update
                                     // with recalculated speed (which will
@@ -7385,6 +7427,48 @@ async fn download_parts_from_source(
                                             measured_speed
                                         );
                                     }
+                                    let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                                    if let Some(pending) = pipelined_next.as_mut() {
+                                        let _ = expire_outstanding_ranges(
+                                            &mut pending.outstanding_ranges,
+                                        );
+                                    }
+                                    if expired > 0 {
+                                        let before = sent_idx;
+                                        while sent_idx < batches.len()
+                                            && outstanding_ranges.len()
+                                                < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                                        {
+                                            let batch = batches[sent_idx].clone();
+                                            if write_part_request_batch(
+                                                &mut *writer,
+                                                file_hash,
+                                                &batch,
+                                                needs_i64,
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                anyhow::bail!(
+                                                    "connection lost while refilling expired request"
+                                                );
+                                            }
+                                            push_outstanding_batch(
+                                                &mut outstanding_ranges,
+                                                &batch,
+                                            );
+                                            sent_idx += 1;
+                                        }
+                                        if sent_idx > before {
+                                            hard_deadline =
+                                                tokio::time::Instant::now() + read_timeout;
+                                        } else if outstanding_ranges.is_empty()
+                                            && sent_idx >= batches.len()
+                                        {
+                                            break Err(());
+                                        }
+                                    }
+                                    continue;
                                 }
                             }
                         }
@@ -7460,6 +7544,10 @@ async fn download_parts_from_source(
                         return Err(e.into());
                     }
                     Err(()) => {
+                        if outstanding_ranges.is_empty() && sent_idx >= batches.len() {
+                            exit_reason = "outstanding_drained";
+                            break;
+                        }
                         if !got_any_data {
                             // Peer accepted the slot but hasn't begun sending.
                             // Stay connected and re-assert our block request like
@@ -7626,8 +7714,8 @@ async fn download_parts_from_source(
                         // verified-good data on disk (which the upload path then
                         // serves as safe). Only write/record bytes that overlap a
                         // gap; duplicate bytes still flow through the request-
-                        // pipeline bookkeeping below (skipping it here could stall
-                        // the pipeline refill that keys off blocks_received).
+                        // pipeline bookkeeping below so a duplicate of a range's
+                        // last packet can still complete that outstanding request.
                         // D21: write ONLY the gap sub-ranges of this block, never the
                         // whole block. With several sources in flight (and cross-part
                         // pipelining) a block can overlap bytes we already wrote — and
@@ -7689,9 +7777,7 @@ async fn download_parts_from_source(
                                     "source {_src_idx} had {consecutive_bad_blocks} consecutive disk write failures, disconnecting"
                                 );
                             }
-                            continue;
-                        }
-                        if !written_subranges.is_empty() {
+                        } else if !written_subranges.is_empty() {
                             // The PartFileWriter serializes the writes for us —
                             // each `await` is an mpsc round-trip, not a global
                             // file lock acquisition.
@@ -7721,7 +7807,15 @@ async fn download_parts_from_source(
                         // `speed_bytes` stays on wire bytes — duplicates really
                         // did consume bandwidth, which is what a rate means.
                         src_transferred += newly_written;
-                        blocks_received_in_current_req += 1;
+                        if take_completed_outstanding_range(&mut outstanding_ranges, start, end) {
+                            blocks_received_in_current_req += 1;
+                        } else if let Some(pending) = pipelined_next.as_mut() {
+                            let _ = take_completed_outstanding_range(
+                                &mut pending.outstanding_ranges,
+                                start,
+                                end,
+                            );
+                        }
                         speed_bytes += piece_len;
                         // Attribute this wire response by absolute offset for
                         // current-vs-pipelined-part receive bookkeeping. Credit
@@ -7760,12 +7854,25 @@ async fn download_parts_from_source(
                             );
                         }
 
-                        let requested_end = batches
+                        let requested_end = outstanding_ranges
                             .iter()
-                            .take(sent_idx)
-                            .flatten()
-                            .find_map(|(requested_start, requested_end)| {
-                                (*requested_start == start).then_some(*requested_end)
+                            .find_map(|r| (r.start == start).then_some(r.end))
+                            .or_else(|| {
+                                pipelined_next.as_ref().and_then(|pending| {
+                                    pending
+                                        .outstanding_ranges
+                                        .iter()
+                                        .find_map(|r| (r.start == start).then_some(r.end))
+                                })
+                            })
+                            .or_else(|| {
+                                batches
+                                    .iter()
+                                    .take(sent_idx)
+                                    .flatten()
+                                    .find_map(|(requested_start, requested_end)| {
+                                        (*requested_start == start).then_some(*requested_end)
+                                    })
                             })
                             .or_else(|| {
                                 (resumed
@@ -7806,8 +7913,19 @@ async fn download_parts_from_source(
                             compressed,
                         )?
                         else {
+                            refresh_outstanding_range(&mut outstanding_ranges, start);
+                            if let Some(pending) = pipelined_next.as_mut() {
+                                refresh_outstanding_range(
+                                    &mut pending.outstanding_ranges,
+                                    start,
+                                );
+                            }
                             continue;
                         };
+                        refresh_outstanding_range(&mut outstanding_ranges, start);
+                        if let Some(pending) = pipelined_next.as_mut() {
+                            refresh_outstanding_range(&mut pending.outstanding_ranges, start);
+                        }
 
                         let piece_len = decompressed.len() as u64;
                         if start.saturating_add(piece_len) > file_size {
@@ -7891,9 +8009,7 @@ async fn download_parts_from_source(
                                     "source {_src_idx} had {consecutive_bad_blocks} consecutive compressed disk write failures, disconnecting"
                                 );
                             }
-                            continue;
-                        }
-                        if !written_subranges.is_empty() {
+                        } else if !written_subranges.is_empty() {
                             consecutive_bad_blocks = 0;
                         } else {
                             tracing::trace!(
@@ -7908,7 +8024,19 @@ async fn download_parts_from_source(
                         // Contribution, not wire bytes — see the uncompressed
                         // path above.
                         src_transferred += newly_written;
-                        blocks_received_in_current_req += 1;
+                        if take_completed_outstanding_range(
+                            &mut outstanding_ranges,
+                            start,
+                            start + piece_len,
+                        ) {
+                            blocks_received_in_current_req += 1;
+                        } else if let Some(pending) = pipelined_next.as_mut() {
+                            let _ = take_completed_outstanding_range(
+                                &mut pending.outstanding_ranges,
+                                start,
+                                start + piece_len,
+                            );
+                        }
                         speed_bytes += piece_len;
                         // Receive bookkeeping only; gap-byte credit was added
                         // above from the tracker transition.
@@ -8356,7 +8484,11 @@ async fn download_parts_from_source(
                     }
                 }
 
-                // Pipeline refill when a request's worth of blocks completes
+                // Pipeline refill when a request's worth of requested ranges completes
+                let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                if let Some(pending) = pipelined_next.as_mut() {
+                    let _ = expire_outstanding_ranges(&mut pending.outstanding_ranges);
+                }
                 let blocks_in_batch = if completed_reqs < batches.len() {
                     batches[completed_reqs].len()
                 } else {
@@ -8365,7 +8497,11 @@ async fn download_parts_from_source(
                 if blocks_received_in_current_req >= blocks_in_batch {
                     blocks_received_in_current_req = 0;
                     completed_reqs += 1;
-                    if sent_idx < batches.len() {
+                    if sent_idx < batches.len()
+                        && sent_idx.saturating_sub(completed_reqs) < max_outstanding
+                        && outstanding_ranges.len()
+                            <= 2 * max_outstanding * MAX_BLOCKS_PER_REQUEST
+                    {
                         let batch = &batches[sent_idx];
                         let (req_payload, req_proto, req_op) = if needs_i64 {
                             (
@@ -8382,8 +8518,10 @@ async fn download_parts_from_source(
                         };
                         write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload)
                             .await?;
+                        push_outstanding_batch(&mut outstanding_ranges, batch);
                         sent_idx += 1;
-                    } else if pipelined_next.is_none()
+                    } else if sent_idx >= batches.len()
+                        && pipelined_next.is_none()
                         && !batches.is_empty()
                         && !pipeline_giveup_for_part
                     {
@@ -8417,9 +8555,9 @@ async fn download_parts_from_source(
                         // our pipelined OP_REQUESTPARTS for the wrong
                         // part, AND we sent fresh requests for the
                         // actually-next part — total in-flight requests
-                        // exceeded the peer's queue cap and they sent
-                        // OP_OUTOFPARTREQS, killing the session after
-                        // ~9.4 MiB.
+                        // exceeded SESSIONMAXTRANS (~9.4 MiB) and they
+                        // sent OP_OUTOFPARTREQS, which is ordinary slot
+                        // rotation rather than a queue-depth limit.
                         //
                         // Only fall back to chunk_selector when the queue
                         // is exhausted (initial single-part assignment
@@ -8560,6 +8698,11 @@ async fn download_parts_from_source(
                                         batches: resume_batches,
                                         sent_idx: resume_sent_idx,
                                         needs_i64: target_needs_i64,
+                                        outstanding_ranges: first_batch
+                                            .iter()
+                                            .copied()
+                                            .map(|(s, e)| OutstandingRange::new(s, e))
+                                            .collect(),
                                     });
                                 }
                             }
@@ -8582,6 +8725,18 @@ async fn download_parts_from_source(
                             // appear in `part_queue`.
                             pipeline_giveup_for_part = true;
                         }
+                    }
+                }
+
+                if expired > 0 {
+                    while sent_idx < batches.len()
+                        && outstanding_ranges.len() < max_outstanding * MAX_BLOCKS_PER_REQUEST
+                    {
+                        let batch = batches[sent_idx].clone();
+                        write_part_request_batch(&mut *writer, file_hash, &batch, needs_i64)
+                            .await?;
+                        push_outstanding_batch(&mut outstanding_ranges, &batch);
+                        sent_idx += 1;
                     }
                 }
 

@@ -1020,6 +1020,42 @@ impl QueueIdentity {
     }
 }
 
+/// True when a queue row may be mutated, taken over, or removed by this session.
+/// Unbound (`current_addr` is `None`) is a reconnect. A live bind is the same
+/// client when the IP and Hello-advertised TCP port match — eMule
+/// `AttachToAlreadyKnown` keys on `GetUserPort()`, not the ephemeral source
+/// port — so a NAT rebind adopts the row. A different IP (or advertised port)
+/// must not steal or delete a bound row.
+fn queue_row_owned_by_session(
+    current_addr: Option<SocketAddr>,
+    row_tcp_port: u16,
+    peer_addr: SocketAddr,
+    session_tcp_port: u16,
+) -> bool {
+    match current_addr {
+        None => true,
+        Some(bound) => {
+            bound == peer_addr
+                || (bound.ip() == peer_addr.ip() && row_tcp_port == session_tcp_port)
+        }
+    }
+}
+
+/// After this identity has been granted a slot, keep its waiting-list row
+/// only when a *different IP* still owns the bind (hash collision / spoof).
+/// Same IP with a mismatched advertised port is a NAT rebind of the peer
+/// that just got the slot — seniority must not sit beside the grant.
+fn keep_queue_row_after_slot_grant(
+    grant_identity: &QueueIdentity,
+    grant_ip: IpAddr,
+    entry: &QueueEntry,
+) -> bool {
+    entry.identity != *grant_identity
+        || entry
+            .current_addr
+            .is_some_and(|bound| bound.ip() != grant_ip)
+}
+
 /// Shared handle to the upload queue so non-upload subsystems (e.g. the UDP
 /// OP_REASKFILEPING handler in `network/mod.rs`) can report an accurate
 /// queue rank for their peers instead of a placeholder 0.
@@ -1143,9 +1179,10 @@ pub(crate) struct QueueEntry {
     pub(crate) identity: QueueIdentity,
     pub(crate) current_addr: Option<SocketAddr>,
     /// Last IP this entry was seen connecting from. Unlike
-    /// `current_addr` (cleared to `None` on disconnect) this survives
-    /// disconnects, so the per-IP queue cap (eMule `cSameIP`) still
-    /// counts lingering waiting-list entries from a churning peer.
+    /// `current_addr` (cleared to `None` only when the bound socket
+    /// disconnects) this survives disconnects, so the per-IP queue cap
+    /// (eMule `cSameIP`) still counts lingering waiting-list entries
+    /// from a churning peer.
     pub(crate) last_ip: Option<std::net::IpAddr>,
     pub(crate) udp_port: u16,
     /// Peer's advertised TCP listen port from Hello — required to dial
@@ -2174,7 +2211,7 @@ pub(crate) fn score_queue_entry(
     } else {
         emule_score
     };
-    let has_download_bonus = cm.has_download_bonus(user_hash)
+    let has_download_bonus = cm.has_download_bonus(user_hash, peer_ip)
         || (use_ember && cm.has_ember_download_bonus(ember_pubkey.expect("guarded by use_ember")));
     if has_download_bonus {
         score *= DOWNLOAD_BONUS_MULTIPLIER;
@@ -3178,10 +3215,23 @@ impl UploadHandler {
     /// Keep the waiting-list entry's file hash in sync when a peer mid-slot
     /// switches files (`OP_SETREQFILEID` / `OP_REQUESTPARTS` / MultiPacket).
     /// Queue scoring and file-priority bonuses key off `QueueEntry::file_hash`.
-    async fn sync_queue_file_hash(&self, identity: &QueueIdentity, file_hash: [u8; 16]) {
+    async fn sync_queue_file_hash(
+        &self,
+        identity: &QueueIdentity,
+        file_hash: [u8; 16],
+        peer_addr: SocketAddr,
+        session_tcp_port: u16,
+    ) {
         let mut queue = self.upload_queue.lock().await;
         if let Some(entry) = queue.iter_mut().find(|e| e.identity == *identity) {
-            entry.file_hash = file_hash;
+            if queue_row_owned_by_session(
+                entry.current_addr,
+                entry.tcp_port,
+                peer_addr,
+                session_tcp_port,
+            ) {
+                entry.file_hash = file_hash;
+            }
         }
     }
 
@@ -3846,7 +3896,8 @@ impl UploadHandler {
         let Some(ip) = entry.last_ip else {
             return;
         };
-        let peer_addr = SocketAddr::new(ip, entry.tcp_port);
+        let grant_tcp_port = entry.tcp_port;
+        let peer_addr = SocketAddr::new(ip, grant_tcp_port);
         if peer_addr.port() == 0 {
             return;
         }
@@ -3942,9 +3993,11 @@ impl UploadHandler {
 
         let accepted = grant_accepted.load(std::sync::atomic::Ordering::Relaxed);
         if accepted {
-            // Granted: drop waiting-list seniority.
+            // Granted: drop waiting-list seniority unless a different IP
+            // still owns the bind. Same-IP advertised-port mismatch is a
+            // NAT rebind of the peer that just got the slot.
             let mut queue = self.upload_queue.lock().await;
-            queue.retain(|e| e.identity != identity);
+            queue.retain(|e| keep_queue_row_after_slot_grant(&identity, peer_addr.ip(), e));
         } else if let Err(e) = result {
             // Pre-grant failure: leave the queue entry (seniority intact) and backoff.
             debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}");
@@ -5837,10 +5890,14 @@ impl UploadHandler {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Drop waiting-list entry now that the slot is granted (eMule
-            // RemoveFromWaitingQueue before/at AcceptUploadReq).
+            // RemoveFromWaitingQueue before/at AcceptUploadReq). A different
+            // IP still bound to this identity keeps its row; a same-IP
+            // advertised-port mismatch is this peer's NAT rebind.
             {
                 let mut queue = self.upload_queue.lock().await;
-                queue.retain(|e| e.identity != queue_identity);
+                queue.retain(|e| {
+                    keep_queue_row_after_slot_grant(&queue_identity, peer_addr.ip(), e)
+                });
             }
             self.record_share_accepted(&fh).await;
             queue_wait_at_grant = 0;
@@ -6308,6 +6365,29 @@ impl UploadHandler {
                     }
                     Err(_) => {
                         if let Some(ref queued_key) = queued_identity {
+                            let still_ours = {
+                                let queue = self.upload_queue.lock().await;
+                                queue.iter().any(|e| {
+                                    e.identity == *queued_key
+                                        && queue_row_owned_by_session(
+                                            e.current_addr,
+                                            e.tcp_port,
+                                            peer_addr,
+                                            hello_caps.tcp_port,
+                                        )
+                                })
+                            };
+                            if !still_ours {
+                                queued_identity = None;
+                                let _ = write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    OP_QUEUEFULL,
+                                    &[],
+                                )
+                                .await;
+                                break;
+                            }
                             let current_active = self
                                 .active_count
                                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -6375,9 +6455,35 @@ impl UploadHandler {
                                         // entries since the snapshot, shifting indices.
                                         // An index-only removal could leave this peer's
                                         // entry as a ghost (slot granted, still queued)
-                                        // or remove the wrong peer.
-                                        if let Some(pos) = queue.iter().position(|e| e.identity == *queued_key) {
-                                            queue.remove(pos);
+                                        // or remove the wrong peer. Ownership is
+                                        // re-checked here: a NAT rebind may have
+                                        // rebound the row since the snapshot.
+                                        let owned_pos = queue.iter().position(|e| {
+                                            e.identity == *queued_key
+                                                && queue_row_owned_by_session(
+                                                    e.current_addr,
+                                                    e.tcp_port,
+                                                    peer_addr,
+                                                    hello_caps.tcp_port,
+                                                )
+                                        });
+                                        match owned_pos {
+                                            Some(pos) => {
+                                                queue.remove(pos);
+                                            }
+                                            None => {
+                                                drop(queue);
+                                                slot_guard.deactivate();
+                                                queued_identity = None;
+                                                let _ = write_packet_async(
+                                                    &mut writer,
+                                                    OP_EMULEPROT,
+                                                    OP_QUEUEFULL,
+                                                    &[],
+                                                )
+                                                .await;
+                                                break;
+                                            }
                                         }
                                         drop(queue);
 
@@ -6746,7 +6852,13 @@ impl UploadHandler {
                             }
                         }
                         current_file_hash = Some(hash);
-                        self.sync_queue_file_hash(&queue_identity, hash).await;
+                        self.sync_queue_file_hash(
+                            &queue_identity,
+                            hash,
+                            peer_addr,
+                            hello_caps.tcp_port,
+                        )
+                        .await;
 
                         if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             self.record_share_request_once(&hash, &mut recorded_share_request)
@@ -7074,13 +7186,27 @@ impl UploadHandler {
                             // (it would have won while disconnected), so grant it the next
                             // slot ahead of normal scoring and drop its queue entry. The
                             // shared `slot_guard.try_activate` below still gates on a free
-                            // slot, so this cannot over-grant.
+                            // slot, so this cannot over-grant. A live waiter bound to a
+                            // different socket still owns the row — don't let a hash
+                            // replay collect the flag and delete them.
                             let mut queue = self.upload_queue.lock().await;
-                            if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
-                                let removed = queue.remove(pos);
-                                removed_queue_entry = Some(removed);
+                            if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity)
+                            {
+                                if queue_row_owned_by_session(
+                                    queue[pos].current_addr,
+                                    queue[pos].tcp_port,
+                                    peer_addr,
+                                    hello_caps.tcp_port,
+                                ) {
+                                    let removed = queue.remove(pos);
+                                    removed_queue_entry = Some(removed);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                true
                             }
-                            true
                         } else {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
@@ -7164,10 +7290,21 @@ impl UploadHandler {
                                     if let Some(pos) =
                                         queue.iter().position(|e| e.identity == queue_identity)
                                     {
-                                        let removed = queue.remove(pos);
-                                        removed_queue_entry = Some(removed);
+                                        if queue_row_owned_by_session(
+                                            queue[pos].current_addr,
+                                            queue[pos].tcp_port,
+                                            peer_addr,
+                                            hello_caps.tcp_port,
+                                        ) {
+                                            let removed = queue.remove(pos);
+                                            removed_queue_entry = Some(removed);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        true
                                     }
-                                    true
                                 }
                                 Some(_) => false,
                                 None => true,
@@ -7221,23 +7358,33 @@ impl UploadHandler {
                         {
                             // `queue_identity` is keyed on the peer's bare,
                             // wire-visible `user_hash` (unauthenticated —
-                            // no cryptographic binding). A *different*
-                            // TCP session — this peer reconnecting, or an
-                            // entirely different peer claiming the same
-                            // hash — can reclaim this same entry. Detect
-                            // that by comparing the stored `current_addr`
-                            // (cleared to `None` on disconnect) against
-                            // this session's address *before* overwriting
-                            // it: a mismatch (or `None`) means the entry's
-                            // `is_friend_slot`/`ember_verified` — which
-                            // encode "this session proved PoP" — belong to
-                            // a session that is not the one in front of us
-                            // now, and must not be inherited. Without this,
-                            // any subsequent connection claiming a
-                            // once-verified `user_hash` would get friend-
-                            // slot priority and Ember credit-ratio scoring
-                            // without ever proving key possession itself.
-                            let same_session = queue[pos].current_addr == Some(peer_addr);
+                            // no cryptographic binding). If the row is
+                            // already bound to a different IP or advertised
+                            // TCP port, refuse the reclaim: overwriting
+                            // `current_addr` would zero the victim's
+                            // promotion score until they re-ask, and
+                            // resetting session flags would strip
+                            // friend-slot / Ember verification from the
+                            // live waiter. Same IP + Hello-advertised port
+                            // is the same client (eMule GetUserPort) and
+                            // takes the row over. Preserve `join_time`
+                            // (seniority) only for a genuine reconnect,
+                            // when `current_addr` is `None`.
+                            let bound_addr = queue[pos].current_addr;
+                            if !queue_row_owned_by_session(
+                                bound_addr,
+                                queue[pos].tcp_port,
+                                peer_addr,
+                                hello_caps.tcp_port,
+                            ) {
+                                drop(queue);
+                                drop(idx_snap);
+                                drop(cm);
+                                write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[])
+                                    .await?;
+                                break;
+                            }
+                            let same_session = bound_addr == Some(peer_addr);
                             if !same_session {
                                 queue[pos].is_friend_slot = false;
                                 queue[pos].ember_verified = false;
@@ -7565,7 +7712,13 @@ impl UploadHandler {
                             // Force the size backstop below to re-resolve for the
                             // newly-targeted file.
                             total_size = 0;
-                            self.sync_queue_file_hash(&queue_identity, requested).await;
+                            self.sync_queue_file_hash(
+                                &queue_identity,
+                                requested,
+                                peer_addr,
+                                hello_caps.tcp_port,
+                            )
+                            .await;
                         }
                     }
                     let hash = if let Some(h) = current_file_hash {
@@ -7674,7 +7827,7 @@ impl UploadHandler {
                     // "transferred" stat. Use strict `<` so contiguous
                     // ranges stay as separate entries: fusing them lets a
                     // single OP_SENDINGPART cover all three blocks, and
-                    // the downloader counts block responses per packet
+                    // the downloader counts completed requested ranges
                     // (see `multi_source.rs` `blocks_received_in_current_req`).
                     // With the old `<=` the downloader's refill logic
                     // stalled after the first 540 KB and the outer
@@ -8685,30 +8838,27 @@ impl UploadHandler {
                             if let Some(entry) =
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
                             {
-                                // This re-admission site assumed the found
-                                // entry always belongs to *this* session
-                                // (re-queuing itself after its own active
-                                // slot ended), but `queue_identity` is
-                                // still just the bare, unauthenticated
-                                // `user_hash`: while this session was
-                                // actively uploading, its own queue row was
-                                // removed (see the grant path above), which
-                                // leaves a window for an unrelated
-                                // connection claiming the same `user_hash`
-                                // to push a *fresh, unverified* row for
-                                // that identity. If this session's active
-                                // slot then rotates out (byte/time cap or
-                                // score-based preemption) and lands here,
-                                // it would find that other connection's row
-                                // and hand it this session's own
-                                // `is_friend_slot`/`ember_verified` state —
-                                // exactly the cross-session flag leak fixed
-                                // above at the initial queue-insertion site,
-                                // just reachable via a different path. Same
-                                // fix: only trust/preserve the row's
-                                // existing flags if it's still addressed to
-                                // this session.
-                                let same_session = entry.current_addr == Some(peer_addr);
+                                // Same live-session bind as the initial
+                                // queue-insertion site: while this session
+                                // was uploading its row was removed, so
+                                // another connection claiming this
+                                // `user_hash` may have inserted a fresh
+                                // row. Do not hijack a waiter's row bound
+                                // to a different IP or advertised port;
+                                // refuse and let the caller send OP_QUEUEFULL.
+                                // Same IP + Hello-advertised port takes
+                                // the row over. Preserve seniority only
+                                // when `current_addr` is `None` (reconnect).
+                                let bound_addr = entry.current_addr;
+                                if !queue_row_owned_by_session(
+                                    bound_addr,
+                                    entry.tcp_port,
+                                    peer_addr,
+                                    hello_caps.tcp_port,
+                                ) {
+                                    false
+                                } else {
+                                let same_session = bound_addr == Some(peer_addr);
                                 if !same_session {
                                     entry.is_friend_slot = false;
                                     entry.ember_verified = false;
@@ -8744,6 +8894,7 @@ impl UploadHandler {
                                     entry.ember_pubkey = hello_caps.ember_pubkey;
                                 }
                                 true
+                                }
                             } else if queue.len() < MAX_UPLOAD_QUEUE_SIZE {
                                 queue.push(queue_entry_from_hello(
                                     queue_identity.clone(),
@@ -9223,7 +9374,13 @@ impl UploadHandler {
                             }
                             current_file_hash = Some(mpreq.file_hash);
                             total_size = file.size;
-                            self.sync_queue_file_hash(&queue_identity, mpreq.file_hash).await;
+                            self.sync_queue_file_hash(
+                                &queue_identity,
+                                mpreq.file_hash,
+                                peer_addr,
+                                hello_caps.tcp_port,
+                            )
+                            .await;
 
                                 // eMule ProcessExtendedInfo over MultiPacket: the
                                 // OP_REQUESTFILENAME sub-block carries the peer's
@@ -9239,7 +9396,22 @@ impl UploadHandler {
                                 }
 
                                 let partial_bitmap = if file.is_partial && file.size > 0 {
-                                    let tracker = super::part_tracker::PartTracker::new(file.size, &file.path);
+                                    let file_size = file.size;
+                                    let part_path = file.path.clone();
+                                    let fallback_path = part_path.clone();
+                                    let tracker = tokio::task::spawn_blocking(move || {
+                                        super::part_tracker::PartTracker::new(file_size, &part_path)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "PartTracker load task failed for MultiPacket bitmap: {e}"
+                                        );
+                                        super::part_tracker::PartTracker::new_empty(
+                                            file_size,
+                                            &fallback_path,
+                                        )
+                                    });
                                     // Advertise only parts we will actually serve
                                     // (complete AND MD4-verified). Using bare
                                     // `completed_parts()` here advertised unverified
@@ -9589,7 +9761,15 @@ impl UploadHandler {
                         .await;
                         {
                             let mut queue = self.upload_queue.lock().await;
-                            queue.retain(|e| e.identity != queue_identity);
+                            queue.retain(|e| {
+                                e.identity != queue_identity
+                                    || !queue_row_owned_by_session(
+                                        e.current_addr,
+                                        e.tcp_port,
+                                        peer_addr,
+                                        hello_caps.tcp_port,
+                                    )
+                            });
                         }
                         break;
                     }
@@ -10376,18 +10556,23 @@ impl UploadHandler {
                 .await;
         }
 
-        // Keep queued peers on disconnect, but mark them disconnected.
-        // eMule preserves LowID/disconnected queue entries until the normal
-        // purge window; immediate removal destroys seniority and makes the
-        // `add_next_connect` fast path unreachable. The queue's 1-hour purge
-        // cap bounds stale entries.
+        // Keep queued peers on disconnect, but mark them disconnected
+        // only when this socket is the one bound to the row. Matching on
+        // identity alone would let a hash-spoofer connect and hang up,
+        // clearing a still-connected victim's `current_addr`. eMule
+        // preserves LowID/disconnected queue entries until the normal
+        // purge window; immediate removal destroys seniority and makes
+        // the `add_next_connect` fast path unreachable. The queue's
+        // 1-hour purge cap bounds stale entries.
         {
             let mut queue = self.upload_queue.lock().await;
             queue.retain_mut(|e| {
                 if e.identity != queue_identity {
                     return true;
                 }
-                e.current_addr = None;
+                if e.current_addr == Some(peer_addr) {
+                    e.current_addr = None;
+                }
                 true
             });
         }
