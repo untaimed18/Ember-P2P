@@ -68,12 +68,28 @@ impl EmberObservedIpVotes {
         if self.votes.len() >= MAX_TRACKED_ADDRS && !self.votes.contains_key(&reported) {
             // Drop the least-recently-updated address to make room, so a peer
             // reporting a fresh address on every reply cannot grow this map.
-            if let Some(oldest) = self
+            //
+            // Never the confirmed one, however quiet it has gone: `prune` reads
+            // its quorum back out of this map, so evicting it retracts a
+            // confirmation whose votes are all still live — and in this very
+            // call `current_count` would then read zero, letting a merely tied
+            // rival take the address over, which is the takeover the tie rule
+            // exists to refuse. The plain minimum is still the fallback so the
+            // cap holds even when the confirmed entry is the only candidate.
+            let confirmed = self.confirmed;
+            let victim = self
                 .votes
                 .iter()
+                .filter(|(addr, _)| Some(**addr) != confirmed)
                 .min_by_key(|(_, v)| v.last_update)
                 .map(|(k, _)| *k)
-            {
+                .or_else(|| {
+                    self.votes
+                        .iter()
+                        .min_by_key(|(_, v)| v.last_update)
+                        .map(|(k, _)| *k)
+                });
+            if let Some(oldest) = victim {
                 self.votes.remove(&oldest);
             }
         }
@@ -353,6 +369,58 @@ mod tests {
             "stale votes must not count toward the quorum"
         );
         assert_eq!(votes.confirmed(), None);
+    }
+
+    /// The tracked-address cap must not be able to evict the address a live
+    /// quorum has confirmed. `prune` reads that quorum out of `votes`, so
+    /// dropping the entry retracts a confirmation nothing was wrong with — and
+    /// it makes `current_count` read zero, so the very next three-net rival
+    /// walks in, which is exactly what
+    /// `a_tied_rival_quorum_does_not_displace_a_live_confirmation` forbids.
+    #[test]
+    fn the_address_cap_never_evicts_the_confirmed_address() {
+        let mut votes = EmberObservedIpVotes::new();
+        let current = addr(50, 4672);
+        let rival = addr(51, 4672);
+        let t0 = Instant::now();
+
+        votes.record_vote_at(current, reporter(1, 0, 1), t0);
+        votes.record_vote_at(current, reporter(1, 1, 1), t0);
+        assert_eq!(
+            votes.record_vote_at(current, reporter(1, 2, 1), t0),
+            Some(current)
+        );
+
+        // Every filler is strictly newer, so the confirmed address is the LRU
+        // victim on every insert once the map is full.
+        let later = t0 + Duration::from_secs(1);
+        for i in 0..(MAX_TRACKED_ADDRS as u16 * 2) {
+            let filler = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 9, 1), 5000 + i));
+            votes.record_vote_at(filler, reporter(2, 2, 2), later);
+        }
+
+        assert_eq!(
+            votes.confirmed(),
+            Some(current),
+            "a live quorum must survive the tracked-address cap"
+        );
+        assert!(
+            votes.votes.len() <= MAX_TRACKED_ADDRS,
+            "and the cap still has to hold, tracking {}",
+            votes.votes.len()
+        );
+        assert_eq!(
+            votes.record_vote_at(rival, reporter(3, 0, 1), later),
+            None,
+            "nor may the eviction hand the address to a rival that only ties"
+        );
+        votes.record_vote_at(rival, reporter(3, 1, 1), later);
+        assert_eq!(
+            votes.record_vote_at(rival, reporter(3, 2, 1), later),
+            None,
+            "a 3-net rival must still be refused against a still-backed confirmation"
+        );
+        assert_eq!(votes.confirmed(), Some(current));
     }
 
     /// A peer answering with a different address each time must not grow the

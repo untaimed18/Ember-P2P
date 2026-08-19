@@ -344,6 +344,17 @@ impl RoutingTable {
             return AddResult::Rejected;
         }
 
+        // Diversity limits scale with how much of the network we can see, so
+        // read them once before borrowing a bucket. Carried into
+        // `add_to_cache` rather than recomputed there: `scale()` walks all 128
+        // buckets, and `merge_gossip_contacts` runs this whole path once per
+        // contact in a FOUND_NODE — most of which land in the cache on a warm
+        // table, so recomputing doubled the walks for a frame.
+        let scale = self.scale();
+        let max_per_ip = scale.max_contacts_per_ip();
+        let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
+
         if !self.admits_addr(&contact.addr) {
             // "Cannot confirm" is not "known bad". While `ipfilter.dat` is
             // still parsing, `is_blocked_for_kad` calls every non-seed address
@@ -357,7 +368,7 @@ impl RoutingTable {
             // clears the cache of anything genuinely blocked, so nothing enters
             // the table without passing the real list.
             if !self.definitely_blocked(&contact.addr) {
-                self.add_to_cache(bucket_idx, contact);
+                self.add_to_cache(bucket_idx, contact, scale);
                 return AddResult::Rejected;
             }
             trace!(
@@ -367,13 +378,6 @@ impl RoutingTable {
             );
             return AddResult::Rejected;
         }
-
-        // Diversity limits scale with how much of the network we can see, so
-        // read them once before borrowing a bucket.
-        let scale = self.scale();
-        let max_per_ip = scale.max_contacts_per_ip();
-        let max_subnet_global = scale.max_contacts_per_subnet_global();
-        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
 
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
@@ -438,7 +442,7 @@ impl RoutingTable {
                 "Rejected contact {} (subnet limit per bucket)",
                 contact.node_id
             );
-            self.add_to_cache(bucket_idx, contact);
+            self.add_to_cache(bucket_idx, contact, scale);
             return AddResult::Rejected;
         }
 
@@ -446,7 +450,7 @@ impl RoutingTable {
         let global_count = self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
         if global_count >= max_subnet_global {
             trace!("Rejected contact {} (global subnet limit)", contact.node_id);
-            self.add_to_cache(bucket_idx, contact);
+            self.add_to_cache(bucket_idx, contact, scale);
             return AddResult::Rejected;
         }
 
@@ -461,7 +465,7 @@ impl RoutingTable {
                 "Rejected contact {} (per-IP limit {max_per_ip} for {ip})",
                 contact.node_id
             );
-            self.add_to_cache(bucket_idx, contact);
+            self.add_to_cache(bucket_idx, contact, scale);
             return AddResult::Rejected;
         }
 
@@ -519,7 +523,7 @@ impl RoutingTable {
         let ping_addr = oldest.addr;
         let ping_id = oldest.node_id;
         let ping_noise = oldest.noise_pub;
-        self.add_to_cache(bucket_idx, contact);
+        self.add_to_cache(bucket_idx, contact, scale);
 
         AddResult::PingOldest {
             addr: ping_addr,
@@ -566,8 +570,11 @@ impl RoutingTable {
             let cand_subnet = candidate.subnet_key();
             let cand_ip = candidate.addr.ip();
             // Never promote a peer that is already resident: that would give
-            // one contact two slots in the same bucket.
-            if bucket.find(&candidate.node_id).is_some() {
+            // one contact two slots in the same bucket. `dead_id` needs saying
+            // separately because it was removed above, so `find` no longer
+            // sees it — promoting its own entry would undo the eviction that
+            // just happened and hand the contact a clean failure count.
+            if candidate.node_id == *dead_id || bucket.find(&candidate.node_id).is_some() {
                 continue;
             }
             // A cache entry can be stale: the policy may have tightened, or
@@ -1005,8 +1012,26 @@ impl RoutingTable {
 
     // ── Internal helpers ──
 
-    fn add_to_cache(&mut self, bucket_idx: usize, contact: EmberContact) {
-        let scale = self.scale();
+    fn add_to_cache(
+        &mut self,
+        bucket_idx: usize,
+        contact: EmberContact,
+        scale: scale::NetworkScale,
+    ) {
+        // A contact holding a bucket slot must never also hold a cache entry.
+        // `add_contact` parks a lead here *before* it tests residency, and
+        // while `ipfilter.dat` is still parsing `admits_addr` refuses every
+        // address it cannot yet judge — a window that opens on every launch,
+        // during which the UDP ingress deliberately still lets known peers
+        // through. Each resident contact that answered us in it filed a
+        // duplicate of itself, and `evict_and_replace` removes the dead
+        // contact before it scans the cache, so that duplicate then passed the
+        // already-resident test and put the peer straight back with
+        // `failed_queries` cleared — three missed liveness pings undone.
+        if self.buckets[bucket_idx].find(&contact.node_id).is_some() {
+            return;
+        }
+
         let max_subnet_global = scale.max_contacts_per_subnet_global();
         let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
         let max_per_ip = scale.max_contacts_per_ip();
@@ -1724,6 +1749,50 @@ mod tests {
             .filter(|c| c.node_id == newcomer_id)
             .count();
         assert_eq!(occurrences, 1, "a peer must occupy at most one slot");
+    }
+
+    /// The same rule from the other direction: a contact that already holds a
+    /// slot must not acquire a cache entry either. `add_contact` parks a lead
+    /// before it tests residency, so during the window every launch opens with
+    /// — filter attached, ranges not parsed, known peers still answering —
+    /// every resident contact filed a duplicate of itself. `evict_and_replace`
+    /// removes the dead contact before it scans the cache, so that duplicate
+    /// passed the already-resident test and promoted the peer straight back
+    /// with a clean failure count, undoing the three missed pings that had just
+    /// retired it.
+    #[test]
+    fn a_resident_contact_is_never_parked_as_its_own_replacement() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let resident = make_contact(0x11, 4672);
+        let id = resident.node_id;
+        assert!(matches!(rt.add_contact(resident.clone()), AddResult::Added));
+
+        let mut filter = IpFilter::new(true, false);
+        rt.set_ip_filter(filter.create_shared_snapshot());
+        assert!(
+            !rt.admits_addr(&resident.addr),
+            "this only reproduces while the gate cannot judge the address yet"
+        );
+        rt.add_contact(resident.clone());
+
+        let bucket_idx = local.bucket_index(&id).expect("a bucket");
+        assert!(
+            rt.buckets[bucket_idx].find_in_cache(&id).is_none(),
+            "a contact holding a bucket slot must not also be its own cache entry"
+        );
+
+        filter.mark_ranges_ready();
+        rt.set_ip_filter(filter.create_shared_snapshot());
+
+        assert!(
+            !rt.evict_and_replace(&id),
+            "a dead contact must not be available as its own replacement"
+        );
+        assert!(
+            rt.get_contact(&id).is_none(),
+            "the eviction has to stick, in the bucket and in the cache"
+        );
     }
 
     /// Cryptographic node IDs stop a peer impersonating another node, but not

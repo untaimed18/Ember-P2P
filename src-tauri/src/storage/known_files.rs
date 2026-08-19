@@ -804,6 +804,18 @@ impl KnownFileList {
         self.dirty
     }
 
+    /// Whether this catalog came from disk (or is a genuine first run) and may
+    /// therefore be written back.
+    ///
+    /// Lets a caller skip a save it knows [`KnownFiles::save`] would refuse.
+    /// The refusal inside `save` stays as the real guard — this is only so the
+    /// periodic writer does not spend a blocking task and the save lock on a
+    /// write that cannot land, and does not then report the no-op as a failed
+    /// one.
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
+    }
+
     pub fn dirty_generation(&self) -> u64 {
         self.dirty_generation
     }

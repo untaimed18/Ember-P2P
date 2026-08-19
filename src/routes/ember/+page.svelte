@@ -521,7 +521,19 @@
     </section>
   {/if}
 
-  <p class="about-text">{m.ember_about_text()}</p>
+  <div class="about-callout">
+    <span class="about-icon" aria-hidden="true">
+      <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="10" cy="10" r="7"/>
+        <path d="M10 9.4v4"/>
+        <path d="M10 6.7h.01"/>
+      </svg>
+    </span>
+    <div class="about-callout-text">
+      <strong>{m.ember_about_title()}</strong>
+      <p class="about-text">{m.ember_about_text()}</p>
+    </div>
+  </div>
 
   <!--
     Everything below is protocol-level diagnostics. Collapsed by default,
@@ -867,7 +879,11 @@
     white-space: nowrap;
   }
 
-  .beta-lock {
+  /* The beta lock and the "About the Ember Network" explainer are the same
+     component wearing different icons, so they share their rules outright
+     rather than drifting apart in two copies. */
+  .beta-lock,
+  .about-callout {
     display: flex;
     align-items: flex-start;
     gap: 12px;
@@ -877,7 +893,8 @@
     border-radius: var(--radius-lg);
   }
 
-  .beta-lock-icon {
+  .beta-lock-icon,
+  .about-icon {
     width: 32px;
     height: 32px;
     border-radius: var(--radius-md);
@@ -889,12 +906,14 @@
     background: color-mix(in srgb, var(--ember-color, #c2185b) 14%, transparent);
   }
 
-  .beta-lock-text {
+  .beta-lock-text,
+  .about-callout-text {
     flex: 1;
     min-width: 0;
   }
 
-  .beta-lock-text strong {
+  .beta-lock-text strong,
+  .about-callout-text strong {
     display: block;
     font-size: 13px;
     font-weight: 600;
@@ -1312,7 +1331,9 @@
   }
 
   .about-text {
-    margin: 4px 0 0;
+    /* Matches `.beta-lock-text p` so the title-to-body gap is identical in
+       both callouts. */
+    margin: 2px 0 0;
     color: var(--text-muted);
     font-size: 13px;
     line-height: 1.6;
