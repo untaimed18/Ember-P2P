@@ -538,6 +538,9 @@ fn apply_udp_mapping_keepalive(
     }
 
     let port = mapped.port();
+    if port == 0 {
+        return false;
+    }
     // UI always shows the latest observed mapping.
     state.stats.public_udp_port = port;
 
@@ -690,6 +693,13 @@ fn tcp_port_confirmation(
     stable_hits: u8,
     observed_port: u16,
 ) -> TcpPortConfirmation {
+    if observed_port == 0 {
+        return TcpPortConfirmation {
+            candidate_port,
+            stable_hits,
+            confirmed_port: None,
+        };
+    }
     if observed_port == configured_tcp_port {
         return TcpPortConfirmation {
             candidate_port: None,
@@ -6179,6 +6189,14 @@ mod tests {
         assert_eq!(result.confirmed_port, Some(4662));
         assert_eq!(result.candidate_port, None);
         assert_eq!(result.stable_hits, 0);
+    }
+
+    #[test]
+    fn tcp_port_confirmation_ignores_port_zero() {
+        let result = tcp_port_confirmation(4662, Some(51234), 1, 0);
+        assert_eq!(result.confirmed_port, None);
+        assert_eq!(result.candidate_port, Some(51234));
+        assert_eq!(result.stable_hits, 1);
     }
 
     #[test]
@@ -26522,6 +26540,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             friend_hashes.clone(),
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
+
+                                        // Windows Firewall already allows KAD UDP
+                                        // (`udp_port`) and, at startup, anticipated
+                                        // QUIC on `tcp_port`. If bind landed on a
+                                        // fallback neighbour, open that port too —
+                                        // otherwise inbound punch/relay is dropped
+                                        // even when UPnP forwarded it.
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            let fw_quic = bound_port;
+                                            let fw_kad_udp = state.udp_port;
+                                            tokio::task::spawn_blocking(move || {
+                                                crate::security::firewall::ensure_quic_udp_firewall_rule(
+                                                    fw_quic, fw_kad_udp,
+                                                );
+                                            });
+                                        }
 
                                         // Forward the QUIC UDP port via UPnP. QUIC binds
                                         // its socket here — after the initial UPnP setup

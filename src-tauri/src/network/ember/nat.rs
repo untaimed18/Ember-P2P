@@ -469,6 +469,8 @@ pub(crate) fn parse_binding_response(
 
     let mut offset = 20;
     let end = 20 + msg_len;
+    let mut xor_mapped = None;
+    let mut mapped = None;
     while offset + 4 <= end {
         let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
         let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
@@ -481,13 +483,13 @@ pub(crate) fn parse_binding_response(
         let attr_data = &data[offset..offset + attr_len];
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
-                if let Some(addr) = parse_xor_mapped_address(attr_data) {
-                    return Ok(addr);
+                if xor_mapped.is_none() {
+                    xor_mapped = parse_xor_mapped_address(attr_data);
                 }
             }
             ATTR_MAPPED_ADDRESS => {
-                if let Some(addr) = parse_mapped_address(attr_data) {
-                    return Ok(addr);
+                if mapped.is_none() {
+                    mapped = parse_mapped_address(attr_data);
                 }
             }
             _ => {}
@@ -497,7 +499,13 @@ pub(crate) fn parse_binding_response(
         offset += padded;
     }
 
-    Err("No mapped address in response".into())
+    // RFC 5389: ignore MAPPED-ADDRESS when XOR-MAPPED-ADDRESS is present.
+    // Returning the first attribute we saw would prefer a rewritten
+    // MAPPED-ADDRESS over the XOR encoding that middleboxes cannot cheaply
+    // forge to a different value.
+    xor_mapped
+        .or(mapped)
+        .ok_or_else(|| "No mapped address in response".into())
 }
 
 fn parse_xor_mapped_address(data: &[u8]) -> Option<SocketAddr> {
@@ -802,5 +810,49 @@ mod tests {
 
         let addr = parse_binding_response(&response, &txn_id).unwrap();
         assert_eq!(addr, SocketAddr::new(IpAddr::V4(ip), port));
+    }
+
+    #[test]
+    fn xor_mapped_address_wins_over_a_leading_mapped_address() {
+        let txn_id = [0xBB; 12];
+        let magic = STUN_MAGIC_COOKIE.to_be_bytes();
+        let real_ip = std::net::Ipv4Addr::new(198, 51, 100, 9);
+        let real_port: u16 = 41234;
+        let xor_port = real_port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
+        let real_octets = real_ip.octets();
+        let xor_ip = [
+            real_octets[0] ^ magic[0],
+            real_octets[1] ^ magic[1],
+            real_octets[2] ^ magic[2],
+            real_octets[3] ^ magic[3],
+        ];
+
+        let mut mapped_attr = Vec::new();
+        mapped_attr.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+        mapped_attr.extend_from_slice(&8u16.to_be_bytes());
+        mapped_attr.push(0);
+        mapped_attr.push(0x01);
+        mapped_attr.extend_from_slice(&80u16.to_be_bytes());
+        mapped_attr.extend_from_slice(&[10, 0, 0, 1]);
+
+        let mut xor_attr = Vec::new();
+        xor_attr.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        xor_attr.extend_from_slice(&8u16.to_be_bytes());
+        xor_attr.push(0);
+        xor_attr.push(0x01);
+        xor_attr.extend_from_slice(&xor_port.to_be_bytes());
+        xor_attr.extend_from_slice(&xor_ip);
+
+        let attrs_len = (mapped_attr.len() + xor_attr.len()) as u16;
+        let mut response = Vec::new();
+        response.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        response.extend_from_slice(&attrs_len.to_be_bytes());
+        response.extend_from_slice(&magic);
+        response.extend_from_slice(&txn_id);
+        response.extend_from_slice(&mapped_attr);
+        response.extend_from_slice(&xor_attr);
+
+        let addr = parse_binding_response(&response, &txn_id).unwrap();
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(real_ip), real_port));
     }
 }
