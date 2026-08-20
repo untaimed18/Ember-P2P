@@ -77,6 +77,7 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
 
 /// Load contacts from `nodes_ember.dat`.
 pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
+    crate::security::recover_interrupted_replace(path);
     let data = std::fs::read(path)?;
     if data.len() < 7 {
         anyhow::bail!("nodes_ember.dat too small");
@@ -320,6 +321,7 @@ pub fn save_store(
 /// signature and recomputes expiry from the signed creation time. A short or
 /// malformed file yields whatever parsed cleanly before the damage.
 pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedRecord>> {
+    crate::security::recover_interrupted_replace(path);
     let data = std::fs::read(path)?;
     if data.len() < 9 {
         anyhow::bail!("store_ember.dat too small");
@@ -403,9 +405,23 @@ pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedReco
 
     if out.len() < count {
         warn!(
-            "store_ember.dat declared {count} records but {} parsed; using what loaded",
+            "store_ember.dat declared {count} records but {} parsed; \
+             likely a corrupted or truncated file. Backing up before next save.",
             out.len()
         );
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bak = path.with_extension(format!("dat.bak.{ts}"));
+        if let Err(e) = std::fs::copy(path, &bak) {
+            warn!(
+                "Failed to back up partial store_ember.dat to {}: {e}",
+                bak.display(),
+            );
+        } else {
+            info!("Backed up partial store_ember.dat to {}", bak.display());
+        }
     }
     info!(
         "Loaded {} Ember DHT records from {}",

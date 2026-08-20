@@ -329,6 +329,29 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.contacts.len()).sum()
     }
 
+    /// Contacts in replacement caches. Fail-closed IP-filter parking and a
+    /// full bucket both land here; they are not in [`Self::total_contacts`].
+    pub fn cached_len(&self) -> usize {
+        self.buckets
+            .iter()
+            .map(|b| b.replacement_cache.len())
+            .sum()
+    }
+
+    /// Bucket slots plus replacement-cache entries.
+    pub fn held_len(&self) -> usize {
+        self.total_contacts() + self.cached_len()
+    }
+
+    /// Verified contacts in buckets or the replacement cache.
+    pub fn verified_held(&self) -> usize {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.contacts.iter().chain(b.replacement_cache.iter()))
+            .filter(|c| c.is_verified())
+            .count()
+    }
+
     /// Add or update a contact. Returns what action the caller should take.
     pub fn add_contact(&mut self, contact: EmberContact) -> AddResult {
         if contact.node_id == self.local_id {
@@ -404,6 +427,39 @@ impl RoutingTable {
 
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
+
+        // A verified observation is worth more than mute gossip in the same
+        // /24. The subnet cap used to run first and park the live peer in the
+        // replacement cache while unverified squatters kept the slots — and
+        // `add_to_cache` then ignored a later verified copy as a duplicate.
+        if contact.is_verified() {
+            let pos = {
+                let bucket = &self.buckets[bucket_idx];
+                bucket.contacts.iter().position(|c| {
+                    !c.is_verified() && (c.subnet_key() == subnet || bucket.is_full())
+                })
+            };
+            if let Some(pos) = pos {
+                let evicted_ip = self.buckets[bucket_idx].contacts[pos].addr.ip();
+                let ip_ok = ip == evicted_ip
+                    || self.global_ip_count.get(&ip).copied().unwrap_or(0) < max_per_ip;
+                if ip_ok {
+                    let bucket = &mut self.buckets[bucket_idx];
+                    let evicted = bucket.contacts.remove(pos).unwrap();
+                    bucket
+                        .replacement_cache
+                        .retain(|c| c.node_id != contact.node_id);
+                    bucket.contacts.push_back(contact);
+                    bucket.last_activity = chrono::Utc::now().timestamp();
+                    self.release_subnet(evicted.subnet_key());
+                    self.release_ip(evicted.addr.ip());
+                    *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
+                    *self.global_ip_count.entry(ip).or_insert(0) += 1;
+                    return AddResult::Added;
+                }
+            }
+        }
+
         let bucket = &mut self.buckets[bucket_idx];
 
         // Subnet diversity check: per-bucket
@@ -524,6 +580,18 @@ impl RoutingTable {
         if contact.last_seen <= 0 {
             bucket.contacts.insert(pos, existing);
             return AddResult::Added;
+        }
+
+        // Pin the Noise static key once this node_id has answered us. The DHT
+        // header signs Ed25519, not the session key, so a captured Alice PING
+        // replayed inside Mallory's Noise session would otherwise overwrite
+        // Alice's routing slot with Mallory's `noise_pub` and address.
+        if existing.is_verified()
+            && existing.noise_pub != [0u8; 32]
+            && contact.noise_pub != existing.noise_pub
+        {
+            bucket.contacts.insert(pos, existing);
+            return AddResult::Rejected;
         }
 
         let subnet = contact.subnet_key();
@@ -947,30 +1015,43 @@ impl RoutingTable {
 
     /// Contacts worth writing to `nodes_ember.dat`, closest-to-home first.
     ///
-    /// Only proven contacts are persisted: an unverified lead is worth little
-    /// at save time and nothing at all next launch, and saving the whole table
-    /// means junk gossip survives restarts and re-seeds the table each
-    /// session. Preferring contacts near our own ID mirrors KAD's
-    /// `export_bootstrap_contacts` and reloads the buckets that matter most
-    /// for deciding which keys we are responsible for.
+    /// Proven contacts lead: mute gossip must not crowd them out or come back
+    /// as the whole bootstrap set. Remaining slots are filled with untried
+    /// bucket leads (`last_seen == 0`, not yet 3-struck) so a 5-minute save
+    /// after one peer answers does not throw away the rest of `nodes_ember.dat`.
+    /// Replacement-cache gossip stays out — that is the junk this filter exists
+    /// to drop. Preferring contacts near our own ID mirrors KAD.
     pub fn export_bootstrap_contacts(&self, max: usize) -> Vec<EmberContact> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let persistable = |c: &&EmberContact| c.failed_queries < super::MAX_FAILED_QUERIES;
         let mut verified: Vec<(EmberNodeId, &EmberContact)> = self
             .buckets
             .iter()
             .flat_map(|b| b.contacts.iter())
-            // Not `failed_queries == 0`: one unanswered probe is normal at any
-            // moment during a refresh burst, and excluding those contacts
-            // shrinks the saved set well below the live table. Only contacts
-            // on the verge of eviction are dropped.
-            .filter(|c| c.is_verified() && c.failed_queries < super::MAX_FAILED_QUERIES)
+            .filter(|c| c.is_verified() && persistable(c))
             .map(|c| (self.local_id.distance(&c.node_id), c))
             .collect();
         verified.sort_by_key(|a| a.0 .0);
-        verified
+        let mut out: Vec<EmberContact> = verified
             .into_iter()
             .take(max)
             .map(|(_, c)| c.clone())
-            .collect()
+            .collect();
+        if out.len() < max {
+            let mut leads: Vec<(EmberNodeId, &EmberContact)> = self
+                .buckets
+                .iter()
+                .flat_map(|b| b.contacts.iter())
+                .filter(|c| !c.is_verified() && persistable(c))
+                .map(|c| (self.local_id.distance(&c.node_id), c))
+                .collect();
+            leads.sort_by_key(|a| a.0 .0);
+            let room = max - out.len();
+            out.extend(leads.into_iter().take(room).map(|(_, c)| c.clone()));
+        }
+        out
     }
 
     /// Get a contact by node ID, from the bucket or its replacement cache.
@@ -1074,11 +1155,29 @@ impl RoutingTable {
         let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
         let max_per_ip = scale.max_contacts_per_ip();
 
-        // Don't add duplicates to cache
-        if self.buckets[bucket_idx]
-            .find_in_cache(&contact.node_id)
-            .is_some()
-        {
+        if let Some(pos) = self.buckets[bucket_idx].find_in_cache(&contact.node_id) {
+            let existing = &mut self.buckets[bucket_idx].replacement_cache[pos];
+            // Gossip (`last_seen == 0`) must not clobber a cached observation.
+            if contact.last_seen <= 0 {
+                return;
+            }
+            if existing.is_verified()
+                && existing.noise_pub != [0u8; 32]
+                && contact.noise_pub != existing.noise_pub
+            {
+                return;
+            }
+            if contact.is_verified() && !existing.is_verified() {
+                *existing = contact;
+                return;
+            }
+            if contact.last_seen >= existing.last_seen {
+                existing.last_seen = contact.last_seen;
+                existing.failed_queries = 0;
+                existing.noise_pub = contact.noise_pub;
+                existing.ed25519_pub = contact.ed25519_pub;
+                existing.addr = contact.addr;
+            }
             return;
         }
 
@@ -1181,6 +1280,27 @@ mod tests {
 
         let close = make_id(0x01); // bit 120 differs
         assert_eq!(local.bucket_index(&close), Some(120));
+    }
+
+    #[test]
+    fn verified_noise_pub_is_pinned_against_a_different_session() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut alice = make_contact(0x22, 4672);
+        alice.noise_pub = [0xAA; 32];
+        assert!(matches!(rt.add_contact(alice.clone()), AddResult::Added));
+
+        let mut mallory = alice.clone();
+        mallory.noise_pub = [0xBB; 32];
+        mallory.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 9, 9, 9)), 4672);
+        mallory.last_seen = chrono::Utc::now().timestamp();
+        assert!(
+            matches!(rt.add_contact(mallory), AddResult::Rejected),
+            "a different Noise session must not steal Alice's slot"
+        );
+        let held = rt.get_contact(&alice.node_id).unwrap();
+        assert_eq!(held.noise_pub, [0xAA; 32]);
+        assert_eq!(held.addr, alice.addr);
     }
 
     #[test]
@@ -1727,21 +1847,82 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Persisting the whole table meant junk gossip survived restarts and
-    /// re-seeded the next session.
+    /// Proven contacts lead the bootstrap file; untried bucket leads fill
+    /// remaining slots so a thin verified table does not throw away seeds.
     #[test]
-    fn only_proven_contacts_are_persisted() {
+    fn bootstrap_export_prefers_proven_then_fills_with_leads() {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
         rt.add_contact(gossip_contact(0x11));
         rt.add_contact(make_contact(0x22, 4672));
 
         let exported = rt.export_bootstrap_contacts(200);
-        assert_eq!(exported.len(), 1);
+        assert_eq!(exported.len(), 2);
         assert_eq!(exported[0].node_id, make_id(0x22));
+        assert_eq!(exported[1].node_id, make_id(0x11));
+        assert!(exported[0].is_verified());
+        assert!(!exported[1].is_verified());
 
-        // And the cap is honoured.
+        let proven_only = rt.export_bootstrap_contacts(1);
+        assert_eq!(proven_only.len(), 1);
+        assert_eq!(proven_only[0].node_id, make_id(0x22));
+
         assert!(rt.export_bootstrap_contacts(0).is_empty());
+    }
+
+    /// Mute gossip filling a /24 must not keep a live same-subnet peer in the
+    /// replacement cache while those leads hold the bucket slots.
+    #[test]
+    fn verified_contact_replaces_unverified_subnet_squatter() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let cap = scale::NetworkScale::Bootstrap.max_contacts_per_subnet_per_bucket();
+        for k in 0..cap as u8 {
+            let mut c = contact_at(0x80 + k, 80, 1, 1, k + 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        assert_eq!(rt.total_contacts(), cap);
+        assert_eq!(rt.verified_len(), 0);
+
+        let live = contact_at(0x90, 80, 1, 1, 9);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "a verified same-/24 peer must take a bucket slot from a lead"
+        );
+        let bucket_idx = local.bucket_index(&live.node_id).expect("a bucket");
+        assert!(
+            rt.buckets[bucket_idx].find(&live.node_id).is_some(),
+            "the live peer belongs in the bucket, not the cache"
+        );
+        assert_eq!(rt.verified_len(), 1);
+    }
+
+    /// A later verified observation of a cached lead must upgrade the cache
+    /// entry rather than being dropped as a duplicate.
+    #[test]
+    fn cached_lead_upgrades_when_it_answers() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
+            assert!(matches!(
+                rt.add_contact(contact_at(i, 80, i, 1, 1)),
+                AddResult::Added
+            ));
+        }
+        let mut lead = contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1);
+        lead.last_seen = 0;
+        let _ = rt.add_contact(lead.clone());
+        let bucket_idx = local.bucket_index(&lead.node_id).expect("a bucket");
+        assert!(rt.buckets[bucket_idx].find(&lead.node_id).is_none());
+        assert!(rt.buckets[bucket_idx]
+            .find_in_cache(&lead.node_id)
+            .is_some());
+
+        lead.last_seen = chrono::Utc::now().timestamp();
+        let _ = rt.add_contact(lead.clone());
+        let cached = rt.get_contact(&lead.node_id).expect("still held");
+        assert!(cached.is_verified(), "the cache entry must upgrade");
     }
 
     /// A peer cached behind a full bucket can enter directly once a slot

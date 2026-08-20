@@ -115,6 +115,11 @@ impl EmberContact {
         self.last_seen > 0
     }
 
+    /// Whether we can send Ember UDP to this contact on the shared IPv4 socket.
+    pub fn is_dialable(&self) -> bool {
+        self.addr.port() != 0 && self.addr.ip().is_ipv4()
+    }
+
     /// Subnet key (first 3 octets for IPv4, first 48 bits for IPv6).
     pub fn subnet_key(&self) -> u64 {
         match self.addr.ip() {

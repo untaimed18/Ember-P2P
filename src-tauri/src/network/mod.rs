@@ -1490,37 +1490,39 @@ fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::
     record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);
 }
 
-/// Verified routing-table contacts plus firsthand session peers the table
-/// refused (typically LAN while `block_private_ips` is on).
+/// Verified routing-table (and cache) contacts plus firsthand session peers
+/// the table refused (typically LAN while `block_private_ips` is on).
+///
+/// Session extras only count toward the verified figure when they have
+/// answered us — LAN PEER_LIST copies arrive with `last_seen == 0` and must
+/// not inflate the high-water mark.
 fn ember_dht_ui_contact_counts(state: &NetworkState) -> (u32, u32) {
-    let contacts = state.ember_dht.contact_count();
-    let verified = state.ember_dht.routing().verified_len();
-    let extra = state
-        .ember_session_dht_contacts
-        .values()
-        .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
-        .count();
-    ((contacts + extra) as u32, (verified + extra) as u32)
+    let extra = ember_session_overlay_extras(state, false);
+    let verified_extra = ember_session_overlay_extras(state, true);
+    (
+        (state.ember_dht.routing().held_len() + extra) as u32,
+        (state.ember_dht.routing().verified_held() + verified_extra) as u32,
+    )
 }
 
-/// Routing-table contacts plus firsthand session peers the table refused.
+/// Routing-table contacts (including the replacement cache) plus firsthand
+/// session peers the table refused.
 ///
 /// Source search, empty-overlay re-arm, and self-lookup key off this rather
 /// than `ember_dht.contact_count()` so a LAN island with `block_private_ips`
 /// on still searches — FIND_VALUE already pins those session peers — and so
 /// a `nodes_ember.dat` lead is still a reason not to declare the overlay
-/// empty. Publish STOREs use [`ember_publishable_peer_count`] instead.
+/// empty. Cache-only contacts (fail-closed parking, full-bucket) count too:
+/// `contact_for` includes the cache, so treating that as "already in the
+/// table" without adding `cached_len` made overlay/publishable read 0 while
+/// a firsthand peer sat only in the cache. Publish STOREs use
+/// [`ember_publishable_peer_count`] instead.
 fn ember_overlay_contact_count(state: &NetworkState) -> usize {
-    let extra = state
-        .ember_session_dht_contacts
-        .values()
-        .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
-        .count();
-    state.ember_dht.contact_count() + extra
+    state.ember_dht.routing().held_len() + ember_session_overlay_extras(state, false)
 }
 
-/// Peers we can actually STORE to: proven table contacts plus firsthand
-/// session peers the public table refused.
+/// Peers we can actually STORE to: proven table/cache contacts plus firsthand
+/// verified session peers the public table refused.
 ///
 /// [`ember_overlay_contact_count`] also includes unverified leads, which is
 /// right for bootstrap/re-arm (a seed we have not pinged yet is still a
@@ -1529,12 +1531,20 @@ fn ember_overlay_contact_count(state: &NetworkState) -> usize {
 /// expire as failures — 82 records / 102 failures in one measured minute
 /// against a single `nodes_ember.dat` seed that never answered.
 fn ember_publishable_peer_count(state: &NetworkState) -> usize {
-    let extra = state
+    state.ember_dht.routing().verified_held() + ember_session_overlay_extras(state, true)
+}
+
+fn ember_session_overlay_extras(state: &NetworkState, verified_only: bool) -> usize {
+    state
         .ember_session_dht_contacts
         .values()
-        .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
-        .count();
-    state.ember_dht.routing().verified_len() + extra
+        .filter(|c| {
+            if verified_only && !c.is_verified() {
+                return false;
+            }
+            state.ember_dht.contact_for(&c.node_id).is_none()
+        })
+        .count()
 }
 
 fn ember_announce_due(
@@ -1700,6 +1710,9 @@ fn ember_top_up_session_targets(
     for contact in session.values() {
         if targets.len() >= K_EMBER_REPLICAS {
             break;
+        }
+        if !contact.is_verified() {
+            continue;
         }
         if !targets.iter().any(|held| held.node_id == contact.node_id) {
             targets.push(contact.clone());
@@ -3995,6 +4008,22 @@ mod friend_transfer_tests {
         ember_top_up_session_targets(&session, &mut targets);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].node_id, session_peer.node_id);
+
+        let gossip = ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0x22; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4672),
+            noise_pub: [0x22; 32],
+            ed25519_pub: [0x22; 32],
+            last_seen: 0,
+            failed_queries: 0,
+        };
+        session.insert((Ipv4Addr::new(192, 168, 1, 10), 4672), gossip);
+        ember_top_up_session_targets(&session, &mut targets);
+        assert_eq!(
+            targets.len(),
+            1,
+            "unverified LAN gossip must not become a STORE target"
+        );
 
         // Already holding the session peer must not duplicate it.
         ember_top_up_session_targets(&session, &mut targets);
@@ -6922,12 +6951,7 @@ mod tests {
         let outcome = pub_.note_ack(4, 0, node);
         assert_eq!(outcome.refused, vec![reference]);
         for reference in outcome.refused {
-            charge_ember_publish_failure(
-                sched.borrow(),
-                reference.file_hash,
-                reference.kind,
-                now,
-            );
+            fail_ember_record_pending(sched.borrow(), reference, now);
         }
 
         assert_eq!(sched.rounds_failed(reference), 1);
@@ -6949,7 +6973,70 @@ mod tests {
         // Another replica took it, which clears the pending set.
         sched.unplaced.remove(&(reference.file_hash, reference.kind));
 
-        charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, now);
+        fail_ember_record_pending(sched.borrow(), reference, now);
+        assert_eq!(sched.rounds_failed(reference), 0);
+    }
+
+    /// One replica's refusal must not drop the pending set while another
+    /// replica's batch is still in flight.
+    #[test]
+    fn a_refusal_does_not_clear_unplaced_while_another_replica_is_in_flight() {
+        let mut pub_ = EmberBatchPublisher::default();
+        let mut sched = TestSchedule::default();
+        let a = ember::dht::EmberNodeId([1u8; 16]);
+        let b = ember::dht::EmberNodeId([2u8; 16]);
+        let reference = record_ref(0xCF, 5);
+        let slot = (reference.file_hash, reference.kind);
+        let now = std::time::Instant::now();
+
+        track_ember_record_pending(sched.borrow(), reference);
+        pub_.in_flight.insert(
+            1,
+            EmberBatchInFlight {
+                node_id: a,
+                records: vec![reference],
+                deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            },
+        );
+        pub_.in_flight.insert(
+            2,
+            EmberBatchInFlight {
+                node_id: b,
+                records: vec![reference],
+                deadline: now + EMBER_BATCH_ACK_TIMEOUT,
+            },
+        );
+
+        let outcome = pub_.note_ack(1, 0, a);
+        assert_eq!(outcome.refused, vec![reference]);
+        assert!(pub_.record_still_outstanding(reference));
+        for reference in outcome.refused {
+            if pub_.record_still_outstanding(reference) {
+                continue;
+            }
+            fail_ember_record_pending(sched.borrow(), reference, now);
+        }
+        assert!(
+            sched.unplaced.contains_key(&slot),
+            "the other replica may still place the record"
+        );
+        assert_eq!(sched.rounds_failed(reference), 0);
+
+        let placed = pub_.note_ack(2, 0b1, b);
+        assert_eq!(placed.placed, vec![reference]);
+        for reference in placed.placed {
+            let slot = (reference.file_hash, reference.kind);
+            if let Some(unplaced) = sched.unplaced.get_mut(&slot) {
+                unplaced.remove(&reference.key);
+                if unplaced.is_empty() {
+                    sched.unplaced.remove(&slot);
+                }
+            }
+        }
+        assert!(
+            !sched.unplaced.contains_key(&slot),
+            "the accepting replica must still be able to retire the file"
+        );
         assert_eq!(sched.rounds_failed(reference), 0);
     }
 
@@ -7160,12 +7247,7 @@ mod tests {
 
         // A round's replica batches all time out together; that is one round.
         for _ in 0..5 {
-            charge_ember_publish_failure(
-                sched.borrow(),
-                reference.file_hash,
-                reference.kind,
-                start,
-            );
+            fail_ember_record_pending(sched.borrow(), reference, start);
         }
         assert_eq!(sched.rounds_failed(reference), 1);
 
@@ -7186,7 +7268,7 @@ mod tests {
         for expected in 2..=EMBER_PUBLISH_MAX_ATTEMPTS {
             at += EMBER_BATCH_ACK_TIMEOUT * 2;
             track_ember_record_pending(sched.borrow(), reference);
-            charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+            fail_ember_record_pending(sched.borrow(), reference, at);
             assert_eq!(sched.rounds_failed(reference), expected);
         }
 
@@ -7194,7 +7276,7 @@ mod tests {
         // putting it first, and the pending marker is released.
         at += EMBER_BATCH_ACK_TIMEOUT * 2;
         track_ember_record_pending(sched.borrow(), reference);
-        charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+        fail_ember_record_pending(sched.borrow(), reference, at);
         assert!(!sched.unplaced.contains_key(&slot));
         assert!(sched.keyword_at.contains_key(&reference.file_hash));
         assert_eq!(
@@ -7212,7 +7294,7 @@ mod tests {
 
         // A straggling timeout after the round resolved must not re-charge it.
         at += EMBER_BATCH_ACK_TIMEOUT * 2;
-        charge_ember_publish_failure(sched.borrow(), reference.file_hash, reference.kind, at);
+        fail_ember_record_pending(sched.borrow(), reference, at);
         assert_eq!(sched.rounds_failed(reference), 0);
     }
 
@@ -11276,7 +11358,7 @@ struct NetworkState {
     /// wire `request_id`. Mirrors `ember_pending_pings` (the control
     /// ping map) and is bounded by `MAX_EMBER_PENDING_PINGS`.
     ember_dht_pending_pings:
-        HashMap<u32, (std::time::Instant, oneshot::Sender<std::time::Duration>)>,
+        HashMap<u32, (std::time::Instant, SocketAddr, oneshot::Sender<std::time::Duration>)>,
     /// Pending Ember DHT `FIND_NODE` requests awaiting a `FOUND_NODE`,
     /// keyed by `request_id`. The waiter receives the contacts the peer
     /// returned. Bounded by `MAX_EMBER_PENDING_PINGS`.
@@ -11348,7 +11430,7 @@ struct NetworkState {
     /// drive the KAD badge.
     ///
     /// Deliberately *not* derived from `ember_source_publish_at`: that map
-    /// is a scheduling clock and `charge_ember_publish_failure` stamps it
+    /// is a scheduling clock and `charge_ember_publish_round` stamps it
     /// for rounds that were never confirmed, so a file nobody stored would
     /// otherwise light up the badge.
     ember_published_sources: HashSet<[u8; 16]>,
@@ -13708,8 +13790,18 @@ async fn probe_ember_gossip_leads(
             Some(&contact.noise_pub),
             &frame,
         ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            ember::transport::OutgoingResult::Ready { packet } => {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!("Ember DHT: gossip probe to {} failed: {e}", contact.addr);
+                        false
+                    }
+                }
+            }
+            ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                behind_handshake = true;
                 match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
                 {
                     Ok(_) => true,
@@ -14014,6 +14106,7 @@ fn ember_highwater_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn load_ember_verified_highwater(path: &std::path::Path) -> EmberVerifiedHighwater {
+    crate::security::recover_interrupted_replace(path);
     let Ok(bytes) = std::fs::read(path) else {
         return EmberVerifiedHighwater::default();
     };
@@ -14090,38 +14183,63 @@ fn record_ember_find_value_quality(
         .saturating_add(search.results.len() as u64);
 }
 
+/// Last outstanding STORE for this record failed (every replica refused or
+/// timed out). Remove this key from the pending set; charge the file only
+/// when none of its keys remain, so a mixed ACK cannot wipe siblings.
+fn fail_ember_record_pending(
+    schedule: EmberPublishSchedule<'_>,
+    reference: EmberRecordRef,
+    now: std::time::Instant,
+) {
+    if reference.kind == EmberPublishKind::Replication {
+        return;
+    }
+    let slot = (reference.file_hash, reference.kind);
+    let Some(unplaced) = schedule.unplaced.get_mut(&slot) else {
+        return;
+    };
+    unplaced.remove(&reference.key);
+    if !unplaced.is_empty() {
+        return;
+    }
+    schedule.unplaced.remove(&slot);
+    charge_ember_publish_round(schedule, reference.file_hash, reference.kind, now);
+}
+
+fn note_ember_store_attempt_failed(
+    state: &mut NetworkState,
+    reference: EmberRecordRef,
+    now: std::time::Instant,
+) {
+    if state.ember_batch_publish.record_still_outstanding(reference) {
+        return;
+    }
+    fail_ember_record_pending(state.publish_schedule(), reference, now);
+}
+
 /// Charge one failed publish round against a file and, once it has gone
 /// unconfirmed too many times, defer it a full republish interval so it stops
 /// holding a selection slot every tick.
 ///
-/// Only ever called for records that reached the wire and were not acked. It
-/// used to be called at *selection*, before the record was even queued, which
-/// meant a file whose records the flush discarded — the common case on a small
-/// table, where every key resolves to the same few peers — burned all three of
-/// its attempts and was parked for hours without a single record having left
-/// the host.
+/// Only ever called after the last outstanding replica for a `(file, kind)`
+/// slot has failed. It used to be called at *selection*, before the record
+/// was even queued, which meant a file whose records the flush discarded —
+/// the common case on a small table, where every key resolves to the same
+/// few peers — burned all three of its attempts and was parked for hours
+/// without a single record having left the host.
 ///
 /// A round sends the same record to `K_EMBER_REPLICAS` peers in separate
-/// batches, and they all time out within a moment of each other, so charges are
-/// collapsed inside one [`EMBER_BATCH_ACK_TIMEOUT`] window. Rounds are a
-/// publish tick apart, comfortably wider, so consecutive rounds still count
-/// separately.
-fn charge_ember_publish_failure(
+/// batches, and they all time out within a moment of each other, so charges
+/// are collapsed inside one [`EMBER_BATCH_ACK_TIMEOUT`] window. Rounds are
+/// a publish tick apart, comfortably wider, so consecutive rounds still
+/// count separately.
+fn charge_ember_publish_round(
     mut schedule: EmberPublishSchedule<'_>,
     file_hash: [u8; 16],
     kind: EmberPublishKind,
     now: std::time::Instant,
 ) {
-    // Replication is not scheduled per file, so there is nothing to back off.
-    if kind == EmberPublishKind::Replication {
-        return;
-    }
     let slot = (file_hash, kind);
-    // No pending set means the round already resolved — confirmed by another
-    // storer, or given up on — and a straggling timeout must not charge it.
-    if !schedule.unplaced.contains_key(&slot) {
-        return;
-    }
     let attempts = schedule
         .attempts
         .entry(slot)
@@ -14135,15 +14253,6 @@ fn charge_ember_publish_failure(
     attempts.rounds_failed += 1;
     attempts.last_charged = now;
     if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
-        // Release the placement hold so the next tick can pick the file up
-        // again. `ember_publish_staleness` returns `None` for anything still
-        // in `unplaced`, so leaving it there after a round expired meant the
-        // file was never re-selected, never produced another batch, and so
-        // never reached `expire()` for a second charge — `rounds_failed`
-        // froze at 1 and the file sat out the rest of the session, which is
-        // the normal outcome on a cold or lossy DHT. The attempt count stays,
-        // so the cap below still applies across rounds.
-        schedule.unplaced.remove(&slot);
         return;
     }
     // Treat it as done for scheduling purposes so the staleness ranking stops
@@ -18423,6 +18532,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // the entire file. `load_contacts` also detaches the range filter for
     // the same reason if one is already present.
     let nodes_ember_path = data_dir.join("nodes_ember.dat");
+    crate::security::recover_interrupted_replace(&nodes_ember_path);
     if nodes_ember_path.exists() {
         // Read + parse on the blocking pool: this is a synchronous whole-file
         // `std::fs` read inside an async fn that shares its runtime with the UI.
@@ -18460,6 +18570,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // that content is missing until replication and the original publishers
     // refill it.
     let store_ember_path = data_dir.join("store_ember.dat");
+    crate::security::recover_interrupted_replace(&store_ember_path);
     if store_ember_path.exists() {
         // Same reasoning as `nodes_ember.dat` above: synchronous file read and
         // record validation, so it belongs on the blocking pool.
@@ -35715,12 +35826,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .ember_dht_stores_failed
                         .saturating_add(abandoned.len() as u32);
                     for reference in abandoned {
-                        charge_ember_publish_failure(
-                            state.publish_schedule(),
-                            reference.file_hash,
-                            reference.kind,
-                            now,
-                        );
+                        note_ember_store_attempt_failed(&mut state, reference, now);
                     }
                 }
 
@@ -38922,8 +39028,21 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             Some(&contact.noise_pub),
             &frame,
         ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            ember::transport::OutgoingResult::Ready { packet } => {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!(
+                            "Ember DHT search {search_id}: send to {} failed: {e}",
+                            contact.addr
+                        );
+                        false
+                    }
+                }
+            }
+            ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                behind_handshake = true;
                 match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
                 {
                     Ok(_) => true,
@@ -38954,8 +39073,7 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
 
         if !send_ok {
             // Couldn't get the query out — fail this shortlist entry so
-            // the search doesn't wait on a node we never reached, and treat a
-            // contact we cannot even transmit to the same way maintenance does.
+            // the search doesn't wait on a node we never reached.
             //
             // `NotSent`, not the default timeout semantics: those deliberately
             // return a retryable entry to `Pending` because the deadline sweep
@@ -38964,6 +39082,11 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
             // pending stalled the whole walk. With a one-entry shortlist (the
             // small overlay this actually runs on) a single ENETUNREACH held the
             // search, and its waiter, until the 120s backstop reaped it.
+            //
+            // Count the miss like a lookup timeout, not a liveness ping:
+            // `prepare_outgoing` Error (handshake in flight for another
+            // identity) used to 3-strike the only `nodes_ember.dat` seed on a
+            // cold join. Unverified leads still skip `fault_ember_search_contact`.
             let failed = state
                 .ember_search
                 .get_mut(search_id)
@@ -38974,7 +39097,7 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                     )
                 });
             if let Some(node_id) = failed {
-                fault_ember_contact(state, &node_id, "unreachable");
+                fault_ember_search_contact(state, &node_id);
             }
             continue;
         }
@@ -39581,8 +39704,19 @@ async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut NetworkState)
                 Some(&contact.noise_pub),
                 &frame,
             ) {
-                ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                ember::transport::OutgoingResult::Ready { packet } => {
+                    match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember batch publish: send to {} failed: {e}", contact.addr);
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    behind_handshake = true;
                     match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead)
                         .await
                     {
@@ -39746,8 +39880,7 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
             Some(&contact.noise_pub),
             &frame,
         ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            ember::transport::OutgoingResult::Ready { packet } => {
                 match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
                 {
                     Ok(_) => true,
@@ -39760,9 +39893,20 @@ async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkState, publi
                     }
                 }
             }
-            // Handshake already in flight; the frame is queued. Give it the
-            // longer budget below so the 5s STORE sweep does not expire it
-            // before the session can flush.
+            ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                behind_handshake = true;
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!(
+                            "Ember DHT publish {publish_id}: send to {} failed: {e}",
+                            contact.addr
+                        );
+                        false
+                    }
+                }
+            }
             ember::transport::OutgoingResult::Queued => {
                 behind_handshake = true;
                 true
@@ -39876,7 +40020,7 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
 fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
     ember_publish_queue_is_backed_up_at(
         state.ember_batch_publish.queued_count,
-        ember_overlay_contact_count(state),
+        ember_publishable_peer_count(state),
     )
 }
 
@@ -40207,12 +40351,15 @@ fn ember_udp_reachable(state: &NetworkState) -> bool {
 /// plus a non-empty Ember routing table (NOT on KAD connectivity), so the
 /// DHT advertises us as a source even on a KAD-less network.
 ///
-/// HighID / open peers publish a direct contact. LowID / TCP-firewalled
-/// peers (slice 15) also self-publish when we have an observed external
+/// HighID / TCP-open peers publish a direct contact. LowID / TCP-Firewalled
+/// peers (KAD or server) also self-publish when we have an observed external
 /// IPv4 (eD2K/KAD/STUN) — the Noise UDP path still reaches DHT storers,
 /// satisfying the anti-reflection IP bind — and set
 /// `SOURCE_FLAG_FIREWALLED | SOURCE_FLAG_RELAY_CAPABLE` so downloaders
 /// route LowID↔LowID via the Ember broker instead of a doomed TCP dial.
+/// Ember-only nodes with no TCP proof do not advertise FIREWALLED just
+/// because UPnP failed at startup. UDP-unreachable still asks a buddy and
+/// still advertises relay, without parking the TCP contact.
 async fn maybe_publish_ember_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -40223,12 +40370,17 @@ async fn maybe_publish_ember_sources(
 ) {
     // Refresh firewall-awareness gauges every tick (slice 15), even when
     // we skip publishing (empty table / no IP yet).
-    let firewalled_like = state.firewalled || state.low_id;
-    // Only the UDP half of the decision defers to Ember's own evidence. TCP
-    // LowID still forces the firewalled flag: `SOURCE_FLAG_FIREWALLED` also
-    // tells downloaders to reach us through the broker, and an open UDP port
-    // says nothing about whether our TCP port accepts connections.
-    let needs_buddy = firewalled_like || (state.udp_firewalled && !ember_udp_reachable(state));
+    let firewalled_like = state.low_id
+        || state.firewall_checker.tcp_status()
+            == crate::network::kad::firewall::FirewallStatus::Firewalled;
+    // SOURCE_FLAG_FIREWALLED tells downloaders not to TCP-dial. That is a TCP
+    // fact: LowID, or KAD/server concluding Firewalled. The pessimistic
+    // startup `state.firewalled` (`!upnp_success`) is not — Ember-only never
+    // clears it, and an open UDP port is not proof TCP accepts connections
+    // either. UDP-unreachable still asks a buddy to PROXY_STORE and still
+    // advertises relay, without parking the TCP contact.
+    let udp_needs_help = state.udp_firewalled && !ember_udp_reachable(state);
+    let needs_buddy = firewalled_like || udp_needs_help;
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
 
@@ -40341,10 +40493,10 @@ async fn maybe_publish_ember_sources(
     if settings.obfuscation_enabled {
         flags |= ember::SOURCE_FLAG_OBFUSCATION;
     }
-    // TCP LowID *or* UDP-firewalled: advertise firewalled+relay so downloaders
-    // use the broker, and so storers accept buddy-forwarded STORES.
-    if needs_buddy {
+    if firewalled_like {
         flags |= ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE;
+    } else if needs_buddy {
+        flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
     }
     let contact = ember::dht::publish::SourceContact {
         ip: external_ip,
@@ -40362,7 +40514,11 @@ async fn maybe_publish_ember_sources(
                 c.push(extra.clone());
             }
         }
-        c.retain(|x| x.node_id != state.ember_dht.local_id() && x.failed_queries == 0);
+        c.retain(|x| {
+            x.node_id != state.ember_dht.local_id()
+                && x.failed_queries == 0
+                && x.is_verified()
+        });
         c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         c.truncate(EMBER_SOURCE_BUDDY_MAX);
         c
@@ -40549,6 +40705,11 @@ async fn maybe_publish_ember_keywords(
             files_with_no_keywords.push(file_hash);
             continue;
         }
+        let mut planned: Vec<(
+            EmberRecordRef,
+            ember::dht::publish::SignedRecord,
+            Vec<ember::dht::EmberContact>,
+        )> = Vec::new();
         for keyword in keywords {
             let record = state.ember_dht.build_keyword_record(
                 &keyword,
@@ -40557,20 +40718,32 @@ async fn maybe_publish_ember_keywords(
                 file_size,
                 &file_name,
             );
-            // Serve our own record too when we are responsible for its key,
-            // like any other storer would.
             state.ember_dht.store_own_record(&record);
-
-            // Queue rather than send: records bound for the same peer travel
-            // together, which is what makes a large library's republish cycle
-            // fit inside the record TTL.
             let targets = ember_overlay_publish_targets(state, record.keyword_hash);
             let reference = EmberRecordRef {
                 file_hash,
                 kind: EmberPublishKind::Keyword,
                 key: record.keyword_hash,
             };
-            let queued = state.ember_batch_publish.enqueue(
+            planned.push((reference, record, targets));
+        }
+        // All-or-nothing: tracking only the keywords that fit the queue let
+        // the ones that landed stamp the file, locking the skipped terms out
+        // for a full republish interval.
+        if planned.iter().any(|(_, _, t)| t.is_empty()) {
+            continue;
+        }
+        let need: usize = planned.iter().map(|(_, _, t)| t.len()).sum();
+        if state
+            .ember_batch_publish
+            .queued_count
+            .saturating_add(need)
+            > EMBER_BATCH_QUEUE_MAX
+        {
+            continue;
+        }
+        for (reference, record, targets) in planned {
+            if state.ember_batch_publish.enqueue(
                 &targets,
                 reference,
                 ember::dht::messages::BatchedRecord {
@@ -40578,8 +40751,7 @@ async fn maybe_publish_ember_keywords(
                     record: record.data.clone(),
                     record_signature: record.signature,
                 },
-            );
-            if queued {
+            ) {
                 track_ember_record_pending(state.publish_schedule(), reference);
             }
         }
@@ -40661,7 +40833,9 @@ async fn run_ember_kad_bridge(
     // the XX pass a full second budget — up to twice the documented cap in one
     // call, spent on the slower 2-RTT handshake.
     let mut dialled = 0usize;
-    if force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+    let bridging =
+        force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    if bridging {
         let candidates = kad_bridge_candidates(
             &state.ember_noise_keys,
             &state.ember_kad_bridge_attempted,
@@ -40674,7 +40848,11 @@ async fn run_ember_kad_bridge(
             }
         }
     }
-    let xx_budget = max_pings.saturating_sub(dialled);
+    let xx_budget = if bridging {
+        max_pings.saturating_sub(dialled)
+    } else {
+        0
+    };
     let xx_candidates = xx_bridge_candidates(
         &state.ember_keyless_peers,
         &state.ember_noise_keys,
@@ -40904,8 +41082,21 @@ async fn run_ember_maintenance(
             Some(&contact.noise_pub),
             &frame,
         ) {
-            ember::transport::OutgoingResult::Ready { packet }
-            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            ember::transport::OutgoingResult::Ready { packet } => {
+                match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!(
+                            "Ember DHT maintenance: ping to {} failed: {e}",
+                            contact.addr
+                        );
+                        false
+                    }
+                }
+            }
+            ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                behind_handshake = true;
                 match send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead).await
                 {
                     Ok(_) => true,
@@ -41473,8 +41664,19 @@ async fn handle_ember_dht_message(
                 .ember_transport
                 .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
             {
-                ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                ember::transport::OutgoingResult::Ready { packet } => {
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    behind_handshake = true;
                     match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
                         .await
                     {
@@ -41535,7 +41737,10 @@ async fn handle_ember_dht_message(
         // our outbound PINGs (pending control or maintenance). Unsolicited
         // PONGs with forged `observed` must not drive external_ip.
         let correlated_pong = inbound.pong_request_id.is_some_and(|rid| {
-            state.ember_dht_pending_pings.contains_key(&rid)
+            state
+                .ember_dht_pending_pings
+                .get(&rid)
+                .is_some_and(|(_, dest, _)| *dest == from)
                 || state
                     .ember_dht_maint_pings
                     .get(&rid)
@@ -41583,8 +41788,14 @@ async fn handle_ember_dht_message(
                 .get(&rid)
                 .zip(inbound.sender_id)
                 .is_some_and(|(ping, from_id)| ping.node_id == from_id);
-            if let Some((sent_at, tx)) = state.ember_dht_pending_pings.remove(&rid) {
-                let _ = tx.send(sent_at.elapsed());
+            if let Some((sent_at, dest, tx)) = state.ember_dht_pending_pings.remove(&rid) {
+                if dest == from {
+                    let _ = tx.send(sent_at.elapsed());
+                } else {
+                    state
+                        .ember_dht_pending_pings
+                        .insert(rid, (sent_at, dest, tx));
+                }
             } else if answered_maint_ping {
                 state.ember_dht_maint_pings.remove(&rid);
                 // The engine's inbound path already refreshed this contact's
@@ -41691,12 +41902,7 @@ async fn handle_ember_dht_message(
                     .ember_dht_stores_failed
                     .saturating_add(outcome.refused.len() as u32);
                 for reference in outcome.refused {
-                    charge_ember_publish_failure(
-                        state.publish_schedule(),
-                        reference.file_hash,
-                        reference.kind,
-                        now,
-                    );
+                    note_ember_store_attempt_failed(state, reference, now);
                 }
             }
         }

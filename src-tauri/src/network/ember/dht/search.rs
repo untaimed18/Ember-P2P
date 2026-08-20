@@ -238,6 +238,7 @@ impl IterativeSearch {
     ) -> Self {
         let mut shortlist: Vec<ShortlistEntry> = initial_contacts
             .into_iter()
+            .filter(|c| c.is_dialable())
             .map(|c| {
                 let distance = target.distance(&c.node_id);
                 ShortlistEntry {
@@ -285,12 +286,22 @@ impl IterativeSearch {
         }
 
         let mut batch = Vec::new();
-        for prefer_pinned in [true, false] {
+        // Pinned session peers, then verified contacts, then mute leads.
+        // XOR-distance sort used to walk gossip first; search faults skip
+        // unverified so those leads never left the shortlist.
+        for prefer in 0..3 {
             for entry in &mut self.shortlist {
                 if batch.len() >= can_send {
                     break;
                 }
-                if entry.pinned != prefer_pinned {
+                let class = if entry.pinned {
+                    0
+                } else if entry.contact.is_verified() {
+                    1
+                } else {
+                    2
+                };
+                if class != prefer {
                     continue;
                 }
                 if entry.state == NodeState::Pending
@@ -320,6 +331,9 @@ impl IterativeSearch {
     pub fn seed_extra_contacts(&mut self, contacts: Vec<EmberContact>) -> usize {
         let mut added = 0;
         for contact in contacts {
+            if !contact.is_dialable() {
+                continue;
+            }
             if contact.node_id == self.target {
                 continue;
             }
@@ -452,6 +466,9 @@ impl IterativeSearch {
             .unwrap_or(EmberNodeId([0xFF; 16]));
 
         for contact in closer_nodes {
+            if !contact.is_dialable() {
+                continue;
+            }
             if self.queried.contains(&contact.node_id) {
                 continue;
             }
@@ -495,7 +512,7 @@ impl IterativeSearch {
             let mut kept = 0usize;
             self.shortlist.retain(|e| {
                 kept += 1;
-                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight || e.pinned
+                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight || e.pinned || e.contact.is_verified()
             });
         }
 
@@ -1155,12 +1172,12 @@ mod tests {
             "the pin must not be able to end the walk at the convergence floor: \
              only {answered} peers were asked"
         );
-        // The phantom holds one of the K shortlist slots, so exhausting the walk
-        // means every other entry answered.
+        // Verified seeds stay on the shortlist even after a closer unverified
+        // phantom is merged, so the walk still asks every real contact.
         assert_eq!(
             answered,
-            K_BUCKET_SIZE - 1,
-            "the walk must fall back to exhausting its shortlist"
+            K_BUCKET_SIZE,
+            "the walk must still ask every verified seed"
         );
         assert!(search.complete, "and it must still terminate");
     }
