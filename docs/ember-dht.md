@@ -46,7 +46,9 @@ gets in through, in rough order of who arrives first:
    **`nodes_ember.dat`** (up to `EMBER_PERSIST_MAX_CONTACTS` = 200) once
    the node has been online before.
 
-The rendezvous server is still used for *friend* NAT traversal and relay.
+The rendezvous server is still used for *friend* NAT traversal and relay
+(how that sits next to STUN, QUIC, UPnP, KAD buddy, and EPX relay is
+[docs/nat-traversal.md](nat-traversal.md)).
 It has no role in DHT bootstrap: that pool, its endpoint, and the pinned
 key it verified were deleted, because the server and client never agreed
 on the envelope format and restoring it would have handed the operator an

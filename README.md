@@ -233,8 +233,8 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 - **KAD Network & eD2K Servers** — Connect to the decentralized KAD DHT and traditional eD2K servers for peer discovery and search. A community `server.met` can be downloaded from emule-security.org, and fresh KAD `nodes.dat` bootstrap contacts can be fetched from Settings → Network when KAD will not connect.
 - **Auto-Connect** — Optionally reconnect KAD and your last eD2K server on launch; with no server history, Auto-Connect Server falls back to eMule Sunrise.
 - **EPX Source Exchange** — Ember peers share source lists with each other for faster downloads (see above).
-- **NAT Traversal** — UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID↔LowID paths when attestations allow.
-- **STUN Port Keep-Alive** — Periodic STUN plus a TCP hold from the listen port keeps NAT mappings alive and advertises the discovered public ports for HighID. Aimed at CGNAT and full-cone NAT without UPnP; auto-suspends on symmetric or unstable remapping.
+- **NAT Traversal** — Layered fallbacks, not one mechanism: UPnP port mapping, KAD firewall checks, STUN keep-alive, Ember QUIC hole-punch, KAD buddy, EPX peer-relay (ERAT), and a friend-only WebSocket relay. A session uses a subset; the stack as a whole is required because each piece covers a different NAT class or peer population — see [docs/nat-traversal.md](docs/nat-traversal.md).
+- **STUN Port Keep-Alive** — Periodic STUN plus a TCP hold from the listen port keeps NAT mappings alive and advertises the discovered public ports for HighID. Aimed at CGNAT and full-cone NAT without UPnP; auto-suspends on symmetric or unstable remapping. Distinct from the STUN NAT-type probe that decides whether a QUIC hole-punch is worth attempting.
 - **Protocol Obfuscation** — RC4-based TCP and UDP header encryption to help with ISP throttling.
 - **Deep Links** — Opens `ed2k://` URIs and `.emulecollection` files from the OS, including while Ember is already running. Incoming links require confirm/review before opening, and pending links can be reviewed later.
 
@@ -294,14 +294,15 @@ Ember currently ships for **Windows 10 and Windows 11**. No external runtimes ar
 
 ### Port forwarding
 
-Ember uses two ports for peer communication:
+Ember uses two configured ports, plus a QUIC UDP socket that usually lands on the TCP port number:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 4662 | TCP | Peer-to-peer file transfers |
 | 4672 | UDP | KAD DHT and Ember Network communication (both share this socket) |
+| 4662 (typical) | UDP | Ember QUIC — hole-punch and peer-relay. Own socket, not shared with 4672; may fall back to a neighbour port if that UDP port is taken |
 
-These are configurable in **Settings > Network**. For best performance (HighID), forward both ports on your router, enable **UPnP** so Ember maps them automatically, or leave **STUN port keep-alive** on.
+These are configurable in **Settings > Network**. For best performance (HighID), forward the TCP and KAD UDP ports on your router, enable **UPnP** so Ember maps them (and QUIC) automatically, or leave **STUN port keep-alive** on. You do not need every NAT feature on every network — UPnP, STUN, QUIC punch, buddy, and relay are fallbacks for different NAT classes; the map is in [docs/nat-traversal.md](docs/nat-traversal.md).
 
 STUN keep-alive (on by default) periodically refreshes your NAT mappings with STUN, holds a TCP connection from the listen port, and advertises the discovered public ports so peers connect to the right place. It is aimed at CGNAT and full-cone NAT where UPnP is unavailable, and auto-suspends on Open/Symmetric NAT or unstable remapping, falling back to your configured ports. Symmetric NAT or a VPN that remaps ports unstably still generally needs a VPN with a fixed forwarded port.
 
@@ -314,7 +315,7 @@ An ID is derived from your IP address and assigned by the eD2K server when Ember
 
 A Low ID routes control messages through the server instead of peer to peer, which adds overhead, and two Low ID clients cannot connect to each other at all, so you see fewer sources. On busy servers, messages can also be dropped, costing you queue progress. The ID affects control traffic only — file data always moves client to client — and past the High ID threshold a larger numeric value confers no advantage.
 
-If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check your OS firewall allows Ember on both protocols, enable UPnP, and leave STUN keep-alive on. eD2K Low ID and KAD Firewalled are separate verdicts — the first is TCP reachability as judged by the server, the second is KAD's own assessment of your UDP reachability, so you can legitimately be High ID and Firewalled at once.
+If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check your OS firewall allows Ember on both protocols, enable UPnP, and leave STUN keep-alive on. Two Low ID eMule clients still cannot TCP to each other; Ember-to-Ember then tries QUIC hole-punch (friends) or EPX peer-relay (downloads). eD2K Low ID and KAD Firewalled are separate verdicts — the first is TCP reachability as judged by the server, the second is KAD's own assessment of your UDP reachability, so you can legitimately be High ID and Firewalled at once.
 
 ### For developers
 
@@ -363,6 +364,7 @@ The production build writes platform packages under `src-tauri/target/release/bu
 | Database | SQLite via rusqlite |
 | Networking | Tokio async runtime |
 | Ember Overlay Transport | Noise IK / XX over UDP (ChaCha20-Poly1305 + BLAKE2s) |
+| Ember NAT / punch / relay | STUN, Quinn QUIC (`ember/1`), rendezvous punch + WebSocket relay |
 | Ember DHT | Kademlia, 128-bit BLAKE3 node IDs, Ed25519-signed frames |
 | Friend Discovery | Rendezvous server (Axum on Fly.io) |
 | Friend Sessions | Noise IK + Ed25519 proof of possession |
