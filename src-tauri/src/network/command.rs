@@ -2304,7 +2304,7 @@ async fn handle_command_inner(
             let (pong_tx, pong_rx) = oneshot::channel();
             state
                 .ember_dht_pending_pings
-                .insert(request_id, (std::time::Instant::now(), pong_tx));
+                .insert(request_id, (std::time::Instant::now(), addr, pong_tx));
 
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }

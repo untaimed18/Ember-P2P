@@ -1274,6 +1274,10 @@ impl EmberDht {
                         && publisher_is_sender
                         && self.accept_proxy_forward(msg.sender_id, Instant::now())
                     {
+                        // We are often the only public replica for this key.
+                        // `start_publish_to` STOREs to *other* contacts, so
+                        // without this FIND_VALUE walking us answers FOUND_NODE.
+                        let _ = self.store_own_record(&parsed);
                         out.proxy_store_forward = Some((msg.request_id, parsed));
                     }
                 }
@@ -1397,16 +1401,18 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
     Some(h)
 }
 
-/// Multi-keyword FIND_VALUE answer: primary-key blobs whose `file_hash`
-/// appears under every secondary key this node also holds.
+/// Multi-keyword FIND_VALUE answer: primary-key blobs, optionally narrowed
+/// to `file_hash`es that also appear under a secondary key this node holds.
 ///
 /// Secondary keywords live near different IDs on a sparse DHT, so the
 /// peer closest to the primary often holds none of the extras. Missing
-/// secondaries are skipped (not treated as empty intersection) so we
-/// still serve primary hits; the searcher applies filename AND at emit
-/// as defense-in-depth. When we *do* hold one or more secondaries, we
-/// filter by `file_hash` intersection. Empty intersection → `None`
-/// (`FOUND_NODE`). Single-key queries serve all live primary records.
+/// secondaries are skipped so we still serve primary hits; the searcher
+/// applies filename AND at emit. When we *do* hold secondaries, a non-empty
+/// intersection is a bandwidth win (don't send primary hits that cannot
+/// match). An *empty* intersection used to return `None` (`FOUND_NODE`),
+/// which hid the primary blobs on a small or dense overlay where one node
+/// holds many unrelated keys — holding the wrong extra was then worse than
+/// holding none. Serve the primary in that case too.
 fn intersect_find_value_records(
     store: &mut DhtStore,
     keys: &[[u8; 16]],
@@ -1508,18 +1514,24 @@ fn intersect_live_records<'a>(
 
     let filtered: Vec<&_> = match &allowed {
         None => primary_recs,
-        Some(set) => primary_recs
-            .into_iter()
-            .filter(|r| {
-                file_hash_from_record_data(&r.data)
-                    .map(|h| set.contains(&h))
-                    .unwrap_or(false)
-            })
-            .collect(),
+        Some(set) => {
+            let hit: Vec<&_> = primary_recs
+                .iter()
+                .copied()
+                .filter(|r| {
+                    file_hash_from_record_data(&r.data)
+                        .map(|h| set.contains(&h))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if hit.is_empty() {
+                primary_recs
+            } else {
+                hit
+            }
+        }
     };
 
-    // Applied an AND and nothing survived → FOUND_NODE so the searcher
-    // keeps walking (we are not a useful value peer for this query).
     if filtered.is_empty() {
         return None;
     }
@@ -2554,6 +2566,42 @@ mod tests {
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
         let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
         assert_eq!(blobs.len(), 1);
+    }
+
+    #[test]
+    fn find_value_serves_primary_when_secondary_hashes_do_not_overlap() {
+        // Dense / small overlay: this node holds both keys, but for different
+        // files. Returning FOUND_NODE hid the primary hits; filename AND at
+        // the searcher is the right filter.
+        let mut a = dht(35);
+        let mut b = dht(36);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(35, 4672);
+        let b_addr = addr(36, 4672);
+
+        let ubuntu = a.build_keyword_record("ubuntu", [1u8; 16], [0u8; 32], 10, "ubuntu.iso");
+        let server = a.build_keyword_record("server", [2u8; 16], [0u8; 32], 10, "server.iso");
+        for rec in [&ubuntu, &server] {
+            let (_rid, bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000)
+                    .stored_record
+            );
+        }
+
+        let (_frid, find_bytes) =
+            a.build_find_value(vec![ubuntu.keyword_hash, server.keyword_hash]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(
+            on_b.find_value_hit,
+            "unrelated secondary records must not suppress primary FOUND_VALUE"
+        );
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
+        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        assert_eq!(blobs.len(), 1);
+        let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
+        assert_eq!(parsed.file_hash, [1u8; 16]);
     }
 
     fn source_contact_at(last: u8) -> SourceContact {

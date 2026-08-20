@@ -9,7 +9,7 @@
 //!
 //! What does not belong here: anything that reads or advances the publish
 //! *schedule* on `NetworkState` (`EmberPublishSchedule`,
-//! `charge_ember_publish_failure`, `confirm_ember_record_placed`), and the
+//! `fail_ember_record_pending`, `confirm_ember_record_placed`), and the
 //! socket-facing passes (`flush_ember_batch_publish`,
 //! `maybe_publish_ember_sources`). Those need the live state and stay in the
 //! parent module.
@@ -48,7 +48,7 @@ pub(crate) struct EmberRecordRef {
 ///
 /// `last_charged` exists so that the `K_EMBER_REPLICAS` batches carrying one
 /// round all count as the single round they are. See
-/// [`super::charge_ember_publish_failure`].
+/// [`super::charge_ember_publish_round`].
 pub(crate) struct EmberPublishAttempts {
     pub(crate) rounds_failed: u32,
     pub(crate) last_charged: std::time::Instant,
@@ -298,7 +298,7 @@ impl EmberBatchPublisher {
     ///
     /// The references are returned rather than merely counted because these are
     /// the only publishes known to have reached the wire and failed, which is
-    /// what [`super::charge_ember_publish_failure`] is allowed to hold against
+    /// what [`super::charge_ember_publish_round`] is allowed to hold against
     /// a file.
     pub(crate) fn expire(&mut self, now: std::time::Instant) -> Vec<EmberRecordRef> {
         let mut abandoned = Vec::new();
@@ -310,6 +310,18 @@ impl EmberBatchPublisher {
             live
         });
         abandoned
+    }
+
+    /// Whether `reference` still sits in a queued or in-flight batch, so a
+    /// refusal or timeout from one replica must not retire it yet.
+    pub(crate) fn record_still_outstanding(&self, reference: EmberRecordRef) -> bool {
+        self.in_flight
+            .values()
+            .any(|b| b.records.contains(&reference))
+            || self
+                .queued
+                .values()
+                .any(|(_, recs)| recs.iter().any(|q| q.reference == reference))
     }
 
     /// Put records the flush could not send back under their destination,
