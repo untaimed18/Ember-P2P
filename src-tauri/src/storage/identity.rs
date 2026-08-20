@@ -120,6 +120,7 @@ impl NodeIdentity {
     /// generation.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
+        #[cfg(target_os = "windows")]
         let protected_marker = data_dir.join("identity.protected");
         // A crash inside `atomic_write`'s Windows replace-fallback can leave the
         // identity parked under its backup name with nothing at `path`. Reaching
