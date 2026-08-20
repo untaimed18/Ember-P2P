@@ -13,8 +13,9 @@ const ROOT_TRANSACTION_FILE: &str = "approved_roots.transaction.json";
 /// File-system identity captured without following the final path component.
 /// On Windows this is the volume serial + 64-bit file ID returned by
 /// `GetFileInformationByHandle`, together with the reparse attribute. On Unix
-/// this is `st_dev` + `st_ino` from `lstat` so replacing a root at the same
-/// path cannot retain a prior approval.
+/// this is `st_dev` + `st_ino` from `lstat`, plus birth time when the
+/// filesystem reports it, so replacing a root at the same path cannot retain a
+/// prior approval even if the inode number is recycled.
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     #[serde(default)]
@@ -28,6 +29,12 @@ pub struct ObjectIdentity {
     pub attributes: u32,
     #[serde(default)]
     pub reparse_point: bool,
+    /// Object birth time in Unix nanoseconds, or `0` when unknown (Windows,
+    /// filesystems without `STATX_BTIME`, records written before this field).
+    /// Compared only when both sides are non-zero so an upgrade cannot revoke
+    /// every existing approval.
+    #[serde(default)]
+    pub created_ns: u64,
 }
 
 /// Only the volume serial and the file ID name an object; `dwFileAttributes` is
@@ -40,12 +47,29 @@ pub struct ObjectIdentity {
 /// The reparse flag stays in the comparison: an existing empty directory can be
 /// turned into a junction in place, keeping its file ID, so it is a genuine
 /// change of what the path names rather than metadata drift.
+///
+/// Unix birth time is stored on the identity but compared only in
+/// [`same_approved_object`]: putting a "0 means unknown" wildcard into
+/// `PartialEq` would break `Eq`. `chmod` does not change birth time, so this
+/// is not the metadata-drift trap `attributes` was.
 impl PartialEq for ObjectIdentity {
     fn eq(&self, other: &Self) -> bool {
         self.volume_serial == other.volume_serial
             && self.file_id == other.file_id
             && self.reparse_point == other.reparse_point
     }
+}
+
+/// True when `live` is still the object `stored` was captured from.
+///
+/// ext4 and tmpfs often recycle `st_ino` on `rmdir`+`mkdir` of the same path,
+/// so inode number alone cannot tell a replacement from the original. Birth
+/// time can, when both records have it. A `0` value means "unknown" (Windows,
+/// old `approved_roots.json`, filesystems without `STATX_BTIME`) and is not
+/// treated as a mismatch, so an upgrade cannot revoke every existing approval.
+fn same_approved_object(stored: &ObjectIdentity, live: &ObjectIdentity) -> bool {
+    stored == live
+        && (stored.created_ns == 0 || live.created_ns == 0 || stored.created_ns == live.created_ns)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,8 +201,8 @@ impl ApprovedRoot {
         let canonical = configured.canonicalize()?;
         let configured_identity = object_identity(&configured)?;
         let target_identity = object_identity(&canonical)?;
-        if configured_identity != self.configured_identity
-            || target_identity != self.target_identity
+        if !same_approved_object(&configured_identity, &self.configured_identity)
+            || !same_approved_object(&target_identity, &self.target_identity)
             || path_key(&canonical) != path_key(Path::new(&self.canonical))
         {
             return Err(io::Error::new(
@@ -793,6 +817,28 @@ fn single_path_component(name: &std::ffi::OsStr) -> io::Result<&std::ffi::OsStr>
     })
 }
 
+fn created_ns(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|duration| {
+                duration
+                    .as_secs()
+                    .checked_mul(1_000_000_000)
+                    .and_then(|secs| secs.checked_add(u64::from(duration.subsec_nanos())))
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
 #[cfg(unix)]
 fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
     use std::os::unix::fs::MetadataExt;
@@ -802,6 +848,7 @@ fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
         file_id: metadata.ino(),
         attributes: 0,
         reparse_point: false,
+        created_ns: created_ns(&metadata),
     })
 }
 
@@ -822,6 +869,7 @@ fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentity> {
         file_id: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
         attributes: info.dwFileAttributes,
         reparse_point: (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+        created_ns: 0,
     })
 }
 
@@ -2006,6 +2054,7 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
         file_id: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
         attributes: info.dwFileAttributes,
         reparse_point: (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+        created_ns: 0,
     })
 }
 
@@ -2018,6 +2067,7 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
         file_id: metadata.ino(),
         attributes: 0,
         reparse_point: metadata.file_type().is_symlink(),
+        created_ns: created_ns(&metadata),
     })
 }
 
@@ -2056,6 +2106,30 @@ mod tests {
             strip_extended_path_prefix(r"\\server\share\file.txt"),
             r"\\server\share\file.txt"
         );
+    }
+
+    #[test]
+    fn same_approved_object_ignores_unknown_birth_time_but_not_a_known_mismatch() {
+        let base = ObjectIdentity {
+            volume_serial: 1,
+            file_id: 2,
+            attributes: 0,
+            reparse_point: false,
+            created_ns: 0,
+        };
+        let with_birth = ObjectIdentity {
+            created_ns: 42,
+            ..base.clone()
+        };
+        assert!(same_approved_object(&base, &with_birth));
+        assert!(same_approved_object(&with_birth, &base));
+        assert!(!same_approved_object(
+            &with_birth,
+            &ObjectIdentity {
+                created_ns: 43,
+                ..base
+            }
+        ));
     }
 
     #[test]
@@ -2194,11 +2268,33 @@ mod tests {
             )
             .unwrap();
         assert!(registry.verify_root(&root).is_ok());
+        let original = object_identity(&root).unwrap();
         std::fs::remove_dir(&root).unwrap();
         std::fs::create_dir(&root).unwrap();
+        if object_identity(&root).unwrap() == original {
+            // ext4/tmpfs often recycle `st_ino` on the next mkdir of the same
+            // name. Park reused objects until the path names a different inode
+            // — the case `st_dev`+`st_ino` itself is meant to reject. Birth
+            // time still rejects a same-inode replacement in `verify_root`
+            // when the filesystem reports it.
+            let mut decoys = Vec::new();
+            loop {
+                let decoy = base.join(format!("decoy-{}", decoys.len()));
+                std::fs::rename(&root, &decoy).unwrap();
+                decoys.push(decoy);
+                std::fs::create_dir(&root).unwrap();
+                if object_identity(&root).unwrap() != original {
+                    break;
+                }
+                assert!(
+                    decoys.len() < 32,
+                    "could not obtain a distinct directory identity"
+                );
+            }
+        }
         assert!(
             registry.verify_root(&root).is_err(),
-            "replaced directory inode must not retain approval"
+            "replaced directory must not retain approval"
         );
         let _ = std::fs::remove_dir_all(base);
     }
