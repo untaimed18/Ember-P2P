@@ -17,6 +17,12 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password set during key generation
 # (GITHUB_TOKEN is provided automatically.)
+#
+# Linux `.deb` / AppImage targets are declared in tauri.conf.json and compiled
+# on CI (`check-linux`), but this workflow still builds and signs Windows only.
+# Shipping Linux needs a second runner (ubuntu-22.04), updater-manifest work
+# for linux-x86_64, and a decision on AppImage vs .deb as the in-app updater
+# artifact. Do not add those here until that path is designed.
 
 on:
   push:

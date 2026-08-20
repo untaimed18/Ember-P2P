@@ -48,6 +48,17 @@ pub struct ShareIntentStore {
 
 static SHARE_INTENT: OnceLock<parking_lot::RwLock<Option<Arc<ShareIntentStore>>>> = OnceLock::new();
 
+#[cfg(test)]
+static SHARE_INTENT_TEST_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
+/// Serialize tests that install the process-global share-intent store.
+#[cfg(test)]
+pub(crate) fn test_store_lock() -> parking_lot::MutexGuard<'static, ()> {
+    SHARE_INTENT_TEST_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock()
+}
+
 fn global_slot() -> &'static parking_lot::RwLock<Option<Arc<ShareIntentStore>>> {
     SHARE_INTENT.get_or_init(|| parking_lot::RwLock::new(None))
 }
@@ -341,6 +352,7 @@ mod tests {
     #[test]
     fn migrates_unshared_known_record_and_detects_later_loss() {
         use crate::storage::known_files::{KnownFileList, KnownFileRecord};
+        let _lock = test_store_lock();
         let base = std::env::temp_dir().join(format!(
             "ember-share-intent-migration-{}-{}",
             std::process::id(),
@@ -383,6 +395,7 @@ mod tests {
 
     #[test]
     fn initialize_restores_interrupted_replace_before_first_run_persist() {
+        let _lock = test_store_lock();
         let base = std::env::temp_dir().join(format!(
             "ember-share-intent-recover-{}-{}",
             std::process::id(),

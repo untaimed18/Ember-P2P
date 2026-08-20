@@ -158,6 +158,27 @@ test("version policy rejects stale package-lock root metadata", () => {
   }
 });
 
+test("version policy requires Linux bundle targets alongside Windows", () => {
+  const fixture = policyFixture();
+  try {
+    const configPath = join(fixture, "src-tauri/tauri.conf.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.bundle.targets = ["nsis", "msi"];
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+    assert.throws(
+      () =>
+        verifyVersions({
+          root: fixture,
+          tag: `v${packageVersion}`,
+          requireTag: true,
+        }),
+      /bundle\.targets must include deb/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("workflow policy rejects mutable action references", () => {
   const fixture = policyFixture();
   try {

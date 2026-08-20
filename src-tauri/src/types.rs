@@ -1527,19 +1527,46 @@ fn default_update_check_frequency() -> String {
     "daily".to_string()
 }
 
+/// Fresh-install download root: `Downloads/Ember` under the user's known
+/// downloads directory, or `~/Downloads/Ember` when that XDG path is unset.
+///
+/// Never fall back to `std::env::temp_dir()`. On Linux that is `/tmp`, and on
+/// Windows it is typically under `AppData\Local\Temp` — both have a basename
+/// in `SENSITIVE_DIR_NAMES`, so `validate_settings` would reject the defaults
+/// and config load would reset in a loop. Linux CI and servers often have no
+/// `xdg-user-dirs` setup, so `UserDirs::download_dir()` is `None` there.
+fn default_download_folder() -> String {
+    if let Some(user_dirs) = directories::UserDirs::new() {
+        if let Some(downloads) = user_dirs.download_dir() {
+            return downloads.join("Ember").to_string_lossy().into_owned();
+        }
+        return user_dirs
+            .home_dir()
+            .join("Downloads")
+            .join("Ember")
+            .to_string_lossy()
+            .into_owned();
+    }
+    let home = std::env::var_os(if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    })
+    .filter(|value| !value.is_empty())
+    .map(std::path::PathBuf::from);
+    if let Some(home) = home {
+        return home
+            .join("Downloads")
+            .join("Ember")
+            .to_string_lossy()
+            .into_owned();
+    }
+    String::new()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
-        let download_dir = directories::UserDirs::new()
-            .and_then(|d| {
-                d.download_dir()
-                    .map(|p| p.join("Ember").to_string_lossy().to_string())
-            })
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(std::env::temp_dir())
-                    .join("Ember")
-                    .to_string_lossy()
-                    .to_string()
-            });
+        let download_dir = default_download_folder();
 
         let completed_dir = std::path::PathBuf::from(&download_dir)
             .join("Downloads")

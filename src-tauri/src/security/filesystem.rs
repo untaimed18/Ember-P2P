@@ -1170,6 +1170,8 @@ pub fn open_existing_approved(
     let (verified_parent, parent_handle, parent_identity) =
         verified_parent_handle(parent, allowed_roots)?;
     let verified = verified_parent.join(name);
+    #[cfg(unix)]
+    let _ = &parent_identity;
     #[cfg(windows)]
     let _ = &parent_handle;
 
@@ -1446,6 +1448,8 @@ fn remove_approved_file_inner(
 ) -> io::Result<()> {
     let (verified_parent, parent_handle, parent_identity, name) =
         split_verified_file_parent(path, allowed_roots)?;
+    #[cfg(unix)]
+    let _ = (&verified_parent, &parent_identity);
     #[cfg(windows)]
     let _ = &parent_handle;
 
@@ -1544,6 +1548,8 @@ pub fn create_new_in_approved_parent(
     let file_name = single_path_component(name)?;
     let (verified_parent, parent_handle, parent_identity) =
         verified_parent_handle(parent, allowed_roots)?;
+    #[cfg(unix)]
+    let _ = &parent_identity;
     #[cfg(windows)]
     let _ = &parent_handle;
     let candidate = verified_parent.join(file_name);
@@ -1621,6 +1627,8 @@ pub fn prepare_approved_subdir(
 ) -> io::Result<PathBuf> {
     let file_name = single_path_component(std::ffi::OsStr::new(name))?;
     let (verified_root, root_handle, root_identity) = open_verified_directory(root, allowed_roots)?;
+    #[cfg(unix)]
+    let _ = &root_identity;
     #[cfg(windows)]
     let _ = &root_handle;
     let candidate = verified_root.join(file_name);
