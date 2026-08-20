@@ -320,6 +320,26 @@ pub async fn run_friend_session_over_transport(
             },
         })
         .await;
+    // The dedicated friend-connect path never went through upload.rs, so a
+    // relayed or NAT-traversed session never emitted EmberPeerDiscovered.
+    // Without that, a live Ember friend never became a DHT introduction
+    // (`session_peers=0` while they were chatting). Same guards as the
+    // inbound upload path.
+    if !peer_v4.is_unspecified()
+        && listen_port > 0
+        && !crate::security::is_bogus_v4(peer_v4)
+    {
+        let _ = ul_event_tx
+            .send(UploadEvent {
+                transfer_id: String::new(),
+                kind: UploadEventKind::EmberPeerDiscovered {
+                    ip: peer_v4,
+                    tcp_port: listen_port,
+                    udp_port: hello_caps.udp_port,
+                },
+            })
+            .await;
+    }
 
     let handle = FriendSessionHandle {
         session_id: ember_session_handle.session_id(),
@@ -706,22 +726,37 @@ pub async fn run_friend_session_over_transport(
     Ok(handle)
 }
 
-/// Number of signed `/v2/punch/poll` requests to make after registering, and the delay
-/// between them. A friend's own offline-retry loop fires independently of
-/// ours (there is no request/response coupling before this point — see
-/// [`punch_friend`]), so this window exists purely to catch two
-/// independently-scheduled retries landing close together. The rendezvous
-/// server only retains a punch registration for 30 s
-/// (`rendezvous-server/src/main.rs::PUNCH_TTL`), so polling much past
-/// that would just poll a registration that already expired.
+/// Number of signed punch polls after registering, and the delay between them.
+/// A friend's own offline-retry loop fires independently of ours (there is no
+/// request/response coupling before this point — see [`punch_friend_until`]),
+/// so this window exists purely to catch two independently-scheduled retries
+/// landing close together. The rendezvous server only retains a punch
+/// registration for 30 s (`rendezvous-server/src/main.rs::PUNCH_TTL`), so
+/// polling much past that would just poll a registration that already expired.
 const FRIEND_PUNCH_POLL_ATTEMPTS: usize = 12;
 const FRIEND_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Exclusive punch time before the relay is *dialed*. The relay task is
+/// spawned at fallback t=0 so this sleep overlaps punch-registration HTTP;
+/// three 2 s poll intervals is long enough that a friend who is *also* in
+/// this function (the only case a punch can succeed) usually appears, and
+/// short enough that the high-probability relay is not starved.
+const FRIEND_PUNCH_RELAY_RACE_AFTER: std::time::Duration = std::time::Duration::from_secs(6);
+/// Combined punch+relay budget after TCP fails. Covers the 6 s exclusive punch
+/// window, the 45 s friend-relay ticket wait, and a few seconds of offer/WS
+/// connect, and replaces the previous unbounded 12×(2 s sleep + 10 s HTTP)
+/// punch ceiling (~154 s).
+const FRIEND_FALLBACK_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cap on one reciprocal-punch completion (identity lookup + QUIC dial + ack)
+/// so a hung QUIC idle timeout cannot starve a ready relay.
+const FRIEND_PUNCH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Reach a friend who isn't directly dialable by trying, in order: a
-/// plain TCP dial to `addr` (the previous, sole behaviour), an Ember QUIC
-/// hole-punch coordinated via the rendezvous server, and finally a
-/// rendezvous WebSocket relay hop. Returns as soon as any method produces
-/// a live, authenticated Ember session.
+/// Reach a friend who isn't directly dialable by trying a plain TCP dial
+/// to `addr` first (the previous, sole behaviour). If that fails, an Ember
+/// QUIC hole-punch and a rendezvous WebSocket relay hop are raced: the
+/// relay's [`FRIEND_PUNCH_RELAY_RACE_AFTER`] delay starts at fallback t=0
+/// (overlapping punch-registration HTTPS) and the first transport to
+/// produce a live hop is handed to a single handshake. Returns as soon as
+/// that handshake produces an authenticated Ember session.
 ///
 /// Before this, friend sessions had zero fallback beyond
 /// `TcpStream::connect` — two friends who are both behind a NAT that
@@ -803,84 +838,54 @@ pub async fn connect_friend_with_fallback(
         )
     };
 
-    if let (Some(endpoint), Some(ext_addr), Some(punch_secret)) = (
-        quic_endpoint.as_ref(),
-        our_external_addr,
-        ed25519_secret_key.as_ref(),
-    ) {
-        if our_nat_type != crate::network::ember::nat::NatType::Symmetric {
-            match punch_friend(
-                &rendezvous_url,
-                endpoint,
-                our_quic_public_port,
-                our_ember_hash,
-                expected_ember_hash,
-                ext_addr,
-                our_nat_type,
-                punch_secret,
-            )
-            .await
-            {
-                Ok((send, recv)) => {
-                    info!(
-                        "Friend hole-punch to {} succeeded",
-                        hex::encode(expected_ember_hash)
-                    );
-                    return run_friend_session_over_transport(
-                        Box::new(recv),
-                        Box::new(send),
-                        addr,
-                        expected_ember_hash,
-                        our_user_hash,
-                        our_ember_hash,
-                        our_nickname.clone(),
-                        our_client_id,
-                        tcp_port,
-                        udp_port,
-                        obfuscate,
-                        ember_sessions.clone(),
-                        ul_event_tx.clone(),
-                        friend_hashes.clone(),
-                        ed25519_pubkey,
-                        ed25519_secret_key,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    debug!(
-                        "Friend hole-punch to {} failed: {e}",
-                        hex::encode(expected_ember_hash)
-                    );
-                }
-            }
-        }
-    }
+    let fallback_deadline = tokio::time::Instant::now() + FRIEND_FALLBACK_PHASE_TIMEOUT;
+    let punch_eligible = quic_endpoint.is_some()
+        && our_external_addr.is_some()
+        && ed25519_secret_key.is_some()
+        && our_nat_type != crate::network::ember::nat::NatType::Symmetric;
 
-    // Server relay tickets are deliberately restricted to a manually-known
-    // friend. The transport's later Ember handshake also verifies the peer,
-    // but refusing before issuing a ticket avoids turning arbitrary source
-    // addresses into authenticated relay capabilities.
-    if !friend_hashes.read().await.contains(&expected_ember_hash) {
-        return Err(anyhow::anyhow!(
-            "server relay is restricted to known friends"
-        ));
-    }
-    let relay_secret = ed25519_secret_key.ok_or_else(|| {
-        anyhow::anyhow!("server relay requires the local registered identity key")
-    })?;
-
-    match relay_friend(
+    match nat_fallback_transport(
         &rendezvous_url,
+        quic_endpoint,
+        our_quic_public_port,
         our_ember_hash,
         expected_ember_hash,
-        ed25519_pubkey
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("server relay requires local v2 identity"))?,
-        &relay_secret,
+        our_external_addr,
+        our_nat_type,
+        punch_eligible,
+        ed25519_pubkey,
+        ed25519_secret_key,
+        friend_hashes.clone(),
+        fallback_deadline,
     )
     .await
     {
-        Ok(ws_stream) => {
+        Ok(FallbackTransport::Punch(send, recv)) => {
+            info!(
+                "Friend hole-punch to {} succeeded",
+                hex::encode(expected_ember_hash)
+            );
+            run_friend_session_over_transport(
+                Box::new(recv),
+                Box::new(send),
+                addr,
+                expected_ember_hash,
+                our_user_hash,
+                our_ember_hash,
+                our_nickname,
+                our_client_id,
+                tcp_port,
+                udp_port,
+                obfuscate,
+                ember_sessions,
+                ul_event_tx,
+                friend_hashes,
+                ed25519_pubkey,
+                ed25519_secret_key,
+            )
+            .await
+        }
+        Ok(FallbackTransport::Relay(ws_stream)) => {
             info!(
                 "Friend relay to {} connected",
                 hex::encode(expected_ember_hash)
@@ -908,14 +913,273 @@ pub async fn connect_friend_with_fallback(
         }
         Err(e) => {
             debug!(
-                "Friend relay to {} failed: {e}",
+                "Friend NAT fallback to {} failed: {e}",
                 hex::encode(expected_ember_hash)
             );
             Err(anyhow::anyhow!(
-                "all connection methods failed for friend {}: tcp={tcp_err}; relay={e}",
+                "all connection methods failed for friend {}: tcp={tcp_err}; fallback={e}",
                 hex::encode(expected_ember_hash)
             ))
         }
+    }
+}
+
+enum FallbackTransport {
+    Punch(quinn::SendStream, quinn::RecvStream),
+    Relay(crate::network::ember::relay::WsStream),
+}
+
+struct AbortOnDropTask<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn as_mut(&mut self) -> Option<&mut tokio::task::JoinHandle<T>> {
+        self.0.as_mut()
+    }
+
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.0.take()
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn ack_observed_punch(
+    rendezvous_url: &str,
+    our_ember_hash: &[u8; 16],
+    info: &crate::network::ember::relay::PunchInfo,
+    secret_key: &[u8; 32],
+) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::network::ember::relay::ack_punch(
+            rendezvous_url,
+            our_ember_hash,
+            &info.punch_id,
+            &info.capability,
+            info.epoch,
+            secret_key,
+        ),
+    )
+    .await;
+}
+
+fn relay_arm_delay(punch_will_be_attempted: bool) -> std::time::Duration {
+    if punch_will_be_attempted {
+        FRIEND_PUNCH_RELAY_RACE_AFTER
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+fn punch_attempt_deadline(
+    now: tokio::time::Instant,
+    phase_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    phase_deadline.min(now + FRIEND_PUNCH_ATTEMPT_TIMEOUT)
+}
+
+fn join_task_error<T>(result: Result<Result<T, String>, tokio::task::JoinError>) -> String {
+    match result {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => "task returned success after being treated as failure".to_string(),
+        Err(error) if error.is_panic() => "task panicked".to_string(),
+        Err(error) if error.is_cancelled() => "task cancelled".to_string(),
+        Err(error) => format!("task failed: {error}"),
+    }
+}
+
+fn combine_transport_errors(punch: Option<String>, relay: Option<String>) -> String {
+    match (punch, relay) {
+        (Some(punch), Some(relay)) => format!("punch={punch}; relay={relay}"),
+        (Some(punch), None) => format!("punch={punch}"),
+        (None, Some(relay)) => format!("relay={relay}"),
+        (None, None) => "NAT fallback failed".to_string(),
+    }
+}
+
+enum FallbackRace<P, R> {
+    Punch {
+        value: P,
+        leftover_relay: Option<R>,
+    },
+    Relay {
+        value: R,
+    },
+    Failed(String),
+    Timeout {
+        leftover_relay: Option<R>,
+    },
+}
+
+enum FirstFinished<P, R> {
+    Punch(Result<Result<P, String>, tokio::task::JoinError>),
+    Relay(Result<Result<R, String>, tokio::task::JoinError>),
+    Timeout,
+}
+
+enum OtherWait {
+    Missing,
+    Timeout,
+}
+
+async fn abort_and_reap<T>(guard: Option<AbortOnDropTask<Result<T, String>>>) -> Option<T> {
+    let mut guard = guard?;
+    let handle = guard.take()?;
+    handle.abort();
+    match handle.await {
+        Ok(Ok(value)) => Some(value),
+        _ => None,
+    }
+}
+
+async fn await_other_until<T>(
+    guard: Option<AbortOnDropTask<Result<T, String>>>,
+    deadline: tokio::time::Instant,
+) -> Result<Result<T, String>, OtherWait> {
+    let Some(mut guard) = guard else {
+        return Err(OtherWait::Missing);
+    };
+    let Some(mut handle) = guard.take() else {
+        return Err(OtherWait::Missing);
+    };
+    let abort = handle.abort_handle();
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(Ok(Ok(value))) => Ok(Ok(value)),
+        Ok(Ok(Err(error))) => Ok(Err(error)),
+        Ok(Err(join)) => Ok(Err(join_task_error::<T>(Err(join)))),
+        Err(_) => {
+            abort.abort();
+            match handle.await {
+                Ok(Ok(value)) => Ok(Ok(value)),
+                _ => Err(OtherWait::Timeout),
+            }
+        }
+    }
+}
+
+fn spawn_relay_then_punch<P, R>(
+    punch: impl std::future::Future<Output = Result<P, String>> + Send + 'static,
+    relay: impl std::future::Future<Output = Result<R, String>> + Send + 'static,
+) -> (
+    tokio::task::JoinHandle<Result<P, String>>,
+    tokio::task::JoinHandle<Result<R, String>>,
+)
+where
+    P: Send + 'static,
+    R: Send + 'static,
+{
+    // Relay first so its delay starts at t=0 and overlaps punch registration
+    // HTTP. `punch` must own that registration; awaiting it before this spawn
+    // is the ordering bug this helper exists to prevent.
+    let relay = tokio::spawn(relay);
+    let punch = tokio::spawn(punch);
+    (punch, relay)
+}
+
+async fn drive_fallback_race<P, R>(
+    punch: Option<tokio::task::JoinHandle<Result<P, String>>>,
+    relay: Option<tokio::task::JoinHandle<Result<R, String>>>,
+    deadline: tokio::time::Instant,
+) -> FallbackRace<P, R> {
+    let mut punch_guard = punch.map(AbortOnDropTask::new);
+    let mut relay_guard = relay.map(AbortOnDropTask::new);
+
+    let first = tokio::select! {
+        biased;
+        result = async {
+            punch_guard
+                .as_mut()
+                .expect("punch branch is gated on is_some")
+                .as_mut()
+                .expect("punch handle")
+                .await
+        }, if punch_guard.is_some() => {
+            let _ = punch_guard.take();
+            FirstFinished::Punch(result)
+        }
+        result = async {
+            relay_guard
+                .as_mut()
+                .expect("relay branch is gated on is_some")
+                .as_mut()
+                .expect("relay handle")
+                .await
+        }, if relay_guard.is_some() => {
+            let _ = relay_guard.take();
+            FirstFinished::Relay(result)
+        }
+        _ = tokio::time::sleep_until(deadline) => FirstFinished::Timeout,
+    };
+
+    match first {
+        FirstFinished::Punch(Ok(Ok(value))) => FallbackRace::Punch {
+            value,
+            leftover_relay: abort_and_reap(relay_guard.take()).await,
+        },
+        FirstFinished::Punch(fail) => {
+            let punch_err = join_task_error(fail);
+            match await_other_until(relay_guard.take(), deadline).await {
+                Ok(Ok(value)) => FallbackRace::Relay { value },
+                Ok(Err(relay_err)) => FallbackRace::Failed(combine_transport_errors(
+                    Some(punch_err),
+                    Some(relay_err),
+                )),
+                Err(OtherWait::Timeout) => FallbackRace::Failed(combine_transport_errors(
+                    Some(punch_err),
+                    Some("timed out".to_string()),
+                )),
+                Err(OtherWait::Missing) => {
+                    FallbackRace::Failed(combine_transport_errors(Some(punch_err), None))
+                }
+            }
+        }
+        FirstFinished::Relay(Ok(Ok(value))) => {
+            let _ = abort_and_reap(punch_guard.take()).await;
+            FallbackRace::Relay { value }
+        }
+        FirstFinished::Relay(fail) => {
+            let relay_err = join_task_error(fail);
+            match await_other_until(punch_guard.take(), deadline).await {
+                Ok(Ok(value)) => FallbackRace::Punch {
+                    value,
+                    leftover_relay: None,
+                },
+                Ok(Err(punch_err)) => FallbackRace::Failed(combine_transport_errors(
+                    Some(punch_err),
+                    Some(relay_err),
+                )),
+                Err(OtherWait::Timeout) => FallbackRace::Failed(combine_transport_errors(
+                    Some("timed out".to_string()),
+                    Some(relay_err),
+                )),
+                Err(OtherWait::Missing) => {
+                    FallbackRace::Failed(combine_transport_errors(None, Some(relay_err)))
+                }
+            }
+        }
+        FirstFinished::Timeout => {
+            let _ = abort_and_reap(punch_guard.take()).await;
+            FallbackRace::Timeout {
+                leftover_relay: abort_and_reap(relay_guard.take()).await,
+            }
+        }
+    }
+}
+
+async fn abandon_offered_ticket(slot: &Arc<std::sync::Mutex<Option<String>>>) {
+    let ticket_id = slot.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(ticket_id) = ticket_id {
+        crate::network::ember::relay::abandon_offered_friend_relay_ticket(&ticket_id).await;
     }
 }
 
@@ -932,16 +1196,170 @@ pub async fn connect_friend_with_fallback(
 /// here: each side's normal reconnect attempt already plays both parts,
 /// since [`connect_friend_with_fallback`] is exactly what runs whenever
 /// either side's retry loop wakes up for this friend.
+///
+/// The relay task is spawned at fallback t=0, before punch registration
+/// HTTPS is awaited, so its [`FRIEND_PUNCH_RELAY_RACE_AFTER`] sleep overlaps
+/// those round-trips. The first transport that yields streams wins; the
+/// loser is aborted. Handshake/session registration happens only on the
+/// winner, so `ember_sessions` cannot gain two slots from this race. There is
+/// no rendezvous withdraw route: our punch registration expires with the
+/// server's 30 s `PUNCH_TTL`, and a later dial's register replaces the
+/// `(target, from)` entry. An offered-but-unjoined relay ticket has no
+/// cancel route either and lives until the server's 90 s `RELAY_TICKET_TTL`.
 #[allow(clippy::too_many_arguments)]
-async fn punch_friend(
+async fn nat_fallback_transport(
     rendezvous_url: &str,
-    endpoint: &quinn::Endpoint,
+    quic_endpoint: Option<Arc<quinn::Endpoint>>,
     our_quic_public_port: Option<u16>,
     our_ember_hash: [u8; 16],
     friend_ember_hash: [u8; 16],
-    our_external_addr: SocketAddr,
+    our_external_addr: Option<SocketAddr>,
     our_nat_type: crate::network::ember::nat::NatType,
-    secret_key: &[u8; 32],
+    punch_eligible: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+    friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    deadline: tokio::time::Instant,
+) -> Result<FallbackTransport, String> {
+    let punch_will_attempt = punch_eligible
+        && quic_endpoint.is_some()
+        && our_external_addr.is_some()
+        && ed25519_secret_key.is_some();
+    let is_friend = friend_hashes.read().await.contains(&friend_ember_hash);
+    let can_relay = is_friend && ed25519_secret_key.is_some() && ed25519_pubkey.is_some();
+    if !punch_will_attempt && !can_relay {
+        if !is_friend {
+            return Err("server relay is restricted to known friends".to_string());
+        }
+        if ed25519_secret_key.is_none() {
+            return Err("server relay requires the local registered identity key".to_string());
+        }
+        return Err("server relay requires local v2 identity".to_string());
+    }
+
+    let (skip_tx, skip_rx) = tokio::sync::watch::channel(false);
+    let offered_ticket = Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let (punch_handle, relay_handle) = match (punch_will_attempt, can_relay) {
+        (true, true) => {
+            let endpoint = quic_endpoint.clone().expect("punch_will_attempt");
+            let ext_addr = our_external_addr.expect("punch_will_attempt");
+            let secret = ed25519_secret_key.expect("punch_will_attempt");
+            let pubkey = ed25519_pubkey.expect("can_relay");
+            let offered = offered_ticket.clone();
+            let (punch, relay) = spawn_relay_then_punch(
+                punch_from_register(
+                    rendezvous_url.to_string(),
+                    endpoint,
+                    our_quic_public_port,
+                    our_ember_hash,
+                    friend_ember_hash,
+                    ext_addr,
+                    our_nat_type,
+                    secret,
+                    deadline,
+                    skip_tx,
+                ),
+                delayed_relay_friend(
+                    rendezvous_url.to_string(),
+                    relay_arm_delay(true),
+                    skip_rx,
+                    deadline,
+                    our_ember_hash,
+                    friend_ember_hash,
+                    pubkey,
+                    secret,
+                    offered,
+                ),
+            );
+            (Some(punch), Some(relay))
+        }
+        (true, false) => {
+            drop(skip_rx);
+            let endpoint = quic_endpoint.clone().expect("punch_will_attempt");
+            let ext_addr = our_external_addr.expect("punch_will_attempt");
+            let secret = ed25519_secret_key.expect("punch_will_attempt");
+            (
+                Some(tokio::spawn(punch_from_register(
+                    rendezvous_url.to_string(),
+                    endpoint,
+                    our_quic_public_port,
+                    our_ember_hash,
+                    friend_ember_hash,
+                    ext_addr,
+                    our_nat_type,
+                    secret,
+                    deadline,
+                    skip_tx,
+                ))),
+                None,
+            )
+        }
+        (false, true) => {
+            drop(skip_tx);
+            let secret = ed25519_secret_key.expect("can_relay");
+            let pubkey = ed25519_pubkey.expect("can_relay");
+            let offered = offered_ticket.clone();
+            (
+                None,
+                Some(tokio::spawn(delayed_relay_friend(
+                    rendezvous_url.to_string(),
+                    relay_arm_delay(false),
+                    skip_rx,
+                    deadline,
+                    our_ember_hash,
+                    friend_ember_hash,
+                    pubkey,
+                    secret,
+                    offered,
+                ))),
+            )
+        }
+        (false, false) => unreachable!("eligibility already returned"),
+    };
+
+    match drive_fallback_race(punch_handle, relay_handle, deadline).await {
+        FallbackRace::Punch {
+            value,
+            leftover_relay,
+        } => {
+            if let Some(stream) = leftover_relay {
+                crate::network::ember::relay::close_server_relay(stream).await;
+            }
+            abandon_offered_ticket(&offered_ticket).await;
+            Ok(FallbackTransport::Punch(value.0, value.1))
+        }
+        FallbackRace::Relay { value } => Ok(FallbackTransport::Relay(value)),
+        FallbackRace::Failed(error) => {
+            abandon_offered_ticket(&offered_ticket).await;
+            if !is_friend && punch_will_attempt && !can_relay {
+                Err("server relay is restricted to known friends".to_string())
+            } else {
+                Err(error)
+            }
+        }
+        FallbackRace::Timeout { leftover_relay } => {
+            if let Some(stream) = leftover_relay {
+                crate::network::ember::relay::close_server_relay(stream).await;
+            }
+            abandon_offered_ticket(&offered_ticket).await;
+            Err("NAT fallback timed out".to_string())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn punch_from_register(
+    rendezvous_url: String,
+    endpoint: Arc<quinn::Endpoint>,
+    our_quic_public_port: Option<u16>,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    ext_addr: SocketAddr,
+    our_nat_type: crate::network::ember::nat::NatType,
+    secret_key: [u8; 32],
+    deadline: tokio::time::Instant,
+    skip_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     // Register a port on the QUIC endpoint's own socket, not
     // `our_external_addr.port()` — that address comes from the KAD UDP
@@ -956,164 +1374,256 @@ async fn punch_friend(
     let advertise_port = our_quic_public_port
         .filter(|port| *port != 0)
         .or_else(|| endpoint.local_addr().map(|a| a.port()).ok())
-        .unwrap_or_else(|| our_external_addr.port());
-    // Bind the exact observed/canonical external IP into the signed register
-    // payload — port alone is insufficient after the rendezvous IP-binding change.
-    crate::network::ember::relay::register_punch_with_ip(
-        rendezvous_url,
-        &our_ember_hash,
-        &friend_ember_hash,
-        advertise_port,
-        our_nat_type.as_u8(),
-        our_external_addr.ip(),
-        secret_key,
-        &our_ember_hash,
+        .unwrap_or_else(|| ext_addr.port());
+    match tokio::time::timeout_at(
+        deadline,
+        crate::network::ember::relay::register_punch_with_ip(
+            &rendezvous_url,
+            &our_ember_hash,
+            &friend_ember_hash,
+            advertise_port,
+            our_nat_type.as_u8(),
+            ext_addr.ip(),
+            &secret_key,
+            &our_ember_hash,
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = skip_tx.send(true);
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = skip_tx.send(true);
+            return Err("punch register timed out".to_string());
+        }
+    }
+    punch_friend_until(
+        &rendezvous_url,
+        endpoint.as_ref(),
+        our_ember_hash,
+        friend_ember_hash,
+        &secret_key,
+        deadline,
+    )
+    .await
+}
 
-    let our_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
-        .verifying_key()
-        .to_bytes();
+async fn wait_relay_arm(
+    delay: std::time::Duration,
+    mut skip_rx: tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = async {
+            loop {
+                if *skip_rx.borrow() {
+                    break;
+                }
+                if skip_rx.changed().await.is_err() {
+                    // Sender dropped without skip=true: punch ended (success
+                    // or abort). Do not treat that as "register failed"; wait
+                    // out the remaining delay or the phase deadline instead.
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {}
+        _ = tokio::time::sleep_until(deadline) => {
+            return Err("NAT fallback timed out".to_string());
+        }
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("NAT fallback timed out".to_string());
+    }
+    Ok(())
+}
 
+async fn delayed_relay_friend(
+    rendezvous_url: String,
+    delay: std::time::Duration,
+    skip_rx: tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    pubkey: [u8; 32],
+    secret: [u8; 32],
+    offered_ticket: Arc<std::sync::Mutex<Option<String>>>,
+) -> Result<crate::network::ember::relay::WsStream, String> {
+    wait_relay_arm(delay, skip_rx, deadline).await?;
+    relay_friend(
+        &rendezvous_url,
+        our_ember_hash,
+        friend_ember_hash,
+        &pubkey,
+        &secret,
+        deadline,
+        offered_ticket,
+    )
+    .await
+}
+
+async fn punch_friend_until(
+    rendezvous_url: &str,
+    endpoint: &quinn::Endpoint,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    secret_key: &[u8; 32],
+    deadline: tokio::time::Instant,
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
-        tokio::time::sleep(FRIEND_PUNCH_POLL_INTERVAL).await;
-        match crate::network::ember::relay::poll_punch(rendezvous_url, &our_ember_hash, secret_key)
-            .await
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(FRIEND_PUNCH_POLL_INTERVAL) => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            crate::network::ember::relay::poll_punch(rendezvous_url, &our_ember_hash, secret_key),
+        )
+        .await
         {
-            Ok(Some(info)) => {
-                // poll_punch already verifies the IP-bound register proof.
-                let expected_capability =
-                    match crate::network::rendezvous::fetch_identity_pubkey_authenticated(
+            Ok(Ok(Some(info))) => {
+                let info_for_timeout = info.clone();
+                match tokio::time::timeout_at(
+                    punch_attempt_deadline(tokio::time::Instant::now(), deadline),
+                    try_complete_friend_punch(
                         rendezvous_url,
-                        &friend_ember_hash,
-                        &our_ember_hash,
-                        &our_pubkey,
+                        endpoint,
+                        our_ember_hash,
+                        friend_ember_hash,
                         secret_key,
-                    )
-                    .await
-                    {
-                        Ok(Some(pubkey)) => {
-                            crate::network::ember::crypto::derive_pairwise_presence_capability(
-                                secret_key,
-                                &pubkey,
-                                &our_pubkey,
-                                info.epoch,
-                            )
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            debug!("Friend punch: identity lookup failed: {error}");
-                            None
-                        }
-                    };
-                let expected_capability = match expected_capability {
-                    Some(capability) => capability,
-                    None => {
-                        let _ = crate::network::ember::relay::ack_punch(
-                            rendezvous_url,
-                            &our_ember_hash,
-                            &info.punch_id,
-                            &info.capability,
-                            info.epoch,
-                            secret_key,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-                if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
-                    || info.capability != expected_capability
-                {
-                    let _ = crate::network::ember::relay::ack_punch(
-                        rendezvous_url,
-                        &our_ember_hash,
-                        &info.punch_id,
-                        &info.capability,
-                        info.epoch,
-                        secret_key,
-                    )
-                    .await;
-                    continue;
-                }
-                let peer_nat = crate::network::ember::nat::NatType::from_u8(info.nat_type);
-                let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
-                    let _ = crate::network::ember::relay::ack_punch(
-                        rendezvous_url,
-                        &our_ember_hash,
-                        &info.punch_id,
-                        &info.capability,
-                        info.epoch,
-                        secret_key,
-                    )
-                    .await;
-                    continue;
-                };
-                let routable = match ip {
-                    std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
-                    std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
-                };
-                if !routable || info.port == 0 {
-                    debug!(
-                        "Friend punch: ignoring non-routable target {ip}:{}",
-                        info.port
-                    );
-                    let _ = crate::network::ember::relay::ack_punch(
-                        rendezvous_url,
-                        &our_ember_hash,
-                        &info.punch_id,
-                        &info.capability,
-                        info.epoch,
-                        secret_key,
-                    )
-                    .await;
-                    continue;
-                }
-                let peer_addr = SocketAddr::new(ip, info.port);
-                debug!("Friend punch: signed peer at {peer_addr} reports NAT {peer_nat:?}");
-                // Pin to the friend's node id rather than accepting any Ed25519
-                // cert: `info.from_id` was matched against
-                // `hashed_id(&friend_ember_hash)` above and the pairwise
-                // capability checked, so the identity we expect is already
-                // established from a signed record before we dial.
-                match super::super::ember::broker::punch_quic_pinned(
-                    endpoint,
-                    peer_addr,
-                    secret_key,
-                    friend_ember_hash,
+                        info,
+                    ),
                 )
                 .await
                 {
-                    Ok(streams) => {
-                        crate::network::ember::relay::ack_punch(
+                    Ok(Ok(streams)) => return Ok(streams),
+                    Ok(Err(e)) => debug!("Friend hole-punch attempt failed: {e}"),
+                    Err(_) => {
+                        ack_observed_punch(
                             rendezvous_url,
                             &our_ember_hash,
-                            &info.punch_id,
-                            &info.capability,
-                            info.epoch,
-                            secret_key,
-                        )
-                        .await?;
-                        return Ok(streams);
-                    }
-                    Err(error) => {
-                        debug!("Friend QUIC punch to {peer_addr} failed: {error}");
-                        let _ = crate::network::ember::relay::ack_punch(
-                            rendezvous_url,
-                            &our_ember_hash,
-                            &info.punch_id,
-                            &info.capability,
-                            info.epoch,
+                            &info_for_timeout,
                             secret_key,
                         )
                         .await;
+                        debug!("Friend hole-punch attempt timed out");
                     }
                 }
             }
-            Ok(None) => {}
-            Err(e) => debug!("Friend punch poll error: {e}"),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => debug!("Friend punch poll error: {e}"),
+            Err(_) => break,
         }
     }
     Err("no reciprocal punch registration found before timeout".to_string())
+}
+
+async fn try_complete_friend_punch(
+    rendezvous_url: &str,
+    endpoint: &quinn::Endpoint,
+    our_ember_hash: [u8; 16],
+    friend_ember_hash: [u8; 16],
+    secret_key: &[u8; 32],
+    info: crate::network::ember::relay::PunchInfo,
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    let our_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
+        .verifying_key()
+        .to_bytes();
+    let expected_capability =
+        match crate::network::rendezvous::fetch_identity_pubkey_authenticated(
+            rendezvous_url,
+            &friend_ember_hash,
+            &our_ember_hash,
+            &our_pubkey,
+            secret_key,
+        )
+        .await
+        {
+            Ok(Some(pubkey)) => crate::network::ember::crypto::derive_pairwise_presence_capability(
+                secret_key,
+                &pubkey,
+                &our_pubkey,
+                info.epoch,
+            ),
+            Ok(None) => None,
+            Err(error) => {
+                debug!("Friend punch: identity lookup failed: {error}");
+                None
+            }
+        };
+    let expected_capability = match expected_capability {
+        Some(capability) => capability,
+        None => {
+            ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+            return Err("punch identity lookup failed".to_string());
+        }
+    };
+    if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
+        || info.capability != expected_capability
+    {
+        ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+        return Err("punch identity or capability mismatch".to_string());
+    }
+    let peer_nat = crate::network::ember::nat::NatType::from_u8(info.nat_type);
+    let Ok(ip) = info.ip.parse::<std::net::IpAddr>() else {
+        ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+        return Err("punch target ip unparseable".to_string());
+    };
+    let routable = match ip {
+        std::net::IpAddr::V4(v4) => !crate::security::is_special_use_v4(v4),
+        std::net::IpAddr::V6(_) => !crate::security::is_private_ip(ip),
+    };
+    if !routable || info.port == 0 {
+        debug!(
+            "Friend punch: ignoring non-routable target {ip}:{}",
+            info.port
+        );
+        ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+        return Err("punch target is not routable".to_string());
+    }
+    let peer_addr = SocketAddr::new(ip, info.port);
+    debug!("Friend punch: signed peer at {peer_addr} reports NAT {peer_nat:?}");
+    // Pin to the friend's node id rather than accepting any Ed25519
+    // cert: `info.from_id` was matched against
+    // `hashed_id(&friend_ember_hash)` above and the pairwise
+    // capability checked, so the identity we expect is already
+    // established from a signed record before we dial.
+    match super::super::ember::broker::punch_quic_pinned(
+        endpoint,
+        peer_addr,
+        secret_key,
+        friend_ember_hash,
+    )
+    .await
+    {
+        Ok(streams) => {
+            crate::network::ember::relay::ack_punch(
+                rendezvous_url,
+                &our_ember_hash,
+                &info.punch_id,
+                &info.capability,
+                info.epoch,
+                secret_key,
+            )
+            .await?;
+            Ok(streams)
+        }
+        Err(error) => {
+            debug!("Friend QUIC punch to {peer_addr} failed: {error}");
+            ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+            Err(error)
+        }
+    }
 }
 
 /// Fall back to a rendezvous-brokered WebSocket relay to reach a friend
@@ -1128,26 +1638,35 @@ async fn relay_friend(
     friend_ember_hash: [u8; 16],
     our_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
+    deadline: tokio::time::Instant,
+    offered_ticket: Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<crate::network::ember::relay::WsStream, String> {
-    let offer = crate::network::rendezvous::offer_friend_relay_ticket(
-        rendezvous_url,
-        &our_ember_hash,
-        &friend_ember_hash,
-        our_pubkey,
-        secret_key,
+    let offer = tokio::time::timeout_at(
+        deadline,
+        crate::network::rendezvous::offer_friend_relay_ticket(
+            rendezvous_url,
+            &our_ember_hash,
+            &friend_ember_hash,
+            our_pubkey,
+            secret_key,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| "friend relay ticket offer timed out".to_string())??;
 
-    // The responder polls independently. Keep this a total deadline rather
-    // than 45 request iterations: a stalled status request must not extend
-    // the capability's useful lifetime indefinitely.
-    let deadline = tokio::time::Instant::now()
-        + crate::network::rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT;
+    *offered_ticket
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(offer.ticket_id.clone());
+
+    let ticket_deadline = deadline.min(
+        tokio::time::Instant::now()
+            + crate::network::rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT,
+    );
     let mut status_retry_delay = std::time::Duration::from_secs(1);
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    while tokio::time::Instant::now() < ticket_deadline {
+        let remaining = ticket_deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(remaining.min(status_retry_delay)).await;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = ticket_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -1165,12 +1684,16 @@ async fn relay_friend(
         .await
         {
             Ok(Ok(true)) => {
-                return crate::network::ember::relay::connect_server_relay(
-                    rendezvous_url,
-                    &offer.ticket_id,
-                    &offer.initiator_token,
+                return tokio::time::timeout_at(
+                    deadline,
+                    crate::network::ember::relay::connect_server_relay(
+                        rendezvous_url,
+                        &offer.ticket_id,
+                        &offer.initiator_token,
+                    ),
                 )
-                .await;
+                .await
+                .map_err(|_| "server relay connect timed out".to_string())?;
             }
             Ok(Ok(false)) => {}
             Ok(Err(e)) => {
@@ -1246,6 +1769,207 @@ mod tests {
         .expect("connect_friend_with_fallback must not hang with no rendezvous URL");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn punch_relay_race_is_delayed_and_fallback_phase_is_bounded() {
+        assert_eq!(
+            FRIEND_PUNCH_RELAY_RACE_AFTER,
+            FRIEND_PUNCH_POLL_INTERVAL * 3
+        );
+        assert!(FRIEND_FALLBACK_PHASE_TIMEOUT > FRIEND_PUNCH_RELAY_RACE_AFTER);
+        assert!(FRIEND_FALLBACK_PHASE_TIMEOUT < std::time::Duration::from_secs(154));
+        assert!(
+            FRIEND_FALLBACK_PHASE_TIMEOUT
+                >= FRIEND_PUNCH_RELAY_RACE_AFTER
+                    + crate::network::rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT
+        );
+        assert_eq!(relay_arm_delay(true), FRIEND_PUNCH_RELAY_RACE_AFTER);
+        assert_eq!(relay_arm_delay(false), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn punch_attempt_deadline_is_capped_by_the_phase() {
+        let now = tokio::time::Instant::now();
+        let phase = now + FRIEND_FALLBACK_PHASE_TIMEOUT;
+        assert_eq!(
+            punch_attempt_deadline(now, phase),
+            now + FRIEND_PUNCH_ATTEMPT_TIMEOUT
+        );
+        let late = phase - std::time::Duration::from_millis(100);
+        assert_eq!(punch_attempt_deadline(late, phase), phase);
+        assert!(punch_attempt_deadline(late, phase) < late + FRIEND_PUNCH_ATTEMPT_TIMEOUT);
+    }
+
+    /// Production `nat_fallback_transport` cannot be driven without HTTPS/QUIC.
+    /// These tests drive the extracted race: spawn order, relay arm delay vs
+    /// skip, punch win after the relay delay, combined errors, and panics.
+    /// `tokio::time::pause()` is unavailable (`test-util` is not enabled on
+    /// this crate's tokio dependency, which this agent does not own).
+    #[tokio::test]
+    async fn relay_starts_while_punch_register_is_outstanding() {
+        let (block_tx, block_rx) = tokio::sync::oneshot::channel::<()>();
+        let (register_started_tx, register_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (relay_started_tx, relay_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let punch = async move {
+            let _ = register_started_tx.send(());
+            let _ = block_rx.await;
+            Err::<(), _>("register still outstanding".to_string())
+        };
+        let relay = async move {
+            let _ = relay_started_tx.send(());
+            std::future::pending::<()>().await;
+            Err::<(), _>("unused".to_string())
+        };
+
+        let (punch_handle, relay_handle) = spawn_relay_then_punch(punch, relay);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            register_started_rx.await.expect("punch register started");
+            relay_started_rx.await.expect("relay started");
+        })
+        .await
+        .expect("relay must be running while punch registration is still blocked");
+        assert!(
+            !punch_handle.is_finished(),
+            "punch/register must still be outstanding"
+        );
+        assert!(!relay_handle.is_finished());
+        drop(block_tx);
+        punch_handle.abort();
+        relay_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_arm_delay_overlaps_outstanding_register_and_honors_skip() {
+        let delay = std::time::Duration::from_millis(50);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let (skip_tx, skip_rx) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let wait = tokio::spawn(wait_relay_arm(delay, skip_rx, deadline));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !wait.is_finished(),
+            "relay must not dial before the delay while register is outstanding"
+        );
+        wait.await
+            .expect("wait_relay_arm join")
+            .expect("wait_relay_arm");
+        assert!(started.elapsed() >= delay);
+        drop(skip_tx);
+
+        let (skip_tx, skip_rx) = tokio::sync::watch::channel(false);
+        let wait = tokio::spawn(wait_relay_arm(
+            std::time::Duration::from_secs(5),
+            skip_rx,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(6),
+        ));
+        skip_tx.send(true).expect("skip");
+        tokio::time::timeout(std::time::Duration::from_millis(200), wait)
+            .await
+            .expect("failed register must start the relay immediately")
+            .expect("join")
+            .expect("wait_relay_arm skip");
+
+        let (skip_tx, skip_rx) = tokio::sync::watch::channel(false);
+        let delay = std::time::Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        let wait = tokio::spawn(wait_relay_arm(
+            delay,
+            skip_rx,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        ));
+        drop(skip_tx);
+        wait.await
+            .expect("join")
+            .expect("drop without skip must not fail the wait");
+        assert!(
+            started.elapsed() >= delay,
+            "dropping the skip sender must not start the relay immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn punch_win_after_relay_delay_aborts_leftover_relay() {
+        let delay = std::time::Duration::from_millis(40);
+        let (offered_tx, offered_rx) = tokio::sync::oneshot::channel::<()>();
+        let punch = async move {
+            tokio::time::sleep(delay + std::time::Duration::from_millis(20)).await;
+            Ok::<_, String>("punch")
+        };
+        let relay = async move {
+            tokio::time::sleep(delay).await;
+            let _ = offered_tx.send(());
+            std::future::pending::<()>().await;
+            Err::<&'static str, _>("relay still waiting to connect".to_string())
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (punch_handle, relay_handle) = spawn_relay_then_punch(punch, relay);
+        match drive_fallback_race(Some(punch_handle), Some(relay_handle), deadline).await {
+            FallbackRace::Punch {
+                value,
+                leftover_relay,
+            } => {
+                assert_eq!(value, "punch");
+                assert!(
+                    leftover_relay.is_none(),
+                    "aborted pre-connect relay must not yield a stream"
+                );
+            }
+            FallbackRace::Relay { .. } => panic!("punch should have won after the relay delay"),
+            FallbackRace::Failed(error) => panic!("unexpected failure: {error}"),
+            FallbackRace::Timeout { .. } => panic!("race timed out"),
+        }
+        offered_rx
+            .await
+            .expect("relay must have passed its delay (offered) before punch won");
+    }
+
+    #[tokio::test]
+    async fn fallback_race_reports_both_errors_and_distinguishes_panic() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let punch = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Err::<(), _>("no reciprocal punch registration found before timeout".to_string())
+        };
+        let relay = async { Err::<(), _>("friend relay ticket status failed: 503".to_string()) };
+        let (punch_handle, relay_handle) = spawn_relay_then_punch(punch, relay);
+        match drive_fallback_race(Some(punch_handle), Some(relay_handle), deadline).await {
+            FallbackRace::Failed(error) => {
+                assert!(
+                    error.contains("punch=no reciprocal punch registration found before timeout"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("relay=friend relay ticket status failed: 503"),
+                    "{error}"
+                );
+            }
+            _ => panic!("expected combined transport failure"),
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let punch = async {
+            panic!("punch boom");
+            #[allow(unreachable_code)]
+            Err::<(), _>("unused".to_string())
+        };
+        let relay = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Err::<(), _>("friend relay ticket status failed: 503".to_string())
+        };
+        let (punch_handle, relay_handle) = spawn_relay_then_punch(punch, relay);
+        match drive_fallback_race(Some(punch_handle), Some(relay_handle), deadline).await {
+            FallbackRace::Failed(error) => {
+                assert!(error.contains("punch=task panicked"), "{error}");
+                assert!(
+                    error.contains("relay=friend relay ticket status failed: 503"),
+                    "{error}"
+                );
+            }
+            _ => panic!("expected panic to be distinguishable in the combined error"),
+        }
     }
 
     /// Regression guard for the "online_friends not updated on successful

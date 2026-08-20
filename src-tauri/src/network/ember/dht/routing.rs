@@ -355,6 +355,29 @@ impl RoutingTable {
         let max_subnet_global = scale.max_contacts_per_subnet_global();
         let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
 
+        // Resident before the IP gate: during the fail-closed filter window
+        // `admits_addr` refuses every non-seed, and Ember peers are never Kad
+        // seeds. Applying the gate first diverted a verified observation for a
+        // contact we already hold into the replacement cache (or dropped it,
+        // because the cache refuses a duplicate of a resident). New contacts
+        // still have to pass the gate below. An address *change* still has to
+        // be admitted; a refused new address refreshes last_seen in place.
+        if let Some(existing_addr) = self.buckets[bucket_idx]
+            .find(&contact.node_id)
+            .map(|pos| self.buckets[bucket_idx].contacts[pos].addr)
+        {
+            let admit_new_addr =
+                contact.addr == existing_addr || self.admits_addr(&contact.addr);
+            return self.apply_resident_contact(
+                bucket_idx,
+                contact,
+                max_per_ip,
+                max_subnet_global,
+                max_subnet_bucket,
+                admit_new_addr,
+            );
+        }
+
         if !self.admits_addr(&contact.addr) {
             // "Cannot confirm" is not "known bad". While `ipfilter.dat` is
             // still parsing, `is_blocked_for_kad` calls every non-seed address
@@ -382,59 +405,6 @@ impl RoutingTable {
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
         let bucket = &mut self.buckets[bucket_idx];
-
-        // If already in the bucket: only mutate from a verified observation
-        // (`last_seen > 0`, e.g. a direct signed frame). Unverified gossip
-        // (FOUND_NODE / bootstrap entries use `last_seen == 0`) must not
-        // rewrite addr/keys or reset freshness — that bypassed subnet caps
-        // (eclipse) and could clobber a live contact with `last_seen = 0`.
-        if let Some(pos) = bucket.find(&contact.node_id) {
-            let mut existing = bucket.contacts.remove(pos).unwrap();
-            if contact.last_seen <= 0 {
-                bucket.contacts.insert(pos, existing);
-                return AddResult::Added;
-            }
-
-            let old_subnet = existing.subnet_key();
-            let old_ip = existing.addr.ip();
-            if contact.addr != existing.addr {
-                if subnet != old_subnet {
-                    if bucket.subnet_count(subnet) >= max_subnet_bucket {
-                        bucket.contacts.insert(pos, existing);
-                        return AddResult::Rejected;
-                    }
-                    let global_count = self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
-                    if global_count >= max_subnet_global {
-                        bucket.contacts.insert(pos, existing);
-                        return AddResult::Rejected;
-                    }
-                }
-                if ip != old_ip && self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip
-                {
-                    let bucket = &mut self.buckets[bucket_idx];
-                    bucket.contacts.insert(pos, existing);
-                    return AddResult::Rejected;
-                }
-                if subnet != old_subnet {
-                    self.release_subnet(old_subnet);
-                    *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
-                }
-                if ip != old_ip {
-                    self.release_ip(old_ip);
-                    *self.global_ip_count.entry(ip).or_insert(0) += 1;
-                }
-                existing.addr = contact.addr;
-            }
-
-            existing.noise_pub = contact.noise_pub;
-            existing.ed25519_pub = contact.ed25519_pub;
-            existing.last_seen = contact.last_seen;
-            existing.failed_queries = 0;
-            let bucket = &mut self.buckets[bucket_idx];
-            bucket.contacts.push_back(existing);
-            bucket.last_activity = contact.last_seen;
-            return AddResult::Added;
-        }
 
         // Subnet diversity check: per-bucket
         if bucket.subnet_count(subnet) >= max_subnet_bucket {
@@ -530,6 +500,81 @@ impl RoutingTable {
             node_id: ping_id,
             noise_pub: ping_noise,
         }
+    }
+
+    fn apply_resident_contact(
+        &mut self,
+        bucket_idx: usize,
+        contact: EmberContact,
+        max_per_ip: usize,
+        max_subnet_global: usize,
+        max_subnet_bucket: usize,
+        admit_new_addr: bool,
+    ) -> AddResult {
+        let bucket = &mut self.buckets[bucket_idx];
+        let Some(pos) = bucket.find(&contact.node_id) else {
+            return AddResult::Rejected;
+        };
+        let mut existing = bucket.contacts.remove(pos).unwrap();
+        // Only mutate from a verified observation (`last_seen > 0`, e.g. a
+        // direct signed frame). Unverified gossip (FOUND_NODE / bootstrap
+        // entries use `last_seen == 0`) must not rewrite addr/keys or reset
+        // freshness — that bypassed subnet caps (eclipse) and could clobber
+        // a live contact with `last_seen = 0`.
+        if contact.last_seen <= 0 {
+            bucket.contacts.insert(pos, existing);
+            return AddResult::Added;
+        }
+
+        let subnet = contact.subnet_key();
+        let ip = contact.addr.ip();
+        if contact.addr != existing.addr {
+            if !admit_new_addr {
+                existing.noise_pub = contact.noise_pub;
+                existing.ed25519_pub = contact.ed25519_pub;
+                existing.last_seen = contact.last_seen;
+                existing.failed_queries = 0;
+                bucket.contacts.push_back(existing);
+                bucket.last_activity = contact.last_seen;
+                return AddResult::Added;
+            }
+            let old_subnet = existing.subnet_key();
+            let old_ip = existing.addr.ip();
+            if subnet != old_subnet {
+                if bucket.subnet_count(subnet) >= max_subnet_bucket {
+                    bucket.contacts.insert(pos, existing);
+                    return AddResult::Rejected;
+                }
+                let global_count = self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
+                if global_count >= max_subnet_global {
+                    bucket.contacts.insert(pos, existing);
+                    return AddResult::Rejected;
+                }
+            }
+            if ip != old_ip && self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip {
+                let bucket = &mut self.buckets[bucket_idx];
+                bucket.contacts.insert(pos, existing);
+                return AddResult::Rejected;
+            }
+            if subnet != old_subnet {
+                self.release_subnet(old_subnet);
+                *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
+            }
+            if ip != old_ip {
+                self.release_ip(old_ip);
+                *self.global_ip_count.entry(ip).or_insert(0) += 1;
+            }
+            existing.addr = contact.addr;
+        }
+
+        existing.noise_pub = contact.noise_pub;
+        existing.ed25519_pub = contact.ed25519_pub;
+        existing.last_seen = contact.last_seen;
+        existing.failed_queries = 0;
+        let bucket = &mut self.buckets[bucket_idx];
+        bucket.contacts.push_back(existing);
+        bucket.last_activity = contact.last_seen;
+        AddResult::Added
     }
 
     /// Called when a liveness ping to the oldest contact in a bucket fails.
@@ -1019,15 +1064,8 @@ impl RoutingTable {
         scale: scale::NetworkScale,
     ) {
         // A contact holding a bucket slot must never also hold a cache entry.
-        // `add_contact` parks a lead here *before* it tests residency, and
-        // while `ipfilter.dat` is still parsing `admits_addr` refuses every
-        // address it cannot yet judge — a window that opens on every launch,
-        // during which the UDP ingress deliberately still lets known peers
-        // through. Each resident contact that answered us in it filed a
-        // duplicate of itself, and `evict_and_replace` removes the dead
-        // contact before it scans the cache, so that duplicate then passed the
-        // already-resident test and put the peer straight back with
-        // `failed_queries` cleared — three missed liveness pings undone.
+        // Other callers (and an older `add_contact` that parked before it
+        // tested residency) can still hand a resident in here; refuse it.
         if self.buckets[bucket_idx].find(&contact.node_id).is_some() {
             return;
         }
@@ -1793,6 +1831,43 @@ mod tests {
             rt.get_contact(&id).is_none(),
             "the eviction has to stick, in the bucket and in the cache"
         );
+    }
+
+    #[test]
+    fn a_verified_observation_updates_a_resident_during_the_fail_closed_window() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut resident = make_contact(0x11, 4672);
+        resident.last_seen = 1;
+        let id = resident.node_id;
+        assert!(matches!(rt.add_contact(resident.clone()), AddResult::Added));
+
+        let mut filter = IpFilter::new(true, false);
+        rt.set_ip_filter(filter.create_shared_snapshot());
+        assert!(!rt.admits_addr(&resident.addr));
+
+        resident.last_seen = 42;
+        resident.failed_queries = 2;
+        assert!(matches!(rt.add_contact(resident), AddResult::Added));
+        let held = rt.get_contact(&id).expect("still resident");
+        assert_eq!(held.last_seen, 42);
+        assert_eq!(held.failed_queries, 0);
+
+        // A new contact still has to pass the gate. It parks in the
+        // replacement cache like any other refusal, and promotion re-checks
+        // `admits_addr`, so a filtered address can never reach a bucket.
+        let mut blocked = make_contact(0x22, 4672);
+        blocked.last_seen = 99;
+        let blocked_id = blocked.node_id;
+        assert!(matches!(rt.add_contact(blocked), AddResult::Rejected));
+        assert!(
+            rt.get_contact(&blocked_id).is_some(),
+            "a gated new contact parks in the replacement cache, not dropped"
+        );
+        assert_eq!(rt.promote_cached_contacts(), 0);
+        filter.mark_ranges_ready();
+        rt.set_ip_filter(filter.create_shared_snapshot());
+        assert_eq!(rt.promote_cached_contacts(), 1);
     }
 
     /// Cryptographic node IDs stop a peer impersonating another node, but not

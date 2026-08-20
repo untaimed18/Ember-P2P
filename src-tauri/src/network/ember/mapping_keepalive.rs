@@ -9,6 +9,14 @@
 //! - **TCP listen port:** outbound TCP connect with SO_REUSEADDR from the
 //!   same local TCP port (holds the TCP mapping), plus STUN-over-TCP from that
 //!   same local endpoint to authoritatively learn the public TCP port.
+//! - **QUIC socket:** Quinn owns that UDP socket and drops non-QUIC
+//!   datagrams, so a STUN Binding sent through the endpoint cannot be
+//!   read back, and a second bind on the same port cannot share it
+//!   (Quinn never sets `SO_REUSEADDR`). Keep-alive is a one-datagram
+//!   [`quinn::Endpoint::connect`] to a STUN reflector, dropped immediately
+//!   so it emits an Initial close from the real socket and refreshes the
+//!   NAT mapping. The public port is not re-sampled. Skipped until the
+//!   endpoint exists.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -51,7 +59,9 @@ const TCP_STUN_SERVERS: &[&str] = &[
 /// STUN/connect budget. The real constraint is the network loop's
 /// `MAPPING_KA_WATCHDOG` (90 s). Realistic worst case is
 /// 3 × (5 + 8) + 4 × (5 + 5) = 79 s (three TCP-hold DNS+connect timeouts,
-/// then four TCP-STUN DNS+connect timeouts), still inside that watchdog.
+/// then four TCP-STUN DNS+connect timeouts). The QUIC keep-alive is a
+/// parallel DNS lookup (≤ 5 s) plus an immediate datagram; it does not
+/// add to the sequential TCP total. Still inside that watchdog.
 /// `tokio::time::timeout` cancels the future, not the `getaddrinfo` call
 /// running on a blocking thread — that thread stays occupied until the OS
 /// gives up. Bounded, not a leak.
@@ -227,6 +237,33 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpS
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
     Ok(stream)
+}
+
+/// Emit one UDP datagram from the QUIC endpoint so a port-restricted NAT
+/// mapping does not idle out.
+///
+/// Quinn takes exclusive ownership of the socket and never surfaces a
+/// datagram it cannot parse as QUIC, so a STUN Binding cannot be read back.
+/// A sibling bind is not an option: the endpoint socket is created without
+/// `SO_REUSEADDR`, so a second bind fails on every platform, and enabling
+/// reuse on both would make inbound delivery indeterminate on Windows.
+/// Dropping the [`quinn::Connecting`] emits a single Initial close from the
+/// real socket and consumes no connection slot.
+pub(crate) async fn quic_mapping_keepalive(
+    endpoint: Arc<quinn::Endpoint>,
+    server_index: usize,
+) {
+    let server = DEFAULT_STUN_SERVERS[server_index % DEFAULT_STUN_SERVERS.len()];
+    let server_addr = match lookup_ipv4(server, server).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            debug!("QUIC mapping keepalive {e}");
+            return;
+        }
+    };
+    if let Err(e) = endpoint.connect(server_addr, "stun") {
+        debug!("QUIC mapping keepalive endpoint transmit: {e}");
+    }
 }
 
 /// Background cycle: TCP hold + TCP STUN on `tcp_port`.
