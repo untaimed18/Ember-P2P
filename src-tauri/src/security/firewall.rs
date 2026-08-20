@@ -6,6 +6,12 @@ use crate::security::filesystem::windows_system_path;
 
 const RULE_NAME_TCP: &str = "Ember P2P (TCP)";
 const RULE_NAME_UDP: &str = "Ember P2P (UDP)";
+/// QUIC binds its own UDP socket, usually on `tcp_port` — a different
+/// number from the KAD UDP port this module already opens. Without a
+/// dedicated inbound UDP allow, Windows drops unsolicited QUIC Initial
+/// packets: hole-punch accepts, relay-target connects, and `relay_for_peers`
+/// all fail even when UPnP forwarded the port and TCP HighID is fine.
+const RULE_NAME_QUIC_UDP: &str = "Ember P2P (QUIC UDP)";
 
 /// Spawned by absolute path, never by bare name — see
 /// [`windows_system_path`] for the planted-binary hijack this avoids.
@@ -179,7 +185,12 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
 }
 
 /// Remove stale firewall rules whose port no longer matches, then ensure
-/// inbound TCP and UDP rules exist for the configured ports.
+/// inbound TCP, KAD UDP, and (when it is a distinct port) QUIC UDP rules
+/// exist for the configured ports.
+///
+/// QUIC typically binds UDP on `tcp_port`. Opening that here at startup
+/// covers the common case before the endpoint exists; [`ensure_quic_udp_firewall_rule`]
+/// updates the rule if bind later falls back to a neighbour port.
 ///
 /// When the user is *not* running elevated and the rules don't yet
 /// exist, we used to emit two raw `netsh` stderr dumps every single
@@ -198,6 +209,13 @@ pub fn ensure_firewall_rules(tcp_port: u16, udp_port: u16) {
         elevation_failures.push("UDP");
     }
 
+    if dedicated_quic_udp_port(tcp_port, udp_port).is_some() {
+        let quic_outcome = ensure_one_rule(RULE_NAME_QUIC_UDP, "UDP", tcp_port);
+        if matches!(quic_outcome, Some(AddRuleOutcome::NeedsElevation)) {
+            elevation_failures.push("QUIC");
+        }
+    }
+
     // Single consolidated WARN: same information density as the old
     // "Run as administrator" line, but emitted *once* and naming both
     // protocols. Detail-per-rule lives at debug level for support.
@@ -210,6 +228,34 @@ pub fn ensure_firewall_rules(tcp_port: u16, udp_port: u16) {
              this warning will go away.",
         );
     }
+}
+
+/// After the QUIC endpoint binds, open inbound UDP on the *actual* port.
+///
+/// No-op when that port is already the KAD UDP port (covered by
+/// [`RULE_NAME_UDP`]) or when it matches `tcp_port` already opened by
+/// [`ensure_firewall_rules`]. Recreates [`RULE_NAME_QUIC_UDP`] if bind
+/// landed on a fallback neighbour (`tcp_port+1..=+4`).
+pub fn ensure_quic_udp_firewall_rule(quic_udp_port: u16, kad_udp_port: u16) {
+    let Some(port) = dedicated_quic_udp_port(quic_udp_port, kad_udp_port) else {
+        return;
+    };
+    if matches!(
+        ensure_one_rule(RULE_NAME_QUIC_UDP, "UDP", port),
+        Some(AddRuleOutcome::NeedsElevation)
+    ) {
+        warn!(
+            "Windows Firewall rule for Ember P2P (QUIC UDP/{port}) could not be added: \
+             elevation required. Inbound hole-punch and peer-relay may be blocked until \
+             you run Ember once as Administrator.",
+        );
+    }
+}
+
+/// Dedicated QUIC UDP allow-rule is needed when QUIC is not sharing the
+/// KAD UDP port (and is actually bound).
+fn dedicated_quic_udp_port(quic_udp_port: u16, kad_udp_port: u16) -> Option<u16> {
+    (quic_udp_port != 0 && quic_udp_port != kad_udp_port).then_some(quic_udp_port)
 }
 
 /// Returns `Some(outcome)` when `add_firewall_rule` actually ran (rule
@@ -226,4 +272,21 @@ fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRule
         delete_firewall_rule(rule_name);
     }
     Some(add_firewall_rule(rule_name, protocol, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedicated_quic_udp_port;
+
+    #[test]
+    fn dedicated_quic_rule_skipped_when_sharing_kad_udp_port() {
+        assert_eq!(dedicated_quic_udp_port(4672, 4672), None);
+        assert_eq!(dedicated_quic_udp_port(0, 4672), None);
+    }
+
+    #[test]
+    fn dedicated_quic_rule_needed_on_tcp_port_or_fallback() {
+        assert_eq!(dedicated_quic_udp_port(4662, 4672), Some(4662));
+        assert_eq!(dedicated_quic_udp_port(4663, 4672), Some(4663));
+    }
 }
