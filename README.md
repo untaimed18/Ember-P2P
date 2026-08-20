@@ -323,6 +323,14 @@ If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check
 - [Rust](https://rustup.rs/) (1.94+, matching `rust-version` in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml))
 - [Node.js](https://nodejs.org/) (20.19+, 22.12+ or 24+, matching `engines` in [`package.json`](package.json); CI builds on 24)
 - **Windows**: Visual Studio Build Tools with C++ workload
+- **Linux**: WebKitGTK 4.1 and GTK 3 development packages. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev pkg-config file
+```
+
+Official releases are still Windows-only. A Linux build from this tree produces a `.deb` and an AppImage locally; those formats are not yet published or auto-updated.
 
 #### Development
 
@@ -343,7 +351,7 @@ npm test
 npm run tauri build
 ```
 
-The production build produces an NSIS installer in `src-tauri/target/release/bundle/`.
+The production build writes platform packages under `src-tauri/target/release/bundle/`: NSIS/MSI on Windows, `.deb` and AppImage on Linux.
 
 ## Tech Stack
 

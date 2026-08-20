@@ -124,6 +124,20 @@ export function verifyVersions({
     );
   }
 
+  const targets = tauriConfig.bundle?.targets;
+  const requiredTargets = ["nsis", "msi", "deb", "appimage"];
+  if (!Array.isArray(targets)) {
+    errors.push("src-tauri/tauri.conf.json bundle.targets must be an array");
+  } else {
+    for (const target of requiredTargets) {
+      if (!targets.includes(target)) {
+        errors.push(
+          `src-tauri/tauri.conf.json bundle.targets must include ${target}`,
+        );
+      }
+    }
+  }
+
   const effectiveTag = tag ?? envReleaseTag();
   if (requireTag && !effectiveTag) {
     errors.push(

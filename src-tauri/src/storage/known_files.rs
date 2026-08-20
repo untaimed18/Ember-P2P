@@ -996,7 +996,13 @@ impl KnownFileList {
             }
         }
         if let Ok(store) = crate::storage::share_intent::global() {
-            store.mark_catalog_seen()?;
+            // `known.met` is already durable. A missing share-intent file
+            // (common when tests replace the process-global store and then
+            // delete its directory) must not turn a successful catalog write
+            // into a hard failure.
+            if let Err(error) = store.mark_catalog_seen() {
+                warn!("Failed to mark share-intent catalog seen: {error}");
+            }
         }
         info!("Saved {} known files to known.met", self.files.len());
         Ok(())

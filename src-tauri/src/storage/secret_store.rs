@@ -8,8 +8,12 @@
 //! files already get — the ACL stops same-machine snooping; DPAPI stops a
 //! stolen/exfiltrated file from being usable elsewhere.
 //!
-//! On non-Windows targets (developer/CI machines only — release ships Windows)
-//! this is a transparent pass-through; the restricted ACL remains the control.
+//! On non-Windows targets this is a transparent pass-through; the restricted
+//! file mode (`0600` / `0700`) remains the control. That is enough to stop
+//! other local accounts from reading the files, but unlike DPAPI it does not
+//! bind the blob to this user/machine — a copied `identity.json` is usable
+//! elsewhere. A Linux secret-service backend is the remaining piece before
+//! shipped Linux builds match the Windows at-rest bar.
 //!
 //! Wire format of a protected blob: `MAGIC (8 bytes) || DPAPI ciphertext`.
 //! Files without `MAGIC` are treated as legacy plaintext and are transparently
@@ -23,6 +27,7 @@ const MAGIC: &[u8; 8] = b"EMBRSEC1";
 
 /// Extra entropy mixed into DPAPI so a protected blob can only be unwrapped by
 /// this application's code path (not by another DPAPI consumer on the system).
+#[cfg(target_os = "windows")]
 const ENTROPY: &[u8] = b"ember-secret-store-v1";
 
 /// True if `stored` is already in the protected (MAGIC-tagged) form.
@@ -39,9 +44,8 @@ pub fn is_protected(stored: &[u8]) -> bool {
 /// usable on another account/machine). Failing the save and regenerating
 /// next launch is the safer degradation.
 ///
-/// On non-Windows builds (developer/CI only — release ships Windows) this
-/// is a transparent pass-through and always succeeds; the restricted file
-/// ACL remains the control there.
+/// On non-Windows builds this is a transparent pass-through and always
+/// succeeds; the restricted file mode remains the control there.
 pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     #[cfg(target_os = "windows")]
     {

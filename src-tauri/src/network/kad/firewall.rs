@@ -264,6 +264,9 @@ impl FirewallChecker {
     /// `reporter` is the responding contact's source IP; votes are weighted by
     /// distinct /24 (K7) so a single-subnet cluster can't bias the result.
     pub fn handle_pong(&mut self, reported_udp_port: u16, reporter: Ipv4Addr) {
+        if reported_udp_port == 0 {
+            return;
+        }
         let o = reporter.octets();
         let reporter_net: [u8; 3] = [o[0], o[1], o[2]];
         self.udp_port_votes
@@ -492,5 +495,19 @@ mod tests {
             Some(Ipv4Addr::new(10, 0, 0, 5)),
             "LAN HighID from a local server is adoptable"
         );
+    }
+
+    #[test]
+    fn pong_ignores_reported_port_zero() {
+        let mut fw = FirewallChecker::new();
+        let reporters = [
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ];
+        for reporter in reporters {
+            fw.handle_pong(0, reporter);
+        }
+        assert!(fw.external_udp_port().is_none());
     }
 }
