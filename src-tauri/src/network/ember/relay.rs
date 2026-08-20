@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::{Sink, Stream};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info};
 
 const MSG_RELAY_REQUEST: u8 = 0x01;
@@ -1343,6 +1343,26 @@ impl WsStream {
         }
     }
 }
+
+/// Tear down an unused server-relay hop. Used when a friend-connect race
+/// has already authenticated on another transport so this socket must not
+/// linger on the pinned rendezvous process.
+pub async fn close_server_relay(mut stream: WsStream) {
+    let _ = tokio::time::timeout(Duration::from_secs(1), stream.shutdown()).await;
+}
+
+/// Best-effort cleanup when a friend-connect punch wins after a relay ticket
+/// was already offered.
+///
+/// The rendezvous server has no cancel/withdraw route. Live endpoints are
+/// mailbox offer/poll, ticket accept/status, and `/v2/relay/{id}` join.
+/// Join requires the ticket to already be `accepted`, so the initiator cannot
+/// consume an unused offer by connecting and closing. The abandoned offer
+/// remains until the server's `RELAY_TICKET_TTL` (90 s). In that window the
+/// friend's mailbox poller may still accept it and spend a pinned-server
+/// inbound slot on a hop nobody will join.
+#[allow(clippy::unused_async)]
+pub async fn abandon_offered_friend_relay_ticket(_ticket_id: &str) {}
 
 impl AsyncRead for WsStream {
     fn poll_read(

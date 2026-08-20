@@ -245,12 +245,13 @@ const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60
 const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
 /// Realistic worst-case STUN/TCP-hold cycle is 79s: 3×(5+8) + 4×(5+5)
 /// (DNS+connect timeouts on three TCP-hold targets then four TCP STUN
-/// servers). Pathological (every STUN write/read stage also times out) is
-/// ~139s: 3×(5+8) + 4×(5+5+5+5+5). 90s is not sized to wait that out — a
-/// cycle still running then has already missed four
-/// `MAPPING_KEEPALIVE_INTERVAL`s (20s) and cannot hold a NAT mapping open.
-/// Abandoning it is intentional (~1s cost); the generation guard discards
-/// the late result.
+/// servers). The QUIC keep-alive is a parallel DNS lookup (≤5s) plus an
+/// immediate datagram and does not add. Pathological (every STUN write/read
+/// stage also times out) is ~139s: 3×(5+8) + 4×(5+5+5+5+5). 90s is not
+/// sized to wait that out — a cycle still running then has already missed
+/// four `MAPPING_KEEPALIVE_INTERVAL`s (20s) and cannot hold a NAT mapping
+/// open. Abandoning it is intentional (~1s cost); the generation guard
+/// discards the late result.
 const MAPPING_KA_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(90);
 const RENDEZVOUS_REGISTER_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -400,7 +401,8 @@ fn advertised_udp_port(state: &NetworkState) -> u16 {
 /// one is reachable there. This is deliberately not `advertised_udp_port`: that
 /// tracks the KAD socket, and NAT mappings are per-socket, so its public port
 /// says nothing about where QUIC can be reached. `None` means no QUIC endpoint
-/// is bound yet.
+/// is bound yet. Mapping keep-alive transmits from this socket to hold the
+/// mapping open; it does not re-sample the public port.
 fn advertised_quic_port(state: &NetworkState) -> Option<u16> {
     state
         .quic_public_port
@@ -1311,6 +1313,28 @@ fn ember_established_addrs(state: &NetworkState) -> HashSet<(Ipv4Addr, u16)> {
         .collect()
 }
 
+/// How many rendezvous-listed peers are already overlay contacts.
+fn ember_rendezvous_converted_contacts(state: &NetworkState, peers: &[KadSource]) -> usize {
+    let established = ember_established_addrs(state);
+    let listed: Vec<(Ipv4Addr, u16)> = peers.iter().map(|s| (s.ip, s.udp_port)).collect();
+    let session: HashSet<(Ipv4Addr, u16)> =
+        state.ember_session_dht_contacts.keys().copied().collect();
+    ember_rendezvous_converted_among(&listed, &established, &session)
+}
+
+/// Same membership rule as [`ember_rendezvous_converted_contacts`], for tests
+/// that cannot construct a `NetworkState`.
+fn ember_rendezvous_converted_among(
+    listed: &[(Ipv4Addr, u16)],
+    established: &HashSet<(Ipv4Addr, u16)>,
+    session: &HashSet<(Ipv4Addr, u16)>,
+) -> usize {
+    listed
+        .iter()
+        .filter(|addr| established.contains(*addr) || session.contains(*addr))
+        .count()
+}
+
 /// Remember an Ember peer we met over eD2K but hold no Noise key for, so the
 /// bridge can reach it with a 2-RTT Noise_XX handshake.
 ///
@@ -1481,9 +1505,11 @@ fn ember_dht_ui_contact_counts(state: &NetworkState) -> (u32, u32) {
 
 /// Routing-table contacts plus firsthand session peers the table refused.
 ///
-/// Publish, source search, and per-tick budgets key off this rather than
-/// `ember_dht.contact_count()` so a LAN island with `block_private_ips` on
-/// still stores and searches — FIND_VALUE already pins those session peers.
+/// Source search, empty-overlay re-arm, and self-lookup key off this rather
+/// than `ember_dht.contact_count()` so a LAN island with `block_private_ips`
+/// on still searches — FIND_VALUE already pins those session peers — and so
+/// a `nodes_ember.dat` lead is still a reason not to declare the overlay
+/// empty. Publish STOREs use [`ember_publishable_peer_count`] instead.
 fn ember_overlay_contact_count(state: &NetworkState) -> usize {
     let extra = state
         .ember_session_dht_contacts
@@ -1491,6 +1517,24 @@ fn ember_overlay_contact_count(state: &NetworkState) -> usize {
         .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
         .count();
     state.ember_dht.contact_count() + extra
+}
+
+/// Peers we can actually STORE to: proven table contacts plus firsthand
+/// session peers the public table refused.
+///
+/// [`ember_overlay_contact_count`] also includes unverified leads, which is
+/// right for bootstrap/re-arm (a seed we have not pinged yet is still a
+/// reason not to declare the overlay empty) and wrong for publish: STOREs
+/// queued at a lead sit behind a Noise handshake that never completes and
+/// expire as failures — 82 records / 102 failures in one measured minute
+/// against a single `nodes_ember.dat` seed that never answered.
+fn ember_publishable_peer_count(state: &NetworkState) -> usize {
+    let extra = state
+        .ember_session_dht_contacts
+        .values()
+        .filter(|c| state.ember_dht.contact_for(&c.node_id).is_none())
+        .count();
+    state.ember_dht.routing().verified_len() + extra
 }
 
 fn ember_announce_due(
@@ -2738,6 +2782,38 @@ impl NoTransportReason {
 /// How long a rendezvous presence registration is treated as fresh.
 const PRESENCE_HEARTBEAT_SECS: u64 = 120;
 
+/// Floor on retrying a *failed* presence heartbeat. Successes keep using
+/// [`PRESENCE_HEARTBEAT_SECS`] via [`should_refresh_presence`].
+///
+/// The first retry after a failure is one bootstrap tick (10s) so a
+/// transient error recovers quickly. Subsequent failures double that
+/// until the success-path interval, so a persistently down server is
+/// not hit six times a minute forever.
+fn presence_failure_retry_secs(fail_streak: u32) -> u64 {
+    let shift = fail_streak.saturating_sub(1).min(16);
+    (10u64.saturating_mul(1u64 << shift)).min(PRESENCE_HEARTBEAT_SECS)
+}
+
+/// Whether the failure-path floor allows another heartbeat attempt.
+///
+/// `since_last_register == None` is the error case (the success clock was
+/// cleared). `since_last_attempt == None` is the first retry, which is
+/// allowed immediately.
+fn presence_failure_retry_due(
+    since_last_register: Option<std::time::Duration>,
+    since_last_attempt: Option<std::time::Duration>,
+    fail_streak: u32,
+) -> bool {
+    if since_last_register.is_some() {
+        return true;
+    }
+    since_last_attempt
+        .map(|elapsed| {
+            elapsed >= std::time::Duration::from_secs(presence_failure_retry_secs(fail_streak))
+        })
+        .unwrap_or(true)
+}
+
 /// Whether to publish our presence to the rendezvous server on this tick.
 ///
 /// Keyed on having registered successfully at least once this session, not on
@@ -3828,6 +3904,60 @@ mod friend_transfer_tests {
         assert!(
             !stale.is_empty(),
             "and still publishes meanwhile, from the table"
+        );
+    }
+
+    /// Unverified leads (`last_seen == 0`) are worth pinging, but a STORE
+    /// queued behind their handshake expires as a failure if they never
+    /// answer. Publishing must wait for someone who has already PONGed.
+    #[test]
+    fn publish_targets_skip_unverified_leads() {
+        use std::collections::VecDeque;
+
+        let local = ember::dht::EmberNodeId([0u8; 16]);
+        let mut routing = ember::dht::routing::RoutingTable::new(local, false);
+        routing.add_contact(ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0x40; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 1, 1)), 4672),
+            noise_pub: [0x40; 32],
+            ed25519_pub: [0x40; 32],
+            last_seen: 0,
+            failed_queries: 0,
+        });
+        routing.add_contact(ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0x41; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 2, 1)), 4672),
+            noise_pub: [0x41; 32],
+            ed25519_pub: [0x41; 32],
+            last_seen: 1_700_000_000,
+            failed_queries: 0,
+        });
+
+        let key = [0xAB; 16];
+        let now = 1_700_000_000i64;
+        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
+        let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
+
+        let from_table = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        assert_eq!(from_table.len(), 1);
+        assert!(from_table[0].is_verified());
+        assert_eq!(from_table[0].node_id, ember::dht::EmberNodeId([0x41; 16]));
+
+        // A lookup that remembered the lead must not revive it as a STORE
+        // target either: resolve against the table as it is now, then skip
+        // anyone still unverified.
+        cache.insert(key, (vec![ember::dht::EmberNodeId([0x40; 16])], now));
+        queue.clear();
+        let from_cache = ember_publish_targets_for(&cache, &mut queue, &routing, key, now);
+        assert!(
+            !from_cache
+                .iter()
+                .any(|c| c.node_id == ember::dht::EmberNodeId([0x40; 16])),
+            "an unverified cached ID must not be dialled for STORE"
+        );
+        assert!(
+            from_cache.iter().all(|c| c.is_verified()),
+            "top-up from the table must also skip leads"
         );
     }
 
@@ -5791,6 +5921,34 @@ mod tests {
             true,
             true,
             Some(std::time::Duration::from_secs(9_999))
+        ));
+    }
+
+    #[test]
+    fn a_failed_heartbeat_backs_off_instead_of_retrying_every_bootstrap_tick() {
+        assert_eq!(presence_failure_retry_secs(0), 10);
+        assert_eq!(presence_failure_retry_secs(1), 10, "first retry stays fast");
+        assert_eq!(presence_failure_retry_secs(2), 20);
+        assert_eq!(presence_failure_retry_secs(3), 40);
+        assert_eq!(presence_failure_retry_secs(4), 80);
+        assert_eq!(presence_failure_retry_secs(5), PRESENCE_HEARTBEAT_SECS);
+        assert_eq!(presence_failure_retry_secs(u32::MAX), PRESENCE_HEARTBEAT_SECS);
+
+        let ten = std::time::Duration::from_secs(10);
+        let nineteen = std::time::Duration::from_secs(19);
+        assert!(
+            presence_failure_retry_due(None, None, 1),
+            "the first retry after a failure is allowed immediately"
+        );
+        assert!(presence_failure_retry_due(None, Some(ten), 1));
+        assert!(
+            !presence_failure_retry_due(None, Some(nineteen), 2),
+            "the second failure waits 20s, not another 10s tick"
+        );
+        assert!(presence_failure_retry_due(
+            Some(std::time::Duration::from_secs(PRESENCE_HEARTBEAT_SECS)),
+            Some(std::time::Duration::from_secs(1)),
+            5
         ));
     }
 
@@ -8131,6 +8289,51 @@ mod tests {
     }
 
     #[test]
+    fn rendezvous_conversion_counts_live_table_and_session_contacts() {
+        let a = (Ipv4Addr::new(1, 2, 3, 4), 4672);
+        let b = (Ipv4Addr::new(5, 6, 7, 8), 4672);
+        let listed = [a, b];
+        let mut established = HashSet::new();
+        let mut session = HashSet::new();
+        assert_eq!(
+            ember_rendezvous_converted_among(&listed, &established, &session),
+            0,
+            "listed peers that are not contacts have not converted"
+        );
+        established.insert(a);
+        assert_eq!(
+            ember_rendezvous_converted_among(&listed, &established, &session),
+            1
+        );
+        session.insert(b);
+        assert_eq!(
+            ember_rendezvous_converted_among(&listed, &established, &session),
+            2
+        );
+    }
+
+    #[test]
+    fn the_rendezvous_empty_streak_follows_conversion_not_listing() {
+        // Cold join: nobody converted → streak 0→1, first retry at 60s.
+        let after_miss = ember_rendezvous_empty_streak_after(0, 0);
+        assert_eq!(after_miss, 1);
+        assert_eq!(
+            ember_rendezvous_retry_secs(after_miss),
+            EMBER_RENDEZVOUS_FIRST_RETRY_SECS
+        );
+        // A later lookup that finds someone already in the table resets.
+        let after_hit = ember_rendezvous_empty_streak_after(after_miss, 1);
+        assert_eq!(after_hit, 0);
+        assert_eq!(
+            ember_rendezvous_retry_secs(after_hit),
+            EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS
+        );
+        assert_eq!(ember_rendezvous_empty_streak_after(1, 0), 2);
+        assert_eq!(ember_rendezvous_empty_streak_after(3, 0), 4);
+        assert_eq!(ember_rendezvous_empty_streak_after(5, 2), 0);
+    }
+
+    #[test]
     fn stun_may_replace_a_kad_vote_but_not_a_live_highid() {
         let stun = Ipv4Addr::new(8, 8, 8, 8);
         let kad = Ipv4Addr::new(4, 4, 4, 4);
@@ -10403,7 +10606,9 @@ struct NetworkState {
     /// Separate from `quic_port` because a re-mapping NAT gives them different
     /// values, and every consumer wants one specific side of that: UPnP maps
     /// the *bound* port, while anything a peer dials needs the *public* one
-    /// (read it through `advertised_quic_port`).
+    /// (read it through `advertised_quic_port`). Mapping keep-alive holds the
+    /// mapping open but cannot re-read this port: quinn never surfaces
+    /// non-QUIC datagrams.
     quic_public_port: Option<u16>,
     upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
@@ -10756,8 +10961,10 @@ struct NetworkState {
     /// Unix time the last rendezvous lookup started, to space out retries
     /// while the routing table is still empty. 0 = never.
     ember_rendezvous_looked_up_at: i64,
-    /// Consecutive rendezvous lookups that listed nobody, driving the retry
-    /// backoff. Reset the moment one returns a peer.
+    /// Consecutive rendezvous lookups that converted nobody from the live
+    /// table, driving the retry backoff. Reset when any listed peer is
+    /// already a routing-table or session contact. A node holding 1–19
+    /// contacts that include a listed peer therefore never escalates.
     ember_rendezvous_empty_streak: u32,
     /// When each contact was last sent an `ANNOUNCE_PEER`, so gossip
     /// exchange rotates through the table instead of pinning itself to
@@ -10789,6 +10996,14 @@ struct NetworkState {
     /// Unix time we last received any Ember DHT frame. `None` until the first
     /// one arrives. Drives disconnect detection.
     ember_last_inbound: Option<i64>,
+    /// Overlay contact count as of the previous maintenance tick, so emptying
+    /// can re-arm bootstrap on the *transition* to zero rather than every tick
+    /// spent there.
+    ember_last_overlay_contacts: usize,
+    /// Unix time of the last empty-overlay re-arm. 0 = never. Floors how often
+    /// that re-arm may fire so a node with no reachable peers cannot hammer
+    /// the rendezvous lookup every eviction cycle.
+    ember_empty_rearmed_at: i64,
     /// Nodes a real lookup found to be closest to a record key, per key, with
     /// the unix time we learned them.
     ///
@@ -10953,6 +11168,14 @@ struct NetworkState {
     rendezvous_register_generation: u64,
     /// Last time we registered with the rendezvous server (for heartbeat)
     rendezvous_last_register: Option<std::time::Instant>,
+    /// When the last presence heartbeat was spawned, including failures.
+    /// Separated from `rendezvous_last_register` so a failed attempt can
+    /// back off without the success-path 120s clock (which is cleared on
+    /// error so the first retry is fast).
+    rendezvous_last_attempt: Option<std::time::Instant>,
+    /// Consecutive failed presence heartbeats. Drives
+    /// [`presence_failure_retry_secs`]; reset on success.
+    rendezvous_register_fail_streak: u32,
     /// Tracks active outbound friend session tasks to prevent duplicates.
     /// ember_hash -> Instant when the session was started.
     outbound_session_tasks: HashMap<[u8; 16], std::time::Instant>,
@@ -13941,9 +14164,19 @@ fn charge_ember_publish_failure(
 
 /// Record one completed lookup of the Ember rendezvous key.
 ///
-/// `listed` is advertised peers after dropping this node's own advert, which
-/// is the number that can actually bootstrap us. Zero is the cold-join miss.
-fn note_ember_rendezvous_lookup(state: &mut NetworkState, listed: usize) {
+/// `listed` is advertised peers after dropping this node's own advert.
+/// `converted` is how many of those are already overlay (or session)
+/// contacts, measured against the live table — so it reflects conversions
+/// from *earlier* lookups, not this one's. A listed peer that never became a
+/// contact is a cold-join miss: a stale advert is otherwise indistinguishable
+/// from a live one.
+///
+/// The streak resets whenever any listed peer is already a contact. This
+/// lookup only runs below [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified
+/// contacts, so a node stuck in that band that also advertises itself under
+/// the rendezvous key resets on every lookup and never escalates. That is
+/// pre-existing; the backoff is for a table that converted nobody.
+fn note_ember_rendezvous_lookup(state: &mut NetworkState, listed: usize, converted: usize) {
     state.ember_diagnostics.ember_dht_rendezvous_lookups = state
         .ember_diagnostics
         .ember_dht_rendezvous_lookups
@@ -13954,10 +14187,16 @@ fn note_ember_rendezvous_lookup(state: &mut NetworkState, listed: usize) {
             .ember_diagnostics
             .ember_dht_rendezvous_empty
             .saturating_add(1);
-        state.ember_rendezvous_empty_streak =
-            state.ember_rendezvous_empty_streak.saturating_add(1);
+    }
+    state.ember_rendezvous_empty_streak =
+        ember_rendezvous_empty_streak_after(state.ember_rendezvous_empty_streak, converted);
+}
+
+fn ember_rendezvous_empty_streak_after(streak: u32, converted: usize) -> u32 {
+    if converted == 0 {
+        streak.saturating_add(1)
     } else {
-        state.ember_rendezvous_empty_streak = 0;
+        0
     }
 }
 
@@ -14004,6 +14243,19 @@ fn fault_ember_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNode
 /// a seed for every later lookup until the liveness sweep happened to reach it,
 /// which at eight pings a minute can be many minutes of five-second stalls.
 fn fault_ember_search_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNodeId) {
+    // Unverified leads have no `last_seen` and are the only bootstrap we
+    // hold on a cold join. Publish-target FIND_NODEs (two per tick) plus the
+    // liveness ping all land on that one contact; each lookup timeout is 12s
+    // behind a handshake, so three strikes evicted the seed in ~20s — before
+    // the rendezvous keys had a chance to convert. Liveness pings still
+    // fault leads; a dead seed drops after three unanswered pings (~3 min).
+    if !state
+        .ember_dht
+        .contact_for(node_id)
+        .is_some_and(|c| c.is_verified())
+    {
+        return;
+    }
     evict_ember_contact_if_dead(state, node_id, "unresponsive in lookup");
 }
 
@@ -14317,7 +14569,7 @@ const EMBER_RENDEZVOUS_REPUBLISH_SECS: i64 = 5 * 3600;
 /// recovering within a reasonable time once peers do appear.
 const EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS: i64 = 600;
 
-/// Spacing for the *first* retry after a lookup that listed nobody.
+/// Spacing for the *first* retry after a lookup that converted nobody.
 ///
 /// Ten minutes is right for a node that genuinely cannot reach anyone, but it
 /// was also being applied to the first miss, and this key is the only cold-join
@@ -14326,9 +14578,12 @@ const EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS: i64 = 600;
 /// stuck node still costs almost nothing.
 const EMBER_RENDEZVOUS_FIRST_RETRY_SECS: i64 = 60;
 
-/// How long to wait before the next rendezvous lookup, given how many in a row
-/// have come back with no peers listed. Doubles per empty result up to
-/// [`EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS`].
+/// How long to wait before the next rendezvous lookup, given how many in a
+/// row converted nobody. Doubles per empty result up to
+/// [`EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS`]. A lookup that finds even one
+/// already-known contact resets the streak (and this interval) to the
+/// steady cadence; that includes a node whose 1–19 contacts include a
+/// listed peer, which therefore never escalates.
 fn ember_rendezvous_retry_secs(empty_streak: u32) -> i64 {
     if empty_streak == 0 {
         return EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS;
@@ -14408,7 +14663,15 @@ fn maybe_start_ember_rendezvous_lookup(
     }
     state.ember_rendezvous_search = Some(sid);
     state.ember_rendezvous_looked_up_at = now;
-    info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+    let verified = state.ember_dht.routing().verified_len();
+    if verified == 0 {
+        info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+    } else {
+        info!(
+            "Ember rendezvous: looking up {key} to grow a thin DHT table \
+             ({verified} verified, want {EMBER_KAD_BRIDGE_UNTIL_CONTACTS})"
+        );
+    }
     true
 }
 
@@ -14473,6 +14736,15 @@ const EMBER_SELF_LOOKUP_WARM_VERIFIED: usize = ember::dht::K_BUCKET_SIZE / 2;
 const EMBER_SELF_LOOKUP_REPEAT_SECS: i64 = 4 * 3600;
 /// Silence after which the DHT is treated as disconnected and re-bootstraps.
 const EMBER_DISCONNECT_SECS: i64 = 20 * 60;
+/// Floor on how often emptying the overlay may re-arm bootstrap. The re-arm
+/// itself fires only on the transition to zero (staying empty is left to the
+/// rendezvous backoff). This stops a node whose lookups keep listing stale
+/// leads — add, three-strike evict, empty again — from zeroing
+/// `ember_rendezvous_looked_up_at` every eviction cycle and hammering the
+/// rendezvous key. 300s matches [`EMBER_BRIDGE_RETRY_MAX`]: long enough that
+/// one failed conversion (~2 min in the field) does not immediately re-arm,
+/// far shorter than [`EMBER_DISCONNECT_SECS`].
+const EMBER_EMPTY_REARM_SECS: i64 = 300;
 
 /// How long a verified contact may go unheard before it is purged outright,
 /// matching KAD's two hours. Well beyond the liveness-ping interval, so this
@@ -15258,7 +15530,11 @@ fn finalize_removed_searches_with_keyword_results(
                 .unwrap_or_default();
             let established = ember_established_addrs(state);
             harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers, &established);
-            note_ember_rendezvous_lookup(state, peers.len());
+            note_ember_rendezvous_lookup(
+                state,
+                peers.len(),
+                ember_rendezvous_converted_contacts(state, &peers),
+            );
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             if let Some(entries) = preserved_results.get(sid) {
@@ -17202,6 +17478,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_self_lookup_done = false;
     state.ember_last_self_lookup = 0;
     state.ember_last_inbound = None;
+    state.ember_last_overlay_contacts = 0;
+    state.ember_empty_rearmed_at = 0;
     state.ember_publish_targets.clear();
     state.ember_publish_target_queue.clear();
     state.ember_publish_target_lookups.clear();
@@ -18014,6 +18292,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_self_lookup_done: false,
         ember_last_self_lookup: 0,
         ember_last_inbound: None,
+        ember_last_overlay_contacts: 0,
+        ember_empty_rearmed_at: 0,
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
         ember_publish_target_lookups: HashMap::new(),
@@ -18059,6 +18339,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
         rendezvous_last_register: None,
+        rendezvous_last_attempt: None,
+        rendezvous_register_fail_streak: 0,
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
         friend_search_started_at: None,
@@ -18945,9 +19227,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut tcp_map_ka_gen: Option<u64> = None;
     // Whether *any* keep-alive contribution (confirmed UDP mapping, applied
     // TCP mapping, or a successful TCP hold) succeeded for the current
-    // generation. Reset when a new round starts; checked once both the UDP
-    // and TCP results for that round have been processed so a fully failed
-    // cycle can clear the "Active" indicator instead of leaving it sticky.
+    // generation. Reset when a new round starts; checked once every in-flight
+    // half of that round has been processed so a fully failed cycle can
+    // clear the "Active" indicator instead of leaving it sticky.
     let mut mapping_ka_cycle_success = false;
     let mut next_mapping_ka_at = tokio::time::Instant::now()
         + if settings.stun_keepalive_enabled {
@@ -23882,10 +24164,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let keys_before = state.ember_noise_keys.len();
                         harvest_ember_noise_keys(&mut state.ember_noise_keys, &peers, &established);
                         let keys_learned = state.ember_noise_keys.len().saturating_sub(keys_before);
-                        note_ember_rendezvous_lookup(&mut state, peers.len());
+                        let converted = ember_rendezvous_converted_contacts(&state, &peers);
+                        note_ember_rendezvous_lookup(&mut state, peers.len(), converted);
                         info!(
                             "Ember rendezvous lookup finished: {found} advertised peer(s), \
-                             {} after dropping self, {keys_learned} new dialable Noise key(s) \
+                             {} after dropping self, {converted} already overlay contact(s), \
+                             {keys_learned} new dialable Noise key(s) \
                              ({} cached in total)",
                             peers.len(),
                             state.ember_noise_keys.len()
@@ -26258,6 +26542,73 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
+                // Presence heartbeat on this 10s timer so the 120s constant is
+                // what we actually honour. `should_refresh_presence` still
+                // refuses until `PRESENCE_HEARTBEAT_SECS` have elapsed since
+                // the last *success*, so steady-state `/register` mutations
+                // stay one per that interval. Failed attempts clear that
+                // clock so the first retry is a single bootstrap tick; after
+                // that [`presence_failure_retry_secs`] doubles 10→20→40→80
+                // and caps at the success interval.
+                if rendezvous_register_in_flight
+                    && rendezvous_register_started_at
+                        .is_some_and(|started| started.elapsed() > RENDEZVOUS_REGISTER_WATCHDOG)
+                {
+                    warn!("Rendezvous registration exceeded watchdog timeout; allowing retry");
+                    state.rendezvous_register_generation =
+                        state.rendezvous_register_generation.saturating_add(1);
+                    rendezvous_register_in_flight = false;
+                    rendezvous_register_started_at = None;
+                }
+                if should_refresh_presence(
+                    state.friend_presence_initial_done,
+                    rendezvous_register_in_flight,
+                    state.rendezvous_last_register.map(|t| t.elapsed()),
+                ) && presence_failure_retry_due(
+                    state.rendezvous_last_register.map(|t| t.elapsed()),
+                    state.rendezvous_last_attempt.map(|t| t.elapsed()),
+                    state.rendezvous_register_fail_streak,
+                ) {
+                    if let Some(rv_ip) = state.external_ip {
+                        let rv_url = settings.rendezvous_url.clone();
+                        let rv_port = advertised_tcp_port(&state);
+                        let rv_udp_port = advertised_udp_port(&state);
+                        let rv_hash = ember_hash;
+                        let rv_pubkey = ed25519_pubkey;
+                        let rv_secret = ed25519_secret_key;
+                        let (rv_friends, rv_channel_neighbors) =
+                            load_rendezvous_register_targets(&db, rv_pubkey).await;
+                        let tx = rendezvous_register_result_tx.clone();
+                        rendezvous_register_in_flight = true;
+                        rendezvous_register_started_at = Some(tokio::time::Instant::now());
+                        state.rendezvous_last_attempt = Some(std::time::Instant::now());
+                        state.rendezvous_register_generation =
+                            state.rendezvous_register_generation.saturating_add(1);
+                        let generation = state.rendezvous_register_generation;
+                        tokio::spawn(async move {
+                            let result = rendezvous::register(
+                                &rv_url,
+                                &rv_hash,
+                                rv_port,
+                                rv_udp_port,
+                                rv_ip,
+                                &rv_pubkey,
+                                &rv_secret,
+                                &rv_friends,
+                                &rv_channel_neighbors,
+                            )
+                            .await;
+                            let _ = tx.send(RendezvousRegisterResult {
+                                generation,
+                                initial: false,
+                                result,
+                            });
+                        });
+                    } else {
+                        debug!("Rendezvous heartbeat skipped: external_ip not currently known");
+                    }
+                }
+
                 // Initial friend search burst: look up all offline friends
                 // via the rendezvous server as soon as we have a known IP.
                 if !state.friend_search_initial_done
@@ -26590,10 +26941,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // and never fall silent: a tick that does nothing is the
                     // one worth reading. Session peers the public table
                     // refused count here the same way the publishers do.
+                    //
+                    // Unverified leads count as overlay contacts (bootstrap
+                    // still needs them) but not as STORE targets. Flooding
+                    // them used to log selected=82 / failed=102 against a
+                    // single seed that never completed a Noise handshake.
+                    let publishable = ember_publishable_peer_count(&state);
                     if contacts == 0 {
                         info!(
                             "Ember publish cycle: idle, Ember overlay is empty so there is \
                              nobody to publish to — queued={queued}, in-flight={in_flight}, \
+                             awaiting placement={unplaced}"
+                        );
+                    } else if publishable == 0 {
+                        info!(
+                            "Ember publish cycle: idle, holding STOREs until a verified peer \
+                             answers — contacts={contacts} ({verified} verified), \
+                             queued={queued}, in-flight={in_flight}, \
                              awaiting placement={unplaced}"
                         );
                     } else {
@@ -26632,12 +26996,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.ember_publish_pass = EmberPublishPassStats::default();
                 }
 
-                // Folded into the routing-table guard rather than returning:
-                // everything below the guard is rendezvous/friend-presence
-                // work, and an early return here defeated the whole point of
-                // the comment that follows. An eD2K-only session never leaves
-                // `Disconnected`, so the presence heartbeat never ran and the
-                // node quietly dropped off the rendezvous server.
+                // KAD publish diagnostics only. Presence heartbeat lives on
+                // `bootstrap_timer` so an eD2K-only session (status stays
+                // `Disconnected`) still refreshes rendezvous.
                 if state.stats.status == NetworkStatus::Disconnected
                     || state.routing_table.is_empty()
                 {
@@ -26664,98 +27025,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 );
                 } // end routing-table guard: publish diagnostics only
 
-                // Rendezvous / friend-presence work deliberately sits OUTSIDE
-                // the routing-table guard above. Friend discovery and hole
-                // punching go through the rendezvous server and have nothing to
-                // do with Kademlia, but while they were nested in the `else`
-                // branch a client with an empty KAD routing table — KAD
-                // disabled, or simply not bootstrapped yet — never sent a
-                // presence heartbeat and never answered a punch, so friends
-                // silently could not reach it.
-                //
-                // Rendezvous heartbeat: re-register every 2 minutes to keep
-                // our presence alive on the rendezvous server.
-                //
-                // Defensive: also re-check `state.external_ip.is_some()`
-                // before firing. `rendezvous_registered` only flips back
-                // to `false` on a full disconnect (which also resets
-                // `external_ip`), but if a future code path ever clears
-                // `external_ip` without resetting the registered flag we
-                // would otherwise hit `register()`'s required-IP contract
-                // and panic the spawned task.
-                if rendezvous_register_in_flight
-                    && rendezvous_register_started_at
-                        .is_some_and(|started| started.elapsed() > RENDEZVOUS_REGISTER_WATCHDOG)
-                {
-                    warn!("Rendezvous registration exceeded watchdog timeout; allowing retry");
-                    state.rendezvous_register_generation =
-                        state.rendezvous_register_generation.saturating_add(1);
-                    rendezvous_register_in_flight = false;
-                    rendezvous_register_started_at = None;
-                }
-                // Keyed on having established presence at all, not on still
-                // believing we hold it. A failed heartbeat clears
-                // `rendezvous_registered`, and gating the retry on that flag
-                // closed the only door left open: the initial-registration
-                // path above is already shut by `friend_presence_initial_done`,
-                // which failure does not reset. One unlucky heartbeat — a
-                // moment's packet loss to the rendezvous server — therefore
-                // took the node off it for the rest of the session, with
-                // friends unable to find it until a reconnect, and nothing
-                // anywhere saying so. `rendezvous_last_register` is cleared on
-                // failure, so the retry goes out on the next tick.
-                if should_refresh_presence(
-                    state.friend_presence_initial_done,
-                    rendezvous_register_in_flight,
-                    state.rendezvous_last_register.map(|t| t.elapsed()),
-                ) {
-                        if let Some(rv_ip) = state.external_ip {
-                            let rv_url = settings.rendezvous_url.clone();
-                            // Heartbeat must advertise the same *kind* of
-                            // port we registered with (TCP listener, not
-                            // QUIC — see the initial registration site) —
-                            // using `advertised_tcp_port` here too means a
-                            // STUN remap discovered between heartbeats
-                            // naturally refreshes the rendezvous entry.
-                            let rv_port = advertised_tcp_port(&state);
-                            let rv_udp_port = advertised_udp_port(&state);
-                            let rv_hash = ember_hash;
-                            let rv_pubkey = ed25519_pubkey;
-                            let rv_secret = ed25519_secret_key;
-                            let (rv_friends, rv_channel_neighbors) =
-                                load_rendezvous_register_targets(&db, rv_pubkey).await;
-                            let tx = rendezvous_register_result_tx.clone();
-                            rendezvous_register_in_flight = true;
-                            rendezvous_register_started_at = Some(tokio::time::Instant::now());
-                            state.rendezvous_register_generation =
-                                state.rendezvous_register_generation.saturating_add(1);
-                            let generation = state.rendezvous_register_generation;
-                            tokio::spawn(async move {
-                                let result =
-                                    rendezvous::register(
-                                        &rv_url,
-                                        &rv_hash,
-                                        rv_port,
-                                        rv_udp_port,
-                                        rv_ip,
-                                        &rv_pubkey,
-                                        &rv_secret,
-                                        &rv_friends,
-                                        &rv_channel_neighbors,
-                                    )
-                                        .await;
-                                let _ = tx.send(RendezvousRegisterResult {
-                                    generation,
-                                    initial: false,
-                                    result,
-                                });
-                            });
-                        } else {
-                            debug!(
-                                "Rendezvous heartbeat skipped: external_ip not currently known",
-                            );
-                        }
-                }
+                // Rendezvous presence heartbeat lives on `bootstrap_timer`
+                // (10s) so it actually honours `PRESENCE_HEARTBEAT_SECS`.
+                // Punch polling was split onto `punch_poll_timer` for the
+                // same reason: this 60s arm quantized both past their TTLs.
+
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'publish_timer' panicked: {}", describe_panic(&*__p));
@@ -34196,7 +34470,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                     }
                 }
-                if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
+                if !udp_map_ka_in_flight
+                    && !tcp_map_ka_in_flight
+                    && !mapping_ka_cycle_success
+                {
                     if state.stats.stun_keepalive_active {
                         info!(
                             "STUN keepalive: cycle {} without a confirmed UDP mapping or TCP hold — marking inactive until the next cycle",
@@ -34265,7 +34542,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                     }
                 }
-                if !udp_map_ka_in_flight && !tcp_map_ka_in_flight && !mapping_ka_cycle_success {
+                if !udp_map_ka_in_flight
+                    && !tcp_map_ka_in_flight
+                    && !mapping_ka_cycle_success
+                {
                     if state.stats.stun_keepalive_active {
                         info!(
                             "STUN keepalive: cycle completed without a confirmed UDP mapping or TCP hold (tcp_hold_ok={}) — marking inactive until the next cycle",
@@ -34311,23 +34591,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
                 // Wait for any in-flight cycle; retry soon (not a full extra
                 // interval) so a slow STUN/TCP hold delays the next round by
-                // as little as possible. Realistic worst case is 79s
-                // (3×(5+8)+4×(5+5) DNS+connect timeouts). Pathological
-                // (~139s: every STUN write/read stage also times out) is
-                // abandoned at 90s on purpose — a cycle still running then
-                // has already missed four 20s keep-alive intervals.
+                // as little as possible. Realistic worst case is still 79s
+                // (3×(5+8)+4×(5+5) DNS+connect timeouts): UDP runs in
+                // parallel (≤ 5+5=10s). Pathological (~139s: every STUN
+                // write/read stage also times out) is abandoned at 90s on
+                // purpose — a cycle still running then has already missed four
+                // 20s keep-alive intervals.
                 if udp_map_ka_in_flight || tcp_map_ka_in_flight {
                     next_mapping_ka_at = now + std::time::Duration::from_secs(1);
                     return;
                 }
                 next_mapping_ka_at = now
                     + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
-                // Probe UDP and TCP independently. Equal numeric port values do
-                // not conflict because each transport has its own socket
-                // namespace.
+                // Probe UDP and TCP independently. Equal numeric port values
+                // do not conflict because each transport has its own socket
+                // namespace. QUIC is a fire-and-forget datagram from the real
+                // endpoint (no result to wait on) and is skipped until the
+                // endpoint exists. UDP and QUIC use adjacent STUN indices so
+                // they do not hit the same reflector in one cycle; the index
+                // then advances by one so UDP still walks sequentially.
                 state.mapping_ka_generation = state.mapping_ka_generation.wrapping_add(1);
                 mapping_ka_cycle_success = false;
                 let gen = state.mapping_ka_generation;
+                let ka_index = mapping_ka_server_index;
+                mapping_ka_server_index = mapping_ka_server_index.wrapping_add(1);
                 udp_map_ka_in_flight = true;
                 udp_map_ka_started_at = Some(tokio::time::Instant::now());
                 udp_map_ka_gen = Some(gen);
@@ -34335,9 +34622,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     udp_socket.clone(),
                     udp_map_ka_result_tx.clone(),
                     gen,
-                    mapping_ka_server_index,
+                    ka_index,
                 ));
-                mapping_ka_server_index = mapping_ka_server_index.wrapping_add(1);
                 tcp_map_ka_in_flight = true;
                 tcp_map_ka_started_at = Some(tokio::time::Instant::now());
                 tcp_map_ka_gen = Some(gen);
@@ -34352,6 +34638,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         mapped,
                     });
                 });
+                if let Some(quic_ep) = state
+                    .connection_broker
+                    .as_ref()
+                    .and_then(|b| b.quic_endpoint().cloned())
+                {
+                    let quic_index = ka_index.wrapping_add(1);
+                    tokio::spawn(async move {
+                        ember::mapping_keepalive::quic_mapping_keepalive(quic_ep, quic_index)
+                            .await;
+                    });
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'mapping_keepalive_timer' panicked: {}", describe_panic(&*__p));
@@ -34379,6 +34676,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         state.rendezvous_registered = true;
                         state.last_presence_blocked = outcome.existing_friends_blocked();
                         state.rendezvous_last_register = Some(std::time::Instant::now());
+                        state.rendezvous_register_fail_streak = 0;
                         if result.initial {
                             state.friend_presence_initial_done = true;
                         }
@@ -34411,6 +34709,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         state.rendezvous_registered = false;
                         state.last_presence_blocked = false;
                         state.rendezvous_last_register = None;
+                        if !result.initial {
+                            state.rendezvous_register_fail_streak =
+                                state.rendezvous_register_fail_streak.saturating_add(1);
+                        }
                         let _ = app_handle.emit(
                             "ember:friend-discoverable",
                             serde_json::json!({
@@ -39803,6 +40105,7 @@ fn ember_publish_targets_for(
         .map(|ids| {
             ids.iter()
                 .filter_map(|id| routing.get_contact(id).cloned())
+                .filter(|c| c.is_verified())
                 .collect()
         })
         .unwrap_or_default();
@@ -39820,6 +40123,9 @@ fn ember_publish_targets_for(
         for contact in routing.find_closest_prefer_verified(&target, K_EMBER_REPLICAS) {
             if out.len() >= K_EMBER_REPLICAS {
                 break;
+            }
+            if !contact.is_verified() {
+                continue;
             }
             if !out.iter().any(|held| held.node_id == contact.node_id) {
                 out.push(contact);
@@ -39926,7 +40232,7 @@ async fn maybe_publish_ember_sources(
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
 
-    if !settings.ember_native_enabled || tcp_port == 0 || ember_overlay_contact_count(state) == 0 {
+    if !settings.ember_native_enabled || tcp_port == 0 || ember_publishable_peer_count(state) == 0 {
         return;
     }
     // Prefer the confirmed external IP (eD2K HighID / KAD firewall vote).
@@ -40008,7 +40314,7 @@ async fn maybe_publish_ember_sources(
         ranked.truncate(ember_source_files_per_tick(
             publishable,
             ranked.len(),
-            ember_overlay_contact_count(state),
+            ember_publishable_peer_count(state),
         ));
         state.ember_publish_pass.selected += ranked.len();
         ranked
@@ -40166,7 +40472,7 @@ async fn maybe_publish_ember_keywords(
     settings: &AppSettings,
     local_index: &Arc<RwLock<LocalIndex>>,
 ) {
-    if !settings.ember_native_enabled || ember_overlay_contact_count(state) == 0 {
+    if !settings.ember_native_enabled || ember_publishable_peer_count(state) == 0 {
         return;
     }
     if ember_publish_queue_is_backed_up(state) {
@@ -40208,7 +40514,7 @@ async fn maybe_publish_ember_keywords(
         state.ember_publish_pass.due += ranked.len();
         ranked.truncate(ember_keyword_files_per_tick(
             publishable,
-            ember_overlay_contact_count(state),
+            ember_publishable_peer_count(state),
         ));
         state.ember_publish_pass.selected += ranked.len();
         ranked
@@ -40404,15 +40710,13 @@ async fn run_ember_maintenance(
 ) -> EmberMaintenanceResult {
     let mut result = EmberMaintenanceResult::default();
 
-    // 0) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
-    result.kad_bridge_pings_sent =
-        run_ember_kad_bridge(socket, state, force, EMBER_KAD_BRIDGE_MAX_PINGS).await;
-
-    // 0a) Disconnect detection. If nothing has spoken to us for a long
-    //     stretch the table we hold is probably stale (laptop resumed, link
-    //     dropped, every peer churned). Re-arm the bootstrap machinery rather
-    //     than sitting on a dead table: the bridge gets to retry peers it
-    //     already tried, and the self-lookup runs again once we are back.
+    // 0) Disconnect / empty-table re-arm *before* the bridge. Both paths
+    //    clear `ember_kad_bridge_attempted` so the peers we already tried
+    //    become candidates again; running the bridge first spent this
+    //    cycle's starved budget against the old backoff, then cleared it,
+    //    so an "overlay emptied" tick logged `bridge=0` with cached Noise
+    //    keys sitting unused. Drop `ember_bridge_fast_at` too, or the 1 Hz
+    //    pass still waits out its own 5 s spacing.
     let now_secs = chrono::Utc::now().timestamp();
     {
         // Falling back to the start time matters: a node that has never heard
@@ -40426,6 +40730,7 @@ async fn run_ember_maintenance(
             );
             state.ember_self_lookup_done = false;
             state.ember_kad_bridge_attempted.clear();
+            state.ember_bridge_fast_at = None;
             state.ember_rendezvous_looked_up_at = 0;
             // A re-bootstrap is a fresh join: an earlier stretch of empty
             // lookups says nothing about the network we are rejoining.
@@ -40433,7 +40738,24 @@ async fn run_ember_maintenance(
             // Only re-arm once per silent stretch, not on every tick.
             state.ember_last_inbound = Some(now_secs);
         }
+
+        let contacts = ember_overlay_contact_count(state);
+        if contacts == 0
+            && state.ember_last_overlay_contacts > 0
+            && now_secs.saturating_sub(state.ember_empty_rearmed_at) >= EMBER_EMPTY_REARM_SECS
+        {
+            info!("Ember DHT: overlay emptied, re-arming bootstrap");
+            state.ember_kad_bridge_attempted.clear();
+            state.ember_bridge_fast_at = None;
+            state.ember_rendezvous_looked_up_at = 0;
+            state.ember_empty_rearmed_at = now_secs;
+        }
+        state.ember_last_overlay_contacts = contacts;
     }
+
+    // 0a) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
+    result.kad_bridge_pings_sent =
+        run_ember_kad_bridge(socket, state, force, EMBER_KAD_BRIDGE_MAX_PINGS).await;
 
     // 0b) Staleness purge. Liveness pings alone need three consecutive
     //     misses to evict, and the ping budget is small, so a contact that
@@ -40526,21 +40848,28 @@ async fn run_ember_maintenance(
     //     our own table's answer for a distant key. Same shape as a bucket
     //     refresh: the search has no waiter, and `maybe_finish_ember_search`
     //     files the result under the key it was resolving.
-    for _ in 0..EMBER_MAINT_MAX_TARGET_LOOKUPS {
-        let Some(key) = state.ember_publish_target_queue.pop_front() else {
-            break;
-        };
-        let target = ember::dht::EmberNodeId(key);
-        match start_ember_find_node(state, target) {
-            Some(search_id) => {
-                state.ember_publish_target_lookups.insert(search_id, key);
-                drive_ember_search(socket, state, search_id).await;
-            }
-            None => {
-                // Search cap reached. Put it back so the key is not silently
-                // dropped from the rotation, and stop for this cycle.
-                state.ember_publish_target_queue.push_front(key);
+    //
+    //     Skip while nobody has answered: the first publish tick queues every
+    //     selected key, and with only the nodes_ember.dat lead to ask, those
+    //     FIND_NODEs are two more unanswered queries on the same handshake
+    //     that the liveness ping is already waiting on.
+    if state.ember_dht.routing().verified_len() > 0 {
+        for _ in 0..EMBER_MAINT_MAX_TARGET_LOOKUPS {
+            let Some(key) = state.ember_publish_target_queue.pop_front() else {
                 break;
+            };
+            let target = ember::dht::EmberNodeId(key);
+            match start_ember_find_node(state, target) {
+                Some(search_id) => {
+                    state.ember_publish_target_lookups.insert(search_id, key);
+                    drive_ember_search(socket, state, search_id).await;
+                }
+                None => {
+                    // Search cap reached. Put it back so the key is not silently
+                    // dropped from the rotation, and stop for this cycle.
+                    state.ember_publish_target_queue.push_front(key);
+                    break;
+                }
             }
         }
     }
@@ -40729,7 +41058,7 @@ async fn run_ember_maintenance(
     info!(
         "Ember DHT cycle: contacts={} ({verified_now_len} verified, {} leads, {} session), \
          announced={}, peer_lists={}, gossip={} (new {}, refused {}), pings={}, bridge={}, \
-         noise_keys={}, session_peers={}, records due={} selected={} queued={} re-armed={} \
+         noise_keys={}, keyless={}, records due={} selected={} queued={} re-armed={} \
          backlog={}",
         state.ember_dht.contact_count(),
         state
