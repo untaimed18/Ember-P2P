@@ -226,13 +226,15 @@
   // "Checking" outranks "relayed": without a known external address the
   // firewall verdict isn't settled yet, so claiming a relay is in use
   // would be guessing.
-  type Reachability = 'direct' | 'relayed' | 'checking';
+  type Reachability = 'direct' | 'relayed' | 'checking' | 'waiting_buddy';
   let reachability: Reachability = $derived(
     diag?.ember_dht_udp_unreachable
       ? 'checking'
-      : diag?.ember_dht_firewalled_publishing
-        ? 'relayed'
-        : 'direct',
+      : diag?.ember_dht_waiting_buddy
+        ? 'waiting_buddy'
+        : diag?.ember_dht_firewalled_publishing
+          ? 'relayed'
+          : 'direct',
   );
 
   let reachabilityLabel = $derived(
@@ -240,7 +242,9 @@
       ? m.ember_health_direct()
       : reachability === 'relayed'
         ? m.ember_health_relayed()
-        : m.kad_checking(),
+        : reachability === 'waiting_buddy'
+          ? m.ember_health_waiting_buddy()
+          : m.kad_checking(),
   );
 
   let reachabilityHint = $derived(
@@ -248,7 +252,9 @@
       ? m.ember_health_direct_hint()
       : reachability === 'relayed'
         ? m.ember_dht_firewalled_publishing_hint()
-        : m.ember_dht_udp_unreachable_hint(),
+        : reachability === 'waiting_buddy'
+          ? m.ember_dht_waiting_buddy_hint()
+          : m.ember_dht_udp_unreachable_hint(),
   );
 
   // Deliberately the live count of files with a placed source record, not the
@@ -279,7 +285,7 @@
   );
 
   let reachabilityTone: PillTone = $derived(
-    reachability === 'direct' ? 'ok' : reachability === 'relayed' ? 'warn' : 'muted',
+    reachability === 'direct' ? 'ok' : reachability === 'relayed' || reachability === 'waiting_buddy' ? 'warn' : 'muted',
   );
 
   let sharingPillLabel = $derived(

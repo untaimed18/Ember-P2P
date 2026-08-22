@@ -57,6 +57,9 @@ export interface UpdaterState {
    *  a failed run leaves the phase at `error` with a "Later" button still
    *  showing, which put the leak straight back. */
   fromHandoff: boolean;
+  /** Manifest existed but `latest.json.sig` did not. Survives silent checks
+   *  so Settings does not look current. */
+  signatureMissing: boolean;
 }
 
 interface UpdateHandoffReport {
@@ -77,6 +80,7 @@ interface SecureUpdateCheckResult {
   update: SecureUpdateInfo | null;
   pendingRetained: boolean;
   error?: string | null;
+  signatureMissing?: boolean;
 }
 
 type SecureUpdateProgress =
@@ -96,6 +100,7 @@ const INITIAL: UpdaterState = {
   dismissed: false,
   installerReady: false,
   fromHandoff: false,
+  signatureMissing: false,
 };
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
@@ -285,7 +290,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // button that runs the already-downloaded installer — was destroyed a couple
   // of seconds after startup by the routine silent check.
   const staged = takeStagedSnapshot();
-  updater.update((s) => ({ ...s, phase: 'checking', error: null }));
+  updater.update((s) => ({ ...s, phase: 'checking', error: null, signatureMissing: false }));
   try {
     const result = await invoke<SecureUpdateCheckResult>('secure_updater_check');
     const found = result.update;
@@ -326,10 +331,25 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
         // installer rather than offering the old one.
         installerReady: false,
         fromHandoff: false,
+        signatureMissing: false,
       });
       return true;
     }
     await disposePending();
+    if (result.signatureMissing) {
+      retryAction = 'check';
+      if (staged) {
+        restoreStaged(staged);
+        return false;
+      }
+      updater.set({
+        ...INITIAL,
+        phase: opts.silent ? 'idle' : 'error',
+        error: m.updater_signature_missing(),
+        signatureMissing: true,
+      });
+      return false;
+    }
     if (result.error && !opts.silent) {
       retryAction = 'check';
       // A check that failed says nothing about the staged installer either, and

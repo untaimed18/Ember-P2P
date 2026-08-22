@@ -4132,7 +4132,7 @@ impl Ed2kDownload {
                             }
                             consecutive_bad_blocks = 0;
                             let piece_len = end - start;
-                            self.acquire_download_bandwidth(piece_len).await;
+                            self.acquire_download_bandwidth(piece_len).await?;
 
                             // Never overwrite bytes we already have. Write ONLY the
                             // gap sub-ranges of this block, not the whole block: a
@@ -4309,7 +4309,7 @@ impl Ed2kDownload {
                                 continue;
                             }
                             consecutive_bad_blocks = 0;
-                            self.acquire_download_bandwidth(piece_len).await;
+                            self.acquire_download_bandwidth(piece_len).await?;
 
                             // D21 (compressed): write ONLY the gap sub-ranges of the
                             // decompressed block, never the whole block — see the
@@ -5372,8 +5372,11 @@ impl Ed2kDownload {
         Ok(())
     }
 
-    async fn acquire_download_bandwidth(&self, bytes: u64) {
-        self.bandwidth_limiter.acquire_download(bytes).await;
+    async fn acquire_download_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
+        if !self.bandwidth_limiter.acquire_download(bytes).await {
+            anyhow::bail!("bandwidth limiter stopped");
+        }
+        Ok(())
     }
 }
 

@@ -3042,7 +3042,9 @@ async fn request_friend_transfer(
             };
         }
     };
-    let transport = transport.expect("a Send decision implies a usable transport");
+    let Ok(transport) = transport else {
+        return FriendXferRequestOutcome::Refused;
+    };
 
     let session = state
         .ember_sessions
@@ -6997,7 +6999,7 @@ mod tests {
     }
 
     /// Build a `FOUND_VALUE`-shaped keyword blob (`record_data || signature`)
-    /// signed by `sk`, matching what `build_ember_keyword_results` parses.
+    /// signed by `sk`, matching what `build_ember_keyword_built` parses.
     fn ember_kw_blob(
         sk: &ed25519_dalek::SigningKey,
         keyword: &str,
@@ -8055,7 +8057,7 @@ mod tests {
             ember_kw_blob(&sk2, "ubuntu", hash_a, 100, "ubuntu-24.iso"),
             ember_kw_blob(&sk1, "ubuntu", hash_b, 200, "ubuntu-server.iso"),
         ];
-        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()], None);
+        let results = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None).results;
         assert_eq!(results.len(), 2, "two distinct files");
         let a = results
             .iter()
@@ -8088,11 +8090,12 @@ mod tests {
             ember_kw_blob(&sk, "ubuntuiso", hash_a, 1, "ubuntuiso server amd64"),
             ember_kw_blob(&sk, "ubuntuiso", hash_b, 1, "ubuntuiso desktop amd64"),
         ];
-        let results = build_ember_keyword_results(
+        let results = build_ember_keyword_built(
             &blobs,
             &["ubuntuiso".to_string(), "server".to_string()],
             None,
-        );
+        )
+        .results;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file.hash, hex::encode(hash_a));
     }
@@ -8118,7 +8121,7 @@ mod tests {
             "ubuntu server amd64.iso",
         )];
 
-        let results = build_ember_keyword_results(&blobs, &keywords, None);
+        let results = build_ember_keyword_built(&blobs, &keywords, None).results;
         assert_eq!(
             results.len(),
             1,
@@ -8145,14 +8148,14 @@ mod tests {
         // keyword AND would drop it.
         let or_expr = crate::search::query::parse("matrix OR reloaded")
             .expect("query parses to an expression");
-        let or_results = build_ember_keyword_results(&blobs, &keywords, Some(&or_expr));
+        let or_results = build_ember_keyword_built(&blobs, &keywords, Some(&or_expr)).results;
         assert_eq!(or_results.len(), 2, "OR keeps both sides");
 
         // A NOT query must drop the excluded file even though the excluded
         // term never appears in the flattened positive keywords.
         let not_expr = crate::search::query::parse("reloaded -documentary").expect("query parses");
         let not_results =
-            build_ember_keyword_results(&blobs, &["reloaded".to_string()], Some(&not_expr));
+            build_ember_keyword_built(&blobs, &["reloaded".to_string()], Some(&not_expr)).results;
         assert_eq!(not_results.len(), 1, "NOT excludes the negated match");
         assert_eq!(not_results[0].file.hash, hex::encode(hash_a));
     }
@@ -8180,7 +8183,7 @@ mod tests {
         source_blob.extend_from_slice(&source.signature);
         // A source record (wrong type) and an undersized garbage blob.
         let blobs = vec![source_blob, vec![0u8; 8]];
-        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()], None);
+        let results = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None).results;
         assert!(
             results.is_empty(),
             "source records and garbage must not become keyword hits"
@@ -19100,6 +19103,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_file_assembly: HashMap::new(),
     };
 
+    kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
+
     // Seed the Ember DHT routing table from the last session's persisted
     // contacts (slice 7). This is the native equivalent of KAD's
     // `nodes.dat` and is what lets Ember rejoin the DHT after a restart
@@ -19357,7 +19362,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let credit_save_ownership = Arc::new(tokio::sync::Mutex::new(()));
 
     // Load credits from DB (primary) and clients.met (fallback), persist RSA keypair
-    let credit_manager: Arc<RwLock<CreditManager>> = {
+    let (credit_manager, secident_status, crypto_unreadable): (
+        Arc<RwLock<CreditManager>>,
+        &'static str,
+        bool,
+    ) = {
         let mut cm = CreditManager::new();
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
@@ -19465,6 +19474,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 pruned_after
             );
         }
+        let secident_status = cm.secident_status();
+        let crypto_unreadable = cm.crypto_unreadable();
         let arc = Arc::new(RwLock::new(cm));
         // L6: pair the startup prune with an immediate disk flush so
         // a crash inside the first 60-s save tick can't reload the
@@ -19481,8 +19492,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 credit_save_ownership.clone(),
             );
         }
-        arc
+        (arc, secident_status, crypto_unreadable)
     };
+
+    state.stats.secident_status = secident_status.to_string();
+    if crypto_unreadable {
+        let _ = app_handle.emit("secident-key-unreadable", ());
+    }
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
     let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
@@ -26810,6 +26826,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // separately in the UI for detailed status.
                     state.stats.firewalled = state.firewalled;
                     state.firewalled_shared.store(state.firewalled, std::sync::atomic::Ordering::Relaxed);
+                    kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
                     update_publish_manager_state(&mut state);
                     let tcp_status = state.firewall_checker.tcp_status();
                     let udp_status = state.firewall_checker.udp_status();
@@ -40366,34 +40383,6 @@ fn parse_ember_source_records(
     out
 }
 
-/// Build `SearchResult`s from the blobs returned by an Ember DHT keyword
-/// `FIND_VALUE` (slice 10).
-///
-/// Each blob is re-verified (`from_value_blob` checks the publisher
-/// signature), kept only if it is a keyword record whose embedded
-/// `keyword_hash` matches the primary query keyword (defense in depth vs
-/// a LOOKUP peer returning unrelated signed records), and -- for multi-word
-/// queries -- AND-filtered so every query keyword appears in the file name
-/// (the DHT key only matched the primary keyword). Records are deduped by
-/// eD2K file hash, with `availability` reflecting the number of distinct
-/// publishers seen for that file. Sources are intentionally empty: a
-/// keyword hit identifies the file, and source discovery runs separately
-/// via the slice-9 source lookup when a download starts.
-/// User keyword search (slice 10): build SearchResults from gathered
-/// keyword records. Multi-keyword queries already ask peers to intersect
-/// by `file_hash` on the wire; this still applies a filename substring AND
-/// as defense-in-depth (and for peers that only held the primary key).
-/// Rows for a keyword hit. Each row's `ember_file_hash` is the plurality
-/// digest (shown so a click can pin a unique file). Automatic seeding of
-/// the enforced map uses only [`EmberKeywordBuilt::corroborated`].
-fn build_ember_keyword_results(
-    blobs: &[Vec<u8>],
-    keywords: &[String],
-    query_expr: Option<&crate::search::query::QueryExpr>,
-) -> Vec<SearchResult> {
-    build_ember_keyword_built(blobs, keywords, query_expr).results
-}
-
 struct EmberKeywordBuilt {
     results: Vec<SearchResult>,
     /// Digests at least two publishers agree on — safe to `or_insert` into
@@ -40401,6 +40390,24 @@ struct EmberKeywordBuilt {
     corroborated: Vec<([u8; 16], [u8; 32])>,
 }
 
+/// Build search rows from Ember DHT keyword `FIND_VALUE` blobs (slice 10).
+///
+/// Each blob is re-verified (`from_value_blob` checks the publisher
+/// signature), kept only if it is a keyword record whose embedded
+/// `keyword_hash` matches the primary query keyword (defense in depth vs
+/// a LOOKUP peer returning unrelated signed records), and -- for multi-word
+/// queries -- AND-filtered so every query keyword appears in the file name
+/// (the DHT key only matched the primary keyword). Multi-keyword queries
+/// already ask peers to intersect by `file_hash` on the wire; the filename
+/// filter is defense-in-depth (and for peers that only held the primary
+/// key). Records are deduped by eD2K file hash, with `availability`
+/// reflecting the number of distinct publishers. Sources are empty: a
+/// keyword hit identifies the file, and source discovery runs separately
+/// via the slice-9 source lookup when a download starts.
+///
+/// Each row's `ember_file_hash` is the plurality digest (shown so a click
+/// can pin a unique file). Automatic seeding of the enforced map uses only
+/// [`EmberKeywordBuilt::corroborated`].
 fn build_ember_keyword_built(
     blobs: &[Vec<u8>],
     keywords: &[String],
@@ -41690,6 +41697,7 @@ async fn maybe_publish_ember_sources(
     let needs_buddy = firewalled_like || udp_needs_help;
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
+    state.ember_diagnostics.ember_dht_waiting_buddy = false;
 
     if !settings.ember_native_enabled || tcp_port == 0 || ember_publishable_peer_count(state) == 0 {
         return;
@@ -41721,7 +41729,32 @@ async fn maybe_publish_ember_sources(
         },
     };
 
-    if needs_buddy {
+    // The HighID named in the trailer — and the only contact we PROXY_STORE.
+    // Computed before gauges so a firewalled node with no buddy is not
+    // advertised as "relayed / sharing still works" while STORE is skipped.
+    let named_buddy: Option<(ember::dht::EmberContact, ember::dht::publish::SourceBuddy)> =
+        if firewalled_like {
+            let mut c = state.ember_dht.contacts();
+            for extra in state.ember_session_dht_contacts.values() {
+                if !c.iter().any(|held| held.node_id == extra.node_id) {
+                    c.push(extra.clone());
+                }
+            }
+            c.retain(|x| {
+                x.node_id != state.ember_dht.local_id()
+                    && x.failed_queries == 0
+                    && x.is_verified()
+            });
+            c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            c.into_iter()
+                .find_map(|contact| ember_named_source_buddy(&contact).map(|buddy| (contact, buddy)))
+        } else {
+            None
+        };
+
+    if firewalled_like && named_buddy.is_none() {
+        state.ember_diagnostics.ember_dht_waiting_buddy = true;
+    } else if needs_buddy {
         state.ember_diagnostics.ember_dht_firewalled_publishing = true;
     }
 
@@ -41808,29 +41841,6 @@ async fn maybe_publish_ember_sources(
     } else if needs_buddy {
         flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
     }
-
-    // The HighID named in the trailer — and the only contact we PROXY_STORE.
-    // Naming one buddy while asking three left consume CALLBACK_REQ-ing a
-    // node that never accepted the record.
-    let named_buddy: Option<(ember::dht::EmberContact, ember::dht::publish::SourceBuddy)> =
-        if firewalled_like {
-            let mut c = state.ember_dht.contacts();
-            for extra in state.ember_session_dht_contacts.values() {
-                if !c.iter().any(|held| held.node_id == extra.node_id) {
-                    c.push(extra.clone());
-                }
-            }
-            c.retain(|x| {
-                x.node_id != state.ember_dht.local_id()
-                    && x.failed_queries == 0
-                    && x.is_verified()
-            });
-            c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-            c.into_iter()
-                .find_map(|contact| ember_named_source_buddy(&contact).map(|buddy| (contact, buddy)))
-        } else {
-            None
-        };
 
     let mut contact = ember::dht::publish::SourceContact {
         ip: external_ip,
@@ -46205,6 +46215,7 @@ async fn handle_udp_packet_inner(
                 state.firewall_checker.handle_udp_firewall_result(true);
                 state.udp_firewalled = false;
                 state.udp_fw_verified = true;
+                kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
                 state.stats.firewalled = state.firewalled;
                 if udp_port > 0
                     && !stun_udp_mapping_active(state)

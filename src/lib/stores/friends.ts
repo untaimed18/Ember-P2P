@@ -10,12 +10,23 @@ import {
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
+import { toastError } from '$lib/stores/toast';
+import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
 export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
+let friendsSeedFailedToast = false;
+
+function noteFriendsSeedFailure(what: string, e: unknown) {
+  console.warn(`friends: seed ${what} failed`, e);
+  if (!friendsSeedFailedToast) {
+    friendsSeedFailedToast = true;
+    toastError(m.friends_init_failed());
+  }
+}
 /**
  * Whether a registration attempt has actually come back failed, as opposed to
  * simply not having succeeded yet. The two look identical through
@@ -342,7 +353,9 @@ export async function initFriendsStore() {
     const reqs = await getFriendRequests();
     if (myEpoch !== storeEpoch) return;
     friendRequests.set(reqs);
-  } catch { /* backend not ready yet */ }
+  } catch (e) {
+    noteFriendsSeedFailure('getFriendRequests', e);
+  }
 
   try {
     const counts = await getUnreadMessageCounts();
@@ -359,7 +372,9 @@ export async function initFriendsStore() {
       }
       return next;
     });
-  } catch { /* backend not ready yet */ }
+  } catch (e) {
+    noteFriendsSeedFailure('getUnreadMessageCounts', e);
+  }
 
   // M6: previously `isDiscoverable` only flipped when the backend
   // emitted `ember:friend-discoverable`, which doesn't fire until
@@ -372,7 +387,9 @@ export async function initFriendsStore() {
     const discoverable = await isFriendDiscoverable();
     if (myEpoch !== storeEpoch) return;
     isDiscoverable.set(discoverable);
-  } catch { /* backend not ready yet */ }
+  } catch (e) {
+    noteFriendsSeedFailure('isFriendDiscoverable', e);
+  }
 
   // Seed the online set from the backend's current view so friends don't all
   // show offline (chat/browse disabled) until the next `ember:friend-online`
@@ -382,7 +399,9 @@ export async function initFriendsStore() {
     const online = await getOnlineFriends();
     if (myEpoch !== storeEpoch) return;
     onlineFriends.update((s) => new Set([...s, ...online]));
-  } catch { /* backend not ready yet */ }
+  } catch (e) {
+    noteFriendsSeedFailure('getOnlineFriends', e);
+  }
 }
 
 export function clearUnread(friendHash: string) {

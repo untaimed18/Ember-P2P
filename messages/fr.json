@@ -152,7 +152,7 @@
   "ember_copied": "Copié",
   "ember_copy_failed": "Échec",
   "ember_about_title": "À propos du réseau Ember",
-  "ember_about_text": "Le Réseau Ember n'a aucun serveur : votre application trouve les autres personnes directement et chaque connexion est chiffrée de bout en bout. Les recherches, les téléchargements et les fichiers que vous partagez y transitent tous. Il fonctionne en parallèle des réseaux eMule, vous conservez donc l'accès aux deux.",
+  "ember_about_text": "Le Réseau Ember n'a aucun serveur : votre application trouve les autres personnes directement et chaque connexion est chiffrée de bout en bout. Les recherches et la découverte de sources passent par Ember DHT. Les octets de fichier transitent encore par le protocole eD2K jusqu'à l'activation du transfert Ember natif. Il fonctionne en parallèle des réseaux eMule, vous conservez donc l'accès aux deux.",
   "ember_disabled_explainer": "Activez Ember pour rechercher, télécharger et partager des fichiers directement avec d'autres utilisateurs d'Ember.",
   "ember_toggle_failed": "Impossible de modifier le paramètre du réseau Ember : {error}",
   "ember_load_failed": "Échec du chargement de l'état du réseau Ember : {error}",
@@ -2563,5 +2563,13 @@
   "error_channels_handoff_failed": "Impossible de transférer la propriété : {detail}",
   "error_channels_file_too_large": "Les pièces jointes doivent faire entre 1 octet et 256 Ko",
   "error_channels_file_failed": "Impossible de charger la pièce jointe : {detail}",
-  "error_channels_attach_failed": "Impossible de joindre le fichier : {detail}"
+  "error_channels_attach_failed": "Impossible de joindre le fichier : {detail}",
+  "ember_health_waiting_buddy": "En attente d'un relais",
+  "ember_dht_waiting_buddy_hint": "Vous êtes derrière un pare-feu et aucun buddy HighID n'est encore disponible, Ember ne peut donc pas publier vos fichiers partagés tant qu'un n'est pas trouvé.",
+  "wizard_kad_off_warning": "Sans KAD, Ember n'a pas de liste de seeds. Vous pourrez chercher sur Ember DHT une fois des pairs présents, mais le premier contact peut prendre plus longtemps.",
+  "search_query_syntax_hint_ember": "La recherche Ember exige chaque mot dans le nom de fichier. AND / OR / NOT ne s'appliquent qu'à eD2K (KAD et serveurs).",
+  "updater_signature_missing": "Le flux de mises à jour n'a pas de signature. Ember ne prétendra pas que vous êtes à jour.",
+  "secident_key_unreadable": "Votre clé d'identification sécurisée n'a pas pu être lue. Les crédits sont désactivés jusqu'à récupération de la clé.",
+  "friends_init_failed": "Impossible de charger les données d'amis. Certaines fonctions peuvent être indisponibles jusqu'au redémarrage.",
+  "statusbar_shared_refresh_failed": "Impossible d'actualiser le nombre de fichiers partagés."
 }

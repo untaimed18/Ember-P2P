@@ -4,6 +4,7 @@
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatSpeed } from '$lib/utils';
+  import { addToast } from '$lib/stores/toast';
   import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import * as m from '$lib/paraglide/messages';
 
@@ -13,6 +14,7 @@
   let sharedCount = $state(0);
   let sharedBytes = $state(0);
   let sharedRefreshGen = 0;
+  let sharedRefreshFailedToast = false;
   let emberJoinTimedOut = $state(false);
   let emberJoinSince: number | null = null;
   let emberJoinTimer: ReturnType<typeof setTimeout> | null = null;
@@ -62,9 +64,12 @@
           sharedCount = stats.count;
           sharedBytes = stats.total_bytes;
         }
-      } catch {
-        // Backend not ready / transient IPC failure — the next
-        // shared-files-changed event (or remount) will reconcile.
+      } catch (e) {
+        console.warn('StatusBar: getSharedFileCount failed', e);
+        if (!sharedRefreshFailedToast) {
+          sharedRefreshFailedToast = true;
+          addToast('warning', m.statusbar_shared_refresh_failed());
+        }
       }
     }
 
@@ -75,7 +80,14 @@
     // sync without polling.
     const unlistenPromise = listen('shared-files-changed', () => {
       void refreshSharedCount();
-    }).catch(() => () => {});
+    }).catch((e) => {
+      console.warn('StatusBar: shared-files-changed listen failed', e);
+      if (!sharedRefreshFailedToast) {
+        sharedRefreshFailedToast = true;
+        addToast('warning', m.statusbar_shared_refresh_failed());
+      }
+      return () => {};
+    });
 
     return () => {
       active = false;

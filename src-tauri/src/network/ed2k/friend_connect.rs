@@ -145,7 +145,7 @@ pub async fn run_friend_session_over_transport(
         supports_crypt_layer: obfuscate,
         requests_crypt_layer: obfuscate,
         requires_crypt_layer: false,
-        supports_direct_udp_callback: false,
+        supports_direct_udp_callback: crate::network::kad::firewall::advertised_direct_udp_callback(),
         supports_captcha: false,
         server_ip: 0,
         server_port: 0,

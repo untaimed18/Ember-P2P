@@ -546,7 +546,7 @@ mod tests {
     /// divergences stay out of it: the frontend takes `max` where `merge_into`
     /// sums ed2k availability (the backend has already summed within a network),
     /// it keeps the first name where `merge_search_vecs` elects one by vote, and
-    /// it does not cap `source_addresses`.
+    /// both sides cap `source_addresses` at `MAX_SOURCE_ADDRS`.
     fn merge_contract_fixture() -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/fixtures/merge-contract.json");
@@ -620,6 +620,18 @@ mod tests {
                 "clamp_source_count({count})"
             );
         }
+    }
+
+    #[test]
+    fn source_address_cap_matches_the_shared_merge_contract() {
+        let fixture = merge_contract_fixture();
+        assert_eq!(
+            MAX_SOURCE_ADDRS as u64,
+            fixture["max_source_addrs"]
+                .as_u64()
+                .expect("fixture has max_source_addrs"),
+            "the source-address cap drifted from the shared contract"
+        );
     }
 
     #[test]

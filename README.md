@@ -209,7 +209,7 @@ This is a **static** DH, not a ratchet. It gives confidentiality and integrity a
 - **Friends-Only Shares** — Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.
 - **Friend File Offers** — Push a specific shared file to a mutual friend; it arrives as an actionable notification they can accept or decline.
 - **Friend Transfers Without HighID** — Mutual-friend downloads can use the secure friend session (and optional peer relay) when HighID or callback paths are unavailable.
-- **Priority Upload Slots** — Mutual friends jump ahead in your upload queue on authenticated sessions. Ordinary eMule file connections do not.
+- **Priority Upload Slots** — Friends you have listed get queue priority on authenticated sessions (one-sided). Private friends-only content still requires mutual friendship. Ordinary eMule file connections do not.
 - **Friend Block List** — Block a Friend ID to reject future requests, chat, browse and offers from that identity. Blocking removes any existing mutual friendship, and unblocking does not restore it.
 - **Optional Peer Relaying** — **Relay for other peers** (Settings) lets your client carry traffic for peers that cannot reach each other directly. It is what makes transfers work behind strict NATs, and it spends your upload bandwidth on people you are not trading with, so it can be turned off.
 

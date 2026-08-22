@@ -135,6 +135,19 @@ test("the Rust side derives its ceiling from the same wire limit", () => {
   );
 });
 
+test("the source-address cap matches the fixture on both sides", () => {
+  assert.equal(fixture.max_source_addrs, 500);
+  const rust = readFileSync(rustMergePath, "utf8");
+  assert.match(
+    rust,
+    /const MAX_SOURCE_ADDRS: usize = 500;/,
+    "src-tauri/src/search/merge.rs no longer pins MAX_SOURCE_ADDRS at 500",
+  );
+  const declared = store.match(/const MAX_SOURCE_ADDRS = (\d+)/);
+  assert.ok(declared, "MAX_SOURCE_ADDRS is no longer declared in src/lib/stores/search.ts");
+  assert.equal(Number(declared[1]), fixture.max_source_addrs);
+});
+
 test("the fixture actually carries cases", () => {
   // Guards the loader itself: an empty or renamed section would make every
   // check above pass by iterating nothing.

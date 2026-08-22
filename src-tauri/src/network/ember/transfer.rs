@@ -140,6 +140,11 @@ impl ChunkRequest {
         let mut ember_file_hash = [0u8; 32];
         ember_file_hash.copy_from_slice(&data[1..33]);
         let count = u32::from_le_bytes(data[33..37].try_into().ok()?) as usize;
+        // Cap before allocating; a huge `count` would OOM on a dormant path.
+        const MAX_CHUNK_REQUEST: usize = 1024;
+        if count > MAX_CHUNK_REQUEST {
+            return None;
+        }
         if data.len() < 37 + count * 4 {
             return None;
         }
@@ -189,6 +194,9 @@ impl ChunkData {
         ember_file_hash.copy_from_slice(&data[1..33]);
         let chunk_index = u32::from_le_bytes(data[33..37].try_into().ok()?);
         let data_len = u32::from_le_bytes(data[37..41].try_into().ok()?) as usize;
+        if data_len > CHUNK_SIZE {
+            return None;
+        }
         if data.len() < 41 + data_len {
             return None;
         }
@@ -380,6 +388,24 @@ mod tests {
         assert_eq!(decoded.ember_file_hash, chunk.ember_file_hash);
         assert_eq!(decoded.chunk_index, chunk.chunk_index);
         assert_eq!(decoded.data, chunk.data);
+    }
+
+    #[test]
+    fn chunk_request_decode_rejects_huge_count() {
+        let mut buf = vec![0x01];
+        buf.extend_from_slice(&[0xAA; 32]);
+        buf.extend_from_slice(&(100_000u32).to_le_bytes());
+        assert!(ChunkRequest::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn chunk_data_decode_rejects_oversize_payload() {
+        let mut buf = vec![0x02];
+        buf.extend_from_slice(&[0xBB; 32]);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&((CHUNK_SIZE as u32) + 1).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        assert!(ChunkData::decode(&buf).is_none());
     }
 
     #[test]

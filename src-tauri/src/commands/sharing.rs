@@ -969,6 +969,25 @@ fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<F
     needs_hashing
 }
 
+/// After hashing, restore share-intent and friends-only from known.met by
+/// hash. Path+meta matching already did this at discovery; a rehash (mtime
+/// changed, content unchanged) would otherwise keep `discover_file`'s
+/// `friends_only: false` and publish a restricted file to the open network.
+fn restore_known_hash_flags(file: &mut FileInfo, known: &KnownFileList) {
+    let Ok(bytes) = hex::decode(&file.hash) else {
+        return;
+    };
+    if bytes.len() != 16 {
+        return;
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&bytes);
+    file.shared = crate::storage::share_intent::effective_shared(&hash, file.shared);
+    if let Some(record) = known.find_by_hash(&hash) {
+        file.friends_only = record.friends_only;
+    }
+}
+
 /// Apply a folder's configured default priority only to paths that need a new
 /// hash. Known files keep their persisted per-file priority, while pending
 /// files and their later hash-completion replacements inherit this value.
@@ -1618,16 +1637,7 @@ pub async fn add_shared_folder(
                     updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
-                    if let Ok(bytes) = hex::decode(&updated_file.hash) {
-                        if bytes.len() == 16 {
-                            let mut hash = [0u8; 16];
-                            hash.copy_from_slice(&bytes);
-                            updated_file.shared = crate::storage::share_intent::effective_shared(
-                                &hash,
-                                updated_file.shared,
-                            );
-                        }
-                    }
+                    restore_known_hash_flags(&mut updated_file, &known_list);
 
                     let still_shared = {
                         let cfg = config.read().await;
@@ -3169,16 +3179,7 @@ async fn reload_shared_files_page(
                     updated_file.ember_file_hash = ember_file_hash;
                     updated_file.size = hashed_size;
                     updated_file.modified_at = hashed_modified_at;
-                    if let Ok(bytes) = hex::decode(&updated_file.hash) {
-                        if bytes.len() == 16 {
-                            let mut hash = [0u8; 16];
-                            hash.copy_from_slice(&bytes);
-                            updated_file.shared = crate::storage::share_intent::effective_shared(
-                                &hash,
-                                updated_file.shared,
-                            );
-                        }
-                    }
+                    restore_known_hash_flags(&mut updated_file, &known_list);
 
                     let still_shared = {
                         let cfg = config.read().await;

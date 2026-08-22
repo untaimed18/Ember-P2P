@@ -43,7 +43,7 @@
   /// short; this just guards against pathologically long pasted input.
   const MAX_SEARCH_QUERY_LEN = 256;
 
-  let searchMethod: SearchMethod = $state('global');
+  let searchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
 
   let barQuery = $state('');
@@ -914,7 +914,9 @@
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
       })
-      .catch(() => {});
+      .catch((e) => {
+        console.warn('search: getSettings failed', e);
+      });
 
     // Poll Ember DHT contact count while Ember is enabled so the readiness
     // strip can show "joining" vs "ready" without navigating to /ember.
@@ -952,7 +954,9 @@
       if (hashes.length > 0) queueHistoryFetch(hashes);
     }).then((u) => {
       if (historyListenMounted) unlistenHistory = u; else u();
-    }).catch(() => {});
+    }).catch((e) => {
+      console.warn('search: download-history-cleared listen failed', e);
+    });
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
@@ -2404,6 +2408,9 @@
   {/if}
 </div>
 <p class="search-syntax-hint">{m.search_query_syntax_hint()}</p>
+{#if searchMethod === 'ember' || searchMethod === 'global'}
+  <p class="search-syntax-hint">{m.search_query_syntax_hint_ember()}</p>
+{/if}
 
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>

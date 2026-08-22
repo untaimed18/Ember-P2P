@@ -1097,7 +1097,7 @@ async fn handle_command_inner(
                         tcp_port: advertised_tcp_port(&state),
                         udp_port: advertised_udp_port(&state),
                         bandwidth_limiter: bandwidth_limiter.clone(),
-                        control,
+                        control: control.clone(),
                         source_manager: Some(source_manager.clone()),
                         comment_manager: Some(state.comment_manager.clone()),
                         credit_manager: Some(credit_manager.clone()),
@@ -1142,16 +1142,50 @@ async fn handle_command_inner(
                         .active_established_senders
                         .insert(tid.clone(), est_inject_tx);
                     let tx2 = tx.clone();
+                    let old_tracker = state.tracker_registry.lock().get(&tid2).cloned();
                     if let Some(old_handle) = state.download_handles.remove(&tid2) {
+                        // Per-source tasks are detached `tokio::spawn`s that
+                        // only stop when their TransferControl is cancelled.
+                        // Aborting the worker handle does not reach them.
+                        // Skip cancel when the manager already holds *this*
+                        // control (pause→resume registers the new one first).
+                        {
+                            let mgr = transfer_manager.read().await;
+                            if let Some(existing) = mgr.get_control(&tid2) {
+                                if !std::sync::Arc::ptr_eq(&existing, &control) {
+                                    existing.cancel();
+                                }
+                            }
+                        }
                         debug!(
                             "Aborting existing download task for {tid2} before starting new one"
                         );
                         old_handle.abort();
-                        // Match CancelDownload: wait for the old worker (and its
-                        // spawn_blocking children) to release the .part before the
-                        // new multi-source task opens it.
+                        // Parent Drop now aborts child AbortHandles. Wait for
+                        // the worker, then for in-progress claims so the new
+                        // PartFileWriter does not overlap the old one.
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle)
                             .await;
+                        if let Some(tracker) = old_tracker {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                async {
+                                    loop {
+                                        let idle = {
+                                            let t = tracker.read().await;
+                                            t.in_progress_part_count() == 0
+                                                && t.write_reservation_count() == 0
+                                        };
+                                        if idle {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(20))
+                                            .await;
+                                    }
+                                },
+                            )
+                            .await;
+                        }
                     }
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
@@ -3342,6 +3376,7 @@ async fn handle_command_inner(
             state.last_kad_contact = None;
             state.udp_firewalled = true;
             state.udp_fw_verified = false;
+            kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
             state.overloaded_nodes.clear();
             state.buddy_manager.reset().await;
             state.buddy_event_rx = None;

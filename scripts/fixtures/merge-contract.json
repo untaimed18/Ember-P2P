@@ -10,11 +10,12 @@
     "scope on purpose: Rust sums availability across ed2k-only origins while the",
     "frontend takes the max (the backend already summed within a network), Rust",
     "elects the filename by vote while the frontend keeps the first name it saw,",
-    "and only Rust caps source_addresses.",
+    "and both sides cap source_addresses (MAX_SOURCE_ADDRS).",
     "Origin cases stay within the ASCII origin labels: the two sides agree on",
     "ordering there (JS sorts by UTF-16 code unit, Rust by byte)."
   ],
   "max_plausible_sources": 65535,
+  "max_source_addrs": 500,
   "result_key_cases": [
     {
       "name": "the ed2k hash wins over every fallback",

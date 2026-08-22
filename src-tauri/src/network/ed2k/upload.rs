@@ -691,9 +691,11 @@ pub(crate) fn friends_only_snapshot_ready(set: &SharedFriendsOnlyHashes) -> bool
     }
 }
 
-/// Index row wins when present. A snapshot hit is always restricted. An
-/// index miss before the snapshot is ready is restricted (known.met-only
-/// flags have not landed yet).
+/// Snapshot hit is always restricted. Until known.met has been absorbed,
+/// fail closed even when the live index says public — hashing starts rows
+/// with `friends_only: false`, and restoring that flag from known.met can
+/// lag the first serve. After the snapshot is ready, the index row wins
+/// when present and a miss is public.
 fn friends_only_from_sources(
     snapshot_hit: bool,
     snapshot_ready: bool,
@@ -702,10 +704,10 @@ fn friends_only_from_sources(
     if snapshot_hit {
         return true;
     }
-    match index_friends_only {
-        Some(flag) => flag,
-        None => !snapshot_ready,
+    if !snapshot_ready {
+        return true;
     }
+    index_friends_only.unwrap_or(false)
 }
 
 /// Shared buddy info for including in Hello tags (updated by network task)
@@ -2823,6 +2825,7 @@ pub async fn start_upload_server(
                                 info!("TCP connect-back from {peer_addr} confirms port is open (firewall check passed)");
                                 server.tcp_connect_back_shared.store(true, std::sync::atomic::Ordering::Relaxed);
                                 server.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+                                crate::network::kad::firewall::note_local_tcp_firewalled(false);
                                 drop(stream);
                                 continue;
                             }
@@ -3384,8 +3387,7 @@ impl UploadHandler {
                 // The membership lookup is deliberately inside this branch so
                 // the overwhelmingly common public-file path never pays for
                 // the lock.
-                if (file.friends_only
-                    || friends_only_snapshot_contains(&self.friends_only_hashes, file_hash))
+                if self.hash_is_friends_only(file_hash).await
                     && !mutual_friend_access(
                         &self.mutual_friend_hashes,
                         peer.ember_hash,
@@ -3802,7 +3804,7 @@ impl UploadHandler {
                 .obfuscation_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
             requires_crypt_layer: false,
-            supports_direct_udp_callback: false,
+            supports_direct_udp_callback: crate::network::kad::firewall::advertised_direct_udp_callback(),
             supports_captcha: false,
             server_ip,
             server_port,
@@ -10855,7 +10857,13 @@ impl UploadHandler {
             anyhow::bail!("network disconnected");
         }
         tokio::select! {
-            _ = self.bandwidth_limiter.acquire_upload(bytes) => Ok(()),
+            ok = self.bandwidth_limiter.acquire_upload(bytes) => {
+                if ok {
+                    Ok(())
+                } else {
+                    anyhow::bail!("bandwidth limiter stopped")
+                }
+            }
             _ = async {
                 loop {
                     if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
@@ -11303,8 +11311,15 @@ mod friends_only_snapshot_tests {
             "after absorb, an index miss that is not in the snapshot is public"
         );
         assert!(friends_only_from_sources(true, false, Some(false)));
-        assert!(!friends_only_from_sources(false, false, Some(false)));
+        assert!(
+            friends_only_from_sources(false, false, Some(false)),
+            "index false is not trusted until the snapshot is ready"
+        );
         assert!(friends_only_from_sources(false, true, Some(true)));
+        assert!(
+            !friends_only_from_sources(false, true, Some(false)),
+            "after absorb, a public index row is public"
+        );
     }
 }
 

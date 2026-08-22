@@ -34,6 +34,10 @@ pub struct BandwidthLimiter {
     /// in-progress USS throttle.
     uss_active: AtomicBool,
     refill_notify: Arc<Notify>,
+    /// Starts true so unit tests without a refill task still park on an empty
+    /// bucket. The refill task sets this false on Drop so waiters abort
+    /// instead of hanging forever.
+    refill_alive: AtomicBool,
 }
 
 impl BandwidthLimiter {
@@ -54,33 +58,45 @@ impl BandwidthLimiter {
             smoothed_download: AtomicU64::new(0),
             uss_active: AtomicBool::new(false),
             refill_notify: Arc::new(Notify::new()),
+            refill_alive: AtomicBool::new(true),
         }
     }
 
-    /// Acquire upload bandwidth. Drains tokens in chunks if the piece is larger
-    /// than the current bucket, waiting for refills between chunks.
-    pub async fn acquire_upload(&self, bytes: u64) {
+    /// Acquire upload bandwidth. Returns `false` if the refill task has died
+    /// and tokens cannot be obtained without bypassing the cap. Callers must
+    /// abort the transfer rather than send unbounded.
+    pub async fn acquire_upload(&self, bytes: u64) -> bool {
         let max = self.max_upload_rate.load(Ordering::Relaxed);
         if max == 0 {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
-            return;
+            return true;
         }
-        self.drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate)
-            .await;
+        if !self
+            .drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate)
+            .await
+        {
+            return false;
+        }
         self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+        true
     }
 
-    /// Acquire download bandwidth. Drains tokens in chunks if the piece is larger
-    /// than the current bucket, waiting for refills between chunks.
-    pub async fn acquire_download(&self, bytes: u64) {
+    /// Acquire download bandwidth. Returns `false` if the refill task has died
+    /// and tokens cannot be obtained without bypassing the cap.
+    pub async fn acquire_download(&self, bytes: u64) -> bool {
         let max = self.max_download_rate.load(Ordering::Relaxed);
         if max == 0 {
             self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
-            return;
+            return true;
         }
-        self.drain_tokens(&self.download_tokens, bytes, &self.max_download_rate)
-            .await;
+        if !self
+            .drain_tokens(&self.download_tokens, bytes, &self.max_download_rate)
+            .await
+        {
+            return false;
+        }
         self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
+        true
     }
 
     /// Core token drain: takes as many tokens as available per iteration,
@@ -103,17 +119,23 @@ impl BandwidthLimiter {
     /// unlimited would block forever: `refill_tokens_incremental` adds no
     /// tokens while the rate is 0, so the bucket never refills and the
     /// refill `Notify` never fires for this pool again.
-    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, max_rate: &AtomicU64) {
+    ///
+    /// Returns `false` if the refill task is gone so the caller can abort
+    /// instead of treating the remainder as unlimited.
+    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, max_rate: &AtomicU64) -> bool {
         let start = std::time::Instant::now();
         let mut warned_slow = false;
         while remaining > 0 {
             // Stop throttling immediately if the rate became "unlimited"
             // after this call started draining (0 == unlimited).
             if max_rate.load(Ordering::Relaxed) == 0 {
-                return;
+                return true;
             }
             let current = tokens.load(Ordering::Acquire);
             if current == 0 {
+                if !self.refill_alive.load(Ordering::Acquire) {
+                    return false;
+                }
                 // 25 ms wake granularity (was 100 ms). The refill task
                 // calls `notify_waiters()` on every refill — which is the
                 // primary wakeup — but the timeout is the safety net for
@@ -148,6 +170,7 @@ impl BandwidthLimiter {
                 }
             }
         }
+        true
     }
 
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).
@@ -404,6 +427,26 @@ impl BandwidthLimiter {
     pub fn smoothed_download_speed(&self) -> u64 {
         self.smoothed_download.load(Ordering::Relaxed)
     }
+
+    fn mark_refill_stopped(&self) {
+        self.refill_alive.store(false, Ordering::Release);
+        self.refill_notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub fn stop_refill_for_test(&self) {
+        self.mark_refill_stopped();
+    }
+}
+
+struct RefillAliveGuard {
+    limiter: std::sync::Arc<BandwidthLimiter>,
+}
+
+impl Drop for RefillAliveGuard {
+    fn drop(&mut self) {
+        self.limiter.mark_refill_stopped();
+    }
 }
 
 pub async fn start_token_refill(
@@ -414,6 +457,11 @@ pub async fn start_token_refill(
 ) {
     const REFILL_INTERVAL_MS: u64 = 100;
     const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
+
+    limiter.refill_alive.store(true, Ordering::Release);
+    let _refill_guard = RefillAliveGuard {
+        limiter: limiter.clone(),
+    };
 
     let max_up = limiter.max_upload_rate.load(Ordering::Relaxed);
     let mut uss = super::uss::UploadSpeedSense::new(0, max_up);
@@ -646,6 +694,17 @@ mod tests {
             .await
             .expect("acquire must return after rate switched to unlimited")
             .expect("spawned task should not panic");
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_false_when_refill_task_dies() {
+        let bw = Arc::new(BandwidthLimiter::new(1000, 1000));
+        bw.acquire_upload(1000).await;
+        bw.stop_refill_for_test();
+        let ok = tokio::time::timeout(Duration::from_secs(2), bw.acquire_upload(10_000))
+            .await
+            .expect("must not hang after refill death");
+        assert!(!ok, "dead refill must not bypass the rate cap");
     }
 
     /// Poll `done` on a short interval until it holds or the budget runs out.

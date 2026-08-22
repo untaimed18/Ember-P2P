@@ -152,7 +152,7 @@
   "ember_copied": "Kopiert",
   "ember_copy_failed": "Fehlgeschlagen",
   "ember_about_title": "Über das Ember-Netzwerk",
-  "ember_about_text": "Das Ember-Netzwerk kommt ohne Server aus: Ihre App findet andere Personen direkt, und jede Verbindung ist Ende-zu-Ende-verschlüsselt. Suchen, Downloads und Ihre freigegebenen Dateien laufen alle darüber. Es läuft parallel zu den eMule-Netzwerken, Sie behalten also Zugang zu beiden.",
+  "ember_about_text": "Das Ember-Netzwerk kommt ohne Server aus: Ihre App findet andere Personen direkt, und jede Verbindung ist Ende-zu-Ende-verschlüsselt. Suche und Quellenfindung laufen über Ember DHT. Dateibytes werden weiterhin mit dem eD2K-Protokoll übertragen, bis der native Ember-Transfer aktiv ist. Es läuft parallel zu den eMule-Netzwerken, Sie behalten also Zugang zu beiden.",
   "ember_disabled_explainer": "Schalten Sie Ember ein, um Dateien direkt mit anderen Ember-Nutzern zu suchen, herunterzuladen und zu teilen.",
   "ember_toggle_failed": "Die Einstellung für das Ember-Netzwerk konnte nicht geändert werden: {error}",
   "ember_load_failed": "Der Status des Ember-Netzwerks konnte nicht geladen werden: {error}",
@@ -2563,5 +2563,13 @@
   "error_channels_handoff_failed": "Eigentum konnte nicht übertragen werden: {detail}",
   "error_channels_file_too_large": "Anhänge müssen zwischen 1 Byte und 256 KB liegen",
   "error_channels_file_failed": "Anhang konnte nicht geladen werden: {detail}",
-  "error_channels_attach_failed": "Datei konnte nicht angehängt werden: {detail}"
+  "error_channels_attach_failed": "Datei konnte nicht angehängt werden: {detail}",
+  "ember_health_waiting_buddy": "Warten auf Relais",
+  "ember_dht_waiting_buddy_hint": "Sie sind hinter einer Firewall und es ist noch kein HighID-Buddy verfügbar, daher kann Ember Ihre geteilten Dateien erst veröffentlichen, wenn einer gefunden wird.",
+  "wizard_kad_off_warning": "Ohne KAD hat Ember keine eigene Seed-Liste. Ember-DHT-Suche funktioniert, sobald Peers da sind, der erste Kontakt kann aber länger dauern.",
+  "search_query_syntax_hint_ember": "Die Ember-Suche gleicht jedes Wort im Dateinamen ab. AND / OR / NOT gelten nur für eD2K (KAD und Server).",
+  "updater_signature_missing": "Dem Update-Feed fehlt eine Signatur. Ember gibt nicht vor, dass Sie auf dem neuesten Stand sind.",
+  "secident_key_unreadable": "Ihr Secure-Identification-Schlüssel konnte nicht gelesen werden. Credits sind deaktiviert, bis der Schlüssel wiederhergestellt ist.",
+  "friends_init_failed": "Freundesdaten konnten nicht geladen werden. Einige Funktionen sind bis zum Neustart möglicherweise nicht verfügbar.",
+  "statusbar_shared_refresh_failed": "Die Anzahl geteilter Dateien konnte nicht aktualisiert werden."
 }

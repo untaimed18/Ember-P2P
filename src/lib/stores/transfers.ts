@@ -90,11 +90,19 @@ function countServedPartBits(hex: string | undefined, partCount: number): number
 
 /**
  * Merge byte counters from a `list_transfers` snapshot with the live event
- * row. Downloads keep `Math.max` so a stale poll cannot rewind the bar.
+ * row. Downloads keep `Math.max` so a stale poll cannot rewind the bar,
+ * except after a real rewind (hash fail / searching / …): take API counters
+ * and hold live progress events until a later poll moves forward.
  * Uploads use unique coverage for `progress` / `completed_size`; `Math.max`
  * is still right (monotonic on a row) unless the event still holds the old
  * wire-capped 100% while the parts bitmap is incomplete — then prefer API.
  */
+const lastApiCompleted = new Map<string, number>();
+/** After a poll rewind, ignore live `transfer-progress` until a later poll
+ *  shows the API moving forward again. Stale coalesced events would otherwise
+ *  `Math.max` the bar back to the pre-hash-fail value. */
+const progressRewindHold = new Set<string>();
+
 function mergeProgressCounters(
   apiItem: Transfer,
   eventItem: Transfer,
@@ -104,6 +112,26 @@ function mergeProgressCounters(
   const eventCompleted = eventItem.completed_size || 0;
   const isUpload = apiItem.direction === 'upload' || eventItem.direction === 'upload';
   if (!isUpload) {
+    const prevApi = lastApiCompleted.get(apiItem.id);
+    lastApiCompleted.set(apiItem.id, apiCompleted);
+    const apiRewound = prevApi != null && apiCompleted < prevApi;
+    const apiStatus = apiItem.status;
+    if (
+      apiRewound ||
+      apiStatus === 'hashing' ||
+      apiStatus === 'verifying' ||
+      apiStatus === 'searching' ||
+      apiStatus === 'failed'
+    ) {
+      progressRewindHold.add(apiItem.id);
+      pendingProgress.delete(apiItem.id);
+      return {
+        progress: apiItem.progress,
+        transferred: apiItem.transferred || 0,
+        completed_size: apiCompleted,
+      };
+    }
+    progressRewindHold.delete(apiItem.id);
     return {
       progress: Math.max(apiItem.progress, eventItem.progress),
       transferred,
@@ -185,6 +213,7 @@ const PROGRESS_SKIP_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer
   'verifying',
   'completing',
   'hashing',
+  'searching',
   'insufficient',
   'noneneeded',
 ]);
@@ -386,6 +415,7 @@ function flushProgress() {
       }
       const existing = list[idx];
       if (PROGRESS_SKIP_STATUSES.has(existing.status)) continue;
+      if (existing.direction !== 'upload' && progressRewindHold.has(id)) continue;
       const isUpload = existing.direction === 'upload';
       const rawTransferred = isUpload ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
       const transferred = Math.max(rawTransferred, existing.transferred || 0);
@@ -892,6 +922,8 @@ export function forgetTransfer(id: string) {
   reversibleStateLeftAt.delete(id);
   sourceCountsUpdatedAt.delete(id);
   missingFromApiSince.delete(id);
+  lastApiCompleted.delete(id);
+  progressRewindHold.delete(id);
 }
 
 export function cleanupTransferStore() {
@@ -916,6 +948,8 @@ export function cleanupTransferStore() {
   reversibleStateEnteredAt.clear();
   reversibleStateLeftAt.clear();
   sourceCountsUpdatedAt.clear();
+  lastApiCompleted.clear();
+  progressRewindHold.clear();
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   if (flushRaf !== null) {

@@ -72,16 +72,11 @@ impl CommentManager {
         if !self.comments.contains_key(file_hash) && self.comments.len() >= MAX_COMMENT_FILES {
             return;
         }
-        let user_name = if user_name.len() > 256 {
-            user_name[..user_name.floor_char_boundary(256)].to_string()
-        } else {
-            user_name
-        };
-        let comment = if comment.len() > 4096 {
-            comment[..comment.floor_char_boundary(4096)].to_string()
-        } else {
-            comment
-        };
+        let user_name = crate::security::sanitize_remote_text(&user_name, 256);
+        let comment = crate::security::sanitize_remote_text(&comment, 4096);
+        if user_name.is_empty() && comment.is_empty() {
+            return;
+        }
         let entry = self.comments.entry(file_hash.to_string()).or_default();
         if let Some(existing) = entry
             .peer_comments
@@ -202,6 +197,22 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(fake, 0);
         assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 1);
+    }
+
+    #[test]
+    fn peer_comment_strips_control_and_bidi() {
+        let mut cm = CommentManager::new();
+        cm.add_peer_comment(
+            "aa",
+            "al\u{202E}ice\0".into(),
+            RATING_GOOD,
+            "hi\nthere".into(),
+            0,
+        );
+        let c = &cm.get_comments("aa").unwrap().peer_comments[0];
+        assert!(!c.user_name.contains('\0'));
+        assert!(!c.user_name.contains('\u{202E}'));
+        assert!(!c.comment.contains('\n'));
     }
 
     #[test]
