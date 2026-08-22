@@ -50,9 +50,9 @@ const PENDING_DIR: &str = "updates";
 /// a stale marker and its 15 MB installer do not live on the disk forever.
 const HANDOFF_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 
-/// Manifest or signature asset is absent at the configured endpoint. Treated as
-/// "no update available" rather than a hard check failure — common when a
-/// release exists without the hardened `latest.json.sig` yet.
+/// Manifest asset is absent at the configured endpoint. Treated as
+/// "no update available" rather than a hard check failure. A missing
+/// `latest.json.sig` when the manifest exists is [`UpdaterSignatureMissing`].
 #[derive(Debug)]
 struct UpdaterResourceMissing;
 
@@ -63,6 +63,25 @@ impl std::fmt::Display for UpdaterResourceMissing {
 }
 
 impl std::error::Error for UpdaterResourceMissing {}
+
+/// `latest.json` was present but `latest.json.sig` was not. Unlike a missing
+/// manifest (no update published), this is a check failure — never "up to date".
+#[derive(Debug)]
+struct UpdaterSignatureMissing;
+
+impl std::fmt::Display for UpdaterSignatureMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("updater signature not found")
+    }
+}
+
+impl std::error::Error for UpdaterSignatureMissing {}
+
+fn is_missing_updater_signature(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<UpdaterSignatureMissing>().is_some())
+}
 
 fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
     error
@@ -129,6 +148,8 @@ pub struct SecureUpdateCheckResult {
     pending_retained: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default)]
+    signature_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1139,13 +1160,10 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     {
         Ok(response) => response,
         Err(error) if is_missing_updater_resource(&error) => {
-            // Stock Tauri releases may publish latest.json without the hardened
-            // latest.json.sig. Until that asset exists, there is no signed update
-            // to offer — not a check failure.
-            tracing::debug!(
-                "Secure updater signature missing at configured endpoint; treating as no update"
+            tracing::warn!(
+                "Secure updater signature missing at configured endpoint; refusing to treat as up to date"
             );
-            return Ok(None);
+            return Err(UpdaterSignatureMissing.into());
         }
         Err(error) => return Err(error),
     };
@@ -1411,6 +1429,7 @@ pub async fn secure_updater_check(
                 update: Some(info),
                 pending_retained: true,
                 error: None,
+                signature_missing: false,
             })
         }
         Ok(None) => {
@@ -1425,6 +1444,7 @@ pub async fn secure_updater_check(
                 update: pending.as_ref().map(|pending| pending.info.clone()),
                 pending_retained: pending.is_some(),
                 error: None,
+                signature_missing: false,
             })
         }
         Err(error) => {
@@ -1448,10 +1468,12 @@ pub async fn secure_updater_check(
             // Return structured retention state so the UI cannot keep offering
             // Install after native pending was cleared, and can restore it when
             // native still holds a verified artifact.
+            let signature_missing = is_missing_updater_signature(&error);
             Ok(SecureUpdateCheckResult {
                 update: pending.as_ref().map(|pending| pending.info.clone()),
                 pending_retained: pending.is_some(),
                 error: Some(public_failure(UpdaterOperation::Check, error)),
+                signature_missing,
             })
         }
     }

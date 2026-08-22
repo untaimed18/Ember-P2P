@@ -365,6 +365,9 @@ export async function initNetworkStore() {
     registered.push(await listen('server-auto-connect-failed', () => {
       toastWarning(m.toast_server_auto_connect_failed());
     }));
+    registered.push(await listen('secident-key-unreadable', () => {
+      toastError(m.secident_key_unreadable());
+    }));
   } catch (e) {
     for (const u of registered) u();
     // Only relinquish the flag if this init still owns the store; a later init

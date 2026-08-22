@@ -34,6 +34,24 @@ use super::transfer::{
 /// persist `.part.met` files even when download tasks are aborted.
 pub type SharedTrackerRegistry = Arc<parking_lot::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
 
+/// Drop this worker's registry row only if it still owns the slot.
+/// StartDownload can insert a replacement Arc under the same transfer id
+/// while a timed-out predecessor is still unwinding; a bare `remove(id)`
+/// would delete the live worker's tracker.
+fn unregister_own_tracker(
+    registry: &SharedTrackerRegistry,
+    transfer_id: &str,
+    tracker: &Arc<RwLock<PartTracker>>,
+) {
+    let mut reg = registry.lock();
+    if reg
+        .get(transfer_id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, tracker))
+    {
+        reg.remove(transfer_id);
+    }
+}
+
 /// Shared per-peer "known missing parts" hints. Populated by source
 /// workers when a peer accepts our upload request and then drops the
 /// TCP connection with zero bytes transferred — a strong signal that
@@ -732,6 +750,75 @@ fn injection_wait_action(
     InjectionWaitAction::Continue
 }
 
+/// Aborts every tracked per-source task when the parent worker is dropped
+/// (JoinHandle::abort on StartDownload does not reach detached children).
+struct SourceAbortSet {
+    handles: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl SourceAbortSet {
+    fn new() -> Self {
+        Self {
+            handles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn track<T>(&self, handle: &tokio::task::JoinHandle<T>) {
+        if let Ok(mut v) = self.handles.lock() {
+            v.push(handle.abort_handle());
+        }
+    }
+}
+
+impl Drop for SourceAbortSet {
+    fn drop(&mut self) {
+        if let Ok(mut v) = self.handles.lock() {
+            for h in v.drain(..) {
+                h.abort();
+            }
+        }
+    }
+}
+
+enum DropReleaseOp {
+    InProgress(Vec<usize>),
+    WriteRanges(Vec<(u64, u64)>),
+    Frequency(Vec<bool>),
+}
+
+type DropReleaseTx = tokio::sync::mpsc::UnboundedSender<DropReleaseOp>;
+
+fn spawn_drop_release_worker(
+    tracker: Arc<RwLock<PartTracker>>,
+    chunk_sel: Arc<RwLock<ChunkSelector>>,
+) -> DropReleaseTx {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // Detached: Drop of the parent must not abort this, or in-flight Drop
+    // sends from aborted source tasks would have nowhere to land.
+    tokio::spawn(async move {
+        while let Some(op) = rx.recv().await {
+            match op {
+                DropReleaseOp::InProgress(parts) => {
+                    let mut t = tracker.write().await;
+                    for p in parts {
+                        t.release_in_progress(p);
+                    }
+                }
+                DropReleaseOp::WriteRanges(ranges) => {
+                    let mut t = tracker.write().await;
+                    for (s, e) in ranges {
+                        t.release_write_reservation(s, e);
+                    }
+                }
+                DropReleaseOp::Frequency(avail) => {
+                    chunk_sel.write().await.remove_source(&avail);
+                }
+            }
+        }
+    });
+    tx
+}
+
 /// RAII guard owning ONE source worker's per-part in-progress claims,
 /// releasing them on drop so a task that exits via `?` or `bail!` cannot
 /// leave a part stuck as "somebody is downloading this".
@@ -744,6 +831,7 @@ fn injection_wait_action(
 struct InProgressGuard {
     tracker: Arc<RwLock<PartTracker>>,
     active: Vec<usize>,
+    drop_tx: Option<DropReleaseTx>,
 }
 
 impl InProgressGuard {
@@ -751,6 +839,15 @@ impl InProgressGuard {
         Self {
             tracker,
             active: Vec::new(),
+            drop_tx: None,
+        }
+    }
+
+    fn with_release_tx(tracker: Arc<RwLock<PartTracker>>, drop_tx: DropReleaseTx) -> Self {
+        Self {
+            tracker,
+            active: Vec::new(),
+            drop_tx: Some(drop_tx),
         }
     }
 
@@ -796,13 +893,25 @@ where
         });
         return;
     }
-    loop {
-        if let Ok(mut t) = tracker.try_write() {
-            apply(&mut t, claims);
-            return;
-        }
-        std::thread::yield_now();
+    tracing::warn!("release_tracker_claims: no tokio runtime and tracker busy; leaking claim");
+}
+
+fn release_chunk_frequency(chunk_sel: Arc<RwLock<ChunkSelector>>, avail: Vec<bool>) {
+    if let Ok(mut sel) = chunk_sel.try_write() {
+        sel.remove_source(&avail);
+        return;
     }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                chunk_sel.write().await.remove_source(&avail);
+            });
+        });
+        return;
+    }
+    tracing::warn!(
+        "WireAvailabilityGuard: no runtime and chunk selector busy; leaking source frequency"
+    );
 }
 
 impl Drop for InProgressGuard {
@@ -811,6 +920,11 @@ impl Drop for InProgressGuard {
             return;
         }
         let to_clear = std::mem::take(&mut self.active);
+        if let Some(tx) = &self.drop_tx {
+            if tx.send(DropReleaseOp::InProgress(to_clear.clone())).is_ok() {
+                return;
+            }
+        }
         release_tracker_claims(&self.tracker, to_clear, |t, parts| {
             for p in parts {
                 t.release_in_progress(p);
@@ -838,14 +952,25 @@ impl Drop for InProgressGuard {
 struct WriteReservation {
     tracker: Arc<RwLock<PartTracker>>,
     reserved: Vec<(u64, u64)>,
+    drop_tx: Option<DropReleaseTx>,
 }
 
 impl WriteReservation {
     async fn acquire(tracker: &Arc<RwLock<PartTracker>>, start: u64, end: u64) -> Self {
+        Self::acquire_with_release(tracker, start, end, None).await
+    }
+
+    async fn acquire_with_release(
+        tracker: &Arc<RwLock<PartTracker>>,
+        start: u64,
+        end: u64,
+        drop_tx: Option<DropReleaseTx>,
+    ) -> Self {
         let reserved = tracker.write().await.reserve_write_subranges(start, end);
         Self {
             tracker: tracker.clone(),
             reserved,
+            drop_tx,
         }
     }
 
@@ -881,6 +1006,11 @@ impl Drop for WriteReservation {
             return;
         }
         let to_release = std::mem::take(&mut self.reserved);
+        if let Some(tx) = &self.drop_tx {
+            if tx.send(DropReleaseOp::WriteRanges(to_release.clone())).is_ok() {
+                return;
+            }
+        }
         release_tracker_claims(&self.tracker, to_release, |t, ranges| {
             for (s, e) in ranges {
                 t.release_write_reservation(s, e);
@@ -914,9 +1044,16 @@ async fn write_gap_subranges_ms(
     data: &[u8],
     src_idx: usize,
     label: &str,
+    drop_tx: Option<&DropReleaseTx>,
 ) -> GapWriteOutcome {
     let end = start.saturating_add(data.len() as u64);
-    let mut reservation = WriteReservation::acquire(tracker, start, end).await;
+    let mut reservation = WriteReservation::acquire_with_release(
+        tracker,
+        start,
+        end,
+        drop_tx.cloned(),
+    )
+    .await;
     let mut written_subranges = Vec::with_capacity(reservation.ranges().len());
     let mut write_ok = true;
     let mut disk_full = None;
@@ -1525,6 +1662,8 @@ impl MultiSourceDownload {
             cs.update_frequencies(&self.sources);
             Arc::new(RwLock::new(cs))
         };
+        let drop_tx = spawn_drop_release_worker(tracker.clone(), chunk_selector.clone());
+        let source_aborts = SourceAbortSet::new();
 
         let queue_wait_secs = self.ed2k_limits.queue_wait_secs;
 
@@ -1956,6 +2095,7 @@ impl MultiSourceDownload {
             let init_src_ip = source.peer_ip.clone();
             let init_src_port = source.peer_port;
             let init_disk_full = disk_full.clone();
+            let src_drop_tx = drop_tx.clone();
             let handle = tokio::spawn(async move {
                 if sem_clone.available_permits() == 0 {
                     let _ = fail_etx
@@ -2033,6 +2173,7 @@ impl MultiSourceDownload {
                         // sources path; we always dial these peers fresh.
                         None,
                         init_missing_parts,
+                        Some(src_drop_tx),
                     ) => res,
                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                 };
@@ -2101,6 +2242,7 @@ impl MultiSourceDownload {
                 }
                 (src_idx, parts, result)
             });
+            source_aborts.track(&handle);
             handles.push(handle);
         }
 
@@ -2399,6 +2541,7 @@ impl MultiSourceDownload {
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
+                            let src_drop_tx = drop_tx.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
@@ -2429,6 +2572,7 @@ impl MultiSourceDownload {
                                         // stream available.
                                         None,
                                         inj_missing_parts,
+                                        Some(src_drop_tx),
                                     ) => res,
                                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                                 };
@@ -2460,6 +2604,7 @@ impl MultiSourceDownload {
                                 }
                                 (src_idx, parts, result)
                             });
+                            source_aborts.track(&handle);
                             injected_abort_handles.push(handle.abort_handle());
                             pending_futs.push(handle);
                         } else {
@@ -2644,6 +2789,7 @@ impl MultiSourceDownload {
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
+                            let src_drop_tx = drop_tx.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match acquire_source_permit(&sem, &ctrl).await {
                                     Ok(p) => p,
@@ -2675,6 +2821,7 @@ impl MultiSourceDownload {
                                         // of dialing the LowID peer back.
                                         Some(stream),
                                         inj_missing_parts,
+                                        Some(src_drop_tx),
                                     ) => res,
                                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                                 };
@@ -2706,6 +2853,7 @@ impl MultiSourceDownload {
                                 }
                                 (src_idx, parts, result)
                             });
+                            source_aborts.track(&handle);
                             injected_abort_handles.push(handle.abort_handle());
                             pending_futs.push(handle);
                         } else {
@@ -3145,7 +3293,8 @@ impl MultiSourceDownload {
                 let a_file_req_oh = self.file_req_overhead.clone();
                 let a_missing_parts = peers_missing_parts.clone();
                 let a_disk_full = disk_full.clone();
-                adopted_handles.push(tokio::spawn(async move {
+                let src_drop_tx = drop_tx.clone();
+                let handle = tokio::spawn(async move {
                     let _permit = match acquire_source_permit(&sem, &ctrl).await {
                         Ok(p) => p,
                         Err(_) => return,
@@ -3171,6 +3320,7 @@ impl MultiSourceDownload {
                             a_file_req_oh,
                             Some(stream),
                             a_missing_parts,
+                            Some(src_drop_tx),
                         ) => res,
                         _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                     };
@@ -3200,7 +3350,9 @@ impl MultiSourceDownload {
                             }).await;
                         }
                     }
-                }));
+                });
+                source_aborts.track(&handle);
+                adopted_handles.push(handle);
             }
 
             // Deduplicate on the dial key. `injected_sources` is appended to
@@ -3598,7 +3750,8 @@ impl MultiSourceDownload {
                 let r_src_ip = source.peer_ip.clone();
                 let r_src_port = source.peer_port;
                 let r_disk_full = disk_full.clone();
-                retry_handles.push(tokio::spawn(async move {
+                let src_drop_tx = drop_tx.clone();
+                let handle = tokio::spawn(async move {
                     let _permit = match acquire_source_permit(&r_sem, &rctrl).await {
                         Ok(p) => p,
                         Err(_) => return,
@@ -3628,6 +3781,7 @@ impl MultiSourceDownload {
                             // alive by the time we retry.
                             None,
                             r_missing_parts,
+                            Some(src_drop_tx),
                         ) => res,
                         _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                     };
@@ -3694,7 +3848,9 @@ impl MultiSourceDownload {
                             debug!("Retry source {} failed: {e:#}", src_idx);
                         }
                     }
-                }));
+                });
+                source_aborts.track(&handle);
+                retry_handles.push(handle);
             }
 
             drop(retry_tx);
@@ -3908,7 +4064,7 @@ impl MultiSourceDownload {
             // which re-opens parts for re-download.
             if verified_result.is_none() && self.control.is_cancelled() {
                 if let Some(ref registry) = self.tracker_registry {
-                    registry.lock().remove(&self.transfer_id);
+                    unregister_own_tracker(registry, &self.transfer_id, &tracker);
                 }
                 anyhow::bail!("cancelled by user");
             }
@@ -4057,8 +4213,11 @@ impl MultiSourceDownload {
         }
 
         if let Some(ref registry) = self.tracker_registry {
-            registry.lock().remove(&self.transfer_id);
+            unregister_own_tracker(registry, &self.transfer_id, &tracker);
         }
+
+        drop(source_aborts);
+        drop(drop_tx);
 
         Ok(())
     }
@@ -4175,6 +4334,7 @@ async fn download_parts_from_source(
     // the peer has already failed on) and by the receive-loop error
     // path (to record a fresh failure). See `SharedPeerMissingParts`.
     peers_missing_parts: SharedPeerMissingParts,
+    drop_tx: Option<DropReleaseTx>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use tokio::net::TcpStream;
@@ -4241,7 +4401,10 @@ async fn download_parts_from_source(
     let mut src_available_parts: Option<u32> = None;
     let mut src_total_parts: Option<u32> = None;
     let src_country_code: Option<String> = crate::geoip::lookup_country(&geoip, addr.ip());
-    let mut ip_guard = InProgressGuard::new(tracker.clone());
+    let mut ip_guard = match drop_tx.clone() {
+        Some(tx) => InProgressGuard::with_release_tx(tracker.clone(), tx),
+        None => InProgressGuard::new(tracker.clone()),
+    };
 
     macro_rules! emit_source {
         ($status:expr, $qr:expr, $speed:expr) => {
@@ -4444,7 +4607,7 @@ async fn download_parts_from_source(
             supports_crypt_layer: obfuscation_enabled,
             requests_crypt_layer: obfuscation_enabled,
             requires_crypt_layer: false,
-            supports_direct_udp_callback: false,
+            supports_direct_udp_callback: crate::network::kad::firewall::advertised_direct_udp_callback(),
             supports_captcha: false,
             server_ip,
             server_port,
@@ -6458,6 +6621,7 @@ async fn download_parts_from_source(
                 Some(WireAvailabilityGuard {
                     chunk_sel: Some(cs.clone()),
                     avail: Some(pfs.clone()),
+                    drop_tx: drop_tx.clone(),
                 })
             }
             _ => None,
@@ -7712,7 +7876,9 @@ async fn download_parts_from_source(
                             continue;
                         }
                         consecutive_bad_blocks = 0;
-                        bw.acquire_download(piece_len).await;
+                        if !bw.acquire_download(piece_len).await {
+                            anyhow::bail!("bandwidth limiter stopped");
+                        }
 
                         // D21: never overwrite bytes we already have. With several
                         // sources in flight (and cross-part pipelining), source B
@@ -7743,7 +7909,15 @@ async fn download_parts_from_source(
                         // see `WriteReservation` for why the guard can no
                         // longer span the write itself.
                         let gap_write =
-                            write_gap_subranges_ms(&tracker, &output, start, data, _src_idx, "")
+                            write_gap_subranges_ms(
+                                &tracker,
+                                &output,
+                                start,
+                                data,
+                                _src_idx,
+                                "",
+                                drop_tx.as_ref(),
+                            )
                                 .await;
                         if let Some(ref e) = gap_write.disk_full {
                             anyhow::bail!("stage:insufficient_disk disk write failed: {e}");
@@ -7956,7 +8130,9 @@ async fn download_parts_from_source(
                             continue;
                         }
                         consecutive_bad_blocks = 0;
-                        bw.acquire_download(piece_len).await;
+                        if !bw.acquire_download(piece_len).await {
+                            anyhow::bail!("bandwidth limiter stopped");
+                        }
 
                         // D21 (compressed): mirror the uncompressed gap guard above.
                         // Write ONLY the gap sub-ranges of the decompressed block,
@@ -7975,6 +8151,7 @@ async fn download_parts_from_source(
                             &decompressed,
                             _src_idx,
                             "compressed ",
+                            drop_tx.as_ref(),
                         )
                         .await;
                         if let Some(ref e) = gap_write.disk_full {
@@ -9441,10 +9618,6 @@ async fn download_parts_from_source(
     Ok(())
 }
 
-/// Pre-computed pipeline state for the next part this source should
-/// download. After fixing the queue-misalignment bug the caller now
-/// only consumes `part_idx` and recomputes the rest via
-/// `compute_part_blocks_ms`, but the other fields stay populated so a
 /// Releases a source's wire-learned availability contribution when the source
 /// task ends, by any route.
 ///
@@ -9462,6 +9635,7 @@ async fn download_parts_from_source(
 struct WireAvailabilityGuard {
     chunk_sel: Option<Arc<RwLock<ChunkSelector>>>,
     avail: Option<Vec<bool>>,
+    drop_tx: Option<DropReleaseTx>,
 }
 
 impl Drop for WireAvailabilityGuard {
@@ -9469,11 +9643,12 @@ impl Drop for WireAvailabilityGuard {
         let (Some(chunk_sel), Some(avail)) = (self.chunk_sel.take(), self.avail.take()) else {
             return;
         };
-        // `Drop` cannot await, so hand the release to the runtime. This runs
-        // inside the source task, so a handle is always available.
-        tokio::spawn(async move {
-            chunk_sel.write().await.remove_source(&avail);
-        });
+        if let Some(tx) = self.drop_tx.take() {
+            if tx.send(DropReleaseOp::Frequency(avail.clone())).is_ok() {
+                return;
+            }
+        }
+        release_chunk_frequency(chunk_sel, avail);
     }
 }
 
@@ -10061,6 +10236,122 @@ mod tests {
         drop(t);
 
         let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    #[tokio::test]
+    async fn drop_release_channel_frees_in_progress_claim() {
+        let (tracker, path) = test_tracker("drop-channel", PARTSIZE);
+        let cs = Arc::new(RwLock::new(ChunkSelector::new(1)));
+        let tx = spawn_drop_release_worker(tracker.clone(), cs);
+        {
+            let mut g = InProgressGuard::with_release_tx(tracker.clone(), tx.clone());
+            g.claim(0).await;
+            assert!(tracker.read().await.is_in_progress(0));
+            drop(g);
+        }
+        let start = std::time::Instant::now();
+        while tracker.read().await.is_in_progress(0)
+            && start.elapsed() < std::time::Duration::from_secs(1)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !tracker.read().await.is_in_progress(0),
+            "drop channel must release the claim"
+        );
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    #[tokio::test]
+    async fn drop_release_closed_channel_falls_back_to_lock() {
+        let (tracker, path) = test_tracker("drop-closed", PARTSIZE);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        {
+            let mut g = InProgressGuard::with_release_tx(tracker.clone(), tx);
+            g.claim(0).await;
+            assert!(tracker.read().await.is_in_progress(0));
+            drop(g);
+        }
+        assert!(
+            !tracker.read().await.is_in_progress(0),
+            "closed drop channel must still release via the lock fallback"
+        );
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    #[tokio::test]
+    async fn write_reservation_closed_channel_falls_back_to_lock() {
+        let (tracker, path) = test_tracker("wr-closed", 1000);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        {
+            let reservation =
+                WriteReservation::acquire_with_release(&tracker, 0, 400, Some(tx)).await;
+            assert_eq!(reservation.ranges(), &[(0, 400)]);
+            assert_eq!(tracker.read().await.write_reservation_count(), 1);
+        }
+        assert_eq!(
+            tracker.read().await.write_reservation_count(),
+            0,
+            "closed drop channel must still hand the reservation back"
+        );
+        let _ = std::fs::remove_file(path.with_extension("part.met"));
+    }
+
+    #[test]
+    fn unregister_own_tracker_leaves_replacement() {
+        let (old, path1) = test_tracker("reg-old", PARTSIZE);
+        let (new, path2) = test_tracker("reg-new", PARTSIZE);
+        let registry: SharedTrackerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        registry.lock().insert("tid".into(), old.clone());
+        registry.lock().insert("tid".into(), new.clone());
+        unregister_own_tracker(&registry, "tid", &old);
+        {
+            let reg = registry.lock();
+            let got = reg.get("tid").expect("replacement must remain");
+            assert!(Arc::ptr_eq(got, &new));
+        }
+        unregister_own_tracker(&registry, "tid", &new);
+        assert!(registry.lock().get("tid").is_none());
+        let _ = std::fs::remove_file(path1.with_extension("part.met"));
+        let _ = std::fs::remove_file(path2.with_extension("part.met"));
+    }
+
+    #[tokio::test]
+    async fn wire_avail_closed_channel_falls_back_to_lock() {
+        let cs = Arc::new(RwLock::new(ChunkSelector::new(1)));
+        {
+            let mut sel = cs.write().await;
+            sel.part_frequency[0] = 1;
+            sel.total_sources = 1;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        drop(WireAvailabilityGuard {
+            chunk_sel: Some(cs.clone()),
+            avail: Some(vec![true]),
+            drop_tx: Some(tx),
+        });
+        let sel = cs.read().await;
+        assert_eq!(sel.total_sources, 0);
+        assert_eq!(sel.part_frequency[0], 0);
+    }
+
+    #[tokio::test]
+    async fn source_abort_set_aborts_children_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let set = SourceAbortSet::new();
+        let flag2 = flag.clone();
+        let h = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag2.store(true, Ordering::Relaxed);
+        });
+        set.track(&h);
+        drop(set);
+        let joined = h.await;
+        assert!(joined.is_err(), "child must be aborted");
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     /// H1b: a reservation that is never committed — an early `?`, a `bail!`, or

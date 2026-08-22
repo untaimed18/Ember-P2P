@@ -152,7 +152,7 @@
   "ember_copied": "Copiato",
   "ember_copy_failed": "Non riuscito",
   "ember_about_title": "Informazioni su Ember Network",
-  "ember_about_text": "Ember Network non ha server: la tua app trova le altre persone direttamente e ogni connessione è cifrata end-to-end. Ricerche, download e i file che condividi passano tutti di lì. Funziona insieme alle reti eMule, così mantieni l'accesso a entrambe.",
+  "ember_about_text": "Ember Network non ha server: la tua app trova le altre persone direttamente e ogni connessione è cifrata end-to-end. Ricerche e scoperta delle fonti passano da Ember DHT. I byte dei file viaggiano ancora con il protocollo eD2K finché il trasferimento Ember nativo non è attivo. Funziona insieme alle reti eMule, così mantieni l'accesso a entrambe.",
   "ember_disabled_explainer": "Attiva Ember per cercare, scaricare e condividere file direttamente con altri utenti Ember.",
   "ember_toggle_failed": "Impossibile modificare l'impostazione di Ember Network: {error}",
   "ember_load_failed": "Impossibile caricare lo stato di Ember Network: {error}",
@@ -2473,5 +2473,13 @@
   "layout_policy_reset_failed": "Impossibile reimpostare la policy di sicurezza.",
   "ember_overview_published": "File pubblicati",
   "ember_health_network": "Rete",
-  "ember_health_sharing_published_count": "Pubblicati · {count}"
+  "ember_health_sharing_published_count": "Pubblicati · {count}",
+  "ember_health_waiting_buddy": "In attesa di un relay",
+  "ember_dht_waiting_buddy_hint": "Sei dietro un firewall e non c'è ancora un buddy HighID, quindi Ember non può pubblicare i file condivisi finché non ne trova uno.",
+  "wizard_kad_off_warning": "Senza KAD, Ember non ha una lista di seed propria. Potrai cercare su Ember DHT quando ci saranno peer, ma il primo contatto può richiedere più tempo.",
+  "search_query_syntax_hint_ember": "La ricerca Ember richiede ogni parola nel nome del file. AND / OR / NOT valgono solo su eD2K (KAD e server).",
+  "updater_signature_missing": "Il canale degli aggiornamenti è senza firma. Ember non farà finta che tu sia aggiornato.",
+  "secident_key_unreadable": "Impossibile leggere la chiave di identificazione sicura. I crediti restano disattivati finché la chiave non viene recuperata.",
+  "friends_init_failed": "Impossibile caricare i dati degli amici. Alcune funzioni potrebbero non essere disponibili fino al riavvio.",
+  "statusbar_shared_refresh_failed": "Impossibile aggiornare il conteggio dei file condivisi."
 }

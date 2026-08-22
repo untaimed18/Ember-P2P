@@ -152,7 +152,7 @@
   "ember_copied": "Copiado",
   "ember_copy_failed": "Falhou",
   "ember_about_title": "Sobre a Ember Network",
-  "ember_about_text": "A Ember Network não tem servidores: seu aplicativo encontra outras pessoas diretamente e cada conexão é criptografada de ponta a ponta. Pesquisas, downloads e os arquivos que você compartilha passam todos por ela. Ela funciona junto com as redes eMule, então você mantém o acesso às duas.",
+  "ember_about_text": "A Ember Network não tem servidores: seu aplicativo encontra outras pessoas diretamente e cada conexão é criptografada de ponta a ponta. Pesquisas e descoberta de fontes passam pelo Ember DHT. Os bytes dos arquivos ainda são transferidos com o protocolo eD2K até o envio nativo Ember ser ativado. Ela funciona junto com as redes eMule, então você mantém o acesso às duas.",
   "ember_disabled_explainer": "Ative o Ember para pesquisar, baixar e compartilhar arquivos diretamente com outros usuários do Ember.",
   "ember_toggle_failed": "Não foi possível alterar a configuração da Ember Network: {error}",
   "ember_load_failed": "Falha ao carregar o status da Ember Network: {error}",
@@ -2473,5 +2473,13 @@
   "layout_policy_reset_failed": "Não foi possível redefinir a política de segurança.",
   "ember_overview_published": "Arquivos publicados",
   "ember_health_network": "Rede",
-  "ember_health_sharing_published_count": "Publicados · {count}"
+  "ember_health_sharing_published_count": "Publicados · {count}",
+  "ember_health_waiting_buddy": "Aguardando um relé",
+  "ember_dht_waiting_buddy_hint": "Você está atrás de um firewall e ainda não há um buddy HighID, então o Ember não pode publicar seus arquivos compartilhados até encontrar um.",
+  "wizard_kad_off_warning": "Sem KAD, o Ember não tem lista de seeds própria. Você ainda pode pesquisar no Ember DHT quando tiver pares, mas o primeiro contato pode demorar mais.",
+  "search_query_syntax_hint_ember": "A pesquisa Ember exige cada palavra no nome do arquivo. AND / OR / NOT valem só no eD2K (KAD e servidores).",
+  "updater_signature_missing": "O canal de atualização está sem assinatura. O Ember não vai fingir que você está atualizado.",
+  "secident_key_unreadable": "Não foi possível ler sua chave de identificação segura. Os créditos ficam desativados até a chave ser recuperada.",
+  "friends_init_failed": "Não foi possível carregar os dados de amigos. Alguns recursos podem ficar indisponíveis até você reiniciar.",
+  "statusbar_shared_refresh_failed": "Não foi possível atualizar a contagem de arquivos compartilhados."
 }

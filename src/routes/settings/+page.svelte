@@ -65,6 +65,7 @@
     restartToUpdate,
     runStagedInstaller,
   } from '$lib/stores/updater';
+  import { networkStats } from '$lib/stores/network';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
@@ -2298,6 +2299,12 @@
           </div>
         </div>
         <div class="card-body">
+          {#if $networkStats.secident_status === 'broken'}
+            <div class="field">
+              <span class="feedback error" role="alert">{m.secident_key_unreadable()}</span>
+            </div>
+            <div class="divider"></div>
+          {/if}
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_obfuscation_label()}</span>
@@ -2723,7 +2730,7 @@
             <div
               class="about-update-status"
               class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
-              class:error={$updater.phase === 'error' || $updater.phase === 'stalled'}
+              class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing}
               class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
             >
               {#if $updater.phase === 'uptodate'}
@@ -2747,8 +2754,8 @@
                     ? m.updater_stalled_body({ version: $updater.version ?? '' })
                     : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
                 </span>
-              {:else if $updater.phase === 'error'}
-                <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? '' })}</span>
+              {:else if $updater.phase === 'error' || $updater.signatureMissing}
+                <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
               {:else}
                 <span class="hint">{m.settings_about_check_hint()}</span>
               {/if}

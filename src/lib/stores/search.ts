@@ -98,9 +98,11 @@ const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number;
  * count as a u16 on the wire, so anything above it is a claim no honest peer can
  * make. */
 const MAX_PLAUSIBLE_SOURCES = 65535;
+/** Pin with `scripts/fixtures/merge-contract.json` / `MAX_SOURCE_ADDRS` in merge.rs. */
+const MAX_SOURCE_ADDRS = 500;
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
-  const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])]));
+  const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])])).slice(0, MAX_SOURCE_ADDRS);
   // Backend ed2k resights emit absolute noted availability; take max so we do
   // not double-sum. Cross-server summing happens in Rust before the emit.
   // Kad / mixed origins also use max (matches merge.rs).

@@ -3,7 +3,7 @@
   "baseLocale": "en",
   "locales": ["en", "es", "fr", "pt-BR", "de", "zh-CN", "it", "ru", "zh-TW"],
   "modules": [
-    "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4.4.1/dist/index.js"
+    "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4.4.3/dist/index.js"
   ],
   "plugin.inlang.messageFormat": {
     "pathPattern": "./messages/{locale}.json"

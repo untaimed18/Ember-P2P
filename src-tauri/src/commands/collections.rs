@@ -17,7 +17,7 @@ pub struct CollectionDownloadResult {
     pub failed_count: usize,
 }
 
-#[tauri::command]
+#[allow(dead_code)]
 pub async fn load_collection(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -371,10 +371,8 @@ async fn create_collection_internal(
     ))
 }
 
-/// Legacy raw-path command. Retains the Library-root restriction so arbitrary
-/// WebView IPC cannot write elsewhere; normal Library exports use the native
-/// save dialog command below.
-#[tauri::command]
+/// Legacy raw-path helper kept for unit tests. Not registered as IPC.
+#[allow(dead_code)]
 pub async fn create_collection(
     state: tauri::State<'_, AppState>,
     name: String,

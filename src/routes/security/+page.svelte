@@ -20,6 +20,7 @@
   import { translateError } from '$lib/i18n';
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
+  import { networkStats } from '$lib/stores/network';
   import IconX from '$lib/components/IconX.svelte';
 
   let stats = $state<IpFilterStats | null>(null);
@@ -510,6 +511,11 @@
 {/if}
 
 <div class="security-content">
+  {#if $networkStats.secident_status === 'broken'}
+    <div class="banner error-banner" role="alert">
+      <span>{m.secident_key_unreadable()}</span>
+    </div>
+  {/if}
   {#if error}
     <div class="banner error-banner" role="alert">
       <span>{error}</span>

@@ -263,6 +263,8 @@ export interface NetworkStats {
   ember_dht_contacts: number;
   /** Contacts that have answered us. Used for connected vs still-joining. */
   ember_dht_verified_contacts?: number;
+  /** SecIdent: available | unavailable | broken */
+  secident_status?: 'available' | 'unavailable' | 'broken';
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via
@@ -376,6 +378,8 @@ export interface EmberDiagnostics {
   ember_dht_store_replays: number;
   /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
   ember_dht_firewalled_publishing: boolean;
+  /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
+  ember_dht_waiting_buddy?: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */

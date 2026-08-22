@@ -22,23 +22,9 @@ export interface CollectionDownloadResult {
   failedCount: number;
 }
 
-export async function loadCollection(path: string): Promise<Collection> {
-  return invoke('load_collection', { path });
-}
-
 /** Opens a native picker; files selected by the user may live outside Library roots. */
 export async function pickAndLoadCollection(): Promise<Collection | null> {
   return invoke('pick_and_load_collection');
-}
-
-export async function createCollection(
-  name: string,
-  author: string,
-  files: CollectionFile[],
-  outputPath: string,
-  binary: boolean
-): Promise<string> {
-  return invoke('create_collection', { name, author, files, outputPath, binary });
 }
 
 /** Opens a native save dialog and writes the collection to its selected path. */

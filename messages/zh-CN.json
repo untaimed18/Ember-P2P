@@ -152,7 +152,7 @@
   "ember_copied": "已复制",
   "ember_copy_failed": "失败",
   "ember_about_title": "关于 Ember Network",
-  "ember_about_text": "Ember Network 没有任何服务器：应用会直接找到其他人，并且每条连接都经过端到端加密。搜索、下载以及你分享的文件都通过它传输。它与 eMule 网络并行运行，因此两者你都能继续使用。",
+  "ember_about_text": "Ember Network 没有任何服务器：应用会直接找到其他人，并且每条连接都经过端到端加密。搜索和来源发现走 Ember DHT。在原生 Ember 传输启用之前，文件字节仍通过 eD2K 协议传输。它与 eMule 网络并行运行，因此两者你都能继续使用。",
   "ember_disabled_explainer": "开启 Ember，即可直接与其他 Ember 用户搜索、下载和分享文件。",
   "ember_toggle_failed": "无法更改 Ember Network 设置：{error}",
   "ember_load_failed": "加载 Ember Network 状态失败：{error}",
@@ -2473,5 +2473,13 @@
   "layout_policy_reset_failed": "无法重置安全策略。",
   "ember_overview_published": "已发布文件",
   "ember_health_network": "网络",
-  "ember_health_sharing_published_count": "已发布 · {count}"
+  "ember_health_sharing_published_count": "已发布 · {count}",
+  "ember_health_waiting_buddy": "正在等待中继",
+  "ember_dht_waiting_buddy_hint": "你处于防火墙后，目前没有 HighID 伙伴，因此 Ember 在找到伙伴之前无法发布你共享的文件。",
+  "wizard_kad_off_warning": "关闭 KAD 后，Ember 没有自己的种子列表。有对等节点后仍可搜索 Ember DHT，但首次连接可能更慢。",
+  "search_query_syntax_hint_ember": "Ember 搜索要求文件名包含每一个词。AND / OR / NOT 仅适用于 eD2K（KAD 和服务器）。",
+  "updater_signature_missing": "更新源缺少签名。Ember 不会假装你已是最新版本。",
+  "secident_key_unreadable": "无法读取安全标识密钥。在恢复密钥之前，积分功能已停用。",
+  "friends_init_failed": "无法加载好友数据。在重启之前，部分好友功能可能不可用。",
+  "statusbar_shared_refresh_failed": "无法刷新共享文件数量。"
 }

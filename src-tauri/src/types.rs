@@ -522,6 +522,10 @@ pub struct NetworkStats {
     /// joined overlay.
     #[serde(default)]
     pub ember_dht_verified_contacts: u32,
+    /// SecIdent RSA key: `"available"`, `"unavailable"` (never had a key),
+    /// or `"broken"` (cryptkey.dat exists but could not be read).
+    #[serde(default)]
+    pub secident_status: String,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -755,6 +759,9 @@ pub struct EmberDiagnostics {
     /// Ember DHT source records (UDP Noise path is usable).
     #[serde(default)]
     pub ember_dht_firewalled_publishing: bool,
+    /// True when firewalled with no HighID buddy yet — source STORE is skipped.
+    #[serde(default)]
+    pub ember_dht_waiting_buddy: bool,
     /// Slice 15: true when Ember is on but we have no external IPv4 to put
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
@@ -986,6 +993,7 @@ impl Default for NetworkStats {
             ember_native_enabled: true,
             ember_dht_contacts: 0,
             ember_dht_verified_contacts: 0,
+            secident_status: String::from("unavailable"),
         }
     }
 }

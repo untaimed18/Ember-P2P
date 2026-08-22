@@ -23,8 +23,10 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_SOURCE,
+    source_key, SignedRecord, SourceContact, RECORD_TYPE_SOURCE,
 };
+#[cfg(test)]
+use super::publish::SourceBuddy;
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -367,6 +369,11 @@ impl EmberDht {
 
     /// The buddy contact a firewalled publisher should write into its trailer
     /// when asking us to `PROXY_STORE`. `None` until we have a routable IPv4.
+    ///
+    /// Production publishers copy this from a verified DHT contact via
+    /// `ember_named_source_buddy`; tests use this getter on the buddy engine
+    /// itself so they do not have to rebuild the same `SourceBuddy`.
+    #[cfg(test)]
     pub fn advertised_source_buddy(&self) -> Option<SourceBuddy> {
         let buddy = SourceBuddy {
             ip: self.local_contact_ip,

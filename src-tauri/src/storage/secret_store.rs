@@ -8,44 +8,47 @@
 //! files already get — the ACL stops same-machine snooping; DPAPI stops a
 //! stolen/exfiltrated file from being usable elsewhere.
 //!
-//! On non-Windows targets this is a transparent pass-through; the restricted
-//! file mode (`0600` / `0700`) remains the control. That is enough to stop
-//! other local accounts from reading the files, but unlike DPAPI it does not
-//! bind the blob to this user/machine — a copied `identity.json` is usable
-//! elsewhere. A Linux secret-service backend is the remaining piece before
-//! shipped Linux builds match the Windows at-rest bar.
+//! On Unix we wrap with XChaCha20-Poly1305 keyed by HKDF-SHA256 of this
+//! machine's identity plus the username (`EMBRSEC2`). Fail closed if the
+//! machine-id cannot be read. Restricted file mode (`0600`) remains.
 //!
-//! Wire format of a protected blob: `MAGIC (8 bytes) || DPAPI ciphertext`.
-//! Files without `MAGIC` are treated as legacy plaintext and are transparently
-//! re-saved in protected form by the callers on next load.
+//! Wire format: `MAGIC (8 bytes) || ciphertext` (`EMBRSEC1` = DPAPI,
+//! `EMBRSEC2` = XChaCha20-Poly1305 + concatenated IKM (legacy Unix),
+//! `EMBRSEC3` = XChaCha20-Poly1305 + length-prefixed IKM and optional
+//! OS keyring wrapping key). Files without MAGIC are treated as legacy
+//! plaintext and are transparently re-saved in protected form by the
+//! callers on next load.
 
 use zeroize::Zeroizing;
 
-/// Marker prefixing a DPAPI-wrapped blob. Lets us distinguish protected files
-/// from legacy plaintext ones without a separate flag.
+/// Marker prefixing a DPAPI-wrapped blob (Windows).
 const MAGIC: &[u8; 8] = b"EMBRSEC1";
+/// Marker prefixing an XChaCha20-Poly1305 blob (Unix, concatenated IKM).
+const MAGIC_V2: &[u8; 8] = b"EMBRSEC2";
+/// Unix wrap with length-prefixed HKDF IKM and optional keyring key.
+const MAGIC_V3: &[u8; 8] = b"EMBRSEC3";
+
+#[cfg(not(target_os = "windows"))]
+const KEY_SRC_HKDF: u8 = 0;
+#[cfg(not(target_os = "windows"))]
+const KEY_SRC_KEYRING: u8 = 1;
 
 /// Extra entropy mixed into DPAPI so a protected blob can only be unwrapped by
 /// this application's code path (not by another DPAPI consumer on the system).
 #[cfg(target_os = "windows")]
 const ENTROPY: &[u8] = b"ember-secret-store-v1";
 
-/// True if `stored` is already in the protected (MAGIC-tagged) form.
+/// True if `stored` is already in a protected (MAGIC-tagged) form.
 pub fn is_protected(stored: &[u8]) -> bool {
-    stored.len() >= MAGIC.len() && &stored[..MAGIC.len()] == MAGIC
+    stored.len() >= 8
+        && (&stored[..8] == MAGIC || &stored[..8] == MAGIC_V2 || &stored[..8] == MAGIC_V3)
 }
 
 /// Wrap `plaintext` for at-rest storage. On success returns
 /// `MAGIC || ciphertext`.
 ///
-/// On Windows a DPAPI failure returns `Err` and the caller MUST NOT fall
-/// back to writing the secret unencrypted — silently persisting plaintext
-/// would defeat the whole point of the store (a copied key file would be
-/// usable on another account/machine). Failing the save and regenerating
-/// next launch is the safer degradation.
-///
-/// On non-Windows builds this is a transparent pass-through and always
-/// succeeds; the restricted file mode remains the control there.
+/// A protect failure returns `Err` and the caller MUST NOT fall back to
+/// writing the secret unencrypted.
 pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     #[cfg(target_os = "windows")]
     {
@@ -63,22 +66,21 @@ pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(plaintext.to_vec())
+        unix::protect(plaintext)
     }
 }
 
-/// Inverse of [`protect`]. If `stored` begins with `MAGIC`, DPAPI-unprotect the
-/// remainder; otherwise treat `stored` as legacy plaintext and return it
-/// unchanged. Returns `Err` only when a MAGIC-tagged blob fails to decrypt
-/// (wrong user/machine, or corruption) — callers treat that like a corrupt
-/// secret file rather than silently rotating identity.
+/// Inverse of [`protect`]. MAGIC-tagged blobs are decrypted; anything else is
+/// treated as legacy plaintext. Returns `Err` when a tagged blob fails to
+/// decrypt (wrong user/machine, or corruption) — callers treat that like a
+/// corrupt secret file rather than silently rotating identity.
 ///
 /// The result is `Zeroizing` because it is the long-term private key material
 /// itself (identity, SecIdent keypair, chat-history key): without a wiping
 /// destructor the plaintext survives in freed heap for the rest of the process
 /// lifetime and lands in any crash dump written afterwards.
 pub fn unprotect(stored: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    if is_protected(stored) {
+    if stored.len() >= 8 && &stored[..8] == MAGIC {
         #[cfg(target_os = "windows")]
         {
             return win::unprotect(&stored[MAGIC.len()..], ENTROPY)
@@ -92,7 +94,212 @@ pub fn unprotect(stored: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
             );
         }
     }
+    if stored.len() >= 8 && (&stored[..8] == MAGIC_V2 || &stored[..8] == MAGIC_V3) {
+        #[cfg(not(target_os = "windows"))]
+        {
+            return unix::unprotect(stored);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            anyhow::bail!(
+                "secret file is Unix-protected but this is a Windows build; \
+                 move the file back to the machine that created it"
+            );
+        }
+    }
     Ok(Zeroizing::new(stored.to_vec()))
+}
+
+#[cfg(not(target_os = "windows"))]
+mod unix {
+    use super::{KEY_SRC_HKDF, KEY_SRC_KEYRING, MAGIC_V2, MAGIC_V3};
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
+    use hkdf::Hkdf;
+    use rand::{rngs::OsRng, RngCore};
+    use sha2::Sha256;
+    use zeroize::{Zeroize, Zeroizing};
+
+    const NONCE_LEN: usize = 24;
+    const HKDF_SALT_V2: &[u8] = b"ember-secret-store-v2";
+    const HKDF_INFO_V2: &[u8] = b"ember-secret-store-v2-key";
+    const HKDF_SALT_V3: &[u8] = b"ember-secret-store-v3";
+    const HKDF_INFO_V3: &[u8] = b"ember-secret-store-v3-key";
+
+    fn machine_id() -> anyhow::Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        {
+            for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+                if let Ok(s) = std::fs::read_to_string(path) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(trimmed.as_bytes().to_vec());
+                    }
+                }
+            }
+            anyhow::bail!("machine-id unreadable")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut uuid = [0u8; 16];
+            let wait = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `uuid` is a 16-byte buffer; `wait` is a valid timespec.
+            let rc = unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &wait) };
+            if rc != 0 || uuid.iter().all(|&b| b == 0) {
+                anyhow::bail!("gethostuuid failed");
+            }
+            Ok(uuid.to_vec())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            anyhow::bail!("no machine-id source on this Unix target")
+        }
+    }
+
+    fn username() -> anyhow::Result<String> {
+        let name = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"));
+        match name {
+            Ok(s) if !s.is_empty() => Ok(s),
+            _ => anyhow::bail!("username unreadable"),
+        }
+    }
+
+    fn push_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(data);
+    }
+
+    fn hkdf_key(salt: &[u8], info: &[u8], length_prefixed: bool) -> anyhow::Result<[u8; 32]> {
+        let id = machine_id()?;
+        let user = username()?;
+        let mut ikm = Vec::new();
+        if length_prefixed {
+            push_len_prefixed(&mut ikm, &id);
+            push_len_prefixed(&mut ikm, user.as_bytes());
+        } else {
+            ikm.extend_from_slice(&id);
+            ikm.extend_from_slice(user.as_bytes());
+        }
+        let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+        let mut key = [0u8; 32];
+        hk.expand(info, &mut key)
+            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        Ok(key)
+    }
+
+    fn keyring_wrapping_key() -> anyhow::Result<[u8; 32]> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let entry = keyring::Entry::new("ember-p2p", "secret-store-v3")
+                .map_err(|e| anyhow::anyhow!("keyring: {e}"))?;
+            match entry.get_password() {
+                Ok(s) => {
+                    let bytes = hex::decode(s.trim())
+                        .map_err(|_| anyhow::anyhow!("keyring key is not hex"))?;
+                    if bytes.len() != 32 {
+                        anyhow::bail!("keyring key wrong length");
+                    }
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    Ok(key)
+                }
+                Err(_) => {
+                    let mut key = [0u8; 32];
+                    OsRng.fill_bytes(&mut key);
+                    entry
+                        .set_password(&hex::encode(key))
+                        .map_err(|e| anyhow::anyhow!("keyring store: {e}"))?;
+                    Ok(key)
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            anyhow::bail!("no keyring on this Unix target")
+        }
+    }
+
+    fn encrypt_with(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<( [u8; NONCE_LEN], Vec<u8>)> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("XChaCha20-Poly1305 protect failed"))?;
+        Ok((nonce, encrypted))
+    }
+
+    fn decrypt_with(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plain = cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("XChaCha20-Poly1305 unprotect failed"))?;
+        Ok(Zeroizing::new(plain))
+    }
+
+    pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let (src, mut key) = match keyring_wrapping_key() {
+            Ok(k) => (KEY_SRC_KEYRING, k),
+            Err(_) => (
+                KEY_SRC_HKDF,
+                hkdf_key(HKDF_SALT_V3, HKDF_INFO_V3, true)?,
+            ),
+        };
+        let result = encrypt_with(&key, plaintext);
+        key.zeroize();
+        let (nonce, encrypted) = result?;
+        let mut out = Vec::with_capacity(MAGIC_V3.len() + 1 + NONCE_LEN + encrypted.len());
+        out.extend_from_slice(MAGIC_V3);
+        out.push(src);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&encrypted);
+        Ok(out)
+    }
+
+    pub fn unprotect(stored: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        if stored.len() >= 8 && &stored[..8] == MAGIC_V3 {
+            if stored.len() < 8 + 1 + NONCE_LEN {
+                anyhow::bail!("EMBRSEC3 blob too short");
+            }
+            let src = stored[8];
+            let nonce = &stored[9..9 + NONCE_LEN];
+            let ct = &stored[9 + NONCE_LEN..];
+            let mut key = match src {
+                KEY_SRC_KEYRING => keyring_wrapping_key()?,
+                KEY_SRC_HKDF => hkdf_key(HKDF_SALT_V3, HKDF_INFO_V3, true)?,
+                _ => anyhow::bail!("unknown EMBRSEC3 key source"),
+            };
+            let result = decrypt_with(&key, nonce, ct);
+            key.zeroize();
+            return result;
+        }
+        if stored.len() >= 8 && &stored[..8] == MAGIC_V2 {
+            let body = &stored[MAGIC_V2.len()..];
+            if body.len() < NONCE_LEN {
+                anyhow::bail!("EMBRSEC2 blob too short");
+            }
+            let mut key = hkdf_key(HKDF_SALT_V2, HKDF_INFO_V2, false)?;
+            let result = decrypt_with(&key, &body[..NONCE_LEN], &body[NONCE_LEN..]);
+            key.zeroize();
+            return result;
+        }
+        anyhow::bail!("not a Unix-protected secret blob")
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -242,5 +449,31 @@ mod tests {
         let legacy = b"{\"kad_id\":[1,2,3]}";
         assert!(!is_protected(legacy));
         assert_eq!(&unprotect(legacy).unwrap()[..], &legacy[..]);
+    }
+
+    #[test]
+    fn foreign_platform_magic_is_rejected() {
+        #[cfg(target_os = "windows")]
+        {
+            let mut blob = Vec::from(*b"EMBRSEC2");
+            blob.extend_from_slice(&[0u8; 40]);
+            assert!(is_protected(&blob));
+            assert!(unprotect(&blob).is_err());
+            let mut v3 = Vec::from(*b"EMBRSEC3");
+            v3.extend_from_slice(&[0u8; 40]);
+            assert!(is_protected(&v3));
+            assert!(unprotect(&v3).is_err());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut blob = Vec::from(*b"EMBRSEC1");
+            blob.extend_from_slice(&[0u8; 40]);
+            assert!(is_protected(&blob));
+            assert!(unprotect(&blob).is_err());
+            let wrapped = protect(b"secret-material").expect("protect");
+            assert!(is_protected(&wrapped));
+            assert_ne!(&wrapped, b"secret-material");
+            assert_eq!(&unprotect(&wrapped).unwrap()[..], b"secret-material");
+        }
     }
 }

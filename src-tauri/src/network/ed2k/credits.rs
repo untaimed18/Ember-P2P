@@ -367,6 +367,12 @@ pub struct CreditManager {
     our_private_key: Vec<u8>,
     #[zeroize(skip)]
     crypto_available: bool,
+    /// True when cryptkey.dat exists but could not be used (undecryptable or
+    /// corrupt). Distinct from first-run "never had RSA": the permissive
+    /// credit path must not run, or a stolen/unreadable key would silently
+    /// grant credits to unverified peers.
+    #[zeroize(skip)]
+    crypto_unreadable: bool,
 }
 
 impl CreditManager {
@@ -377,6 +383,7 @@ impl CreditManager {
             our_public_key: Vec::new(),
             our_private_key: Vec::new(),
             crypto_available: false,
+            crypto_unreadable: false,
         }
     }
 
@@ -410,6 +417,7 @@ impl CreditManager {
                     let backup = key_path.with_extension("dat.undecryptable");
                     let _ = std::fs::copy(&key_path, &backup);
                     self.crypto_available = false;
+                    self.crypto_unreadable = true;
                     return;
                 }
             };
@@ -451,6 +459,7 @@ impl CreditManager {
                             self.our_public_key = final_pub;
                             self.our_private_key = priv_key;
                             self.crypto_available = true;
+                            self.crypto_unreadable = false;
                             tracing::info!("Loaded RSA keypair from {}", key_path.display());
                             // Rewrite when the public key was SPKI-normalised OR
                             // the file was still legacy plaintext (so it gets
@@ -500,6 +509,7 @@ impl CreditManager {
                 "cryptkey.dat is corrupt; SecIdent remains disabled and the keypair was NOT regenerated"
             );
             self.crypto_available = false;
+            self.crypto_unreadable = true;
             return;
         }
 
@@ -507,6 +517,7 @@ impl CreditManager {
         self.our_public_key = public_key;
         self.our_private_key = private_key;
         self.crypto_available = !self.our_public_key.is_empty();
+        self.crypto_unreadable = false;
 
         if !self.our_public_key.is_empty() {
             let mut out = Vec::new();
@@ -604,11 +615,29 @@ impl CreditManager {
     /// without it we only reject `Failed`/`BadGuy` (permissive fallback,
     /// matching the prior behaviour for genuinely-credited unknown peers).
     fn credit_accepted(&self, user_hash: &[u8; 16]) -> bool {
+        if self.crypto_unreadable {
+            return false;
+        }
         let ident_state = self.credits.get(user_hash).map(|r| r.ident_state);
         if self.crypto_available {
             matches!(ident_state, Some(IdentState::Verified))
         } else {
             !matches!(ident_state, Some(IdentState::Failed | IdentState::BadGuy))
+        }
+    }
+
+    pub fn crypto_unreadable(&self) -> bool {
+        self.crypto_unreadable
+    }
+
+    /// `"available"` | `"unavailable"` | `"broken"` for `NetworkStats`.
+    pub fn secident_status(&self) -> &'static str {
+        if self.crypto_unreadable {
+            "broken"
+        } else if self.crypto_available {
+            "available"
+        } else {
+            "unavailable"
         }
     }
 
@@ -670,6 +699,9 @@ impl CreditManager {
             None => return MIN_CREDIT_RATIO,
         };
         let ident = self.get_current_ident_state(user_hash, current_ip);
+        if self.crypto_unreadable {
+            return MIN_CREDIT_RATIO;
+        }
         if self.crypto_available {
             let floor = match ident {
                 IdentState::Failed | IdentState::BadGuy | IdentState::Needed => true,
@@ -781,6 +813,9 @@ impl CreditManager {
             Some(r) if r.downloaded > 1_048_576 => r,
             _ => return false,
         };
+        if self.crypto_unreadable {
+            return false;
+        }
         if self.crypto_available {
             match self.get_current_ident_state(user_hash, current_ip) {
                 IdentState::Verified => true,
@@ -2607,6 +2642,25 @@ mod tests {
             restored, original,
             "interrupted replace must not mint a replacement SecIdent key"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_cryptkey_refuses_all_credits() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-cryptkey-corrupt-{}-{}",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cryptkey.dat"), b"not-a-keypair").unwrap();
+        let mut cm = CreditManager::new();
+        cm.load_or_create_keypair(&dir);
+        assert!(cm.crypto_unreadable());
+        assert_eq!(cm.secident_status(), "broken");
+        let peer = [0x33u8; 16];
+        assert!(!cm.add_uploaded(peer, 2_000_000));
+        assert!(!cm.has_download_bonus(&peer, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

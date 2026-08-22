@@ -506,6 +506,9 @@
             </div>
           </div>
           <p class="step-hint">{m.wizard_connect_hint()}</p>
+          {#if !autoConnectKad}
+            <p class="step-hint wizard-kad-off">{m.wizard_kad_off_warning()}</p>
+          {/if}
         </div>
 
       {:else if step === 7}

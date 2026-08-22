@@ -418,6 +418,38 @@ impl FirewallChecker {
     }
 }
 
+/// Process-wide TCP/UDP firewall bits advertised in eD2K Hello
+/// (`supports_direct_udp_callback`). Hello builders in the upload listener
+/// and per-source download tasks do not hold `NetworkState`; they read these
+/// atomics instead. Defaults match startup: TCP open-until-proven only after
+/// UPnP, UDP firewalled until a probe succeeds.
+static LOCAL_TCP_FIREWALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static LOCAL_UDP_FIREWALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn publish_local_firewall(tcp_firewalled: bool, udp_firewalled: bool) {
+    LOCAL_TCP_FIREWALLED.store(tcp_firewalled, std::sync::atomic::Ordering::Relaxed);
+    LOCAL_UDP_FIREWALLED.store(udp_firewalled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn note_local_tcp_firewalled(firewalled: bool) {
+    LOCAL_TCP_FIREWALLED.store(firewalled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// eMule `SupportsDirectUDPCallback`: TCP firewalled and UDP reachable, so
+/// LowID peers can still be reached by UDP callback without wasting a buddy.
+pub fn advertised_direct_udp_callback() -> bool {
+    LOCAL_TCP_FIREWALLED.load(std::sync::atomic::Ordering::Relaxed)
+        && !LOCAL_UDP_FIREWALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Same predicate as [`advertised_direct_udp_callback`], for explicit statuses
+/// (buddy search uses confirmed `Firewalled`, not the Hello atomics).
+pub fn can_advertise_direct_udp_callback(tcp: FirewallStatus, udp: FirewallStatus) -> bool {
+    tcp == FirewallStatus::Firewalled && udp != FirewallStatus::Firewalled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +541,28 @@ mod tests {
             fw.handle_pong(0, reporter);
         }
         assert!(fw.external_udp_port().is_none());
+    }
+
+    #[test]
+    fn advertised_direct_udp_callback_requires_tcp_fw_and_udp_open() {
+        publish_local_firewall(true, true);
+        assert!(!advertised_direct_udp_callback());
+        publish_local_firewall(true, false);
+        assert!(advertised_direct_udp_callback());
+        publish_local_firewall(false, false);
+        assert!(!advertised_direct_udp_callback());
+        publish_local_firewall(true, true);
+        assert!(can_advertise_direct_udp_callback(
+            FirewallStatus::Firewalled,
+            FirewallStatus::Open
+        ));
+        assert!(!can_advertise_direct_udp_callback(
+            FirewallStatus::Firewalled,
+            FirewallStatus::Firewalled
+        ));
+        assert!(!can_advertise_direct_udp_callback(
+            FirewallStatus::Open,
+            FirewallStatus::Open
+        ));
     }
 }
