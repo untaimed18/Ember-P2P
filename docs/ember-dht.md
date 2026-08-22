@@ -152,9 +152,11 @@ was made and what to watch now that it is live.
 **Shipped after 1.5.3 (no wire change):** item 1's cheap path (rotate the served
 window), item 5 (persist the Ember source publish schedule), item 6's leftover
 replication heartbeat, and item 8's store-rejection causes, search-quality
-averages, and persisted verified-contact high-water. Pagination, firewalled
-consume, and dropping `node_id` still wait on a version bump. Item 2 remains
-blocked on measuring whether truncation still binds after rotation.
+averages, and persisted verified-contact high-water. Pagination and dropping
+`node_id` still wait on a version bump. Firewalled consume shipped as an
+additive record trailer plus two new message types that older v2 peers ignore.
+Item 2 remains blocked on measuring whether truncation still binds after
+rotation.
 
 **Shipped in 1.5.5 (no wire change):** Ember BLAKE3 pin mismatch is a permanent
 download failure with a visible fail badge (it used to reopen every part and
@@ -228,19 +230,40 @@ the emit step, and it removes the search from `ember_keyword_searches`. That
 ordering is what stops a reaped search from being streamed after its
 `search-complete`, and it is not obvious from either site alone.
 
-### 4. Firewalled sources are discoverable but not dialable
+### 4. Firewalled sources are discoverable but not dialable — done
 
-This is the largest genuine functional gap against KAD. The publish side is
-complete — a firewalled node sets `SOURCE_FLAG_FIREWALLED`, asks HighID contacts
-to `PROXY_STORE`, and storers attribute the record to the forwarder. The consume
-side has nothing: `SourceContact` carries no buddy address or buddy hash, so
-there is no Ember equivalent of KAD's `TAG_BUDDYHASH` plus
-`KADEMLIA_CALLBACK_REQ`. Such peers only work today because they are usually also
-on eD2K/KAD.
+Publish was already complete: a firewalled node sets `SOURCE_FLAG_FIREWALLED`,
+asks the named HighID to `PROXY_STORE`, and storers attribute the record to the
+forwarder. Consume now matches KAD's buddy callback without a DHT version bump.
 
-A protocol addition: a buddy field in the source record and a callback message.
-Sizeable, and it should follow item 1 so both wire changes land in one version
-bump.
+A firewalled source record may append a 70-byte trailer (publisher eD2K user
+hash + buddy IPv4 + buddy UDP port + buddy Noise key + 16-byte callback token)
+after the existing 41-byte contact. HighID records stay 41 bytes. New message
+types `CALLBACK_REQ` (0x0F) and `CALLBACK` (0x10) decode as `Unknown` on older
+peers.
+
+A reachable searcher sends `CALLBACK_REQ` (including the token from the signed
+trailer) to the named buddy. The buddy forwards `CALLBACK` only for a publisher
+it recently `PROXY_STORE`d for, copies the searcher's *observed* UDP address
+rather than a claimed IP, and copies the token. The publisher overlay-`STORE`s
+the firewalled record only after that buddy `PROXY_STORE_ACK`s, so `FIND_VALUE`
+cannot name a buddy that cannot bounce. The publisher accepts `CALLBACK` only
+from a buddy that ACKed a `PROXY_STORE` for that file, and only when the token
+matches the one it published. It then connects eD2K TCP back (the same
+upload-listener path as KAD `OP_CALLBACK`). Firewalled Ember DHT contacts are
+never registered in SourceManager (that map has no firewalled bit, so pending
+promotion would TCP-dial the claimed NAT IP). `WaitCallbackKad` rows are also
+kept out of TCP reask and pause/resume seeding; only `CALLBACK_REQ` retries
+them. A searcher that itself is
+TCP-firewalled (LowID, or KAD/server `Firewalled` — not the UPnP-pessimistic
+startup flag) does not send `CALLBACK_REQ`. Firewalled Ember DHT records also
+set `SOURCE_FLAG_RELAY_CAPABLE`, so ingest starts the same Ember punch/relay
+broker KAD uses for Ember-capable LowID sources instead of leaving both sides
+parked. An unusable named buddy still parks — including Searching-only pending
+downloads — rather than dropping the source. The broker still needs admitted
+ERAT candidates; it does not invent a relay.
+
+Diagnostics: `ember_dht_callback_sent / forwards / connects` on the Ember page.
 
 ### 5. Persist the Ember source publish schedule — done
 

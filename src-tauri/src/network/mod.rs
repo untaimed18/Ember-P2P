@@ -1975,6 +1975,8 @@ async fn handle_epx_sources(
     // Only used to charge relay attestations to an introducer.
     from_ember_hash: Option<[u8; 16]>,
     label: &str,
+    include_pending_downloads: bool,
+    we_are_unreachable: bool,
 ) -> usize {
     state.ember_diagnostics.epx_events_received = state
         .ember_diagnostics
@@ -2006,7 +2008,15 @@ async fn handle_epx_sources(
         let matching_ids = {
             let mgr = transfer_manager.read().await;
             let hash_hex = hex::encode(file_hash);
-            matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex)
+            let mut ids = matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex);
+            if include_pending_downloads {
+                for (tid, pd) in &state.pending_downloads {
+                    if pd.file_hash == hash_hex && !ids.contains(tid) {
+                        ids.push(tid.clone());
+                    }
+                }
+            }
+            ids
         };
         if matching_ids.is_empty() {
             continue;
@@ -2030,7 +2040,7 @@ async fn handle_epx_sources(
             // back.
             let verdict = {
                 let mut admission = ember::ingest::SourceAdmission {
-                    we_are_unreachable: state.firewalled || state.low_id,
+                    we_are_unreachable,
                     external_ip: state.external_ip,
                     dead_sources: &mut state.dead_sources,
                     ip_filter: &mut state.ip_filter,
@@ -2058,17 +2068,29 @@ async fn handle_epx_sources(
             // way to aim a swarm of downloaders at a third party when the record
             // was forged.
             //
-            // Keep the row — the peer stays visible, counts as a source, and is
-            // reseeded on pause/resume — but park it out of the dial rotation
-            // (`LowToLowIp` is what `time_until_reask` treats as never-dial) and
-            // let the punch/relay broker hand the worker an established stream
-            // instead, which is what `maybe_publish_ember_sources` says the flag
-            // is for. A peer whose flag is stale because it since gained a
-            // forwarded port is reachable again on its next republish, and can
-            // dial us meanwhile.
+            // Keep the row out of TCP rotation. When we are also unreachable
+            // and the source advertised `SOURCE_FLAG_RELAY_CAPABLE` (Ember DHT
+            // firewalled publish does), start the same LowID↔LowID broker
+            // KAD uses for Ember-capable callback sources — otherwise two
+            // Ember-only firewalled peers that never hit KAD stay parked.
+            // `LowToLowIp` / `EmberRelay` are never-dial; the broker hands
+            // the worker an established stream on success.
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
                 let mut stored_new = false;
                 for transfer_id in &matching_ids {
+                    let broker_started = ember_firewalled_source_should_broker(
+                        we_are_unreachable,
+                        flags,
+                        ip,
+                        port,
+                    ) && start_ember_low_to_low_broker(
+                        state,
+                        transfer_id,
+                        *file_hash,
+                        ip,
+                        port,
+                    )
+                    .await;
                     let pfs = state
                         .per_file_sources
                         .entry(transfer_id.clone())
@@ -2076,7 +2098,11 @@ async fn handle_epx_sources(
                     if pfs.add_source_full(ip, port, udp_port) {
                         stored_new = true;
                     }
-                    pfs.set_low_to_low(ip, port, None);
+                    if broker_started {
+                        pfs.set_ember_relay(ip, port, None);
+                    } else {
+                        pfs.set_low_to_low(ip, port, None);
+                    }
                 }
                 if stored_new {
                     state.ember_payload_dirty = true;
@@ -2088,7 +2114,7 @@ async fn handle_epx_sources(
                         .or_default() += 1;
                 }
                 debug!(
-                    "EPX source {ip}:{port} is firewalled; kept as a parked source rather than dialled ({label})"
+                    "EPX source {ip}:{port} is firewalled; parked out of TCP dial ({label})"
                 );
                 continue;
             }
@@ -4096,6 +4122,159 @@ mod friend_transfer_tests {
             Some(now + 60),
             now
         ));
+    }
+
+    #[test]
+    fn ember_tcp_firewalled_matches_publish_not_upnp_guess() {
+        use crate::network::kad::firewall::FirewallStatus;
+        assert!(
+            !ember_tcp_firewalled_from(false, FirewallStatus::Unknown),
+            "UPnP-pessimistic / unknown must not skip CALLBACK_REQ"
+        );
+        assert!(!ember_tcp_firewalled_from(false, FirewallStatus::Open));
+        assert!(ember_tcp_firewalled_from(false, FirewallStatus::Firewalled));
+        assert!(ember_tcp_firewalled_from(true, FirewallStatus::Open));
+        assert!(ember_tcp_firewalled_from(true, FirewallStatus::Unknown));
+    }
+
+    #[test]
+    fn ember_source_uses_callback_parks_unusable_buddies() {
+        let buddy = ember::dht::publish::SourceBuddy {
+            ip: Ipv4Addr::new(8, 8, 4, 4),
+            udp_port: 4672,
+            noise_pub: [0xB1; 32],
+        };
+        let src = ember::dht::publish::DiscoveredSource {
+            ip: Ipv4Addr::new(10, 0, 0, 9),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: ember::SOURCE_FLAG_FIREWALLED,
+            user_hash: Some([0xCCu8; 16]),
+            buddy: Some(buddy),
+            callback_token: Some([0xDDu8; 16]),
+            publisher_id: [0xAAu8; 16],
+        };
+        assert!(ember_source_uses_callback(&src, false, false));
+        assert!(
+            !ember_source_uses_callback(&src, true, false),
+            "firewalled searcher parks rather than CALLBACK_REQ"
+        );
+        assert!(
+            !ember_source_uses_callback(&src, false, true),
+            "filtered or banned buddy must fall back to park, not drop"
+        );
+
+        let lan = ember::dht::publish::DiscoveredSource {
+            buddy: Some(ember::dht::publish::SourceBuddy {
+                ip: Ipv4Addr::new(192, 168, 0, 2),
+                udp_port: 4672,
+                noise_pub: [0xB1; 32],
+            }),
+            ..src
+        };
+        assert!(
+            !ember_source_uses_callback(&lan, false, false),
+            "special-use buddy is not a callback job"
+        );
+
+        assert!(
+            !ember_source_is_sm_dialable(&src),
+            "FIREWALLED contacts must not be registered in SourceManager"
+        );
+        let highid = ember::dht::publish::DiscoveredSource {
+            flags: 0,
+            buddy: None,
+            callback_token: None,
+            ..src
+        };
+        assert!(ember_source_is_sm_dialable(&highid));
+    }
+
+    #[test]
+    fn ember_firewalled_source_should_broker_matches_kad_ember_capable_gate() {
+        let ip = Ipv4Addr::new(8, 8, 8, 8);
+        assert!(
+            ember_firewalled_source_should_broker(
+                true,
+                ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
+                ip,
+                4662,
+            ),
+            "two firewalled Ember peers must start the broker"
+        );
+        assert!(
+            !ember_firewalled_source_should_broker(
+                false,
+                ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
+                ip,
+                4662,
+            ),
+            "reachable searcher uses CALLBACK_REQ, not the broker"
+        );
+        assert!(
+            !ember_firewalled_source_should_broker(
+                true,
+                ember::SOURCE_FLAG_FIREWALLED,
+                ip,
+                4662,
+            ),
+            "without RELAY_CAPABLE, admission already refuses LowID↔LowID"
+        );
+        assert!(!ember_firewalled_source_should_broker(
+            true,
+            ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
+            Ipv4Addr::UNSPECIFIED,
+            4662,
+        ));
+        assert!(!ember_firewalled_source_should_broker(
+            true,
+            ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
+            ip,
+            0,
+        ));
+    }
+
+    #[test]
+    fn epx_marks_ember_relay_as_firewalled() {
+        use ed2k::sources::DownloadSourceState::*;
+        assert!(epx_advertises_source_firewalled(&WaitCallbackKad));
+        assert!(epx_advertises_source_firewalled(&LowToLowIp));
+        assert!(
+            epx_advertises_source_firewalled(&EmberRelay),
+            "broker-parked firewalled contacts must not be gossiped as HighID"
+        );
+        assert!(!epx_advertises_source_firewalled(&New));
+        assert!(!epx_advertises_source_firewalled(&Failed));
+        assert!(!epx_advertises_source_firewalled(&FriendConnect));
+    }
+
+    #[test]
+    fn ember_named_source_buddy_skips_unroutable_contacts() {
+        use std::net::{IpAddr, SocketAddr};
+        let ok = ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([1u8; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 4672),
+            noise_pub: [0x11; 32],
+            ed25519_pub: [0x22; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        };
+        assert!(ember_named_source_buddy(&ok).is_some());
+
+        let mut lan = ok.clone();
+        lan.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4672);
+        assert!(ember_named_source_buddy(&lan).is_none());
+
+        let mut docs = ok.clone();
+        docs.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 4672);
+        assert!(ember_named_source_buddy(&docs).is_none());
+
+        let mut v6 = ok.clone();
+        v6.addr = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            4672,
+        );
+        assert!(ember_named_source_buddy(&v6).is_none());
     }
 
     #[test]
@@ -6859,6 +7038,7 @@ mod tests {
                 udp_port: 4672,
                 flags: 0,
                 noise_pub: [0u8; 32],
+                ..Default::default()
             },
         )
     }
@@ -7971,6 +8151,7 @@ mod tests {
                 udp_port: 4672,
                 flags: 0,
                 noise_pub: [0u8; 32],
+                ..Default::default()
             },
             &sk,
         );
@@ -8034,6 +8215,7 @@ mod tests {
                 udp_port: 4672,
                 flags: ember::SOURCE_FLAG_FIREWALLED,
                 noise_pub: attacker_key,
+                ..Default::default()
             },
         );
         let mut diag = crate::types::EmberDiagnostics::default();
@@ -8056,6 +8238,53 @@ mod tests {
     }
 
     #[test]
+    fn firewalled_source_records_preserve_callback_buddy() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let file_hash = [0x44u8; 16];
+        let buddy = ember::dht::publish::SourceBuddy {
+            ip: Ipv4Addr::new(203, 0, 113, 10),
+            udp_port: 4672,
+            noise_pub: [0xB1; 32],
+        };
+        let blob = ember_source_blob_contact(
+            &sk,
+            file_hash,
+            [0u8; 32],
+            ember::dht::publish::SourceContact {
+                ip: Ipv4Addr::new(10, 0, 0, 9),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: ember::SOURCE_FLAG_FIREWALLED,
+                noise_pub: [0x33; 32],
+                user_hash: Some([0xCCu8; 16]),
+                buddy: Some(buddy),
+                callback_token: Some([0xDDu8; 16]),
+            },
+        );
+        let mut diag = crate::types::EmberDiagnostics::default();
+        let mut noise_keys = HashMap::new();
+        let mut content_hashes = HashMap::new();
+        let sources = parse_ember_source_records(
+            &[blob],
+            file_hash,
+            None,
+            &mut diag,
+            &mut noise_keys,
+            &HashSet::new(),
+            &mut content_hashes,
+        );
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].buddy, Some(buddy));
+        assert_eq!(sources[0].user_hash, Some([0xCCu8; 16]));
+        assert_eq!(sources[0].callback_token, Some([0xDDu8; 16]));
+        assert_ne!(sources[0].publisher_id, [0u8; 16]);
+        assert!(
+            noise_keys.is_empty(),
+            "firewalled buddy contacts must not pin Noise keys either"
+        );
+    }
+
+    #[test]
     fn highid_source_records_cache_bound_noise_keys() {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
         let file_hash = [0x43u8; 16];
@@ -8071,6 +8300,7 @@ mod tests {
                 udp_port: 4672,
                 flags: 0,
                 noise_pub: key,
+                ..Default::default()
             },
         );
         let mut diag = crate::types::EmberDiagnostics::default();
@@ -10514,6 +10744,17 @@ async fn retire_ember_session(
     true
 }
 
+/// Source record held until the named buddy ACKs `PROXY_STORE`, so overlay
+/// `FIND_VALUE` cannot advertise a buddy that cannot bounce `CALLBACK_REQ`.
+struct EmberPendingProxyOverlay {
+    record: ember::dht::publish::SignedRecord,
+    reference: EmberRecordRef,
+    queued_at: std::time::Instant,
+}
+
+const EMBER_PROXY_OVERLAY_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+const MAX_EMBER_PENDING_PROXY_OVERLAY: usize = 256;
+
 struct NetworkState {
     local_id: KadId,
     user_hash: [u8; 16],
@@ -11480,7 +11721,14 @@ struct NetworkState {
     /// completion point (`maybe_finish_ember_search`) is synchronous, but
     /// injection (`handle_epx_sources`) is async, so results are buffered
     /// here and drained on the next `ember_search_timer` tick.
-    ember_pending_source_injections: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)>,
+    ember_pending_source_injections: Vec<([u8; 16], Vec<ember::dht::publish::DiscoveredSource>)>,
+    /// Buddy-relayed Ember `CALLBACK`s asking us (firewalled publisher) to
+    /// connect-and-serve the searcher. Drained on the search timer, which
+    /// has `connect_serve_tx`.
+    ember_pending_callback_connects: Vec<ember::dht::engine::CallbackConnect>,
+    /// Firewalled source records waiting for `PROXY_STORE_ACK` before overlay
+    /// `STORE_BATCH`. Keyed by `(buddy, request_id)`.
+    ember_pending_proxy_overlay: HashMap<(ember::dht::EmberNodeId, u32), EmberPendingProxyOverlay>,
     /// Channel gossip ids already persisted or flooded this session.
     channel_gossip_seen: HashMap<[u8; 16], std::time::Instant>,
     channel_gossip_seen_order: VecDeque<[u8; 16]>,
@@ -16665,13 +16913,23 @@ async fn try_start_pending_download_from_known_sources(
         .collect();
 
     if live_sources.is_empty() {
-        state
-            .pending_downloads
-            .insert(transfer_id.to_string(), pending);
-        return false;
+        if !pending_download_has_parked_ember_sources(state, transfer_id) {
+            state
+                .pending_downloads
+                .insert(transfer_id.to_string(), pending);
+            return false;
+        }
     }
 
-    let source_count = live_sources.len() as u32;
+    let source_count = live_sources
+        .len()
+        .max(
+            state
+                .per_file_sources
+                .get(transfer_id)
+                .map(|pfs| pfs.sources.len())
+                .unwrap_or(0),
+        ) as u32;
     {
         let mut mgr = transfer_manager.write().await;
         mgr.update_status(transfer_id, TransferStatus::Active);
@@ -17534,6 +17792,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_download_source_searches.clear();
     state.ember_source_search_state.clear();
     state.ember_pending_source_injections.clear();
+    state.ember_pending_callback_connects.clear();
+    state.ember_pending_proxy_overlay.clear();
     state.ember_keyword_searches.clear();
     state.ember_pending_keyword_results.clear();
     state.ember_channel_presence_searches.clear();
@@ -18518,6 +18778,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_download_source_searches: HashMap::new(),
         ember_source_search_state: HashMap::new(),
         ember_pending_source_injections: Vec::new(),
+        ember_pending_callback_connects: Vec::new(),
+        ember_pending_proxy_overlay: HashMap::new(),
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
@@ -21658,7 +21920,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
                 // Inject Ember Peer Exchange sources into matching active downloads
                 if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}")).await;
+                    let we_are_unreachable = state.firewalled || state.low_id;
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}"), false, we_are_unreachable).await;
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port, udp_port } = event {
@@ -22570,7 +22833,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 // Inject Ember Peer Exchange sources from upload-side peers
                 if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event.kind {
-                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload").await;
+                    let we_are_unreachable = state.firewalled || state.low_id;
+                    handle_epx_sources(&mut state, &transfer_manager, &source_manager, &local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload", false, we_are_unreachable).await;
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port, udp_port } = event.kind {
@@ -29437,6 +29701,108 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
+                // Ember CALLBACK_REQ reask: independent of KAD. Same short
+                // cadence as KAD so a lost Noise frame is retried promptly.
+                {
+                    struct EmberCallbackReaskJob {
+                        transfer_id: String,
+                        file_hash: [u8; 16],
+                        src_ip: Ipv4Addr,
+                        src_port: u16,
+                        buddy_ip: Ipv4Addr,
+                        buddy_port: u16,
+                        buddy_noise: [u8; 32],
+                        publisher_id: [u8; 16],
+                        callback_token: [u8; 16],
+                        user_hash: Option<[u8; 16]>,
+                    }
+                    let mut reask_jobs: Vec<EmberCallbackReaskJob> = Vec::new();
+                    for (tid, pfs) in &state.per_file_sources {
+                        let is_live = state.pending_downloads.contains_key(tid)
+                            || state.active_source_senders.contains_key(tid);
+                        if !is_live {
+                            continue;
+                        }
+                        for src in &pfs.sources {
+                            if !src.ember_callback_reask_due() {
+                                continue;
+                            }
+                            let (Some(buddy_ip), Some(buddy_port), Some(buddy_noise), Some(publisher_id), Some(callback_token)) = (
+                                src.callback_buddy_ip,
+                                src.callback_buddy_port,
+                                src.callback_ember_buddy_noise,
+                                src.callback_ember_publisher,
+                                src.callback_ember_token,
+                            ) else {
+                                continue;
+                            };
+                            reask_jobs.push(EmberCallbackReaskJob {
+                                transfer_id: tid.clone(),
+                                file_hash: pfs.file_hash,
+                                src_ip: src.ip,
+                                src_port: src.tcp_port,
+                                buddy_ip,
+                                buddy_port,
+                                buddy_noise,
+                                publisher_id,
+                                callback_token,
+                                user_hash: src.source_user_hash,
+                            });
+                        }
+                    }
+                    if !reask_jobs.is_empty() {
+                        let crypt_options = if settings.obfuscation_enabled {
+                            0x03
+                        } else {
+                            0
+                        };
+                        let searcher_tcp = advertised_tcp_port(&state);
+                        let searcher_uh = state.user_hash;
+                        for job in reask_jobs {
+                            if send_ember_callback_req(
+                                &udp_socket,
+                                &mut state,
+                                job.buddy_ip,
+                                job.buddy_port,
+                                job.buddy_noise,
+                                ember::dht::EmberNodeId(job.publisher_id),
+                                job.file_hash,
+                                searcher_tcp,
+                                crypt_options,
+                                searcher_uh,
+                                job.callback_token,
+                            )
+                            .await
+                            {
+                                if let Some(pfs) = state.per_file_sources.get_mut(&job.transfer_id)
+                                {
+                                    pfs.mark_callback_requested(
+                                        job.src_ip,
+                                        job.src_port,
+                                        job.user_hash,
+                                    );
+                                }
+                                register_or_refresh_pending_kad_callback(
+                                    &pending_kad_callbacks,
+                                    job.src_ip,
+                                    job.src_port,
+                                    job.file_hash,
+                                    job.user_hash,
+                                )
+                                .await;
+                                let ip_s = upload_server::kad_callback_display_key(
+                                    job.src_ip,
+                                    job.user_hash,
+                                );
+                                state.callback_row_pending_since.insert(
+                                    (job.transfer_id.clone(), ip_s, job.src_port),
+                                    now,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Always process cancellations even when offline.
                 {
                     let to_cancel: Vec<String> = state.pending_downloads.iter()
@@ -35380,10 +35746,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     .take(ember::MAX_EPX_SOURCES_PER_FILE)
                                     .map(|s| {
                                         let mut flags = 0u8;
-                                        if matches!(s.state,
-                                            ed2k::sources::DownloadSourceState::WaitCallbackKad
-                                            | ed2k::sources::DownloadSourceState::LowToLowIp
-                                        ) {
+                                        if epx_advertises_source_firewalled(&s.state) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
                                         }
                                         if local_relay_ip == Some(s.ip) {
@@ -35444,10 +35807,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     .take(ember::MAX_EPX_SOURCES_PER_FILE)
                                     .map(|s| {
                                         let mut flags = 0u8;
-                                        if matches!(s.state,
-                                            ed2k::sources::DownloadSourceState::WaitCallbackKad
-                                            | ed2k::sources::DownloadSourceState::LowToLowIp
-                                        ) {
+                                        if epx_advertises_source_firewalled(&s.state) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
                                         }
                                         if local_relay_ip == Some(s.ip) {
@@ -35678,6 +36038,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     && state.ember_publish.active_count() == 0
                     && state.ember_dht_maint_pings.is_empty()
                     && state.ember_pending_source_injections.is_empty()
+                    && state.ember_pending_callback_connects.is_empty()
+                    && state.ember_pending_proxy_overlay.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
                     && state.ember_pending_channel_presence.is_empty()
                     && state.ember_pending_channel_moderation.is_empty()
@@ -35871,6 +36233,38 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 //    sources here for the async injection below.
                 if !state.ember_pending_source_injections.is_empty() {
                     let entries = std::mem::take(&mut state.ember_pending_source_injections);
+                    let we_are_unreachable = ember_tcp_firewalled(&state);
+
+                    // Firewalled records that name a usable buddy, when we can
+                    // accept a TCP connect-back, take the Ember CALLBACK_REQ
+                    // path instead of being parked as LowToLowIp. An unusable
+                    // buddy falls through to the park path rather than dropping
+                    // the source.
+                    let mut epx_entries: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)> =
+                        Vec::new();
+                    let mut callback_jobs: Vec<([u8; 16], ember::dht::publish::DiscoveredSource)> =
+                        Vec::new();
+                    for (fh, sources) in &entries {
+                        let mut rest = Vec::new();
+                        for src in sources {
+                            let buddy_blocked_or_banned = src.buddy.is_some_and(|b| {
+                                state.banned_ips.contains(&b.ip)
+                                    || state.ip_filter.is_blocked(b.ip)
+                            });
+                            if ember_source_uses_callback(
+                                src,
+                                we_are_unreachable,
+                                buddy_blocked_or_banned,
+                            ) {
+                                callback_jobs.push((*fh, *src));
+                            } else {
+                                rest.push((src.ip, src.tcp_port, src.udp_port, src.flags));
+                            }
+                        }
+                        if !rest.is_empty() {
+                            epx_entries.push((*fh, rest));
+                        }
+                    }
 
                     // (a) Record every discovered source in the source manager.
                     //     This is what lets a *pending* no-seed download (started
@@ -35884,46 +36278,212 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     {
                         let mut sm = source_manager.write().await;
                         for (fh, sources) in &entries {
-                            for &(ip, tcp_port, udp_port, flags) in sources {
-                                if state.ip_filter.is_blocked(ip) || state.banned_ips.contains(&ip)
+                            for src in sources {
+                                if state.ip_filter.is_blocked(src.ip)
+                                    || state.banned_ips.contains(&src.ip)
                                 {
                                     continue;
                                 }
+                                // Firewalled records are reached by CALLBACK_REQ
+                                // or parked as LowToLowIp. SourceManager has no
+                                // firewalled bit, so registering the claimed NAT
+                                // IP would let pending promotion TCP-dial it.
+                                if !ember_source_is_sm_dialable(src) {
+                                    continue;
+                                }
                                 let connect_options =
-                                    if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
+                                    if src.flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
                                         0x02
                                     } else {
                                         0
                                     };
                                 sm.register_source_full_opts(
                                     *fh,
-                                    ip,
-                                    tcp_port,
-                                    udp_port,
-                                    [0u8; 16],
+                                    src.ip,
+                                    src.tcp_port,
+                                    src.udp_port,
+                                    src.user_hash.unwrap_or([0u8; 16]),
                                     connect_options,
                                 );
                             }
                         }
                     }
 
-                    // (b) Inject into already-active transfers. Reuses the
-                    //     EPX/KAD ingest (ipfilter, ban, dedup, caps,
-                    //     relay-candidate handling, per-transfer counters).
-                    handle_epx_sources(
-                        &mut state,
-                        &transfer_manager,
-                        &source_manager,
-                        &local_index,
-                        &entries,
-                        &[],
-                        &[],
-                        &[],
-                        // Our own DHT lookup results, not a peer's forward.
-                        None,
-                        "ember-dht",
-                    )
-                    .await;
+                    // (b) Inject HighID / uncallable-firewalled sources into
+                    //     already-active transfers. Reuses the EPX/KAD ingest.
+                    if !epx_entries.is_empty() {
+                        handle_epx_sources(
+                            &mut state,
+                            &transfer_manager,
+                            &source_manager,
+                            &local_index,
+                            &epx_entries,
+                            &[],
+                            &[],
+                            &[],
+                            // Our own DHT lookup results, not a peer's forward.
+                            None,
+                            "ember-dht",
+                            true,
+                            we_are_unreachable,
+                        )
+                        .await;
+                    }
+
+                    // (b2) Firewalled sources with a signed buddy: park as
+                    //      WaitCallbackKad and send CALLBACK_REQ.
+                    if !callback_jobs.is_empty() {
+                        let crypt_options = if settings.obfuscation_enabled {
+                            0x03
+                        } else {
+                            0
+                        };
+                        let searcher_tcp = advertised_tcp_port(&state);
+                        let searcher_uh = state.user_hash;
+                        let mut callback_tids: Vec<String> = Vec::new();
+                        for (fh, src) in callback_jobs {
+                            let Some(buddy) = src.buddy else {
+                                continue;
+                            };
+                            if buddy.udp_port == 0
+                                || state.ip_filter.is_blocked(buddy.ip)
+                                || state.banned_ips.contains(&buddy.ip)
+                                || crate::security::is_special_use_v4(buddy.ip)
+                            {
+                                continue;
+                            }
+                            if src.publisher_id == [0u8; 16] {
+                                continue;
+                            }
+                            let Some(token) = src.callback_token.filter(|t| *t != [0u8; 16]) else {
+                                continue;
+                            };
+                            let matching_ids = {
+                                let mgr = transfer_manager.read().await;
+                                let hash_hex = hex::encode(fh);
+                                let mut ids = matching_active_transfer_ids_for_hash(
+                                    &state, &mgr, &hash_hex,
+                                );
+                                for (tid, pd) in &state.pending_downloads {
+                                    if pd.file_hash == hash_hex && !ids.contains(tid) {
+                                        ids.push(tid.clone());
+                                    }
+                                }
+                                ids
+                            };
+                            for tid in &matching_ids {
+                                let pfs = state.per_file_sources.entry(tid.clone()).or_insert_with(
+                                    || ed2k::sources::PerFileSourceList::new(fh),
+                                );
+                                let added = pfs.add_source_with_identity(
+                                    src.ip,
+                                    src.tcp_port,
+                                    src.udp_port,
+                                    src.user_hash,
+                                );
+                                pfs.set_ember_callback_buddy(
+                                    src.ip,
+                                    src.tcp_port,
+                                    buddy.ip,
+                                    buddy.udp_port,
+                                    buddy.noise_pub,
+                                    src.publisher_id,
+                                    src.user_hash,
+                                    src.callback_token,
+                                    added,
+                                );
+                            }
+                            if matching_ids.is_empty() {
+                                continue;
+                            }
+                            {
+                                let mut mgr = transfer_manager.write().await;
+                                let now_ts = chrono::Utc::now().timestamp();
+                                for tid in &matching_ids {
+                                    let ip_s = upload_server::kad_callback_display_key(
+                                        src.ip,
+                                        src.user_hash,
+                                    );
+                                    if !mgr.has_source_detail_for_ip(tid, &ip_s) {
+                                        mgr.update_source_detail(
+                                            tid,
+                                            crate::types::SourceInfo {
+                                                ip: ip_s.clone(),
+                                                port: src.tcp_port,
+                                                status: crate::types::SourceStatus::WaitCallback,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "Ember Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: crate::geoip::lookup_country(
+                                                    &geoip,
+                                                    std::net::IpAddr::V4(src.ip),
+                                                ),
+                                                user_hash: src.user_hash,
+                                            },
+                                        );
+                                    }
+                                    state.callback_row_pending_since.insert(
+                                        (tid.clone(), ip_s, src.tcp_port),
+                                        now_ts,
+                                    );
+                                    if !callback_tids.contains(tid) {
+                                        callback_tids.push(tid.clone());
+                                    }
+                                }
+                            }
+                            if send_ember_callback_req(
+                                &udp_socket,
+                                &mut state,
+                                buddy.ip,
+                                buddy.udp_port,
+                                buddy.noise_pub,
+                                ember::dht::EmberNodeId(src.publisher_id),
+                                fh,
+                                searcher_tcp,
+                                crypt_options,
+                                searcher_uh,
+                                token,
+                            )
+                            .await
+                            {
+                                for tid in &matching_ids {
+                                    if let Some(pfs) = state.per_file_sources.get_mut(tid) {
+                                        pfs.mark_callback_requested(
+                                            src.ip,
+                                            src.tcp_port,
+                                            src.user_hash,
+                                        );
+                                    }
+                                }
+                                register_or_refresh_pending_kad_callback(
+                                    &pending_kad_callbacks,
+                                    src.ip,
+                                    src.tcp_port,
+                                    fh,
+                                    src.user_hash,
+                                )
+                                .await;
+                                info!(
+                                    "Sent Ember CALLBACK_REQ to buddy {}:{} for source {}:{} file {}",
+                                    buddy.ip,
+                                    buddy.udp_port,
+                                    src.ip,
+                                    src.tcp_port,
+                                    hex::encode(fh),
+                                );
+                            }
+                        }
+                        for tid in callback_tids {
+                            let _ = app_handle.emit(
+                                "transfer:sources-updated",
+                                serde_json::json!({ "transfer_id": tid }),
+                            );
+                        }
+                    }
 
                     // (c) Promote any pending no-seed download for these hashes
                     //     now that a live source exists for it.
@@ -35965,6 +36525,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .await;
                     }
                 }
+
+                drain_ember_callback_connects(&mut state, &connect_serve_tx).await;
 
                 // 7) Stream keyword hits out of lookups that are still walking.
                 //    `FIND_VALUE` is deliberately excluded from early
@@ -38993,6 +39555,7 @@ async fn handle_ember_control_message(
                         .routing()
                         .contact_at(from)
                         .map(|c| c.node_id.0);
+                    let we_are_unreachable = state.firewalled || state.low_id;
                     let injected = handle_epx_sources(
                         state,
                         transfer_manager,
@@ -39004,6 +39567,8 @@ async fn handle_ember_control_message(
                         &result.relay_attestations,
                         from_ember_hash,
                         "ember-udp",
+                        false,
+                        we_are_unreachable,
                     )
                     .await;
                     debug!("ember-udp: ingested EPX from {from} ({injected} sources injected)");
@@ -39370,7 +39935,7 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
 }
 
 /// Parse the blobs returned by an Ember DHT source `FIND_VALUE` into
-/// connectable `(ip, tcp_port, udp_port, flags)` tuples (slice 9).
+/// verified [`ember::dht::publish::DiscoveredSource`]s (slice 9).
 ///
 /// Each blob is re-verified (`from_value_blob` checks the publisher
 /// signature), filtered to source records whose embedded file hash matches
@@ -39388,7 +39953,7 @@ fn parse_ember_source_records(
     noise_keys: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     established: &HashSet<(Ipv4Addr, u16)>,
     content_hashes: &mut HashMap<[u8; 16], [u8; 32]>,
-) -> Vec<(Ipv4Addr, u16, u16, u8)> {
+) -> Vec<ember::dht::publish::DiscoveredSource> {
     let mut out = Vec::new();
     // Expected-digest votes, keyed by publisher. A source record is signed
     // only by a key the record carries itself, so there is no trust anchor —
@@ -39433,7 +39998,17 @@ fn parse_ember_source_records(
                 );
             }
         }
-        out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
+        out.push(ember::dht::publish::DiscoveredSource {
+            ip: sc.ip,
+            tcp_port: sc.tcp_port,
+            udp_port: sc.udp_port,
+            flags: sc.flags,
+            user_hash: sc.user_hash,
+            buddy: sc.buddy,
+            callback_token: sc.callback_token,
+            publisher_id: ember::crypto::node_id_from_ed25519_bytes(&rec.publisher_key)
+                .unwrap_or([0u8; 16]),
+        });
     }
     // Fill a gap, never correct one, and only on corroboration. This map is the
     // digest the transfer enforces at completion, so overwriting an entry fails
@@ -40380,6 +40955,177 @@ fn ember_udp_reachable(state: &NetworkState) -> bool {
     )
 }
 
+/// Same TCP-firewalled predicate publish uses for `SOURCE_FLAG_FIREWALLED`
+/// and consume uses before sending `CALLBACK_REQ`. `state.firewalled` starts
+/// as `!upnp_success` and Ember-only nodes never clear it, so consume must
+/// not use that flag.
+fn ember_tcp_firewalled_from(
+    low_id: bool,
+    tcp_status: crate::network::kad::firewall::FirewallStatus,
+) -> bool {
+    low_id || tcp_status == crate::network::kad::firewall::FirewallStatus::Firewalled
+}
+
+fn ember_tcp_firewalled(state: &NetworkState) -> bool {
+    ember_tcp_firewalled_from(state.low_id, state.firewall_checker.tcp_status())
+}
+
+/// First verified HighID IPv4 we may name in a firewalled source trailer.
+fn ember_named_source_buddy(
+    contact: &ember::dht::EmberContact,
+) -> Option<ember::dht::publish::SourceBuddy> {
+    let std::net::IpAddr::V4(ip) = contact.addr.ip() else {
+        return None;
+    };
+    let buddy = ember::dht::publish::SourceBuddy {
+        ip,
+        udp_port: contact.addr.port(),
+        noise_pub: contact.noise_pub,
+    };
+    buddy.is_routable().then_some(buddy)
+}
+
+/// Whether consume should `CALLBACK_REQ` this source. Unusable or locally
+/// blocked buddies fall through to the firewalled park path instead of
+/// being dropped.
+fn ember_source_uses_callback(
+    src: &ember::dht::publish::DiscoveredSource,
+    we_are_unreachable: bool,
+    buddy_blocked_or_banned: bool,
+) -> bool {
+    src.takes_callback(we_are_unreachable) && !buddy_blocked_or_banned
+}
+
+/// PFS states whose declared IP must not be gossiped as a HighID EPX source.
+///
+/// `EmberRelay` is the LowID↔LowID broker park. Omitting it here advertised
+/// Ember DHT firewalled contacts as ordinary dialable sources after ingest
+/// started the broker.
+fn epx_advertises_source_firewalled(state: &ed2k::sources::DownloadSourceState) -> bool {
+    matches!(
+        state,
+        ed2k::sources::DownloadSourceState::WaitCallbackKad
+            | ed2k::sources::DownloadSourceState::LowToLowIp
+            | ed2k::sources::DownloadSourceState::EmberRelay
+    )
+}
+
+/// LowID↔LowID: both sides firewalled, source asked downloaders to use the
+/// Ember broker (`SOURCE_FLAG_RELAY_CAPABLE`). Same gate KAD uses via
+/// `is_ember_capable` before `attempt_low_to_low`.
+fn ember_firewalled_source_should_broker(
+    we_are_unreachable: bool,
+    flags: u8,
+    ip: Ipv4Addr,
+    port: u16,
+) -> bool {
+    we_are_unreachable
+        && flags & ember::SOURCE_FLAG_FIREWALLED != 0
+        && flags & ember::SOURCE_FLAG_RELAY_CAPABLE != 0
+        && port != 0
+        && !ip.is_unspecified()
+}
+
+/// Start the punch/relay broker for a firewalled Ember source. Advertises
+/// our QUIC bind port, not a KAD-UDP-probed one. No-op when the broker
+/// was never constructed (no confirmed external IP / QUIC endpoint yet).
+async fn start_ember_low_to_low_broker(
+    state: &mut NetworkState,
+    transfer_id: &str,
+    file_hash: [u8; 16],
+    source_ip: Ipv4Addr,
+    source_port: u16,
+) -> bool {
+    let ext = state.nat_info.external_addr.map(|addr| {
+        SocketAddr::new(addr.ip(), state.quic_port.unwrap_or(state.tcp_port))
+    });
+    let nat_type = state.nat_info.nat_type;
+    let Some(broker) = state.connection_broker.as_mut() else {
+        return false;
+    };
+    broker
+        .attempt_low_to_low(
+            transfer_id,
+            file_hash,
+            source_ip,
+            source_port,
+            nat_type,
+            ext,
+        )
+        .await
+}
+
+/// SourceManager has no firewalled bit. FIREWALLED Ember DHT contacts must
+/// never be registered there — pending promotion would TCP-dial the claimed
+/// NAT IP.
+fn ember_source_is_sm_dialable(src: &ember::dht::publish::DiscoveredSource) -> bool {
+    src.flags & ember::SOURCE_FLAG_FIREWALLED == 0
+}
+
+fn pending_download_has_parked_ember_sources(state: &NetworkState, transfer_id: &str) -> bool {
+    state.per_file_sources.get(transfer_id).is_some_and(|pfs| {
+        pfs.sources.iter().any(|s| {
+            matches!(
+                s.state,
+                ed2k::sources::DownloadSourceState::WaitCallbackKad
+                    | ed2k::sources::DownloadSourceState::LowToLowIp
+                    | ed2k::sources::DownloadSourceState::EmberRelay
+            )
+        })
+    })
+}
+
+fn prune_ember_pending_proxy_overlay(state: &mut NetworkState) {
+    let now = std::time::Instant::now();
+    let expired: Vec<(ember::dht::EmberNodeId, u32, EmberRecordRef)> = state
+        .ember_pending_proxy_overlay
+        .iter()
+        .filter(|(_, pending)| now.duration_since(pending.queued_at) >= EMBER_PROXY_OVERLAY_TTL)
+        .map(|(k, pending)| (k.0, k.1, pending.reference))
+        .collect();
+    for (buddy, rid, reference) in expired {
+        state.ember_pending_proxy_overlay.remove(&(buddy, rid));
+        untrack_ember_record_pending(state.publish_schedule(), reference);
+    }
+}
+
+async fn flush_ember_proxy_overlay_ack(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    buddy: ember::dht::EmberNodeId,
+    request_id: u32,
+) {
+    prune_ember_pending_proxy_overlay(state);
+    let Some(pending) = state
+        .ember_pending_proxy_overlay
+        .remove(&(buddy, request_id))
+    else {
+        return;
+    };
+    state.ember_dht.store_own_record(&pending.record);
+    if !enqueue_ember_source_overlay(state, &pending.record, pending.reference) {
+        untrack_ember_record_pending(state.publish_schedule(), pending.reference);
+    }
+    flush_ember_batch_publish(socket, state).await;
+}
+
+fn enqueue_ember_source_overlay(
+    state: &mut NetworkState,
+    record: &ember::dht::publish::SignedRecord,
+    reference: EmberRecordRef,
+) -> bool {
+    let targets = ember_overlay_publish_targets(state, record.keyword_hash);
+    state.ember_batch_publish.enqueue(
+        &targets,
+        reference,
+        ember::dht::messages::BatchedRecord {
+            key: record.keyword_hash,
+            record: record.data.clone(),
+            record_signature: record.signature,
+        },
+    )
+}
+
 /// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
 /// Runs on the 60-second publish tick, gated on `ember_native_enabled`
@@ -40405,15 +41151,15 @@ async fn maybe_publish_ember_sources(
 ) {
     // Refresh firewall-awareness gauges every tick (slice 15), even when
     // we skip publishing (empty table / no IP yet).
-    let firewalled_like = state.low_id
-        || state.firewall_checker.tcp_status()
-            == crate::network::kad::firewall::FirewallStatus::Firewalled;
+    let firewalled_like = ember_tcp_firewalled(state);
     // SOURCE_FLAG_FIREWALLED tells downloaders not to TCP-dial. That is a TCP
     // fact: LowID, or KAD/server concluding Firewalled. The pessimistic
     // startup `state.firewalled` (`!upnp_success`) is not — Ember-only never
     // clears it, and an open UDP port is not proof TCP accepts connections
-    // either. UDP-unreachable still asks a buddy to PROXY_STORE and still
-    // advertises relay, without parking the TCP contact.
+    // either. UDP-unreachable still advertises relay without parking the TCP
+    // contact. PROXY_STORE is only for TCP-firewalled records: the buddy
+    // rejects a HighID source, and consume only CALLBACK_REQs FIREWALLED
+    // trailers.
     let udp_needs_help = state.udp_firewalled && !ember_udp_reachable(state);
     let needs_buddy = firewalled_like || udp_needs_help;
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
@@ -40533,121 +41279,202 @@ async fn maybe_publish_ember_sources(
     } else if needs_buddy {
         flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
     }
-    let contact = ember::dht::publish::SourceContact {
+
+    // The HighID named in the trailer — and the only contact we PROXY_STORE.
+    // Naming one buddy while asking three left consume CALLBACK_REQ-ing a
+    // node that never accepted the record.
+    let named_buddy: Option<(ember::dht::EmberContact, ember::dht::publish::SourceBuddy)> =
+        if firewalled_like {
+            let mut c = state.ember_dht.contacts();
+            for extra in state.ember_session_dht_contacts.values() {
+                if !c.iter().any(|held| held.node_id == extra.node_id) {
+                    c.push(extra.clone());
+                }
+            }
+            c.retain(|x| {
+                x.node_id != state.ember_dht.local_id()
+                    && x.failed_queries == 0
+                    && x.is_verified()
+            });
+            c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            c.into_iter()
+                .find_map(|contact| ember_named_source_buddy(&contact).map(|buddy| (contact, buddy)))
+        } else {
+            None
+        };
+
+    let mut contact = ember::dht::publish::SourceContact {
         ip: external_ip,
         tcp_port,
         udp_port,
         flags,
         noise_pub: *state.ember_transport.local_noise_public_key(),
+        user_hash: None,
+        buddy: None,
+        callback_token: None,
     };
+    if let Some((_, buddy)) = &named_buddy {
+        contact.buddy = Some(*buddy);
+        contact.user_hash = Some(state.user_hash);
+    }
 
-    // HighID buddies that can fan out PROXY_STORE for us (freshest first).
-    let buddies: Vec<ember::dht::EmberContact> = if needs_buddy {
-        let mut c = state.ember_dht.contacts();
-        for extra in state.ember_session_dht_contacts.values() {
-            if !c.iter().any(|held| held.node_id == extra.node_id) {
-                c.push(extra.clone());
-            }
-        }
-        c.retain(|x| {
-            x.node_id != state.ember_dht.local_id()
-                && x.failed_queries == 0
-                && x.is_verified()
-        });
-        c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-        c.truncate(EMBER_SOURCE_BUDDY_MAX);
-        c
-    } else {
-        Vec::new()
-    };
+    prune_ember_pending_proxy_overlay(state);
 
     for (file_hash, file_size, file_name, ember_file_hash) in due {
+        let mut file_contact = contact;
+        if file_contact.buddy.is_some() {
+            file_contact.callback_token = Some(state.ember_dht.callback_token(&file_hash));
+        }
         let record = state.ember_dht.build_source_record(
             file_hash,
             ember_file_hash,
             file_size,
             &file_name,
-            contact,
+            file_contact,
         );
-        // Serve our own record too when we are responsible for its key.
-        state.ember_dht.store_own_record(&record);
-
-        // Queue for batched delivery. The schedule is advanced only when a
-        // peer acks, so a publish that reached nobody is retried next tick
-        // instead of locking the file out for the full republish interval —
-        // which is what happened when the timestamp was written at dispatch.
-        let targets = ember_overlay_publish_targets(state, record.keyword_hash);
         let reference = EmberRecordRef {
             file_hash,
             kind: EmberPublishKind::Source,
             key: record.keyword_hash,
         };
-        if state.ember_batch_publish.enqueue(
-            &targets,
-            reference,
-            ember::dht::messages::BatchedRecord {
-                key: record.keyword_hash,
-                record: record.data.clone(),
-                record_signature: record.signature,
-            },
-        ) {
-            track_ember_record_pending(state.publish_schedule(), reference);
+
+        // Overlay STORE names the buddy in the trailer. Hold it until that
+        // buddy ACKs PROXY_STORE so FIND_VALUE cannot succeed while
+        // callback_clients is still empty.
+        if let Some((buddy, _)) = &named_buddy {
+            if let Some(rid) = ask_ember_source_buddy(socket, state, &record, buddy).await {
+                if state.ember_pending_proxy_overlay.len() >= MAX_EMBER_PENDING_PROXY_OVERLAY {
+                    if let Some(oldest) = state
+                        .ember_pending_proxy_overlay
+                        .iter()
+                        .min_by_key(|(_, p)| p.queued_at)
+                        .map(|(k, _)| *k)
+                    {
+                        if let Some(dropped) = state.ember_pending_proxy_overlay.remove(&oldest) {
+                            untrack_ember_record_pending(state.publish_schedule(), dropped.reference);
+                        }
+                    }
+                }
+                track_ember_record_pending(state.publish_schedule(), reference);
+                state.ember_pending_proxy_overlay.insert(
+                    (buddy.node_id, rid),
+                    EmberPendingProxyOverlay {
+                        record,
+                        reference,
+                        queued_at: std::time::Instant::now(),
+                    },
+                );
+            }
+            continue;
         }
 
-        // Buddy path: also ask HighID contacts to STORE on our behalf when
-        // we are TCP/UDP firewalled (symmetric NAT / dual-FW). Buddies that
-        // accept reply with PROXY_STORE_ACK and fan out normal STORE_RECORDs.
-        if !buddies.is_empty() {
-            ask_ember_source_buddies(socket, state, &record, &buddies).await;
+        state.ember_dht.store_own_record(&record);
+        if enqueue_ember_source_overlay(state, &record, reference) {
+            track_ember_record_pending(state.publish_schedule(), reference);
         }
     }
 
     flush_ember_batch_publish(socket, state).await;
 }
 
-/// Cap on HighID buddies asked to PROXY_STORE per source publish tick.
-const EMBER_SOURCE_BUDDY_MAX: usize = 3;
-
-/// Send `PROXY_STORE` to each buddy for a firewalled source record.
-async fn ask_ember_source_buddies(
+/// Send `PROXY_STORE` to the HighID named in the source trailer.
+async fn ask_ember_source_buddy(
     socket: &UdpSocket,
     state: &mut NetworkState,
     record: &ember::dht::publish::SignedRecord,
-    buddies: &[ember::dht::EmberContact],
-) {
+    buddy: &ember::dht::EmberContact,
+) -> Option<u32> {
     let key = record.keyword_hash;
-    for buddy in buddies {
-        let (_rid, frame) =
-            state
-                .ember_dht
-                .build_proxy_store(key, record.data.clone(), record.signature);
-        let sent =
-            match state
-                .ember_transport
-                .prepare_outgoing(buddy.addr, Some(&buddy.noise_pub), &frame)
-            {
-                ember::transport::OutgoingResult::Ready { packet }
-                |                 ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    send_ember_udp(socket, &packet, buddy.addr, &state.ember_dht_overhead)
-                        .await
-                        .is_ok()
-                }
-                ember::transport::OutgoingResult::Queued => {
-                    // Handshake already in flight; the frame is queued and
-                    // will flush when the session completes — same as
-                    // `drive_ember_publish`. Treating this as failure skipped
-                    // buddy fan-out for the whole tick.
-                    true
-                }
-                ember::transport::OutgoingResult::Error(_) => false,
-            };
-        if sent {
-            state.ember_diagnostics.ember_dht_buddy_publishes = state
-                .ember_diagnostics
-                .ember_dht_buddy_publishes
-                .saturating_add(1);
-        }
+    let (rid, frame) =
+        state
+            .ember_dht
+            .build_proxy_store(key, record.data.clone(), record.signature);
+    let sent =
+        match state
+            .ember_transport
+            .prepare_outgoing(buddy.addr, Some(&buddy.noise_pub), &frame)
+        {
+            ember::transport::OutgoingResult::Ready { packet }
+            |             ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                send_ember_udp(socket, &packet, buddy.addr, &state.ember_dht_overhead)
+                    .await
+                    .is_ok()
+            }
+            ember::transport::OutgoingResult::Queued => {
+                // Handshake already in flight; the frame is queued and
+                // will flush when the session completes — same as
+                // `drive_ember_publish`. Treating this as failure skipped
+                // buddy fan-out for the whole tick.
+                true
+            }
+            ember::transport::OutgoingResult::Error(_) => false,
+        };
+    if sent {
+        state.ember_dht.note_proxy_store_sent(
+            buddy.node_id,
+            rid,
+            record.file_hash,
+            std::time::Instant::now(),
+        );
+        state.ember_diagnostics.ember_dht_buddy_publishes = state
+            .ember_diagnostics
+            .ember_dht_buddy_publishes
+            .saturating_add(1);
+        Some(rid)
+    } else {
+        None
     }
+}
+
+/// Send Ember `CALLBACK_REQ` to the HighID buddy named in a firewalled source record.
+async fn send_ember_callback_req(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    buddy_ip: Ipv4Addr,
+    buddy_udp: u16,
+    buddy_noise: [u8; 32],
+    publisher_id: ember::dht::EmberNodeId,
+    file_hash: [u8; 16],
+    searcher_tcp_port: u16,
+    crypt_options: u8,
+    searcher_user_hash: [u8; 16],
+    callback_token: [u8; 16],
+) -> bool {
+    if buddy_udp == 0 || crate::security::is_special_use_v4(buddy_ip) {
+        return false;
+    }
+    if callback_token == [0u8; 16] {
+        return false;
+    }
+    let addr = SocketAddr::new(std::net::IpAddr::V4(buddy_ip), buddy_udp);
+    let (_rid, frame) = state.ember_dht.build_callback_req(
+        publisher_id,
+        file_hash,
+        searcher_tcp_port,
+        crypt_options,
+        searcher_user_hash,
+        callback_token,
+    );
+    let sent = match state
+        .ember_transport
+        .prepare_outgoing(addr, Some(&buddy_noise), &frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead)
+                .await
+                .is_ok()
+        }
+        ember::transport::OutgoingResult::Queued => true,
+        ember::transport::OutgoingResult::Error(_) => false,
+    };
+    if sent {
+        state.ember_diagnostics.ember_dht_callback_sent = state
+            .ember_diagnostics
+            .ember_dht_callback_sent
+            .saturating_add(1);
+    }
+    sent
 }
 
 /// Publish Ember DHT *keyword* records for shared files (slice 8) so a
@@ -41645,6 +42472,41 @@ async fn handle_ember_dht_message(
                 }
             }
         }
+    }
+
+    if let Some((dest, noise, frame)) = inbound.callback_forward {
+        match state
+            .ember_transport
+            .prepare_outgoing(dest, Some(&noise), &frame)
+        {
+            ember::transport::OutgoingResult::Ready { packet }
+            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                if send_ember_udp(socket, &packet, dest, &state.ember_dht_overhead)
+                    .await
+                    .is_ok()
+                {
+                    state.ember_diagnostics.ember_dht_callback_forwards = state
+                        .ember_diagnostics
+                        .ember_dht_callback_forwards
+                        .saturating_add(1);
+                }
+            }
+            ember::transport::OutgoingResult::Queued => {
+                state.ember_diagnostics.ember_dht_callback_forwards = state
+                    .ember_diagnostics
+                    .ember_dht_callback_forwards
+                    .saturating_add(1);
+            }
+            ember::transport::OutgoingResult::Error(_) => {}
+        }
+    }
+
+    if let Some(connect) = inbound.callback_connect {
+        state.ember_pending_callback_connects.push(connect);
+    }
+
+    if let (Some(rid), Some(sender)) = (inbound.proxy_store_ack, inbound.sender_id) {
+        flush_ember_proxy_overlay_ack(socket, state, sender, rid).await;
     }
 
     // Encrypt and send any signed DHT replies (e.g. the PONG answering
@@ -46496,6 +47358,62 @@ fn connect_serve_target_ok(
         }
     }
     true
+}
+
+/// Drain buddy-relayed Ember `CALLBACK`s: connect-and-serve the searcher
+/// (same upload-listener path as KAD `OP_CALLBACK`).
+async fn drain_ember_callback_connects(
+    state: &mut NetworkState,
+    connect_serve_tx: &tokio::sync::mpsc::Sender<upload_server::ConnectServeRequest>,
+) {
+    let pending = std::mem::take(&mut state.ember_pending_callback_connects);
+    if pending.is_empty() {
+        return;
+    }
+    let self_tcp = advertised_tcp_port(state);
+    for cb in pending {
+        // Same as KAD `OP_CALLBACK`: connect-and-serve, do not treat this as
+        // an AddUpNextClient push-grant (`push_grant_file_hash` would send
+        // `OP_ACCEPTUPLOADREQ` immediately). `file_hash` is the published
+        // source the searcher asked for — log it so a bad dest can be tied
+        // back to the grant that unlocked this CALLBACK.
+        info!(
+            "Ember callback: connect to {}:{} for file {}",
+            cb.dest_ip,
+            cb.dest_port,
+            hex::encode(cb.file_hash)
+        );
+        let safe = !state.ip_filter.is_blocked(cb.dest_ip)
+            && !state.banned_ips.contains(&cb.dest_ip)
+            && connect_serve_target_ok(
+                cb.dest_ip,
+                cb.dest_port,
+                state.external_ip,
+                state.tcp_port,
+                self_tcp,
+                cb.user_hash,
+                &state.user_hash,
+            );
+        if !safe {
+            continue;
+        }
+        let peer_addr = SocketAddr::new(cb.dest_ip.into(), cb.dest_port);
+        if let Err(e) = connect_serve_tx.try_send(upload_server::ConnectServeRequest {
+            peer_addr,
+            crypt_options: cb.crypt_options,
+            user_hash: cb.user_hash,
+            push_grant_file_hash: None,
+            push_grant_accepted: None,
+            secure_friend_ember_hash: None,
+        }) {
+            debug!("Could not enqueue Ember callback-serve for {peer_addr}: {e}");
+            continue;
+        }
+        state.ember_diagnostics.ember_dht_callback_connects = state
+            .ember_diagnostics
+            .ember_dht_callback_connects
+            .saturating_add(1);
+    }
 }
 
 fn extract_kad_sources(entries: &[kad::messages::SearchResultEntry]) -> Vec<KadSource> {

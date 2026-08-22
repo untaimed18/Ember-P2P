@@ -15,7 +15,7 @@
 //! a `NetworkState`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -57,13 +57,38 @@ const PROXY_FORWARD_WINDOW: Duration = Duration::from_secs(60);
 
 /// Proxy forwards accepted from one sender per [`PROXY_FORWARD_WINDOW`].
 ///
-/// A firewalled peer asks its buddies to fan out one source record per file it
-/// is republishing, on a two-hour cadence spread over the minute ticks in it,
-/// and `network::mod` sends each round to three buddies. That covers a library
-/// of roughly two thousand files without this ever firing. A peer past it is
-/// only paced on the favour: its own direct source publish is untouched, since
-/// a firewalled source record is accepted from any address.
+/// A firewalled peer asks the HighID named in its source trailer to fan out
+/// one source record per file it is republishing, on a two-hour cadence
+/// spread over the minute ticks in it. That covers a library of roughly two
+/// thousand files without this ever firing. A peer past it is only paced on
+/// the favour: its own direct source publish is untouched, since a firewalled
+/// source record is accepted from any address.
 const MAX_PROXY_FORWARDS_PER_SENDER: usize = 24;
+
+/// How long we remember a publisher we `PROXY_STORE`d for, so a later
+/// `CALLBACK_REQ` can still reach them. Matches the source-record TTL: a
+/// searcher can find a six-hour-old record, and the buddy named in it has
+/// to still know the publisher.
+const CALLBACK_CLIENT_TTL: Duration = Duration::from_secs(6 * 3600);
+/// Bound on remembered `PROXY_STORE` publishers we will callback-relay for.
+const MAX_CALLBACK_CLIENTS: usize = 256;
+/// `CALLBACK_REQ`s we will bounce per searcher per minute.
+const MAX_CALLBACK_FORWARDS_PER_SENDER: usize = 8;
+const MAX_CALLBACK_FORWARDS_IN_FLIGHT: usize = 32;
+const CALLBACK_FORWARD_WINDOW: Duration = Duration::from_secs(60);
+/// Outbound connect-backs we will honour per buddy per minute.
+const MAX_CALLBACK_CONNECTS_PER_BUDDY: usize = 8;
+const MAX_CALLBACK_CONNECTS_IN_FLIGHT: usize = 16;
+const CALLBACK_CONNECT_WINDOW: Duration = Duration::from_secs(60);
+/// Buddies that accepted `PROXY_STORE` for us, kept for the same TTL as the
+/// records that name them, so a `CALLBACK` from one of them is accepted.
+const MAX_OUR_PROXY_BUDDIES: usize = 32;
+/// How long a `PROXY_STORE` we sent may still be ACKed. Handshake (12s) plus
+/// the buddy taking a publish slot is well under this; past it the ask is
+/// gone and a late or guessed ACK cannot unlock connect-back.
+const PROXY_STORE_ASK_TTL: Duration = Duration::from_secs(90);
+/// Bound on in-flight `PROXY_STORE` request ids remembered per buddy.
+const MAX_PENDING_PROXY_ASKS_PER_BUDDY: usize = 64;
 
 /// Share of the liveness-ping budget held for unverified leads when there are
 /// enough verified contacts due to spend the whole thing. One in four: enough
@@ -178,6 +203,35 @@ pub struct DhtInbound {
     pub channel_msg: Option<Vec<u8>>,
     /// Overlay relay envelope (`MSG_CHANNEL_RELAY`).
     pub channel_relay: Option<Vec<u8>>,
+    /// A verified `CALLBACK_REQ` the caller should encrypt and send to this
+    /// publisher (addr, noise_pub, already-signed CALLBACK frame).
+    pub callback_forward: Option<(SocketAddr, [u8; 32], Vec<u8>)>,
+    /// We are the firewalled publisher; connect-and-serve this searcher.
+    pub callback_connect: Option<CallbackConnect>,
+    /// A `PROXY_STORE_ACK` matched a request we sent (`request_id`), so this
+    /// sender is now a trusted callback buddy for that file.
+    pub proxy_store_ack: Option<u32>,
+}
+
+/// Destination a firewalled publisher should dial after a buddy-relayed
+/// `CALLBACK`. The network loop applies the live IP-filter / ban gates
+/// before handing it to the upload listener's connect-and-serve path.
+///
+/// `file_hash` is the source the searcher asked for (already bound by the
+/// PROXY_STORE grant + token). The drain logs it; it is not a push-grant.
+#[derive(Debug, Clone)]
+pub struct CallbackConnect {
+    pub dest_ip: Ipv4Addr,
+    pub dest_port: u16,
+    pub file_hash: [u8; 16],
+    pub crypt_options: u8,
+    pub user_hash: Option<[u8; 16]>,
+}
+
+struct CallbackClient {
+    addr: SocketAddr,
+    noise_pub: [u8; 32],
+    last_seen: Instant,
 }
 
 /// What happened to one record offered to the local store.
@@ -224,6 +278,26 @@ pub struct EmberDht {
     /// prunes past [`PROXY_FORWARD_WINDOW`], which bounds the queue without a
     /// separate size cap.
     proxy_forwards: VecDeque<(Instant, EmberNodeId)>,
+    /// Publishers we recently `PROXY_STORE`d for, so a `CALLBACK_REQ` can
+    /// still find them after the proxy fan-out has finished.
+    callback_clients: HashMap<EmberNodeId, CallbackClient>,
+    /// HighID contacts that *accepted* `PROXY_STORE` for us (`PROXY_STORE_ACK`
+    /// with the request id we sent). A `CALLBACK` is accepted only from one
+    /// of these, so a random DHT peer cannot tell us to connect to an
+    /// arbitrary address, and a contact we merely transmitted to cannot
+    /// either.
+    our_proxy_buddies: HashMap<EmberNodeId, Instant>,
+    /// `PROXY_STORE` request ids still waiting for an ACK, keyed by buddy.
+    /// Each entry is `(request_id, file_hash, sent_at)`.
+    pending_proxy_asks: HashMap<EmberNodeId, Vec<(u32, [u8; 16], Instant)>>,
+    /// Files a buddy ACKed `PROXY_STORE` for. `CALLBACK` is accepted only
+    /// for one of these, so an ACKed buddy cannot aim connect-back for an
+    /// arbitrary file_hash.
+    proxy_file_grants: HashMap<(EmberNodeId, [u8; 16]), Instant>,
+    /// Recent `CALLBACK_REQ`s we bounced, for the per-searcher budget.
+    callback_forwards: VecDeque<(Instant, EmberNodeId)>,
+    /// Recent `CALLBACK`s we honoured with a connect-back, per buddy.
+    callback_connects: VecDeque<(Instant, EmberNodeId)>,
     /// Inbound STORE records refused before they reached the store: the
     /// publisher signature did not parse, or the DHT key did not match the
     /// record's own content key.
@@ -264,6 +338,12 @@ impl EmberDht {
             store_sig_cache_max: MAX_STORE_SIG_CACHE,
             store_sig_swept_at: None,
             proxy_forwards: VecDeque::new(),
+            callback_clients: HashMap::new(),
+            our_proxy_buddies: HashMap::new(),
+            pending_proxy_asks: HashMap::new(),
+            proxy_file_grants: HashMap::new(),
+            callback_forwards: VecDeque::new(),
+            callback_connects: VecDeque::new(),
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
@@ -538,10 +618,10 @@ impl EmberDht {
     /// so an unmetered version lets any peer holding a Noise session convert one
     /// datagram into twenty and occupy the publish driver indefinitely.
     ///
-    /// There is no buddy-agreement state anywhere in the Ember DHT — no set of
-    /// peers we agreed to proxy for — so this cannot be answered by asking who
-    /// is entitled to the favour. What is bounded instead is the work: how much
-    /// one peer may ask for, and how much may be outstanding at all.
+    /// There is still no *agreement* for who may ask us to fan out stores —
+    /// [`Self::callback_clients`] only remembers publishers after we accept, so
+    /// that a later `CALLBACK_REQ` can find them. What is bounded here is the
+    /// work: how much one peer may ask for, and how much may be outstanding.
     fn accept_proxy_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
         while let Some((at, _)) = self.proxy_forwards.front() {
             if now.duration_since(*at) < PROXY_FORWARD_WINDOW {
@@ -567,6 +647,241 @@ impl EmberDht {
         }
         self.proxy_forwards.push_back((now, sender));
         true
+    }
+
+    /// Remember that we just `PROXY_STORE`d for `publisher`, so a later
+    /// `CALLBACK_REQ` naming them can be bounced to `addr`.
+    fn remember_callback_client(
+        &mut self,
+        publisher: EmberNodeId,
+        addr: SocketAddr,
+        noise_pub: [u8; 32],
+        now: Instant,
+    ) {
+        self.callback_clients
+            .retain(|_, c| now.duration_since(c.last_seen) < CALLBACK_CLIENT_TTL);
+        if self.callback_clients.len() >= MAX_CALLBACK_CLIENTS
+            && !self.callback_clients.contains_key(&publisher)
+        {
+            if let Some(oldest) = self
+                .callback_clients
+                .iter()
+                .min_by_key(|(_, c)| c.last_seen)
+                .map(|(id, _)| *id)
+            {
+                self.callback_clients.remove(&oldest);
+            }
+        }
+        self.callback_clients.insert(
+            publisher,
+            CallbackClient {
+                addr,
+                noise_pub,
+                last_seen: now,
+            },
+        );
+    }
+
+    /// Remember that we sent `PROXY_STORE` `request_id` to `buddy`. A later
+    /// `PROXY_STORE_ACK` is honoured only if it echoes this id, so a contact
+    /// we transmitted to cannot unlock connect-back with a guessed ACK.
+    pub fn note_proxy_store_sent(
+        &mut self,
+        buddy: EmberNodeId,
+        request_id: u32,
+        file_hash: [u8; 16],
+        now: Instant,
+    ) {
+        self.prune_proxy_asks(now);
+        let asks = self.pending_proxy_asks.entry(buddy).or_default();
+        asks.retain(|(_, _, at)| now.duration_since(*at) < PROXY_STORE_ASK_TTL);
+        if !asks.iter().any(|(rid, _, _)| *rid == request_id) {
+            if asks.len() >= MAX_PENDING_PROXY_ASKS_PER_BUDDY {
+                asks.remove(0);
+            }
+            asks.push((request_id, file_hash, now));
+        }
+    }
+
+    /// Record that `buddy` accepted `PROXY_STORE`. A `CALLBACK` from anyone
+    /// else is refused — that message would otherwise be an unauthenticated
+    /// "connect to this IP" gadget.
+    fn note_proxy_buddy(&mut self, buddy: EmberNodeId, now: Instant) {
+        self.our_proxy_buddies
+            .retain(|_, at| now.duration_since(*at) < CALLBACK_CLIENT_TTL);
+        if self.our_proxy_buddies.len() >= MAX_OUR_PROXY_BUDDIES
+            && !self.our_proxy_buddies.contains_key(&buddy)
+        {
+            if let Some(oldest) = self
+                .our_proxy_buddies
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(id, _)| *id)
+            {
+                self.our_proxy_buddies.remove(&oldest);
+            }
+        }
+        self.our_proxy_buddies.insert(buddy, now);
+    }
+
+    fn prune_proxy_asks(&mut self, now: Instant) {
+        self.pending_proxy_asks.retain(|_, asks| {
+            asks.retain(|(_, _, at)| now.duration_since(*at) < PROXY_STORE_ASK_TTL);
+            !asks.is_empty()
+        });
+        self.proxy_file_grants
+            .retain(|_, at| now.duration_since(*at) < CALLBACK_CLIENT_TTL);
+    }
+
+    fn complete_proxy_store_ask(
+        &mut self,
+        buddy: EmberNodeId,
+        request_id: u32,
+        now: Instant,
+    ) -> bool {
+        self.prune_proxy_asks(now);
+        let Some(asks) = self.pending_proxy_asks.get_mut(&buddy) else {
+            return false;
+        };
+        let Some(idx) = asks.iter().position(|(rid, _, _)| *rid == request_id) else {
+            return false;
+        };
+        let (_, file_hash, _) = asks.remove(idx);
+        if asks.is_empty() {
+            self.pending_proxy_asks.remove(&buddy);
+        }
+        self.note_proxy_buddy(buddy, now);
+        self.proxy_file_grants.insert((buddy, file_hash), now);
+        true
+    }
+
+    /// Token a firewalled source record names, and that `CALLBACK` must echo.
+    pub fn callback_token(&self, file_hash: &[u8; 16]) -> [u8; 16] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ember-dht-callback-token-v1");
+        hasher.update(&self.signing_key.to_bytes());
+        hasher.update(file_hash);
+        let digest = hasher.finalize();
+        let mut token = [0u8; 16];
+        token.copy_from_slice(&digest.as_bytes()[..16]);
+        token
+    }
+
+    fn callback_grant_ok(&self, buddy: EmberNodeId, file_hash: [u8; 16], token: [u8; 16], now: Instant) -> bool {
+        if token == [0u8; 16] || token != self.callback_token(&file_hash) {
+            return false;
+        }
+        self.proxy_file_grants
+            .get(&(buddy, file_hash))
+            .is_some_and(|at| now.duration_since(*at) < CALLBACK_CLIENT_TTL)
+    }
+
+    fn is_recent_proxy_buddy(&self, buddy: EmberNodeId, now: Instant) -> bool {
+        self.our_proxy_buddies
+            .get(&buddy)
+            .is_some_and(|at| now.duration_since(*at) < CALLBACK_CLIENT_TTL)
+    }
+
+    fn accept_callback_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
+        Self::admit_budgeted(
+            &mut self.callback_forwards,
+            sender,
+            now,
+            CALLBACK_FORWARD_WINDOW,
+            MAX_CALLBACK_FORWARDS_IN_FLIGHT,
+            MAX_CALLBACK_FORWARDS_PER_SENDER,
+        )
+    }
+
+    fn accept_callback_connect(&mut self, buddy: EmberNodeId, now: Instant) -> bool {
+        Self::admit_budgeted(
+            &mut self.callback_connects,
+            buddy,
+            now,
+            CALLBACK_CONNECT_WINDOW,
+            MAX_CALLBACK_CONNECTS_IN_FLIGHT,
+            MAX_CALLBACK_CONNECTS_PER_BUDDY,
+        )
+    }
+
+    fn admit_budgeted(
+        q: &mut VecDeque<(Instant, EmberNodeId)>,
+        who: EmberNodeId,
+        now: Instant,
+        window: Duration,
+        max_in_flight: usize,
+        max_per_sender: usize,
+    ) -> bool {
+        while let Some((at, _)) = q.front() {
+            if now.duration_since(*at) < window {
+                break;
+            }
+            q.pop_front();
+        }
+        if q.len() >= max_in_flight {
+            return false;
+        }
+        let from_who = q.iter().filter(|(_, id)| *id == who).count();
+        if from_who >= max_per_sender {
+            return false;
+        }
+        q.push_back((now, who));
+        true
+    }
+
+    fn callback_dest_ok(ip: Ipv4Addr, port: u16) -> bool {
+        port != 0 && !crate::security::is_special_use_v4(ip)
+    }
+
+    /// Sign a `CALLBACK_REQ` for the buddy named in a firewalled source record.
+    pub fn build_callback_req(
+        &mut self,
+        publisher_id: EmberNodeId,
+        file_hash: [u8; 16],
+        searcher_tcp_port: u16,
+        crypt_options: u8,
+        searcher_user_hash: [u8; 16],
+        callback_token: [u8; 16],
+    ) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_callback_req(
+            self.local_id,
+            request_id,
+            publisher_id,
+            file_hash,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        );
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
+    }
+
+    /// Sign a `CALLBACK` (normally produced when bouncing `CALLBACK_REQ`).
+    #[cfg(test)]
+    pub fn build_callback(
+        &mut self,
+        file_hash: [u8; 16],
+        searcher_ip: Ipv4Addr,
+        searcher_tcp_port: u16,
+        crypt_options: u8,
+        searcher_user_hash: [u8; 16],
+        callback_token: [u8; 16],
+    ) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_callback(
+            self.local_id,
+            request_id,
+            file_hash,
+            searcher_ip,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        );
+        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        (request_id, bytes)
     }
 
     /// Shrink the replay cache so its eviction order can be exercised without
@@ -1301,6 +1616,12 @@ impl EmberDht {
                         && publisher_is_sender
                         && self.accept_proxy_forward(msg.sender_id, Instant::now())
                     {
+                        self.remember_callback_client(
+                            msg.sender_id,
+                            from,
+                            remote_noise_pub,
+                            Instant::now(),
+                        );
                         // We are often the only public replica for this key.
                         // `start_publish_to` STOREs to *other* contacts, so
                         // without this FIND_VALUE walking us answers FOUND_NODE.
@@ -1329,9 +1650,12 @@ impl EmberDht {
                 out.peer_list = Some((msg.request_id, contacts));
             }
             DhtPayload::ProxyStoreAck { key: _ } => {
-                // Publisher-side: buddy accepted the proxy request. No
-                // further engine work — diagnostics are updated by the
-                // network loop if desired.
+                // Publisher-side: honour the ACK only when it echoes a
+                // request id we actually sent this buddy. That is what
+                // unlocks `CALLBACK` connect-back.
+                if self.complete_proxy_store_ask(msg.sender_id, msg.request_id, Instant::now()) {
+                    out.proxy_store_ack = Some(msg.request_id);
+                }
             }
             DhtPayload::FindValue { keys } => {
                 out.find_value_received = true;
@@ -1377,6 +1701,70 @@ impl EmberDht {
             }
             DhtPayload::ChannelRelay { body } => {
                 out.channel_relay = Some(body);
+            }
+            DhtPayload::CallbackReq {
+                publisher_id,
+                file_hash,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
+            } => {
+                // Searcher's IP comes from the datagram, never the payload:
+                // a claimed address would let anyone aim the publisher at a
+                // third party. The token is copied through so the publisher
+                // can bind connect-back to a file it asked us to proxy.
+                let now = Instant::now();
+                if let std::net::IpAddr::V4(searcher_ip) = from.ip() {
+                    if Self::callback_dest_ok(searcher_ip, searcher_tcp_port) {
+                        let client = self.callback_clients.get(&publisher_id).and_then(|c| {
+                            (now.duration_since(c.last_seen) < CALLBACK_CLIENT_TTL)
+                                .then_some((c.addr, c.noise_pub))
+                        });
+                        if let Some((dest, noise)) = client {
+                            if self.accept_callback_forward(msg.sender_id, now) {
+                                let rid = self.next_request_id();
+                                let reply = messages::build_callback(
+                                    self.local_id,
+                                    rid,
+                                    file_hash,
+                                    searcher_ip,
+                                    searcher_tcp_port,
+                                    crypt_options,
+                                    searcher_user_hash,
+                                    callback_token,
+                                );
+                                let bytes =
+                                    messages::encode_message(&reply, &self.signing_key, true);
+                                out.callback_forward = Some((dest, noise, bytes));
+                            }
+                        }
+                    }
+                }
+            }
+            DhtPayload::Callback {
+                file_hash,
+                searcher_ip,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
+            } => {
+                let now = Instant::now();
+                if self.is_recent_proxy_buddy(msg.sender_id, now)
+                    && self.callback_grant_ok(msg.sender_id, file_hash, callback_token, now)
+                    && Self::callback_dest_ok(searcher_ip, searcher_tcp_port)
+                    && self.accept_callback_connect(msg.sender_id, now)
+                {
+                    out.callback_connect = Some(CallbackConnect {
+                        dest_ip: searcher_ip,
+                        dest_port: searcher_tcp_port,
+                        file_hash,
+                        crypt_options,
+                        user_hash: (searcher_user_hash != [0u8; 16])
+                            .then_some(searcher_user_hash),
+                    });
+                }
             }
             other => {
                 // Unknown arrive here once peers speak them. We've already
@@ -2644,6 +3032,7 @@ mod tests {
             udp_port: 4672,
             flags: 0,
             noise_pub: [0x44; 32],
+            ..Default::default()
         }
     }
 
@@ -3117,6 +3506,160 @@ mod tests {
         let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
         assert!(on_buddy.proxy_store_forward.is_none());
         assert!(on_buddy.responses.is_empty());
+    }
+
+    #[test]
+    fn callback_req_forwards_only_after_proxy_store() {
+        let mut publisher = dht(90);
+        let mut buddy = dht(91);
+        let mut searcher = dht(92);
+        let pub_noise = [0xAAu8; 32];
+        let searcher_noise = [0xCCu8; 32];
+        let pub_addr = addr(90, 4672);
+        let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
+
+        let mut contact = source_contact_at(90);
+        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED;
+        let record = publisher.build_source_record([9u8; 16], [0u8; 32], 1, "fw.mkv", contact);
+        let (proxy_rid, proxy) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(buddy
+            .handle_message(&proxy, pub_addr, pub_noise, 2000)
+            .proxy_store_forward
+            .is_some());
+
+        let file_hash = [9u8; 16];
+        let token = publisher.callback_token(&file_hash);
+        let (_rid, req) = searcher.build_callback_req(
+            publisher.local_id(),
+            file_hash,
+            4662,
+            0,
+            [0x11u8; 16],
+            token,
+        );
+        let on_buddy = buddy.handle_message(&req, searcher_addr, searcher_noise, 2001);
+        let (dest, _noise, frame) = on_buddy
+            .callback_forward
+            .expect("buddy should bounce CALLBACK_REQ");
+        assert_eq!(dest, pub_addr);
+
+        publisher.note_proxy_store_sent(buddy.local_id(), proxy_rid, file_hash, Instant::now());
+        let ack = buddy.build_proxy_store_ack_frame(proxy_rid, record.keyword_hash);
+        let on_ack = publisher.handle_message(&ack, addr(91, 4672), [0xBBu8; 32], 2002);
+        assert!(
+            on_ack.proxy_store_ack.is_some(),
+            "matching PROXY_STORE_ACK unlocks CALLBACK"
+        );
+
+        let on_pub = publisher.handle_message(&frame, addr(91, 4672), [0xBBu8; 32], 2003);
+        let connect = on_pub
+            .callback_connect
+            .expect("publisher should connect-serve the searcher");
+        assert_eq!(connect.dest_ip, Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(connect.dest_port, 4662);
+        assert_eq!(connect.file_hash, file_hash);
+        assert_eq!(connect.user_hash, Some([0x11u8; 16]));
+    }
+
+    #[test]
+    fn callback_req_without_proxy_store_is_dropped() {
+        let mut buddy = dht(93);
+        let mut searcher = dht(94);
+        let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
+        let (_rid, req) =
+            searcher.build_callback_req(EmberNodeId([0x99; 16]), [1u8; 16], 4662, 0, [0u8; 16], [0x44u8; 16]);
+        let on_buddy = buddy.handle_message(&req, searcher_addr, [0xCCu8; 32], 2000);
+        assert!(on_buddy.callback_forward.is_none());
+    }
+
+    #[test]
+    fn callback_from_a_stranger_is_dropped() {
+        let mut publisher = dht(95);
+        let mut stranger = dht(96);
+        let searcher_ip = Ipv4Addr::new(8, 8, 4, 4);
+        let (_rid, frame) =
+            stranger.build_callback([2u8; 16], searcher_ip, 4662, 0, [0u8; 16], [0x55u8; 16]);
+        let on_pub = publisher.handle_message(&frame, addr(96, 4672), [0xDDu8; 32], 2000);
+        assert!(on_pub.callback_connect.is_none());
+    }
+
+    #[test]
+    fn callback_requires_matching_proxy_store_ack() {
+        let mut publisher = dht(97);
+        let mut buddy = dht(98);
+        let searcher_ip = Ipv4Addr::new(8, 8, 8, 8);
+        let key = [0xABu8; 16];
+        let file_hash = [3u8; 16];
+        let token = publisher.callback_token(&file_hash);
+        let (rid, _proxy) = publisher.build_proxy_store(key, vec![0u8; 8], [0u8; 64]);
+        let (_cb_rid, callback) =
+            buddy.build_callback(file_hash, searcher_ip, 4662, 0, [0u8; 16], token);
+        let buddy_addr = addr(98, 4672);
+        let buddy_noise = [0xEEu8; 32];
+
+        // Sent but never ACKed: the buddy we transmitted to cannot aim us.
+        publisher.note_proxy_store_sent(buddy.local_id(), rid, file_hash, Instant::now());
+        let on_sent = publisher.handle_message(&callback, buddy_addr, buddy_noise, 2000);
+        assert!(
+            on_sent.callback_connect.is_none(),
+            "CALLBACK before PROXY_STORE_ACK must be dropped"
+        );
+
+        // ACK that does not echo the request id we sent is ignored.
+        let wrong_ack = buddy.build_proxy_store_ack_frame(rid.wrapping_add(1), key);
+        let on_wrong = publisher.handle_message(&wrong_ack, buddy_addr, buddy_noise, 2001);
+        assert!(on_wrong.proxy_store_ack.is_none());
+        let on_after_wrong = publisher.handle_message(&callback, buddy_addr, buddy_noise, 2002);
+        assert!(on_after_wrong.callback_connect.is_none());
+
+        // Matching ACK unlocks CALLBACK from that buddy for this file+token.
+        let ack = buddy.build_proxy_store_ack_frame(rid, key);
+        let on_ack = publisher.handle_message(&ack, buddy_addr, buddy_noise, 2003);
+        assert!(on_ack.proxy_store_ack.is_some());
+        let on_ok = publisher.handle_message(&callback, buddy_addr, buddy_noise, 2004);
+        assert!(on_ok.callback_connect.is_some());
+
+        let (_rid, wrong_token) = buddy.build_callback(
+            file_hash,
+            searcher_ip,
+            4662,
+            0,
+            [0u8; 16],
+            [0xFFu8; 16],
+        );
+        let on_bad_token =
+            publisher.handle_message(&wrong_token, buddy_addr, buddy_noise, 2005);
+        assert!(
+            on_bad_token.callback_connect.is_none(),
+            "CALLBACK with a token we did not publish must be dropped"
+        );
+
+        let other_hash = [4u8; 16];
+        let other_token = publisher.callback_token(&other_hash);
+        let (_rid, other_file) =
+            buddy.build_callback(other_hash, searcher_ip, 4662, 0, [0u8; 16], other_token);
+        let on_other = publisher.handle_message(&other_file, buddy_addr, buddy_noise, 2006);
+        assert!(
+            on_other.callback_connect.is_none(),
+            "CALLBACK for a file we did not PROXY_STORE to this buddy must be dropped"
+        );
+    }
+
+    #[test]
+    fn unsolicited_proxy_store_ack_does_not_unlock_callback() {
+        let mut publisher = dht(99);
+        let mut stranger = dht(100);
+        let searcher_ip = Ipv4Addr::new(8, 8, 4, 4);
+        let ack = stranger.build_proxy_store_ack_frame(7, [0x11u8; 16]);
+        let on_ack =
+            publisher.handle_message(&ack, addr(100, 4672), [0xFFu8; 32], 2000);
+        assert!(on_ack.proxy_store_ack.is_none());
+        let (_rid, callback) =
+            stranger.build_callback([4u8; 16], searcher_ip, 4662, 0, [0u8; 16], [0x66u8; 16]);
+        let on_cb =
+            publisher.handle_message(&callback, addr(100, 4672), [0xFFu8; 32], 2001);
+        assert!(on_cb.callback_connect.is_none());
     }
 
     #[test]

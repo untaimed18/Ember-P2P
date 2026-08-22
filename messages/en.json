@@ -108,6 +108,7 @@
   "ember_stat_serve_hit_miss": "Serve hits / misses",
   "ember_stat_serve_truncated": "Truncated answers / withheld records",
   "ember_stat_buddy_pub_fwd": "Buddy publish / forward",
+  "ember_stat_callback_sent_fwd_conn": "Callback sent / forwarded / connected",
   "ember_stat_malformed": "Malformed frames",
   "ember_stat_version_mismatch": "Version mismatches",
   "ember_stat_rendezvous": "Rendezvous listed / lookups / empty",

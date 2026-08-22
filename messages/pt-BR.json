@@ -105,6 +105,7 @@
   "ember_stat_serve_hit_miss": "Acertos / erros ao servir",
   "ember_stat_serve_truncated": "Respostas truncadas / registros omitidos",
   "ember_stat_buddy_pub_fwd": "Publicação / encaminhamento de buddy",
+  "ember_stat_callback_sent_fwd_conn": "Callback enviado / encaminhado / conectado",
   "ember_stat_malformed": "Quadros malformados",
   "ember_stat_version_mismatch": "Incompatibilidades de versão",
   "ember_stat_rendezvous": "Rendezvous listados / buscas / vazios",

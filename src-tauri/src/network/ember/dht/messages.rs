@@ -29,11 +29,27 @@ pub const MSG_PROXY_STORE_ACK: u8 = 0x0C;
 pub const MSG_STORE_BATCH: u8 = 0x0D;
 /// Answer to `STORE_BATCH`, reporting how many of its records were stored.
 pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
-/// Channel gossip body. `0x0D` is already `STORE_BATCH`; this is the next free opcode.
-pub const MSG_CHANNEL_MSG: u8 = 0x0F;
+/// Searcher → HighID buddy: please tell `publisher_id` to connect back to us.
+///
+/// Additive: a v2 peer that does not speak this type decodes it as
+/// [`DhtPayload::Unknown`] and ignores it. The DHT header layout is unchanged,
+/// so this is not a version bump.
+pub const MSG_CALLBACK_REQ: u8 = 0x0F;
+/// Buddy → firewalled publisher: connect to this searcher for `file_hash`.
+pub const MSG_CALLBACK: u8 = 0x10;
+/// Channel gossip body. `0x0F`/`0x10` are Ember callback; these are next.
+pub const MSG_CHANNEL_MSG: u8 = 0x11;
 /// Ask a HighID overlay contact to forward a `CHANNEL_MSG` to a LowID target.
 /// Capability-bound rooms use this instead of the friend WebSocket broker.
-pub const MSG_CHANNEL_RELAY: u8 = 0x10;
+pub const MSG_CHANNEL_RELAY: u8 = 0x12;
+
+/// `CALLBACK_REQ` body: publisher node id, file hash, searcher TCP port,
+/// crypt options, searcher eD2K user hash, callback token. The searcher's
+/// IP is the UDP source the buddy observed — it is not in the payload.
+pub const CALLBACK_REQ_WIRE_LEN: usize = 16 + 16 + 2 + 1 + 16 + 16;
+/// `CALLBACK` body: file hash, searcher IPv4, TCP port, crypt options,
+/// searcher user hash, callback token.
+pub const CALLBACK_WIRE_LEN: usize = 16 + 4 + 2 + 1 + 16 + 16;
 
 /// Records one `STORE_BATCH` may carry.
 ///
@@ -254,6 +270,29 @@ pub enum DhtPayload {
     /// decrypt the gossip; they only forward to a UDP session they already have.
     ChannelRelay {
         body: Vec<u8>,
+    },
+    /// Searcher → buddy. `searcher_tcp_port` is claimed (UDP cannot observe
+    /// TCP); the buddy fills the publisher-facing `CALLBACK` from the
+    /// datagram's source address, not from anything here.
+    CallbackReq {
+        publisher_id: EmberNodeId,
+        file_hash: [u8; 16],
+        searcher_tcp_port: u16,
+        crypt_options: u8,
+        searcher_user_hash: [u8; 16],
+        callback_token: [u8; 16],
+    },
+    /// Buddy → firewalled publisher. `searcher_ip` is the address the buddy
+    /// received `CALLBACK_REQ` from. `callback_token` is copied from the
+    /// request so the publisher can bind connect-back to a file it asked
+    /// this buddy to proxy.
+    Callback {
+        file_hash: [u8; 16],
+        searcher_ip: Ipv4Addr,
+        searcher_tcp_port: u16,
+        crypt_options: u8,
+        searcher_user_hash: [u8; 16],
+        callback_token: [u8; 16],
     },
     Unknown(Vec<u8>),
 }
@@ -666,6 +705,64 @@ pub fn build_channel_relay(sender_id: EmberNodeId, request_id: u32, body: Vec<u8
     }
 }
 
+/// Searcher → buddy: ask `publisher_id` to connect back for `file_hash`.
+pub fn build_callback_req(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    publisher_id: EmberNodeId,
+    file_hash: [u8; 16],
+    searcher_tcp_port: u16,
+    crypt_options: u8,
+    searcher_user_hash: [u8; 16],
+    callback_token: [u8; 16],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_CALLBACK_REQ,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::CallbackReq {
+            publisher_id,
+            file_hash,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        },
+        signature: [0u8; 64],
+    }
+}
+
+/// Buddy → firewalled publisher: connect to this searcher.
+pub fn build_callback(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    file_hash: [u8; 16],
+    searcher_ip: Ipv4Addr,
+    searcher_tcp_port: u16,
+    crypt_options: u8,
+    searcher_user_hash: [u8; 16],
+    callback_token: [u8; 16],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_CALLBACK,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::Callback {
+            file_hash,
+            searcher_ip,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        },
+        signature: [0u8; 64],
+    }
+}
+
 /// How many bytes `record` costs inside a `STORE_BATCH`: the 16-byte key, the
 /// 2-byte length prefix, the body, and the 64-byte record signature.
 pub fn batched_record_wire_len(record_len: usize) -> usize {
@@ -816,6 +913,40 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
         }
         DhtPayload::ChannelMsg { body } => body.clone(),
         DhtPayload::ChannelRelay { body } => body.clone(),
+        DhtPayload::CallbackReq {
+            publisher_id,
+            file_hash,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        } => {
+            let mut buf = Vec::with_capacity(CALLBACK_REQ_WIRE_LEN);
+            buf.extend_from_slice(&publisher_id.0);
+            buf.extend_from_slice(file_hash);
+            buf.write_u16::<LittleEndian>(*searcher_tcp_port).unwrap();
+            buf.push(*crypt_options);
+            buf.extend_from_slice(searcher_user_hash);
+            buf.extend_from_slice(callback_token);
+            buf
+        }
+        DhtPayload::Callback {
+            file_hash,
+            searcher_ip,
+            searcher_tcp_port,
+            crypt_options,
+            searcher_user_hash,
+            callback_token,
+        } => {
+            let mut buf = Vec::with_capacity(CALLBACK_WIRE_LEN);
+            buf.extend_from_slice(file_hash);
+            buf.extend_from_slice(&searcher_ip.octets());
+            buf.write_u16::<LittleEndian>(*searcher_tcp_port).unwrap();
+            buf.push(*crypt_options);
+            buf.extend_from_slice(searcher_user_hash);
+            buf.extend_from_slice(callback_token);
+            buf
+        }
         DhtPayload::Unknown(data) => data.clone(),
     }
 }
@@ -1101,6 +1232,57 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             }
             Ok(DhtPayload::ChannelRelay {
                 body: data.to_vec(),
+            })
+        }
+        MSG_CALLBACK_REQ => {
+            if data.len() != CALLBACK_REQ_WIRE_LEN {
+                anyhow::bail!(
+                    "CALLBACK_REQ length {} (expected {CALLBACK_REQ_WIRE_LEN})",
+                    data.len()
+                );
+            }
+            let mut publisher = [0u8; 16];
+            publisher.copy_from_slice(&data[..16]);
+            let mut file_hash = [0u8; 16];
+            file_hash.copy_from_slice(&data[16..32]);
+            let searcher_tcp_port = u16::from_le_bytes([data[32], data[33]]);
+            let crypt_options = data[34];
+            let mut searcher_user_hash = [0u8; 16];
+            searcher_user_hash.copy_from_slice(&data[35..51]);
+            let mut callback_token = [0u8; 16];
+            callback_token.copy_from_slice(&data[51..67]);
+            Ok(DhtPayload::CallbackReq {
+                publisher_id: EmberNodeId(publisher),
+                file_hash,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
+            })
+        }
+        MSG_CALLBACK => {
+            if data.len() != CALLBACK_WIRE_LEN {
+                anyhow::bail!(
+                    "CALLBACK length {} (expected {CALLBACK_WIRE_LEN})",
+                    data.len()
+                );
+            }
+            let mut file_hash = [0u8; 16];
+            file_hash.copy_from_slice(&data[..16]);
+            let searcher_ip = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
+            let searcher_tcp_port = u16::from_le_bytes([data[20], data[21]]);
+            let crypt_options = data[22];
+            let mut searcher_user_hash = [0u8; 16];
+            searcher_user_hash.copy_from_slice(&data[23..39]);
+            let mut callback_token = [0u8; 16];
+            callback_token.copy_from_slice(&data[39..55]);
+            Ok(DhtPayload::Callback {
+                file_hash,
+                searcher_ip,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
             })
         }
         _ => Ok(DhtPayload::Unknown(data.to_vec())),
@@ -1483,7 +1665,10 @@ mod tests {
             MSG_PROXY_STORE_ACK,
             MSG_STORE_BATCH,
             MSG_STORE_BATCH_ACK,
+            MSG_CALLBACK_REQ,
+            MSG_CALLBACK,
             MSG_CHANNEL_MSG,
+            MSG_CHANNEL_RELAY,
             0x00,
             0xFF,
         ];
@@ -1742,5 +1927,58 @@ mod tests {
         };
         let encoded = encode_message(&msg, &sk, true);
         assert!(decode_message(&encoded, true).is_err());
+    }
+
+    #[test]
+    fn callback_req_and_callback_round_trip() {
+        let (sk, id) = test_keypair();
+        let publisher = EmberNodeId([0x11; 16]);
+        let file_hash = [0x22u8; 16];
+        let user_hash = [0x33u8; 16];
+        let token = [0x44u8; 16];
+        let req = build_callback_req(id, 7, publisher, file_hash, 4662, 0x03, user_hash, token);
+        let encoded = encode_message(&req, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::CallbackReq {
+                publisher_id,
+                file_hash: fh,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
+            } => {
+                assert_eq!(publisher_id, publisher);
+                assert_eq!(fh, file_hash);
+                assert_eq!(searcher_tcp_port, 4662);
+                assert_eq!(crypt_options, 0x03);
+                assert_eq!(searcher_user_hash, user_hash);
+                assert_eq!(callback_token, token);
+            }
+            other => panic!("expected CallbackReq, got {other:?}"),
+        }
+
+        let ip = Ipv4Addr::new(8, 8, 4, 4);
+        let cb = build_callback(id, 8, file_hash, ip, 4662, 0x03, user_hash, token);
+        let encoded = encode_message(&cb, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::Callback {
+                file_hash: fh,
+                searcher_ip,
+                searcher_tcp_port,
+                crypt_options,
+                searcher_user_hash,
+                callback_token,
+            } => {
+                assert_eq!(fh, file_hash);
+                assert_eq!(searcher_ip, ip);
+                assert_eq!(searcher_tcp_port, 4662);
+                assert_eq!(crypt_options, 0x03);
+                assert_eq!(searcher_user_hash, user_hash);
+                assert_eq!(callback_token, token);
+            }
+            other => panic!("expected Callback, got {other:?}"),
+        }
     }
 }

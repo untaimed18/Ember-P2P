@@ -105,6 +105,7 @@
   "ember_stat_serve_hit_miss": "服務命中 / 未命中",
   "ember_stat_serve_truncated": "被截斷的回覆 / 未傳送記錄",
   "ember_stat_buddy_pub_fwd": "夥伴釋出 / 轉發",
+  "ember_stat_callback_sent_fwd_conn": "回連 已發 / 轉發 / 接通",
   "ember_stat_malformed": "格式錯誤的幀",
   "ember_stat_version_mismatch": "版本不相容",
   "ember_stat_rendezvous": "會合已列出 / 查詢 / 空",

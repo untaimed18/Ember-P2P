@@ -15,21 +15,16 @@ use crate::network::ember::crypto;
 /// Longest file name that still leaves a keyword or source record inside
 /// [`messages::MAX_STORE_RECORD_BYTES`], so we never sign a body a storer
 /// would accept and a `FOUND_VALUE` packer would then skip.
-fn max_encoded_name_bytes(has_source_contact: bool) -> usize {
-    let extra = if has_source_contact {
-        SOURCE_CONTACT_WIRE_LEN
-    } else {
-        0
-    };
+fn max_encoded_name_bytes(contact_bytes: usize) -> usize {
     messages::MAX_STORE_RECORD_BYTES
         .saturating_sub(RECORD_HEADER_LEN)
-        .saturating_sub(extra)
+        .saturating_sub(contact_bytes)
 }
 
 /// Truncate `file_name` on a UTF-8 boundary so the encoded body fits the
 /// FOUND_VALUE pack budget.
-fn clamp_name_to_record_budget(file_name: &str, has_source_contact: bool) -> &str {
-    let max = max_encoded_name_bytes(has_source_contact);
+fn clamp_name_to_record_budget(file_name: &str, contact_bytes: usize) -> &str {
+    let max = max_encoded_name_bytes(contact_bytes);
     let bytes = file_name.as_bytes();
     if bytes.len() <= max {
         return file_name;
@@ -73,6 +68,80 @@ pub const CHANNEL_MOD_LIST_MAX: usize = 16;
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
 pub(super) const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
 
+/// Optional callback trailer after the contact block, present on firewalled
+/// source records: publisher eD2K user_hash(16) + buddy ip(4) + buddy
+/// udp_port(2) + buddy noise_pub(32) + callback token(16). HighID records stay
+/// 41 bytes. v2 parsers that ignore trailing bytes still accept the contact;
+/// this build reads the extra 70 when they are there. Not a version bump.
+pub(super) const SOURCE_CALLBACK_TRAILER_LEN: usize = 16 + 4 + 2 + 32 + 16;
+
+fn source_contact_encoded_len(contact: Option<&SourceContact>) -> usize {
+    match contact {
+        Some(sc) if sc.buddy.is_some() => SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_LEN,
+        Some(_) => SOURCE_CONTACT_WIRE_LEN,
+        None => 0,
+    }
+}
+
+fn encode_source_contact(data: &mut Vec<u8>, sc: &SourceContact) {
+    data.extend_from_slice(&sc.ip.octets());
+    data.write_u16::<LittleEndian>(sc.tcp_port).unwrap();
+    data.write_u16::<LittleEndian>(sc.udp_port).unwrap();
+    data.push(sc.flags);
+    data.extend_from_slice(&sc.noise_pub);
+    if let Some(buddy) = sc.buddy {
+        data.extend_from_slice(&sc.user_hash.unwrap_or([0u8; 16]));
+        data.extend_from_slice(&buddy.ip.octets());
+        data.write_u16::<LittleEndian>(buddy.udp_port).unwrap();
+        data.extend_from_slice(&buddy.noise_pub);
+        data.extend_from_slice(&sc.callback_token.unwrap_or([0u8; 16]));
+    }
+}
+
+fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
+    if data.len() < off + SOURCE_CONTACT_WIRE_LEN {
+        return None;
+    }
+    let ip = Ipv4Addr::new(data[off], data[off + 1], data[off + 2], data[off + 3]);
+    let tcp_port = u16::from_le_bytes([data[off + 4], data[off + 5]]);
+    let udp_port = u16::from_le_bytes([data[off + 6], data[off + 7]]);
+    let flags = data[off + 8];
+    let mut noise_pub = [0u8; 32];
+    noise_pub.copy_from_slice(&data[off + 9..off + 41]);
+    let mut contact = SourceContact {
+        ip,
+        tcp_port,
+        udp_port,
+        flags,
+        noise_pub,
+        user_hash: None,
+        buddy: None,
+        callback_token: None,
+    };
+    let rest = off + SOURCE_CONTACT_WIRE_LEN;
+    if data.len() >= rest + SOURCE_CALLBACK_TRAILER_LEN {
+        let mut user_hash = [0u8; 16];
+        user_hash.copy_from_slice(&data[rest..rest + 16]);
+        let b = rest + 16;
+        let buddy_ip = Ipv4Addr::new(data[b], data[b + 1], data[b + 2], data[b + 3]);
+        let buddy_udp = u16::from_le_bytes([data[b + 4], data[b + 5]]);
+        let mut buddy_noise = [0u8; 32];
+        buddy_noise.copy_from_slice(&data[b + 6..b + 38]);
+        let mut token = [0u8; 16];
+        token.copy_from_slice(&data[b + 38..b + 54]);
+        if buddy_udp != 0 && !buddy_ip.is_unspecified() {
+            contact.user_hash = (user_hash != [0u8; 16]).then_some(user_hash);
+            contact.buddy = Some(SourceBuddy {
+                ip: buddy_ip,
+                udp_port: buddy_udp,
+                noise_pub: buddy_noise,
+            });
+            contact.callback_token = (token != [0u8; 16]).then_some(token);
+        }
+    }
+    Some(contact)
+}
+
 /// Fixed-size prefix every record body carries before its file name:
 /// `record_type(1) + keyword_hash(16) + file_hash(16) + ember_file_hash(32)
 /// + file_size(8) + publisher_key(32) + timestamp(8) + name_len(2)`.
@@ -92,11 +161,32 @@ pub fn source_key(file_hash: &[u8; 16]) -> [u8; 16] {
     key
 }
 
+/// HighID buddy a firewalled publisher names so a searcher can send
+/// `CALLBACK_REQ` instead of dialling the unverified source address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBuddy {
+    pub ip: Ipv4Addr,
+    pub udp_port: u16,
+    pub noise_pub: [u8; 32],
+}
+
+impl SourceBuddy {
+    /// Whether this buddy is a plausible UDP destination for `CALLBACK_REQ`.
+    /// Special-use / unspecified IPv4 and port 0 never are.
+    pub fn is_routable(&self) -> bool {
+        self.udp_port != 0
+            && !self.ip.is_unspecified()
+            && !crate::security::is_special_use_v4(self.ip)
+    }
+}
+
 /// The publisher's self-reported reachable contact, carried inside a
 /// signed `RECORD_TYPE_SOURCE` record (and therefore covered by the
 /// publisher's signature). A downloader uses `ip` + `tcp_port` to dial the
 /// source over the existing eD2K client-to-client path; `noise_pub` is
-/// stashed for future native (Noise) dialing.
+/// stashed for future native (Noise) dialing. Firewalled records also
+/// carry [`Self::buddy`] so the searcher can ask that HighID to bounce a
+/// connect-back rather than dialling the unverified address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceContact {
     pub ip: Ipv4Addr,
@@ -104,6 +194,78 @@ pub struct SourceContact {
     pub udp_port: u16,
     pub flags: u8,
     pub noise_pub: [u8; 32],
+    /// Publisher's eD2K user hash, present with [`Self::buddy`] so a
+    /// connect-back Hello can match the pending callback the way KAD
+    /// matches `TAG_BUDDYHASH` sources by user hash rather than NAT IP.
+    pub user_hash: Option<[u8; 16]>,
+    /// HighID buddy named in the trailer. Publish `PROXY_STORE`s only this
+    /// contact; consume `CALLBACK_REQ`s it.
+    pub buddy: Option<SourceBuddy>,
+    /// Publisher-derived token the searcher copies into `CALLBACK_REQ` and
+    /// the buddy copies into `CALLBACK`. Bind connect-back to a file we
+    /// actually asked this buddy to proxy.
+    pub callback_token: Option<[u8; 16]>,
+}
+
+impl Default for SourceContact {
+    fn default() -> Self {
+        Self {
+            ip: Ipv4Addr::UNSPECIFIED,
+            tcp_port: 0,
+            udp_port: 0,
+            flags: 0,
+            noise_pub: [0u8; 32],
+            user_hash: None,
+            buddy: None,
+            callback_token: None,
+        }
+    }
+}
+
+/// A source record a `FIND_VALUE` returned, after signature verification.
+///
+/// Distinct from [`SourceContact`] so the consume path can keep the
+/// publisher's Ember node ID (derived from the signed Ed25519 key) next
+/// to the buddy fields without stuffing it into the on-wire contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveredSource {
+    pub ip: Ipv4Addr,
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub flags: u8,
+    pub user_hash: Option<[u8; 16]>,
+    pub buddy: Option<SourceBuddy>,
+    /// Token from the signed trailer; `CALLBACK_REQ` must carry it.
+    pub callback_token: Option<[u8; 16]>,
+    /// `BLAKE3(publisher Ed25519)[..16]` — the identity `CALLBACK_REQ`
+    /// names so the buddy can look up who it proxied for.
+    pub publisher_id: [u8; 16],
+}
+
+impl DiscoveredSource {
+    /// Whether a reachable searcher should `CALLBACK_REQ` this source instead
+    /// of parking it. A firewalled searcher, a HighID record, a missing
+    /// publisher id, or an unusable buddy all return false — the caller then
+    /// falls back to the firewalled EPX park path rather than dropping the
+    /// source or TCP-dialling the unverified NAT address.
+    pub fn takes_callback(&self, searcher_tcp_firewalled: bool) -> bool {
+        if searcher_tcp_firewalled {
+            return false;
+        }
+        if self.flags & crate::network::ember::SOURCE_FLAG_FIREWALLED == 0 {
+            return false;
+        }
+        if self.publisher_id == [0u8; 16] {
+            return false;
+        }
+        let Some(token) = self.callback_token else {
+            return false;
+        };
+        if token == [0u8; 16] {
+            return false;
+        }
+        self.buddy.is_some_and(|b| b.is_routable())
+    }
 }
 
 /// Channel-specific trailer parsed from a `RECORD_TYPE_CHANNEL` body.
@@ -406,12 +568,13 @@ impl SignedRecord {
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
-        let file_name = clamp_name_to_record_budget(file_name, source_contact.is_some());
+        let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
+        let file_name = clamp_name_to_record_budget(file_name, contact_bytes);
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len();
 
         let mut data = Vec::with_capacity(
-            1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + SOURCE_CONTACT_WIRE_LEN,
+            1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + contact_bytes,
         );
         data.push(record_type);
         data.extend_from_slice(&keyword_hash);
@@ -427,11 +590,7 @@ impl SignedRecord {
         // is signed along with everything above so a relayed record can't have
         // its address rewritten.
         if let Some(sc) = source_contact {
-            data.extend_from_slice(&sc.ip.octets());
-            data.write_u16::<LittleEndian>(sc.tcp_port).unwrap();
-            data.write_u16::<LittleEndian>(sc.udp_port).unwrap();
-            data.push(sc.flags);
-            data.extend_from_slice(&sc.noise_pub);
+            encode_source_contact(&mut data, &sc);
         }
 
         let channel = if let Some(extra) = channel_extra {
@@ -654,22 +813,7 @@ impl SignedRecord {
         // silently treating it as contactless.
         let source_contact = if record_type == RECORD_TYPE_SOURCE {
             let off = 115 + name_len;
-            if data.len() < off + SOURCE_CONTACT_WIRE_LEN {
-                return None;
-            }
-            let ip = Ipv4Addr::new(data[off], data[off + 1], data[off + 2], data[off + 3]);
-            let tcp_port = u16::from_le_bytes([data[off + 4], data[off + 5]]);
-            let udp_port = u16::from_le_bytes([data[off + 6], data[off + 7]]);
-            let flags = data[off + 8];
-            let mut noise_pub = [0u8; 32];
-            noise_pub.copy_from_slice(&data[off + 9..off + 41]);
-            Some(SourceContact {
-                ip,
-                tcp_port,
-                udp_port,
-                flags,
-                noise_pub,
-            })
+            Some(decode_source_contact(data, off)?)
         } else {
             None
         };
@@ -932,6 +1076,18 @@ impl PublishManager {
         }
     }
 
+    /// Store on the closest verified contacts currently in `routing`.
+    /// Channel presence, moderation, and handoff still use this snapshot.
+    pub fn start_publish(
+        &mut self,
+        record: SignedRecord,
+        routing: &super::routing::RoutingTable,
+    ) -> Option<u32> {
+        let dht_key = EmberNodeId(record.keyword_hash);
+        let targets = routing.find_closest_prefer_verified(&dht_key, super::K_BUCKET_SIZE);
+        self.start_publish_to(record, targets)
+    }
+
     /// Start a publish onto an already-resolved target set.
     ///
     /// Used by buddy `PROXY_STORE` and the harness so they share the same
@@ -1038,6 +1194,15 @@ mod tests {
             udp_port: 4672,
             flags: 0x05,
             noise_pub: [0x33; 32],
+            ..Default::default()
+        }
+    }
+
+    fn test_buddy() -> SourceBuddy {
+        SourceBuddy {
+            ip: Ipv4Addr::new(8, 8, 4, 4),
+            udp_port: 4672,
+            noise_pub: [0xB1; 32],
         }
     }
 
@@ -1068,6 +1233,52 @@ mod tests {
         blob.extend_from_slice(&record.signature);
         let from_blob = SignedRecord::from_value_blob(&blob).unwrap();
         assert_eq!(from_blob.source_contact, Some(contact));
+    }
+
+    #[test]
+    fn firewalled_source_record_round_trips_the_callback_trailer() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let contact = SourceContact {
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            user_hash: Some([0xCCu8; 16]),
+            buddy: Some(test_buddy()),
+            callback_token: Some([0xDDu8; 16]),
+            ..test_contact()
+        };
+        let record = SignedRecord::source(
+            [0xAA; 16],
+            [0xBB; 32],
+            99999,
+            "fw.mp3",
+            contact,
+            &sk,
+        );
+        assert_eq!(
+            record.data.len(),
+            115 + "fw.mp3".len() + SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_LEN
+        );
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.source_contact, Some(contact));
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let from_blob = SignedRecord::from_value_blob(&blob).unwrap();
+        assert_eq!(from_blob.source_contact, Some(contact));
+        assert!(SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    #[test]
+    fn source_record_without_trailer_still_parses() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let contact = test_contact();
+        let record = SignedRecord::source([0xAA; 16], [0xBB; 32], 1, "x", contact, &sk);
+        assert_eq!(
+            record.data.len(),
+            115 + 1 + SOURCE_CONTACT_WIRE_LEN,
+            "HighID records must not grow the callback trailer"
+        );
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.source_contact, Some(contact));
+        assert!(parsed.source_contact.unwrap().buddy.is_none());
     }
 
     #[test]
@@ -1534,5 +1745,85 @@ mod tests {
         );
         assert!(record.file_name.len() < huge.len());
         assert!(record.verify());
+    }
+
+    fn discovered_firewalled(buddy: Option<SourceBuddy>) -> DiscoveredSource {
+        DiscoveredSource {
+            ip: Ipv4Addr::new(10, 0, 0, 9),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            user_hash: Some([0xCCu8; 16]),
+            buddy,
+            callback_token: Some([0xDDu8; 16]),
+            publisher_id: [0xAAu8; 16],
+        }
+    }
+
+    #[test]
+    fn routable_buddy_is_a_public_udp_destination() {
+        assert!(test_buddy().is_routable());
+        assert!(!SourceBuddy {
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            udp_port: 4672,
+            noise_pub: [0xB1; 32],
+        }
+        .is_routable());
+        assert!(!SourceBuddy {
+            ip: Ipv4Addr::new(8, 8, 4, 4),
+            udp_port: 0,
+            noise_pub: [0xB1; 32],
+        }
+        .is_routable());
+        assert!(
+            !SourceBuddy {
+                ip: Ipv4Addr::new(203, 0, 113, 10),
+                udp_port: 4672,
+                noise_pub: [0xB1; 32],
+            }
+            .is_routable(),
+            "TEST-NET documentation addresses are not callback destinations"
+        );
+    }
+
+    #[test]
+    fn takes_callback_requires_a_reachable_searcher_and_a_usable_buddy() {
+        let src = discovered_firewalled(Some(test_buddy()));
+        assert!(src.takes_callback(false));
+        assert!(
+            !src.takes_callback(true),
+            "a firewalled searcher must park, not CALLBACK_REQ"
+        );
+
+        let highid = DiscoveredSource {
+            flags: 0,
+            ..src
+        };
+        assert!(!highid.takes_callback(false));
+
+        let no_id = DiscoveredSource {
+            publisher_id: [0u8; 16],
+            ..src
+        };
+        assert!(!no_id.takes_callback(false));
+
+        let lan_buddy = discovered_firewalled(Some(SourceBuddy {
+            ip: Ipv4Addr::new(192, 168, 1, 1),
+            udp_port: 4672,
+            noise_pub: [0xB1; 32],
+        }));
+        assert!(
+            !lan_buddy.takes_callback(false),
+            "unusable buddy must not take the callback path (park instead)"
+        );
+
+        let no_buddy = discovered_firewalled(None);
+        assert!(!no_buddy.takes_callback(false));
+
+        let no_token = DiscoveredSource {
+            callback_token: None,
+            ..src
+        };
+        assert!(!no_token.takes_callback(false));
     }
 }

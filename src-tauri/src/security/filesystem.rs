@@ -817,26 +817,19 @@ fn single_path_component(name: &std::ffi::OsStr) -> io::Result<&std::ffi::OsStr>
     })
 }
 
+#[cfg(unix)]
 fn created_ns(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        metadata
-            .created()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|duration| {
-                duration
-                    .as_secs()
-                    .checked_mul(1_000_000_000)
-                    .and_then(|secs| secs.checked_add(u64::from(duration.subsec_nanos())))
-            })
-            .unwrap_or(0)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
+    metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| {
+            duration
+                .as_secs()
+                .checked_mul(1_000_000_000)
+                .and_then(|secs| secs.checked_add(u64::from(duration.subsec_nanos())))
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(unix)]

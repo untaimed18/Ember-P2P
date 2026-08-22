@@ -68,7 +68,7 @@ Shared files are published as keyword records (findable by name) and source reco
 - **Search** — The Search page exposes an **Ember Only** method, and **Global** queries Ember alongside KAD and servers, merging into one de-duplicated result list. With KAD and eD2K both offline, Global falls back to Ember alone.
 - **Source lookup** — Downloads resolve sources on the Ember DHT in addition to KAD and servers, so a file found elsewhere can still gain Ember sources.
 - **Publish badge** — The Library marks a shared file with an **Ember** badge (`shared_ember` on `FileInfo`) once a source record is placed, which is the point at which other Ember users can actually fetch it.
-- **Firewalled publishing** — LowID and firewalled nodes publish through a buddy `PROXY_STORE` fan-out instead of storing directly.
+- **Firewalled publishing and consume** — LowID and firewalled nodes publish through a buddy `PROXY_STORE` fan-out instead of storing directly, and name that buddy in the source record so a reachable searcher can `CALLBACK_REQ` them (KAD callback analogue; LowID↔LowID still needs relay).
 - **BLAKE3 integrity** — Records carry a BLAKE3 digest and a download verifies against it whenever one is available (search hit, DHT source record, `known.met` / library). Deep links without a digest still complete and are hashed for future sharing.
 - **Adaptive abuse limits** — Admission and storage limits scale with observed network size ([`dht/scale.rs`](src-tauri/src/network/ember/dht/scale.rs)): per-IP and per-subnet caps, return-routability checks before a node spends anything substantial on a request (so Ember cannot be used as a traffic reflector), and per-publisher storage quotas so one peer cannot fill the space this node offers the network or sidestep its quota by changing port.
 
@@ -79,7 +79,7 @@ Shared files are published as keyword records (findable by name) and source reco
 - **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
 - **No reputation scoring on gossip** — admission is bounded by the diversity caps above, but gossip itself is not scored, so table poisoning under sustained Sybil pressure is only rate-limited.
-- **Not yet exercised end to end** — LowID publishing through buddy `PROXY_STORE`, a cold join from an empty contact file with no KAD, and republish behaviour across a full record TTL on a large library.
+- **Not yet exercised end to end** — LowID publishing through buddy `PROXY_STORE` and Ember callback consume, a cold join from an empty contact file with no KAD, and republish behaviour across a full record TTL on a large library.
 
 ## EPX — Ember Peer Exchange
 

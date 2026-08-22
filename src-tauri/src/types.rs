@@ -765,6 +765,15 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Ember `CALLBACK_REQ` frames we sent (searcher → buddy).
+    #[serde(default)]
+    pub ember_dht_callback_sent: u32,
+    /// `CALLBACK_REQ`s we bounced to a firewalled publisher.
+    #[serde(default)]
+    pub ember_dht_callback_forwards: u32,
+    /// `CALLBACK`s we honoured by connecting back to the searcher.
+    #[serde(default)]
+    pub ember_dht_callback_connects: u32,
     /// Outbound `FIND_VALUE` frames sent this session (slice 17).
     #[serde(default)]
     pub ember_dht_find_values_sent: u32,

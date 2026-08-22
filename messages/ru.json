@@ -105,6 +105,7 @@
   "ember_stat_serve_hit_miss": "Попадания / промахи обслуживания",
   "ember_stat_serve_truncated": "Усечённые ответы / пропущенные записи",
   "ember_stat_buddy_pub_fwd": "Публикация / пересылка Buddy",
+  "ember_stat_callback_sent_fwd_conn": "Callback отправлен / переслан / соединён",
   "ember_stat_malformed": "Некорректные кадры",
   "ember_stat_version_mismatch": "Несовпадения версии",
   "ember_stat_rendezvous": "Rendezvous: узлы / запросы / пустые",
