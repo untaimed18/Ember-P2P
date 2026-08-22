@@ -1570,6 +1570,19 @@ pub fn take_pending_ember_default_on_notice(
         .swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
+/// Consume the "staged restore failed or is still pending" notice, if
+/// startup raised one. One-shot latch, same reason as the Ember-default-on
+/// notice: the condition is already on disk and an event fired before the
+/// webview is listening would never be shown.
+#[tauri::command]
+pub fn take_pending_restore_failed_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state
+        .pending_restore_failed_notice
+        .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
 #[tauri::command]
 pub async fn set_close_behavior(
     state: tauri::State<'_, AppState>,

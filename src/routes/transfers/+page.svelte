@@ -2127,6 +2127,9 @@
     let firstError: unknown;
     for (const info of batch.links) {
       try {
+        // Do not pass `info.ember` into startDownload. A pasted link is
+        // untrusted; pinning that digest would make the first writer we hear
+        // from the BLAKE3 we verify against.
         const res = await startDownload(
           info.hash,
           info.name,
@@ -2134,7 +2137,7 @@
           '',
           0,
           undefined,
-          info.ember,
+          undefined,
           info.aich,
         );
         if (res.already_queued) already += 1;

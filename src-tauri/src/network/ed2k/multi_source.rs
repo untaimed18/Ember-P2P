@@ -774,31 +774,48 @@ impl InProgressGuard {
     }
 }
 
+/// Release tracker claims from `Drop` without fire-and-forget tasks.
+///
+/// A leaked in-progress claim or write reservation is a gap no worker can
+/// fill. `try_write` is the fast path; otherwise block until the lock is
+/// available. Never spawn a detached task from Drop.
+fn release_tracker_claims<T, F>(tracker: &Arc<RwLock<PartTracker>>, claims: T, apply: F)
+where
+    F: FnOnce(&mut PartTracker, T),
+{
+    if let Ok(mut t) = tracker.try_write() {
+        apply(&mut t, claims);
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut t = tracker.write().await;
+                apply(&mut t, claims);
+            });
+        });
+        return;
+    }
+    loop {
+        if let Ok(mut t) = tracker.try_write() {
+            apply(&mut t, claims);
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
         if self.active.is_empty() {
             return;
         }
         let to_clear = std::mem::take(&mut self.active);
-        let cleared = {
-            if let Ok(mut t) = self.tracker.try_write() {
-                for &p in &to_clear {
-                    t.release_in_progress(p);
-                }
-                true
-            } else {
-                false
+        release_tracker_claims(&self.tracker, to_clear, |t, parts| {
+            for p in parts {
+                t.release_in_progress(p);
             }
-        };
-        if !cleared {
-            let tracker = self.tracker.clone();
-            tokio::spawn(async move {
-                let mut t = tracker.write().await;
-                for p in to_clear {
-                    t.release_in_progress(p);
-                }
-            });
-        }
+        });
     }
 }
 
@@ -864,16 +881,8 @@ impl Drop for WriteReservation {
             return;
         }
         let to_release = std::mem::take(&mut self.reserved);
-        if let Ok(mut t) = self.tracker.try_write() {
-            for (s, e) in to_release {
-                t.release_write_reservation(s, e);
-            }
-            return;
-        }
-        let tracker = self.tracker.clone();
-        tokio::spawn(async move {
-            let mut t = tracker.write().await;
-            for (s, e) in to_release {
+        release_tracker_claims(&self.tracker, to_release, |t, ranges| {
+            for (s, e) in ranges {
                 t.release_write_reservation(s, e);
             }
         });

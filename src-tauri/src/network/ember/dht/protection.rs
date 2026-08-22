@@ -82,8 +82,8 @@ impl WindowCounter {
     fn allow_n(&mut self, now: Instant, window: Duration, limit: u32, cost: u32) -> bool {
         let half = window / 2;
         match self.window_start {
-            Some(start) if now.duration_since(start) < half => {}
-            Some(start) if now.duration_since(start) < window => {
+            Some(start) if now.saturating_duration_since(start) < half => {}
+            Some(start) if now.saturating_duration_since(start) < window => {
                 // One half-window has elapsed: age the buckets.
                 self.previous = self.count;
                 self.count = 0;
@@ -98,7 +98,7 @@ impl WindowCounter {
         }
 
         let start = self.window_start.expect("set above");
-        let elapsed = now.duration_since(start).min(half);
+        let elapsed = now.saturating_duration_since(start).min(half);
         // Weight the previous half by how much of it still overlaps the
         // trailing `window` we are approximating.
         let carry_fraction = 1.0 - (elapsed.as_secs_f64() / half.as_secs_f64().max(f64::EPSILON));
@@ -277,21 +277,21 @@ impl DhtProtection {
         if self.msg_counters.len() > MAX_IP_ENTRIES / 2 {
             self.msg_counters.retain(|_, c| {
                 c.last_activity()
-                    .map(|s| now.duration_since(s) < MSG_WINDOW * 4)
+                    .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
                     .unwrap_or(false)
             });
         }
         if self.store_counters.len() > MAX_IP_ENTRIES / 2 {
             self.store_counters.retain(|_, c| {
                 c.last_activity()
-                    .map(|s| now.duration_since(s) < STORE_WINDOW * 2)
+                    .map(|s| now.saturating_duration_since(s) < STORE_WINDOW * 2)
                     .unwrap_or(false)
             });
         }
         if self.lookup_counters.len() > MAX_IP_ENTRIES / 2 {
             self.lookup_counters.retain(|_, c| {
                 c.last_activity()
-                    .map(|s| now.duration_since(s) < LOOKUP_WINDOW * 2)
+                    .map(|s| now.saturating_duration_since(s) < LOOKUP_WINDOW * 2)
                     .unwrap_or(false)
             });
         }

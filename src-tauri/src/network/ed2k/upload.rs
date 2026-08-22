@@ -22,7 +22,7 @@ use crate::network::ed2k::sources::SourceManager;
 use crate::network::ed2k::tcp_obfuscation::{self, NegotiationResult, Rc4Reader, Rc4Writer};
 use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
-use crate::types::TransferDirection;
+use crate::types::{TransferDirection, TransferStatus};
 
 /// A live friend session's outbound packet sender, plus a liveness
 /// timestamp (unix seconds of last confirmed inbound activity from the
@@ -640,6 +640,73 @@ pub type SharedBannedIps = Arc<std::sync::RwLock<std::collections::HashSet<std::
 /// Shared set of banned user hashes for upload-only enforcement.
 /// Checked after Hello handshake reveals the peer's identity.
 pub type SharedBannedHashes = Arc<std::sync::RwLock<std::collections::HashSet<[u8; 16]>>>;
+
+/// known.met `friends_only` hashes, snapshotted for the upload listener.
+///
+/// [`UploadHandler`] cannot read `KnownFileList` (it lives on the network
+/// task). The share index already covers library rows, but a friends-only
+/// flag that exists **only** in known.met — an in-progress download of a
+/// previously restricted hash, or an unshared completed copy that fell
+/// through to `.part` — is invisible there. This set is the missing half.
+///
+/// `ready` is false until known.met has been absorbed. An empty hash set
+/// with `ready == false` must not be read as "nothing is restricted".
+#[derive(Default)]
+pub struct FriendsOnlySnapshot {
+    ready: bool,
+    hashes: std::collections::HashSet<[u8; 16]>,
+}
+
+pub type SharedFriendsOnlyHashes = Arc<std::sync::RwLock<FriendsOnlySnapshot>>;
+
+pub fn replace_friends_only_hashes(
+    dest: &SharedFriendsOnlyHashes,
+    hashes: impl IntoIterator<Item = [u8; 16]>,
+) {
+    let next: std::collections::HashSet<[u8; 16]> = hashes.into_iter().collect();
+    match dest.write() {
+        Ok(mut snap) => snap.hashes = next,
+        Err(poisoned) => poisoned.into_inner().hashes = next,
+    }
+}
+
+pub fn mark_friends_only_snapshot_ready(dest: &SharedFriendsOnlyHashes) {
+    match dest.write() {
+        Ok(mut snap) => snap.ready = true,
+        Err(poisoned) => poisoned.into_inner().ready = true,
+    }
+}
+
+pub(crate) fn friends_only_snapshot_contains(set: &SharedFriendsOnlyHashes, hash: &[u8; 16]) -> bool {
+    match set.read() {
+        Ok(s) => s.hashes.contains(hash),
+        Err(poisoned) => poisoned.into_inner().hashes.contains(hash),
+    }
+}
+
+pub(crate) fn friends_only_snapshot_ready(set: &SharedFriendsOnlyHashes) -> bool {
+    match set.read() {
+        Ok(s) => s.ready,
+        Err(poisoned) => poisoned.into_inner().ready,
+    }
+}
+
+/// Index row wins when present. A snapshot hit is always restricted. An
+/// index miss before the snapshot is ready is restricted (known.met-only
+/// flags have not landed yet).
+fn friends_only_from_sources(
+    snapshot_hit: bool,
+    snapshot_ready: bool,
+    index_friends_only: Option<bool>,
+) -> bool {
+    if snapshot_hit {
+        return true;
+    }
+    match index_friends_only {
+        Some(flag) => flag,
+        None => !snapshot_ready,
+    }
+}
 
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
@@ -1684,6 +1751,8 @@ struct UploadHandler {
     banned_ips: SharedBannedIps,
     /// Shared banned user hashes for upload-only enforcement after Hello
     banned_hashes: SharedBannedHashes,
+    /// known.met friends-only hashes (see [`SharedFriendsOnlyHashes`]).
+    friends_only_hashes: SharedFriendsOnlyHashes,
     /// Anti-leech client-software pattern filter. Checked once per session
     /// after Hello/EmuleInfo, before any slot is granted or queue position
     /// is held. Hot-reloadable from disk via the Settings UI.
@@ -2443,6 +2512,7 @@ pub(crate) async fn udp_queue_rank_for_peer(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_upload_server(
     tcp_port: u16,
     advertise_tcp_port: Arc<std::sync::atomic::AtomicU16>,
@@ -2471,6 +2541,7 @@ pub async fn start_upload_server(
     shared_ip_filter: SharedIpFilter,
     banned_ips: SharedBannedIps,
     banned_hashes: SharedBannedHashes,
+    friends_only_hashes: SharedFriendsOnlyHashes,
     antileech: crate::security::antileech::SharedAntiLeechFilter,
     skip_compress_video: Arc<std::sync::atomic::AtomicBool>,
     filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
@@ -2585,6 +2656,7 @@ pub async fn start_upload_server(
         shared_ip_filter,
         banned_ips,
         banned_hashes,
+        friends_only_hashes,
         antileech,
         skip_compress_video,
         filter_incoming_connections,
@@ -3235,6 +3307,21 @@ impl UploadHandler {
         }
     }
 
+    /// True when the share index **or** the known.met snapshot marks this
+    /// hash friends-only. Index covers live library rows; the snapshot covers
+    /// flags that exist only in known.met (see [`SharedFriendsOnlyHashes`]).
+    async fn hash_is_friends_only(&self, file_hash: &[u8; 16]) -> bool {
+        let snapshot_hit = friends_only_snapshot_contains(&self.friends_only_hashes, file_hash);
+        let snapshot_ready = friends_only_snapshot_ready(&self.friends_only_hashes);
+        let index_friends_only = {
+            let index = self.local_index.read().await;
+            index
+                .get_by_hash(&hex::encode(file_hash))
+                .map(|f| f.friends_only)
+        };
+        friends_only_from_sources(snapshot_hit, snapshot_ready, index_friends_only)
+    }
+
     /// True when `file_hash` is restricted to mutual friends and this peer is
     /// not one — so queueing them could only ever end in a refusal.
     ///
@@ -3242,13 +3329,7 @@ impl UploadHandler {
     /// go out; this exists purely so a peer who cannot be served does not sit
     /// in the waiting list occupying a slot another peer could use.
     async fn friends_only_and_barred(&self, file_hash: &[u8; 16], peer: PeerFileAccess) -> bool {
-        let restricted = {
-            let index = self.local_index.read().await;
-            index
-                .get_by_hash(&hex::encode(file_hash))
-                .is_some_and(|f| f.friends_only)
-        };
-        if !restricted {
+        if !self.hash_is_friends_only(file_hash).await {
             return false;
         }
         !mutual_friend_access(
@@ -3303,7 +3384,8 @@ impl UploadHandler {
                 // The membership lookup is deliberately inside this branch so
                 // the overwhelmingly common public-file path never pays for
                 // the lock.
-                if file.friends_only
+                if (file.friends_only
+                    || friends_only_snapshot_contains(&self.friends_only_hashes, file_hash))
                     && !mutual_friend_access(
                         &self.mutual_friend_hashes,
                         peer.ember_hash,
@@ -3374,6 +3456,24 @@ impl UploadHandler {
             }
         }
 
+        // Unshared index rows `break` into this `.part` branch, and hashes
+        // that exist only in known.met never enter the index branch at all.
+        // Either way, friends-only content must not leave for a stranger.
+        if self.hash_is_friends_only(file_hash).await
+            && !mutual_friend_access(
+                &self.mutual_friend_hashes,
+                peer.ember_hash,
+                peer.secure_v2_authenticated,
+            )
+            .await
+        {
+            tracing::debug!(
+                "Rejecting resolve for friends-only partial from non-friend: {}",
+                hash_hex
+            );
+            return None;
+        }
+
         let transfer = {
             let mgr = self.transfer_manager.read().await;
             mgr.active
@@ -3419,6 +3519,53 @@ impl UploadHandler {
             aich_hash_hex: String::new(),
             is_partial: true,
         })
+    }
+
+    /// Whether this peer may learn our source list for `file_hash`.
+    ///
+    /// Public-listable shares and in-progress public downloads: yes.
+    /// Friends-only hashes: only an authenticated mutual friend.
+    /// Arbitrary hashes we happen to have in SourceManager: no.
+    ///
+    /// Does not use [`Self::resolve_upload_file`]: an unshared friends-only
+    /// index row `break`s into the in-progress `.part` branch there, which
+    /// would treat "we are downloading it" as a public SX yes. known.met-only
+    /// flags are read from [`Self::friends_only_hashes`], not the index.
+    async fn may_answer_source_exchange(
+        &self,
+        file_hash: &[u8; 16],
+        peer: PeerFileAccess,
+    ) -> bool {
+        let hash_hex = hex::encode(file_hash);
+        let public_share = {
+            let index = self.local_index.read().await;
+            index
+                .get_by_hash(&hash_hex)
+                .is_some_and(|f| f.is_public_listable())
+        };
+        if self.hash_is_friends_only(file_hash).await {
+            return mutual_friend_access(
+                &self.mutual_friend_hashes,
+                peer.ember_hash,
+                peer.secure_v2_authenticated,
+            )
+            .await;
+        }
+        if public_share {
+            return true;
+        }
+        let mgr = self.transfer_manager.read().await;
+        mgr.active
+            .values()
+            .chain(mgr.queue.iter())
+            .any(|t| {
+                t.direction == TransferDirection::Download
+                    && t.file_hash == hash_hex
+                    && !matches!(
+                        t.status,
+                        TransferStatus::Completed | TransferStatus::Failed
+                    )
+            })
     }
 
     /// Build the `OP_ASKSHAREDFILESANSWER` payload: `<count 4>(<HASH
@@ -9538,6 +9685,13 @@ impl UploadHandler {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     // SX v1: respond with OP_ANSWERSOURCES (legacy v1 format)
                     if let Some(hash) = current_file_hash {
+                        let peer = PeerFileAccess {
+                            ember_hash: peer_ember_hash,
+                            secure_v2_authenticated,
+                        };
+                        if !self.may_answer_source_exchange(&hash, peer).await {
+                            continue;
+                        }
                         let exclude_ip = match peer_addr.ip() {
                             std::net::IpAddr::V4(v4) => v4,
                             _ => std::net::Ipv4Addr::UNSPECIFIED,
@@ -9568,6 +9722,13 @@ impl UploadHandler {
                         let requested_version = payload[0];
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&payload[3..19]);
+                        let peer = PeerFileAccess {
+                            ember_hash: peer_ember_hash,
+                            secure_v2_authenticated,
+                        };
+                        if !self.may_answer_source_exchange(&hash, peer).await {
+                            continue;
+                        }
                         let exclude_ip = match peer_addr.ip() {
                             std::net::IpAddr::V4(v4) => v4,
                             _ => std::net::Ipv4Addr::UNSPECIFIED,
@@ -11086,6 +11247,64 @@ mod unique_served_tests {
             3,
             PADDING_KEEPALIVE_WINDOW - std::time::Duration::from_secs(1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod friends_only_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn known_met_hash_is_visible_after_replace_and_gone_after_clear() {
+        let set: SharedFriendsOnlyHashes = Arc::new(std::sync::RwLock::new(Default::default()));
+        let hash = [0xABu8; 16];
+        assert!(
+            !friends_only_snapshot_contains(&set, &hash),
+            "empty snapshot must not restrict a hash"
+        );
+        assert!(
+            !friends_only_snapshot_ready(&set),
+            "snapshot must stay unread until known.met is absorbed"
+        );
+        replace_friends_only_hashes(&set, [hash]);
+        assert!(
+            friends_only_snapshot_contains(&set, &hash),
+            "upload listener must see a known.met friends-only hash"
+        );
+        assert!(
+            !friends_only_snapshot_ready(&set),
+            "replacing hashes must not imply the catalog has been absorbed"
+        );
+        assert!(
+            !friends_only_snapshot_contains(&set, &[0xCD; 16]),
+            "unrelated hashes stay unrestricted"
+        );
+        mark_friends_only_snapshot_ready(&set);
+        assert!(friends_only_snapshot_ready(&set));
+        replace_friends_only_hashes(&set, std::iter::empty());
+        assert!(
+            !friends_only_snapshot_contains(&set, &hash),
+            "clearing friends-only must lift the upload restriction"
+        );
+        assert!(
+            friends_only_snapshot_ready(&set),
+            "clearing hashes must not un-ready the snapshot"
+        );
+    }
+
+    #[test]
+    fn index_miss_is_restricted_until_snapshot_is_ready() {
+        assert!(
+            friends_only_from_sources(false, false, None),
+            "known.met-only hashes must not be treated as public before absorb"
+        );
+        assert!(
+            !friends_only_from_sources(false, true, None),
+            "after absorb, an index miss that is not in the snapshot is public"
+        );
+        assert!(friends_only_from_sources(true, false, Some(false)));
+        assert!(!friends_only_from_sources(false, false, Some(false)));
+        assert!(friends_only_from_sources(false, true, Some(true)));
     }
 }
 

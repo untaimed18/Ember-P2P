@@ -147,10 +147,14 @@
       // against any push events that landed in the meantime,
       // deduping by content tuple.
       (async () => {
-        const listenerOk = await setupListener(gen, hash);
-        if (gen !== loadGen) return;
-        await loadMessages(gen, hash);
-        if (gen === loadGen) liveError = !listenerOk;
+        try {
+          const listenerOk = await setupListener(gen, hash);
+          if (gen !== loadGen) return;
+          await loadMessages(gen, hash);
+          if (gen === loadGen) liveError = !listenerOk;
+        } finally {
+          if (gen === loadGen) loading = false;
+        }
       })();
       markAsRead();
     }

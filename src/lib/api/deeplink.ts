@@ -11,6 +11,8 @@ export interface DeepLinkPreview {
   name?: string;
   size?: number;
   hash?: string;
+  /** Untrusted `eh=` digest. Shown on confirm; never passed to startDownload. */
+  ember?: string;
   endpoint?: string;
   host?: string;
 }

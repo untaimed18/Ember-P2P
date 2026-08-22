@@ -2,11 +2,14 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
+#[cfg(debug_assertions)]
 use crate::network::ember::dht::publish::SignedRecord;
 use crate::network::{
-    EmberDhtContactInfo, EmberDhtSearchInfo, EmberDhtStoreInfo, EmberMaintenanceResult,
-    EmberPublishResult, NetworkCommand, PeerReputationInfo, ReputationStatsInfo,
+    EmberDhtContactInfo, EmberDhtSearchInfo, EmberDhtStoreInfo, NetworkCommand,
+    PeerReputationInfo, ReputationStatsInfo,
 };
+#[cfg(debug_assertions)]
+use crate::network::{EmberMaintenanceResult, EmberPublishResult};
 use crate::types::EmberDiagnostics;
 use crate::types::*;
 
@@ -26,6 +29,7 @@ pub struct EmberPingResult {
 /// contacts a single peer answered with for a target ID, or the reason
 /// the lookup failed. `rtt_ms` is an approximate round trip measured
 /// across the IPC + network hop (dev signal, not a precise metric).
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberDhtFindResult {
     pub success: bool,
@@ -45,10 +49,12 @@ const MAX_EMBER_PING_TIMEOUT_MS: u64 = 60_000;
 
 /// Default timeout for an iterative lookup — longer than a single-hop
 /// find because it runs several `FIND_NODE` rounds across the network.
+#[cfg(debug_assertions)]
 const DEFAULT_EMBER_LOOKUP_TIMEOUT_MS: u64 = 30_000;
 
 /// Result of the `ember_dht_publish_keyword` harness command: the DHT key
 /// the record landed under and how many nodes acknowledged storing it.
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberDhtPublishResult {
     pub success: bool,
@@ -64,6 +70,7 @@ pub struct EmberDhtPublishResult {
 
 /// One signed record returned by `ember_dht_find_value`, flattened for
 /// IPC. Only records whose publisher signature verified are surfaced.
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberDhtRecordInfo {
     /// Record type byte (`0x01` keyword, `0x02` source).
@@ -80,6 +87,7 @@ pub struct EmberDhtRecordInfo {
 
 /// Result of the `ember_dht_find_value` harness command: the verified
 /// records discovered for a keyword, or the reason the lookup failed.
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberDhtFindValueResult {
     pub success: bool,
@@ -92,6 +100,7 @@ pub struct EmberDhtFindValueResult {
 
 /// Result of the `ember_dht_run_maintenance` harness command: how much
 /// work the forced maintenance cycle kicked off (slice 6).
+#[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
 pub struct EmberDhtMaintenanceResult {
     pub success: bool,
@@ -1814,6 +1823,7 @@ pub async fn get_ember_dht_store(
 /// bridge, peer exchange, and DHT gossip. It is kept as the one way to
 /// introduce two nodes directly, which is what a local multi-node test needs
 /// when neither can reach KAD.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn add_ember_dht_contact(
     state: tauri::State<'_, AppState>,
@@ -1860,6 +1870,7 @@ pub async fn add_ember_dht_contact(
 /// the DHT PING/PONG path, so a successful round trip also seeds both
 /// nodes' routing tables. `peer_pubkey_hex` is the peer's **Noise**
 /// key; when omitted it is resolved from the KAD-fed cache.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_ping_peer(
     state: tauri::State<'_, AppState>,
@@ -1951,6 +1962,7 @@ pub async fn ember_dht_ping_peer(
 /// caller just sees "what does this peer know". `peer_pubkey_hex` is the
 /// peer's **Noise** key; when omitted it is resolved from the KAD-fed
 /// cache.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_find_node(
     state: tauri::State<'_, AppState>,
@@ -2059,6 +2071,7 @@ pub async fn ember_dht_find_node(
 /// table, so DHT-ping or seed at least one contact first. `target_hex`
 /// is an optional 32-char (16-byte) node ID; blank ⇒ a random target
 /// (a self-style probe that broadens the routing table).
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_iterative_find_node(
     state: tauri::State<'_, AppState>,
@@ -2132,6 +2145,7 @@ pub async fn ember_dht_iterative_find_node(
 /// an optional 32-char (16-byte) hash; blank ⇒ a random one (handy for
 /// dev-publishing distinct test records). Seed/ping at least one contact
 /// first or there will be no nodes to store on.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_publish_keyword(
     state: tauri::State<'_, AppState>,
@@ -2226,6 +2240,7 @@ pub async fn ember_dht_publish_keyword(
 /// for the keyword's key, returning the ones whose publisher signature
 /// verifies. Seeds from the local routing table, so DHT-ping or seed at
 /// least one contact first.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_find_value(
     state: tauri::State<'_, AppState>,
@@ -2322,6 +2337,7 @@ pub async fn ember_dht_find_value(
 /// behaviour can be observed immediately. The returned tally is what the
 /// cycle *initiated* — evictions and refresh results land asynchronously
 /// and surface in `get_ember_diagnostics`.
+#[cfg(debug_assertions)]
 #[tauri::command]
 pub async fn ember_dht_run_maintenance(
     state: tauri::State<'_, AppState>,

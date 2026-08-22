@@ -553,11 +553,28 @@ pub fn run() {
             // Swap in a restore staged by `import_backup` before anything
             // opens the files it replaces. Once the database is open and the
             // identity is cached in memory, replacing them underneath is not
-            // something that can be done safely.
+            // something that can be done safely. Failures and leftover staging
+            // are latched for a blocking UI notice — logging alone left users
+            // running on mixed or pre-restore files with no explanation.
+            let mut restore_failed_notice = false;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
-                    if let Err(e) = commands::backup::apply_pending_restore(&dir) {
-                        tracing::error!("Failed to apply the staged restore: {e}");
+                    match commands::backup::apply_pending_restore(&dir) {
+                        Err(e) => {
+                            tracing::error!("Failed to apply the staged restore: {e}");
+                            restore_failed_notice = true;
+                        }
+                        // `Ok(Some(_))` applied. A leftover marker is a failed
+                        // staging-dir cleanup, not a failed restore — the
+                        // toast would wrongly say we are on previous files.
+                        // `Ok(None)` with a marker still on disk is schema-
+                        // too-new or a mid-apply abort left for retry.
+                        Ok(None) => {
+                            if commands::backup::pending_restore_still_staged(&dir) {
+                                restore_failed_notice = true;
+                            }
+                        }
+                        Ok(Some(_)) => {}
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -836,6 +853,9 @@ pub fn run() {
                 pending_close_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pending_ember_default_on_notice: Arc::new(std::sync::atomic::AtomicBool::new(
                     ember_default_on_applied,
+                )),
+                pending_restore_failed_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+                    restore_failed_notice,
                 )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
@@ -1671,7 +1691,10 @@ pub fn run() {
             info!("Ember P2P application started");
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            macro_rules! ember_invoke_handler {
+                ($($harness:path),* $(,)?) => {
+                    tauri::generate_handler![
             commands::backup::export_backup,
             commands::backup::pick_backup_file,
             commands::backup::clear_picked_backup,
@@ -1798,13 +1821,7 @@ pub fn run() {
             commands::peers::get_ember_dht_contacts,
             commands::peers::get_ember_dht_searches,
             commands::peers::get_ember_dht_store,
-            commands::peers::add_ember_dht_contact,
-            commands::peers::ember_dht_ping_peer,
-            commands::peers::ember_dht_find_node,
-            commands::peers::ember_dht_iterative_find_node,
-            commands::peers::ember_dht_publish_keyword,
-            commands::peers::ember_dht_find_value,
-            commands::peers::ember_dht_run_maintenance,
+            $($harness,)*
             commands::peers::ember_request_sources,
             commands::settings::get_settings,
             commands::settings::update_settings,
@@ -1817,6 +1834,7 @@ pub fn run() {
             commands::settings::set_close_behavior,
             commands::settings::take_pending_close_request,
             commands::settings::take_pending_ember_default_on_notice,
+            commands::settings::take_pending_restore_failed_notice,
             commands::settings::open_ember_website,
             commands::security::get_security_policy_state,
             commands::security::acknowledge_security_policy_reset,
@@ -1858,7 +1876,26 @@ pub fn run() {
             commands::updater::secure_updater_install,
             commands::updater::secure_updater_handoff_status,
             commands::updater::secure_updater_run_saved_installer,
-        ])
+                    ]
+                };
+            }
+            #[cfg(debug_assertions)]
+            {
+                ember_invoke_handler![
+                    commands::peers::add_ember_dht_contact,
+                    commands::peers::ember_dht_ping_peer,
+                    commands::peers::ember_dht_find_node,
+                    commands::peers::ember_dht_iterative_find_node,
+                    commands::peers::ember_dht_publish_keyword,
+                    commands::peers::ember_dht_find_value,
+                    commands::peers::ember_dht_run_maintenance,
+                ]
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                ember_invoke_handler![]
+            }
+        })
         .on_window_event(|window, event| {
             // Title-bar X handler. Decides whether to fully exit, hide to
             // the system tray, or hand off to the frontend dialog based on

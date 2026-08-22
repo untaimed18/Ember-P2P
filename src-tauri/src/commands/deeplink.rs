@@ -35,6 +35,11 @@ pub struct DeepLinkPreview {
     pub name: Option<String>,
     pub size: Option<u64>,
     pub hash: Option<String>,
+    /// Untrusted `eh=` digest from the link, shown on confirm so the user can
+    /// see it. Never passed to `start_download` — a pasted link must not pin
+    /// the BLAKE3 we verify against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ember: Option<String>,
     pub endpoint: Option<String>,
     pub host: Option<String>,
 }
@@ -58,6 +63,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             name: Some(crate::security::sanitize_remote_text(&info.name, 8192)),
             size: Some(info.size),
             hash: Some(info.hash.to_ascii_lowercase()),
+            ember: info.ember,
             endpoint: None,
             host: None,
         });
@@ -78,6 +84,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             name: None,
             size: None,
             hash: None,
+            ember: None,
             endpoint: Some(format!("{ip}:{port}")),
             host: None,
         });
@@ -108,6 +115,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             name: None,
             size: None,
             hash: None,
+            ember: None,
             endpoint: None,
             host: Some(host),
         });
@@ -122,6 +130,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             name,
             size: None,
             hash: None,
+            ember: None,
             endpoint: None,
             host: None,
         });

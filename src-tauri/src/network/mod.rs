@@ -379,6 +379,16 @@ fn advertised_quic_port(state: &NetworkState) -> Option<u16> {
         .filter(|p| *p != 0)
 }
 
+/// Keep the DHT engine's advertised buddy identity in sync with STUN/UPnP.
+fn refresh_ember_advertised_buddy(state: &mut NetworkState) {
+    let ip = state.external_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    state.ember_dht.set_advertised_buddy(
+        *state.ember_transport.local_noise_public_key(),
+        ip,
+        advertised_udp_port(state),
+    );
+}
+
 /// Whether STUN keep-alive should actively refresh/advertise mappings.
 /// Symmetric / unstable remapping (typical VPN) must not override Settings ports.
 fn mapping_probe_allowed_by_activity(
@@ -7789,10 +7799,8 @@ mod tests {
     /// A digest a transfer will *enforce* has to be corroborated, because getting
     /// it wrong is unrecoverable: the content check fails at completion and reopens
     /// every part, on every retry, forever. The source path already required two
-    /// agreeing publishers; the keyword path took the digest straight off the
-    /// displayed row, which is a plurality with no minimum. So one publisher naming
-    /// a popular eD2K hash with a junk BLAKE3 could make that file permanently
-    /// un-completable for anyone who searched for it.
+    /// agreeing publishers. A keyword *row* may show a plurality of one so the
+    /// user can pin it by clicking download; automatic search seeding must not.
     #[test]
     fn one_publisher_cannot_seed_a_digest_a_transfer_will_enforce() {
         use ed25519_dalek::SigningKey;
@@ -7806,29 +7814,35 @@ mod tests {
         let real = [0x77u8; 32];
 
         let blobs = vec![
-            // One publisher, one claim: displayable, never enforceable.
+            // One publisher, one claim: displayable, never auto-enforced.
             ember_kw_blob_with_digest(&liar, "ubuntu", poisoned, junk, 100, "ubuntu.iso"),
             // Two publishers agreeing: enforceable.
             ember_kw_blob_with_digest(&honest_a, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
             ember_kw_blob_with_digest(&honest_b, "ubuntu", agreed, real, 100, "ubuntu-24.iso"),
         ];
-        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()], None);
+        let built = build_ember_keyword_built(&blobs, &["ubuntu".to_string()], None);
 
-        assert_eq!(results.len(), 2, "both files are still shown");
-        let shown = results
+        assert_eq!(built.results.len(), 2, "both files are still shown");
+        let shown = built
+            .results
             .iter()
             .find(|r| r.file.hash == hex::encode(poisoned))
             .expect("the single-publisher file is displayed");
-        // Empty, not the claim. This field is what the search page hands to
-        // `start_download`, which writes it into the enforced map — so carrying an
-        // uncorroborated digest here is the poisoning path, however the search
-        // code itself seeds that map.
+        assert_eq!(
+            shown.file.ember_file_hash,
+            hex::encode(junk),
+            "a unique digest is shown so a click can pin it"
+        );
         assert!(
-            shown.file.ember_file_hash.is_empty(),
-            "an uncorroborated digest must not ride the row into the download path"
+            built
+                .corroborated
+                .iter()
+                .all(|(hash, _)| *hash != poisoned),
+            "an uncorroborated digest must not auto-seed the enforced map"
         );
 
-        let agreed_row = results
+        let agreed_row = built
+            .results
             .iter()
             .find(|r| r.file.hash == hex::encode(agreed))
             .expect("the corroborated file is displayed");
@@ -7836,6 +7850,13 @@ mod tests {
             agreed_row.file.ember_file_hash,
             hex::encode(real),
             "a digest two publishers agree on is carried"
+        );
+        assert!(
+            built
+                .corroborated
+                .iter()
+                .any(|(hash, digest)| *hash == agreed && *digest == real),
+            "a corroborated digest is what automatic seeding may pin"
         );
     }
 
@@ -10381,12 +10402,74 @@ async fn save_part_tracker_snapshot(
     }
 }
 
+/// Serializes fire-and-forget transfer status writes so a later live state
+/// cannot be overwritten by an earlier `spawn_blocking` that lost the race.
+struct TransferStatusWriteClock {
+    seq: std::sync::atomic::AtomicU64,
+    last: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl TransferStatusWriteClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            seq: std::sync::atomic::AtomicU64::new(1),
+            last: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn transfer_status_write_is_stale(applied: Option<u64>, seq: u64) -> bool {
+    applied.is_some_and(|a| seq <= a)
+}
+
+fn apply_transfer_status_write(
+    clock: &TransferStatusWriteClock,
+    db: &Database,
+    transfer_id: &str,
+    status: &str,
+    seq: u64,
+) {
+    let mut last = match clock.last.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if transfer_status_write_is_stale(last.get(transfer_id).copied(), seq) {
+        return;
+    }
+    // Record seq even when SQLite fails so a slower older write cannot
+    // land after a newer attempt. The next user-visible transition gets a
+    // fresh seq.
+    last.insert(transfer_id.to_string(), seq);
+    if let Err(e) = db.update_transfer_status(transfer_id, status) {
+        warn!("DB update_transfer_status('{status}') failed for {transfer_id}: {e}");
+    }
+}
+
+fn spawn_transfer_status_write(
+    clock: &Arc<TransferStatusWriteClock>,
+    db: Arc<Database>,
+    transfer_id: String,
+    status: &'static str,
+) {
+    let seq = clock.next_seq();
+    let clock = Arc::clone(clock);
+    tokio::task::spawn_blocking(move || {
+        apply_transfer_status_write(&clock, &db, &transfer_id, status, seq);
+    });
+}
+
 async fn mark_download_insufficient(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     transfer_id: &str,
     file_name: &str,
+    status_writes: &Arc<TransferStatusWriteClock>,
 ) -> Vec<Transfer> {
     let promoted = {
         let mut mgr = transfer_manager.write().await;
@@ -10405,9 +10488,12 @@ async fn mark_download_insufficient(
         // Free the concurrent slot and promote the next queued download (T2).
         mgr.promote_available()
     };
-    if let Err(e) = db.update_transfer_status(transfer_id, "insufficient") {
-        warn!("DB update_transfer_status('insufficient') failed for {transfer_id}: {e}");
-    }
+    spawn_transfer_status_write(
+        status_writes,
+        db.clone(),
+        transfer_id.to_string(),
+        "insufficient",
+    );
     let _ = app_handle.emit(
         "transfer-status",
         serde_json::json!({
@@ -12226,6 +12312,7 @@ fn hydrate_ember_publish_schedule(
     source_unix: &mut HashMap<[u8; 16], u32>,
     keyword_dest: &mut HashMap<[u8; 16], std::time::Instant>,
     keyword_unix: &mut HashMap<[u8; 16], u32>,
+    published_sources: &mut HashSet<[u8; 16]>,
 ) {
     let now_unix = chrono::Utc::now().timestamp();
     let now_inst = std::time::Instant::now();
@@ -12234,6 +12321,11 @@ fn hydrate_ember_publish_schedule(
             source_unix
                 .entry(record.file_hash)
                 .or_insert(record.last_ember_source_publish);
+            let age = (now_unix.max(0) as u64)
+                .saturating_sub(record.last_ember_source_publish as u64);
+            if age < EMBER_SOURCE_RECORD_TTL.as_secs() {
+                published_sources.insert(record.file_hash);
+            }
             if !source_dest.contains_key(&record.file_hash) {
                 if let Some(at) = ember_publish_instant(
                     record.last_ember_source_publish,
@@ -13070,6 +13162,8 @@ const EMBER_CONTACT_STALE_SECS: i64 = 2 * 3600;
 /// traffic per tick on every node, so it stays where it is and the limit is
 /// recorded here instead.
 const EMBER_SOURCE_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+/// Live window for a source record on the DHT (matches `dht/store.rs`).
+const EMBER_SOURCE_RECORD_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Floor on shared-file source records (re)published per `publish_timer`
 /// tick, so a nearly-idle library still makes progress every minute.
@@ -13357,6 +13451,207 @@ fn parse_ember_file_hash(hash_hex: &str) -> [u8; 32] {
         }
     }
     out
+}
+
+/// Hashes that must not be advertised on the open network (server offers,
+/// KAD source publish, EPX, UDP reask, source exchange).
+fn collect_friends_only_hashes(
+    local_index: &crate::search::index::LocalIndex,
+    known_files: &KnownFileList,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = local_index
+        .all_files()
+        .iter()
+        .filter(|f| f.friends_only && !f.hash.is_empty())
+        .map(|f| f.hash.to_ascii_lowercase())
+        .collect();
+    for rec in known_files.iter_records() {
+        if rec.friends_only {
+            out.insert(hex::encode(rec.file_hash));
+        }
+    }
+    out
+}
+
+fn hash_hex_is_friends_only(restricted: &HashSet<String>, file_hash: &str) -> bool {
+    restricted.contains(&file_hash.to_ascii_lowercase())
+}
+
+/// Open-network advertise of a partial is allowed only after known.met has
+/// been absorbed. Until then a friends-only hash that exists only on disk
+/// looks public (empty catalog + index miss).
+fn kad_may_advertise_partial(
+    known_files: &KnownFileList,
+    restricted: &HashSet<String>,
+    file_hash: &str,
+) -> bool {
+    known_files.is_authoritative() && !hash_hex_is_friends_only(restricted, file_hash)
+}
+
+/// Complete shares: must be publicly listable on the index *and* not
+/// friends-only in known.met. Until the catalog is absorbed, skip them
+/// the same way as partials — a rematch row looks public.
+fn kad_may_advertise_complete(
+    file: &FileInfo,
+    known_files: &KnownFileList,
+    restricted: &HashSet<String>,
+) -> bool {
+    file.is_public_listable() && kad_may_advertise_partial(known_files, restricted, &file.hash)
+}
+
+fn hash16_is_friends_only(
+    hash: &[u8; 16],
+    local_index: &crate::search::index::LocalIndex,
+    known_files: &KnownFileList,
+) -> bool {
+    let hex = hex::encode(hash);
+    local_index
+        .get_by_hash(&hex)
+        .or_else(|| local_index.get_by_hash(&hex.to_ascii_uppercase()))
+        .is_some_and(|f| f.friends_only)
+        || known_files.find_by_hash(hash).is_some_and(|r| r.friends_only)
+}
+
+/// Register active/queued public downloads for KAD source publish. No-ops
+/// until known.met is authoritative so a disk-only friends-only hash is not
+/// advertised in the startup window.
+async fn publish_kad_partials_from_transfers(
+    state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    known_files: &KnownFileList,
+) -> u32 {
+    if !known_files.is_authoritative() {
+        return 0;
+    }
+    let restricted = {
+        let index = local_index.read().await;
+        collect_friends_only_hashes(&index, known_files)
+    };
+    let mut partial_count = 0u32;
+    let mgr = transfer_manager.read().await;
+    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+        if transfer.direction != TransferDirection::Download {
+            continue;
+        }
+        if matches!(
+            transfer.status,
+            TransferStatus::Completed | TransferStatus::Failed
+        ) {
+            continue;
+        }
+        if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
+            continue;
+        }
+        let hash_bytes = match hex::decode(&transfer.file_hash) {
+            Ok(bytes) if bytes.len() >= 16 => bytes,
+            _ => continue,
+        };
+        let ext = std::path::Path::new(&transfer.file_name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+        state.publish_manager.add_file(PublishableFile {
+            file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+            file_name: transfer.file_name.clone(),
+            file_size: transfer.total_size,
+            file_type: crate::search::index::infer_file_type(&ext),
+            complete_sources: 0,
+            keyword_publishable: false,
+            last_source_publish: {
+                let mut raw = [0u8; 16];
+                raw.copy_from_slice(&hash_bytes[..16]);
+                known_files
+                    .find_by_hash(&raw)
+                    .map(|r| r.last_publish_src as i64)
+                    .unwrap_or(0)
+            },
+        });
+        partial_count += 1;
+    }
+    partial_count
+}
+
+/// Register publicly listable completes for KAD source+keyword publish.
+/// No-ops until known.met is authoritative; skips known.met friends-only
+/// hashes even when the index row still looks public.
+async fn publish_kad_completes_from_index(
+    state: &mut NetworkState,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    known_files: &KnownFileList,
+) -> usize {
+    if !known_files.is_authoritative() {
+        return 0;
+    }
+    let files: Vec<PublishableFile> = {
+        let index = local_index.read().await;
+        let restricted = collect_friends_only_hashes(&index, known_files);
+        index
+            .all_files()
+            .iter()
+            .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
+            .filter_map(|f| {
+                let hash_bytes = hex::decode(&f.hash).ok()?;
+                if hash_bytes.len() < 16 {
+                    return None;
+                }
+                Some(PublishableFile {
+                    file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                    file_name: f.name.clone(),
+                    file_size: f.size,
+                    file_type: crate::search::index::infer_file_type(&f.extension),
+                    complete_sources: f.complete_sources,
+                    keyword_publishable: true,
+                    last_source_publish: {
+                        let mut raw = [0u8; 16];
+                        raw.copy_from_slice(&hash_bytes[..16]);
+                        known_files
+                            .find_by_hash(&raw)
+                            .map(|r| r.last_publish_src as i64)
+                            .unwrap_or(0)
+                    },
+                })
+            })
+            .collect()
+    };
+    let n = files.len();
+    state.publish_manager.add_files_batch(files);
+    n
+}
+
+async fn or_index_friends_only_from_known(
+    local_index: &Arc<RwLock<LocalIndex>>,
+    known_files: &KnownFileList,
+) {
+    let hashes = collect_known_friends_only_hashes(known_files);
+    if hashes.is_empty() {
+        return;
+    }
+    local_index
+        .write()
+        .await
+        .or_friends_only_from_hashes(&hashes);
+}
+
+fn collect_known_friends_only_hashes(known_files: &KnownFileList) -> HashSet<[u8; 16]> {
+    known_files
+        .iter_records()
+        .filter(|r| r.friends_only)
+        .map(|r| r.file_hash)
+        .collect()
+}
+
+fn sync_shared_friends_only_hashes(
+    dest: &upload_server::SharedFriendsOnlyHashes,
+    known_files: &KnownFileList,
+) {
+    upload_server::replace_friends_only_hashes(
+        dest,
+        collect_known_friends_only_hashes(known_files),
+    );
+    if known_files.is_authoritative() {
+        upload_server::mark_friends_only_snapshot_ready(dest);
+    }
 }
 
 /// Set the Library KAD / eD2K / Ember badges from real publish/offer state,
@@ -16331,6 +16626,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         Arc::new(std::sync::RwLock::new(banned_ips.clone()));
     let shared_banned_hashes: ed2k::upload::SharedBannedHashes =
         Arc::new(std::sync::RwLock::new(banned_hashes));
+    let shared_friends_only_hashes: ed2k::upload::SharedFriendsOnlyHashes =
+        Arc::new(std::sync::RwLock::new(Default::default()));
 
     // AntiLeech client-software filter — eMule's `AntiLeech.dat`
     // equivalent. Loads from `<data_dir>/antileech.dat` (seeded with the
@@ -16782,6 +17079,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // stalled behind large known.met / ipfilter.dat parses.
     let mut known_files = KnownFileList::new();
     info!("Known files / AICH / ipfilter load deferred until event loop");
+    let transfer_status_writes = TransferStatusWriteClock::new();
 
     // Initialize statistics manager
     let mut stats_manager = StatsManager::new();
@@ -17143,6 +17441,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_ip_filter = shared_ip_filter.clone();
         let ul_banned = shared_banned_ips.clone();
         let ul_banned_hashes = shared_banned_hashes.clone();
+        let ul_friends_only = shared_friends_only_hashes.clone();
         let ul_antileech = shared_antileech.clone();
         let ul_skip_compress = state.skip_compress_video_shared.clone();
         let ul_filter_incoming = state.filter_incoming_shared.clone();
@@ -17197,6 +17496,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_ip_filter,
                 ul_banned,
                 ul_banned_hashes,
+                ul_friends_only,
                 ul_antileech,
                 ul_skip_compress,
                 ul_filter_incoming,
@@ -17599,6 +17899,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     > = None;
     let mut part_progress_map: Option<std::collections::HashMap<String, (u64, bool, bool)>> = None;
     let mut pending_startup_cleanup = true;
+    let mut known_met_ready = false;
     let mut pending_upnp_setup = upnp_enabled;
     let mut deferred_disk_loads: Option<tokio::task::JoinHandle<DeferredDiskLoads>> = {
         let ipfilter_path = data_dir.join("ipfilter.dat");
@@ -17831,6 +18132,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &firewall_probe_ips,
                         &shared_banned_ips,
                         &shared_banned_hashes,
+                        &shared_friends_only_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -17842,6 +18144,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed25519_pubkey,
                         ed25519_secret_key,
                         &upload_queue_handle,
+                        &transfer_status_writes,
                     ).await;
                 }
             }
@@ -17924,12 +18227,41 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             state.ember_dht.evict_filtered_contacts();
                         }
                         known_files.absorb_missing_from(loads.known_files);
+                        sync_shared_friends_only_hashes(&shared_friends_only_hashes, &known_files);
+                        or_index_friends_only_from_known(&local_index, &known_files).await;
+                        known_met_ready = true;
+                        // Live StartDownload / PartFileReady / first KAD
+                        // connect may have skipped advertise while this
+                        // catalog was a placeholder. Public completes and
+                        // partials land now; friends-only stay out.
+                        if state.first_publish_done {
+                            let shared_n = publish_kad_completes_from_index(
+                                &mut state,
+                                &local_index,
+                                &known_files,
+                            )
+                            .await;
+                            let partial_n = publish_kad_partials_from_transfers(
+                                &mut state,
+                                &transfer_manager,
+                                &local_index,
+                                &known_files,
+                            )
+                            .await;
+                            if shared_n + partial_n as usize > 0 {
+                                info!(
+                                    "Backfilled {shared_n} public shares + {partial_n} partial downloads into KAD publish after known.met load"
+                                );
+                            }
+                        }
+                        state.request_offer_files = true;
                         hydrate_ember_publish_schedule(
                             &known_files,
                             &mut state.ember_source_publish_at,
                             &mut state.ember_source_publish_unix,
                             &mut state.ember_keyword_publish_at,
                             &mut state.ember_keyword_publish_unix,
+                            &mut state.ember_published_sources,
                         );
                         state.aich_hash_sets = loads.aich_hash_sets;
                         for (k, v) in loads.aich_root_map {
@@ -17950,6 +18282,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         warn!("Deferred disk load task panicked: {e}");
+                        known_met_ready = true;
                         // A failed deferred read must not turn an enabled
                         // filter into an intentional empty one. Keep the
                         // peer paths fail-closed until a successful reload.
@@ -18009,13 +18342,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
 
-        if pending_incomplete_downloads.is_some() && part_progress_map.is_some() {
+        if pending_incomplete_downloads.is_some()
+            && part_progress_map.is_some()
+            && known_met_ready
+        {
             let incomplete = pending_incomplete_downloads.take().unwrap();
             let progress_map = part_progress_map.take().unwrap();
             let count = incomplete.len();
             info!("Resuming {count} incomplete downloads from previous session");
             let dl_folder = settings.download_folder.clone();
             let mut restore_db_writes: Vec<Transfer> = Vec::new();
+            let resume_restricted = {
+                let index = local_index.read().await;
+                collect_friends_only_hashes(&index, &known_files)
+            };
             for mut transfer in incomplete {
                 // Hash-failed downloads are restored only to keep their Temp
                 // `.part` owned (orphan sweep). Do not auto-start them.
@@ -18277,11 +18617,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 // Register partial download for KAD source publishing
                 if let Ok(hash_bytes) = hex::decode(&transfer.file_hash) {
-                    if hash_bytes.len() >= 16 {
+                    if hash_bytes.len() >= 16
+                        && kad_may_advertise_partial(
+                            &known_files,
+                            &resume_restricted,
+                            &transfer.file_hash,
+                        )
+                    {
                         let ext = std::path::Path::new(&transfer.file_name)
                             .extension()
                             .map(|e| e.to_string_lossy().to_string())
                             .unwrap_or_default();
+                        let mut raw = [0u8; 16];
+                        raw.copy_from_slice(&hash_bytes[..16]);
                         state.publish_manager.add_file(PublishableFile {
                             file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
                             file_name: transfer.file_name.clone(),
@@ -18289,14 +18637,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             file_type: crate::search::index::infer_file_type(&ext),
                             complete_sources: 0,
                             keyword_publishable: false,
-                            last_source_publish: {
-                                let mut raw = [0u8; 16];
-                                raw.copy_from_slice(&hash_bytes[..16]);
-                                known_files
-                                    .find_by_hash(&raw)
-                                    .map(|r| r.last_publish_src as i64)
-                                    .unwrap_or(0)
-                            },
+                            last_source_publish: known_files
+                                .find_by_hash(&raw)
+                                .map(|r| r.last_publish_src as i64)
+                                .unwrap_or(0),
                         });
                     }
                 }
@@ -18366,12 +18710,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             state.request_offer_files = false;
             if state.server_connected {
                 let mut seen_offer_hashes = std::collections::HashSet::new();
-                let mut offer_files: Vec<ed2k::server::OfferFile> = {
+                let (mut offer_files, restricted) = {
                     let index = local_index.read().await;
-                    index
+                    let restricted = collect_friends_only_hashes(&index, &known_files);
+                    let offer_files: Vec<ed2k::server::OfferFile> = index
                         .all_files()
                         .iter()
-                        .filter(|f| f.is_public_listable())
+                        .filter(|f| kad_may_advertise_complete(f, &known_files, &restricted))
                         .filter_map(|f| {
                             let hash_bytes = hex::decode(&f.hash).ok()?;
                             if hash_bytes.len() < 16 {
@@ -18390,7 +18735,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 file_type: String::new(),
                             })
                         })
-                        .collect()
+                        .collect();
+                    (offer_files, restricted)
                 };
                 let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
                 {
@@ -18402,6 +18748,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         if matches!(
                             transfer.status,
                             TransferStatus::Completed | TransferStatus::Failed
+                        ) {
+                            continue;
+                        }
+                        if !kad_may_advertise_partial(
+                            &known_files,
+                            &restricted,
+                            &transfer.file_hash,
                         ) {
                             continue;
                         }
@@ -18783,6 +19136,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &credit_manager,
                                 &transfer_manager,
                                 &source_manager,
+                                &known_files,
                             ).await;
                         }
                     }
@@ -18844,6 +19198,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &credit_manager,
                                     &transfer_manager,
                                     &source_manager,
+                                    &known_files,
                                 ).await;
                             }
                         }
@@ -18933,6 +19288,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &firewall_probe_ips,
                             &shared_banned_ips,
                             &shared_banned_hashes,
+                            &shared_friends_only_hashes,
                             &shared_server_addr,
                             &shared_ember_payload,
                             &ember_payload_generation,
@@ -18944,6 +19300,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             ed25519_pubkey,
                             ed25519_secret_key,
                             &upload_queue_handle,
+                            &transfer_status_writes,
                         ).await;
                     }
                 }
@@ -18954,6 +19311,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let DownloadEvent::PartFileReady { ref transfer_id, ref file_hash, file_size, ref file_name } = event {
                     info!("Part file ready for {} ({}) — offering to server and publishing to KAD",
                         transfer_id, hex::encode(file_hash));
+                    let restricted = {
+                        let index = local_index.read().await;
+                        !known_files.is_authoritative()
+                            || hash16_is_friends_only(file_hash, &index, &known_files)
+                    };
+                    if !restricted {
                     if state.server_connected {
                         let offer = vec![ed2k::server::OfferFile {
                             hash: *file_hash,
@@ -18995,6 +19358,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             .map(|r| r.last_publish_src as i64)
                             .unwrap_or(0),
                     });
+                    }
                 }
                 if let DownloadEvent::Completed {
                     ref transfer_id,
@@ -19368,7 +19732,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     *shared_files.write().await = snap;
                                 }
 
-                                if shared_file.is_public_listable() {
+                                if kad_may_advertise_complete(
+                                    &shared_file,
+                                    &known_files,
+                                    &{
+                                        let index = local_index.read().await;
+                                        collect_friends_only_hashes(&index, &known_files)
+                                    },
+                                ) {
                                     // Publish to KAD
                                     state.publish_manager.add_file(PublishableFile {
                                         file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
@@ -19568,6 +19939,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &app_handle,
                             transfer_id,
                             &file_name,
+                            &transfer_status_writes,
                         )
                         .await;
                         // Start any downloads promoted into the freed concurrent
@@ -19626,6 +19998,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &firewall_probe_ips,
                                 &shared_banned_ips,
                                 &shared_banned_hashes,
+                                &shared_friends_only_hashes,
                                 &shared_server_addr,
                                 &shared_ember_payload,
                                 &ember_payload_generation,
@@ -19637,6 +20010,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 ed25519_pubkey,
                                 ed25519_secret_key,
                                 &upload_queue_handle,
+                                &transfer_status_writes,
                             )
                             .await;
                         }
@@ -19726,15 +20100,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 priority: priority_str_to_u32(&t.priority),
                             });
                             info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
-                            {
-                                let db = db.clone();
-                                let tid = transfer_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Err(e) = db.update_transfer_status(&tid, "searching") {
-                                        warn!("DB update_transfer_status('searching') failed for {tid}: {e}");
-                                    }
-                                });
-                            }
+                            spawn_transfer_status_write(
+                                &transfer_status_writes,
+                                db.clone(),
+                                transfer_id.clone(),
+                                "searching",
+                            );
 
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
                                 "id": transfer_id,
@@ -20323,7 +20694,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // event can't unwind the whole network loop (→ outer catch →
                 // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
                 // catch_unwind pattern.
-                if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, &app_handle, &transfer_manager, &source_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since)).catch_unwind().await {
+                if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, &app_handle, &transfer_manager, &source_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, &transfer_status_writes)).catch_unwind().await {
                     error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
                 }
 
@@ -20379,6 +20750,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &firewall_probe_ips,
                         &shared_banned_ips,
                         &shared_banned_hashes,
+                        &shared_friends_only_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -20390,6 +20762,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed25519_pubkey,
                         ed25519_secret_key,
                         &upload_queue_handle,
+                        &transfer_status_writes,
                     ).await;
                 }
 
@@ -21635,6 +22008,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &firewall_probe_ips,
                         &shared_banned_ips,
                         &shared_banned_hashes,
+                        &shared_friends_only_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -21646,6 +22020,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ed25519_pubkey,
                         ed25519_secret_key,
                         &upload_queue_handle,
+                        &transfer_status_writes,
                     ).await;
                 }
             }
@@ -23919,15 +24294,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             last_publish: now,
                                         },
                                     );
-                                    if let Err(e) = db.save_published_note(
-                                        &note.file_hash.to_hex(),
-                                        note.rating,
-                                        &note.comment,
-                                        now,
-                                        note.file_name.as_deref(),
-                                        note.file_size,
-                                    ) {
-                                        warn!("Failed to persist note republish timestamp: {e}");
+                                    {
+                                        let db = db.clone();
+                                        let hash_hex = note.file_hash.to_hex();
+                                        let rating = note.rating;
+                                        let comment = note.comment.clone();
+                                        let file_name = note.file_name.clone();
+                                        let file_size = note.file_size;
+                                        tokio::task::spawn_blocking(move || {
+                                            if let Err(e) = db.save_published_note(
+                                                &hash_hex,
+                                                rating,
+                                                &comment,
+                                                now,
+                                                file_name.as_deref(),
+                                                file_size,
+                                            ) {
+                                                warn!(
+                                                    "Failed to persist note republish timestamp: {e}"
+                                                );
+                                            }
+                                        });
                                     }
                                 }
                                 info!(
@@ -24449,69 +24836,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // Populate publish manager with all shared files on first connect
                     if !state.first_publish_done {
                         state.first_publish_done = true;
-                        let files: Vec<PublishableFile> = {
-                            let index = local_index.read().await;
-                            index.all_files()
-                                .iter()
-                                .filter(|f| f.is_public_listable())
-                                .filter_map(|f| {
-                                    let hash_bytes = hex::decode(&f.hash).ok()?;
-                                    if hash_bytes.len() < 16 { return None; }
-                                    Some(PublishableFile {
-                                        file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
-                                        file_name: f.name.clone(),
-                                        file_size: f.size,
-                                        file_type: crate::search::index::infer_file_type(&f.extension),
-                                        complete_sources: f.complete_sources,
-                                        keyword_publishable: true,
-                                        last_source_publish: {
-                                            let mut raw = [0u8; 16];
-                                            raw.copy_from_slice(&hash_bytes[..16]);
-                                            known_files
-                                                .find_by_hash(&raw)
-                                                .map(|r| r.last_publish_src as i64)
-                                                .unwrap_or(0)
-                                        },
-                                    })
-                                })
-                                .collect()
-                        };
-                        let shared_count = files.len();
-                        state.publish_manager.add_files_batch(files);
-
-                        let mut partial_count = 0u32;
-                        {
-                            let mgr = transfer_manager.read().await;
-                            for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                                if transfer.direction != TransferDirection::Download { continue; }
-                                if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) { continue; }
-                                let hash_bytes = match hex::decode(&transfer.file_hash) {
-                                    Ok(bytes) if bytes.len() >= 16 => bytes,
-                                    _ => continue,
-                                };
-                                let ext = std::path::Path::new(&transfer.file_name)
-                                    .extension()
-                                    .map(|e| e.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                state.publish_manager.add_file(PublishableFile {
-                                    file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
-                                    file_name: transfer.file_name.clone(),
-                                    file_size: transfer.total_size,
-                                    file_type: crate::search::index::infer_file_type(&ext),
-                                    complete_sources: 0,
-                                    keyword_publishable: false,
-                                    last_source_publish: {
-                                        let mut raw = [0u8; 16];
-                                        raw.copy_from_slice(&hash_bytes[..16]);
-                                        known_files
-                                            .find_by_hash(&raw)
-                                            .map(|r| r.last_publish_src as i64)
-                                            .unwrap_or(0)
-                                    },
-                                });
-                                partial_count += 1;
-                            }
-                        }
+                        let shared_count = publish_kad_completes_from_index(
+                            &mut state,
+                            &local_index,
+                            &known_files,
+                        )
+                        .await;
+                        let partial_count = publish_kad_partials_from_transfers(
+                            &mut state,
+                            &transfer_manager,
+                            &local_index,
+                            &known_files,
+                        )
+                        .await;
                         info!("Populated publish manager with {shared_count} shared files + {partial_count} partial downloads after bootstrap");
                     }
 
@@ -25126,8 +25463,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut state,
                     &settings,
                     &local_index,
-                    settings.tcp_port,
-                    udp_port,
+                    &known_files,
                 )
                 .await;
 
@@ -25138,6 +25474,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut state,
                     &settings,
                     &local_index,
+                    &known_files,
                 )
                 .await;
 
@@ -27695,15 +28032,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             }
                             // Offload the DB write so a WAL commit can't stall the
                             // event loop, and never hold `transfer_manager` across it.
-                            {
-                                let db = db.clone();
-                                let tid = tid.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Err(e) = db.update_transfer_status(&tid, "failed") {
-                                        warn!("DB update_transfer_status('failed') failed for {tid}: {e}");
-                                    }
-                                });
-                            }
+                            spawn_transfer_status_write(
+                                &transfer_status_writes,
+                                db.clone(),
+                                tid.clone(),
+                                "failed",
+                            );
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
                                 "id": tid,
                                 "status": "failed",
@@ -27755,6 +28089,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &app_handle,
                         &tid,
                         &file_name,
+                        &transfer_status_writes,
                     )
                     .await;
                     for t in freed {
@@ -27947,6 +28282,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &app_handle,
                                 tid,
                                 &pending.file_name,
+                                &transfer_status_writes,
                             )
                             .await;
                             for t in freed {
@@ -28147,6 +28483,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &app_handle,
                                 tid,
                                 &pending.file_name,
+                                &transfer_status_writes,
                             )
                             .await;
                             for t in freed {
@@ -31411,12 +31748,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // flush to the UI before a potentially large offer.
                         {
                             let mut seen_offer_hashes = std::collections::HashSet::new();
-                            let mut offer_files: Vec<ed2k::server::OfferFile> = {
+                            let (mut offer_files, restricted) = {
                                 let index = local_index.read().await;
-                                index
+                                let restricted = collect_friends_only_hashes(&index, &known_files);
+                                let offer_files: Vec<ed2k::server::OfferFile> = index
                                     .all_files()
                                     .iter()
-                                    .filter(|f| f.is_public_listable())
+                                    .filter(|f| {
+                                        kad_may_advertise_complete(f, &known_files, &restricted)
+                                    })
                                     .filter_map(|f| {
                                         let hash_bytes = hex::decode(&f.hash).ok()?;
                                         if hash_bytes.len() < 16 {
@@ -31435,7 +31775,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             file_type: String::new(),
                                         })
                                     })
-                                    .collect()
+                                    .collect();
+                                (offer_files, restricted)
                             };
                             let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
                             {
@@ -31447,6 +31788,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     if matches!(
                                         transfer.status,
                                         TransferStatus::Completed | TransferStatus::Failed
+                                    ) {
+                                        continue;
+                                    }
+                                    if !kad_may_advertise_partial(
+                                        &known_files,
+                                        &restricted,
+                                        &transfer.file_hash,
                                     ) {
                                         continue;
                                     }
@@ -33485,6 +33833,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let local_relay_ip = local_relay_attestation.as_ref().map(|a| a.relay_ip);
 
                 let entries = {
+                    let restricted = {
+                        let idx = local_index.read().await;
+                        collect_friends_only_hashes(&idx, &known_files)
+                    };
                     let mgr = transfer_manager.read().await;
                     let sm = source_manager.read().await;
                     let mut file_entries = Vec::new();
@@ -33496,6 +33848,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             continue;
                         }
                         if matches!(transfer.status, TransferStatus::Completed | TransferStatus::Failed) {
+                            continue;
+                        }
+                        if !kad_may_advertise_partial(&known_files, &restricted, &transfer.file_hash) {
                             continue;
                         }
                         let hash_bytes = match hex::decode(&transfer.file_hash) {
@@ -33552,6 +33907,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // Include completed (seeded) files that have known sources
                     for transfer in mgr.active.values().chain(mgr.queue.iter()) {
                         if transfer.status != TransferStatus::Completed {
+                            continue;
+                        }
+                        if !kad_may_advertise_partial(&known_files, &restricted, &transfer.file_hash) {
                             continue;
                         }
                         if seen_hashes.contains(&transfer.file_hash) {
@@ -34340,13 +34698,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // filter: those records have been considered, and not
                         // moving the cursor would re-examine them every tick.
                         kw.last_streamed_count = gathered;
+                        let built = build_ember_keyword_built(
+                            &records,
+                            &kw.keywords,
+                            kw.query_expr.as_ref(),
+                        );
+                        for (ed2k, digest) in &built.corroborated {
+                            state.ember_content_hashes.entry(*ed2k).or_insert(*digest);
+                        }
                         let batch = EmberKeywordResultBatch {
                             request_id: kw.request_id,
-                            results: build_ember_keyword_results(
-                                &records,
-                                &kw.keywords,
-                                kw.query_expr.as_ref(),
-                            ),
+                            results: built.results,
                             keywords: kw.keywords.clone(),
                             file_type_filter: kw.file_type_filter.clone(),
                             min_size: kw.min_size,
@@ -34357,19 +34719,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         };
                         if batch.results.is_empty() {
                             continue;
-                        }
-                        // Same digest seeding the completion path does, so a
-                        // streamed row establishes the mapping just as one
-                        // emitted at the end would.
-                        for r in &batch.results {
-                            let digest = parse_ember_file_hash(&r.file.ember_file_hash);
-                            if digest != [0u8; 32] {
-                                if let Ok(bytes) = hex::decode(r.file.hash.trim()) {
-                                    if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                                        state.ember_content_hashes.entry(ed2k).or_insert(digest);
-                                    }
-                                }
-                            }
                         }
                         state.ember_pending_keyword_results.push(batch);
                     }
@@ -37541,34 +37890,25 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 // sweep clears `ember_pending` and `search-complete` fires.
                 //
                 // Deliberately every record, not just the tail the streaming
-                // sweep has yet to send. `build_ember_keyword_results`
+                // sweep has yet to send. `build_ember_keyword_built`
                 // aggregates across the records it is handed: `availability` is
-                // the number of distinct publishers, and a row only carries an
-                // `ember_file_hash` once two publishers agree on one. Handing it
+                // the number of distinct publishers, and a row carries a
+                // plurality digest for display/click while automatic map
+                // seeding still requires two publishers to agree. Handing it
                 // one batch at a time computes both per batch, so a file whose
                 // publishers arrived in different batches is under-counted and
-                // loses its digest — which silently drops the BLAKE3 check the
-                // corroboration rule exists to guarantee.
+                // loses its corroborated digest — which silently drops the
+                // BLAKE3 check the corroboration rule exists to guarantee.
                 //
                 // Re-emitting a streamed row is not a duplicate: `dedup_streamed_batch`
                 // in the emit sweep turns any hash already streamed into an
                 // availability update carrying these corrected values.
-                let results =
-                    build_ember_keyword_results(&records, &kw.keywords, kw.query_expr.as_ref());
-                // The rows only ever carry a corroborated digest now, so this can
-                // seed straight from them. Still `or_insert`, so a search hit fills
-                // a gap and never displaces what the UI, known.met or a local hash
-                // already established.
-                for r in &results {
-                    let digest = parse_ember_file_hash(&r.file.ember_file_hash);
-                    if digest != [0u8; 32] {
-                        if let Ok(bytes) = hex::decode(r.file.hash.trim()) {
-                            if let Ok(ed2k) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                                state.ember_content_hashes.entry(ed2k).or_insert(digest);
-                            }
-                        }
-                    }
+                let built =
+                    build_ember_keyword_built(&records, &kw.keywords, kw.query_expr.as_ref());
+                for (ed2k, digest) in &built.corroborated {
+                    state.ember_content_hashes.entry(*ed2k).or_insert(*digest);
                 }
+                let results = built.results;
                 state
                     .ember_pending_keyword_results
                     .push(EmberKeywordResultBatch {
@@ -37675,9 +38015,9 @@ fn parse_ember_source_records(
     //
     // What is already in the map is *not* necessarily trusted, which an earlier
     // version of this comment claimed: a keyword search pre-seeds the same map
-    // from its own results a little further up, so a gap can be filled by remote
-    // data either way. `insert` on the `StartDownload` path does still let the
-    // user's own choice overwrite whatever was pre-seeded.
+    // from corroborated results a little further up, so a gap can be filled by
+    // remote data either way. `or_insert` on `StartDownload` never overwrites
+    // a pin that is already there.
     if let Some(digest) = corroborated_ember_digest(&publisher_digests) {
         content_hashes.entry(file_hash).or_insert(digest);
     }
@@ -37701,13 +38041,29 @@ fn parse_ember_source_records(
 /// keyword records. Multi-keyword queries already ask peers to intersect
 /// by `file_hash` on the wire; this still applies a filename substring AND
 /// as defense-in-depth (and for peers that only held the primary key).
-/// Rows for a keyword hit. Each row's `ember_file_hash` is either a digest at
-/// least two publishers agree on, or empty — see the note where it is set.
+/// Rows for a keyword hit. Each row's `ember_file_hash` is the plurality
+/// digest (shown so a click can pin a unique file). Automatic seeding of
+/// the enforced map uses only [`EmberKeywordBuilt::corroborated`].
 fn build_ember_keyword_results(
     blobs: &[Vec<u8>],
     keywords: &[String],
     query_expr: Option<&crate::search::query::QueryExpr>,
 ) -> Vec<SearchResult> {
+    build_ember_keyword_built(blobs, keywords, query_expr).results
+}
+
+struct EmberKeywordBuilt {
+    results: Vec<SearchResult>,
+    /// Digests at least two publishers agree on — safe to `or_insert` into
+    /// `ember_content_hashes` without a user click.
+    corroborated: Vec<([u8; 16], [u8; 32])>,
+}
+
+fn build_ember_keyword_built(
+    blobs: &[Vec<u8>],
+    keywords: &[String],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+) -> EmberKeywordBuilt {
     use crate::search::index::infer_file_type;
 
     let kw_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
@@ -37826,25 +38182,22 @@ fn build_ember_keyword_results(
         }
     }
 
-    // The digest on the row has to be corroborated, because this field is not the
-    // display string it looks like — the search page hands `file.ember_file_hash`
-    // straight to `start_download`, which writes it into the map a transfer
-    // *enforces* at completion. A wrong value there is unrecoverable: the content
-    // check fails at the end and reopens every part, on every retry.
-    //
-    // Carrying a plurality-of-one here and corroborating only where the search
-    // path seeded the map was therefore no defence at all: one publisher naming a
-    // popular eD2K hash with a junk BLAKE3 still reached the enforced map the
-    // moment anybody clicked download on that row, and by a plain overwrite that
-    // could displace an already-corroborated digest. Leaving it empty when no two
-    // publishers agree costs nothing — the transfer then verifies against ed2k and
-    // AICH, which is the documented safe fallback.
-    for (_, (result, votes)) in dedup.iter_mut() {
-        result.file.ember_file_hash = corroborated_ember_digest(votes)
+    // The digest on the row is what the search page hands to start_download
+    // on click (user-chosen pin, even a plurality of one). Automatic fills
+    // of ember_content_hashes still require two publishers.
+    let mut corroborated = Vec::new();
+    for (hash, (result, votes)) in dedup.iter_mut() {
+        result.file.ember_file_hash = majority_ember_digest(votes)
             .map(hex::encode)
             .unwrap_or_default();
+        if let Some(digest) = corroborated_ember_digest(votes) {
+            corroborated.push((*hash, digest));
+        }
     }
-    dedup.into_values().map(|(sr, _)| sr).collect()
+    EmberKeywordBuilt {
+        results: dedup.into_values().map(|(sr, _)| sr).collect(),
+        corroborated,
+    }
 }
 
 /// Pick the most common non-zero Ember BLAKE3 among publishers; empty if none.
@@ -38333,6 +38686,174 @@ fn is_ember_publishable(file: &FileInfo) -> bool {
 /// `or_insert`, a single wrong claim failed that file's verification for as long
 /// as the process lived.
 #[cfg(test)]
+mod known_friends_only_snapshot_tests {
+    use super::*;
+    use crate::storage::known_files::KnownFileRecord;
+
+    fn rec(hash: [u8; 16], friends_only: bool, path: &str) -> KnownFileRecord {
+        KnownFileRecord {
+            file_hash: hash,
+            part_hashes: Vec::new(),
+            file_name: "a.bin".into(),
+            file_size: 1,
+            file_path: path.into(),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            modified_at: 0,
+            all_time_transferred: 0,
+            all_time_requested: 0,
+            all_time_accepted: 0,
+            upload_priority: 0,
+            last_publish_src: 0,
+            last_shared: 0,
+            is_shared: true,
+            friends_only,
+            complete_sources: 0,
+            last_ember_source_publish: 0,
+            last_ember_keyword_publish: 0,
+        }
+    }
+
+    #[test]
+    fn known_met_only_friends_only_lands_in_the_upload_snapshot() {
+        let mut known = KnownFileList::new();
+        known.add_or_update(rec([0x11; 16], true, "/restricted.bin"));
+        known.add_or_update(rec([0x22; 16], false, "/public.bin"));
+        let dest: upload_server::SharedFriendsOnlyHashes =
+            Arc::new(std::sync::RwLock::new(Default::default()));
+        sync_shared_friends_only_hashes(&dest, &known);
+        assert!(
+            upload_server::friends_only_snapshot_contains(&dest, &[0x11; 16]),
+            "a known.met friends-only hash must reach the upload listener"
+        );
+        assert!(
+            !upload_server::friends_only_snapshot_contains(&dest, &[0x22; 16]),
+            "public known.met records must not be treated as friends-only"
+        );
+    }
+
+    #[test]
+    fn clearing_friends_only_drops_the_hash_from_the_upload_snapshot() {
+        let mut known = KnownFileList::new();
+        known.add_or_update(rec([0x33; 16], true, "/was-restricted.bin"));
+        let dest: upload_server::SharedFriendsOnlyHashes =
+            Arc::new(std::sync::RwLock::new(Default::default()));
+        sync_shared_friends_only_hashes(&dest, &known);
+        assert!(upload_server::friends_only_snapshot_contains(&dest, &[0x33; 16]));
+
+        known.find_by_hash_mut(&[0x33; 16]).unwrap().friends_only = false;
+        sync_shared_friends_only_hashes(&dest, &known);
+        assert!(
+            !upload_server::friends_only_snapshot_contains(&dest, &[0x33; 16]),
+            "lifting friends-only must unsync the upload restriction"
+        );
+    }
+
+    #[test]
+    fn kad_partial_hex_guard_is_case_insensitive() {
+        let mut known = KnownFileList::new();
+        known.add_or_update(rec([0xAB; 16], true, "/r.bin"));
+        let index = crate::search::index::LocalIndex::new();
+        let restricted = collect_friends_only_hashes(&index, &known);
+        let lower = hex::encode([0xAB; 16]);
+        assert!(hash_hex_is_friends_only(&restricted, &lower));
+        assert!(hash_hex_is_friends_only(
+            &restricted,
+            &lower.to_ascii_uppercase()
+        ));
+        assert!(hash16_is_friends_only(&[0xAB; 16], &index, &known));
+        assert!(!hash16_is_friends_only(&[0xCD; 16], &index, &known));
+        assert!(
+            !kad_may_advertise_partial(&known, &restricted, &lower),
+            "a placeholder catalog must not advertise even a known friends-only hash"
+        );
+        assert!(
+            !kad_may_advertise_partial(&known, &restricted, &hex::encode([0xCD; 16])),
+            "unknown hashes must not be advertised until known.met is absorbed"
+        );
+    }
+
+    fn public_share(hash_hex: &str) -> FileInfo {
+        FileInfo {
+            id: hash_hex.to_string(),
+            name: "a.bin".into(),
+            path: "/a.bin".into(),
+            size: 1,
+            hash: hash_hex.to_string(),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            extension: "bin".into(),
+            modified_at: 0,
+            priority: "normal".into(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: String::new(),
+            shared: true,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        }
+    }
+
+    #[test]
+    fn kad_complete_advertise_skips_placeholder_and_known_met_restricted() {
+        let hash = [0xAB; 16];
+        let hex = hex::encode(hash);
+        let public = public_share(&hex);
+
+        let placeholder = KnownFileList::new();
+        let empty_restricted = HashSet::new();
+        assert!(
+            !kad_may_advertise_complete(&public, &placeholder, &empty_restricted),
+            "complete advertise must wait for known.met the same way partials do"
+        );
+
+        let mut known = KnownFileList::new();
+        known.mark_authoritative_for_tests();
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        assert!(
+            kad_may_advertise_complete(&public, &known, &restricted),
+            "a public complete must advertise once the catalog is absorbed"
+        );
+
+        known.add_or_update(rec(hash, true, "/r.bin"));
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        assert!(
+            !kad_may_advertise_complete(&public, &known, &restricted),
+            "known.met friends-only must win over a rematched public index row"
+        );
+
+        let mut friends_only = public.clone();
+        friends_only.friends_only = true;
+        let mut known_public = KnownFileList::new();
+        known_public.mark_authoritative_for_tests();
+        known_public.add_or_update(rec(hash, false, "/r.bin"));
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known_public);
+        assert!(
+            !kad_may_advertise_complete(&friends_only, &known_public, &restricted),
+            "index friends_only must still keep a file off the open network"
+        );
+    }
+
+    #[test]
+    fn later_transfer_status_seq_wins() {
+        assert!(transfer_status_write_is_stale(Some(2), 1));
+        assert!(!transfer_status_write_is_stale(Some(1), 2));
+        assert!(!transfer_status_write_is_stale(None, 1));
+        assert!(
+            transfer_status_write_is_stale(Some(5), 5),
+            "equal seq is a duplicate, not a newer write"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ember_digest_corroboration_tests {
     use super::*;
 
@@ -38695,7 +39216,10 @@ async fn start_ember_low_to_low_broker(
     source_port: u16,
 ) -> bool {
     let ext = state.nat_info.external_addr.map(|addr| {
-        SocketAddr::new(addr.ip(), state.quic_port.unwrap_or(state.tcp_port))
+        SocketAddr::new(
+            addr.ip(),
+            advertised_quic_port(state).unwrap_or(state.tcp_port),
+        )
     });
     let nat_type = state.nat_info.nat_type;
     let Some(broker) = state.connection_broker.as_mut() else {
@@ -38804,9 +39328,11 @@ async fn maybe_publish_ember_sources(
     state: &mut NetworkState,
     settings: &AppSettings,
     local_index: &Arc<RwLock<LocalIndex>>,
-    tcp_port: u16,
-    udp_port: u16,
+    known_files: &KnownFileList,
 ) {
+    refresh_ember_advertised_buddy(state);
+    let tcp_port = advertised_tcp_port(state);
+    let udp_port = advertised_udp_port(state);
     // Refresh firewall-awareness gauges every tick (slice 15), even when
     // we skip publishing (empty table / no IP yet).
     let firewalled_like = ember_tcp_firewalled(state);
@@ -38875,10 +39401,13 @@ async fn maybe_publish_ember_sources(
     let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
+        let restricted = collect_friends_only_hashes(&idx, known_files);
         let mut ranked: Vec<(u64, usize)> = Vec::new();
         let mut publishable = 0usize;
         for (i, f) in files.iter().enumerate() {
-            if !is_ember_publishable(f) {
+            if !is_ember_publishable(f)
+                || !kad_may_advertise_partial(known_files, &restricted, &f.hash)
+            {
                 continue;
             }
             let Some(hash) = hex::decode(&f.hash)
@@ -39026,6 +39555,13 @@ async fn maybe_publish_ember_sources(
             continue;
         }
 
+        if firewalled_like {
+            // Spec: overlay STORE waits for PROXY_STORE_ACK. A FIREWALLED
+            // record with no named buddy is unfetchable (HighID searchers
+            // park and never CALLBACK_REQ) but still lights the Library badge.
+            continue;
+        }
+
         state.ember_dht.store_own_record(&record);
         if enqueue_ember_source_overlay(state, &record, reference) {
             track_ember_record_pending(state.publish_schedule(), reference);
@@ -39147,6 +39683,7 @@ async fn maybe_publish_ember_keywords(
     state: &mut NetworkState,
     settings: &AppSettings,
     local_index: &Arc<RwLock<LocalIndex>>,
+    known_files: &KnownFileList,
 ) {
     if !settings.ember_native_enabled || ember_publishable_peer_count(state) == 0 {
         return;
@@ -39159,9 +39696,12 @@ async fn maybe_publish_ember_keywords(
     let due: Vec<([u8; 16], u64, String, [u8; 32])> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
+        let restricted = collect_friends_only_hashes(&idx, known_files);
         let mut ranked: Vec<(u64, usize)> = Vec::new();
         for (i, f) in files.iter().enumerate() {
-            if !is_ember_publishable(f) {
+            if !is_ember_publishable(f)
+                || !kad_may_advertise_partial(known_files, &restricted, &f.hash)
+            {
                 continue;
             }
             let Some(hash) = hex::decode(&f.hash)
@@ -39684,7 +40224,16 @@ async fn run_ember_maintenance(
     for (data, signature) in republish_batch {
         let record = match ember::dht::publish::SignedRecord::from_wire(&data, signature) {
             Some(r) => r,
-            None => continue, // already verified when stored; skip if somehow malformed
+            None => {
+                // take_republish_batch already stamped last_republished.
+                if data.len() >= 17 {
+                    let mut key = [0u8; 16];
+                    key.copy_from_slice(&data[1..17]);
+                    state.ember_dht.mark_republish_due(&key, &signature);
+                    result.republish_rearmed += 1;
+                }
+                continue;
+            }
         };
         let targets = ember_overlay_publish_targets(state, record.keyword_hash);
         // Replication carries someone else's record, so there is no local
@@ -39753,10 +40302,11 @@ async fn run_ember_maintenance(
         state.ember_verified_highwater_dirty = true;
     }
     if state.ember_verified_highwater_dirty {
-        save_ember_verified_highwater(
-            &ember_highwater_path(&state.data_dir),
-            &state.ember_verified_highwater,
-        );
+        let path = ember_highwater_path(&state.data_dir);
+        let hw = state.ember_verified_highwater.clone();
+        tokio::task::spawn_blocking(move || {
+            save_ember_verified_highwater(&path, &hw);
+        });
         state.ember_verified_highwater_dirty = false;
     }
 
@@ -39874,6 +40424,7 @@ async fn handle_ember_dht_message(
     } else {
         Vec::new()
     };
+    refresh_ember_advertised_buddy(state);
     let inbound = state.ember_dht.handle_incoming(
         payload,
         from,
@@ -40092,39 +40643,70 @@ async fn handle_ember_dht_message(
     }
 
     // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
-    // source record out via the normal publish driver. ACK only after
-    // start_publish_to succeeds so the publisher is not told "ok" when the
-    // local publish queue is full.
+    // source record out via the normal publish driver. Charge budget and
+    // remember the publisher only after start_publish_to succeeds so a full
+    // publish table does not spend quota on a silent drop.
     if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
-        let key = forward.keyword_hash;
-        let targets = ember_overlay_publish_targets(state, key);
-        if let Some(publish_id) = state.ember_publish.start_publish_to(forward, targets) {
-            state.ember_diagnostics.ember_dht_buddy_forwards = state
-                .ember_diagnostics
-                .ember_dht_buddy_forwards
-                .saturating_add(1);
-            drive_ember_publish(socket, state, publish_id).await;
-            let ack_bytes = state.ember_dht.build_proxy_store_ack_frame(proxy_rid, key);
-            match state
-                .ember_transport
-                .prepare_outgoing(from, Some(&remote_noise_pub), &ack_bytes)
-            {
-                ember::transport::OutgoingResult::Ready { packet }
-                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    if let Err(e) =
-                        send_ember_udp(socket, &packet, from, &state.ember_dht_overhead).await
-                    {
-                        debug!("Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}");
+        if let Some(publisher) = inbound.sender_id {
+            let now_inst = std::time::Instant::now();
+            if state.ember_dht.can_accept_proxy_forward(publisher, now_inst) {
+                let key = forward.keyword_hash;
+                let targets = ember_overlay_publish_targets(state, key);
+                let replica = forward.clone();
+                if let Some(publish_id) =
+                    state.ember_publish.start_publish_to(forward, targets)
+                {
+                    if state.ember_dht.commit_proxy_store(
+                        publisher,
+                        from,
+                        remote_noise_pub,
+                        &replica,
+                        now_inst,
+                    ) {
+                        state.ember_diagnostics.ember_dht_buddy_forwards = state
+                            .ember_diagnostics
+                            .ember_dht_buddy_forwards
+                            .saturating_add(1);
+                        drive_ember_publish(socket, state, publish_id).await;
+                        let ack_bytes =
+                            state.ember_dht.build_proxy_store_ack_frame(proxy_rid, key);
+                        match state.ember_transport.prepare_outgoing(
+                            from,
+                            Some(&remote_noise_pub),
+                            &ack_bytes,
+                        ) {
+                            ember::transport::OutgoingResult::Ready { packet }
+                            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                                if let Err(e) = send_ember_udp(
+                                    socket,
+                                    &packet,
+                                    from,
+                                    &state.ember_dht_overhead,
+                                )
+                                .await
+                                {
+                                    debug!(
+                                        "Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}"
+                                    );
+                                }
+                            }
+                            ember::transport::OutgoingResult::Queued => {
+                                debug!(
+                                    "Ember DHT: PROXY_STORE_ACK to {from} queued behind handshake"
+                                );
+                            }
+                            ember::transport::OutgoingResult::Error(e) => {
+                                debug!(
+                                    "Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}"
+                                );
+                            }
+                        }
+                    } else {
+                        // Slot was granted; replica/budget refused. Free it so
+                        // a failed store cannot occupy the publish table until
+                        // PUBLISH_TIMEOUT_SECS.
+                        let _ = state.ember_publish.remove(publish_id);
                     }
-                }
-                ember::transport::OutgoingResult::Queued => {
-                    // ACK is buffered behind an in-progress Noise handshake
-                    // and will flush when the session completes — same path
-                    // as other DHT replies. Do not treat as failure.
-                    debug!("Ember DHT: PROXY_STORE_ACK to {from} queued behind handshake");
-                }
-                ember::transport::OutgoingResult::Error(e) => {
-                    debug!("Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}");
                 }
             }
         }
@@ -40549,6 +41131,7 @@ async fn handle_udp_packet(
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
+    known_files: &KnownFileList,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
         socket,
@@ -40564,6 +41147,7 @@ async fn handle_udp_packet(
         credit_manager,
         transfer_manager,
         source_manager,
+        known_files,
     ))
     .catch_unwind()
     .await
@@ -40590,6 +41174,7 @@ async fn handle_udp_packet_inner(
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
+    known_files: &KnownFileList,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -40712,25 +41297,39 @@ async fn handle_udp_packet_inner(
                 let file_hash = reask.file_hash;
                 let hash_hex = hex::encode(file_hash);
 
+                let restricted = {
+                    let idx = local_index.read().await;
+                    idx.get_by_hash(&hash_hex).is_some_and(|f| f.friends_only)
+                        || known_files
+                            .find_by_hash(&file_hash)
+                            .is_some_and(|r| r.friends_only)
+                };
                 let local_file = {
                     let idx = local_index.read().await;
                     // UDP carries no authenticated peer identity, so this can
                     // only ever answer for public files. Index presence alone
                     // used to be enough, which confirmed possession of both
                     // unshared and friends-only files to any prober.
-                    idx.get_by_hash(&hash_hex)
-                        .filter(|file| file.is_public_listable())
-                        .map(|file| {
-                            (
-                                file.size,
-                                vec![
-                                    true;
-                                    ed2k::messages::ed2k_wire_part_count(file.size) as usize
-                                ],
-                            )
-                        })
+                    if restricted {
+                        None
+                    } else {
+                        idx.get_by_hash(&hash_hex)
+                            .filter(|file| file.is_public_listable())
+                            .map(|file| {
+                                (
+                                    file.size,
+                                    vec![
+                                        true;
+                                        ed2k::messages::ed2k_wire_part_count(file.size) as usize
+                                    ],
+                                )
+                            })
+                    }
                 };
-                let partial_candidate = if local_file.is_none() {
+                let partial_candidate = if local_file.is_none()
+                    && !restricted
+                    && known_files.is_authoritative()
+                {
                     let mgr = transfer_manager.read().await;
                     mgr.active.values().chain(mgr.queue.iter()).find_map(|t| {
                         if t.direction != TransferDirection::Download
@@ -43537,6 +44136,7 @@ async fn handle_download_event(
     // `source_retry_timer` doesn't keep checking keys that no longer
     // refer to live rows.
     callback_row_pending_since: &mut HashMap<(String, String, u16), i64>,
+    status_writes: &Arc<TransferStatusWriteClock>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -43614,9 +44214,12 @@ async fn handle_download_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_status(&transfer_id, crate::types::TransferStatus::Verifying);
             }
-            if let Err(e) = db.update_transfer_status(&transfer_id, "verifying") {
-                warn!("DB update_transfer_status('verifying') failed for {transfer_id}: {e}");
-            }
+            spawn_transfer_status_write(
+                status_writes,
+                db.clone(),
+                transfer_id.clone(),
+                "verifying",
+            );
             let _ = app_handle.emit(
                 "transfer-status",
                 serde_json::json!({
@@ -43897,6 +44500,8 @@ async fn handle_download_event(
             };
             let db_for_completion = db.clone();
             let completion_transfer_id = transfer_id.clone();
+            let completed_seq = status_writes.next_seq();
+            let completed_clock = Arc::clone(status_writes);
             tokio::task::spawn_blocking(move || {
                 if let Some(total_size) = final_total {
                     if let Err(e) = db_for_completion.update_transfer_progress(
@@ -43910,13 +44515,13 @@ async fn handle_download_event(
                         );
                     }
                 }
-                if let Err(e) =
-                    db_for_completion.update_transfer_status(&completion_transfer_id, "completed")
-                {
-                    warn!(
-                        "DB update_transfer_status('completed') failed for {completion_transfer_id}: {e}"
-                    );
-                }
+                apply_transfer_status_write(
+                    &completed_clock,
+                    &db_for_completion,
+                    &completion_transfer_id,
+                    "completed",
+                    completed_seq,
+                );
                 if let Some((file_hash, file_name, total_size)) = history_row {
                     if let Err(e) = db_for_completion.record_download_history(
                         &file_hash,
@@ -43947,7 +44552,7 @@ async fn handle_download_event(
             let temp_dir = PathBuf::from(download_folder).join("Temp");
             let part_path = temp_dir.join(format!("{transfer_id}.part"));
             let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
-            if part_path.exists() {
+            if tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
                 if let Err(e) = tokio::fs::remove_file(&part_path).await {
                     warn!(
                         "Failed to clean up leftover .part after completion: {} — {e}",
@@ -43957,7 +44562,7 @@ async fn handle_download_event(
                     info!("Cleaned up leftover .part file for completed download {transfer_id}");
                 }
             }
-            if met_path.exists() {
+            if tokio::fs::try_exists(&met_path).await.unwrap_or(false) {
                 let _ = tokio::fs::remove_file(&met_path).await;
             }
 
@@ -44012,11 +44617,15 @@ async fn handle_download_event(
                     .map(|t| (t.transferred, t.progress, t.speed))
             };
             if let Some((transferred, progress, speed)) = final_progress {
-                if let Err(e) =
-                    db.update_transfer_progress(&transfer_id, transferred, progress, speed)
-                {
-                    warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
-                }
+                let db = db.clone();
+                let transfer_id = transfer_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) =
+                        db.update_transfer_progress(&transfer_id, transferred, progress, speed)
+                    {
+                        warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
+                    }
+                });
             }
             db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
@@ -44038,9 +44647,12 @@ async fn handle_download_event(
             } else {
                 warn!("Failed event for transfer {transfer_id} not found in active set");
             }
-            if let Err(e) = db.update_transfer_status(&transfer_id, "failed") {
-                warn!("DB update_transfer_status('failed') failed for {transfer_id}: {e}");
-            }
+            spawn_transfer_status_write(
+                status_writes,
+                db.clone(),
+                transfer_id.clone(),
+                "failed",
+            );
             let _ = app_handle.emit(
                 "transfer-failed",
                 serde_json::json!({
