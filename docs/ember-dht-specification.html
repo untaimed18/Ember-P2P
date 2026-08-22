@@ -738,7 +738,7 @@ footer.doc-end {
     <tr><td>Find Ember nodes and keep a verified routing table</td><td>Move file bytes (that is still eD2K c2c)</td></tr>
     <tr><td>Publish and look up keyword and source records</td><td>Replace KAD or eD2K; it runs beside them</td></tr>
     <tr><td>Carry BLAKE3 integrity digests on records</td><td>Host a bootstrap roster or seed list</td></tr>
-    <tr><td>Let firewalled nodes publish via buddy <code>PROXY_STORE</code></td><td>Let a searcher callback a firewalled source (consume side is unfinished)</td></tr>
+    <tr><td>Let firewalled nodes publish via buddy <code>PROXY_STORE</code>, consume via <code>CALLBACK_REQ</code>, and start the Ember broker for LowID↔LowID</td><td>Guarantee a working relay (that still needs admitted ERAT candidates)</td></tr>
     <tr><td>Refuse incompatible wire versions at the version byte</td><td>Negotiate an upgrade or tell the user why a peer was dropped</td></tr>
   </tbody>
 </table>
@@ -1069,6 +1069,8 @@ footer.doc-end {
     <tr><td>0x0C</td><td>PROXY_STORE_ACK</td><td>←</td><td>key (16) — buddy accepted, not a DHT STORE_ACK</td></tr>
     <tr><td>0x0D</td><td>STORE_BATCH</td><td>→</td><td>up to 64 records for one destination</td></tr>
     <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
+    <tr><td>0x0F</td><td>CALLBACK_REQ</td><td>→</td><td>publisher id (16) + file hash (16) + searcher TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Searcher → HighID buddy. The searcher's IP is the UDP source, not in the payload.</td></tr>
+    <tr><td>0x10</td><td>CALLBACK</td><td>→</td><td>file hash (16) + searcher IPv4 (4) + TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Buddy → firewalled publisher: connect-and-serve this searcher.</td></tr>
   </tbody>
 </table>
 
@@ -1248,13 +1250,21 @@ footer.doc-end {
     <tr><td>udp_port</td><td>2 LE</td><td>Ember / KAD UDP</td></tr>
     <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable</td></tr>
     <tr><td>noise_pub</td><td>32</td><td>Stashed for future native (Noise) dialing</td></tr>
+    <tr><td>user_hash</td><td>16</td><td>Optional trailer: publisher's eD2K user hash, present with the buddy block</td></tr>
+    <tr><td>buddy_ip</td><td>4</td><td>Optional trailer: HighID buddy the searcher should <code>CALLBACK_REQ</code></td></tr>
+    <tr><td>buddy_udp</td><td>2 LE</td><td>Optional trailer</td></tr>
+    <tr><td>buddy_noise_pub</td><td>32</td><td>Optional trailer: buddy's Noise static key</td></tr>
+    <tr><td>callback_token</td><td>16</td><td>Optional trailer: publisher-derived token copied into <code>CALLBACK_REQ</code> / <code>CALLBACK</code></td></tr>
   </tbody>
 </table>
 <p>
-  A downloader uses <code>ip + tcp_port</code> over the existing eD2K path.
-  <code>SourceContact</code> carries no buddy address or buddy hash, so a
-  firewalled source is discoverable but not Ember-dialable; those peers work
-  today because they are usually also on eD2K/KAD.
+  A downloader uses <code>ip + tcp_port</code> over the existing eD2K path
+  when the source is not firewalled. Firewalled records append a 70-byte
+  callback trailer (user hash + buddy address + buddy Noise key + token) after the
+  41-byte contact. HighID records stay 41 bytes. v2 parsers that ignore extra
+  bytes still accept the contact
+  block; this build reads the trailer when it is present. That is an additive
+  record-body change, not a DHT-frame version bump.
 </p>
 
 <h3>7.3 Ember file hash</h3>
@@ -1558,24 +1568,49 @@ footer.doc-end {
   genuine address change could not displace it.
 </p>
 
-<h3>11.2 Firewalled publishing</h3>
+<h3>11.2 Firewalled publishing and consume</h3>
 <p>
   A LowID / firewalled node sets <code>SOURCE_FLAG_FIREWALLED</code> on its
-  source record and asks HighID contacts to <code>PROXY_STORE</code>. Storers
+  source record, names one HighID <code>PROXY_STORE</code> target in the
+  callback trailer, and asks <em>that</em> contact (only) to fan the record out.
+  Overlay <code>STORE_BATCH</code> of that firewalled record waits for the
+  buddy's matching <code>PROXY_STORE_ACK</code>, so <code>FIND_VALUE</code>
+  cannot advertise a buddy that has not yet accepted the record. Storers
   attribute the record to the forwarder for the per-IP source cap, because the
   declared address is unverified and an attacker could otherwise invent a new
   address per record — each getting a fresh quota.
 </p>
 <p>
-  The consume side has nothing equivalent to KAD’s <code>TAG_BUDDYHASH</code>
-  plus <code>KADEMLIA_CALLBACK_REQ</code>. Firewalled Ember sources are
-  discoverable but not Ember-dialable. They work today because they are
-  usually also on eD2K/KAD. A buddy field in the source record and a callback
-  message are planned as part of the next wire version bump.
+  Consume is the KAD callback analogue. A reachable searcher that finds a
+  firewalled record with a buddy trailer sends <code>CALLBACK_REQ</code> to
+  that buddy over the Ember Noise session, carrying the token from the signed
+  trailer. The buddy forwards
+  <code>CALLBACK</code> only if it recently accepted <code>PROXY_STORE</code>
+  from the named publisher, copying the token through. The publisher accepts <code>CALLBACK</code> only
+  from a buddy that answered <code>PROXY_STORE_ACK</code> with the request id
+  it was sent <em>for that file</em>, and only when the token matches the one
+  it published, then connects eD2K TCP back to the
+  searcher's <em>observed</em> address (the UDP source of
+  <code>CALLBACK_REQ</code>, copied by the buddy — never a claimed IP in the
+  request). Firewalled Ember DHT contacts are not registered in SourceManager
+  (pending promotion would otherwise TCP-dial the claimed NAT IP).
+  <code>WaitCallbackKad</code> rows are kept out of TCP reask and pause/resume
+  seeding; only <code>CALLBACK_REQ</code> retries them. Consume uses the same TCP-firewalled predicate as publish
+  (LowID or KAD/server <code>Firewalled</code>), not the UPnP-pessimistic
+  startup flag. A named buddy that is banned, filtered, or special-use parks
+  the source — including Searching-only pending downloads — rather than dropping it.
+  When the searcher is also TCP-firewalled, ingest does not send
+  <code>CALLBACK_REQ</code>; firewalled Ember records set
+  <code>SOURCE_FLAG_RELAY_CAPABLE</code>, and that path starts the same Ember
+  punch/relay broker KAD uses for Ember-capable LowID sources rather than
+  leaving both sides parked. The broker still needs admitted ERAT candidates.
 </p>
 <p>
   LowID publishing through buddy <code>PROXY_STORE</code> is implemented but
-  not yet exercised end to end on a live network.
+  not yet exercised end to end on a live network. Consume is implemented on
+  the same path: the buddy table is populated when a <code>PROXY_STORE_ACK</code>
+  matches a request we sent, so a network that is already forwarding publishes can bounce
+  callbacks without a second handshake.
 </p>
 
 <!-- ══════════════════════════════════════════════ 12 ══════════════════════════════════════════════ -->
@@ -1628,7 +1663,7 @@ footer.doc-end {
   <thead><tr><th>Budget</th><th>Window</th><th>Named cap</th><th>Keyed on</th></tr></thead>
   <tbody>
     <tr><td>All DHT frames</td><td>1 s</td><td>40</td><td>IP</td></tr>
-    <tr><td>FIND_NODE / FIND_VALUE</td><td>10 s</td><td>60</td><td>IP (shared behind NAT)</td></tr>
+    <tr><td>FIND_NODE / FIND_VALUE / CALLBACK_REQ</td><td>10 s</td><td>60</td><td>IP (shared behind NAT)</td></tr>
     <tr><td>STORE records</td><td>60 s</td><td>NetworkScale</td><td>Verified node ID when known</td></tr>
   </tbody>
 </table>
@@ -1764,6 +1799,7 @@ footer.doc-end {
       <li>Noise transport</li>
       <li>Adaptive abuse limits</li>
       <li>Rich diagnostics (truncation, reject causes, search quality, high-water)</li>
+      <li>Buddy trailer + <code>CALLBACK_REQ</code> for firewalled consume</li>
     </ul>
   </div>
   <div class="col kad">
@@ -1786,8 +1822,10 @@ footer.doc-end {
 <p>
   Roughly half the round trips per lookup come from α = 5 against KAD’s 1 for
   <code>FindNode</code>. Replica count is double. The diagnostic surface is
-  already richer. The largest genuine functional gap is firewalled consume
-  (§11.2). The largest product gap is that bytes still move over eD2K.
+  already richer. Firewalled consume (§11.2) now has an Ember callback path
+  matching KAD's buddy relay, and Ember DHT ingest starts the same LowID↔LowID
+  broker KAD uses for Ember-capable sources. The largest
+  product gap is that bytes still move over eD2K.
 </p>
 
 <!-- ══════════════════════════════════════════════ 16 ══════════════════════════════════════════════ -->
@@ -1802,15 +1840,13 @@ footer.doc-end {
   <li><strong>Serving ceiling ~5 records per reply</strong> — mitigated by window rotation; pagination waits on a version bump.</li>
   <li><strong>45 records per publisher per keyword, network-wide.</strong></li>
   <li><strong>No reputation scoring on gossip</strong> — Sybil pressure is rate-limited, not scored.</li>
-  <li><strong>Firewalled sources are not Ember-dialable.</strong></li>
-  <li><strong>Not yet exercised end to end:</strong> LowID PROXY_STORE, cold join from an empty contact file with no KAD, republish across a full record TTL on a large library.</li>
+  <li><strong>Not yet exercised end to end:</strong> LowID PROXY_STORE / callback, cold join from an empty contact file with no KAD, republish across a full record TTL on a large library.</li>
 </ul>
 
 <h3>16.2 Planned wire changes (one version bump)</h3>
 <p>These wait on <code>EMBER_DHT_VERSION</code> 3 so they can land together:</p>
 <ol>
   <li><strong><code>start_position</code> on FIND_VALUE / FOUND_VALUE</strong> — real pagination. Justified if truncation counters show withheld records on the live network after rotation.</li>
-  <li><strong>Buddy field + callback message</strong> — firewalled consume, the largest functional gap against KAD.</li>
   <li><strong>Drop <code>node_id</code> from wire contacts</strong> — 87 → 71 bytes, 14 → 17 contacts per FOUND_NODE. The ID is BLAKE3 of the key and is re-derived anyway.</li>
 </ol>
 <p>
@@ -1959,8 +1995,9 @@ footer.doc-end {
   </p>
   <p>
     This document describes behaviour as implemented. It is not a promise that
-    the wire will remain unchanged: version 3 is reserved for pagination,
-    firewalled consume, and contact-list compaction. Implementers targeting
+    the wire will remain unchanged: version 3 is reserved for pagination
+    and contact-list compaction. Firewalled consume landed in version 2 as
+    an additive source-record trailer and two new message types. Implementers targeting
     interoperability should treat <code>EMBER_DHT_MIN_VERSION..=EMBER_DHT_VERSION</code>
     as the only supported range.
   </p>

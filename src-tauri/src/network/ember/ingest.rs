@@ -83,7 +83,8 @@ impl SourceAdmission<'_> {
         flags: u8,
     ) -> Result<(), SourceRejection> {
         // Two firewalled peers cannot reach each other. The relay-capable bit
-        // keeps the source eligible for the KAD-callback broker path instead
+        // keeps the source eligible for the Ember LowID↔LowID broker (the same
+        // `attempt_low_to_low` path KAD uses for Ember-capable sources) instead
         // of dropping it outright; the bit is advisory, so it buys the source
         // a chance at a relay, never a relay itself.
         if flags & SOURCE_FLAG_FIREWALLED != 0
@@ -187,8 +188,9 @@ mod tests {
         );
     }
 
-    /// The relay-capable bit keeps a firewalled source alive for the broker
-    /// rather than admitting a relay, which only a verified ERAT can do.
+    /// The relay-capable bit keeps a firewalled source alive for the Ember
+    /// LowID↔LowID broker rather than admitting a relay, which only a verified
+    /// ERAT can do.
     #[test]
     fn a_relay_capable_firewalled_peer_survives_for_the_broker() {
         let mut f = Fixture::new();

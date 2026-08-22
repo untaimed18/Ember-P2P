@@ -382,6 +382,12 @@ export interface EmberDiagnostics {
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
   ember_dht_buddy_forwards: number;
+  /** Ember CALLBACK_REQ frames sent (searcher → buddy). */
+  ember_dht_callback_sent?: number;
+  /** CALLBACK_REQs bounced to a firewalled publisher. */
+  ember_dht_callback_forwards?: number;
+  /** CALLBACKs honoured by connecting back to the searcher. */
+  ember_dht_callback_connects?: number;
   /** Outbound FIND_VALUE frames sent this session. */
   ember_dht_find_values_sent: number;
   /** Completed FIND_VALUE searches that gathered ≥1 record. */

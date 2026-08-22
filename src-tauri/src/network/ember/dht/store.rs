@@ -2123,6 +2123,7 @@ mod tests {
             udp_port: 4672,
             flags: 0,
             noise_pub: [7u8; 32],
+            ..Default::default()
         };
         let file = [0xD1u8; 16];
         let key = source_key(&file);
@@ -2291,6 +2292,7 @@ mod tests {
                     udp_port: 4672,
                     flags: 0,
                     noise_pub: [i; 32],
+                    ..Default::default()
                 },
                 &sk,
             );
@@ -2322,7 +2324,8 @@ mod tests {
                 tcp_port: 4662,
                 udp_port: 4672,
                 flags: 0,
-                noise_pub: [9u8; 32],
+                noise_pub: [200u8; 32],
+                ..Default::default()
             },
             &sk,
         );
@@ -2845,6 +2848,7 @@ mod tests {
                 udp_port: 4672,
                 flags: 0,
                 noise_pub: [1u8; 32],
+                ..Default::default()
             },
             &sk,
         );

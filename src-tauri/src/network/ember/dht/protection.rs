@@ -11,7 +11,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use super::messages::{
-    MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD,
+    MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE, MSG_STORE_BATCH,
+    MSG_STORE_RECORD,
 };
 
 /// Sliding window for per-IP message counts.
@@ -24,7 +25,7 @@ const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// file reads the same way.
 const MAX_MSGS_PER_WINDOW: u32 = 40;
 
-/// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE`).
+/// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE` / `CALLBACK_REQ`).
 const LOOKUP_WINDOW: Duration = Duration::from_secs(10);
 /// Lookup queries accepted from one address per [`LOOKUP_WINDOW`].
 ///
@@ -244,7 +245,10 @@ impl DhtProtection {
             }
         }
 
-        if matches!(msg_type, MSG_FIND_NODE | MSG_FIND_VALUE) {
+        if matches!(
+            msg_type,
+            MSG_FIND_NODE | MSG_FIND_VALUE | MSG_CALLBACK_REQ
+        ) {
             let budget_key = match sender_id {
                 Some(id) => StoreBudgetKey::Node(id),
                 None => StoreBudgetKey::Addr(ip),

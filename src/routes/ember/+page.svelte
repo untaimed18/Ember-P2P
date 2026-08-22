@@ -349,6 +349,7 @@
     { id: 'serve-hits', k: m.ember_stat_serve_hit_miss(), v: `${diag?.ember_dht_find_value_hits ?? 0}/${diag?.ember_dht_find_value_misses ?? 0}` },
     { id: 'serve-truncated', k: m.ember_stat_serve_truncated(), v: `${diag?.ember_dht_found_value_truncated ?? 0}/${diag?.ember_dht_found_value_withheld ?? 0}` },
     { id: 'buddy', k: m.ember_stat_buddy_pub_fwd(), v: `${diag?.ember_dht_buddy_publishes ?? 0}/${diag?.ember_dht_buddy_forwards ?? 0}` },
+    { id: 'callback', k: m.ember_stat_callback_sent_fwd_conn(), v: `${diag?.ember_dht_callback_sent ?? 0}/${diag?.ember_dht_callback_forwards ?? 0}/${diag?.ember_dht_callback_connects ?? 0}` },
     { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
     { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: String(diag?.ember_dht_version_mismatch ?? 0) },
     { id: 'rendezvous', k: m.ember_stat_rendezvous(), v: `${diag?.ember_dht_rendezvous_last_peers ?? 0} / ${diag?.ember_dht_rendezvous_lookups ?? 0} / ${diag?.ember_dht_rendezvous_empty ?? 0}` },

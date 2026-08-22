@@ -103,6 +103,24 @@ pub enum DownloadSourceState {
     Banned,
 }
 
+/// States whose declared IP:port must not be handed to an outbound TCP dialer.
+///
+/// `WaitCallbackKad` waits for the firewalled peer to connect back (KAD
+/// `CallbackReq` or Ember `CALLBACK_REQ`). The address on the row is often
+/// an unverified NAT IP — especially Ember DHT firewalled records, which
+/// skip the storer's anti-reflection bind. `LowToLowIp` / `EmberRelay` /
+/// `FriendConnect` / `Banned` are the other never-dial parks.
+fn source_state_blocks_outbound_tcp(state: &DownloadSourceState) -> bool {
+    matches!(
+        state,
+        DownloadSourceState::WaitCallbackKad
+            | DownloadSourceState::LowToLowIp
+            | DownloadSourceState::EmberRelay
+            | DownloadSourceState::FriendConnect
+            | DownloadSourceState::Banned
+    )
+}
+
 /// A single download source tracked across connection attempts.
 #[derive(Debug, Clone)]
 pub struct DownloadSourceEntry {
@@ -128,6 +146,15 @@ pub struct DownloadSourceEntry {
     pub callback_buddy_port: Option<u16>,
     /// KAD callback verification token (`TAG_BUDDYHASH` = NOT LowID peer KAD id).
     pub callback_buddy_hash: Option<[u8; 16]>,
+    /// Ember Noise pubkey of the HighID buddy named in a firewalled source
+    /// record. When set, the consume path sends Ember `CALLBACK_REQ` instead
+    /// of KAD `CallbackReq`.
+    pub callback_ember_buddy_noise: Option<[u8; 32]>,
+    /// Ember node ID of the firewalled publisher (`CALLBACK_REQ` target).
+    pub callback_ember_publisher: Option<[u8; 16]>,
+    /// Token from the signed Ember source trailer; reask copies it into
+    /// `CALLBACK_REQ`.
+    pub callback_ember_token: Option<[u8; 16]>,
     /// Publisher's ED2K user hash from the KAD source record.
     pub source_user_hash: Option<[u8; 16]>,
     /// Latest part availability bitmap learned from TCP file status or UDP
@@ -150,6 +177,9 @@ impl DownloadSourceEntry {
             callback_buddy_ip: None,
             callback_buddy_port: None,
             callback_buddy_hash: None,
+            callback_ember_buddy_noise: None,
+            callback_ember_publisher: None,
+            callback_ember_token: None,
             source_user_hash: None,
             available_parts: Vec::new(),
         }
@@ -170,6 +200,19 @@ impl DownloadSourceEntry {
     pub fn kad_callback_reask_due(&self) -> bool {
         matches!(self.state, DownloadSourceState::WaitCallbackKad)
             && self.callback_buddy_ip.is_some()
+            && self.callback_buddy_hash.is_some()
+            && self.callback_ember_buddy_noise.is_none()
+            && self.last_asked.elapsed().as_secs() >= KAD_CALLBACK_REASK_SECS as u64
+    }
+
+    /// Ember `CALLBACK_REQ` reask: same cadence as KAD, but requires the
+    /// buddy Noise key and publisher node ID from the signed source record.
+    pub fn ember_callback_reask_due(&self) -> bool {
+        matches!(self.state, DownloadSourceState::WaitCallbackKad)
+            && self.callback_buddy_ip.is_some()
+            && self.callback_ember_buddy_noise.is_some()
+            && self.callback_ember_publisher.is_some()
+            && self.callback_ember_token.is_some()
             && self.last_asked.elapsed().as_secs() >= KAD_CALLBACK_REASK_SECS as u64
     }
 
@@ -194,7 +237,6 @@ impl DownloadSourceEntry {
             | DownloadSourceState::TooManyConns
             | DownloadSourceState::Unreachable => FILEREASKTIME_SECS as u64,
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
-            DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
             DownloadSourceState::Connecting | DownloadSourceState::Downloading => {
                 // Watchdog: if a source has been `Connecting` /
                 // `Downloading` far longer than any legitimate handshake
@@ -210,7 +252,8 @@ impl DownloadSourceEntry {
                 }
                 return u64::MAX;
             }
-            DownloadSourceState::LowToLowIp
+            DownloadSourceState::WaitCallbackKad
+            | DownloadSourceState::LowToLowIp
             | DownloadSourceState::EmberRelay
             // Dialing is exactly what failed, so don't re-dial while the
             // friend's connect-back is outstanding. The network loop clears
@@ -496,10 +539,17 @@ impl PerFileSourceList {
     }
 
     /// Snapshot of dialable HighID sources for seeding a new worker (pause→resume).
+    ///
+    /// Callback / LowID / relay / friend-connect / banned rows stay out:
+    /// their declared address is not a HighID we can TCP-dial.
     pub fn dialable_sources(&self) -> Vec<(Ipv4Addr, u16, u16)> {
         self.sources
             .iter()
-            .filter(|s| !s.ip.is_unspecified() && s.tcp_port != 0)
+            .filter(|s| {
+                !s.ip.is_unspecified()
+                    && s.tcp_port != 0
+                    && !source_state_blocks_outbound_tcp(&s.state)
+            })
             .map(|s| (s.ip, s.tcp_port, s.udp_port))
             .collect()
     }
@@ -523,6 +573,40 @@ impl PerFileSourceList {
             s.callback_buddy_ip = Some(buddy_ip);
             s.callback_buddy_port = Some(buddy_port);
             s.callback_buddy_hash = Some(buddy_hash);
+            if source_user_hash.is_some() {
+                s.source_user_hash = source_user_hash;
+            }
+            s.state = DownloadSourceState::WaitCallbackKad;
+            s.state_changed = Instant::now();
+            if is_new {
+                s.arm_callback_reask();
+            }
+        }
+    }
+
+    /// Record Ember callback buddy metadata from a signed firewalled source
+    /// record and transition to `WaitCallbackKad` (same parked-until-connect-back
+    /// state the KAD path uses).
+    pub fn set_ember_callback_buddy(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        buddy_ip: Ipv4Addr,
+        buddy_port: u16,
+        buddy_noise: [u8; 32],
+        publisher_id: [u8; 16],
+        source_user_hash: Option<[u8; 16]>,
+        callback_token: Option<[u8; 16]>,
+        is_new: bool,
+    ) {
+        let target_idx = self.resolve_idx(ip, port, source_user_hash);
+        if let Some(idx) = target_idx {
+            let s = &mut self.sources[idx];
+            s.callback_buddy_ip = Some(buddy_ip);
+            s.callback_buddy_port = Some(buddy_port);
+            s.callback_ember_buddy_noise = Some(buddy_noise);
+            s.callback_ember_publisher = Some(publisher_id);
+            s.callback_ember_token = callback_token.filter(|t| *t != [0u8; 16]);
             if source_user_hash.is_some() {
                 s.source_user_hash = source_user_hash;
             }
@@ -688,13 +772,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 s.time_until_reask_at(now) == 0
                     && s.can_try_tcp_at(now)
-                    && !matches!(
-                        s.state,
-                        DownloadSourceState::Banned
-                            | DownloadSourceState::LowToLowIp
-                            | DownloadSourceState::EmberRelay
-                            | DownloadSourceState::FriendConnect
-                    )
+                    && !source_state_blocks_outbound_tcp(&s.state)
             })
             .collect();
         ready.sort_by(|a, b| {
@@ -729,13 +807,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 s.time_until_reask() == 0
                     && s.can_try_tcp()
-                    && !matches!(
-                        s.state,
-                        DownloadSourceState::Banned
-                            | DownloadSourceState::LowToLowIp
-                            | DownloadSourceState::EmberRelay
-                            | DownloadSourceState::FriendConnect
-                    )
+                    && !source_state_blocks_outbound_tcp(&s.state)
                     && !is_banned(s.ip, s.tcp_port)
             })
             .collect();
@@ -2468,6 +2540,70 @@ mod tests {
     }
 
     #[test]
+    fn ember_callback_reask_is_immediate_for_new_sources() {
+        let hash = [0x45; 16];
+        let ip = Ipv4Addr::new(5, 5, 5, 5);
+        let buddy = Ipv4Addr::new(6, 6, 6, 6);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_ember_callback_buddy(
+            ip,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            true,
+        );
+        assert!(pfs.sources[0].ember_callback_reask_due());
+        assert!(
+            !pfs.sources[0].kad_callback_reask_due(),
+            "Ember-buddy rows must not also fire the KAD CallbackReq path"
+        );
+        pfs.mark_callback_requested(ip, 4662, None);
+        assert!(!pfs.sources[0].ember_callback_reask_due());
+    }
+
+    #[test]
+    fn wait_callback_kad_is_never_offered_for_a_tcp_dial() {
+        let hash = [0x46; 16];
+        let highid = Ipv4Addr::new(7, 7, 7, 7);
+        let ember_fw = Ipv4Addr::new(10, 0, 0, 9);
+        let kad_fw = Ipv4Addr::new(10, 0, 0, 10);
+        let parked = Ipv4Addr::new(8, 8, 8, 8);
+        let buddy = Ipv4Addr::new(8, 8, 4, 4);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(highid, 4662, 0));
+        assert!(pfs.add_source_full(ember_fw, 4662, 0));
+        assert!(pfs.add_source_full(kad_fw, 4662, 0));
+        assert!(pfs.add_source_full(parked, 4662, 0));
+
+        pfs.set_ember_callback_buddy(
+            ember_fw,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            true,
+        );
+        pfs.set_kad_callback_buddy(kad_fw, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), true);
+        pfs.set_low_to_low(parked, 4662, None);
+
+        let later = Instant::now() + Duration::from_secs(2000);
+        let ready = pfs.sources_ready_for_reask_at(later);
+        assert_eq!(ready, vec![(highid, 4662)]);
+        assert!(pfs.sources.iter().any(|s| s.ember_callback_reask_due()));
+
+        let dialable = pfs.dialable_sources();
+        assert_eq!(dialable, vec![(highid, 4662, 0)]);
+    }
+
+    #[test]
     fn set_low_to_low_targets_correct_unspecified_ip_row_by_identity() {
         // Two different classic-ed2k-server LowID peers for the same file,
         // both stored with `ip = UNSPECIFIED` (no real address known) and
@@ -2623,6 +2759,12 @@ mod tests {
         assert!(
             !ready.contains(&(parked, 4662)),
             "a parked firewalled source must not be dialled"
+        );
+        assert!(
+            !pfs.dialable_sources()
+                .iter()
+                .any(|(ip, _, _)| *ip == parked),
+            "pause/resume must not seed a parked firewalled IP either"
         );
         assert_eq!(
             pfs.sources.len(),
