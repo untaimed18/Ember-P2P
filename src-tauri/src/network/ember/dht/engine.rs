@@ -22,7 +22,10 @@ use ed25519_dalek::SigningKey;
 use tracing::trace;
 
 use super::messages::{self, DhtPayload};
-use super::publish::{source_key, SignedRecord, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE};
+use super::publish::{
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_SOURCE,
+};
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -308,6 +311,15 @@ pub struct EmberDht {
     /// STORE records for keys this node is not close enough to hold, once
     /// the routing table is large enough to be selective.
     store_reject_proximity: u64,
+    /// Noise static we currently advertise. A `PROXY_STORE` trailer must
+    /// name this key, otherwise a firewalled publisher can steer every
+    /// searcher's `CALLBACK_REQ` at someone else.
+    local_noise_pub: [u8; 32],
+    /// Public IPv4 we currently advertise as a source buddy. Unspecified
+    /// until STUN/KAD/eD2K gives us one.
+    local_contact_ip: Ipv4Addr,
+    /// UDP port we currently advertise as a source buddy.
+    local_contact_udp: u16,
 }
 
 impl EmberDht {
@@ -347,7 +359,50 @@ impl EmberDht {
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
+            local_noise_pub: [0u8; 32],
+            local_contact_ip: Ipv4Addr::UNSPECIFIED,
+            local_contact_udp: 0,
         }
+    }
+
+    /// Update the endpoint `PROXY_STORE` trailers must name for us to accept.
+    pub fn set_advertised_buddy(&mut self, noise_pub: [u8; 32], ip: Ipv4Addr, udp_port: u16) {
+        self.local_noise_pub = noise_pub;
+        self.local_contact_ip = ip;
+        self.local_contact_udp = udp_port;
+    }
+
+    /// The buddy contact a firewalled publisher should write into its trailer
+    /// when asking us to `PROXY_STORE`. `None` until we have a routable IPv4.
+    pub fn advertised_source_buddy(&self) -> Option<SourceBuddy> {
+        let buddy = SourceBuddy {
+            ip: self.local_contact_ip,
+            udp_port: self.local_contact_udp,
+            noise_pub: self.local_noise_pub,
+        };
+        buddy.is_routable().then_some(buddy)
+    }
+
+    /// Whether a firewalled source record's signed trailer names **this** node.
+    ///
+    /// Identity is the Noise static, not the eD2K/STUN `(ip, udp)` self-view.
+    /// Publishers write the buddy's observed Ember UDP `contact.addr`, which
+    /// can differ from `advertised_source_buddy()` when HighID TCP and the
+    /// UDP mapping are not the same endpoint. Requiring byte-equality of those
+    /// structs rejected honest LowID `PROXY_STORE` and, with overlay STORE
+    /// skipped until ACK, blocked firewalled source publish entirely.
+    /// Naming another node's key is still refused (steering).
+    fn trailer_names_us(&self, contact: Option<&SourceContact>) -> bool {
+        let Some(sc) = contact else {
+            return false;
+        };
+        let Some(buddy) = sc.buddy else {
+            return false;
+        };
+        if self.local_noise_pub == [0u8; 32] || !buddy.is_routable() {
+            return false;
+        }
+        buddy.noise_pub == self.local_noise_pub
     }
 
     /// Our 128-bit DHT node ID.
@@ -505,10 +560,10 @@ impl EmberDht {
         // then has to evict live entries around.
         let sweep_due = self
             .store_sig_swept_at
-            .is_none_or(|at| now_inst.duration_since(at) >= STORE_SIG_REPLAY_TTL);
+            .is_none_or(|at| now_inst.saturating_duration_since(at) >= STORE_SIG_REPLAY_TTL);
         if sweep_due {
             self.store_sig_seen
-                .retain(|_, t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL);
+                .retain(|_, t| now_inst.saturating_duration_since(*t) < STORE_SIG_REPLAY_TTL);
             let live = &self.store_sig_seen;
             self.store_sig_order.retain(|k| live.contains_key(k));
             self.store_sig_swept_at = Some(now_inst);
@@ -516,7 +571,7 @@ impl EmberDht {
         if self
             .store_sig_seen
             .get(&sig_key)
-            .is_some_and(|t| now_inst.duration_since(*t) < STORE_SIG_REPLAY_TTL)
+            .is_some_and(|t| now_inst.saturating_duration_since(*t) < STORE_SIG_REPLAY_TTL)
         {
             let held = self.store.get_live(&key);
             // A replay only counts as one if we still hold what it stands for.
@@ -623,8 +678,18 @@ impl EmberDht {
     /// that a later `CALLBACK_REQ` can find them. What is bounded here is the
     /// work: how much one peer may ask for, and how much may be outstanding.
     fn accept_proxy_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
+        if !self.can_accept_proxy_forward(sender, now) {
+            return false;
+        }
+        self.proxy_forwards.push_back((now, sender));
+        true
+    }
+
+    /// [`Self::accept_proxy_forward`] without charging, so the network loop can
+    /// refuse a full publish table without spending budget on a silent drop.
+    pub fn can_accept_proxy_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
         while let Some((at, _)) = self.proxy_forwards.front() {
-            if now.duration_since(*at) < PROXY_FORWARD_WINDOW {
+            if now.saturating_duration_since(*at) < PROXY_FORWARD_WINDOW {
                 break;
             }
             self.proxy_forwards.pop_front();
@@ -632,7 +697,7 @@ impl EmberDht {
         let in_flight = self
             .proxy_forwards
             .iter()
-            .filter(|(at, _)| now.duration_since(*at) < PROXY_FORWARD_INFLIGHT)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < PROXY_FORWARD_INFLIGHT)
             .count();
         if in_flight >= MAX_PROXY_FORWARDS_IN_FLIGHT {
             return false;
@@ -645,8 +710,52 @@ impl EmberDht {
         if from_sender >= MAX_PROXY_FORWARDS_PER_SENDER {
             return false;
         }
-        self.proxy_forwards.push_back((now, sender));
         true
+    }
+
+    /// Store a local replica, then charge proxy budget and remember the
+    /// publisher for `CALLBACK_REQ`.
+    ///
+    /// Store runs first so a full/expired replica cannot burn a publish slot
+    /// and a callback grant. Call only after [`PublishManager::start_publish_to`]
+    /// granted a slot; the caller must drop that slot if this returns false.
+    pub fn commit_proxy_store(
+        &mut self,
+        publisher: EmberNodeId,
+        from: SocketAddr,
+        remote_noise_pub: [u8; 32],
+        record: &SignedRecord,
+        now: Instant,
+    ) -> bool {
+        if !self.store_proxy_replica(record) {
+            return false;
+        }
+        if !self.accept_proxy_forward(publisher, now) {
+            return false;
+        }
+        self.remember_callback_client(publisher, from, remote_noise_pub, now);
+        true
+    }
+
+    /// Named-buddy replica: skip the k-closest proximity gate. We accepted
+    /// `PROXY_STORE` because the trailer named us, so FIND_VALUE walking this
+    /// node must not answer FOUND_NODE.
+    pub fn store_proxy_replica(&mut self, record: &SignedRecord) -> bool {
+        self.sync_store_scale();
+        self.store.store(
+            record.keyword_hash,
+            record.data.clone(),
+            record.signature,
+            record.publisher_key,
+            record.timestamp,
+        )
+    }
+
+    /// Drop keyword and source records we ourselves published for `file_hash`.
+    /// Used when a file is restricted to friends after it already went out.
+    pub fn drop_own_file_records(&mut self, file_hash: &[u8; 16]) -> usize {
+        let publisher = self.signing_key.verifying_key().to_bytes();
+        self.store.drop_publisher_file(&publisher, file_hash)
     }
 
     /// Remember that we just `PROXY_STORE`d for `publisher`, so a later
@@ -659,7 +768,7 @@ impl EmberDht {
         now: Instant,
     ) {
         self.callback_clients
-            .retain(|_, c| now.duration_since(c.last_seen) < CALLBACK_CLIENT_TTL);
+            .retain(|_, c| now.saturating_duration_since(c.last_seen) < CALLBACK_CLIENT_TTL);
         if self.callback_clients.len() >= MAX_CALLBACK_CLIENTS
             && !self.callback_clients.contains_key(&publisher)
         {
@@ -694,7 +803,7 @@ impl EmberDht {
     ) {
         self.prune_proxy_asks(now);
         let asks = self.pending_proxy_asks.entry(buddy).or_default();
-        asks.retain(|(_, _, at)| now.duration_since(*at) < PROXY_STORE_ASK_TTL);
+        asks.retain(|(_, _, at)| now.saturating_duration_since(*at) < PROXY_STORE_ASK_TTL);
         if !asks.iter().any(|(rid, _, _)| *rid == request_id) {
             if asks.len() >= MAX_PENDING_PROXY_ASKS_PER_BUDDY {
                 asks.remove(0);
@@ -708,7 +817,7 @@ impl EmberDht {
     /// "connect to this IP" gadget.
     fn note_proxy_buddy(&mut self, buddy: EmberNodeId, now: Instant) {
         self.our_proxy_buddies
-            .retain(|_, at| now.duration_since(*at) < CALLBACK_CLIENT_TTL);
+            .retain(|_, at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL);
         if self.our_proxy_buddies.len() >= MAX_OUR_PROXY_BUDDIES
             && !self.our_proxy_buddies.contains_key(&buddy)
         {
@@ -726,11 +835,11 @@ impl EmberDht {
 
     fn prune_proxy_asks(&mut self, now: Instant) {
         self.pending_proxy_asks.retain(|_, asks| {
-            asks.retain(|(_, _, at)| now.duration_since(*at) < PROXY_STORE_ASK_TTL);
+            asks.retain(|(_, _, at)| now.saturating_duration_since(*at) < PROXY_STORE_ASK_TTL);
             !asks.is_empty()
         });
         self.proxy_file_grants
-            .retain(|_, at| now.duration_since(*at) < CALLBACK_CLIENT_TTL);
+            .retain(|_, at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL);
     }
 
     fn complete_proxy_store_ask(
@@ -773,13 +882,13 @@ impl EmberDht {
         }
         self.proxy_file_grants
             .get(&(buddy, file_hash))
-            .is_some_and(|at| now.duration_since(*at) < CALLBACK_CLIENT_TTL)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL)
     }
 
     fn is_recent_proxy_buddy(&self, buddy: EmberNodeId, now: Instant) -> bool {
         self.our_proxy_buddies
             .get(&buddy)
-            .is_some_and(|at| now.duration_since(*at) < CALLBACK_CLIENT_TTL)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL)
     }
 
     fn accept_callback_forward(&mut self, sender: EmberNodeId, now: Instant) -> bool {
@@ -813,7 +922,7 @@ impl EmberDht {
         max_per_sender: usize,
     ) -> bool {
         while let Some((at, _)) = q.front() {
-            if now.duration_since(*at) < window {
+            if now.saturating_duration_since(*at) < window {
                 break;
             }
             q.pop_front();
@@ -1614,18 +1723,12 @@ impl EmberDht {
                         && key == parsed.keyword_hash
                         && key == source_key(&parsed.file_hash)
                         && publisher_is_sender
-                        && self.accept_proxy_forward(msg.sender_id, Instant::now())
+                        && self.trailer_names_us(parsed.source_contact.as_ref())
                     {
-                        self.remember_callback_client(
-                            msg.sender_id,
-                            from,
-                            remote_noise_pub,
-                            Instant::now(),
-                        );
-                        // We are often the only public replica for this key.
-                        // `start_publish_to` STOREs to *other* contacts, so
-                        // without this FIND_VALUE walking us answers FOUND_NODE.
-                        let _ = self.store_own_record(&parsed);
+                        // Budget, callback table, and the local replica are
+                        // committed only after the caller obtains a publish
+                        // slot. Charging here left those spent when the 128-slot
+                        // table was full and no ACK went out.
                         out.proxy_store_forward = Some((msg.request_id, parsed));
                     }
                 }
@@ -1718,7 +1821,7 @@ impl EmberDht {
                 if let std::net::IpAddr::V4(searcher_ip) = from.ip() {
                     if Self::callback_dest_ok(searcher_ip, searcher_tcp_port) {
                         let client = self.callback_clients.get(&publisher_id).and_then(|c| {
-                            (now.duration_since(c.last_seen) < CALLBACK_CLIENT_TTL)
+                            (now.saturating_duration_since(c.last_seen) < CALLBACK_CLIENT_TTL)
                                 .then_some((c.addr, c.noise_pub))
                         });
                         if let Some((dest, noise)) = client {
@@ -1964,7 +2067,9 @@ mod tests {
     use super::*;
 
     fn dht(seed: u8) -> EmberDht {
-        EmberDht::new([seed; 32], false)
+        let mut d = EmberDht::new([seed; 32], false);
+        d.set_advertised_buddy([seed; 32], Ipv4Addr::new(8, 8, 8, seed), 4672);
+        d
     }
 
     fn addr(last: u8, port: u16) -> SocketAddr {
@@ -3047,6 +3152,32 @@ mod tests {
         }
     }
 
+    /// Firewalled contact whose trailer names `buddy` — required for
+    /// `PROXY_STORE` to be accepted.
+    fn firewalled_for_buddy(publisher_last: u8, buddy: &EmberDht) -> SourceContact {
+        let mut contact = firewalled_contact_at(publisher_last);
+        contact.buddy = buddy.advertised_source_buddy();
+        contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        contact
+    }
+
+    fn commit_inbound_proxy(
+        buddy: &mut EmberDht,
+        frame: &[u8],
+        from: SocketAddr,
+        noise: [u8; 32],
+        now: i64,
+    ) -> bool {
+        let inbound = buddy.handle_message(frame, from, noise, now);
+        let Some((_, rec)) = inbound.proxy_store_forward else {
+            return false;
+        };
+        let Some(publisher) = inbound.sender_id else {
+            return false;
+        };
+        buddy.commit_proxy_store(publisher, from, noise, &rec, Instant::now())
+    }
+
     /// A source record body signed under a `keyword_hash` of our choosing.
     ///
     /// `SignedRecord::source` always derives the key from the file hash, so
@@ -3162,7 +3293,7 @@ mod tests {
         let mut buddy = dht(89);
         let pub_noise = [0xAA; 32];
         let pub_addr = addr(88, 4672);
-        let contact = firewalled_contact_at(88);
+        let contact = firewalled_for_buddy(88, &buddy);
 
         let mut accepted = 0usize;
         for i in 0..(MAX_PROXY_FORWARDS_PER_SENDER + 8) {
@@ -3174,11 +3305,7 @@ mod tests {
                 record.data.clone(),
                 record.signature,
             );
-            if buddy
-                .handle_message(&frame, pub_addr, pub_noise, 2000)
-                .proxy_store_forward
-                .is_some()
-            {
+            if commit_inbound_proxy(&mut buddy, &frame, pub_addr, pub_noise, 2000) {
                 accepted += 1;
             }
         }
@@ -3190,15 +3317,17 @@ mod tests {
         // The allowance is per sender, so an honest buddy is not punished for a
         // noisy one it shares nothing with but our attention.
         let mut other = dht(90);
-        let record =
-            other.build_source_record([0x90; 16], [0u8; 32], 42, "other.mkv", firewalled_contact_at(90));
+        let record = other.build_source_record(
+            [0x90; 16],
+            [0u8; 32],
+            42,
+            "other.mkv",
+            firewalled_for_buddy(90, &buddy),
+        );
         let (_rid, frame) =
             other.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(
-            buddy
-                .handle_message(&frame, addr(90, 4672), [0x90; 32], 2001)
-                .proxy_store_forward
-                .is_some(),
+            commit_inbound_proxy(&mut buddy, &frame, addr(90, 4672), [0x90; 32], 2001),
             "a second buddy must not inherit the first's spent allowance"
         );
     }
@@ -3220,18 +3349,14 @@ mod tests {
                 [0u8; 32],
                 42,
                 "s.mkv",
-                firewalled_contact_at(seed),
+                firewalled_for_buddy(seed, &buddy),
             );
             let (_rid, frame) = publisher.build_proxy_store(
                 record.keyword_hash,
                 record.data.clone(),
                 record.signature,
             );
-            if buddy
-                .handle_message(&frame, addr(seed, 4672), [seed; 32], 3000)
-                .proxy_store_forward
-                .is_some()
-            {
+            if commit_inbound_proxy(&mut buddy, &frame, addr(seed, 4672), [seed; 32], 3000) {
                 accepted += 1;
             }
         }
@@ -3446,9 +3571,7 @@ mod tests {
         let pub_noise = [0xAA; 32];
         let pub_addr = addr(80, 4672);
 
-        let mut contact = source_contact_at(80);
-        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED
-            | crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        let contact = firewalled_for_buddy(80, &buddy);
         let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "buddy.mkv", contact);
         let key = record.keyword_hash;
         let (_rid, frame) = publisher.build_proxy_store(key, record.data.clone(), record.signature);
@@ -3509,6 +3632,53 @@ mod tests {
     }
 
     #[test]
+    fn proxy_store_accepts_trailer_naming_our_noise_at_observed_addr() {
+        let mut publisher = dht(80);
+        let mut buddy = dht(81);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(80, 4672);
+
+        let mut contact = firewalled_contact_at(80);
+        contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        // Observed Ember UDP (10.x) ≠ advertised STUN/HighID (8.8.8.81).
+        contact.buddy = Some(crate::network::ember::dht::publish::SourceBuddy {
+            ip: std::net::Ipv4Addr::new(8, 8, 4, 81),
+            udp_port: 4672,
+            noise_pub: [81; 32],
+        });
+        let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "nat.mkv", contact);
+        let (_rid, frame) = publisher.build_proxy_store(
+            record.keyword_hash,
+            record.data.clone(),
+            record.signature,
+        );
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
+        assert!(
+            on_buddy.proxy_store_forward.is_some(),
+            "honest LowID publish must survive HighID-IP ≠ Ember-UDP-addr"
+        );
+    }
+
+    #[test]
+    fn proxy_store_rejects_trailer_that_names_someone_else() {
+        let mut publisher = dht(70);
+        let mut buddy = dht(71);
+        let victim = dht(72);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(70, 4672);
+
+        let contact = firewalled_for_buddy(70, &victim);
+        let record = publisher.build_source_record([6u8; 16], [0u8; 32], 1, "aimed.mkv", contact);
+        let (_rid, frame) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
+        assert!(
+            on_buddy.proxy_store_forward.is_none(),
+            "must not replicate a record that steers CALLBACK_REQ at another node"
+        );
+    }
+
+    #[test]
     fn callback_req_forwards_only_after_proxy_store() {
         let mut publisher = dht(90);
         let mut buddy = dht(91);
@@ -3520,13 +3690,13 @@ mod tests {
 
         let mut contact = source_contact_at(90);
         contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED;
+        contact.buddy = buddy.advertised_source_buddy();
         let record = publisher.build_source_record([9u8; 16], [0u8; 32], 1, "fw.mkv", contact);
         let (proxy_rid, proxy) =
             publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
-        assert!(buddy
-            .handle_message(&proxy, pub_addr, pub_noise, 2000)
-            .proxy_store_forward
-            .is_some());
+        assert!(commit_inbound_proxy(
+            &mut buddy, &proxy, pub_addr, pub_noise, 2000
+        ));
 
         let file_hash = [9u8; 16];
         let token = publisher.callback_token(&file_hash);

@@ -169,6 +169,11 @@ pub struct AppState {
     /// the user would never be told their node had joined a network that
     /// publishes their address and their shared-file keywords.
     pub pending_ember_default_on_notice: Arc<AtomicBool>,
+    /// Set when startup failed to apply a staged profile restore, or left
+    /// `restore-pending/` in place (schema too new, mid-apply abort). The
+    /// layout consumes this latch and shows a sticky warning; Settings >
+    /// Backup can retry or discard.
+    pub pending_restore_failed_notice: Arc<AtomicBool>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio

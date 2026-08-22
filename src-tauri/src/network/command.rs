@@ -43,6 +43,7 @@ pub(crate) async fn handle_command(
     firewall_probe_ips: &upload_server::FirewallProbeSet,
     shared_banned_ips: &upload_server::SharedBannedIps,
     shared_banned_hashes: &upload_server::SharedBannedHashes,
+    shared_friends_only_hashes: &upload_server::SharedFriendsOnlyHashes,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -54,6 +55,7 @@ pub(crate) async fn handle_command(
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
     upload_queue: &ed2k::upload::UploadQueueRef,
+    status_writes: &Arc<TransferStatusWriteClock>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_command_inner(
         socket,
@@ -75,6 +77,7 @@ pub(crate) async fn handle_command(
         firewall_probe_ips,
         shared_banned_ips,
         shared_banned_hashes,
+        shared_friends_only_hashes,
         shared_server_addr,
         shared_ember_payload,
         ember_payload_generation,
@@ -86,6 +89,7 @@ pub(crate) async fn handle_command(
         ed25519_pubkey,
         ed25519_secret_key,
         upload_queue,
+        status_writes,
     ))
     .catch_unwind()
     .await
@@ -118,6 +122,7 @@ async fn handle_command_inner(
     firewall_probe_ips: &upload_server::FirewallProbeSet,
     shared_banned_ips: &upload_server::SharedBannedIps,
     shared_banned_hashes: &upload_server::SharedBannedHashes,
+    shared_friends_only_hashes: &upload_server::SharedFriendsOnlyHashes,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -129,6 +134,7 @@ async fn handle_command_inner(
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
     upload_queue: &ed2k::upload::UploadQueueRef,
+    status_writes: &Arc<TransferStatusWriteClock>,
 ) {
     match cmd {
         NetworkCommand::SearchFiles {
@@ -689,7 +695,7 @@ async fn handle_command_inner(
                         }
                     }
                     if digest != [0u8; 32] {
-                        state.ember_content_hashes.insert(ed2k, digest);
+                        state.ember_content_hashes.entry(ed2k).or_insert(digest);
                     }
                 }
             }
@@ -911,22 +917,32 @@ async fn handle_command_inner(
                     }
                     if let Ok(hb) = hex::decode(&file_hash) {
                         if hb.len() >= 16 {
-                            state.publish_manager.add_file(PublishableFile {
-                                file_hash: md4_bytes_to_kad_id(&hb[..16]),
-                                file_name: publish_file_name,
-                                file_size,
-                                file_type: crate::search::index::infer_file_type(&publish_ext),
-                                complete_sources: 0,
-                                keyword_publishable: false,
-                                last_source_publish: {
-                                    let mut raw = [0u8; 16];
-                                    raw.copy_from_slice(&hb[..16]);
-                                    known_files
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&hb[..16]);
+                            let restricted = {
+                                let idx = local_index.read().await;
+                                !known_files.is_authoritative()
+                                    || idx
+                                        .get_by_hash(&file_hash.to_ascii_lowercase())
+                                        .is_some_and(|f| f.friends_only)
+                                    || known_files
+                                        .find_by_hash(&raw)
+                                        .is_some_and(|r| r.friends_only)
+                            };
+                            if !restricted {
+                                state.publish_manager.add_file(PublishableFile {
+                                    file_hash: md4_bytes_to_kad_id(&hb[..16]),
+                                    file_name: publish_file_name,
+                                    file_size,
+                                    file_type: crate::search::index::infer_file_type(&publish_ext),
+                                    complete_sources: 0,
+                                    keyword_publishable: false,
+                                    last_source_publish: known_files
                                         .find_by_hash(&raw)
                                         .map(|r| r.last_publish_src as i64)
-                                        .unwrap_or(0)
-                                },
-                            });
+                                        .unwrap_or(0),
+                                });
+                            }
                         }
                     }
                     info!(
@@ -1324,9 +1340,13 @@ async fn handle_command_inner(
                         crate::security::parse_ember_file_hash(Some(&ember_file_hash))
                             .ok()
                             .flatten();
+                    let clock = Arc::clone(status_writes);
+                    let seq = clock.next_seq();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
-                            let _ = db_ref.update_transfer_status(&tid, "searching");
+                            apply_transfer_status_write(
+                                &clock, &db_ref, &tid, "searching", seq,
+                            );
                         } else {
                             let db_transfer = Transfer {
                                 id: tid,
@@ -1500,33 +1520,45 @@ async fn handle_command_inner(
 
             if let Ok(hb) = hex::decode(&file_hash) {
                 if hb.len() >= 16 {
-                    state.publish_manager.add_file(PublishableFile {
-                        file_hash: md4_bytes_to_kad_id(&hb[..16]),
-                        file_name: publish_file_name,
-                        file_size,
-                        file_type: crate::search::index::infer_file_type(&publish_ext),
-                        complete_sources: 0,
-                        keyword_publishable: false,
-                        last_source_publish: {
-                            let mut raw = [0u8; 16];
-                            raw.copy_from_slice(&hb[..16]);
-                            known_files
+                    let mut raw = [0u8; 16];
+                    raw.copy_from_slice(&hb[..16]);
+                    let restricted = {
+                        let idx = local_index.read().await;
+                        idx.get_by_hash(&file_hash.to_ascii_lowercase())
+                            .is_some_and(|f| f.friends_only)
+                            || known_files.find_by_hash(&raw).is_some_and(|r| r.friends_only)
+                            || !known_files.is_authoritative()
+                    };
+                    if !restricted {
+                        state.publish_manager.add_file(PublishableFile {
+                            file_hash: md4_bytes_to_kad_id(&hb[..16]),
+                            file_name: publish_file_name,
+                            file_size,
+                            file_type: crate::search::index::infer_file_type(&publish_ext),
+                            complete_sources: 0,
+                            keyword_publishable: false,
+                            last_source_publish: known_files
                                 .find_by_hash(&raw)
                                 .map(|r| r.last_publish_src as i64)
-                                .unwrap_or(0)
-                        },
-                    });
-                    info!("Published partial download to KAD source publish");
+                                .unwrap_or(0),
+                        });
+                        info!("Published partial download to KAD source publish");
+                    }
                 }
             }
         }
 
         NetworkCommand::AnnounceFiles { files } => {
+            let restricted = {
+                let idx = local_index.read().await;
+                collect_friends_only_hashes(&idx, known_files)
+            };
             for file in files {
                 // Friends-only files are never announced to KAD. Publishing a
                 // source or keyword for one would make it discoverable by
-                // search even though browse hides it.
-                if !file.is_public_listable() {
+                // search even though browse hides it. known.met restrictions
+                // win over an index row that still looks public.
+                if !kad_may_advertise_complete(&file, known_files, &restricted) {
                     continue;
                 }
                 if let Ok(raw_bytes) = hex::decode(&file.hash) {
@@ -4204,6 +4236,19 @@ async fn handle_command_inner(
                     return;
                 }
             }
+            for (hash, friends_only) in &parsed {
+                if *friends_only {
+                    state.ember_dht.drop_own_file_records(hash);
+                    state.ember_published_sources.remove(hash);
+                    state.ember_source_publish_unix.remove(hash);
+                    state.ember_keyword_publish_unix.remove(hash);
+                    state.ember_source_publish_at.remove(hash);
+                    state.ember_keyword_publish_at.remove(hash);
+                    let mut sm = source_manager.write().await;
+                    sm.remove_file(hash);
+                }
+            }
+            sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
             let _ = tx.send(Ok(parsed.len()));
         }
 
@@ -4413,10 +4458,25 @@ async fn handle_command_inner(
                     }
                 }
             }
+            // Index friends_only can OR onto a known.met record here; the
+            // upload listener reads the snapshot, not this list.
+            sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
+            or_index_friends_only_from_known(local_index, known_files).await;
+            let restricted: HashSet<String> = all_index_files
+                .iter()
+                .filter(|f| f.friends_only && !f.hash.is_empty())
+                .map(|f| f.hash.to_ascii_lowercase())
+                .chain(
+                    known_files
+                        .iter_records()
+                        .filter(|r| r.friends_only)
+                        .map(|r| hex::encode(r.file_hash)),
+                )
+                .collect();
             let mut seen_hashes = std::collections::HashSet::new();
             let files: Vec<PublishableFile> = all_index_files
                 .iter()
-                .filter(|f| f.is_public_listable())
+                .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
                 .filter_map(|f| {
                     if f.hash.is_empty() || !seen_hashes.insert(f.hash.clone()) {
                         return None;
@@ -4470,6 +4530,9 @@ async fn handle_command_inner(
                         transfer.status,
                         TransferStatus::Completed | TransferStatus::Failed
                     ) {
+                        continue;
+                    }
+                    if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash) {
                         continue;
                     }
                     if transfer.file_hash.is_empty()
@@ -4526,7 +4589,7 @@ async fn handle_command_inner(
             // one must darken its badge exactly as it does for KAD.
             let ember_keep: HashSet<[u8; 16]> = all_index_files
                 .iter()
-                .filter(|f| f.is_public_listable())
+                .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
                 .filter_map(|f| parse_ed2k_hash16(&f.hash))
                 .collect();
             state
@@ -4539,7 +4602,7 @@ async fn handle_command_inner(
                 let mut seen_offer_hashes = std::collections::HashSet::new();
                 let mut offer_files: Vec<ed2k::server::OfferFile> = all_index_files
                     .iter()
-                    .filter(|f| f.is_public_listable())
+                    .filter(|f| kad_may_advertise_complete(f, known_files, &restricted))
                     .filter_map(|f| {
                         if f.hash.is_empty() || !seen_offer_hashes.insert(f.hash.clone()) {
                             return None;
@@ -4570,6 +4633,10 @@ async fn handle_command_inner(
                             transfer.status,
                             TransferStatus::Completed | TransferStatus::Failed
                         ) {
+                            continue;
+                        }
+                        if !kad_may_advertise_partial(known_files, &restricted, &transfer.file_hash)
+                        {
                             continue;
                         }
                         if transfer.file_hash.is_empty()

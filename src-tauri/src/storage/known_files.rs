@@ -146,23 +146,33 @@ impl KnownFileList {
 
     /// Merge records from a freshly loaded catalog. Existing in-memory
     /// entries win on hash collision so a concurrent share-scan that ran
-    /// before disk load finished is not clobbered by stale known.met data.
+    /// before disk load finished is not clobbered by stale known.met data,
+    /// except `friends_only`: a disk `true` is OR'd onto the in-memory row
+    /// so a pre-load rediscovery cannot drop a persisted restriction.
     pub fn absorb_missing_from(&mut self, other: Self) {
         for (hash, record) in other.files {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.files.entry(hash) {
-                if !record.file_path.is_empty() {
-                    self.path_index.insert(
-                        normalize_path_key(&record.file_path),
-                        KnownPathEntry {
-                            hash,
-                            path: record.file_path.clone(),
-                            size: record.file_size,
-                            modified_at: record.modified_at,
-                        },
-                    );
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.files.entry(hash) {
+                // A share-scan that ran before disk load can insert a
+                // rediscovered row with `friends_only = false`. In-memory
+                // winning the whole record would drop a persisted restriction.
+                // OR the flag; other fields stay with the in-memory copy.
+                if record.friends_only {
+                    e.get_mut().friends_only = true;
                 }
-                e.insert(record);
+                continue;
             }
+            if !record.file_path.is_empty() {
+                self.path_index.insert(
+                    normalize_path_key(&record.file_path),
+                    KnownPathEntry {
+                        hash,
+                        path: record.file_path.clone(),
+                        size: record.file_size,
+                        modified_at: record.modified_at,
+                    },
+                );
+            }
+            self.files.insert(hash, record);
         }
         // Path index entries for hashes we already had stay as-is; disk-only
         // path mappings for absorbed hashes are already inserted above.
@@ -814,6 +824,11 @@ impl KnownFileList {
     /// one.
     pub fn is_authoritative(&self) -> bool {
         self.authoritative
+    }
+
+    #[cfg(test)]
+    pub fn mark_authoritative_for_tests(&mut self) {
+        self.authoritative = true;
     }
 
     pub fn dirty_generation(&self) -> u64 {
@@ -1846,6 +1861,26 @@ mod tests {
         assert!(
             loaded.find_by_hash(&hash).unwrap().friends_only,
             "friends_only=true must survive a save/load round trip"
+        );
+    }
+
+    #[test]
+    fn absorb_ors_disk_friends_only_onto_an_in_memory_public_row() {
+        let mut live = KnownFileList::new();
+        live.add_or_update(sample_record());
+        let hash = [0x42; 16];
+        assert!(!live.find_by_hash(&hash).unwrap().friends_only);
+
+        let mut disk = KnownFileList::new();
+        let mut restricted = sample_record();
+        restricted.friends_only = true;
+        disk.add_or_update(restricted);
+        disk.authoritative = true;
+
+        live.absorb_missing_from(disk);
+        assert!(
+            live.find_by_hash(&hash).unwrap().friends_only,
+            "deferred known.met load must restore a restriction the scan dropped"
         );
     }
 

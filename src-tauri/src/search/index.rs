@@ -863,6 +863,34 @@ impl LocalIndex {
         mutation
     }
 
+    /// OR `friends_only` onto index rows whose MD4 is in `hashes`.
+    ///
+    /// known.met is the durable source of the restriction. A path/mtime
+    /// rematch can insert a public row for a hash that is already restricted
+    /// on disk; after that catalog is absorbed, this restores the flag so
+    /// advertise, badges, and upload resolution agree.
+    pub fn or_friends_only_from_hashes(&mut self, hashes: &HashSet<[u8; 16]>) {
+        if hashes.is_empty() {
+            return;
+        }
+        for file in &mut self.files {
+            if file.friends_only || file.hash.is_empty() {
+                continue;
+            }
+            let Ok(bytes) = hex::decode(&file.hash) else {
+                continue;
+            };
+            if bytes.len() != 16 {
+                continue;
+            }
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&bytes);
+            if hashes.contains(&hash) {
+                file.friends_only = true;
+            }
+        }
+    }
+
     /// Like `upsert_file`, but keeps `path_map`/`hash_map`/`name_tokens`
     /// consistent for the affected slot so no full rebuild is required.
     fn upsert_file_indexed(&mut self, mut file: FileInfo) {
@@ -1132,6 +1160,7 @@ mod tests {
 mod local_index_tests {
     use super::{rehash_id, LocalIndex};
     use crate::types::FileInfo;
+    use std::collections::HashSet;
 
     fn file(path: &str, hash: &str, shared: bool, priority: &str) -> FileInfo {
         FileInfo {
@@ -1187,6 +1216,36 @@ mod local_index_tests {
         assert_eq!(mutation.hashes, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
         assert!(!index.get_by_path("A/copy.bin").unwrap().shared);
         assert!(!index.get_by_path("B/copy.bin").unwrap().shared);
+    }
+
+    #[test]
+    fn or_friends_only_from_hashes_marks_matching_public_row() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file(
+                "A/public.bin",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+                "normal",
+            ),
+            file(
+                "B/other.bin",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                true,
+                "normal",
+            ),
+        ]);
+        let mut hashes = HashSet::new();
+        hashes.insert([0xaa; 16]);
+        index.or_friends_only_from_hashes(&hashes);
+        assert!(
+            index.get_by_path("A/public.bin").unwrap().friends_only,
+            "a rematched public row must inherit known.met friends-only"
+        );
+        assert!(
+            !index.get_by_path("B/other.bin").unwrap().friends_only,
+            "unrelated hashes must stay public"
+        );
     }
 
     #[test]

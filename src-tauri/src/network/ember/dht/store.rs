@@ -1134,6 +1134,44 @@ impl DhtStore {
         total_removed
     }
 
+    /// Remove records `publisher_key` published for `file_hash` (keyword and
+    /// source). Friends-only after a public publish drops our local copies
+    /// immediately; remote replicas still expire on TTL.
+    pub fn drop_publisher_file(&mut self, publisher_key: &[u8; 32], file_hash: &[u8; 16]) -> usize {
+        let mut total_removed = 0;
+        let mut freed = 0usize;
+        let mut released: Vec<([u8; 32], usize, bool)> = Vec::new();
+        self.entries.retain(|_, records| {
+            let before = records.len();
+            let mut dropped: Vec<([u8; 32], usize)> = Vec::new();
+            records.retain(|r| {
+                let ours = &r.publisher_key == publisher_key
+                    && file_hash_from_record_data(&r.data) == *file_hash;
+                if ours {
+                    let cost = record_cost(r.data.len());
+                    freed += cost;
+                    dropped.push((r.publisher_key, cost));
+                }
+                !ours
+            });
+            total_removed += before - records.len();
+            let mut gave_up_key: HashSet<[u8; 32]> = HashSet::new();
+            for (author, cost) in dropped {
+                let last = !records.iter().any(|r| r.publisher_key == author)
+                    && gave_up_key.insert(author);
+                released.push((author, cost, last));
+            }
+            !records.is_empty()
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        for (author, cost, last) in released {
+            self.publisher_index.discharge(&author, cost, last);
+        }
+        self.serve_cursor
+            .retain(|k, _| self.entries.contains_key(k));
+        total_removed
+    }
+
     /// Collect records due for republish — those not (re)published within
     /// `interval` (or all of them when `force`) — and mark the returned
     /// ones as republished now. `max` bounds the batch so one maintenance

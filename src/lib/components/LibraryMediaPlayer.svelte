@@ -154,7 +154,11 @@
       if (!pendingPlay) return;
       void el.play().then(() => {
         pendingPlay = false;
-      }).catch(() => {});
+      }).catch((e: unknown) => {
+        const name = e instanceof DOMException ? e.name : '';
+        if (name === 'AbortError' || name === 'NotAllowedError') return;
+        loadError = m.library_media_playback_error();
+      });
     };
 
     if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {

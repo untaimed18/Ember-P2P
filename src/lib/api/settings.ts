@@ -107,6 +107,15 @@ export async function takePendingEmberDefaultOnNotice(): Promise<boolean> {
   return invoke('take_pending_ember_default_on_notice');
 }
 
+/**
+ * Consume the one-shot notice that a staged profile restore failed or is
+ * still waiting. Sticky, because the user needs to open Settings → Backup
+ * to retry or discard.
+ */
+export async function takePendingRestoreFailedNotice(): Promise<boolean> {
+  return invoke('take_pending_restore_failed_notice');
+}
+
 /** Open the official Ember website in the default browser. */
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');

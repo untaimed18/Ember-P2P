@@ -80,7 +80,15 @@
 
   function deepLinkConfirmationMessage(preview: DeepLinkPreview): string {
     if (preview.kind === 'file') {
-      return `${preview.name ?? ''}\n${formatSize(preview.size ?? 0)}\n${preview.hash ?? ''}`;
+      const lines = [
+        preview.name ?? '',
+        formatSize(preview.size ?? 0),
+        preview.hash ?? '',
+      ];
+      if (preview.ember) {
+        lines.push(m.deeplink_ember_digest({ hash: preview.ember }));
+      }
+      return lines.join('\n');
     }
     if (preview.kind === 'server') return preview.endpoint ?? '';
     if (preview.kind === 'serverList') return preview.host ?? '';
@@ -132,6 +140,9 @@
     try {
       if (preview.kind === 'file') {
         const info = await parseEd2kLink(payload);
+        // Do not pass `eh=` / `info.ember` into startDownload. A pasted or
+        // OS-delivered link is untrusted; pinning that digest would make the
+        // first writer we hear from the BLAKE3 we verify against.
         const res = await startDownload(
           info.hash,
           info.name,
@@ -139,7 +150,7 @@
           '',
           0,
           undefined,
-          info.ember,
+          undefined,
           info.aich,
         );
         if (!destroyed) {

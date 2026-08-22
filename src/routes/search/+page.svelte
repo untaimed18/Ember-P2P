@@ -872,6 +872,12 @@
   let emberContacts = $state(0);
   let emberJoinTimedOut = $state(false);
   let emberJoinActiveSince = $state<number | null>(null);
+  let emberDiagnosticsStale = $state(false);
+  let emberSearchUsable = $derived(emberEnabled && emberContacts > 0);
+  let searchSubmitBlocked = $derived(
+    (searchMethod === 'ember' && !emberSearchUsable)
+      || (searchMethod === 'global' && !kadUpLive && !serverUpLive && !emberSearchUsable),
+  );
 
   function recomputeEmberJoinState() {
     if (!emberEnabled) {
@@ -897,6 +903,7 @@
     // Re-arm joining UX when Ember is toggled on (mirrors /ember).
     void emberEnabled;
     void emberContacts;
+    void emberDiagnosticsStale;
     recomputeEmberJoinState();
   });
 
@@ -921,8 +928,12 @@
       getEmberDiagnostics()
         .then((d) => {
           emberContacts = d.ember_dht_verified_contacts ?? 0;
+          emberDiagnosticsStale = false;
         })
-        .catch(() => {});
+        .catch((e) => {
+          emberDiagnosticsStale = true;
+          console.error('Failed to poll Ember DHT readiness:', e);
+        });
     };
     refreshEmber();
     emberPoll = setInterval(refreshEmber, 3000);
@@ -1421,16 +1432,23 @@
     const kadUp = $networkStats.status === 'connected';
     const serverUp = $serverStatus === 'connected';
     const emberJoining = emberEnabled && emberContacts === 0 && !emberJoinTimedOut;
-    const emberReady = emberEnabled && (emberContacts > 0 || emberJoinTimedOut);
+    const emberReady = emberEnabled && emberContacts > 0;
+    const emberNoPeers = emberEnabled && emberContacts === 0 && emberJoinTimedOut;
     const methodAllowed =
       method === 'kad' ? kadUp :
       method === 'server' ? serverUp :
       method === 'ember' ? emberReady :
       kadUp || serverUp || emberReady;
     if (!methodAllowed) {
-      // The readiness hint already covers "Ember is still joining". Don't
-      // open a tab that will sit empty, and don't show the disconnected dialog.
-      if (!emberJoining) networkAlertOpen = true;
+      // Joining / timed out with zero Ember contacts: keep the muted hint
+      // only when Ember is the method that would have been used. KAD-only
+      // and server-only still raise the disconnected dialog.
+      const emberIsTheOnlyCandidate =
+        method === 'ember' || (method === 'global' && !kadUp && !serverUp);
+      if (emberIsTheOnlyCandidate && (emberJoining || emberNoPeers)) {
+        return;
+      }
+      networkAlertOpen = true;
       return;
     }
     const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
@@ -2382,7 +2400,7 @@
       {m.common_stop()}
     </button>
   {:else}
-    <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
+    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked}>{m.search_title()}</button>
   {/if}
 </div>
 <p class="search-syntax-hint">{m.search_query_syntax_hint()}</p>

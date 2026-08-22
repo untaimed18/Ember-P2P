@@ -87,9 +87,19 @@
       downloadedHashes = new Set();
       downloadingHashes = new Set();
       (async () => {
-        const ok = await setupListener(gen, hash);
-        if (!ok || gen !== listenerGen || !open) return;
-        await requestBrowse(hash);
+        try {
+          const ok = await setupListener(gen, hash);
+          if (!ok || gen !== listenerGen || !open) {
+            if (gen === listenerGen && open) loading = false;
+            return;
+          }
+          await requestBrowse(hash);
+        } catch (e: unknown) {
+          if (gen === listenerGen && open) {
+            error = translateError(e, m.browse_failed_to_browse());
+            loading = false;
+          }
+        }
       })();
     }
     return () => {

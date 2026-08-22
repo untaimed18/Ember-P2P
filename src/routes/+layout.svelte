@@ -26,6 +26,7 @@
     setCloseBehavior,
     takePendingCloseRequest,
     takePendingEmberDefaultOnNotice,
+    takePendingRestoreFailedNotice,
   } from '$lib/api/settings';
   import { checkForUpdates, checkUpdateHandoff, isUpdateCheckDue } from '$lib/stores/updater';
   import {
@@ -333,6 +334,12 @@
         if (mounted && pending) addToast('warning', m.layout_ember_default_on(), 0);
       })
       .catch((e) => console.error('Failed to consume the ember-default-on latch:', e));
+
+    takePendingRestoreFailedNotice()
+      .then((pending) => {
+        if (mounted && pending) addToast('warning', m.layout_restore_failed(), 0);
+      })
+      .catch((e) => console.error('Failed to consume the restore-failed latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',

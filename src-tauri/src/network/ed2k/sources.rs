@@ -1054,6 +1054,11 @@ impl SourceManager {
         self.max_per_file = (max as usize).max(50);
     }
 
+    /// Drop every remembered source for `file_hash` (friends-only retract).
+    pub fn remove_file(&mut self, file_hash: &[u8; 16]) {
+        self.sources.remove(file_hash);
+    }
+
     pub fn register_source(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16) {
         self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16]);
     }

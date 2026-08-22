@@ -207,10 +207,14 @@
       hasMoreHistory = false;
       oldestDbId = null;
       (async () => {
-        const listenerOk = await setupListener(gen, friend, channel);
-        if (gen !== loadGen) return;
-        await loadMessages(gen, friend, channel);
-        if (gen === loadGen) liveError = !listenerOk;
+        try {
+          const listenerOk = await setupListener(gen, friend, channel);
+          if (gen !== loadGen) return;
+          await loadMessages(gen, friend, channel);
+          if (gen === loadGen) liveError = !listenerOk;
+        } finally {
+          if (gen === loadGen) loading = false;
+        }
       })();
       markAsRead();
     }

@@ -1104,6 +1104,13 @@ fn staging_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(STAGING_DIR)
 }
 
+/// True when a completed staging run is still waiting (or was left behind
+/// after a failed / schema-too-new apply). Incomplete directories without
+/// a marker are discarded by [`apply_pending_restore`] and do not count.
+pub(crate) fn pending_restore_still_staged(data_dir: &Path) -> bool {
+    staging_dir(data_dir).join(STAGING_MARKER).is_file()
+}
+
 /// The marker a completed staging run leaves behind, or `None` when there is
 /// nothing trustworthy to apply. Written last by [`stage_restore`], so its
 /// absence means the staging directory is incomplete.

@@ -23,15 +23,15 @@ export async function getEmberDiagnostics(): Promise<EmberDiagnostics> {
  * learned from signed PING/PONG traffic.
  */
 export async function getEmberDhtContacts(): Promise<EmberDhtContact[]> {
-  return invoke<EmberDhtContact[]>('get_ember_dht_contacts');
+  return withTimeout(invoke<EmberDhtContact[]>('get_ember_dht_contacts'), 'get_ember_dht_contacts', 10_000);
 }
 
 /** Snapshot in-flight Ember DHT iterative searches (slice 16). */
 export async function getEmberDhtSearches(): Promise<EmberDhtSearchEntry[]> {
-  return invoke<EmberDhtSearchEntry[]>('get_ember_dht_searches');
+  return withTimeout(invoke<EmberDhtSearchEntry[]>('get_ember_dht_searches'), 'get_ember_dht_searches', 10_000);
 }
 
 /** Snapshot live Ember DHT store keys (slice 16). */
 export async function getEmberDhtStore(): Promise<EmberDhtStoreEntry[]> {
-  return invoke<EmberDhtStoreEntry[]>('get_ember_dht_store');
+  return withTimeout(invoke<EmberDhtStoreEntry[]>('get_ember_dht_store'), 'get_ember_dht_store', 10_000);
 }

@@ -65,7 +65,7 @@ impl std::fmt::Debug for NodeIdentity {
 }
 
 impl NodeIdentity {
-    fn generate() -> Self {
+    fn generate() -> anyhow::Result<Self> {
         let mut rng = OsRng;
         let mut kad_id = [0u8; 16];
         let mut user_hash = [0u8; 16];
@@ -85,13 +85,13 @@ impl NodeIdentity {
             .expect("static Noise pattern string is always valid");
         let noise_keypair = snow::Builder::new(noise_params)
             .generate_keypair()
-            .expect("Noise keypair generation requires a working OS RNG");
+            .map_err(|e| anyhow::anyhow!("Noise keypair generation failed: {e:?}"))?;
         let mut noise_private_key = [0u8; 32];
         let mut noise_public_key = [0u8; 32];
         noise_private_key.copy_from_slice(&noise_keypair.private);
         noise_public_key.copy_from_slice(&noise_keypair.public);
 
-        NodeIdentity {
+        Ok(NodeIdentity {
             kad_id,
             user_hash,
             udp_key_seed,
@@ -100,7 +100,7 @@ impl NodeIdentity {
             ed25519_public_key: public_key.to_bytes(),
             noise_private_key,
             noise_public_key,
-        }
+        })
     }
 
     pub fn kad_id(&self) -> KadId {
@@ -279,7 +279,7 @@ impl NodeIdentity {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let id = Self::generate();
+                let id = Self::generate()?;
                 let data = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
                 let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
                 std::fs::create_dir_all(data_dir)?;
@@ -319,7 +319,7 @@ mod tests {
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let identity = NodeIdentity::generate();
+        let identity = NodeIdentity::generate().expect("test identity");
         std::fs::write(
             dir.join("identity.json"),
             serde_json::to_vec_pretty(&identity).unwrap(),
