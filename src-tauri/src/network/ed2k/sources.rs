@@ -110,6 +110,13 @@ pub enum DownloadSourceState {
 /// an unverified NAT IP — especially Ember DHT firewalled records, which
 /// skip the storer's anti-reflection bind. `LowToLowIp` / `EmberRelay` /
 /// `FriendConnect` / `Banned` are the other never-dial parks.
+/// Callback requests a `WaitCallbackKad` row may send before the route is
+/// written off and the row returns to the dial pool. Six at the 90 s
+/// [`KAD_CALLBACK_REASK_SECS`] cadence is roughly nine minutes — far longer
+/// than a working buddy needs to relay one frame, and comfortably shorter than
+/// the indefinite park this replaces.
+const MAX_CALLBACK_REASKS: u32 = 6;
+
 fn source_state_blocks_outbound_tcp(state: &DownloadSourceState) -> bool {
     matches!(
         state,
@@ -157,6 +164,10 @@ pub struct DownloadSourceEntry {
     pub callback_ember_token: Option<[u8; 16]>,
     /// Publisher's ED2K user hash from the KAD source record.
     pub source_user_hash: Option<[u8; 16]>,
+    /// Callback requests sent since this row entered the callback route.
+    /// Bounds how long `WaitCallbackKad` may hold the row out of the dial
+    /// pool — see [`Self::callback_route_exhausted`].
+    pub callback_reasks_sent: u32,
     /// Latest part availability bitmap learned from TCP file status or UDP
     /// OP_REASKACK. Used for NNP and complete-source accounting.
     pub available_parts: Vec<bool>,
@@ -181,15 +192,45 @@ impl DownloadSourceEntry {
             callback_ember_publisher: None,
             callback_ember_token: None,
             source_user_hash: None,
+            callback_reasks_sent: 0,
             available_parts: Vec::new(),
         }
     }
 
     /// Shift `last_asked` so [`Self::time_until_reask`] returns 0 immediately.
+    /// A fresh publish also restores the callback budget: new buddy info is a
+    /// reason to believe the route works again.
     fn arm_callback_reask(&mut self) {
         self.last_asked = Instant::now()
             .checked_sub(Duration::from_secs(FILEREASKTIME_SECS as u64 + 1))
             .unwrap_or_else(Instant::now);
+        self.callback_reasks_sent = 0;
+    }
+
+    /// Whether the callback route has had its allotted attempts.
+    ///
+    /// `WaitCallbackKad` parks a row indefinitely: it is excluded from the TCP
+    /// dial pool and [`Self::time_until_reask`] reports `u64::MAX`. That is
+    /// right for a peer that really is firewalled and really will connect
+    /// back, but nothing transitions a row *out* of the state, so a row that
+    /// got here by user-hash dedup — a previously dialable HighID peer that a
+    /// firewalled publish for the same user hash reclassified — would never be
+    /// dialed again for the life of the transfer. Bounding the attempts gives
+    /// the callback a genuine chance (six tries at the 90 s
+    /// [`KAD_CALLBACK_REASK_SECS`] cadence is ~9 minutes) and then hands the
+    /// row back to the ordinary reask path.
+    pub fn callback_route_exhausted(&self) -> bool {
+        self.callback_reasks_sent >= MAX_CALLBACK_REASKS
+    }
+
+    /// Whether this row's address must not be handed to an outbound TCP
+    /// dialer. Wraps [`source_state_blocks_outbound_tcp`] so the
+    /// `WaitCallbackKad` park can expire; every other park is unconditional.
+    fn blocks_outbound_tcp(&self) -> bool {
+        if matches!(self.state, DownloadSourceState::WaitCallbackKad) {
+            return !self.callback_route_exhausted();
+        }
+        source_state_blocks_outbound_tcp(&self.state)
     }
 
     /// Whether a KAD `CallbackReq` should be (re)sent for this firewalled
@@ -199,6 +240,7 @@ impl DownloadSourceEntry {
     /// buddy info so we never spin on a source we can't actually call back.
     pub fn kad_callback_reask_due(&self) -> bool {
         matches!(self.state, DownloadSourceState::WaitCallbackKad)
+            && !self.callback_route_exhausted()
             && self.callback_buddy_ip.is_some()
             && self.callback_buddy_hash.is_some()
             && self.callback_ember_buddy_noise.is_none()
@@ -209,6 +251,7 @@ impl DownloadSourceEntry {
     /// buddy Noise key and publisher node ID from the signed source record.
     pub fn ember_callback_reask_due(&self) -> bool {
         matches!(self.state, DownloadSourceState::WaitCallbackKad)
+            && !self.callback_route_exhausted()
             && self.callback_buddy_ip.is_some()
             && self.callback_ember_buddy_noise.is_some()
             && self.callback_ember_publisher.is_some()
@@ -252,8 +295,18 @@ impl DownloadSourceEntry {
                 }
                 return u64::MAX;
             }
-            DownloadSourceState::WaitCallbackKad
-            | DownloadSourceState::LowToLowIp
+            // Parked until the firewalled peer connects back — but only while
+            // the callback route still has attempts left. Once spent, fall
+            // through to the ordinary interval so the row can be reasked and
+            // dialed instead of sitting out the transfer.
+            DownloadSourceState::WaitCallbackKad => {
+                if self.callback_route_exhausted() {
+                    FILEREASKTIME_SECS as u64
+                } else {
+                    return u64::MAX;
+                }
+            }
+            DownloadSourceState::LowToLowIp
             | DownloadSourceState::EmberRelay
             // Dialing is exactly what failed, so don't re-dial while the
             // friend's connect-back is outstanding. The network loop clears
@@ -548,7 +601,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 !s.ip.is_unspecified()
                     && s.tcp_port != 0
-                    && !source_state_blocks_outbound_tcp(&s.state)
+                    && !s.blocks_outbound_tcp()
             })
             .map(|s| (s.ip, s.tcp_port, s.udp_port))
             .collect()
@@ -573,6 +626,16 @@ impl PerFileSourceList {
             s.callback_buddy_ip = Some(buddy_ip);
             s.callback_buddy_port = Some(buddy_port);
             s.callback_buddy_hash = Some(buddy_hash);
+            // The two callback routes share `callback_buddy_ip`/`_port` but
+            // carry their own identity, so leaving the Ember fields set here
+            // would describe the KAD buddy's address with the Ember buddy's
+            // Noise key. `ember_callback_reask_due` would then win the
+            // predicate race (`kad_callback_reask_due` requires no Noise key),
+            // and every reask opened a handshake that can never complete —
+            // while `WaitCallbackKad` kept the row out of the TCP dial pool.
+            s.callback_ember_buddy_noise = None;
+            s.callback_ember_publisher = None;
+            s.callback_ember_token = None;
             if source_user_hash.is_some() {
                 s.source_user_hash = source_user_hash;
             }
@@ -607,6 +670,10 @@ impl PerFileSourceList {
             s.callback_ember_buddy_noise = Some(buddy_noise);
             s.callback_ember_publisher = Some(publisher_id);
             s.callback_ember_token = callback_token.filter(|t| *t != [0u8; 16]);
+            // Mirror of `set_kad_callback_buddy`: the buddy address now
+            // describes the Ember buddy, so a stale KAD buddy hash on the same
+            // row would point the KAD route at the wrong host.
+            s.callback_buddy_hash = None;
             if source_user_hash.is_some() {
                 s.source_user_hash = source_user_hash;
             }
@@ -634,6 +701,7 @@ impl PerFileSourceList {
     ) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.last_asked = Instant::now();
+            s.callback_reasks_sent = s.callback_reasks_sent.saturating_add(1);
         }
     }
 
@@ -772,7 +840,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 s.time_until_reask_at(now) == 0
                     && s.can_try_tcp_at(now)
-                    && !source_state_blocks_outbound_tcp(&s.state)
+                    && !s.blocks_outbound_tcp()
             })
             .collect();
         ready.sort_by(|a, b| {
@@ -807,7 +875,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 s.time_until_reask() == 0
                     && s.can_try_tcp()
-                    && !source_state_blocks_outbound_tcp(&s.state)
+                    && !s.blocks_outbound_tcp()
                     && !is_banned(s.ip, s.tcp_port)
             })
             .collect();
@@ -2569,6 +2637,110 @@ mod tests {
         );
         pfs.mark_callback_requested(ip, 4662, None);
         assert!(!pfs.sources[0].ember_callback_reask_due());
+    }
+
+    /// A peer that publishes both an Ember firewalled source record and a KAD
+    /// type-3 source resolves to one row (same user hash), so the second
+    /// publish overwrites the shared buddy address. The identity fields have to
+    /// follow it: a row holding the KAD buddy's address next to the Ember
+    /// buddy's Noise key sends a handshake that can never complete, forever,
+    /// while `WaitCallbackKad` keeps it out of the dial pool.
+    #[test]
+    fn a_later_callback_publish_replaces_the_other_transports_identity() {
+        let hash = [0x47; 16];
+        let peer = Ipv4Addr::new(10, 0, 0, 9);
+        let ember_buddy = Ipv4Addr::new(8, 8, 8, 8);
+        let kad_buddy = Ipv4Addr::new(9, 9, 9, 9);
+        let user = [0xBBu8; 16];
+
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_with_identity(peer, 4662, 0, Some(user)));
+
+        pfs.set_ember_callback_buddy(
+            peer,
+            4662,
+            ember_buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xBBu8; 16],
+            Some(user),
+            Some([0xDDu8; 16]),
+            true,
+        );
+        assert!(pfs.sources[0].ember_callback_reask_due());
+        assert!(
+            pfs.sources[0].callback_buddy_hash.is_none(),
+            "the Ember publish owns the buddy address, so no KAD hash may linger"
+        );
+
+        // Now the KAD publish for the same peer lands and takes the address.
+        pfs.set_kad_callback_buddy(peer, 4662, kad_buddy, 4672, [0xEEu8; 16], Some(user), true);
+        let s = &pfs.sources[0];
+        assert_eq!(s.callback_buddy_ip, Some(kad_buddy));
+        assert!(
+            s.callback_ember_buddy_noise.is_none()
+                && s.callback_ember_publisher.is_none()
+                && s.callback_ember_token.is_none(),
+            "Ember identity must not survive next to a KAD buddy address"
+        );
+        assert!(
+            s.kad_callback_reask_due(),
+            "the KAD route must actually fire once it owns the row"
+        );
+        assert!(
+            !s.ember_callback_reask_due(),
+            "and the Ember route must not aim at the KAD buddy"
+        );
+    }
+
+    /// `WaitCallbackKad` used to be an indefinite park, so a row that reached
+    /// it — including a previously dialable peer reclassified by user-hash
+    /// dedup — was excluded from the dial pool for the whole transfer. The
+    /// callback route now gets a bounded number of attempts and then hands the
+    /// row back.
+    #[test]
+    fn an_unanswered_callback_route_returns_the_row_to_the_dial_pool() {
+        let hash = [0x48; 16];
+        let peer = Ipv4Addr::new(10, 0, 0, 9);
+        let buddy = Ipv4Addr::new(8, 8, 8, 8);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(peer, 4662, 0));
+        pfs.set_kad_callback_buddy(peer, 4662, buddy, 4672, [0xAA; 16], None, true);
+
+        // While the route has attempts left the row stays parked.
+        assert!(pfs.sources[0].kad_callback_reask_due());
+        assert!(pfs.dialable_sources().is_empty());
+        assert_eq!(pfs.sources[0].time_until_reask(), u64::MAX);
+
+        // Spend the budget, as the network loop's reask cadence would.
+        for _ in 0..MAX_CALLBACK_REASKS {
+            pfs.sources[0].last_asked = Instant::now()
+                .checked_sub(Duration::from_secs(KAD_CALLBACK_REASK_SECS as u64 + 1))
+                .unwrap();
+            assert!(pfs.sources[0].kad_callback_reask_due());
+            pfs.mark_callback_requested(peer, 4662, None);
+        }
+
+        assert!(pfs.sources[0].callback_route_exhausted());
+        assert!(
+            !pfs.sources[0].kad_callback_reask_due(),
+            "a written-off route must stop burning a UDP send every cycle"
+        );
+        assert_ne!(
+            pfs.sources[0].time_until_reask(),
+            u64::MAX,
+            "the row must rejoin the ordinary reask schedule"
+        );
+        assert_eq!(
+            pfs.dialable_sources(),
+            vec![(peer, 4662, 0)],
+            "and become dialable again rather than sitting out the transfer"
+        );
+
+        // A fresh publish is a reason to believe the route works again.
+        pfs.set_kad_callback_buddy(peer, 4662, buddy, 4672, [0xAA; 16], None, true);
+        assert!(!pfs.sources[0].callback_route_exhausted());
+        assert!(pfs.dialable_sources().is_empty());
     }
 
     #[test]

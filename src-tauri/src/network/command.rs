@@ -4508,6 +4508,15 @@ async fn handle_command_inner(
                         .map(|r| hex::encode(r.file_hash)),
                 )
                 .collect();
+            // Until known.met is absorbed, kad_may_advertise_* is false for
+            // every hash. Reconciling anyway would retain([]) — wiping a
+            // first-publish that landed in the same session — and queue an
+            // empty OP_OFFERFILES that tells the server we share nothing.
+            if !known_files.is_authoritative() {
+                info!(
+                    "Skipping KAD/eD2K advertise reconcile until known.met is absorbed"
+                );
+            } else {
             let mut seen_hashes = std::collections::HashSet::new();
             let files: Vec<PublishableFile> = all_index_files
                 .iter()
@@ -4710,6 +4719,7 @@ async fn handle_command_inner(
                     // this Ack returns immediately and does not block IPC.
                     state.request_offer_files = true;
                 }
+            }
             }
             let _ = reconcile_ack.send(Ok(()));
         }

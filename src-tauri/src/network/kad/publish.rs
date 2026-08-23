@@ -1079,6 +1079,33 @@ mod tests {
     }
 
     #[test]
+    fn build_source_publish_skips_firewalled_without_buddy_or_callback() {
+        let mut publisher = make_publisher(false);
+        publisher.firewalled = true;
+        publisher.direct_udp_callback = false;
+        publisher.buddy_id = None;
+        assert!(
+            publisher.build_source_publish(&sample_file()).is_none(),
+            "firewalled source publish must wait for a buddy or verified UDP callback"
+        );
+
+        publisher.direct_udp_callback = true;
+        assert!(
+            publisher.build_source_publish(&sample_file()).is_some(),
+            "type-6 callback is enough to publish without a buddy"
+        );
+
+        publisher.direct_udp_callback = false;
+        publisher.buddy_id = Some(KadId([0x11; 16]));
+        publisher.buddy_ip = 1;
+        publisher.buddy_port = 4662;
+        assert!(
+            publisher.build_source_publish(&sample_file()).is_some(),
+            "a connected buddy is enough to publish without type-6"
+        );
+    }
+
+    #[test]
     fn buddyhash_tag_uses_uppercase_hex_like_emule_md4str() {
         let mut publisher = make_publisher(false);
         publisher.firewalled = true;
