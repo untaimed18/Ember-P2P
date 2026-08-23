@@ -37,6 +37,13 @@ pub const MSG_STORE_BATCH_ACK: u8 = 0x0E;
 pub const MSG_CALLBACK_REQ: u8 = 0x0F;
 /// Buddy → firewalled publisher: connect to this searcher for `file_hash`.
 pub const MSG_CALLBACK: u8 = 0x10;
+// `0x11` and `0x12` are the channel gossip pair (`MSG_CHANNEL_MSG` /
+// `MSG_CHANNEL_RELAY`). They are not defined on this branch, but they are
+// spoken on the wire by builds that do define them, so nothing here may reuse
+// them: a `BUDDY_ENDORSE_REQ` carries no payload and its decoder ignores the
+// body, so a channel frame landing on that arm would decode cleanly and draw a
+// signed endorsement in reply. Message numbering is global to the overlay, not
+// to a branch.
 /// Firewalled publisher → candidate buddy: sign your own endpoint for me, so
 /// I can name you in a source trailer and searchers can verify it offline.
 ///
@@ -46,10 +53,10 @@ pub const MSG_CALLBACK: u8 = 0x10;
 /// Additive like `CALLBACK_REQ`: a peer that does not speak this type decodes
 /// it as [`DhtPayload::Unknown`] and ignores it, which reads to the requester
 /// as a buddy that cannot be named. Not a version bump.
-pub const MSG_BUDDY_ENDORSE_REQ: u8 = 0x11;
+pub const MSG_BUDDY_ENDORSE_REQ: u8 = 0x13;
 /// Buddy → firewalled publisher: my endpoint, signed by my identity key and
 /// bound to you and an expiry.
-pub const MSG_BUDDY_ENDORSE: u8 = 0x12;
+pub const MSG_BUDDY_ENDORSE: u8 = 0x14;
 
 /// `CALLBACK_REQ` body: publisher node id, file hash, searcher TCP port,
 /// crypt options, searcher eD2K user hash, callback token. The searcher's
