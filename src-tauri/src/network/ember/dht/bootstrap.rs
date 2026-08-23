@@ -18,6 +18,43 @@ const NODES_EMBER_VERSION: u8 = 1;
 /// `add_contact` calls, all on the startup path.
 const MAX_PERSISTED_CONTACTS: usize = crate::network::EMBER_PERSIST_MAX_CONTACTS;
 
+/// Byte ceiling on `nodes_ember.dat` before it is read at all.
+///
+/// The parse loop is already capped, so a forged header cannot drive an
+/// allocation — but `std::fs::read` happens first and will happily pull a
+/// hand-edited or corrupted multi-gigabyte file entirely into memory on the
+/// startup path. `MAX_PERSISTED_CONTACTS` (200) contacts of roughly a hundred
+/// bytes each is about 20 KB, so this is orders of magnitude of slack while
+/// still bounding the read. `kad/bootstrap.rs` guards its own loader the same
+/// way.
+const MAX_NODES_EMBER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Byte ceiling on `store_ember.dat`, for the same reason. 20,000 records at
+/// roughly 1.3 KB each is about 26 MB, so this leaves room to grow.
+const MAX_STORE_EMBER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Copy the current file aside before it is replaced.
+///
+/// Deliberately best-effort and silent: we would rather commit the new file
+/// than refuse the save because a backup could not be made. This is what makes
+/// a thinned-table write recoverable — `save_nodes` only refuses to overwrite
+/// when the table is *empty*, so a table cut to a handful of contacts by
+/// `evict_filtered_contacts`, a `block_private_ips` toggle, or `remove_stale`
+/// after an outage will legitimately be persisted over a healthy 200-contact
+/// file, and without this the previous contents were unrecoverable. Mirrors
+/// `kad/bootstrap.rs`, which has kept a `.bak` for `nodes.dat` all along.
+fn backup_before_overwrite(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    let bak = path.with_file_name(name);
+    if let Err(e) = std::fs::copy(path, &bak) {
+        tracing::debug!("Could not back up {} before overwrite: {e}", path.display());
+    }
+}
+
 /// Persist the routing table to `nodes_ember.dat`.
 ///
 /// Format:
@@ -70,6 +107,7 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
         buf.write_i64::<LittleEndian>(contact.last_seen)?;
     }
 
+    backup_before_overwrite(path);
     crate::security::atomic_write(path, &buf, false)?;
     info!("Saved {} Ember DHT contacts to {}", count, path.display());
     Ok(())
@@ -78,6 +116,14 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
 /// Load contacts from `nodes_ember.dat`.
 pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
     crate::security::recover_interrupted_replace(path);
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_NODES_EMBER_BYTES {
+            anyhow::bail!(
+                "nodes_ember.dat too large ({} bytes, max {MAX_NODES_EMBER_BYTES})",
+                meta.len()
+            );
+        }
+    }
     let data = std::fs::read(path)?;
     if data.len() < 7 {
         anyhow::bail!("nodes_ember.dat too small");
@@ -305,6 +351,7 @@ pub fn save_store(
         buf.write_all(&record.data)?;
     }
 
+    backup_before_overwrite(path);
     crate::security::atomic_write(path, &buf, false)?;
     info!(
         "Saved {} Ember DHT records to {}",
@@ -322,6 +369,14 @@ pub fn save_store(
 /// malformed file yields whatever parsed cleanly before the damage.
 pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedRecord>> {
     crate::security::recover_interrupted_replace(path);
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_STORE_EMBER_BYTES {
+            anyhow::bail!(
+                "store_ember.dat too large ({} bytes, max {MAX_STORE_EMBER_BYTES})",
+                meta.len()
+            );
+        }
+    }
     let data = std::fs::read(path)?;
     if data.len() < 9 {
         anyhow::bail!("store_ember.dat too small");

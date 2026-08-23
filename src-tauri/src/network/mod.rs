@@ -7727,8 +7727,20 @@ mod tests {
     /// behind a Noise handshake was charged nothing, which meant the next
     /// flush six seconds later saw the whole allowance again and a cold peer
     /// could be committed several times over before its handshake finished.
+    ///
+    /// The budget is a *trailing* window now, mirroring the storer's own gate
+    /// (`ember::dht::protection::WindowCounter`) — the two have to use the same
+    /// model or the pacing is fiction, and a storer refusing an over-budget
+    /// frame discards the whole batch without acking it. So the property is no
+    /// longer "spent for exactly a minute, then a clean jump"; it is "charged
+    /// immediately, returned gradually, and never handed back in full inside
+    /// the window".
+    ///
+    /// Queried in forward time order throughout: `record_allowance` ages the
+    /// buckets as a side effect, so going backwards would read a window that
+    /// has already rolled past that instant.
     #[test]
-    fn a_committed_batch_spends_the_peers_minute_for_the_whole_minute() {
+    fn a_committed_batch_is_charged_and_returns_only_gradually() {
         let mut pub_ = EmberBatchPublisher::default();
         let node = ember::dht::EmberNodeId([5u8; 16]);
         let now = std::time::Instant::now();
@@ -7737,20 +7749,37 @@ mod tests {
         assert_eq!(pub_.record_allowance(node, now), per_minute);
         pub_.note_records_sent(node, now, per_minute);
 
-        // Every flush inside the same minute must find the budget spent, not
-        // just the one that charged it.
+        // The original bug: the very next flush saw the whole budget again.
+        assert_eq!(
+            pub_.record_allowance(node, now + EMBER_FLUSH_INTERVAL),
+            0,
+            "a committed batch must be charged straight away"
+        );
+
+        // Walk the rest of the window forward. It may return budget gradually,
+        // but must never offer a fresh full allowance inside it.
         let mut at = now + EMBER_FLUSH_INTERVAL;
+        let mut saw_partial_return = false;
         while at.duration_since(now) < std::time::Duration::from_secs(60) {
-            assert_eq!(
-                pub_.record_allowance(node, at),
-                0,
-                "the peer's minute is spent until the window rolls"
+            let allowance = pub_.record_allowance(node, at);
+            assert!(
+                allowance < per_minute,
+                "a full budget was offered {:?} into the window",
+                at.duration_since(now)
             );
+            if allowance > 0 {
+                saw_partial_return = true;
+            }
             at += EMBER_FLUSH_INTERVAL;
         }
-        // Once the window rolls the peer is offered a fresh minute.
+        assert!(
+            saw_partial_return,
+            "a trailing window should hand budget back gradually, not in one jump"
+        );
+
+        // A full window of silence restores it completely.
         assert_eq!(
-            pub_.record_allowance(node, now + std::time::Duration::from_secs(61)),
+            pub_.record_allowance(node, now + std::time::Duration::from_secs(200)),
             per_minute
         );
     }
@@ -41959,6 +41988,25 @@ async fn maybe_publish_ember_sources(
         state.ember_diagnostics.ember_dht_firewalled_publishing = true;
     }
 
+    // TTL-expire source records still held for a buddy ACK before anything can
+    // return early.
+    //
+    // This is the only periodic sweep of `ember_pending_proxy_overlay`, and it
+    // used to sit below the `due.is_empty()` bail further down — which is
+    // reached precisely when every publishable file is already pinned, because
+    // `ember_publish_staleness` returns `None` for a file with an `unplaced`
+    // entry. So a firewalled node whose named buddy never ACKs (it can legally
+    // send nothing: budget refused, publish table full, or replica rejected)
+    // pinned its whole library within a couple of ticks on the 5-file-per-tick
+    // floor, went permanently `due`-empty, and never again ran the sweep that
+    // would release it — publishing no Ember source record for the rest of the
+    // session while ~10 signed records stayed resident. The 256-entry cap never
+    // fired either, because the map never grew that far.
+    //
+    // Running it here rather than after `due` is computed also means a file the
+    // TTL releases becomes eligible on this tick instead of losing one.
+    prune_ember_pending_proxy_overlay(state);
+
     // Gauges above are wanted every tick, so this comes after them.
     if ember_publish_queue_is_backed_up(state) {
         return;
@@ -42057,8 +42105,6 @@ async fn maybe_publish_ember_sources(
         contact.buddy = Some(*buddy);
         contact.user_hash = Some(state.user_hash);
     }
-
-    prune_ember_pending_proxy_overlay(state);
 
     for (file_hash, file_size, file_name, ember_file_hash) in due {
         let mut file_contact = contact;
@@ -42767,12 +42813,43 @@ async fn run_ember_maintenance(
     //    would be refused a slot outright and the rest would arrive as a
     //    burst far past what a peer accepts per second — the records would be
     //    dropped, unacked, and retried forever.
+    //    Sized from what the flush can actually deliver, and yielding to our
+    //    own publishing.
+    //
+    //    This shares one queue — and one backpressure gate — with source and
+    //    keyword publishing, but took a flat `EMBER_MAINT_MAX_REPUBLISH` while
+    //    both of those size themselves from the routing table. On a small table
+    //    that over-subscribes badly: twenty or fewer contacts means every peer
+    //    receives every record, so the whole tick lands on each of them against
+    //    a per-peer minute budget. The surplus was dropped by carry-over, and
+    //    `mark_republish_due` below makes a dropped replication record due again
+    //    on the very next tick regardless of the interval — so the queue settled
+    //    above the backpressure threshold and stayed there, at which point both
+    //    `maybe_publish_ember_sources` and `maybe_publish_ember_keywords`
+    //    returned without selecting anything, every tick. A node holding a large
+    //    foreign store therefore stopped publishing its *own* files while
+    //    spending its uplink re-sending other people's records it could never
+    //    drain.
+    //
+    //    Half the deliverable budget, because replication is altruistic churn
+    //    coverage while our own records are what the user actually shared; and
+    //    nothing at all while the queue is already backed up, so replication can
+    //    never be the reason our own publishing is skipped.
     let republish_interval = std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS);
     result.republish_due = state.ember_dht.republish_backlog(republish_interval);
-    let republish_batch =
+    let republish_budget = if ember_publish_queue_is_backed_up(state) {
+        0
+    } else {
+        (ember_deliverable_records_per_tick(ember_publishable_peer_count(state)) / 2)
+            .min(EMBER_MAINT_MAX_REPUBLISH)
+    };
+    let republish_batch = if republish_budget == 0 {
+        Vec::new()
+    } else {
         state
             .ember_dht
-            .take_republish_batch(republish_interval, EMBER_MAINT_MAX_REPUBLISH, force);
+            .take_republish_batch(republish_interval, republish_budget, force)
+    };
     result.republish_selected = republish_batch.len();
     for (data, signature) in republish_batch {
         let record = match ember::dht::publish::SignedRecord::from_wire(&data, signature) {

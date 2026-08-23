@@ -123,10 +123,84 @@ pub(crate) struct EmberBatchPublisher {
     /// cannot afford to re-sum every destination on each call.
     pub(crate) queued_count: usize,
     pub(crate) in_flight: HashMap<u32, EmberBatchInFlight>,
-    /// Records sent to each peer in the current minute, so the flush can run
-    /// often without exceeding what a storer will accept. See
-    /// [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`].
-    pub(crate) sent_window: HashMap<ember::dht::EmberNodeId, (u32, std::time::Instant)>,
+    /// Records sent to each peer recently, so the flush can run often without
+    /// exceeding what a storer will accept. See
+    /// [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`] and [`SentWindow`].
+    pub(crate) sent_window: HashMap<ember::dht::EmberNodeId, SentWindow>,
+}
+
+/// Sender-side mirror of the storer's rate window.
+///
+/// This has to use the same model as the receiver or the pacing is fiction.
+/// The storer's [`crate::network::kad`]-style gate
+/// (`ember::dht::protection::WindowCounter`) keeps the previous half-window's
+/// count and weights it by how far into the current half we are, enforcing the
+/// limit over a *trailing* span. This used to be a single counter reset
+/// wholesale at 60 s — a fixed window anchored on the first send of each
+/// minute — so the two only agreed when our minute happened to hold one burst.
+/// A queue that filled unevenly reached our reset believing the whole budget
+/// was free while the storer still carried most of the preceding half and
+/// admitted a fraction of it.
+///
+/// That mattered more than a normal overshoot because the storer's gate is
+/// all-or-nothing per frame and refuses *before* `handle_message`, so no
+/// `STORE_BATCH_ACK` is built: a single refusal silently discards up to
+/// `MAX_STORE_BATCH_RECORDS` records, they age out of `in_flight` as a failed
+/// round, and after `EMBER_PUBLISH_MAX_ATTEMPTS` their files wait out a whole
+/// republish interval. Sources kept flowing so files stayed downloadable by
+/// hash, while their keyword records lapsed and they left DHT search.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SentWindow {
+    /// Charged in the current half-window.
+    count: u32,
+    /// Charged in the half-window before it.
+    previous: u32,
+    /// Start of the current half-window.
+    start: std::time::Instant,
+}
+
+/// Span the per-peer record budget is measured over.
+const SENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl SentWindow {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            count: 0,
+            previous: 0,
+            start: now,
+        }
+    }
+
+    /// Roll the buckets forward. One half-window elapsed ages `count` into
+    /// `previous`; a full window of silence starts clean.
+    fn age(&mut self, now: std::time::Instant) {
+        let half = SENT_WINDOW / 2;
+        let since = now.saturating_duration_since(self.start);
+        if since < half {
+            return;
+        }
+        if since < SENT_WINDOW {
+            self.previous = self.count;
+            self.count = 0;
+            self.start += half;
+        } else {
+            self.previous = 0;
+            self.count = 0;
+            self.start = now;
+        }
+    }
+
+    /// Weighted charge against the trailing window, matching the storer.
+    fn effective(&self, now: std::time::Instant) -> f64 {
+        let half = SENT_WINDOW / 2;
+        let elapsed = now.saturating_duration_since(self.start).min(half);
+        let carry = 1.0 - (elapsed.as_secs_f64() / half.as_secs_f64().max(f64::EPSILON));
+        self.count as f64 + self.previous as f64 * carry
+    }
+
+    fn started_at(&self) -> std::time::Instant {
+        self.start
+    }
 }
 
 /// How one storer's `STORE_BATCH_ACK` resolved the records it was sent.
@@ -176,7 +250,17 @@ pub(crate) const EMBER_MAX_BATCH_FRAMES_PER_PEER: usize = 12;
 /// overshooting means republishing it forever. A storer with a healthy table
 /// enforces the strictest tier and we cannot see which tier a given peer is in,
 /// so pace to that rather than to the more generous bootstrap figure.
-pub(crate) const EMBER_STORE_RECORDS_PER_PEER_PER_MIN: u32 = 120;
+///
+/// Deliberately *below* that strictest tier (120) rather than equal to it. Even
+/// with [`SentWindow`] mirroring the storer's model, the two windows are
+/// anchored at different instants — ours on our first send to that peer, theirs
+/// on their first receipt from us — so their weighted view of a given burst can
+/// exceed ours by part of a half-window. Pacing to the exact figure left no
+/// margin for that, and being over by one record costs a whole frame: the
+/// storer's gate is per-frame and refuses without acking, so up to
+/// `MAX_STORE_BATCH_RECORDS` records are discarded silently. The headroom is
+/// cheap — it only slows a peer already at 96 records a minute.
+pub(crate) const EMBER_STORE_RECORDS_PER_PEER_PER_MIN: u32 = 96;
 
 /// How often the queued records are drained.
 ///
@@ -359,13 +443,13 @@ impl EmberBatchPublisher {
         node_id: ember::dht::EmberNodeId,
         now: std::time::Instant,
     ) -> usize {
-        match self.sent_window.get(&node_id) {
-            Some((used, since))
-                if now.duration_since(*since) < std::time::Duration::from_secs(60) =>
-            {
-                EMBER_STORE_RECORDS_PER_PEER_PER_MIN.saturating_sub(*used) as usize
+        match self.sent_window.get_mut(&node_id) {
+            Some(window) => {
+                window.age(now);
+                let used = window.effective(now).ceil();
+                (f64::from(EMBER_STORE_RECORDS_PER_PEER_PER_MIN) - used).max(0.0) as usize
             }
-            _ => EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize,
+            None => EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize,
         }
     }
 
@@ -378,18 +462,20 @@ impl EmberBatchPublisher {
         if records == 0 {
             return;
         }
-        let entry = self.sent_window.entry(node_id).or_insert((0, now));
-        if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
-            *entry = (0, now);
-        }
-        entry.0 = entry.0.saturating_add(records as u32);
+        let window = self
+            .sent_window
+            .entry(node_id)
+            .or_insert_with(|| SentWindow::new(now));
+        window.age(now);
+        window.count = window.count.saturating_add(records as u32);
     }
 
     /// Forget pacing state for peers we have not sent to in a while, so a long
     /// session's churn cannot grow the map without bound.
     pub(crate) fn prune_sent_window(&mut self, now: std::time::Instant) {
-        self.sent_window.retain(|_, (_, since)| {
-            now.duration_since(*since) < std::time::Duration::from_secs(300)
+        self.sent_window.retain(|_, window| {
+            now.saturating_duration_since(window.started_at())
+                < std::time::Duration::from_secs(300)
         });
     }
 
