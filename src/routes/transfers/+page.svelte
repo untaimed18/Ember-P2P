@@ -98,7 +98,7 @@
     { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
     { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
     { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 70, minWidth: 56, className: 'col-ul-speed', sortField: 'speed' },
-    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, get title() { return m.transfers_col_transferred_upload_hint(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
+    { key: 'transferred', get label() { return m.transfers_col_sent_session(); }, get title() { return m.transfers_col_transferred_upload_hint(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
     // Hidden by default. This is session wire bytes measured against the file
     // size, and re-requests make the former legitimately exceed the latter, so
     // side by side the pair reads like a bug. eMule's upload list has no size
@@ -106,7 +106,7 @@
     { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 70, minWidth: 56, className: 'col-ul-total', defaultHidden: true },
     { key: 'waited', get label() { return m.transfers_col_wait_time(); }, width: 80, minWidth: 72, className: 'col-ul-wait', sortField: 'waited' },
     { key: 'upload_time', get label() { return m.transfers_col_upload_time(); }, width: 80, minWidth: 72, className: 'col-ul-uptime', sortField: 'upload_time' },
-    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status', defaultHidden: true },
     { key: 'up_status', get label() { return m.transfers_col_up_status(); }, width: 170, minWidth: 120, className: 'col-ul-bar' },
   ];
   // QUEUE_COLUMNS schema is for `UploadQueueClient` rows (the real
@@ -172,7 +172,7 @@
     downloads: 'transfers-column-hidden-DownloadListCtrl',
     // V2: bumped when Size became hidden by default, so existing users pick
     // the new layout up once instead of keeping a stale all-visible set.
-    uploads: 'transfers-column-hidden-UploadListCtrlV2',
+    uploads: 'transfers-column-hidden-UploadListCtrlV3',
     queue: 'transfers-column-hidden-QueueListCtrlV2',
     // V2: bumped when Last IP became hidden by default, so existing users
     // pick the new layout up once instead of keeping a stale all-visible set.
@@ -1620,8 +1620,6 @@
     return live > 0 ? live : (t.speed > 0 ? t.speed : 0);
   }
   // Match eMule-style behavior: show rate when transfer data is actually flowing.
-  let totalDownloadRate = $derived(activeDownloads.reduce((sum, t) => sum + displaySpeed(t), 0));
-  let totalUploadRate = $derived(activeUploads.reduce((sum, t) => sum + displaySpeed(t), 0));
   let transferringDownloads = $derived(activeDownloads.filter((t) => displaySpeed(t) > 0).length);
   let totalKnownSources = $derived(activeDownloads.reduce((sum, t) => sum + (t.sources || 0), 0));
   let activeConnectedSources = $derived(activeDownloads.reduce((sum, t) => sum + (t.active_sources || 0) + (t.queued_sources || 0), 0));
@@ -3318,13 +3316,6 @@
   <!-- TOP PANE: Downloads -->
   <div class="pane downloads-pane" style="flex: 0 0 {splitPercent}%;">
     <div class="transfer-overview-bar">
-      <!--
-        D7: these chips are payload-only rates summed over active transfers.
-        The StatusBar shows the network rate (includes protocol overhead),
-        which is expected to be higher. Tooltip clarifies the distinction.
-      -->
-      <span class="overview-chip" title={m.transfers_overview_dl_title()}><span class="overview-label">{m.transfers_overview_label_dl()}</span> {formatSpeed(totalDownloadRate)}</span>
-      <span class="overview-chip" title={m.transfers_overview_ul_title()}><span class="overview-label">{m.transfers_overview_label_ul()}</span> {formatSpeed(totalUploadRate)}</span>
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_active()}</span> {transferringDownloads}</span>
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_sources()}</span> {activeConnectedSources}/{totalKnownSources}</span>
       <label class="filter-wrap" aria-label={m.transfers_filter_aria()}>
@@ -3970,8 +3961,10 @@
                           the parts bar still half empty. `completed_size`
                           is unique per-part coverage, the same metric that
                           ends the session when it reaches file size.
+                          No percent overlay — same as the parts bar: this
+                          cell is a coverage map, not a completion %.
                         -->
-                        <ProgressBar value={t.completed_size} max={t.total_size} color="var(--accent)" />
+                        <ProgressBar value={t.completed_size} max={t.total_size} color="var(--accent)" showPercent={false} />
                         {/if}
                       {:else}
                         <span class="no-bar">—</span>

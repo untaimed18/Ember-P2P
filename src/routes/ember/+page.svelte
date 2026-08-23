@@ -8,10 +8,7 @@
    * contact / search / store snapshots, so the common case costs one
    * command per tick instead of four.
    *
-   * The overlay is always on. The power switch stays on the page so the
-   * control is familiar, but it is disabled: a node that starts with an
-   * empty routing table only fills it once the maintenance tick runs the
-   * KAD bridge — there is no central pool to fetch from.
+   * The overlay is always on.
    */
   import { onMount } from 'svelte';
   import {
@@ -28,7 +25,6 @@
   } from '$lib/types';
   import { formatDurationSecs } from '$lib/utils';
   import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
-  import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -264,25 +260,7 @@
   // file fetchable. This is the same set behind the Library's Ember badge.
   let sharingPublished = $derived(publishedCount > 0);
 
-  type PillTone = 'ok' | 'warn' | 'muted' | 'pending';
-
-  let networkPillLabel = $derived(
-    isConnected
-      ? m.ember_status_connected()
-      : joining
-        ? m.ember_status_connecting()
-        : m.ember_status_no_peers(),
-  );
-  let networkPillTone: PillTone = $derived(
-    isConnected ? 'ok' : joining ? 'pending' : 'warn',
-  );
-  let networkHint = $derived(
-    isConnected
-      ? m.ember_status_connected_hint()
-      : joining
-        ? m.ember_joining_hint()
-        : m.ember_no_contacts_hint(),
-  );
+  type PillTone = 'ok' | 'warn' | 'muted';
 
   let reachabilityTone: PillTone = $derived(
     reachability === 'direct' ? 'ok' : reachability === 'relayed' || reachability === 'waiting_buddy' ? 'warn' : 'muted',
@@ -315,26 +293,31 @@
       : '\u2014',
   );
 
-  let searchQualityLabel = $derived.by(() => {
-    const outcomes = diag?.ember_dht_search_outcomes ?? 0;
+  function searchAvg(sum: number | undefined, outcomes: number): string {
     if (outcomes <= 0) return '\u2014';
-    const nodes = Math.round((diag?.ember_dht_search_nodes_answered ?? 0) / outcomes);
-    const ms = Math.round((diag?.ember_dht_search_elapsed_ms_sum ?? 0) / outcomes);
-    const records = Math.round((diag?.ember_dht_search_records_sum ?? 0) / outcomes);
-    return `${nodes} / ${ms}ms / ${records}`;
-  });
+    return String(Math.round((sum ?? 0) / outcomes));
+  }
 
-  let storeRejectsLabel = $derived(
-    `${diag?.ember_dht_store_reject_verify ?? 0}/${diag?.ember_dht_store_reject_signature ?? 0}/${diag?.ember_dht_store_reject_timestamp ?? 0}/${diag?.ember_dht_store_reject_source_ip ?? 0}/${diag?.ember_dht_store_reject_source_ip_cap ?? 0}/${diag?.ember_dht_store_reject_publisher_cap ?? 0}/${diag?.ember_dht_store_reject_per_key_cap ?? 0}/${diag?.ember_dht_store_reject_proximity ?? 0}`,
-  );
+  function contactAnswered(c: EmberDhtContact): boolean {
+    return (c.last_seen ?? 0) > 0;
+  }
+
+  function contactLastSeen(c: EmberDhtContact): string {
+    const ts = c.last_seen ?? 0;
+    if (ts <= 0) return m.ember_dht_never_seen();
+    return formatDurationSecs(Math.max(0, Math.floor(Date.now() / 1000) - ts));
+  }
 
   // `id` exists so the `{#each}` below is keyed on something stable. Keying
   // on the label would put a translator in a position to crash the page:
   // two of these strings colliding in one locale is a duplicate-key error.
-  let metrics = $derived([
+  let metrics = $derived.by(() => {
+    const outcomes = diag?.ember_dht_search_outcomes ?? 0;
+    return [
     { id: 'contacts', k: m.ember_stat_contacts(), v: String(peerCount) },
-    { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: `${diag?.ember_dht_verified_contacts ?? 0}/${peerCount}` },
-    { id: 'verified-peak', k: m.ember_stat_verified_peak(), v: `${diag?.ember_dht_verified_highwater_today ?? 0}/${diag?.ember_dht_verified_highwater ?? 0}` },
+    { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: String(diag?.ember_dht_verified_contacts ?? 0) },
+    { id: 'verified-peak-today', k: m.ember_stat_verified_peak_today(), v: String(diag?.ember_dht_verified_highwater_today ?? 0) },
+    { id: 'verified-peak-all', k: m.ember_stat_verified_peak_alltime(), v: String(diag?.ember_dht_verified_highwater ?? 0) },
     { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
     { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
     { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: String(diag?.ember_dht_republish_backlog ?? 0) },
@@ -346,29 +329,49 @@
     { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: String(diag?.ember_dht_stored_for_others_records ?? 0) },
     { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
     { id: 'searches', k: m.ember_stat_active_searches(), v: String(diag?.ember_dht_active_searches ?? 0) },
-    { id: 'search-hits', k: m.ember_stat_search_hit_miss(), v: `${diag?.ember_dht_search_hits ?? 0}/${diag?.ember_dht_search_misses ?? 0}` },
-    { id: 'search-quality', k: m.ember_stat_search_quality(), v: searchQualityLabel },
-    { id: 'store-acks', k: m.ember_stat_store_ack_fail(), v: `${diag?.ember_dht_stores_acked ?? 0}/${diag?.ember_dht_stores_failed ?? 0}` },
+    { id: 'search-hits', k: m.ember_stat_search_hits(), v: String(diag?.ember_dht_search_hits ?? 0) },
+    { id: 'search-misses', k: m.ember_stat_search_misses(), v: String(diag?.ember_dht_search_misses ?? 0) },
+    { id: 'search-avg-nodes', k: m.ember_stat_search_avg_nodes(), v: searchAvg(diag?.ember_dht_search_nodes_answered, outcomes) },
+    { id: 'search-avg-ms', k: m.ember_stat_search_avg_ms(), v: outcomes <= 0 ? '\u2014' : `${searchAvg(diag?.ember_dht_search_elapsed_ms_sum, outcomes)}ms` },
+    { id: 'search-avg-records', k: m.ember_stat_search_avg_records(), v: searchAvg(diag?.ember_dht_search_records_sum, outcomes) },
+    { id: 'store-acks', k: m.ember_stat_stores_acked(), v: String(diag?.ember_dht_stores_acked ?? 0) },
+    { id: 'store-fails', k: m.ember_stat_stores_failed(), v: String(diag?.ember_dht_stores_failed ?? 0) },
     { id: 'replication', k: m.ember_stat_avg_replication(), v: String(diag?.ember_dht_avg_replication ?? 0) },
     { id: 'search-rounds', k: m.ember_stat_search_rounds(), v: String(diag?.ember_dht_search_rounds ?? 0) },
     { id: 'find-values', k: m.ember_stat_find_values_sent(), v: String(diag?.ember_dht_find_values_sent ?? 0) },
-    { id: 'serve-hits', k: m.ember_stat_serve_hit_miss(), v: `${diag?.ember_dht_find_value_hits ?? 0}/${diag?.ember_dht_find_value_misses ?? 0}` },
-    { id: 'serve-truncated', k: m.ember_stat_serve_truncated(), v: `${diag?.ember_dht_found_value_truncated ?? 0}/${diag?.ember_dht_found_value_withheld ?? 0}` },
-    { id: 'buddy', k: m.ember_stat_buddy_pub_fwd(), v: `${diag?.ember_dht_buddy_publishes ?? 0}/${diag?.ember_dht_buddy_forwards ?? 0}` },
+    { id: 'serve-hits', k: m.ember_stat_serve_hits(), v: String(diag?.ember_dht_find_value_hits ?? 0) },
+    { id: 'serve-misses', k: m.ember_stat_serve_misses(), v: String(diag?.ember_dht_find_value_misses ?? 0) },
+    { id: 'serve-truncated', k: m.ember_stat_truncated_answers(), v: String(diag?.ember_dht_found_value_truncated ?? 0) },
+    { id: 'serve-withheld', k: m.ember_stat_withheld_records(), v: String(diag?.ember_dht_found_value_withheld ?? 0) },
+    { id: 'buddy-pub', k: m.ember_stat_buddy_publishes(), v: String(diag?.ember_dht_buddy_publishes ?? 0) },
+    { id: 'buddy-fwd', k: m.ember_stat_buddy_forwards(), v: String(diag?.ember_dht_buddy_forwards ?? 0) },
     { id: 'buddy-unendorsed', k: m.ember_stat_buddy_unendorsed(), v: String(diag?.ember_dht_buddy_unendorsed ?? 0) },
     { id: 'buddy-compat', k: m.ember_stat_buddy_compat_publish(), v: diag?.ember_dht_buddy_unendorsed_publish ? m.common_yes() : m.common_no() },
-    { id: 'callback', k: m.ember_stat_callback_sent_fwd_conn(), v: `${diag?.ember_dht_callback_sent ?? 0}/${diag?.ember_dht_callback_forwards ?? 0}/${diag?.ember_dht_callback_connects ?? 0}` },
+    { id: 'callback-sent', k: m.ember_stat_callback_sent(), v: String(diag?.ember_dht_callback_sent ?? 0) },
+    { id: 'callback-fwd', k: m.ember_stat_callback_forwards(), v: String(diag?.ember_dht_callback_forwards ?? 0) },
+    { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: String(diag?.ember_dht_callback_connects ?? 0) },
     { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
     { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: String(diag?.ember_dht_version_mismatch ?? 0) },
-    { id: 'rendezvous', k: m.ember_stat_rendezvous(), v: `${diag?.ember_dht_rendezvous_last_peers ?? 0} / ${diag?.ember_dht_rendezvous_lookups ?? 0} / ${diag?.ember_dht_rendezvous_empty ?? 0}` },
+    { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
+    { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
+    { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
     { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
     { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
-    { id: 'epx-sources', k: m.ember_stat_epx_sources(), v: `${diag?.epx_sources_offered ?? 0}/${diag?.epx_sources_filtered ?? 0}` },
+    { id: 'epx-offered', k: m.ember_stat_epx_sources_offered(), v: String(diag?.epx_sources_offered ?? 0) },
+    { id: 'epx-filtered', k: m.ember_stat_epx_sources_filtered(), v: String(diag?.epx_sources_filtered ?? 0) },
     { id: 'epx-udp-oversized', k: m.ember_stat_epx_udp_oversized(), v: String(diag?.epx_udp_oversized_skipped ?? 0) },
     { id: 'store-key-cap', k: m.ember_stat_store_key_cap(), v: String(diag?.ember_dht_store_key_cap_rejections ?? 0) },
-    { id: 'store-rejects', k: m.ember_stat_store_rejects(), v: storeRejectsLabel },
-  ]);
+    { id: 'reject-verify', k: m.ember_stat_store_reject_verify(), v: String(diag?.ember_dht_store_reject_verify ?? 0) },
+    { id: 'reject-sig', k: m.ember_stat_store_reject_signature(), v: String(diag?.ember_dht_store_reject_signature ?? 0) },
+    { id: 'reject-time', k: m.ember_stat_store_reject_timestamp(), v: String(diag?.ember_dht_store_reject_timestamp ?? 0) },
+    { id: 'reject-ip', k: m.ember_stat_store_reject_source_ip(), v: String(diag?.ember_dht_store_reject_source_ip ?? 0) },
+    { id: 'reject-ip-cap', k: m.ember_stat_store_reject_source_ip_cap(), v: String(diag?.ember_dht_store_reject_source_ip_cap ?? 0) },
+    { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: String(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
+    { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: String(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
+    { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
+    ];
+  });
 
   onMount(() => {
     refreshDiag();
@@ -402,17 +405,13 @@
 
 <header class="page-header">
   <div>
-    <h1>
-      {m.nav_ember_network()}
-      <span class="badge-beta">{m.ember_experimental()}</span>
-    </h1>
+    <h1>{m.nav_ember_network()}</h1>
     <p class="subtitle">{m.ember_page_subtitle()}</p>
   </div>
 </header>
 
 <div class="page-content">
   <div class="ember-inner">
-  <!-- Status + power switch (always on; the control stays visible but locked) -->
   <section class="hero" class:state-off={heroState === 'off' || heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
     <div class="hero-main">
@@ -430,38 +429,26 @@
         {#if statusHint}<p class="hint">{statusHint}</p>{/if}
       </div>
     </div>
-    <div class="hero-toggle">
-      <span class="toggle-caption">{m.ember_enable_label()}</span>
-      <ToggleSwitch
-        checked={true}
-        disabled
-        ariaLabel={m.ember_enable_label()}
-      />
-    </div>
   </section>
-
-  <div class="beta-lock" role="status">
-    <span class="beta-lock-icon" aria-hidden="true">
-      <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="4" y="9" width="12" height="8" rx="1.6"/>
-        <path d="M7 9V6.6a3 3 0 0 1 6 0V9"/>
-      </svg>
-    </span>
-    <div class="beta-lock-text">
-      <strong>{m.ember_beta_lock_title()}</strong>
-      <p>{m.ember_beta_lock_body()}</p>
-    </div>
-    <span class="badge-beta">{m.ember_experimental()}</span>
-  </div>
 
   {#if diagStale}
     <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
   {/if}
 
+  {#if isActive && (diag?.ember_dht_version_mismatch ?? 0) > 0}
+    <div class="banner banner-warn" role="status">{m.ember_version_mismatch_banner()}</div>
+  {/if}
+
   {#if isActive}
     <section class="stat-grid" aria-label={m.ember_health_title()}>
       <div class="stat">
-        <div class="stat-value">{peerCount}</div>
+        <div class="stat-value">
+          {#if peerCount > verifiedCount}
+            {m.ember_overview_peers_of({ verified: verifiedCount, total: peerCount })}
+          {:else}
+            {verifiedCount}
+          {/if}
+        </div>
         <div class="stat-label">{m.ember_overview_peers()}</div>
       </div>
       <div class="stat">
@@ -472,25 +459,6 @@
 
     <section class="card checklist">
       <h2>{m.ember_health_title()}</h2>
-
-      <div class="check-row">
-        <div class="check-indicator" class:ok={networkPillTone === 'ok'} class:warn={networkPillTone === 'warn'} class:pending={networkPillTone === 'pending'} aria-hidden="true">
-          {#if networkPillTone === 'ok'}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
-          {:else if networkPillTone === 'pending'}
-            <span class="check-spinner"></span>
-          {:else}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M8 5.5v3.5M8 11h.01" /></svg>
-          {/if}
-        </div>
-        <div class="check-body">
-          <div class="check-head">
-            <span class="check-label">{m.ember_health_network()}</span>
-            <span class="pill" class:ok={networkPillTone === 'ok'} class:warn={networkPillTone === 'warn'} class:pending={networkPillTone === 'pending'}>{networkPillLabel}</span>
-          </div>
-          <p class="hint">{networkHint}</p>
-        </div>
-      </div>
 
       <div class="check-row">
         <div class="check-indicator" class:ok={reachabilityTone === 'ok'} class:warn={reachabilityTone === 'warn'} class:muted={reachabilityTone === 'muted'} aria-hidden="true">
@@ -529,20 +497,6 @@
       </div>
     </section>
   {/if}
-
-  <div class="about-callout">
-    <span class="about-icon" aria-hidden="true">
-      <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="10" cy="10" r="7"/>
-        <path d="M10 9.4v4"/>
-        <path d="M10 6.7h.01"/>
-      </svg>
-    </span>
-    <div class="about-callout-text">
-      <strong>{m.ember_about_title()}</strong>
-      <p class="about-text">{m.ember_about_text()}</p>
-    </div>
-  </div>
 
   <!--
     Everything below is protocol-level diagnostics. Collapsed by default,
@@ -616,6 +570,8 @@
               <thead>
                 <tr>
                   <th>{m.ember_dht_col_node_id()}</th>
+                  <th>{m.ember_dht_col_answered()}</th>
+                  <th>{m.ember_dht_col_last_seen()}</th>
                   <th>{m.ember_dht_col_distance()}</th>
                 </tr>
               </thead>
@@ -623,10 +579,12 @@
                 {#each filteredContacts as c (c.node_id)}
                   <tr>
                     <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
+                    <td>{contactAnswered(c) ? m.common_yes() : m.common_no()}</td>
+                    <td>{contactLastSeen(c)}</td>
                     <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
                   </tr>
                 {:else}
-                  <tr><td colspan="2" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
+                  <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
                 {/each}
               </tbody>
             </table>
@@ -732,19 +690,6 @@
     max-width: 70ch;
   }
 
-  .badge-beta {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    padding: 2px 8px;
-    border-radius: var(--radius-pill);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    vertical-align: middle;
-  }
-
   .card {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -766,7 +711,6 @@
     overflow: hidden;
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 20px;
     padding: 22px 24px;
     background: var(--bg-secondary);
@@ -872,76 +816,6 @@
     max-width: 56ch;
   }
 
-  .hero-toggle {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
-    flex-shrink: 0;
-  }
-
-  .toggle-caption {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-muted);
-    white-space: nowrap;
-  }
-
-  /* The beta lock and the "About the Ember Network" explainer are the same
-     component wearing different icons, so they share their rules outright
-     rather than drifting apart in two copies. */
-  .beta-lock,
-  .about-callout {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 12px 16px;
-    background: color-mix(in srgb, var(--ember-color, #c2185b) 8%, var(--bg-secondary));
-    border: 1px solid color-mix(in srgb, var(--ember-color, #c2185b) 24%, var(--border));
-    border-radius: var(--radius-lg);
-  }
-
-  .beta-lock-icon,
-  .about-icon {
-    width: 32px;
-    height: 32px;
-    border-radius: var(--radius-md);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    color: var(--ember-color, #c2185b);
-    background: color-mix(in srgb, var(--ember-color, #c2185b) 14%, transparent);
-  }
-
-  .beta-lock-text,
-  .about-callout-text {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .beta-lock-text strong,
-  .about-callout-text strong {
-    display: block;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    color: var(--text-primary);
-  }
-
-  .beta-lock-text p {
-    margin: 2px 0 0;
-    font-size: 13px;
-    line-height: 1.45;
-    color: var(--text-muted);
-  }
-
-  .beta-lock .badge-beta {
-    margin-top: 4px;
-    flex-shrink: 0;
-  }
-
   .hint {
     color: var(--text-muted);
     font-size: 13px;
@@ -1029,12 +903,6 @@
     border-color: color-mix(in srgb, var(--warning) 28%, transparent);
   }
 
-  .check-indicator.pending {
-    color: var(--badge-warning-text, var(--warning));
-    background: color-mix(in srgb, var(--warning) 14%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
-  }
-
   .check-indicator.muted {
     color: var(--text-secondary);
     background: color-mix(in srgb, var(--text-muted) 12%, transparent);
@@ -1085,25 +953,10 @@
     border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
   }
 
-  .pill.pending {
-    color: var(--badge-warning-text, #d9a441);
-    background: color-mix(in srgb, var(--warning, #d9a441) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
-  }
-
   .pill.muted {
     color: var(--text-secondary);
     background: color-mix(in srgb, var(--text-muted) 15%, transparent);
     border-color: color-mix(in srgb, var(--text-muted) 28%, transparent);
-  }
-
-  .check-spinner {
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    border: 2px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-top-color: var(--warning);
-    animation: spin 0.8s linear infinite;
   }
 
   /* --- Technical details disclosure --- */
@@ -1339,16 +1192,6 @@
     border-color: var(--accent);
   }
 
-  .about-text {
-    /* Matches `.beta-lock-text p` so the title-to-body gap is identical in
-       both callouts. */
-    margin: 2px 0 0;
-    color: var(--text-muted);
-    font-size: 13px;
-    line-height: 1.6;
-    max-width: 72ch;
-  }
-
   .banner {
     border-radius: var(--radius-md);
     padding: 10px 14px;
@@ -1363,6 +1206,12 @@
     background: color-mix(in srgb, var(--error, #e06a5f) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--error, #e06a5f) 35%, transparent);
     color: var(--error, #e06a5f);
+  }
+
+  .banner-warn {
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+    color: var(--warning);
   }
 
   .spinner {
@@ -1380,8 +1229,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .spinner,
-    .check-spinner { animation: none; }
+    .spinner { animation: none; }
     .chevron,
     .hero,
     .hero-glow,
@@ -1390,23 +1238,6 @@
   }
 
   @media (max-width: 640px) {
-    .hero {
-      flex-direction: column;
-      align-items: stretch;
-      gap: 16px;
-    }
-    .hero-toggle {
-      align-items: flex-start;
-      flex-direction: row;
-      justify-content: space-between;
-      width: 100%;
-    }
-    .beta-lock {
-      flex-wrap: wrap;
-    }
-    .beta-lock .badge-beta {
-      margin-left: 44px;
-    }
     .stat-grid {
       grid-template-columns: 1fr 1fr;
     }

@@ -101,8 +101,11 @@
     };
   });
 
+  // Source exchange rides the Ember overlay, not KAD. Keying this off
+  // `stats.status` (the KAD light) made the Ember tooltip say "network
+  // offline" while Ember itself was connected.
   function epxStatus(stats: typeof $networkStats): 'active' | 'idle' | 'inactive' {
-    if (stats.status === 'disconnected') return 'inactive';
+    if (!stats.ember_native_enabled) return 'inactive';
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
@@ -114,24 +117,18 @@
 
   function emberDhtTitle(stats: typeof $networkStats): string {
     const status = emberDhtStatus(stats);
+    let base: string;
     if (status === 'connected') {
       const peers = stats.ember_dht_verified_contacts ?? 0;
-      return peers === 1
+      base = peers === 1
         ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
         : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });
+    } else if (stats.ember_native_enabled && emberJoinTimedOut) {
+      base = m.statusbar_ember_dht_title_no_peers();
+    } else {
+      base = m.statusbar_ember_dht_title({ status: statusLabel(status) });
     }
-    if (stats.ember_native_enabled && emberJoinTimedOut) {
-      return m.statusbar_ember_dht_title_no_peers();
-    }
-    return m.statusbar_ember_dht_title({ status: statusLabel(status) });
-  }
-
-  function epxStatusLabel(status: 'active' | 'idle' | 'inactive'): string {
-    switch (status) {
-      case 'active': return m.statusbar_epx_status_active();
-      case 'idle': return m.statusbar_epx_status_idle();
-      case 'inactive': return m.statusbar_epx_status_inactive();
-    }
+    return `${base} · ${epxTitle(stats)}`;
   }
 
   // Localized status string for the tri-state network/server dots.
@@ -150,12 +147,10 @@
     }
   }
 
-  // Two-axis plural for the EPX tooltip. English/Spanish both
+  // Two-axis plural for the source-exchange tooltip. English/Spanish both
   // distinguish singular/plural; we render one of four templates
   // rather than concatenating fragments so translators control
-  // word order (Spanish often inverts noun-adjective compared to
-  // English, even in technical strings like "1 fuente recibida"
-  // vs "{n} fuentes recibidas").
+  // word order.
   function epxTitle(stats: typeof $networkStats): string {
     const status = epxStatus(stats);
     if (status === 'inactive') return m.statusbar_epx_title_offline();
@@ -182,10 +177,6 @@
     <span class="status-label" title={m.statusbar_ed2k_title({ status: statusLabel($serverStatus) })}>
       {m.statusbar_ed2k_label()}
       <span class="dot {$serverStatus}" aria-label={statusLabel($serverStatus)}></span>
-    </span>
-    <span class="status-label" title={epxTitle($networkStats)}>
-      {m.statusbar_epx_label()}
-      <span class="dot {epxStatus($networkStats)}" aria-label={epxStatusLabel(epxStatus($networkStats))}></span>
     </span>
     <span class="status-label status-shared" title={sharedTitle(sharedCount, sharedBytes)}>
       {m.statusbar_shared_label()}
@@ -281,19 +272,9 @@
     animation: status-pulse 1.5s ease-in-out infinite;
   }
 
-  .dot.disconnected, .dot.inactive {
+  .dot.disconnected {
     background: var(--status-disconnected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-disconnected) 16%, transparent);
-  }
-
-  .dot.active {
-    background: var(--status-connected);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
-  }
-
-  .dot.idle {
-    background: var(--status-connecting);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
   }
 
   .status-item {

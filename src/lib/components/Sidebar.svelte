@@ -229,7 +229,7 @@
 
 <nav class="sidebar" class:collapsed={isCollapsed} aria-label={m.sidebar_aria_primary()}>
   <div class="sidebar-header">
-    <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title={m.sidebar_logo_title()}>
+    <a href="/ember" class="logo" onclick={(e) => navigate(e, '/ember')} title={m.sidebar_logo_title()}>
       <img class="logo-icon" src="/icon.png" alt="" width="38" height="38" draggable="false" />
       <span class="logo-wordmark">
         <span class="logo-text">EMBER</span>

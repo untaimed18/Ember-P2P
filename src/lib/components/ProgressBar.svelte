@@ -1,5 +1,11 @@
 <script lang="ts">
-  let { value = 0, max = 100, color = '', status = '' }: { value?: number; max?: number; color?: string; status?: string } = $props();
+  let {
+    value = 0,
+    max = 100,
+    color = '',
+    status = '',
+    showPercent = true,
+  }: { value?: number; max?: number; color?: string; status?: string; showPercent?: boolean } = $props();
 
   const STATUS_COLORS: Record<string, string> = {
     active: 'var(--accent)',
@@ -30,11 +36,13 @@
     class="progress-fill"
     style="width: {percentage}%; background: {resolvedColor};"
   ></div>
-  <span class="progress-text progress-text-track">{percentage.toFixed(1)}%</span>
-  <span
-    class="progress-text progress-text-fill"
-    style="clip-path: inset(0 calc(100% - {percentage}%) 0 0);"
-  >{percentage.toFixed(1)}%</span>
+  {#if showPercent}
+    <span class="progress-text progress-text-track">{percentage.toFixed(1)}%</span>
+    <span
+      class="progress-text progress-text-fill"
+      style="clip-path: inset(0 calc(100% - {percentage}%) 0 0);"
+    >{percentage.toFixed(1)}%</span>
+  {/if}
 </div>
 
 <style>
