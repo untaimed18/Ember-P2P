@@ -105,6 +105,8 @@
   "ember_stat_serve_hit_miss": "服务命中 / 未命中",
   "ember_stat_serve_truncated": "被截断的回复 / 未发送记录",
   "ember_stat_buddy_pub_fwd": "伙伴发布 / 转发",
+  "ember_stat_buddy_unendorsed": "未背书伙伴已暂存",
+  "ember_stat_buddy_compat_publish": "伙伴尾部兼容模式",
   "ember_stat_callback_sent_fwd_conn": "回连 已发 / 转发 / 接通",
   "ember_stat_malformed": "格式错误的帧",
   "ember_stat_version_mismatch": "版本不匹配",

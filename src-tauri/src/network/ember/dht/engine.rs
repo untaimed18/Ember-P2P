@@ -23,10 +23,9 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload};
 use super::publish::{
-    source_key, SignedRecord, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_SOURCE,
 };
-#[cfg(test)]
-use super::publish::SourceBuddy;
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -114,6 +113,24 @@ const PROXY_STORE_ASK_TTL: Duration = Duration::from_secs(90);
 /// ACKs matched nothing, `flush_ember_proxy_overlay_ack` never ran, and a LowID
 /// node published no Ember sources at all.
 const MAX_PENDING_PROXY_ASKS_PER_BUDDY: usize = 256;
+
+/// How long a buddy endorsement we issue stays valid.
+///
+/// Bounds how long a stale endpoint can keep drawing `CALLBACK_REQ` after we
+/// move or lose the mapping, and bounds how long a publisher that has since
+/// been dropped as a client can keep naming us. Longer than the six-hour
+/// source-record TTL would make the expiry meaningless; much shorter would
+/// re-ask on every republish cadence.
+const BUDDY_ENDORSEMENT_TTL_SECS: i64 = 6 * 3600;
+/// Endorsements held from candidate buddies. One is enough to publish; a
+/// handful covers churn in whoever we would name.
+const MAX_BUDDY_ENDORSEMENTS: usize = 16;
+/// How long before re-asking a candidate that has not answered
+/// `BUDDY_ENDORSE_REQ`. Long enough that a silent or non-speaking peer costs
+/// one frame per interval rather than one per publish tick.
+const BUDDY_ENDORSE_REASK: Duration = Duration::from_secs(300);
+/// Bound on outstanding `BUDDY_ENDORSE_REQ` bookkeeping.
+const MAX_BUDDY_ENDORSE_ASKED: usize = 64;
 
 /// Share of the liveness-ping budget held for unverified leads when there are
 /// enough verified contacts due to spend the whole thing. One in four: enough
@@ -236,6 +253,9 @@ pub struct DhtInbound {
     /// A `PROXY_STORE_ACK` matched a request we sent (`request_id`), so this
     /// sender is now a trusted callback buddy for that file.
     pub proxy_store_ack: Option<u32>,
+    /// A candidate buddy endorsed its own endpoint for us and we cached it, so
+    /// firewalled source publish can now name it.
+    pub buddy_endorsed: bool,
 }
 
 /// Destination a firewalled publisher should dial after a buddy-relayed
@@ -342,6 +362,46 @@ pub struct EmberDht {
     local_contact_ip: Ipv4Addr,
     /// UDP port we currently advertise as a source buddy.
     local_contact_udp: u16,
+    /// Endorsements candidate buddies have signed for us, keyed by their node
+    /// ID. A firewalled publisher may only name a buddy it holds one of.
+    buddy_endorsements: HashMap<EmberNodeId, BuddyEndorsement>,
+    /// `BUDDY_ENDORSE_REQ`s we have sent and not yet had answered, so a tick
+    /// that runs every few seconds does not re-ask a silent candidate on every
+    /// pass.
+    buddy_endorse_asked: HashMap<EmberNodeId, Instant>,
+}
+
+/// A candidate buddy's signed statement of its own endpoint, issued to us.
+///
+/// The publisher copies this verbatim into a source trailer. Nothing here is
+/// the publisher's observation of the buddy — the buddy authored all of it,
+/// which is exactly why a searcher can trust the endpoint without knowing the
+/// buddy itself.
+#[derive(Debug, Clone, Copy)]
+pub struct BuddyEndorsement {
+    /// The buddy's Ed25519 identity key, taken from the authenticated frame
+    /// that carried the endorsement (`decode_message` has already bound it to
+    /// the sender's node ID).
+    pub ed25519_pub: [u8; 32],
+    pub ip: Ipv4Addr,
+    pub udp_port: u16,
+    pub noise_pub: [u8; 32],
+    pub expires_at: i64,
+    pub signature: [u8; 64],
+}
+
+impl BuddyEndorsement {
+    /// The trailer form of this endorsement.
+    pub fn as_source_buddy(&self) -> SourceBuddy {
+        SourceBuddy {
+            ip: self.ip,
+            udp_port: self.udp_port,
+            noise_pub: self.noise_pub,
+            ed25519_pub: self.ed25519_pub,
+            endorsed_until: self.expires_at,
+            endorsement: self.signature,
+        }
+    }
 }
 
 impl EmberDht {
@@ -384,6 +444,8 @@ impl EmberDht {
             local_noise_pub: [0u8; 32],
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
+            buddy_endorsements: HashMap::new(),
+            buddy_endorse_asked: HashMap::new(),
         }
     }
 
@@ -394,32 +456,166 @@ impl EmberDht {
         self.local_contact_udp = udp_port;
     }
 
-    /// The buddy contact a firewalled publisher should write into its trailer
-    /// when asking us to `PROXY_STORE`. `None` until we have a routable IPv4.
+    /// Sign our own endpoint as `publisher`'s buddy, so `publisher` can name us
+    /// in a source trailer and any searcher can verify it without knowing us.
     ///
-    /// Production publishers copy this from a verified DHT contact via
-    /// `ember_named_source_buddy`; tests use this getter on the buddy engine
-    /// itself so they do not have to rebuild the same `SourceBuddy`.
-    #[cfg(test)]
-    pub fn advertised_source_buddy(&self) -> Option<SourceBuddy> {
-        let buddy = SourceBuddy {
+    /// We sign the endpoint *we* believe is ours, never one the requester
+    /// supplied — that is the whole point. `None` while we have no routable
+    /// endpoint to offer, which is the honest answer: a node that cannot say
+    /// where it is reachable is not a usable buddy.
+    fn sign_buddy_endorsement(
+        &self,
+        publisher: EmberNodeId,
+        now: i64,
+    ) -> Option<(i64, [u8; 64])> {
+        if self.local_noise_pub == [0u8; 32] {
+            return None;
+        }
+        let candidate = SourceBuddy {
             ip: self.local_contact_ip,
             udp_port: self.local_contact_udp,
             noise_pub: self.local_noise_pub,
+            ed25519_pub: self.signing_key.verifying_key().to_bytes(),
+            endorsed_until: 0,
+            endorsement: [0u8; 64],
         };
-        buddy.is_routable().then_some(buddy)
+        if !candidate.is_routable() {
+            return None;
+        }
+        let expires_at = now.saturating_add(BUDDY_ENDORSEMENT_TTL_SECS);
+        let signed = super::publish::buddy_endorsement_signing_bytes(
+            self.local_contact_ip,
+            self.local_contact_udp,
+            &self.local_noise_pub,
+            &publisher.0,
+            expires_at,
+        );
+        Some((expires_at, crypto::sign(&self.signing_key, &signed)))
+    }
+
+    /// Ask `buddy` to endorse its own endpoint for us, unless we asked
+    /// recently. `None` means "already asked, wait".
+    pub fn build_buddy_endorse_req(
+        &mut self,
+        buddy: EmberNodeId,
+        now: Instant,
+    ) -> Option<(u32, Vec<u8>)> {
+        if self
+            .buddy_endorse_asked
+            .get(&buddy)
+            .is_some_and(|at| now.saturating_duration_since(*at) < BUDDY_ENDORSE_REASK)
+        {
+            return None;
+        }
+        self.buddy_endorse_asked
+            .retain(|_, at| now.saturating_duration_since(*at) < BUDDY_ENDORSE_REASK);
+        if self.buddy_endorse_asked.len() >= MAX_BUDDY_ENDORSE_ASKED {
+            if let Some(oldest) = self
+                .buddy_endorse_asked
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| *id)
+            {
+                self.buddy_endorse_asked.remove(&oldest);
+            }
+        }
+        self.buddy_endorse_asked.insert(buddy, now);
+        let request_id = self.next_request_id();
+        let msg = messages::build_buddy_endorse_req(self.local_id, request_id);
+        Some((
+            request_id,
+            messages::encode_message(&msg, &self.signing_key, true),
+        ))
+    }
+
+    /// A live endorsement `buddy` signed for us, if we hold one.
+    ///
+    /// This is the gate on naming a buddy at all: without an endorsement the
+    /// publisher has nothing a searcher would accept, so it must wait rather
+    /// than publish a trailer every searcher will park.
+    pub fn buddy_endorsement(&self, buddy: &EmberNodeId, now: i64) -> Option<BuddyEndorsement> {
+        self.buddy_endorsements
+            .get(buddy)
+            .copied()
+            .filter(|e| e.expires_at > now)
+    }
+
+    /// Drop endorsements that have lapsed.
+    pub fn prune_buddy_endorsements(&mut self, now: i64) {
+        self.buddy_endorsements.retain(|_, e| e.expires_at > now);
+    }
+
+    /// Absorb an endorsement a candidate buddy signed for us.
+    ///
+    /// Verified against the same predicate a searcher will apply, so we never
+    /// cache something we would go on to publish and have every searcher
+    /// reject. Refusing an endorsement bound to anyone but us is what stops a
+    /// peer replaying one it lifted from another publisher's record.
+    fn absorb_buddy_endorsement(
+        &mut self,
+        buddy: EmberNodeId,
+        ed25519_pub: [u8; 32],
+        ip: Ipv4Addr,
+        udp_port: u16,
+        noise_pub: [u8; 32],
+        expires_at: i64,
+        signature: [u8; 64],
+        now: i64,
+    ) -> bool {
+        let endorsement = BuddyEndorsement {
+            ed25519_pub,
+            ip,
+            udp_port,
+            noise_pub,
+            expires_at,
+            signature,
+        };
+        // The signing key must be the one the frame was attributed to, or the
+        // trailer would name a node ID whose key cannot verify the signature.
+        if crypto::node_id_from_ed25519_bytes(&ed25519_pub) != Some(buddy.0) {
+            return false;
+        }
+        if !endorsement
+            .as_source_buddy()
+            .endorsement_covers(&self.local_id.0, now)
+        {
+            return false;
+        }
+        self.buddy_endorsements.retain(|_, e| e.expires_at > now);
+        if self.buddy_endorsements.len() >= MAX_BUDDY_ENDORSEMENTS
+            && !self.buddy_endorsements.contains_key(&buddy)
+        {
+            if let Some(soonest) = self
+                .buddy_endorsements
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(id, _)| *id)
+            {
+                self.buddy_endorsements.remove(&soonest);
+            }
+        }
+        self.buddy_endorse_asked.remove(&buddy);
+        self.buddy_endorsements.insert(buddy, endorsement);
+        true
     }
 
     /// Whether a firewalled source record's signed trailer names **this** node.
     ///
-    /// Identity is the Noise static, not the eD2K/STUN `(ip, udp)` self-view.
-    /// Publishers write the buddy's observed Ember UDP `contact.addr`, which
-    /// can differ from `advertised_source_buddy()` when HighID TCP and the
-    /// UDP mapping are not the same endpoint. Requiring byte-equality of those
-    /// structs rejected honest LowID `PROXY_STORE` and, with overlay STORE
-    /// skipped until ACK, blocked firewalled source publish entirely.
-    /// Naming another node's key is still refused (steering).
-    fn trailer_names_us(&self, contact: Option<&SourceContact>) -> bool {
+    /// The strong form is our own endorsement: the trailer must carry a
+    /// signature we made, over the endpoint we published, bound to this
+    /// publisher and still live. That is a complete consent check — a
+    /// publisher cannot name us without having asked, and cannot name us at an
+    /// endpoint we did not choose.
+    ///
+    /// A trailer with no endorsement falls back to the older rule: identity is
+    /// the Noise static, not the eD2K/STUN `(ip, udp)` self-view, because a
+    /// pre-endorsement publisher writes the buddy's *observed* Ember UDP
+    /// `contact.addr`, which can differ from ours when HighID TCP and the UDP
+    /// mapping are not the same endpoint. Requiring byte-equality of those
+    /// rejected honest LowID `PROXY_STORE` and, with overlay STORE skipped
+    /// until ACK, blocked firewalled source publish entirely. Naming another
+    /// node's key was, and is, refused.
+    fn trailer_names_us(&self, contact: Option<&SourceContact>, publisher: EmberNodeId, now: i64) -> bool {
         let Some(sc) = contact else {
             return false;
         };
@@ -428,6 +624,10 @@ impl EmberDht {
         };
         if self.local_noise_pub == [0u8; 32] || !buddy.is_routable() {
             return false;
+        }
+        if buddy.has_identity() {
+            return buddy.ed25519_pub == self.signing_key.verifying_key().to_bytes()
+                && buddy.endorsement_covers(&publisher.0, now);
         }
         buddy.noise_pub == self.local_noise_pub
     }
@@ -1782,7 +1982,7 @@ impl EmberDht {
                         && key == parsed.keyword_hash
                         && key == source_key(&parsed.file_hash)
                         && publisher_is_sender
-                        && self.trailer_names_us(parsed.source_contact.as_ref())
+                        && self.trailer_names_us(parsed.source_contact.as_ref(), msg.sender_id, now)
                     {
                         // Budget, callback table, and the local replica are
                         // committed only after the caller obtains a publish
@@ -1926,6 +2126,54 @@ impl EmberDht {
                         user_hash: (searcher_user_hash != [0u8; 16])
                             .then_some(searcher_user_hash),
                     });
+                }
+            }
+            DhtPayload::BuddyEndorseReq => {
+                // Answering costs one signature and discloses nothing: the
+                // endpoint is what we already advertise to every peer.
+                // Deliberately *not* gated on the proxy-forward budget — that
+                // is a 60-second rate limit and this is a six-hour statement,
+                // so coupling them would make whether we can be named at all
+                // depend on how busy the last minute was. What actually bounds
+                // the favour is the forward budget at `PROXY_STORE` time and
+                // the grant check before a `CALLBACK_REQ` is bounced; the
+                // frame rate itself is capped in `protection.rs`.
+                if let Some((expires_at, signature)) =
+                    self.sign_buddy_endorsement(msg.sender_id, now)
+                {
+                    let reply = messages::build_buddy_endorse(
+                        self.local_id,
+                        msg.request_id,
+                        self.local_contact_ip,
+                        self.local_contact_udp,
+                        self.local_noise_pub,
+                        expires_at,
+                        signature,
+                    );
+                    out.responses
+                        .push(messages::encode_message(&reply, &self.signing_key, true));
+                }
+            }
+            DhtPayload::BuddyEndorse {
+                ip,
+                udp_port,
+                noise_pub,
+                expires_at,
+                signature,
+            } => {
+                // `decode_message` bound this key to `sender_id`, so the
+                // endorsement is attributable before we look at it.
+                if let Some(key) = msg.sender_pub_key {
+                    out.buddy_endorsed = self.absorb_buddy_endorsement(
+                        msg.sender_id,
+                        key,
+                        ip,
+                        udp_port,
+                        noise_pub,
+                        expires_at,
+                        signature,
+                        now,
+                    );
                 }
             }
             other => {
@@ -3223,11 +3471,42 @@ mod tests {
         }
     }
 
-    /// Firewalled contact whose trailer names `buddy` — required for
-    /// `PROXY_STORE` to be accepted.
-    fn firewalled_for_buddy(publisher_last: u8, buddy: &EmberDht) -> SourceContact {
+    /// Run the real `BUDDY_ENDORSE_REQ` / `BUDDY_ENDORSE` exchange so
+    /// `publisher` holds `buddy`'s signature over `buddy`'s own endpoint.
+    fn endorse(publisher: &mut EmberDht, buddy: &mut EmberDht, now: i64) -> bool {
+        if publisher.buddy_endorsement(&buddy.local_id(), now).is_some() {
+            return true;
+        }
+        let Some((_rid, req)) =
+            publisher.build_buddy_endorse_req(buddy.local_id(), Instant::now())
+        else {
+            return false;
+        };
+        let on_buddy = buddy.handle_message(&req, addr(1, 4672), [0x01; 32], now);
+        let Some(reply) = on_buddy.responses.first() else {
+            return false;
+        };
+        publisher
+            .handle_message(reply, addr(2, 4672), [0x02; 32], now)
+            .buddy_endorsed
+    }
+
+    /// Firewalled contact whose trailer carries `buddy`'s endorsement —
+    /// required for `PROXY_STORE` to be accepted, and for any searcher to dial.
+    fn firewalled_for_buddy(
+        publisher_last: u8,
+        publisher: &mut EmberDht,
+        buddy: &mut EmberDht,
+        now: i64,
+    ) -> SourceContact {
+        assert!(
+            endorse(publisher, buddy, now),
+            "the buddy must endorse its own endpoint"
+        );
         let mut contact = firewalled_contact_at(publisher_last);
-        contact.buddy = buddy.advertised_source_buddy();
+        contact.buddy = publisher
+            .buddy_endorsement(&buddy.local_id(), now)
+            .map(|e| e.as_source_buddy());
         contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
         contact
     }
@@ -3364,7 +3643,7 @@ mod tests {
         let mut buddy = dht(89);
         let pub_noise = [0xAA; 32];
         let pub_addr = addr(88, 4672);
-        let contact = firewalled_for_buddy(88, &buddy);
+        let contact = firewalled_for_buddy(88, &mut publisher, &mut buddy, 2000);
 
         let mut accepted = 0usize;
         for i in 0..(MAX_PROXY_FORWARDS_PER_SENDER + 8) {
@@ -3388,13 +3667,9 @@ mod tests {
         // The allowance is per sender, so an honest buddy is not punished for a
         // noisy one it shares nothing with but our attention.
         let mut other = dht(90);
-        let record = other.build_source_record(
-            [0x90; 16],
-            [0u8; 32],
-            42,
-            "other.mkv",
-            firewalled_for_buddy(90, &buddy),
-        );
+        let other_contact = firewalled_for_buddy(90, &mut other, &mut buddy, 2001);
+        let record =
+            other.build_source_record([0x90; 16], [0u8; 32], 42, "other.mkv", other_contact);
         let (_rid, frame) =
             other.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(
@@ -3415,13 +3690,9 @@ mod tests {
         let mut accepted = 0usize;
         for seed in 130..190u8 {
             let mut publisher = dht(seed);
-            let record = publisher.build_source_record(
-                [seed; 16],
-                [0u8; 32],
-                42,
-                "s.mkv",
-                firewalled_for_buddy(seed, &buddy),
-            );
+            let contact = firewalled_for_buddy(seed, &mut publisher, &mut buddy, 3000);
+            let record =
+                publisher.build_source_record([seed; 16], [0u8; 32], 42, "s.mkv", contact);
             let (_rid, frame) = publisher.build_proxy_store(
                 record.keyword_hash,
                 record.data.clone(),
@@ -3642,7 +3913,7 @@ mod tests {
         let pub_noise = [0xAA; 32];
         let pub_addr = addr(80, 4672);
 
-        let contact = firewalled_for_buddy(80, &buddy);
+        let contact = firewalled_for_buddy(80, &mut publisher, &mut buddy, 2000);
         let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "buddy.mkv", contact);
         let key = record.keyword_hash;
         let (_rid, frame) = publisher.build_proxy_store(key, record.data.clone(), record.signature);
@@ -3702,8 +3973,12 @@ mod tests {
         assert!(on_buddy.responses.is_empty());
     }
 
+    /// A publisher from before endorsements existed writes the buddy's
+    /// *observed* address, which can differ from the buddy's own view of
+    /// itself. That trailer is still accepted on the Noise static alone, so the
+    /// upgrade does not strand honest older peers.
     #[test]
-    fn proxy_store_accepts_trailer_naming_our_noise_at_observed_addr() {
+    fn proxy_store_accepts_an_unendorsed_trailer_naming_our_noise() {
         let mut publisher = dht(80);
         let mut buddy = dht(81);
         let pub_noise = [0xAA; 32];
@@ -3712,10 +3987,13 @@ mod tests {
         let mut contact = firewalled_contact_at(80);
         contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
         // Observed Ember UDP (10.x) ≠ advertised STUN/HighID (8.8.8.81).
-        contact.buddy = Some(crate::network::ember::dht::publish::SourceBuddy {
+        contact.buddy = Some(SourceBuddy {
             ip: std::net::Ipv4Addr::new(8, 8, 4, 81),
             udp_port: 4672,
             noise_pub: [81; 32],
+            ed25519_pub: [0u8; 32],
+            endorsed_until: 0,
+            endorsement: [0u8; 64],
         });
         let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "nat.mkv", contact);
         let (_rid, frame) = publisher.build_proxy_store(
@@ -3726,7 +4004,7 @@ mod tests {
         let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
         assert!(
             on_buddy.proxy_store_forward.is_some(),
-            "honest LowID publish must survive HighID-IP ≠ Ember-UDP-addr"
+            "honest pre-endorsement publish must survive HighID-IP ≠ Ember-UDP-addr"
         );
     }
 
@@ -3734,11 +4012,11 @@ mod tests {
     fn proxy_store_rejects_trailer_that_names_someone_else() {
         let mut publisher = dht(70);
         let mut buddy = dht(71);
-        let victim = dht(72);
+        let mut victim = dht(72);
         let pub_noise = [0xAA; 32];
         let pub_addr = addr(70, 4672);
 
-        let contact = firewalled_for_buddy(70, &victim);
+        let contact = firewalled_for_buddy(70, &mut publisher, &mut victim, 2000);
         let record = publisher.build_source_record([6u8; 16], [0u8; 32], 1, "aimed.mkv", contact);
         let (_rid, frame) =
             publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
@@ -3747,6 +4025,124 @@ mod tests {
             on_buddy.proxy_store_forward.is_none(),
             "must not replicate a record that steers CALLBACK_REQ at another node"
         );
+    }
+
+    /// A trailer carrying our key but an endpoint we never signed for — or an
+    /// endorsement issued to a different publisher — is a record no searcher
+    /// will act on, so proxying it only spends our bandwidth.
+    #[test]
+    fn proxy_store_rejects_an_endorsement_we_did_not_make_for_this_publisher() {
+        let mut publisher = dht(74);
+        let mut buddy = dht(75);
+        let pub_noise = [0xAA; 32];
+        let pub_addr = addr(74, 4672);
+
+        let honest = firewalled_for_buddy(74, &mut publisher, &mut buddy, 2000);
+        let record = publisher.build_source_record([7u8; 16], [0u8; 32], 1, "ok.mkv", honest);
+        let (_rid, frame) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(
+            buddy
+                .handle_message(&frame, pub_addr, pub_noise, 2000)
+                .proxy_store_forward
+                .is_some(),
+            "our own endorsement, for this publisher, is what consent looks like"
+        );
+
+        // Same signature, endpoint moved.
+        let mut moved = honest;
+        moved.buddy = moved.buddy.map(|b| SourceBuddy {
+            ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
+            ..b
+        });
+        let record = publisher.build_source_record([8u8; 16], [0u8; 32], 1, "moved.mkv", moved);
+        let (_rid, frame) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(buddy
+            .handle_message(&frame, pub_addr, pub_noise, 2001)
+            .proxy_store_forward
+            .is_none());
+
+        // An endorsement we issued to someone else, replayed by this publisher.
+        let mut other = dht(76);
+        let lifted = firewalled_for_buddy(74, &mut other, &mut buddy, 2000);
+        let record = publisher.build_source_record([9u8; 16], [0u8; 32], 1, "lifted.mkv", lifted);
+        let (_rid, frame) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(
+            buddy
+                .handle_message(&frame, pub_addr, pub_noise, 2002)
+                .proxy_store_forward
+                .is_none(),
+            "an endorsement is bound to the publisher it was issued to"
+        );
+    }
+
+    /// The endorsement exchange itself: what a candidate buddy will sign, and
+    /// what a publisher will accept back.
+    #[test]
+    fn an_endorsement_is_only_cached_when_it_is_ours_and_live() {
+        let mut publisher = dht(100);
+        let mut buddy = dht(101);
+        let now = 5_000i64;
+
+        assert!(publisher.buddy_endorsement(&buddy.local_id(), now).is_none());
+        assert!(endorse(&mut publisher, &mut buddy, now));
+        let held = publisher
+            .buddy_endorsement(&buddy.local_id(), now)
+            .expect("endorsement cached");
+        // The buddy signed its *own* endpoint, not anything we told it.
+        assert_eq!(held.ip, Ipv4Addr::new(8, 8, 8, 101));
+        assert_eq!(held.udp_port, 4672);
+        assert_eq!(held.noise_pub, [101u8; 32]);
+        assert_eq!(
+            held.as_source_buddy().node_id(),
+            Some(buddy.local_id().0),
+            "the trailer names the buddy's real DHT id"
+        );
+        assert!(held
+            .as_source_buddy()
+            .endorsement_covers(&publisher.local_id().0, now));
+        assert!(
+            !held
+                .as_source_buddy()
+                .endorsement_covers(&[0x33u8; 16], now),
+            "and nobody else can use it"
+        );
+
+        // Expiry is enforced on read, so a lapsed endorsement stops being
+        // publishable without anything having to sweep it first.
+        assert!(publisher
+            .buddy_endorsement(&buddy.local_id(), held.expires_at)
+            .is_none());
+        publisher.prune_buddy_endorsements(held.expires_at);
+        assert!(publisher.buddy_endorsement(&buddy.local_id(), now).is_none());
+
+        // A buddy with no routable endpoint of its own has nothing to sign, and
+        // says so by staying silent rather than signing 0.0.0.0.
+        let mut homeless = EmberDht::new([102u8; 32], false);
+        let (_rid, req) = publisher
+            .build_buddy_endorse_req(homeless.local_id(), Instant::now())
+            .expect("fresh candidate");
+        let on_homeless = homeless.handle_message(&req, addr(1, 4672), [0x01; 32], now);
+        assert!(on_homeless.responses.is_empty());
+    }
+
+    /// A re-ask on every publish tick would be a frame per tick at a peer too
+    /// old to speak the type, which answers nothing.
+    #[test]
+    fn a_silent_endorse_candidate_is_not_re_asked_every_tick() {
+        let mut publisher = dht(110);
+        let candidate = dht(111).local_id();
+        let now = Instant::now();
+        assert!(publisher.build_buddy_endorse_req(candidate, now).is_some());
+        assert!(
+            publisher.build_buddy_endorse_req(candidate, now).is_none(),
+            "the ask is suppressed until the re-ask interval elapses"
+        );
+        assert!(publisher
+            .build_buddy_endorse_req(candidate, now + BUDDY_ENDORSE_REASK)
+            .is_some());
     }
 
     #[test]
@@ -3759,9 +4155,7 @@ mod tests {
         let pub_addr = addr(90, 4672);
         let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
 
-        let mut contact = source_contact_at(90);
-        contact.flags = crate::network::ember::SOURCE_FLAG_FIREWALLED;
-        contact.buddy = buddy.advertised_source_buddy();
+        let contact = firewalled_for_buddy(90, &mut publisher, &mut buddy, 2000);
         let record = publisher.build_source_record([9u8; 16], [0u8; 32], 1, "fw.mkv", contact);
         let (proxy_rid, proxy) =
             publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);

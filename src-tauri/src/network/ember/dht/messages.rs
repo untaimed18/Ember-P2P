@@ -42,6 +42,24 @@ pub const MSG_CHANNEL_MSG: u8 = 0x11;
 /// Ask a HighID overlay contact to forward a `CHANNEL_MSG` to a LowID target.
 /// Capability-bound rooms use this instead of the friend WebSocket broker.
 pub const MSG_CHANNEL_RELAY: u8 = 0x12;
+// The endorse pair sits after the channel types deliberately. Message
+// numbering is global to the overlay, not to a branch: a `BUDDY_ENDORSE_REQ`
+// carries no payload and its decoder ignores the body, so sharing a number with
+// `CHANNEL_MSG` would have a channel frame decode cleanly on that arm and draw
+// a signed endorsement in reply.
+/// Firewalled publisher → candidate buddy: sign your own endpoint for me, so
+/// I can name you in a source trailer and searchers can verify it offline.
+///
+/// Empty payload — the requester is the authenticated frame `sender_id`, and
+/// that is what the endorsement is bound to.
+///
+/// Additive like `CALLBACK_REQ`: a peer that does not speak this type decodes
+/// it as [`DhtPayload::Unknown`] and ignores it, which reads to the requester
+/// as a buddy that cannot be named. Not a version bump.
+pub const MSG_BUDDY_ENDORSE_REQ: u8 = 0x13;
+/// Buddy → firewalled publisher: my endpoint, signed by my identity key and
+/// bound to you and an expiry.
+pub const MSG_BUDDY_ENDORSE: u8 = 0x14;
 
 /// `CALLBACK_REQ` body: publisher node id, file hash, searcher TCP port,
 /// crypt options, searcher eD2K user hash, callback token. The searcher's
@@ -50,6 +68,11 @@ pub const CALLBACK_REQ_WIRE_LEN: usize = 16 + 16 + 2 + 1 + 16 + 16;
 /// `CALLBACK` body: file hash, searcher IPv4, TCP port, crypt options,
 /// searcher user hash, callback token.
 pub const CALLBACK_WIRE_LEN: usize = 16 + 4 + 2 + 1 + 16 + 16;
+/// `BUDDY_ENDORSE` body: the endpoint the buddy asserts is its own (ipv4(4) +
+/// udp_port(2) + noise_pub(32)), the expiry, and the buddy's signature over
+/// all of it. The signing key is the frame's sender key, which `decode_message`
+/// has already bound to `sender_id`, so it is not repeated here.
+pub const BUDDY_ENDORSE_WIRE_LEN: usize = 4 + 2 + 32 + 8 + 64;
 
 /// Records one `STORE_BATCH` may carry.
 ///
@@ -300,6 +323,22 @@ pub enum DhtPayload {
         crypt_options: u8,
         searcher_user_hash: [u8; 16],
         callback_token: [u8; 16],
+    },
+    /// Publisher → candidate buddy. No body: the endorsement is bound to the
+    /// authenticated `sender_id`, so there is nothing here for a requester to
+    /// influence — in particular it cannot ask for an endpoint of its choosing.
+    BuddyEndorseReq,
+    /// Buddy → publisher. The buddy's own endpoint plus its signature over it.
+    ///
+    /// The publisher copies this verbatim into the source trailer, so the
+    /// endpoint a searcher dials is authored entirely by the node that will
+    /// receive the `CALLBACK_REQ` — never by the publisher's observation of it.
+    BuddyEndorse {
+        ip: Ipv4Addr,
+        udp_port: u16,
+        noise_pub: [u8; 32],
+        expires_at: i64,
+        signature: [u8; 64],
     },
     Unknown(Vec<u8>),
 }
@@ -741,6 +780,46 @@ pub fn build_callback_req(
     }
 }
 
+/// Publisher → candidate buddy: sign your own endpoint for me.
+pub fn build_buddy_endorse_req(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_BUDDY_ENDORSE_REQ,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::BuddyEndorseReq,
+        signature: [0u8; 64],
+    }
+}
+
+/// Buddy → publisher: my endpoint, signed and bound to that publisher.
+pub fn build_buddy_endorse(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    ip: Ipv4Addr,
+    udp_port: u16,
+    noise_pub: [u8; 32],
+    expires_at: i64,
+    signature: [u8; 64],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_BUDDY_ENDORSE,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::BuddyEndorse {
+            ip,
+            udp_port,
+            noise_pub,
+            expires_at,
+            signature,
+        },
+        signature: [0u8; 64],
+    }
+}
+
 /// Buddy → firewalled publisher: connect to this searcher.
 pub fn build_callback(
     sender_id: EmberNodeId,
@@ -973,6 +1052,22 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             buf.push(*crypt_options);
             buf.extend_from_slice(searcher_user_hash);
             buf.extend_from_slice(callback_token);
+            buf
+        }
+        DhtPayload::BuddyEndorseReq => Vec::new(),
+        DhtPayload::BuddyEndorse {
+            ip,
+            udp_port,
+            noise_pub,
+            expires_at,
+            signature,
+        } => {
+            let mut buf = Vec::with_capacity(BUDDY_ENDORSE_WIRE_LEN);
+            buf.extend_from_slice(&ip.octets());
+            buf.write_u16::<LittleEndian>(*udp_port).unwrap();
+            buf.extend_from_slice(noise_pub);
+            buf.write_i64::<LittleEndian>(*expires_at).unwrap();
+            buf.extend_from_slice(signature);
             buf
         }
         DhtPayload::Unknown(data) => data.clone(),
@@ -1311,6 +1406,29 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 crypt_options,
                 searcher_user_hash,
                 callback_token,
+            })
+        }
+        MSG_BUDDY_ENDORSE_REQ => Ok(DhtPayload::BuddyEndorseReq),
+        MSG_BUDDY_ENDORSE => {
+            if data.len() != BUDDY_ENDORSE_WIRE_LEN {
+                anyhow::bail!(
+                    "BUDDY_ENDORSE length {} (expected {BUDDY_ENDORSE_WIRE_LEN})",
+                    data.len()
+                );
+            }
+            let ip = Ipv4Addr::new(data[0], data[1], data[2], data[3]);
+            let udp_port = u16::from_le_bytes([data[4], data[5]]);
+            let mut noise_pub = [0u8; 32];
+            noise_pub.copy_from_slice(&data[6..38]);
+            let expires_at = i64::from_le_bytes(data[38..46].try_into()?);
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&data[46..110]);
+            Ok(DhtPayload::BuddyEndorse {
+                ip,
+                udp_port,
+                noise_pub,
+                expires_at,
+                signature,
             })
         }
         _ => Ok(DhtPayload::Unknown(data.to_vec())),
@@ -2008,5 +2126,48 @@ mod tests {
             }
             other => panic!("expected Callback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn buddy_endorse_round_trip() {
+        let (sk, id) = test_keypair();
+        let req = build_buddy_endorse_req(id, 9);
+        let encoded = encode_message(&req, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        assert!(matches!(decoded.payload, DhtPayload::BuddyEndorseReq));
+        assert_eq!(decoded.request_id, 9, "the answer has to match the ask");
+
+        let ip = Ipv4Addr::new(8, 8, 4, 4);
+        let noise = [0x5Au8; 32];
+        let sig = [0x6Bu8; 64];
+        let msg = build_buddy_endorse(id, 9, ip, 4672, noise, 1_700_000_000, sig);
+        let encoded = encode_message(&msg, &sk, true);
+        let decoded = decode_message(&encoded, true).unwrap();
+        match decoded.payload {
+            DhtPayload::BuddyEndorse {
+                ip: got_ip,
+                udp_port,
+                noise_pub,
+                expires_at,
+                signature,
+            } => {
+                assert_eq!(got_ip, ip);
+                assert_eq!(udp_port, 4672);
+                assert_eq!(noise_pub, noise);
+                assert_eq!(expires_at, 1_700_000_000);
+                assert_eq!(signature, sig);
+            }
+            other => panic!("expected BuddyEndorse, got {other:?}"),
+        }
+
+        // The verifier reads the key off the frame, so the endorsement is only
+        // ever attributable to the sender the signature check bound it to.
+        assert_eq!(decoded.sender_pub_key, Some(sk.verifying_key().to_bytes()));
+
+        // A short or long body is a framing error, not a partial endorsement.
+        let mut truncated = build_buddy_endorse(id, 9, ip, 4672, noise, 1, sig);
+        truncated.payload = DhtPayload::Unknown(vec![0u8; BUDDY_ENDORSE_WIRE_LEN - 1]);
+        let encoded = encode_message(&truncated, &sk, true);
+        assert!(decode_message(&encoded, true).is_err());
     }
 }

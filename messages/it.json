@@ -105,6 +105,8 @@
   "ember_stat_serve_hit_miss": "Risposte riuscite / non riuscite",
   "ember_stat_serve_truncated": "Risposte troncate / record omessi",
   "ember_stat_buddy_pub_fwd": "Buddy: pubblicazione / inoltro",
+  "ember_stat_buddy_unendorsed": "Buddy senza avallo in attesa",
+  "ember_stat_buddy_compat_publish": "Modalità compatibilità trailer buddy",
   "ember_stat_callback_sent_fwd_conn": "Callback inviato / inoltrato / connesso",
   "ember_stat_malformed": "Frame malformati",
   "ember_stat_version_mismatch": "Incompatibilità di versione",

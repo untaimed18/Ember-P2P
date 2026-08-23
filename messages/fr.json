@@ -105,6 +105,8 @@
   "ember_stat_serve_hit_miss": "Réponses trouvées / manquées",
   "ember_stat_serve_truncated": "Réponses tronquées / enregistrements omis",
   "ember_stat_buddy_pub_fwd": "Publication / retransmission compagnon",
+  "ember_stat_buddy_unendorsed": "Compagnons non attestés mis en attente",
+  "ember_stat_buddy_compat_publish": "Mode compatibilité du bloc compagnon",
   "ember_stat_callback_sent_fwd_conn": "Callback envoyé / transmis / connecté",
   "ember_stat_malformed": "Trames malformées",
   "ember_stat_version_mismatch": "Incompatibilités de version",

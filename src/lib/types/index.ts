@@ -380,12 +380,16 @@ export interface EmberDiagnostics {
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy?: boolean;
+  /** Firewalled publishing fell back to an unendorsed buddy trailer (older peers only). */
+  ember_dht_buddy_unendorsed_publish?: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
   ember_dht_buddy_forwards: number;
+  /** Firewalled sources parked because the named buddy never signed for that endpoint. */
+  ember_dht_buddy_unendorsed?: number;
   /** Ember CALLBACK_REQ frames sent (searcher → buddy). */
   ember_dht_callback_sent?: number;
   /** CALLBACK_REQs bounced to a firewalled publisher. */

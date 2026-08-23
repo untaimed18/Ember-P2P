@@ -762,6 +762,12 @@ pub struct EmberDiagnostics {
     /// True when firewalled with no HighID buddy yet — source STORE is skipped.
     #[serde(default)]
     pub ember_dht_waiting_buddy: bool,
+    /// True when firewalled publishing fell back to a buddy trailer no
+    /// candidate has endorsed, because none answered `BUDDY_ENDORSE_REQ`.
+    /// Records still go out, but only builds older than this one will act on
+    /// the callback path — current builds park the source instead.
+    #[serde(default)]
+    pub ember_dht_buddy_unendorsed_publish: bool,
     /// Slice 15: true when Ember is on but we have no external IPv4 to put
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
@@ -772,6 +778,13 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Firewalled source records we parked because the buddy named in the
+    /// trailer had not signed for that endpoint — a forged or lapsed
+    /// endorsement, or a record published before endorsements existed. Rising
+    /// steadily on a healthy network means the callback path is unavailable to
+    /// us and downloads are falling back to the relay/park route.
+    #[serde(default)]
+    pub ember_dht_buddy_unendorsed: u32,
     /// Ember `CALLBACK_REQ` frames we sent (searcher → buddy).
     #[serde(default)]
     pub ember_dht_callback_sent: u32,
