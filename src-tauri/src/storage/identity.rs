@@ -162,15 +162,34 @@ impl NodeIdentity {
                                 String::new()
                             }
                         };
+                        // The recoverable cause differs by platform, and naming
+                        // the wrong one sends the user somewhere useless. On
+                        // Unix the usual reason is a keyring that is simply not
+                        // reachable this launch (locked collection, or no D-Bus
+                        // session because the app was started from a TTY or over
+                        // SSH) — the file is intact and unlocking it is the fix.
+                        #[cfg(target_os = "windows")]
+                        let recovery = "Sign in as the original Windows user, or restore/delete \
+                                        identity.json to reset.";
+                        #[cfg(not(target_os = "windows"))]
+                        let recovery = "If your login keyring is locked or unavailable (for \
+                                        example when starting from a TTY or over SSH), unlock it \
+                                        and start Ember again — the file itself is probably \
+                                        intact. Otherwise restore/delete identity.json to reset.";
+                        #[cfg(target_os = "windows")]
+                        let cause = "is protected for a different Windows user account or is \
+                                     corrupt";
+                        #[cfg(not(target_os = "windows"))]
+                        let cause = "could not be unwrapped with this machine's key store";
                         return Err(anyhow::anyhow!(
-                            "Identity file at {} is protected for a different Windows user \
-                             account or is corrupt ({}). {}Refusing to generate a new identity \
+                            "Identity file at {} {} ({}). {}Refusing to generate a new identity \
                              automatically because this would permanently reset your KAD ID, \
-                             user hash, friend relationships, and upload credits. Sign in as the \
-                             original Windows user, or restore/delete identity.json to reset.",
+                             user hash, friend relationships, and upload credits. {}",
                             path.display(),
+                            cause,
                             unwrap_err,
-                            backup_note
+                            backup_note,
+                            recovery
                         ));
                     }
                 };

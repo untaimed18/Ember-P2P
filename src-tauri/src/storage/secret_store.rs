@@ -190,23 +190,62 @@ mod unix {
         Ok(key)
     }
 
-    fn keyring_wrapping_key() -> anyhow::Result<[u8; 32]> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn keyring_entry() -> anyhow::Result<keyring::Entry> {
+        keyring::Entry::new("ember-p2p", "secret-store-v3")
+            .map_err(|e| anyhow::anyhow!("keyring: {e}"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn decode_keyring_key(stored: &str) -> anyhow::Result<[u8; 32]> {
+        let bytes =
+            hex::decode(stored.trim()).map_err(|_| anyhow::anyhow!("keyring key is not hex"))?;
+        if bytes.len() != 32 {
+            anyhow::bail!("keyring key wrong length");
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(key)
+    }
+
+    /// Read the keyring-held wrapping key, never creating one.
+    ///
+    /// This is what the decrypt path must use. Minting a key here would be
+    /// unrecoverable: `set_password` replaces the key every existing
+    /// `KEY_SRC_KEYRING` blob was sealed under, so a keyring that is merely
+    /// unreachable for one launch (locked collection, no D-Bus session, a
+    /// login keyring that was reset) would turn `identity.json` and
+    /// `cryptkey.dat` into permanently undecryptable files — destroying the
+    /// KAD ID, user hash, friendships and credits the surrounding code exists
+    /// to preserve.
+    fn keyring_wrapping_key_existing() -> anyhow::Result<[u8; 32]> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let entry = keyring::Entry::new("ember-p2p", "secret-store-v3")
-                .map_err(|e| anyhow::anyhow!("keyring: {e}"))?;
+            let entry = keyring_entry()?;
+            let stored = entry
+                .get_password()
+                .map_err(|e| anyhow::anyhow!("keyring read: {e}"))?;
+            decode_keyring_key(&stored)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            anyhow::bail!("no keyring on this Unix target")
+        }
+    }
+
+    /// Read the wrapping key for sealing, minting one only when the entry is
+    /// genuinely absent.
+    ///
+    /// Every other error is propagated so `protect` falls back to the
+    /// machine-id HKDF key and records that choice in the source byte, rather
+    /// than overwriting a key it could not read.
+    fn keyring_wrapping_key_for_protect() -> anyhow::Result<[u8; 32]> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let entry = keyring_entry()?;
             match entry.get_password() {
-                Ok(s) => {
-                    let bytes = hex::decode(s.trim())
-                        .map_err(|_| anyhow::anyhow!("keyring key is not hex"))?;
-                    if bytes.len() != 32 {
-                        anyhow::bail!("keyring key wrong length");
-                    }
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&bytes);
-                    Ok(key)
-                }
-                Err(_) => {
+                Ok(stored) => decode_keyring_key(&stored),
+                Err(keyring::Error::NoEntry) => {
                     let mut key = [0u8; 32];
                     OsRng.fill_bytes(&mut key);
                     entry
@@ -214,6 +253,7 @@ mod unix {
                         .map_err(|e| anyhow::anyhow!("keyring store: {e}"))?;
                     Ok(key)
                 }
+                Err(e) => Err(anyhow::anyhow!("keyring read: {e}")),
             }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -253,7 +293,7 @@ mod unix {
     }
 
     pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let (src, mut key) = match keyring_wrapping_key() {
+        let (src, mut key) = match keyring_wrapping_key_for_protect() {
             Ok(k) => (KEY_SRC_KEYRING, k),
             Err(_) => (
                 KEY_SRC_HKDF,
@@ -280,7 +320,7 @@ mod unix {
             let nonce = &stored[9..9 + NONCE_LEN];
             let ct = &stored[9 + NONCE_LEN..];
             let mut key = match src {
-                KEY_SRC_KEYRING => keyring_wrapping_key()?,
+                KEY_SRC_KEYRING => keyring_wrapping_key_existing()?,
                 KEY_SRC_HKDF => hkdf_key(HKDF_SALT_V3, HKDF_INFO_V3, true)?,
                 _ => anyhow::bail!("unknown EMBRSEC3 key source"),
             };
