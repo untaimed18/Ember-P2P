@@ -144,20 +144,66 @@ impl KnownFileList {
         }
     }
 
-    /// Merge records from a freshly loaded catalog. Existing in-memory
-    /// entries win on hash collision so a concurrent share-scan that ran
-    /// before disk load finished is not clobbered by stale known.met data,
-    /// except `friends_only`: a disk `true` is OR'd onto the in-memory row
-    /// so a pre-load rediscovery cannot drop a persisted restriction.
+    /// Merge records from a freshly loaded catalog.
+    ///
+    /// On a hash collision the in-memory row wins for everything that
+    /// describes the file *now* — path, name, mtime, share intent, priority —
+    /// because a share-scan that ran before this load is the fresher observer
+    /// of those. But it must not win for accumulated history, because the
+    /// colliding in-memory row is usually not a real observation at all: the
+    /// `SharedFilesChangedAck` reconcile fires against the empty placeholder
+    /// on a warm start, `record_needs_refresh` reports "needs refresh" for
+    /// every hash (nothing is known yet), and the record it then builds takes
+    /// the `existing = None` branch — seeding the all-time counters from this
+    /// session's (near-zero) values, `last_publish_src` from 0, and
+    /// `part_hashes` from nothing. Letting that win discarded the real upload
+    /// totals and the per-part MD4 hashsets, and because absorbing makes the
+    /// list authoritative, the next save wrote the zeroed rows to disk. The
+    /// hashsets were the worse loss: nothing recomputes them until the file is
+    /// fully re-hashed, so the client silently stopped being able to serve
+    /// AICH recovery for its own library.
+    ///
+    /// So: cumulative fields take the larger value, and fields that are either
+    /// known or absent take whichever side actually has one.
     pub fn absorb_missing_from(&mut self, other: Self) {
         for (hash, record) in other.files {
             if let std::collections::hash_map::Entry::Occupied(mut e) = self.files.entry(hash) {
+                let live = e.get_mut();
                 // A share-scan that ran before disk load can insert a
                 // rediscovered row with `friends_only = false`. In-memory
-                // winning the whole record would drop a persisted restriction.
-                // OR the flag; other fields stay with the in-memory copy.
+                // winning this would drop a persisted restriction.
                 if record.friends_only {
-                    e.get_mut().friends_only = true;
+                    live.friends_only = true;
+                }
+                // Monotonic history: never let a placeholder-seeded zero (or a
+                // session-only count) walk these backwards.
+                live.all_time_transferred =
+                    live.all_time_transferred.max(record.all_time_transferred);
+                live.all_time_requested = live.all_time_requested.max(record.all_time_requested);
+                live.all_time_accepted = live.all_time_accepted.max(record.all_time_accepted);
+                live.last_publish_src = live.last_publish_src.max(record.last_publish_src);
+                live.last_shared = live.last_shared.max(record.last_shared);
+                live.last_ember_source_publish = live
+                    .last_ember_source_publish
+                    .max(record.last_ember_source_publish);
+                live.last_ember_keyword_publish = live
+                    .last_ember_keyword_publish
+                    .max(record.last_ember_keyword_publish);
+                // Known-or-absent: an empty in-memory value is "not computed
+                // this pass", not "known to be empty".
+                if live.part_hashes.is_empty() && !record.part_hashes.is_empty() {
+                    live.part_hashes = record.part_hashes;
+                }
+                if live.aich_hash.is_empty() && !record.aich_hash.is_empty() {
+                    live.aich_hash = record.aich_hash;
+                }
+                if live.ember_file_hash.is_empty() && !record.ember_file_hash.is_empty() {
+                    live.ember_file_hash = record.ember_file_hash;
+                }
+                // Point-in-time gauge: keep the last known figure rather than
+                // showing 0 until the next source-count sync.
+                if live.complete_sources == 0 {
+                    live.complete_sources = record.complete_sources;
                 }
                 continue;
             }
@@ -1882,6 +1928,95 @@ mod tests {
             live.find_by_hash(&hash).unwrap().friends_only,
             "deferred known.met load must restore a restriction the scan dropped"
         );
+    }
+
+    /// The reconcile that runs before the deferred load manufactures a row
+    /// against the empty placeholder, so its counters are this session's
+    /// (near-zero) values and its `part_hashes` are empty. Absorbing the real
+    /// catalog must not let that placeholder row win the history, because the
+    /// absorb is also what makes the list safe to save — so whatever survives
+    /// here is what gets written back over the real known.met.
+    #[test]
+    fn absorb_keeps_disk_history_over_a_placeholder_seeded_row() {
+        let hash = [0x42; 16];
+
+        // What the pre-absorb reconcile inserts: current path/name, but the
+        // `existing = None` branch's zeroed history.
+        let mut live = KnownFileList::new();
+        let mut manufactured = sample_record();
+        manufactured.part_hashes = Vec::new();
+        manufactured.all_time_transferred = 0;
+        manufactured.all_time_requested = 0;
+        manufactured.all_time_accepted = 0;
+        manufactured.last_publish_src = 0;
+        manufactured.complete_sources = 0;
+        manufactured.aich_hash = String::new();
+        manufactured.ember_file_hash = String::new();
+        live.add_or_update(manufactured);
+
+        let mut disk = KnownFileList::new();
+        let mut real = sample_record();
+        real.part_hashes = vec![[0x11; 16], [0x22; 16]];
+        real.all_time_transferred = 9_000_000_000;
+        real.all_time_requested = 4_321;
+        real.all_time_accepted = 1_234;
+        real.last_publish_src = 1_700_000_900;
+        real.complete_sources = 17;
+        disk.add_or_update(real);
+        disk.authoritative = true;
+
+        live.absorb_missing_from(disk);
+        let merged = live.find_by_hash(&hash).expect("row survives the absorb");
+        assert_eq!(
+            merged.all_time_transferred, 9_000_000_000,
+            "all-time upload total must not reset to this session's bytes"
+        );
+        assert_eq!(merged.all_time_requested, 4_321);
+        assert_eq!(merged.all_time_accepted, 1_234);
+        assert_eq!(
+            merged.last_publish_src, 1_700_000_900,
+            "a zeroed publish stamp would republish the whole library"
+        );
+        assert_eq!(
+            merged.part_hashes.len(),
+            2,
+            "per-part MD4 hashsets must survive — nothing recomputes them \
+             without a full re-hash, so losing them silently breaks AICH recovery"
+        );
+        assert!(!merged.aich_hash.is_empty(), "AICH root must be restored");
+        assert!(
+            !merged.ember_file_hash.is_empty(),
+            "Ember digest must be restored rather than re-hashed"
+        );
+        assert_eq!(
+            merged.complete_sources, 17,
+            "last-known Peers count should be restored, not shown as 0"
+        );
+    }
+
+    /// The merge is a max, not a blind overwrite: a genuinely newer in-memory
+    /// count (bytes served this session before the load landed) must not be
+    /// walked backwards to the on-disk figure either.
+    #[test]
+    fn absorb_keeps_the_larger_counter_when_memory_is_ahead() {
+        let hash = [0x42; 16];
+        let mut live = KnownFileList::new();
+        let mut ahead = sample_record();
+        ahead.all_time_transferred = 5_000;
+        ahead.all_time_requested = 50;
+        live.add_or_update(ahead);
+
+        let mut disk = KnownFileList::new();
+        let mut behind = sample_record();
+        behind.all_time_transferred = 1_000;
+        behind.all_time_requested = 10;
+        disk.add_or_update(behind);
+        disk.authoritative = true;
+
+        live.absorb_missing_from(disk);
+        let merged = live.find_by_hash(&hash).unwrap();
+        assert_eq!(merged.all_time_transferred, 5_000);
+        assert_eq!(merged.all_time_requested, 50);
     }
 
     /// A record with no source-count tag ever written (the common case, and
