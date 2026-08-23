@@ -3589,12 +3589,31 @@ impl UploadHandler {
         // buffer in memory before it's flushed to a peer's socket.
         const MAX_BROWSE_ANSWER_FILES: usize = 50_000;
 
+        // Browse is an *advertise* surface, so it owes the same fail-closed
+        // friends-only rule as the serve path — `is_public_listable()` alone
+        // trusts the live index row, and a share-scan that re-discovered a
+        // restricted file before known.met was absorbed leaves that row
+        // reading `friends_only: false`. `resolve_upload_file` already refuses
+        // to hand out the bytes in that window, but listing the file still
+        // disclosed its name, hash and size to an anonymous peer. Consulting
+        // the snapshot here (rather than `hash_is_friends_only`, which takes
+        // the index lock we are already holding) keeps every advertise and
+        // serve path on one source of truth.
+        let snapshot_ready = friends_only_snapshot_ready(&self.friends_only_hashes);
         let files: Vec<(String, String, u64, String)> = {
             let index = self.local_index.read().await;
             index
                 .all_files()
                 .iter()
-                .filter(|f| f.is_public_listable())
+                .filter(|f| {
+                    if !f.is_friend_visible() {
+                        return false;
+                    }
+                    let snapshot_hit = crate::network::parse_ed2k_hash16(&f.hash).is_some_and(|h| {
+                        friends_only_snapshot_contains(&self.friends_only_hashes, &h)
+                    });
+                    !friends_only_from_sources(snapshot_hit, snapshot_ready, Some(f.friends_only))
+                })
                 .take(MAX_BROWSE_ANSWER_FILES)
                 .map(|f| (f.hash.clone(), f.name.clone(), f.size, f.extension.clone()))
                 .collect()

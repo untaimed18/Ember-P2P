@@ -80,10 +80,20 @@ const MAX_CALLBACK_CLIENTS: usize = 256;
 const MAX_CALLBACK_FORWARDS_PER_SENDER: usize = 8;
 const MAX_CALLBACK_FORWARDS_IN_FLIGHT: usize = 32;
 const CALLBACK_FORWARD_WINDOW: Duration = Duration::from_secs(60);
+/// Span a bounced `CALLBACK_REQ` is treated as still outstanding, so
+/// [`EmberDht::admit_budgeted`] can enforce
+/// [`MAX_CALLBACK_FORWARDS_IN_FLIGHT`] as a real concurrency cap instead of a
+/// global per-minute rate. A bounce is one UDP frame and the publisher's
+/// connect-back follows within a couple of RTTs; 30 s is the same allowance
+/// [`PROXY_FORWARD_INFLIGHT`] gives a store fan-out.
+const CALLBACK_FORWARD_INFLIGHT: Duration = Duration::from_secs(30);
 /// Outbound connect-backs we will honour per buddy per minute.
 const MAX_CALLBACK_CONNECTS_PER_BUDDY: usize = 8;
 const MAX_CALLBACK_CONNECTS_IN_FLIGHT: usize = 16;
 const CALLBACK_CONNECT_WINDOW: Duration = Duration::from_secs(60);
+/// Sub-window for [`MAX_CALLBACK_CONNECTS_IN_FLIGHT`]; see
+/// [`CALLBACK_FORWARD_INFLIGHT`].
+const CALLBACK_CONNECT_INFLIGHT: Duration = Duration::from_secs(30);
 /// Buddies that accepted `PROXY_STORE` for us, kept for the same TTL as the
 /// records that name them, so a `CALLBACK` from one of them is accepted.
 const MAX_OUR_PROXY_BUDDIES: usize = 32;
@@ -92,7 +102,18 @@ const MAX_OUR_PROXY_BUDDIES: usize = 32;
 /// gone and a late or guessed ACK cannot unlock connect-back.
 const PROXY_STORE_ASK_TTL: Duration = Duration::from_secs(90);
 /// Bound on in-flight `PROXY_STORE` request ids remembered per buddy.
-const MAX_PENDING_PROXY_ASKS_PER_BUDDY: usize = 64;
+///
+/// Must cover one publish tick's whole fan-out. A firewalled publisher names a
+/// single buddy and asks it to proxy every source record the tick selected, in
+/// one loop that never services inbound UDP — so every ask is recorded before
+/// the first ACK is read. `ember_source_files_per_tick` allows up to
+/// `EMBER_SOURCE_PUBLISH_MAX_PER_TICK` (256), and 120 even on a one-contact
+/// table. At 64 the table overflowed mid-tick and, because eviction took the
+/// oldest, it discarded precisely the asks the buddy admits — a buddy accepts
+/// the *first* `MAX_PROXY_FORWARDS_PER_SENDER` of a window, so the returning
+/// ACKs matched nothing, `flush_ember_proxy_overlay_ack` never ran, and a LowID
+/// node published no Ember sources at all.
+const MAX_PENDING_PROXY_ASKS_PER_BUDDY: usize = 256;
 
 /// Share of the liveness-ping budget held for unverified leads when there are
 /// enough verified contacts due to spend the whole thing. One in four: enough
@@ -801,7 +822,15 @@ impl EmberDht {
         asks.retain(|(_, _, at)| now.saturating_duration_since(*at) < PROXY_STORE_ASK_TTL);
         if !asks.iter().any(|(rid, _, _)| *rid == request_id) {
             if asks.len() >= MAX_PENDING_PROXY_ASKS_PER_BUDDY {
-                asks.remove(0);
+                // Keep the entries already here rather than evicting the
+                // oldest. The buddy admits the first
+                // `MAX_PROXY_FORWARDS_PER_SENDER` asks of its window, so the
+                // older entries are the ones whose ACK is actually coming;
+                // dropping them to make room for asks the buddy will refuse
+                // loses the ACKs we need. The overflowing ask is simply not
+                // tracked — its record ages out of `ember_pending_proxy_overlay`
+                // exactly as it would have when the buddy refused it.
+                return;
             }
             asks.push((request_id, file_hash, now));
         }
@@ -892,6 +921,7 @@ impl EmberDht {
             sender,
             now,
             CALLBACK_FORWARD_WINDOW,
+            CALLBACK_FORWARD_INFLIGHT,
             MAX_CALLBACK_FORWARDS_IN_FLIGHT,
             MAX_CALLBACK_FORWARDS_PER_SENDER,
         )
@@ -903,16 +933,35 @@ impl EmberDht {
             buddy,
             now,
             CALLBACK_CONNECT_WINDOW,
+            CALLBACK_CONNECT_INFLIGHT,
             MAX_CALLBACK_CONNECTS_IN_FLIGHT,
             MAX_CALLBACK_CONNECTS_PER_BUDDY,
         )
     }
 
+    /// Admit one unit of relay work against a concurrency cap and a per-peer
+    /// rate.
+    ///
+    /// The two limits are measured over *different* spans, which is the whole
+    /// point. `max_in_flight` is a concurrency bound, so it counts only what
+    /// was admitted inside `in_flight_window` — a slot lives at most that long,
+    /// so counting arrivals inside it bounds what can still be alive without
+    /// ever observing a completion. `max_per_sender` is a fairness/anti-flood
+    /// rate, so it counts the whole `window`.
+    ///
+    /// Measuring both over `window` (as this used to) collapsed the
+    /// concurrency cap into a global per-minute rate: a buddy could relay only
+    /// `max_in_flight` callbacks a *minute* no matter how fast they completed,
+    /// so a handful of searchers spending their per-peer quota starved every
+    /// other searcher and the firewalled sources behind this buddy looked dead.
+    /// [`Self::can_accept_proxy_forward`] always had the sub-window; this is
+    /// the same rule.
     fn admit_budgeted(
         q: &mut VecDeque<(Instant, EmberNodeId)>,
         who: EmberNodeId,
         now: Instant,
         window: Duration,
+        in_flight_window: Duration,
         max_in_flight: usize,
         max_per_sender: usize,
     ) -> bool {
@@ -922,7 +971,11 @@ impl EmberDht {
             }
             q.pop_front();
         }
-        if q.len() >= max_in_flight {
+        let in_flight = q
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < in_flight_window)
+            .count();
+        if in_flight >= max_in_flight {
             return false;
         }
         let from_who = q.iter().filter(|(_, id)| *id == who).count();
@@ -3725,6 +3778,123 @@ mod tests {
             stranger.build_callback([2u8; 16], searcher_ip, 4662, 0, [0u8; 16], [0x55u8; 16]);
         let on_pub = publisher.handle_message(&frame, addr(96, 4672), [0xDDu8; 32], 2000);
         assert!(on_pub.callback_connect.is_none());
+    }
+
+    /// `max_in_flight` has to bound concurrency, not throughput. Measuring it
+    /// over the full rate window turned it into a global "32 callbacks a
+    /// minute" ceiling for a node that relays for up to `MAX_CALLBACK_CLIENTS`
+    /// publishers, so a few searchers spending their per-peer quota starved
+    /// everyone else and the firewalled sources behind that buddy looked dead.
+    #[test]
+    fn callback_admission_is_a_concurrency_cap_not_a_per_minute_quota() {
+        fn admit(q: &mut VecDeque<(Instant, EmberNodeId)>, who: EmberNodeId, now: Instant) -> bool {
+            EmberDht::admit_budgeted(
+                q,
+                who,
+                now,
+                CALLBACK_FORWARD_WINDOW,
+                CALLBACK_FORWARD_INFLIGHT,
+                MAX_CALLBACK_FORWARDS_IN_FLIGHT,
+                MAX_CALLBACK_FORWARDS_PER_SENDER,
+            )
+        }
+        // Distinct senders throughout, so the per-sender rate is never what
+        // binds and the assertions are only about the concurrency cap.
+        let sender = |i: usize| EmberNodeId([i as u8; 16]);
+        let t0 = Instant::now();
+        let mut q: VecDeque<(Instant, EmberNodeId)> = VecDeque::new();
+
+        for i in 0..MAX_CALLBACK_FORWARDS_IN_FLIGHT {
+            assert!(admit(&mut q, sender(i), t0), "bounce {i} is within budget");
+        }
+        assert!(
+            !admit(&mut q, sender(200), t0),
+            "the concurrency cap must still apply while those bounces are live"
+        );
+
+        // Past the sub-window those slots cannot still be outstanding, so
+        // capacity returns — while the rate window has NOT rolled over, which
+        // is exactly the case the old code refused.
+        let later = t0 + CALLBACK_FORWARD_INFLIGHT + Duration::from_secs(1);
+        assert!(
+            later.saturating_duration_since(t0) < CALLBACK_FORWARD_WINDOW,
+            "the point of the test is capacity returning *inside* the rate window"
+        );
+        assert!(
+            admit(&mut q, sender(201), later),
+            "finished bounces must free capacity before the rate window rolls over"
+        );
+
+        // The per-sender allowance is still measured over the whole window, so
+        // one peer cannot use that to exceed its own rate.
+        let mut solo: VecDeque<(Instant, EmberNodeId)> = VecDeque::new();
+        let one = sender(7);
+        for _ in 0..MAX_CALLBACK_FORWARDS_PER_SENDER {
+            assert!(admit(&mut solo, one, t0));
+        }
+        assert!(
+            !admit(&mut solo, one, later),
+            "a single searcher's per-minute rate must survive the sub-window"
+        );
+    }
+
+    /// A firewalled publisher fans a whole publish tick at one buddy before
+    /// reading a single reply, and the buddy admits only the *first*
+    /// `MAX_PROXY_FORWARDS_PER_SENDER` of them. So the earliest asks are the
+    /// ones whose ACK actually arrives, and they must still be matchable after
+    /// the rest of the tick has been recorded — otherwise the ACK unlocks
+    /// nothing, the held record never reaches the overlay, and a LowID node
+    /// publishes no Ember sources at all.
+    #[test]
+    fn a_full_tick_of_proxy_asks_keeps_the_ones_the_buddy_will_ack() {
+        let mut publisher = dht(120);
+        let mut buddy = dht(121);
+        let buddy_id = buddy.local_id();
+        let now = Instant::now();
+
+        // The ask table has to survive one tick's worth of fan-out, which is
+        // what `ember_source_files_per_tick` is allowed to select.
+        let per_tick = 256usize;
+        assert!(
+            MAX_PENDING_PROXY_ASKS_PER_BUDDY >= per_tick,
+            "the ask table must cover a whole publish tick's fan-out"
+        );
+
+        let mut first_file = [0u8; 16];
+        first_file[0] = 1;
+        for i in 0..per_tick {
+            let mut file = [0u8; 16];
+            file[0] = (i % 251) as u8;
+            file[1] = (i / 251) as u8;
+            if i == 0 {
+                first_file = file;
+            }
+            publisher.note_proxy_store_sent(buddy_id, i as u32, file, now);
+        }
+
+        // The buddy ACKs request id 0 — it accepted the first ask it saw.
+        let ack = buddy.build_proxy_store_ack_frame(0, [0xABu8; 16]);
+        let on_ack = publisher.handle_message(&ack, addr(121, 4672), [0xEEu8; 32], 3000);
+        assert!(
+            on_ack.proxy_store_ack.is_some(),
+            "the first ask of a tick must still be ACK-able after the tick is recorded"
+        );
+
+        // And that ACK is what grants connect-back for that file.
+        let token = publisher.callback_token(&first_file);
+        let (_rid, callback) = buddy.build_callback(
+            first_file,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4662,
+            0,
+            [0u8; 16],
+            token,
+        );
+        let on_cb = publisher.handle_message(&callback, addr(121, 4672), [0xEEu8; 32], 3001);
+        assert!(
+            on_cb.callback_connect.is_some(),
+            "the ACKed file must be reachable by CALLBACK"
+        );
     }
 
     #[test]

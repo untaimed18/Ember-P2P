@@ -222,7 +222,10 @@ impl BuddyManager {
         if tcp_status != FirewallStatus::Firewalled {
             return false;
         }
-        if udp_status != FirewallStatus::Firewalled {
+        // UDP Open/Unknown ⇒ direct UDP callback may apply; do not consume a
+        // buddy slot. Equivalent to `udp_status != Firewalled` once TCP is
+        // confirmed firewalled.
+        if super::firewall::can_advertise_direct_udp_callback(tcp_status, udp_status) {
             return false;
         }
         if self.state == BuddyState::Connected {

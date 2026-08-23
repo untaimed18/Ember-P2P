@@ -732,6 +732,28 @@ enum InjectionWaitAction {
     Break,
 }
 
+/// Whether the worker must give up immediately because there is nowhere for
+/// bytes to come from.
+///
+/// Starting with no *dialable* source is legitimate and is the whole point of
+/// the firewalled-callback paths: a transfer whose only known peer is parked in
+/// `WaitCallbackKad` / `LowToLowIp` / `EmberRelay` needs a live worker so the
+/// established stream can be injected when the Ember `CALLBACK_REQ` or the
+/// LowID↔LowID broker lands. Bailing on an empty source vector killed that
+/// worker before it ever polled `new_established_rx`, which turned the feature
+/// into a flap loop: the transfer went Active, failed with "no sources
+/// available", classified `Transient`, returned to `Searching`, and started the
+/// same doomed worker on the next retry tick.
+///
+/// So the test is not "are there sources now" but "can a source still arrive".
+fn no_source_can_ever_arrive(
+    sources_empty: bool,
+    has_source_rx: bool,
+    has_established_rx: bool,
+) -> bool {
+    sources_empty && !has_source_rx && !has_established_rx
+}
+
 fn injection_wait_action(
     pending_handles_empty: bool,
     injection_channel_open: bool,
@@ -956,6 +978,7 @@ struct WriteReservation {
 }
 
 impl WriteReservation {
+    #[cfg(test)]
     async fn acquire(tracker: &Arc<RwLock<PartTracker>>, start: u64, end: u64) -> Self {
         Self::acquire_with_release(tracker, start, end, None).await
     }
@@ -1516,7 +1539,11 @@ impl MultiSourceDownload {
             return Ok(());
         }
 
-        if self.sources.is_empty() {
+        if no_source_can_ever_arrive(
+            self.sources.is_empty(),
+            self.new_source_rx.is_some(),
+            self.new_established_rx.is_some(),
+        ) {
             anyhow::bail!("no sources available");
         }
 
@@ -10504,6 +10531,32 @@ mod tests {
         assert_eq!(out, &data[..]);
         // ...and the receive loop's structural validation must accept it.
         assert!(s < e && e <= FILE_SIZE && out.len() == (e - s) as usize);
+    }
+
+    /// A transfer whose only known peer is parked awaiting a connect-back
+    /// starts with zero dialable sources on purpose. Bailing on that killed the
+    /// worker before it could poll `new_established_rx`, so the Ember
+    /// `CALLBACK_REQ` / LowID broker stream had nowhere to land and the
+    /// transfer flapped Active → "no sources available" → Searching forever.
+    #[test]
+    fn a_worker_that_can_still_be_injected_into_must_not_bail() {
+        // No sources, but the callback path can still hand us a live stream.
+        assert!(
+            !no_source_can_ever_arrive(true, true, true),
+            "a parked-source transfer must start and wait for its callback"
+        );
+        assert!(
+            !no_source_can_ever_arrive(true, false, true),
+            "an established-stream channel alone is reason enough to wait"
+        );
+        assert!(
+            !no_source_can_ever_arrive(true, true, false),
+            "so is a metadata-injection channel"
+        );
+        // Nothing can ever arrive: this is the only real dead end.
+        assert!(no_source_can_ever_arrive(true, false, false));
+        // And a worker that already has sources never bails regardless.
+        assert!(!no_source_can_ever_arrive(false, false, false));
     }
 
     #[test]

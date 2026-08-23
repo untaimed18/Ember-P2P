@@ -13622,6 +13622,48 @@ async fn publish_kad_completes_from_index(
     n
 }
 
+/// Promote Connecting → Connected and register public files for KAD publish.
+///
+/// Both the 10s routing-table tick and the UDP bootstrap handler can decide
+/// we are Connected. Only the tick used to populate the publish manager, so a
+/// session whose first verified contact arrived on UDP never registered the
+/// library. Call this from every promotion site.
+async fn promote_kad_connected_and_first_publish(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    known_files: &KnownFileList,
+) {
+    if state.stats.status == NetworkStatus::Connected {
+        return;
+    }
+    if state.routing_table.verified_len() < KAD_MIN_VERIFIED_FOR_CONNECTED {
+        return;
+    }
+    if !kad_has_fresh_contact(state) {
+        return;
+    }
+    state.stats.status = NetworkStatus::Connected;
+    let _ = app_handle.emit("network-status", NetworkStatus::Connected);
+    if state.first_publish_done {
+        return;
+    }
+    state.first_publish_done = true;
+    let shared_count =
+        publish_kad_completes_from_index(state, local_index, known_files).await;
+    let partial_count = publish_kad_partials_from_transfers(
+        state,
+        transfer_manager,
+        local_index,
+        known_files,
+    )
+    .await;
+    info!(
+        "Populated publish manager with {shared_count} shared files + {partial_count} partial downloads after bootstrap"
+    );
+}
+
 async fn or_index_friends_only_from_known(
     local_index: &Arc<RwLock<LocalIndex>>,
     known_files: &KnownFileList,
@@ -15284,10 +15326,15 @@ async fn try_start_pending_download_from_known_sources(
     let dl_tid = ms_download.transfer_id.clone();
     let dl_tid2 = dl_tid.clone();
     info!(
-        "Starting download {} ({}) with {} source(s) [try_start_from_known]",
+        "Starting download {} ({}) with {} live source(s){} [try_start_from_known]",
         dl_tid,
         hex::encode(hash_bytes),
-        live_sources.len()
+        live_sources.len(),
+        if live_sources.is_empty() {
+            " — parked peers only, worker waits for a firewalled connect-back"
+        } else {
+            ""
+        }
     );
     state
         .active_source_senders
@@ -15297,11 +15344,36 @@ async fn try_start_pending_download_from_known_sources(
         .insert(dl_tid.clone(), est_inject_tx);
     let tx = dl_event_tx.clone();
     let tx2 = tx.clone();
+    let old_tracker = state.tracker_registry.lock().get(&dl_tid2).cloned();
     if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
         debug!(
             "Aborting existing download task for {dl_tid2} before starting multi-source download"
         );
+        // Same teardown the `StartDownload` path does. It used to be
+        // defensible to skip it here because a worker reaching this point had
+        // almost certainly already exited — but a transfer whose only peers are
+        // parked now starts a worker that deliberately stays alive waiting for
+        // a connect-back, so this can genuinely abort a live one. Aborting the
+        // parent does not reach its detached per-source tasks, and the new
+        // `PartFileWriter` must not open the `.part` while the old one's writes
+        // are still in flight.
         old_handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), old_handle).await;
+        if let Some(tracker) = old_tracker {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let idle = {
+                        let t = tracker.read().await;
+                        t.in_progress_part_count() == 0 && t.write_reservation_count() == 0
+                    };
+                    if idle {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+        }
     }
     let handle = tokio::spawn(async move {
         if let Err(e) = ms_download.run(tx).await {
@@ -18246,29 +18318,37 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         sync_shared_friends_only_hashes(&shared_friends_only_hashes, &known_files);
                         or_index_friends_only_from_known(&local_index, &known_files).await;
                         known_met_ready = true;
-                        // Live StartDownload / PartFileReady / first KAD
-                        // connect may have skipped advertise while this
-                        // catalog was a placeholder. Public completes and
-                        // partials land now; friends-only stay out.
-                        if state.first_publish_done {
-                            let shared_n = publish_kad_completes_from_index(
-                                &mut state,
-                                &local_index,
-                                &known_files,
-                            )
-                            .await;
-                            let partial_n = publish_kad_partials_from_transfers(
-                                &mut state,
-                                &transfer_manager,
-                                &local_index,
-                                &known_files,
-                            )
-                            .await;
-                            if shared_n + partial_n as usize > 0 {
-                                info!(
-                                    "Backfilled {shared_n} public shares + {partial_n} partial downloads into KAD publish after known.met load"
-                                );
-                            }
+                        // Startup scan often finishes (and no-ops AnnounceFiles)
+                        // against the placeholder catalog a few hundred ms
+                        // before this absorb. KAD auto-connect is off, so
+                        // `first_publish_done` is still false here — gating
+                        // the backfill on it left the publish manager empty
+                        // for the rest of the session. Always register now;
+                        // friends-only hashes stay out inside the helpers.
+                        let shared_n = publish_kad_completes_from_index(
+                            &mut state,
+                            &local_index,
+                            &known_files,
+                        )
+                        .await;
+                        let partial_n = publish_kad_partials_from_transfers(
+                            &mut state,
+                            &transfer_manager,
+                            &local_index,
+                            &known_files,
+                        )
+                        .await;
+                        if shared_n + partial_n as usize > 0 {
+                            info!(
+                                "Backfilled {shared_n} public shares + {partial_n} partial downloads into KAD publish after known.met load"
+                            );
+                            // The library is registered, so the KAD-connect
+                            // promotion does not need to sweep it again — that
+                            // second pass re-derives every keyword, and on the
+                            // UDP promotion path it runs inside packet
+                            // handling. Left false when nothing registered
+                            // (index still scanning) so that path retries.
+                            state.first_publish_done = true;
                         }
                         state.request_offer_files = true;
                         hydrate_ember_publish_schedule(
@@ -18299,6 +18379,67 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     Err(e) => {
                         warn!("Deferred disk load task panicked: {e}");
                         known_met_ready = true;
+                        // Absorbing the catalog is the *only* thing that makes
+                        // it authoritative, and authoritative is what un-gates
+                        // every advertise and serve path: `kad_may_advertise_*`
+                        // and `mark_friends_only_snapshot_ready`. Leaving it
+                        // unset because an unrelated part of that task (the IP
+                        // filter, the AICH sets) panicked would silently turn
+                        // off KAD and Ember publishing, `OP_OFFERFILES`, and
+                        // every upload to a non-friend for the whole session,
+                        // with this one log line as the only signal. The
+                        // deferred handle is already taken and never retried,
+                        // so recover the catalog on its own here.
+                        let known_path = state.data_dir.join("known.met");
+                        match tokio::task::spawn_blocking(move || {
+                            KnownFileList::load_checked(&known_path)
+                        })
+                        .await
+                        {
+                            Ok(Ok(loaded)) => {
+                                known_files.absorb_missing_from(loaded);
+                                sync_shared_friends_only_hashes(
+                                    &shared_friends_only_hashes,
+                                    &known_files,
+                                );
+                                or_index_friends_only_from_known(&local_index, &known_files).await;
+                                let shared_n = publish_kad_completes_from_index(
+                                    &mut state,
+                                    &local_index,
+                                    &known_files,
+                                )
+                                .await;
+                                let partial_n = publish_kad_partials_from_transfers(
+                                    &mut state,
+                                    &transfer_manager,
+                                    &local_index,
+                                    &known_files,
+                                )
+                                .await;
+                                if shared_n + partial_n as usize > 0 {
+                                    state.first_publish_done = true;
+                                }
+                                state.request_offer_files = true;
+                                info!(
+                                    "Recovered known.met after the deferred load panicked: \
+                                     {shared_n} public shares + {partial_n} partial downloads \
+                                     registered; sharing stays enabled"
+                                );
+                            }
+                            Ok(Err(load_err)) => {
+                                error!(
+                                    "known.met could not be read after the deferred load panicked \
+                                     ({load_err}); sharing and publishing stay disabled for this \
+                                     session to avoid advertising a friends-only file"
+                                );
+                            }
+                            Err(join_err) => {
+                                error!(
+                                    "known.met recovery task panicked as well ({join_err}); \
+                                     sharing and publishing stay disabled for this session"
+                                );
+                            }
+                        }
                         // A failed deferred read must not turn an enabled
                         // filter into an intentional empty one. Keep the
                         // peer paths fail-closed until a successful reload.
@@ -24843,33 +24984,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 let count = state.routing_table.len() as u32;
                 info!("Routing table: {count} contacts");
-                if state.stats.status != NetworkStatus::Connected
-                    && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
-                    && kad_has_fresh_contact(&state)
-                {
-                    state.stats.status = NetworkStatus::Connected;
-                    let _ = app_handle.emit("network-status", NetworkStatus::Connected);
-
-                    // Populate publish manager with all shared files on first connect
-                    if !state.first_publish_done {
-                        state.first_publish_done = true;
-                        let shared_count = publish_kad_completes_from_index(
-                            &mut state,
-                            &local_index,
-                            &known_files,
-                        )
-                        .await;
-                        let partial_count = publish_kad_partials_from_transfers(
-                            &mut state,
-                            &transfer_manager,
-                            &local_index,
-                            &known_files,
-                        )
-                        .await;
-                        info!("Populated publish manager with {shared_count} shared files + {partial_count} partial downloads after bootstrap");
-                    }
-
-                }
+                promote_kad_connected_and_first_publish(
+                    &mut state,
+                    &app_handle,
+                    &local_index,
+                    &transfer_manager,
+                    &known_files,
+                )
+                .await;
 
                 // Start initial KAD source searches for pending downloads once KAD
                 // is Connected (not merely Connecting / nodes.dat loaded).
@@ -30616,6 +30738,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             }
                                         }
                                         state.firewall_checker.handle_tcp_connect_back();
+                                        kad::firewall::publish_local_firewall(
+                                            state.firewalled,
+                                            state.udp_firewalled,
+                                        );
                                         let ip_bytes = client_id.to_le_bytes();
                                         let ext_ip = Ipv4Addr::from(ip_bytes);
                                         if !ext_ip.is_unspecified()
@@ -30656,6 +30782,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
                                         state.firewall_checker.note_tcp_firewalled();
+                                        // See the login LowID branch: the Hello
+                                        // capability bit lives in a process
+                                        // atomic and would otherwise keep the
+                                        // stale HighID value for this session.
+                                        kad::firewall::note_local_tcp_firewalled(true);
                                         update_publish_manager_state(&mut state);
                                         state.stats.firewalled = true;
                                         state.stats.tcp_status = format!(
@@ -31636,7 +31767,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 info!("HighID from server confirms TCP port is open, clearing firewalled status");
                                 state.firewalled = false;
                                 state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
-                                update_publish_manager_state(&mut state);
                                 if state.buddy_manager.state() == BuddyState::FindingBuddy {
                                     state.buddy_manager.find_failed();
                                     info!("Cancelled buddy search: HighID proves TCP is open");
@@ -31646,7 +31776,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             {
                                 info!("HighID from server confirms TCP port is open (updating tcp_status)");
                             }
+                            // TCP Open must be recorded *before* we refresh the
+                            // publish manager. `kad_source_publish_treat_as_firewalled`
+                            // treats Unknown as firewalled, so an update here used
+                            // to leave source publishes skipped (no buddy, no type-6)
+                            // until a later unrelated refresh.
                             state.firewall_checker.handle_tcp_connect_back();
+                            kad::firewall::publish_local_firewall(
+                                state.firewalled,
+                                state.udp_firewalled,
+                            );
+                            update_publish_manager_state(&mut state);
                             state.stats.firewalled = state.firewalled;
                             state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                             state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
@@ -31696,6 +31836,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             state.firewalled = true;
                             state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
                             state.firewall_checker.note_tcp_firewalled();
+                            // Hello's `supports_direct_udp_callback` reads a
+                            // process atomic, not `state`. Without this a
+                            // session that was HighID earlier keeps advertising
+                            // "no UDP callback" while LowID, so peers that
+                            // cannot dial our TCP port drop us instead of
+                            // calling back over UDP.
+                            kad::firewall::note_local_tcp_firewalled(true);
                             update_publish_manager_state(&mut state);
                             state.stats.firewalled = true;
                             state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
@@ -36803,14 +36950,29 @@ fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
         .store(client_id_le, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether KAD *source* publishes must use the firewalled (buddy / type-6)
+/// path. Keywords still publish either way; `build_source_publish` returns
+/// `None` until a buddy or verified UDP callback exists.
+///
+/// TCP `Unknown` counts as firewalled so we never advertise a type-1/4
+/// source before inbound TCP is proven. Callers must therefore refresh the
+/// publish manager *after* `handle_tcp_connect_back`, not before.
+fn kad_source_publish_treat_as_firewalled(
+    low_id: bool,
+    tcp_status: crate::network::kad::firewall::FirewallStatus,
+) -> bool {
+    low_id || tcp_status != crate::network::kad::firewall::FirewallStatus::Open
+}
+
 fn update_publish_manager_state(state: &mut NetworkState) {
     // Source/callback publishes follow TCP reachability, not the UPnP-cleared
     // UI badge. A LowID or a TCP check that is not Open means peers cannot
     // dial us, so we publish as firewalled even when the router mapping looks
     // healthy.
-    state.publish_manager.firewalled = state.low_id
-        || state.firewall_checker.tcp_status()
-            != crate::network::kad::firewall::FirewallStatus::Open;
+    state.publish_manager.firewalled = kad_source_publish_treat_as_firewalled(
+        state.low_id,
+        state.firewall_checker.tcp_status(),
+    );
     state.publish_manager.use_extern_kad_port =
         matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
     state.publish_manager.udp_port = state.external_udp_port.unwrap_or(state.udp_port);
@@ -38845,6 +39007,45 @@ mod known_friends_only_snapshot_tests {
         assert!(
             !kad_may_advertise_complete(&friends_only, &known_public, &restricted),
             "index friends_only must still keep a file off the open network"
+        );
+    }
+
+    #[test]
+    fn kad_partial_advertise_once_catalog_is_authoritative() {
+        let restricted_hash = [0xAB; 16];
+        let public_hash = [0xCD; 16];
+        let mut known = KnownFileList::new();
+        known.add_or_update(rec(restricted_hash, true, "/r.bin"));
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        known.mark_authoritative_for_tests();
+        assert!(
+            !kad_may_advertise_partial(&known, &restricted, &hex::encode(restricted_hash)),
+            "friends-only partials stay unpublished after absorb"
+        );
+        assert!(
+            kad_may_advertise_partial(&known, &restricted, &hex::encode(public_hash)),
+            "a public partial must advertise once the catalog is absorbed"
+        );
+    }
+
+    #[test]
+    fn kad_source_publish_treats_unknown_tcp_as_firewalled() {
+        use crate::network::kad::firewall::FirewallStatus;
+        assert!(
+            !kad_source_publish_treat_as_firewalled(false, FirewallStatus::Open),
+            "HighID with proven TCP Open is a direct type-1/4 source"
+        );
+        assert!(
+            kad_source_publish_treat_as_firewalled(false, FirewallStatus::Unknown),
+            "HighID before the TCP check finishes must not publish type-1/4"
+        );
+        assert!(kad_source_publish_treat_as_firewalled(
+            false,
+            FirewallStatus::Firewalled
+        ));
+        assert!(
+            kad_source_publish_treat_as_firewalled(true, FirewallStatus::Open),
+            "LowID stays on the buddy/type-6 path even if KAD TCP is Open"
         );
     }
 
@@ -42020,8 +42221,14 @@ async fn handle_udp_packet_inner(
                 && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
                 && kad_has_fresh_contact(state)
             {
-                state.stats.status = NetworkStatus::Connected;
-                let _ = app_handle.emit("network-status", NetworkStatus::Connected);
+                promote_kad_connected_and_first_publish(
+                    state,
+                    app_handle,
+                    local_index,
+                    transfer_manager,
+                    known_files,
+                )
+                .await;
             }
 
             // eMule: first FindNode(self) only after MIN2S(3) from KAD start (not on first packet).
@@ -43865,8 +44072,13 @@ async fn handle_udp_packet_inner(
                     && state.external_udp_port != Some(udp_port)
                 {
                     state.external_udp_port = Some(udp_port);
-                    update_publish_manager_state(state);
                 }
+                // Type-6 source publish keys off `udp_fw_verified`, not the
+                // port changing. Skipping this when the port was already known
+                // (STUN, a prior probe, settings) left LowID+UDP-open clients
+                // with firewalled=true, no buddy, and no callback — so every
+                // source publish returned None until the next firewall evaluate.
+                update_publish_manager_state(state);
                 state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
                 state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
                 let _ = app_handle.emit(
