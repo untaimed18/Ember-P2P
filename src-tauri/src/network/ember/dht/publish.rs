@@ -59,9 +59,27 @@ pub(super) const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
 /// this build reads the extra 70 when they are there. Not a version bump.
 pub(super) const SOURCE_CALLBACK_TRAILER_LEN: usize = 16 + 4 + 2 + 32 + 16;
 
+/// Whether a buddy would survive `decode_source_contact`.
+///
+/// The decoder discards a trailer whose buddy has port 0 or an unspecified IP
+/// (and with it the `user_hash` and `callback_token` that share the trailer),
+/// so writing one is a 70-byte round-trip loss: `decode(encode(sc)) != sc`, and
+/// re-encoding the parsed contact would give 41 bytes where
+/// `source_contact_encoded_len` promised 111. Both the encoder and the length
+/// helper ask this question so all three agree on when the trailer exists.
+///
+/// Not reachable from the current publish path — `ember_named_source_buddy`
+/// applies the stricter `SourceBuddy::is_routable` before naming anyone — but
+/// this is the one helper whose entire job is predicting the encoder's output.
+fn buddy_survives_decode(buddy: &SourceBuddy) -> bool {
+    buddy.udp_port != 0 && !buddy.ip.is_unspecified()
+}
+
 fn source_contact_encoded_len(contact: Option<&SourceContact>) -> usize {
     match contact {
-        Some(sc) if sc.buddy.is_some() => SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_LEN,
+        Some(sc) if sc.buddy.as_ref().is_some_and(buddy_survives_decode) => {
+            SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_LEN
+        }
         Some(_) => SOURCE_CONTACT_WIRE_LEN,
         None => 0,
     }
@@ -73,7 +91,7 @@ fn encode_source_contact(data: &mut Vec<u8>, sc: &SourceContact) {
     data.write_u16::<LittleEndian>(sc.udp_port).unwrap();
     data.push(sc.flags);
     data.extend_from_slice(&sc.noise_pub);
-    if let Some(buddy) = sc.buddy {
+    if let Some(buddy) = sc.buddy.filter(buddy_survives_decode) {
         data.extend_from_slice(&sc.user_hash.unwrap_or([0u8; 16]));
         data.extend_from_slice(&buddy.ip.octets());
         data.write_u16::<LittleEndian>(buddy.udp_port).unwrap();

@@ -441,9 +441,26 @@ impl RoutingTable {
             };
             if let Some(pos) = pos {
                 let evicted_ip = self.buckets[bucket_idx].contacts[pos].addr.ip();
+                let evicted_subnet = self.buckets[bucket_idx].contacts[pos].subnet_key();
                 let ip_ok = ip == evicted_ip
                     || self.global_ip_count.get(&ip).copied().unwrap_or(0) < max_per_ip;
-                if ip_ok {
+                // Displacing a resident in our *own* /24 leaves both subnet
+                // counts unchanged, so the caps cannot be exceeded and need not
+                // be consulted — that is the case this fast path was written
+                // for. Taking a slot from a different /24 raises our count, and
+                // this branch returned `Added` without ever reaching the checks
+                // below. Because the `|| bucket.is_full()` disjunct above
+                // matches *any* unverified resident, and a contact counts as
+                // verified after one signed frame, a single /24 running one
+                // keypair per host could take every slot in a full bucket —
+                // and `find_closest` serves verified contacts only, so those
+                // slots decide the contact lists we gossip, the store
+                // responsibility comparison, and every lookup frontier.
+                let subnet_ok = evicted_subnet == subnet
+                    || (self.buckets[bucket_idx].subnet_count(subnet) < max_subnet_bucket
+                        && self.global_subnet_count.get(&subnet).copied().unwrap_or(0)
+                            < max_subnet_global);
+                if ip_ok && subnet_ok {
                     let bucket = &mut self.buckets[bucket_idx];
                     let evicted = bucket.contacts.remove(pos).unwrap();
                     bucket
@@ -1896,6 +1913,52 @@ mod tests {
             "the live peer belongs in the bucket, not the cache"
         );
         assert_eq!(rt.verified_len(), 1);
+    }
+
+    /// A verified contact outranks mute gossip, but only within the /24
+    /// diversity caps. The fast path consulted neither, and its
+    /// `|| bucket.is_full()` disjunct matches *any* unverified resident — so
+    /// one /24 running a keypair per host could take a whole full bucket
+    /// simply by sending one signed frame from each. `find_closest` returns
+    /// verified contacts only, so those slots decide the contacts we gossip,
+    /// the store-responsibility comparison and every lookup frontier.
+    #[test]
+    fn a_single_subnet_cannot_take_a_full_bucket_by_being_verified() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // Fill one bucket with unverified leads, each in its own /24 so no
+        // subnet cap is engaged yet.
+        for k in 0..K_BUCKET_SIZE as u8 {
+            let mut lead = contact_at(0x80 + k, 80, k, 1, 1);
+            lead.last_seen = 0;
+            assert!(matches!(rt.add_contact(lead), AddResult::Added));
+        }
+        assert_eq!(rt.verified_len(), 0, "all seeded contacts are mute gossip");
+
+        // Now one /24 speaks from many hosts, each with its own keypair (so
+        // distinct node ids) and its own address (so the per-IP cap is not
+        // what binds).
+        let attacker = contact_at(0xA0, 10, 0, 0, 1);
+        let attacker_subnet = attacker.subnet_key();
+        let bucket_idx = local.bucket_index(&attacker.node_id).expect("a bucket");
+        for j in 0..K_BUCKET_SIZE as u8 {
+            let _ = rt.add_contact(contact_at(0xA0 + j, 10, 0, 0, j + 1));
+        }
+
+        let taken = rt.buckets[bucket_idx]
+            .contacts
+            .iter()
+            .filter(|c| c.subnet_key() == attacker_subnet)
+            .count();
+        assert!(
+            taken < K_BUCKET_SIZE,
+            "one /24 holds {taken} of {K_BUCKET_SIZE} slots — the diversity caps were bypassed"
+        );
+        assert!(
+            taken <= scale::NetworkScale::Bootstrap.max_contacts_per_subnet_global(),
+            "one /24 holds {taken} slots, past the global /24 cap"
+        );
     }
 
     /// A later verified observation of a cached lead must upgrade the cache
