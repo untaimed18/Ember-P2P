@@ -173,13 +173,12 @@ pub struct DhtInbound {
     pub find_value_received: bool,
     /// True when that `FIND_VALUE` was answered with `FOUND_VALUE` (hit).
     pub find_value_hit: bool,
-    /// Live matching records that did not fit the `FOUND_VALUE` datagram.
+    /// Live matching records past the window the `FOUND_VALUE` served.
     ///
     /// Non-zero means this node holds more under the key than one answer can
-    /// carry. Successive queries rotate which window is served, so a publisher
-    /// behind the first handful is no longer permanently invisible here. The
-    /// withheld count is still the evidence needed before paying for
-    /// pagination.
+    /// carry, and the reply said so: the searcher can page through the rest.
+    /// Kept as a counter because it is the only view of how far the datagram
+    /// ceiling actually binds on real keys.
     pub find_value_withheld: u16,
     /// The frame was a `STORE_ACK`; the `request_id` it answered (so the
     /// caller can resolve the matching publish query).
@@ -188,9 +187,8 @@ pub struct DhtInbound {
     pub store_batch_ack: Option<(u32, u64)>,
     /// How many records an inbound `STORE_BATCH` contributed to our store.
     pub batch_records_stored: u16,
-    /// For a `FOUND_VALUE`, the `request_id` it answered plus the raw
-    /// (still publisher-signed) record blobs it carried.
-    pub found_value: Option<(u32, Vec<Vec<u8>>)>,
+    /// For a `FOUND_VALUE`, the page it carried.
+    pub found_value: Option<FoundValuePage>,
     /// The frame was an `ANNOUNCE_PEER` we answered with a `PEER_LIST`.
     pub announce_peer_received: bool,
     /// For a `PEER_LIST`, the `request_id` it answered plus the contacts
@@ -249,6 +247,32 @@ pub struct DhtInbound {
     /// A candidate buddy endorsed its own endpoint for us and we cached it, so
     /// firewalled source publish can now name it.
     pub buddy_endorsed: bool,
+}
+
+/// One page of a `FOUND_VALUE`.
+///
+/// The two positions are what let a searcher walk a key that holds more records
+/// than a datagram can carry. Both are the responder's claim about its own
+/// store, so a searcher must treat them as hints: require `next_position` to be
+/// strictly past what it asked for before following up, and bound the number of
+/// follow-ups regardless of what `total_available` says.
+#[derive(Debug, Clone)]
+pub struct FoundValuePage {
+    /// The `request_id` this answered, so the caller can resolve the query.
+    pub request_id: u32,
+    /// Raw, still publisher-signed record blobs.
+    pub records: Vec<Vec<u8>>,
+    /// Offset to ask for to continue past this page.
+    pub next_position: u16,
+    /// Live records the responder claims to hold for the query.
+    pub total_available: u16,
+}
+
+impl FoundValuePage {
+    /// Whether the responder claims records past this page.
+    pub fn has_more(&self) -> bool {
+        self.next_position < self.total_available
+    }
 }
 
 /// Destination a firewalled publisher should dial after a buddy-relayed
@@ -1395,7 +1419,8 @@ impl EmberDht {
         messages::encode_message(&msg, &self.signing_key, true)
     }
 
-    /// Build a signed `FIND_VALUE` frame querying for `keys`. The answer
+    /// Build a signed `FIND_VALUE` frame querying for `keys` from
+    /// `start_position` in the responder's list for `keys[0]`. The answer
     /// (`FOUND_VALUE`, or `FOUND_NODE` if the peer has no record) arrives
     /// via [`Self::handle_message`].
     ///
@@ -1405,10 +1430,14 @@ impl EmberDht {
     /// callers pass keys most-selective-first, and the keywords dropped here
     /// are still applied by the caller's own filename filter. Truncating is
     /// therefore strictly better than letting a long query go unanswered.
-    pub fn build_find_value(&mut self, mut keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
+    pub fn build_find_value(
+        &mut self,
+        mut keys: Vec<[u8; 16]>,
+        start_position: u16,
+    ) -> (u32, Vec<u8>) {
         keys.truncate(messages::MAX_FIND_VALUE_KEYS);
         let request_id = self.next_request_id();
-        let msg = messages::build_find_value(self.local_id, request_id, keys);
+        let msg = messages::build_find_value(self.local_id, request_id, keys, start_position);
         let bytes = messages::encode_message(&msg, &self.signing_key, true);
         (request_id, bytes)
     }
@@ -1991,14 +2020,19 @@ impl EmberDht {
                     out.proxy_store_ack = Some(msg.request_id);
                 }
             }
-            DhtPayload::FindValue { keys } => {
+            DhtPayload::FindValue {
+                keys,
+                start_position,
+            } => {
                 out.find_value_received = true;
                 // Multi-keyword wire intersection (when `keys.len() > 1`):
                 // serve primary-key (`keys[0]`) records; when this node also
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
-                if let Some(reply) = intersect_find_value_records(&mut self.store, &keys) {
+                if let Some(reply) =
+                    intersect_find_value_records(&self.store, &keys, start_position)
+                {
                     out.find_value_hit = true;
                     out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
                     let fv = messages::build_found_value(
@@ -2006,6 +2040,8 @@ impl EmberDht {
                         msg.request_id,
                         reply.key,
                         reply.blobs,
+                        reply.next_position,
+                        reply.total_available,
                     );
                     out.responses
                         .push(messages::encode_message(&fv, &self.signing_key, true));
@@ -2027,8 +2063,18 @@ impl EmberDht {
             DhtPayload::StoreAck { key: _ } => {
                 out.store_ack_request_id = Some(msg.request_id);
             }
-            DhtPayload::FoundValue { key: _, records } => {
-                out.found_value = Some((msg.request_id, records));
+            DhtPayload::FoundValue {
+                key: _,
+                records,
+                next_position,
+                total_available,
+            } => {
+                out.found_value = Some(FoundValuePage {
+                    request_id: msg.request_id,
+                    records,
+                    next_position,
+                    total_available,
+                });
             }
             DhtPayload::CallbackReq {
                 publisher_id,
@@ -2210,9 +2256,13 @@ fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
 /// which hid the primary blobs on a small or dense overlay where one node
 /// holds many unrelated keys — holding the wrong extra was then worse than
 /// holding none. Serve the primary in that case too.
+///
+/// `start_position` is the searcher's offset into our live list for the primary
+/// key. Returns `None` when the key is empty or the offset is past its end.
 fn intersect_find_value_records(
-    store: &mut DhtStore,
+    store: &DhtStore,
     keys: &[[u8; 16]],
+    start_position: u16,
 ) -> Option<FoundValueReply> {
     let (primary, filtered) = intersect_live_records(store, keys)?;
 
@@ -2223,61 +2273,81 @@ fn intersect_find_value_records(
     // node that can never answer for it. A partial answer is always better:
     // the searcher merges results across the peers it walks.
     //
-    // Start at this key's serve cursor so successive queries surface a
-    // different window rather than the same oldest handful every time. The
-    // cursor only advances when the reply actually withholds records — if
-    // everything fits, rotation is a no-op.
+    // The window starts where the searcher asked. This used to walk from a
+    // per-key cursor we advanced ourselves, wrapping modulo the list, because a
+    // v2 searcher had no way to name an offset — so the only way to surface
+    // anything past the first window was to rotate it under them and hope they
+    // asked again. Rotation could not tell "this searcher wants the next page"
+    // from "a different searcher wants the first", and two searchers walking the
+    // same hot key advanced each other's windows. An offset the searcher owns
+    // has neither problem, so the cursor is gone rather than kept alongside.
     let n = filtered.len();
-    let start = store.serve_start(&primary, n);
+    let start = start_position as usize;
+    if start >= n {
+        // Past the end. A searcher paging in good faith stops before this
+        // (`next_position >= total_available` says the key is exhausted), so
+        // this is either a stale page against a list that has since shrunk or a
+        // peer probing. Either way there is nothing to serve, and answering
+        // `FOUND_NODE` instead is the same thing we do for a key we do not hold.
+        return None;
+    }
+
     let mut used = 0usize;
     let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let mut last_taken: Option<usize> = None;
-    for i in 0..n {
+    let mut past_last_taken = start;
+    let mut first_passed_over: Option<usize> = None;
+    for (i, r) in filtered.iter().enumerate().skip(start) {
         if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
             break;
         }
-        let r = filtered[(start + i) % n];
         let cost = 2 + r.data.len() + 64;
         if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
             // Records vary in size, so keep scanning for a smaller one that
             // still fits rather than stopping at the first oversized record.
+            first_passed_over = first_passed_over.or(Some(i));
             continue;
         }
         used += cost;
         blobs.push(record_blob(r));
-        last_taken = Some(i);
+        past_last_taken = i + 1;
     }
 
     if blobs.is_empty() {
         return None;
     }
-    let withheld = n - blobs.len();
-    if withheld > 0 {
-        // Advance past the last record actually served, not by how many were
-        // packed. The loop above `continue`s over records that no longer fit
-        // the remaining budget, so advancing by the count stepped *over* those
-        // skipped positions. With records of a uniform size that made the
-        // stride constant, the reachable start offsets collapsed into a single
-        // residue class, and a record whose index fell outside it was skipped
-        // in every window: never first, so never small enough to fit, so never
-        // served by this node at all — while `get_live` and the diagnostics
-        // went on reporting it as held.
-        let advance = last_taken.map(|i| i + 1).unwrap_or(1);
-        store.advance_serve_cursor(&primary, advance, n);
-    }
+
+    // Resume at the earliest record this page passed over, not one past the last
+    // it took. A record skipped mid-window only failed to fit the budget *left*
+    // after the ones ahead of it; starting the next page there makes it first,
+    // where it always fits — `MAX_STORE_RECORD_BYTES` is derived from what a
+    // `FOUND_VALUE` can carry as a singleton, and the store refuses anything
+    // larger. Resuming past it instead would hide it for the rest of the walk,
+    // which is the exact failure paging exists to remove. The cost is re-sending
+    // the records between it and the end of this page, which the searcher dedups
+    // by blob hash.
+    //
+    // Progress is still guaranteed: the record at `start` faces an empty budget,
+    // so it is always taken, so whichever of these two wins is greater than
+    // `start` — which is what the searcher requires before it will page again.
+    let next = first_passed_over.unwrap_or(past_last_taken);
     Some(FoundValueReply {
         key: primary,
         blobs,
-        withheld,
+        withheld: n - next,
+        next_position: next.min(u16::MAX as usize) as u16,
+        total_available: n.min(u16::MAX as usize) as u16,
     })
 }
 
-/// A `FOUND_VALUE` answer plus what the datagram had no room for.
+/// A `FOUND_VALUE` answer plus where the searcher should resume.
 struct FoundValueReply {
     key: [u8; 16],
     blobs: Vec<Vec<u8>>,
-    /// Live matching records left unserved by this reply.
+    /// Live matching records past this page's window. Purely diagnostic —
+    /// `total_available` is what the searcher acts on.
     withheld: usize,
+    next_position: u16,
+    total_available: u16,
 }
 
 /// `record_data || signature`, the shape a `FOUND_VALUE` blob and a locally
@@ -2345,6 +2415,15 @@ fn intersect_live_records<'a>(
         return None;
     }
     Some((primary, filtered))
+}
+
+/// Shorthand for the tests that predate `FIND_VALUE` paging: ask for the first
+/// page, which is what every query that is not a follow-up asks for.
+#[cfg(test)]
+impl EmberDht {
+    fn build_find_value_page_one(&mut self, keys: Vec<[u8; 16]>) -> (u32, Vec<u8>) {
+        self.build_find_value(keys, 0)
+    }
 }
 
 #[cfg(test)]
@@ -2853,7 +2932,7 @@ mod tests {
         // Every record is individually retrievable, so batching did not merge
         // or lose any of them.
         for rec in &records {
-            let (_frid, find) = a.build_find_value(vec![rec.key]);
+            let (_frid, find) = a.build_find_value_page_one(vec![rec.key]);
             let hit = b.handle_message(&find, a_addr, a_noise, 1002);
             assert!(hit.find_value_hit, "each batched key must be servable");
         }
@@ -2977,7 +3056,7 @@ mod tests {
             ));
         }
 
-        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1000);
         assert!(on_b.find_value_hit, "the key is held and must be answered");
         assert_eq!(on_b.responses.len(), 1);
@@ -2991,7 +3070,10 @@ mod tests {
 
         // And it still round-trips with real records in it.
         let on_a = a.handle_message(frame, addr(27, 4672), [0xBB; 32], 1001);
-        let (_rid, blobs) = on_a.found_value.expect("A should see a FOUND_VALUE");
+        let blobs = on_a
+            .found_value
+            .expect("A should see a FOUND_VALUE")
+            .records;
         assert!(!blobs.is_empty(), "a partial answer, not an empty one");
         assert!(
             blobs.len() < 80,
@@ -3036,7 +3118,7 @@ mod tests {
         for i in 0..(messages::MAX_FIND_VALUE_KEYS as u8 + 4) {
             keys.push([i; 16]);
         }
-        let (_frid, find_bytes) = a.build_find_value(keys);
+        let (_frid, find_bytes) = a.build_find_value_page_one(keys);
 
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(
@@ -3072,15 +3154,16 @@ mod tests {
         assert_eq!(on_a.store_ack_request_id, Some(store_rid));
 
         // A asks B for the value.
-        let (find_rid, find_bytes) = a.build_find_value(vec![key]);
+        let (find_rid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let on_b2 = b.handle_message(&find_bytes, a_addr, a_noise, 1002);
         assert!(on_b2.find_value_received);
         assert_eq!(on_b2.responses.len(), 1, "B answers with one FOUND_VALUE");
 
         // The FOUND_VALUE returns to A; the blob re-verifies and matches.
         let on_a2 = a.handle_message(&on_b2.responses[0], b_addr, b_noise, 1003);
-        let (got_rid, blobs) = on_a2.found_value.expect("A should see a FOUND_VALUE");
-        assert_eq!(got_rid, find_rid);
+        let page = on_a2.found_value.expect("A should see a FOUND_VALUE");
+        assert_eq!(page.request_id, find_rid);
+        let blobs = page.records;
         assert_eq!(blobs.len(), 1);
         let parsed = SignedRecord::from_value_blob(&blobs[0]).expect("record verifies");
         assert_eq!(parsed.file_name, "ubuntu.iso");
@@ -3125,6 +3208,91 @@ mod tests {
         assert_eq!(b.store_stats(), (1, 1), "the live store is unchanged");
     }
 
+    /// A record too large for the budget *left* on a page must be reached by a
+    /// later one. The packer keeps scanning past it for something that still
+    /// fits, so the records a page serves are not always a contiguous run — and
+    /// resuming after the last one taken would step over the big record every
+    /// time. It is never first, so never faces an empty budget, so never served
+    /// at all, while `get_live` and the diagnostics go on reporting it as held.
+    #[test]
+    fn a_record_skipped_mid_page_is_served_by_a_later_one() {
+        let mut a = dht(40);
+        let mut b = dht(41);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(40, 4672);
+        let b_addr = addr(41, 4672);
+
+        // One record at the body cap — it fits a datagram alone and nothing
+        // else can share with it — surrounded by small ones, stored in that
+        // order so the big one lands mid-window.
+        let big_name = "b".repeat(
+            messages::MAX_STORE_RECORD_BYTES - super::super::publish::RECORD_HEADER_LEN,
+        );
+        let names: Vec<&str> = vec!["small-one.iso", &big_name, "small-two.iso", "small-three.iso"];
+
+        let mut key = [0u8; 16];
+        for (i, name) in names.iter().enumerate() {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i as u8;
+            let record = a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 4096, name);
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000 + i as i64)
+                    .stored_record,
+                "record {i} should be accepted"
+            );
+        }
+
+        // Page the key and collect which files were reached.
+        let mut seen: HashSet<[u8; 16]> = HashSet::new();
+        let mut position = 0u16;
+        for round in 0..12 {
+            let (_rid, find) = a.build_find_value(vec![key], position);
+            let reply = b.handle_message(&find, a_addr, a_noise, 2000 + round);
+            assert!(reply.find_value_hit, "page at {position} must be served");
+            let page = a
+                .handle_message(&reply.responses[0], b_addr, b_noise, 3000 + round)
+                .found_value
+                .expect("FOUND_VALUE");
+            if position == 0 {
+                // The first page is the one that has to pass over the big
+                // record: it takes the small one ahead of it, cannot fit the
+                // big one, and keeps scanning to the two after it.
+                assert_eq!(
+                    page.records.len(),
+                    3,
+                    "the packer must keep scanning past a record that does not fit"
+                );
+                // The crux: it resumes *at* the record it passed over, not after
+                // the last one it took (which would be 4, ending the walk with
+                // the big record never served).
+                assert_eq!(
+                    page.next_position, 1,
+                    "a page must resume at the record it passed over"
+                );
+            }
+            assert!(
+                page.next_position > position,
+                "a page must advance or the searcher would re-ask it forever"
+            );
+            for blob in &page.records {
+                seen.insert(file_hash_from_record_data(blob).expect("a packed record"));
+            }
+            position = page.next_position;
+            if !page.has_more() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            names.len(),
+            "every record must be reachable, including the oversized one"
+        );
+    }
+
     /// A record at the STORE body cap must still pack into FOUND_VALUE as a
     /// singleton. That is the whole point of tying the two budgets together.
     #[test]
@@ -3146,7 +3314,7 @@ mod tests {
                 .stored_record
         );
 
-        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(
             on_b.find_value_hit,
@@ -3191,7 +3359,7 @@ mod tests {
         }
         assert_eq!(b.store_stats(), (1, PUBLISHED));
 
-        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(on_b.find_value_hit);
         assert!(
@@ -3200,7 +3368,7 @@ mod tests {
         );
 
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
         assert!(
             blobs.len() < PUBLISHED,
             "the reply is bounded by what one datagram carries"
@@ -3212,12 +3380,18 @@ mod tests {
         );
     }
 
-    /// Successive FIND_VALUEs on an oversized key must rotate the served
-    /// window. Without that, the oldest handful is the only set this node
-    /// ever returns, and a late publisher under a popular word is invisible
-    /// here no matter how often it is asked for.
+    /// Paging an oversized key must reach every live record, and each page must
+    /// report where the next one starts. Without that the first window is the
+    /// only set this node ever returns, and a late publisher under a popular
+    /// word is invisible here no matter how often it is asked for.
+    ///
+    /// Note what is deliberately *not* asserted: that two identical requests
+    /// return different windows. v2 rotated a server-side cursor to fake paging,
+    /// which meant two searchers walking the same hot key advanced each other's
+    /// window and neither saw a contiguous run. A request now names its own
+    /// offset, so the same request is answered the same way every time.
     #[test]
-    fn successive_find_values_rotate_the_served_window() {
+    fn paging_a_truncated_key_reaches_every_record() {
         let mut a = dht(22);
         let mut b = dht(23);
         let a_noise = [0xAA; 32];
@@ -3255,47 +3429,58 @@ mod tests {
                 .collect()
         }
 
-        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        // An identical request is answered identically: paging is the searcher's
+        // to drive, not something the responder does behind its back.
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let first = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(first.find_value_hit);
         assert!(first.find_value_withheld > 0);
-        let first_blobs = a
+        let first_page = a
             .handle_message(&first.responses[0], b_addr, b_noise, 1002)
             .found_value
-            .expect("FOUND_VALUE")
-            .1;
-        let first_hashes = hashes_from_blobs(&first_blobs);
-
-        let second = b.handle_message(&find_bytes, a_addr, a_noise, 1003);
-        assert!(second.find_value_hit);
-        let second_blobs = a
-            .handle_message(&second.responses[0], b_addr, b_noise, 1004)
+            .expect("FOUND_VALUE");
+        let repeat = b.handle_message(&find_bytes, a_addr, a_noise, 1003);
+        let repeat_page = a
+            .handle_message(&repeat.responses[0], b_addr, b_noise, 1004)
             .found_value
-            .expect("FOUND_VALUE")
-            .1;
-        let second_hashes = hashes_from_blobs(&second_blobs);
-
-        assert_ne!(
-            first_hashes, second_hashes,
-            "a truncated key must not serve the same window twice in a row"
+            .expect("FOUND_VALUE");
+        assert_eq!(
+            hashes_from_blobs(&first_page.records),
+            hashes_from_blobs(&repeat_page.records),
+            "the same offset must serve the same window"
+        );
+        assert_eq!(
+            first_page.total_available as usize, PUBLISHED,
+            "the reply must report every live record, not just the ones it carried"
+        );
+        assert!(
+            first_page.has_more(),
+            "20 records of this size cannot fit one datagram"
         );
 
+        // Walk the key the way a searcher does, following `next_position`.
         let mut seen: HashSet<[u8; 16]> = HashSet::new();
-        seen.extend(first_hashes);
-        seen.extend(second_hashes);
-        for round in 0..8 {
-            let reply = b.handle_message(&find_bytes, a_addr, a_noise, 1100 + round);
-            let blobs = a
-                .handle_message(&reply.responses[0], b_addr, b_noise, 1200 + round)
+        let mut page = first_page;
+        let mut rounds = 0;
+        loop {
+            seen.extend(hashes_from_blobs(&page.records));
+            if !page.has_more() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 40, "paging must terminate");
+            let (_rid, next_find) = a.build_find_value(vec![key], page.next_position);
+            let reply = b.handle_message(&next_find, a_addr, a_noise, 2000 + rounds);
+            assert!(reply.find_value_hit, "a page inside the key must be served");
+            page = a
+                .handle_message(&reply.responses[0], b_addr, b_noise, 3000 + rounds)
                 .found_value
-                .expect("FOUND_VALUE")
-                .1;
-            seen.extend(hashes_from_blobs(&blobs));
+                .expect("FOUND_VALUE");
         }
         assert_eq!(
             seen.len(),
             PUBLISHED,
-            "rotating windows together must cover every live record, got {seen:?}"
+            "paging must cover every live record, got {seen:?}"
         );
         for hash in &published {
             assert!(seen.contains(hash), "missing {}", hex::encode(hash));
@@ -3337,11 +3522,11 @@ mod tests {
         }
 
         let (_frid, find_bytes) =
-            a.build_find_value(vec![r_both_u.keyword_hash, r_both_s.keyword_hash]);
+            a.build_find_value_page_one(vec![r_both_u.keyword_hash, r_both_s.keyword_hash]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(on_b.find_value_hit, "peer holds primary+secondary keys");
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
         assert_eq!(blobs.len(), 1, "only file_hash present under both keys");
         let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
         assert_eq!(parsed.file_hash, both);
@@ -3368,14 +3553,14 @@ mod tests {
 
         let secondary = a.build_keyword_record("server", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
         let (_frid, find_bytes) =
-            a.build_find_value(vec![rec.keyword_hash, secondary.keyword_hash]);
+            a.build_find_value_page_one(vec![rec.keyword_hash, secondary.keyword_hash]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(
             on_b.find_value_hit,
             "missing secondary must not suppress primary FOUND_VALUE"
         );
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
         assert_eq!(blobs.len(), 1);
     }
 
@@ -3402,14 +3587,14 @@ mod tests {
         }
 
         let (_frid, find_bytes) =
-            a.build_find_value(vec![ubuntu.keyword_hash, server.keyword_hash]);
+            a.build_find_value_page_one(vec![ubuntu.keyword_hash, server.keyword_hash]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
         assert!(
             on_b.find_value_hit,
             "unrelated secondary records must not suppress primary FOUND_VALUE"
         );
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let (_rid, blobs) = on_a.found_value.expect("FOUND_VALUE");
+        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
         assert_eq!(blobs.len(), 1);
         let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
         assert_eq!(parsed.file_hash, [1u8; 16]);
@@ -3816,10 +4001,13 @@ mod tests {
 
         // B serves it back on FIND_VALUE and the embedded contact survives the
         // end-to-end round trip and re-verification.
-        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
         let on_b2 = b.handle_message(&find_bytes, a_addr, a_noise, 1002);
         let on_a2 = a.handle_message(&on_b2.responses[0], b_addr, b_noise, 1003);
-        let (_grid, blobs) = on_a2.found_value.expect("A should see a FOUND_VALUE");
+        let blobs = on_a2
+            .found_value
+            .expect("A should see a FOUND_VALUE")
+            .records;
         assert_eq!(blobs.len(), 1);
         let parsed = SignedRecord::from_value_blob(&blobs[0]).expect("record verifies");
         assert_eq!(parsed.record_type, RECORD_TYPE_SOURCE);
@@ -4402,7 +4590,7 @@ mod tests {
         assert!(b.add_contact(c_contact));
 
         // A asks for a key B does not hold.
-        let (find_rid, find_bytes) = a.build_find_value(vec![[0x55u8; 16]]);
+        let (find_rid, find_bytes) = a.build_find_value_page_one(vec![[0x55u8; 16]]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1000);
         assert!(on_b.find_value_received);
         assert_eq!(on_b.responses.len(), 1, "B falls back to FOUND_NODE");

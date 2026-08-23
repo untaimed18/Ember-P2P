@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use tracing::{debug, trace, warn};
@@ -66,6 +66,21 @@ const MAX_QUERY_ATTEMPTS: u8 = 2;
 /// more than the saved traffic — the walk keeps going until it runs out of
 /// shortlist.
 const STALE_RESPONSES_TO_CONVERGE: u8 = ALPHA as u8;
+
+/// Extra `FIND_VALUE` pages one node may be asked for within a single search.
+///
+/// A datagram carries roughly five keyword records, so on a popular key the
+/// first answer is a small fraction of what the responder holds. Paging is how
+/// the rest becomes reachable, but it is also the one mechanism here that lets a
+/// *responder* decide how many queries we send — it reports the total — so it
+/// needs a ceiling that does not depend on that claim.
+///
+/// Eight keeps the round trips to one node bounded while reaching roughly forty
+/// records from it, comfortably inside the [`MAX_RESULTS_PER_NODE`] allowance
+/// that caps what one peer may contribute anyway. Both limits apply, so the
+/// tighter one binds: a node serving large records runs out of allowance first,
+/// one serving small records runs out of pages.
+const MAX_PAGES_PER_NODE: u8 = 8;
 
 /// Nodes that must have answered before convergence may end a `FIND_NODE`.
 ///
@@ -172,6 +187,45 @@ pub enum SearchType {
     FindValue,
 }
 
+/// What a `FOUND_VALUE` reported about the records it did not carry.
+///
+/// Both fields are the responder's claim about its own store, so nothing here is
+/// trusted beyond deciding whether to send one more query: see
+/// [`IterativeSearch::queue_next_page`] for the progress and budget checks.
+#[derive(Debug, Clone, Copy)]
+pub struct ValuePage {
+    pub next_position: u16,
+    pub total_available: u16,
+}
+
+/// One query the driver should send on a search's behalf.
+#[derive(Debug, Clone)]
+pub struct QueryTarget {
+    pub contact: EmberContact,
+    /// Per-search correlation token, echoed back through
+    /// [`IterativeSearch::process_response`].
+    pub request_id: u32,
+    /// Record offset for a `FIND_VALUE`. Zero for a `FIND_NODE` and for the
+    /// first query sent to any node.
+    pub start_position: u16,
+}
+
+/// A query awaiting an answer.
+struct PendingQuery {
+    node: EmberNodeId,
+    /// The offset this query asked for. Kept so a `FOUND_VALUE` can be required
+    /// to advance past it, and so a page follow-up is distinguishable from a
+    /// first query (only the latter is ever zero).
+    start_position: u16,
+}
+
+impl PendingQuery {
+    /// Whether this query was a page follow-up rather than a node's first.
+    fn is_page(&self) -> bool {
+        self.start_position > 0
+    }
+}
+
 /// A search result record from a FOUND_VALUE response.
 #[derive(Debug, Clone)]
 pub struct SearchResultRecord {
@@ -221,8 +275,13 @@ pub struct IterativeSearch {
     /// timeout. Using a counter scoped to the search makes
     /// collisions impossible within one search lifetime.
     next_request_id: u32,
-    /// Request IDs we've sent mapped to the node we sent them to.
-    pending_requests: HashMap<u32, EmberNodeId>,
+    /// Request IDs we've sent mapped to what we asked for.
+    pending_requests: HashMap<u32, PendingQuery>,
+    /// Nodes that reported records past the page they served, with the offset to
+    /// resume at. Drained by [`Self::next_to_query`].
+    page_queue: VecDeque<(EmberNodeId, u16)>,
+    /// Page follow-ups queued per node, against [`MAX_PAGES_PER_NODE`].
+    pages_queued: HashMap<EmberNodeId, u8>,
     /// Answers in a row that brought nothing closer than the best node already
     /// on the shortlist. See [`STALE_RESPONSES_TO_CONVERGE`].
     stale_responses: u8,
@@ -266,19 +325,40 @@ impl IterativeSearch {
             started_at: Instant::now(),
             complete: false,
             pending_requests: HashMap::new(),
+            page_queue: VecDeque::new(),
+            pages_queued: HashMap::new(),
             next_request_id: 1,
             stale_responses: 0,
         }
     }
 
-    /// Get the next batch of nodes to query (up to ALPHA at a time).
-    /// Returns contacts that are Pending and haven't been queried yet.
-    pub fn next_to_query(&mut self) -> Vec<(EmberContact, u32)> {
+    /// Pull the next request id, keeping the counter monotonic within a search.
+    fn take_request_id(&mut self) -> u32 {
+        let req_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        req_id
+    }
+
+    /// Page follow-ups currently awaiting an answer.
+    fn pages_in_flight(&self) -> usize {
+        self.pending_requests
+            .values()
+            .filter(|p| p.is_page())
+            .count()
+    }
+
+    /// Get the next batch of queries to send (up to ALPHA outstanding).
+    ///
+    /// Two kinds of work share the budget: nodes on the shortlist that have not
+    /// been asked yet, and page follow-ups to nodes that already answered with
+    /// more records than their datagram could carry.
+    pub fn next_to_query(&mut self) -> Vec<QueryTarget> {
         let in_flight = self
             .shortlist
             .iter()
             .filter(|e| e.state == NodeState::InFlight)
-            .count();
+            .count()
+            + self.pages_in_flight();
 
         let can_send = ALPHA.saturating_sub(in_flight);
         if can_send == 0 {
@@ -286,6 +366,55 @@ impl IterativeSearch {
         }
 
         let mut batch = Vec::new();
+
+        // Page follow-ups are the cheaper half of the budget: the node has
+        // already answered, so a Noise session is live and the records are known
+        // to exist, where a fresh shortlist node may hold nothing. They still
+        // only get half the batch while there is anywhere left to descend to —
+        // a hot key would otherwise page one node for the whole search while the
+        // frontier stood still, which is how a walk misses the closer nodes that
+        // hold the rest of the index.
+        let has_descent = self
+            .shortlist
+            .iter()
+            .any(|e| e.state == NodeState::Pending && !self.queried.contains(&e.contact.node_id));
+        let page_budget = if has_descent {
+            (can_send / 2).max(1)
+        } else {
+            can_send
+        };
+        while batch.len() < page_budget {
+            let Some((node_id, start)) = self.page_queue.pop_front() else {
+                break;
+            };
+            // The shortlist is trimmed as the walk progresses, so a node that
+            // answered may no longer be on it. Nothing else holds its address,
+            // so the page is simply dropped.
+            let Some(contact) = self
+                .shortlist
+                .iter()
+                .find(|e| e.contact.node_id == node_id)
+                .map(|e| e.contact.clone())
+            else {
+                continue;
+            };
+            let req_id = self.take_request_id();
+            self.pending_requests.insert(
+                req_id,
+                PendingQuery {
+                    node: node_id,
+                    start_position: start,
+                },
+            );
+            batch.push(QueryTarget {
+                contact,
+                request_id: req_id,
+                start_position: start,
+            });
+        }
+        if batch.len() >= can_send {
+            return batch;
+        }
         // The class preference — pinned session peers, then verified contacts,
         // then mute leads — applies to the *opening* batch only, and exists so
         // the first round does not lead with a lead the routing table happened
@@ -334,8 +463,18 @@ impl IterativeSearch {
                     *self.attempts.entry(entry.contact.node_id).or_insert(0) += 1;
                     let req_id = self.next_request_id;
                     self.next_request_id = self.next_request_id.wrapping_add(1);
-                    self.pending_requests.insert(req_id, entry.contact.node_id);
-                    batch.push((entry.contact.clone(), req_id));
+                    self.pending_requests.insert(
+                        req_id,
+                        PendingQuery {
+                            node: entry.contact.node_id,
+                            start_position: 0,
+                        },
+                    );
+                    batch.push(QueryTarget {
+                        contact: entry.contact.clone(),
+                        request_id: req_id,
+                        start_position: 0,
+                    });
                 }
             }
             if batch.len() >= can_send {
@@ -394,6 +533,7 @@ impl IterativeSearch {
         from_id: &EmberNodeId,
         closer_nodes: Vec<EmberContact>,
         value_records: Vec<Vec<u8>>,
+        page: Option<ValuePage>,
     ) -> ResponseOutcome {
         // Reject responses we didn't ask for: an attacker (or a buggy
         // peer) sending arbitrary `(request_id, from_id)` pairs must
@@ -402,10 +542,13 @@ impl IterativeSearch {
         // for transport-layer auth; this is the request-correlation
         // gate.
         let expected = self.pending_requests.remove(&request_id);
-        if expected.as_ref() != Some(from_id) {
+        if expected.as_ref().map(|p| p.node) != Some(*from_id) {
             debug!(
                 "Search {}: rejected response from {} (request_id {} expected {:?})",
-                self.id, from_id, request_id, expected
+                self.id,
+                from_id,
+                request_id,
+                expected.as_ref().map(|p| p.node)
             );
             // Re-insert if we removed a real pending request for a
             // different node — we still want it to be matchable when
@@ -416,6 +559,7 @@ impl IterativeSearch {
             }
             return ResponseOutcome::REFUSED;
         }
+        let asked_start = expected.map(|p| p.start_position).unwrap_or(0);
 
         for entry in &mut self.shortlist {
             if entry.contact.node_id == *from_id {
@@ -479,6 +623,10 @@ impl IterativeSearch {
             }
         }
 
+        if let Some(page) = page {
+            self.queue_next_page(from_id, asked_start, page);
+        }
+
         // Merge closer nodes into shortlist
         let mut new_closer = false;
         let current_best = self
@@ -531,10 +679,22 @@ impl IterativeSearch {
         self.shortlist
             .sort_by_key(|a| a.distance.0);
         if self.shortlist.len() > K_BUCKET_SIZE {
+            // A node we still owe a page to is kept for the same reason as one
+            // with a reply outstanding: `next_to_query` can only reach a page
+            // through the shortlist, so trimming the entry silently drops the
+            // rest of that node's records. It has already proved it holds
+            // matching records, which is more than most of the list has done,
+            // and gossip contacts answer with `last_seen: 0` so the verified
+            // clause does not cover them.
+            let owed: HashSet<EmberNodeId> = self.page_queue.iter().map(|(id, _)| *id).collect();
             let mut kept = 0usize;
             self.shortlist.retain(|e| {
                 kept += 1;
-                kept <= K_BUCKET_SIZE || e.state == NodeState::InFlight || e.pinned || e.contact.is_verified()
+                kept <= K_BUCKET_SIZE
+                    || e.state == NodeState::InFlight
+                    || e.pinned
+                    || e.contact.is_verified()
+                    || owed.contains(&e.contact.node_id)
             });
         }
 
@@ -553,6 +713,45 @@ impl IterativeSearch {
             accepted: true,
             new_closer,
         }
+    }
+
+    /// Decide whether a `FOUND_VALUE` earns one more query to the same node.
+    ///
+    /// Every check here exists because `page` is the *responder's* account of
+    /// its own store, and this is the one place a peer's claim can cause us to
+    /// send traffic. A node that reports an enormous total, or one that keeps
+    /// naming a position it has already served, must cost a bounded number of
+    /// queries either way.
+    fn queue_next_page(&mut self, node: &EmberNodeId, asked_start: u16, page: ValuePage) {
+        if self.search_type != SearchType::FindValue {
+            return;
+        }
+        // The responder says the key is exhausted.
+        if page.next_position >= page.total_available {
+            return;
+        }
+        // Require forward progress. Without this a responder answering with the
+        // offset we just asked for — by bug or on purpose — would have us re-ask
+        // the same window until the search timed out, and every answer would
+        // dedup to nothing while still costing a round trip.
+        if page.next_position <= asked_start {
+            return;
+        }
+        // Nothing left to put the records in.
+        if self.results.len() >= MAX_SEARCH_RESULTS {
+            return;
+        }
+        // This node has already offered everything one peer is allowed to
+        // contribute, so a further page could only be discarded.
+        if self.offered_results.get(node).copied().unwrap_or(0) >= MAX_RESULTS_PER_NODE {
+            return;
+        }
+        let queued = self.pages_queued.entry(*node).or_insert(0);
+        if *queued >= MAX_PAGES_PER_NODE {
+            return;
+        }
+        *queued += 1;
+        self.page_queue.push_back((*node, page.next_position));
     }
 
     /// Mark a node's request as failed (timeout, error).
@@ -583,8 +782,16 @@ impl IterativeSearch {
         request_id: u32,
         failure: QueryFailure,
     ) -> Option<EmberNodeId> {
-        let failed = self.pending_requests.remove(&request_id);
-        if let Some(node_id) = failed {
+        let Some(pending) = self.pending_requests.remove(&request_id) else {
+            self.check_complete();
+            return None;
+        };
+        let node_id = pending.node;
+        // A page follow-up that went unanswered leaves the node exactly as it
+        // was: it has already answered this search at least once, so it is not a
+        // dead contact, and returning it to `Pending` would have the walk re-ask
+        // it from offset zero for records it has already handed us.
+        if !pending.is_page() {
             let spent = self
                 .attempts
                 .get(&node_id)
@@ -608,7 +815,7 @@ impl IterativeSearch {
             }
         }
         self.check_complete();
-        failed
+        Some(node_id)
     }
 
     /// Re-evaluate and return the completion state. Unlike the internal
@@ -633,14 +840,19 @@ impl IterativeSearch {
             return;
         }
 
-        // Complete if no more nodes to query and nothing in flight
+        // Complete if no more nodes to query and nothing in flight.
+        //
+        // Queued and outstanding pages count as work: a walk that has asked
+        // every node it knows of may still be owed most of the records, and
+        // finishing here would discard them along with the search.
         let has_pending = self.shortlist.iter().any(|e| e.state == NodeState::Pending);
         let has_in_flight = self
             .shortlist
             .iter()
             .any(|e| e.state == NodeState::InFlight);
+        let has_pages = !self.page_queue.is_empty() || self.pages_in_flight() > 0;
 
-        if !has_pending && !has_in_flight {
+        if !has_pending && !has_in_flight && !has_pages {
             self.complete = true;
             return;
         }
@@ -1016,6 +1228,36 @@ pub fn extra_keyword_hashes(hashed: &[([u8; 16], String)], intersect: bool) -> V
     }
 }
 
+/// Shorthands for the tests that predate `FIND_VALUE` paging.
+///
+/// Both of those tests' concerns — which node a batch picked, and what a search
+/// does with an answer — are unchanged by paging, so they keep asserting on the
+/// narrower shape rather than restating `start_position: 0` and `None` several
+/// dozen times. The paging tests use the real signatures directly.
+#[cfg(test)]
+impl IterativeSearch {
+    /// [`Self::next_to_query`] reduced to `(contact, request_id)`.
+    fn query_pairs(&mut self) -> Vec<(EmberContact, u32)> {
+        self.next_to_query()
+            .into_iter()
+            .map(|q| (q.contact, q.request_id))
+            .collect()
+    }
+
+    /// [`Self::process_response`] for an answer that carried no page
+    /// information: every `FOUND_NODE`, and any `FOUND_VALUE` from a peer with
+    /// nothing left to offer.
+    fn process_unpaged(
+        &mut self,
+        request_id: u32,
+        from_id: &EmberNodeId,
+        closer_nodes: Vec<EmberContact>,
+        value_records: Vec<Vec<u8>>,
+    ) -> ResponseOutcome {
+        self.process_response(request_id, from_id, closer_nodes, value_records, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,12 +1337,12 @@ mod tests {
     fn walk_until_done(search: &mut IterativeSearch) -> usize {
         let mut answered = 0usize;
         while !search.complete {
-            let batch = search.next_to_query();
+            let batch = search.query_pairs();
             if batch.is_empty() {
                 break;
             }
             for (contact, req_id) in batch {
-                search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                search.process_unpaged(req_id, &contact.node_id, vec![], vec![]);
                 answered += 1;
             }
         }
@@ -1150,7 +1392,7 @@ mod tests {
 
         // Round one: the first peer answers with an ID one bit off the target,
         // which sorts ahead of every real node and can never answer.
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         let mut phantom_id = target.0;
         phantom_id[15] ^= 1;
         let phantom = EmberContact {
@@ -1168,14 +1410,14 @@ mod tests {
             } else {
                 vec![]
             };
-            search.process_response(req_id, &contact.node_id, closer, vec![]);
+            search.process_unpaged(req_id, &contact.node_id, closer, vec![]);
             answered += 1;
         }
 
         // Everyone else answers honestly with nothing closer, and the phantom
         // never answers at all.
         loop {
-            let batch = search.next_to_query();
+            let batch = search.query_pairs();
             if batch.is_empty() {
                 break;
             }
@@ -1183,7 +1425,7 @@ mod tests {
                 if contact.node_id == phantom.node_id {
                     search.mark_failed(req_id);
                 } else {
-                    search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                    search.process_unpaged(req_id, &contact.node_id, vec![], vec![]);
                     answered += 1;
                 }
             }
@@ -1238,7 +1480,7 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
 
         let shared = signed_value_blob("ubuntu", 0x11);
         let only_b = signed_value_blob("ubuntu", 0x22);
@@ -1248,7 +1490,7 @@ mod tests {
             } else {
                 vec![shared.clone()]
             };
-            search.process_response(req_id, &contact.node_id, vec![], records);
+            search.process_unpaged(req_id, &contact.node_id, vec![], records);
         }
 
         assert_eq!(
@@ -1272,10 +1514,10 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        let (_, req_id) = search.next_to_query().remove(0);
+        let (_, req_id) = search.query_pairs().remove(0);
 
         let blob = signed_value_blob("ubuntu", 0x33);
-        search.process_response(req_id, &peer.node_id, vec![], vec![blob.clone(); 50]);
+        search.process_unpaged(req_id, &peer.node_id, vec![], vec![blob.clone(); 50]);
 
         assert_eq!(search.results.len(), 1);
     }
@@ -1293,14 +1535,14 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        let (_, req_id) = search.next_to_query().remove(0);
+        let (_, req_id) = search.query_pairs().remove(0);
 
         let genuine = signed_value_blob("ubuntu", 0x01);
         let mut offered: Vec<Vec<u8>> = (0..20).map(|i| unsigned_value_blob(target, i)).collect();
         offered.extend((0..20).map(|i| forged_value_blob("ubuntu", 0x40 + i)));
         offered.push(genuine.clone());
 
-        search.process_response(req_id, &peer.node_id, vec![], offered);
+        search.process_unpaged(req_id, &peer.node_id, vec![], offered);
 
         assert_eq!(search.results.len(), 1, "only the signed record survives");
         assert_eq!(search.results[0].data, genuine);
@@ -1320,7 +1562,7 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         let (_, req_id) = batch
             .iter()
             .find(|(c, _)| c.node_id == flooder.node_id)
@@ -1335,13 +1577,227 @@ mod tests {
             .collect();
         assert!(flood.len() > MAX_SEARCH_RESULTS);
 
-        search.process_response(*req_id, &flooder.node_id, vec![], flood);
+        search.process_unpaged(*req_id, &flooder.node_id, vec![], flood);
 
         assert_eq!(search.results.len(), MAX_RESULTS_PER_NODE);
         assert!(
             !search.complete,
             "one peer's answer must not end the walk while another is outstanding"
         );
+    }
+
+    /// A single-peer `FIND_VALUE` search against a node holding more than one
+    /// datagram's worth: the search must go back to that same node at the offset
+    /// it named, and keep going until the key is exhausted.
+    #[test]
+    fn a_search_pages_a_node_that_reports_more_records() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Five records a page, fifteen held.
+        const TOTAL: u16 = 15;
+        const PER_PAGE: u16 = 5;
+        let mut asked: Vec<u16> = Vec::new();
+        let mut served = 0u16;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            assert_eq!(batch.len(), 1, "only one node is known");
+            let query = &batch[0];
+            assert_eq!(query.contact.node_id, peer.node_id);
+            asked.push(query.start_position);
+
+            let page_end = (query.start_position + PER_PAGE).min(TOTAL);
+            let blobs: Vec<Vec<u8>> = (query.start_position..page_end)
+                .map(|i| signed_value_blob("ubuntu", i))
+                .collect();
+            served += blobs.len() as u16;
+            search.process_response(
+                query.request_id,
+                &peer.node_id,
+                vec![],
+                blobs,
+                Some(ValuePage {
+                    next_position: page_end,
+                    total_available: TOTAL,
+                }),
+            );
+        }
+
+        assert_eq!(
+            asked,
+            vec![0, 5, 10],
+            "the search must follow the offsets the peer reported"
+        );
+        assert_eq!(served, TOTAL);
+        assert_eq!(search.results.len(), TOTAL as usize);
+        assert!(
+            search.poll_complete(),
+            "an exhausted key with nothing left to ask ends the search"
+        );
+    }
+
+    /// A queued page is outstanding work. Completing while one is pending would
+    /// throw away most of the records on any key big enough to need paging —
+    /// and on a one-node search there is nothing else keeping the walk alive.
+    #[test]
+    fn a_search_does_not_complete_while_a_page_is_owed() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+        let query = &batch[0];
+
+        search.process_response(
+            query.request_id,
+            &peer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 40,
+            }),
+        );
+
+        // The only node has answered, so without the page this search is done.
+        assert!(
+            !search.poll_complete(),
+            "a queued page must keep the search alive"
+        );
+        let follow_up = search.next_to_query();
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(follow_up[0].start_position, 1);
+    }
+
+    /// `next_position` and `total_available` are the responder's claims about
+    /// its own store, and they are the only thing here that can make us send
+    /// more traffic. A peer must not be able to buy unbounded queries with them.
+    #[test]
+    fn a_peer_cannot_page_a_search_forever() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let mut pages = 0u32;
+        let mut offset = 0u16;
+        loop {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            let query = &batch[0];
+            offset = offset.saturating_add(1);
+            pages += 1;
+            assert!(pages < 100, "paging must terminate");
+            // One record per page against a claimed total of 60,000: honest in
+            // shape, ruinous if believed without limit.
+            search.process_response(
+                query.request_id,
+                &peer.node_id,
+                vec![],
+                vec![signed_value_blob("ubuntu", offset)],
+                Some(ValuePage {
+                    next_position: offset,
+                    total_available: 60_000,
+                }),
+            );
+        }
+        assert_eq!(
+            pages as u8,
+            MAX_PAGES_PER_NODE + 1,
+            "the first query plus MAX_PAGES_PER_NODE follow-ups, and no more"
+        );
+    }
+
+    /// A responder that names an offset it has already served would otherwise
+    /// have the search re-ask the same window until the timeout, every answer
+    /// deduping to nothing while still costing a round trip.
+    #[test]
+    fn a_page_that_does_not_advance_earns_no_follow_up() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+        let query = &batch[0];
+        assert_eq!(query.start_position, 0);
+
+        search.process_response(
+            query.request_id,
+            &peer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            // Claims plenty more, but points back at the window just served.
+            Some(ValuePage {
+                next_position: 0,
+                total_available: 900,
+            }),
+        );
+
+        assert!(
+            search.next_to_query().is_empty(),
+            "a page that does not advance must not be followed"
+        );
+        assert!(search.poll_complete());
+    }
+
+    /// A page that goes unanswered must not put the node back on the walk as if
+    /// it had never replied: it would be re-asked from offset zero for records
+    /// it has already handed over, and a well-stocked peer would be re-served
+    /// its own first page for the life of the search.
+    #[test]
+    fn an_unanswered_page_does_not_requery_the_node_from_the_start() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let first = search.next_to_query();
+        search.process_response(
+            first[0].request_id,
+            &peer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 40,
+            }),
+        );
+
+        let page = search.next_to_query();
+        assert_eq!(page[0].start_position, 1);
+        assert_eq!(search.mark_failed(page[0].request_id), Some(peer.node_id));
+
+        assert!(
+            search.next_to_query().is_empty(),
+            "a timed-out page must not re-open the node's first query"
+        );
+        assert!(search.poll_complete());
     }
 
     /// A timeout is not proof a node is gone. Giving up on the first miss
@@ -1357,11 +1813,11 @@ mod tests {
         let sid = sm.start_find_node(target, &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
 
-        let (_, first) = search.next_to_query().remove(0);
+        let (_, first) = search.query_pairs().remove(0);
         assert_eq!(search.mark_failed(first), Some(peer.node_id));
         assert!(!search.complete, "one miss must not end a one-peer search");
 
-        let retry = search.next_to_query();
+        let retry = search.query_pairs();
         assert_eq!(retry.len(), 1, "the node is eligible again");
         assert_eq!(retry[0].0.node_id, peer.node_id);
     }
@@ -1382,7 +1838,7 @@ mod tests {
         let sid = sm.start_find_node(target, &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
 
-        let (_, first) = search.next_to_query().remove(0);
+        let (_, first) = search.query_pairs().remove(0);
         assert_eq!(
             search.mark_failed_with(first, QueryFailure::NotSent),
             Some(peer.node_id)
@@ -1396,7 +1852,7 @@ mod tests {
             "a walk nothing will re-drive has to finish on the spot"
         );
         assert!(
-            search.next_to_query().is_empty(),
+            search.query_pairs().is_empty(),
             "and must not queue a retry no one is going to send"
         );
     }
@@ -1414,13 +1870,13 @@ mod tests {
         let sid = sm.start_find_node(target, &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
 
-        let (_, first) = search.next_to_query().remove(0);
+        let (_, first) = search.query_pairs().remove(0);
         assert_eq!(
             search.mark_failed_with(first, QueryFailure::TimedOut),
             Some(peer.node_id)
         );
         assert!(!search.complete, "one miss must not end a one-peer search");
-        let retry = search.next_to_query();
+        let retry = search.query_pairs();
         assert_eq!(retry.len(), 1, "the node is eligible again");
         assert_eq!(retry[0].0.node_id, peer.node_id);
     }
@@ -1449,7 +1905,7 @@ mod tests {
         let dead_head = make_id(0x40);
         let mut responded = 0usize;
         loop {
-            let batch = search.next_to_query();
+            let batch = search.query_pairs();
             if batch.is_empty() {
                 break;
             }
@@ -1457,7 +1913,7 @@ mod tests {
                 if contact.node_id == dead_head {
                     search.mark_failed(req_id);
                 } else {
-                    search.process_response(req_id, &contact.node_id, vec![], vec![]);
+                    search.process_unpaged(req_id, &contact.node_id, vec![], vec![]);
                     responded += 1;
                 }
             }
@@ -1492,13 +1948,13 @@ mod tests {
         let search = sm.get_mut(sid).unwrap();
 
         for attempt in 1..=MAX_QUERY_ATTEMPTS {
-            let batch = search.next_to_query();
+            let batch = search.query_pairs();
             assert_eq!(batch.len(), 1, "attempt {attempt} should go out");
             search.mark_failed(batch[0].1);
         }
 
         assert!(
-            search.next_to_query().is_empty(),
+            search.query_pairs().is_empty(),
             "the node is spent after {MAX_QUERY_ATTEMPTS} attempts"
         );
         assert!(search.poll_complete(), "and the search converges");
@@ -1619,7 +2075,7 @@ mod tests {
         let sid = sm.start_find_node(target, &rt).expect("search slot");
         let search = sm.get_mut(sid).unwrap();
 
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         assert_eq!(batch.len(), 2, "both known contacts go out together");
         let req_id = batch
             .iter()
@@ -1631,7 +2087,7 @@ mod tests {
         // peer already on the shortlist.
         let closer: Vec<EmberContact> = (2..=(K_BUCKET_SIZE as u8 + 1)).map(make_contact).collect();
         assert_eq!(closer.len(), K_BUCKET_SIZE);
-        search.process_response(req_id, &responder.node_id, closer, vec![]);
+        search.process_unpaged(req_id, &responder.node_id, closer, vec![]);
 
         let waiting = search
             .shortlist
@@ -1654,7 +2110,7 @@ mod tests {
         let search_id = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
-        let to_query = search.next_to_query();
+        let to_query = search.query_pairs();
         assert!(!to_query.is_empty());
         assert!(to_query.len() <= ALPHA);
     }
@@ -1669,12 +2125,12 @@ mod tests {
         let search_id = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         assert!(!batch.is_empty());
 
         // Simulate response with no new nodes
         let (_, req_id) = &batch[0];
-        search.process_response(*req_id, &make_id(0x80), vec![], vec![]);
+        search.process_unpaged(*req_id, &make_id(0x80), vec![], vec![]);
 
         // No more pending, no in-flight → complete
         assert!(search.complete);
@@ -1694,9 +2150,9 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
         let search = sm.get_mut(sid).unwrap();
-        let (_, req_id) = search.next_to_query().into_iter().next().unwrap();
+        let (_, req_id) = search.query_pairs().into_iter().next().unwrap();
 
-        let outcome = search.process_response(req_id, &make_id(0x80), vec![], vec![]);
+        let outcome = search.process_unpaged(req_id, &make_id(0x80), vec![], vec![]);
         assert!(
             outcome.accepted,
             "a peer that knows nobody closer still answered the question"
@@ -1708,8 +2164,8 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
         let search = sm.get_mut(sid).unwrap();
-        let (_, req_id) = search.next_to_query().into_iter().next().unwrap();
-        let outcome = search.process_response(req_id, &make_id(0x7F), vec![], vec![]);
+        let (_, req_id) = search.query_pairs().into_iter().next().unwrap();
+        let outcome = search.process_unpaged(req_id, &make_id(0x7F), vec![], vec![]);
         assert_eq!(outcome, ResponseOutcome::REFUSED);
         assert!(
             search.pending_requests.contains_key(&req_id),
@@ -1731,26 +2187,26 @@ mod tests {
         let search = sm.get_mut(sid).unwrap();
 
         // Round 1: the only pending node is B.
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         assert_eq!(batch.len(), 1);
         let (b_contact, b_req) = batch.into_iter().next().unwrap();
         assert_eq!(b_contact.node_id, make_id(0x80));
 
         // B answers with a closer node C (dist 0x02 < B's 0x81).
         let c = make_contact(0x03);
-        let outcome = search.process_response(b_req, &make_id(0x80), vec![c], vec![]);
+        let outcome = search.process_unpaged(b_req, &make_id(0x80), vec![c], vec![]);
         assert!(outcome.accepted);
         assert!(outcome.new_closer, "C is closer than B → search continues");
         assert!(!search.complete, "C is still pending");
 
         // Round 2: hop to C.
-        let batch2 = search.next_to_query();
+        let batch2 = search.query_pairs();
         assert_eq!(batch2.len(), 1);
         let (c_contact, c_req) = batch2.into_iter().next().unwrap();
         assert_eq!(c_contact.node_id, make_id(0x03));
 
         // C knows no one closer → search converges.
-        search.process_response(c_req, &make_id(0x03), vec![], vec![]);
+        search.process_unpaged(c_req, &make_id(0x03), vec![], vec![]);
         assert!(search.complete);
 
         let responded = search.closest_responded();
@@ -1773,7 +2229,7 @@ mod tests {
         let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
         let search = sm.get_mut(sid).unwrap();
 
-        assert!(search.next_to_query().is_empty());
+        assert!(search.query_pairs().is_empty());
         assert!(search.poll_complete(), "empty search must complete on poll");
         assert!(search.closest_responded().is_empty());
     }
@@ -1791,7 +2247,7 @@ mod tests {
             .expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         let (_, req_id) = &batch[0];
 
         let matching = signed_value_blob("ubuntu", 0x01);
@@ -1804,7 +2260,7 @@ mod tests {
         // key binding alone that turns it away.
         let mismatched = signed_value_blob("debian", 0x03);
 
-        search.process_response(
+        search.process_unpaged(
             *req_id,
             &make_id(0x80),
             vec![],
@@ -1833,7 +2289,7 @@ mod tests {
         assert_eq!(sm.seed_extra_contacts(sid, vec![extra.clone()]), 1);
 
         let search = sm.get_mut(sid).unwrap();
-        let batch = search.next_to_query();
+        let batch = search.query_pairs();
         assert_eq!(
             batch[0].0.node_id, extra.node_id,
             "a connected session peer is asked before XOR-closest public nodes"
@@ -1844,7 +2300,7 @@ mod tests {
             .find(|(c, _)| c.node_id != extra.node_id)
             .expect("the first batch still includes a routing-table contact");
         let closer: Vec<EmberContact> = (2..=(K_BUCKET_SIZE as u8 + 1)).map(make_contact).collect();
-        search.process_response(responder.1, &responder.0.node_id, closer, vec![]);
+        search.process_unpaged(responder.1, &responder.0.node_id, closer, vec![]);
         assert!(
             search
                 .shortlist

@@ -38020,14 +38020,21 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
     };
 
     let mut batch_sent = 0u32;
-    for (contact, per_search_req_id) in batch {
+    for query in batch {
+        let ember::dht::search::QueryTarget {
+            contact,
+            request_id: per_search_req_id,
+            start_position,
+        } = query;
         let (wire_req_id, frame) = match search_type {
             ember::dht::search::SearchType::FindNode => state.ember_dht.build_find_node(target),
             ember::dht::search::SearchType::FindValue => {
                 let mut keys = Vec::with_capacity(1 + extra_keys.len());
                 keys.push(target.0);
                 keys.extend_from_slice(&extra_keys);
-                state.ember_dht.build_find_value(keys)
+                // Non-zero on a page follow-up: this node already answered and
+                // said it holds records past what its datagram could carry.
+                state.ember_dht.build_find_value(keys, start_position)
             }
         };
 
@@ -41630,7 +41637,16 @@ async fn handle_ember_dht_message(
                 match state.ember_search.get_mut(search_id) {
                     Some(search) => {
                         search
-                            .process_response(per_search_req_id, &from_id, contacts, Vec::new())
+                            .process_response(
+                                per_search_req_id,
+                                &from_id,
+                                contacts,
+                                Vec::new(),
+                                // A FOUND_NODE answer to a FIND_VALUE means the
+                                // peer holds nothing under the key, so there is
+                                // no page to follow up.
+                                None,
+                            )
                             .accepted
                     }
                     // Search is gone; nothing will ever match this id again.
@@ -41720,7 +41736,8 @@ async fn handle_ember_dht_message(
     // the owning search (no closer nodes ride a value answer), then drive
     // the next round. A value search can also receive FOUND_NODE answers
     // (handled above) when a peer has no record.
-    if let Some((rid, records)) = inbound.found_value {
+    if let Some(page) = inbound.found_value {
+        let rid = page.request_id;
         if let Some((search_id, per_search_req_id)) = state
             .ember_dht_search_requests
             .get(&rid)
@@ -41736,8 +41753,25 @@ async fn handle_ember_dht_message(
             let consumed = if let Some(from_id) = inbound.sender_id {
                 match state.ember_search.get_mut(search_id) {
                     Some(search) => {
+                        // Only hand the search a page when the peer claims
+                        // records past this answer; "nothing more" and "did not
+                        // say" mean the same thing to it. The search re-checks
+                        // anyway — its budgets have to hold whatever a caller
+                        // passes — but there is no reason to walk them for an
+                        // answer that already said it was the last one.
+                        let value_page =
+                            page.has_more().then_some(ember::dht::search::ValuePage {
+                                next_position: page.next_position,
+                                total_available: page.total_available,
+                            });
                         search
-                            .process_response(per_search_req_id, &from_id, Vec::new(), records)
+                            .process_response(
+                                per_search_req_id,
+                                &from_id,
+                                Vec::new(),
+                                page.records,
+                                value_page,
+                            )
                             .accepted
                     }
                     None => true,

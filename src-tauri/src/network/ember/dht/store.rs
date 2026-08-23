@@ -9,11 +9,31 @@ use super::publish::RECORD_TYPE_SOURCE;
 use super::{scale, EmberNodeId};
 
 /// Maximum records per key (anti-spam).
-const MAX_RECORDS_PER_KEY: usize = 300;
+///
+/// KAD's equivalent is 1000 entries per keyword and this used to be 300, which
+/// made Ember hold under a third of what the network it replaces serves for the
+/// same word. The ratio against [`MAX_RECORDS_PER_PUBLISHER_PER_KEY`] was always
+/// right; the absolute number was the part a user felt.
+///
+/// [`MAX_STORE_BYTES`] is deliberately left where it is, so this raises capacity
+/// per *key* without raising what the process may resident-hold. Whichever binds
+/// first, the byte budget still sheds the records this node is least responsible
+/// for rather than refusing the newcomer — so the interaction degrades by
+/// distance, not by arrival order.
+const MAX_RECORDS_PER_KEY: usize = 1000;
 /// Maximum records one publisher may hold under a single key.
 ///
-/// About 15% of the key, matching the ratio KAD enforces (150 of 1000 entries
-/// per sender), so no single identity can crowd a keyword out on its own.
+/// 15% of the key, matching both the ratio *and* the absolute allowance KAD
+/// enforces (150 of 1000 entries per sender), so no single identity can crowd a
+/// keyword out on its own.
+///
+/// The ratio alone was not enough. Every storer applies this same cap to the
+/// same publisher key, so the ceiling is network-wide rather than per-node: at
+/// 45 a user sharing 200 files with a word in common had 45 of them findable
+/// under it *anywhere*, against KAD's 150. Reaching those records also needs
+/// `FIND_VALUE` paging, since a datagram carries about five — raising this while
+/// a peer could only ever serve its first window would have bought nothing but
+/// replication traffic.
 ///
 /// Enforced only by refusal. An earlier attempt at this displaced whichever
 /// publisher held the most slots when a key was full, which reads as fairness
@@ -30,17 +50,17 @@ const MAX_RECORDS_PER_KEY: usize = 300;
 /// scarcer than a keypair, such as address diversity or proof of work.
 ///
 /// Applies to our own records too, since `store_own_record` goes through the same
-/// path: a user sharing more than 45 files under one word serves at most 45 of them
-/// from their *own* store. That costs nothing in discoverability — every record is
-/// still published to the nodes closest to the key, which is where searchers look —
-/// and it is the same allowance we grant everyone else.
-const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 45;
+/// path: a user sharing more than 150 files under one word serves at most 150 of
+/// them from their *own* store. That costs nothing in discoverability — every
+/// record is still published to the nodes closest to the key, which is where
+/// searchers look — and it is the same allowance we grant everyone else.
+const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 150;
 /// Maximum total keys stored.
 const MAX_KEYS: usize = 50_000;
 /// Ceiling on resident record bytes.
 ///
 /// Key and per-key counts alone left the total unbounded: 50,000 keys times
-/// 300 records is far more than a desktop application should ever hold, and
+/// 1000 records is far more than a desktop application should ever hold, and
 /// an attacker choosing keys can steer records at us deliberately. This is
 /// the limit that actually protects memory; when it is reached the least
 /// valuable records (furthest from our ID, then nearest expiry) are dropped
@@ -383,12 +403,6 @@ pub struct DhtStore {
     publisher_cap_rejections: u64,
     /// The key already holds `MAX_RECORDS_PER_KEY` live records.
     per_key_cap_rejections: u64,
-    /// Per-key offset into the live list for the next `FOUND_VALUE` window.
-    ///
-    /// A popular key holds more records than one datagram can carry. Serving
-    /// from the front every time would hide every record behind that window.
-    /// The cursor rotates only when a reply actually withholds records.
-    serve_cursor: HashMap<[u8; 16], usize>,
     /// Upper bound on the XOR distance of the furthest key currently held,
     /// or `None` when unknown.
     ///
@@ -431,7 +445,6 @@ impl DhtStore {
             source_ip_cap_rejections: 0,
             publisher_cap_rejections: 0,
             per_key_cap_rejections: 0,
-            serve_cursor: HashMap::new(),
             furthest_key_distance: None,
         }
     }
@@ -446,25 +459,6 @@ impl DhtStore {
             publisher_cap: self.publisher_cap_rejections,
             per_key_cap: self.per_key_cap_rejections,
         }
-    }
-
-    /// Where the next packed `FOUND_VALUE` window for `key` should start,
-    /// modulo the current live length.
-    pub(crate) fn serve_start(&self, key: &[u8; 16], n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-        self.serve_cursor.get(key).copied().unwrap_or(0) % n
-    }
-
-    /// Advance the served window after a truncated reply. `packed` is how
-    /// many records this answer actually carried.
-    pub(crate) fn advance_serve_cursor(&mut self, key: &[u8; 16], packed: usize, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let start = self.serve_start(key, n);
-        self.serve_cursor.insert(*key, (start + packed) % n);
     }
 
     /// Track how permissive the abuse limits should currently be.
@@ -530,7 +524,6 @@ impl DhtStore {
                     .discharge(&record.publisher_key, cost, last);
             }
         }
-        self.serve_cursor.remove(key);
     }
 
     /// Make room for a key we do not yet hold. Returns whether there is space.
@@ -748,7 +741,6 @@ impl DhtStore {
             }
             if records.is_empty() {
                 self.entries.remove(&key);
-                self.serve_cursor.remove(&key);
             }
             if self.bytes <= target {
                 break 'keys;
@@ -1115,9 +1107,6 @@ impl DhtStore {
         for (author, cost, last) in released {
             self.publisher_index.discharge(&author, cost, last);
         }
-        self.serve_cursor
-            .retain(|k, _| self.entries.contains_key(k));
-
         if total_removed > 0 {
             debug!("Expired {total_removed} DHT records");
         }
@@ -1157,8 +1146,6 @@ impl DhtStore {
         for (author, cost, last) in released {
             self.publisher_index.discharge(&author, cost, last);
         }
-        self.serve_cursor
-            .retain(|k, _| self.entries.contains_key(k));
         total_removed
     }
 
@@ -2103,6 +2090,28 @@ mod tests {
             refreshed.timestamp,
         ));
         assert_eq!(store.total_records(), 2, "a republish is not a new record");
+    }
+
+    /// Keyword capacity is a user-visible number, not just an anti-abuse knob:
+    /// every storer applies the same per-publisher cap to the same key, so it is
+    /// the network-wide ceiling on how many of one user's files are findable
+    /// under one word. At 45 of 300 that was under a third of what KAD serves
+    /// for the same word, on a network meant to replace it.
+    ///
+    /// Pinned at KAD's own numbers, and pinned together: the ratio is what stops
+    /// one identity crowding a keyword out, and raising either alone breaks it.
+    #[test]
+    fn keyword_capacity_matches_kad() {
+        assert_eq!(MAX_RECORDS_PER_KEY, 1000, "KAD's entries per keyword");
+        assert_eq!(
+            MAX_RECORDS_PER_PUBLISHER_PER_KEY, 150,
+            "KAD's entries per sender"
+        );
+        assert_eq!(
+            MAX_RECORDS_PER_KEY / MAX_RECORDS_PER_PUBLISHER_PER_KEY,
+            6,
+            "no identity may hold more than about a sixth of a key"
+        );
     }
 
     /// Records dedupe on (publisher, file), so one identity can offer a record
