@@ -286,23 +286,45 @@ impl IterativeSearch {
         }
 
         let mut batch = Vec::new();
-        // Pinned session peers, then verified contacts, then mute leads.
-        // XOR-distance sort used to walk gossip first; search faults skip
-        // unverified so those leads never left the shortlist.
-        for prefer in 0..3 {
+        // The class preference — pinned session peers, then verified contacts,
+        // then mute leads — applies to the *opening* batch only, and exists so
+        // the first round does not lead with a lead the routing table happened
+        // to sort first.
+        //
+        // It must not outrank XOR distance after that. Every contact learned
+        // mid-walk decodes with `last_seen: 0`, so `is_verified()` is false and
+        // it always lands in the last class, while a healthy table seeds the
+        // search entirely with verified contacts. Applying the preference on
+        // every batch therefore asked — and, since a fault returns the entry to
+        // `Pending`, retried — all ~20 seeds before the closest node the walk
+        // had actually discovered. With quiet seeds that spent roughly 40s of
+        // the 60s `SEARCH_TIMEOUT_SECS` without descending toward the target at
+        // all: keyword searches missed, and publish lookups resolved to far
+        // nodes that storers then refuse on proximity. It also broke the
+        // invariant `routing.rs` states explicitly — that seed order cannot
+        // matter because the search re-sorts by distance and walks that order.
+        //
+        // `queried` is only empty before the very first query of a search (it
+        // retains nodes whose retries are spent), so this is exactly the
+        // opening batch.
+        let seed_round = self.queried.is_empty();
+        let passes = if seed_round { 3 } else { 1 };
+        for prefer in 0..passes {
             for entry in &mut self.shortlist {
                 if batch.len() >= can_send {
                     break;
                 }
-                let class = if entry.pinned {
-                    0
-                } else if entry.contact.is_verified() {
-                    1
-                } else {
-                    2
-                };
-                if class != prefer {
-                    continue;
+                if seed_round {
+                    let class = if entry.pinned {
+                        0
+                    } else if entry.contact.is_verified() {
+                        1
+                    } else {
+                        2
+                    };
+                    if class != prefer {
+                        continue;
+                    }
                 }
                 if entry.state == NodeState::Pending
                     && !self.queried.contains(&entry.contact.node_id)

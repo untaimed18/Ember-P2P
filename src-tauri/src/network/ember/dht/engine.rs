@@ -1984,6 +1984,7 @@ fn intersect_find_value_records(
     let start = store.serve_start(&primary, n);
     let mut used = 0usize;
     let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut last_taken: Option<usize> = None;
     for i in 0..n {
         if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
             break;
@@ -1997,6 +1998,7 @@ fn intersect_find_value_records(
         }
         used += cost;
         blobs.push(record_blob(r));
+        last_taken = Some(i);
     }
 
     if blobs.is_empty() {
@@ -2004,7 +2006,17 @@ fn intersect_find_value_records(
     }
     let withheld = n - blobs.len();
     if withheld > 0 {
-        store.advance_serve_cursor(&primary, blobs.len(), n);
+        // Advance past the last record actually served, not by how many were
+        // packed. The loop above `continue`s over records that no longer fit
+        // the remaining budget, so advancing by the count stepped *over* those
+        // skipped positions. With records of a uniform size that made the
+        // stride constant, the reachable start offsets collapsed into a single
+        // residue class, and a record whose index fell outside it was skipped
+        // in every window: never first, so never small enough to fit, so never
+        // served by this node at all — while `get_live` and the diagnostics
+        // went on reporting it as held.
+        let advance = last_taken.map(|i| i + 1).unwrap_or(1);
+        store.advance_serve_cursor(&primary, advance, n);
     }
     Some(FoundValueReply {
         key: primary,
