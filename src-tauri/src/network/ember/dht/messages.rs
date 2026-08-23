@@ -146,8 +146,15 @@ const _: () = assert!(
     FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
         <= MAX_FOUND_VALUE_RECORD_BYTES
 );
+// A single-blob `FOUND_VALUE` payload is `key(16) || record_count(2) ||
+// blob_len(2) || body || signature(64)` — see the `DhtPayload::FoundValue`
+// encoder. The leading `1` this used to carry does not exist on the wire, and
+// the blob length prefix is two bytes, not one, so the guard came out a byte
+// under the real payload: it would still have passed at the exact point the
+// payload first exceeded the unfragmented budget, which is the one case it
+// exists to catch. With current constants both sides are exactly equal.
 const _: () = assert!(
-    1 + 16 + 2 + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
+    16 + 2 + FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
         <= MAX_UNFRAGMENTED_PAYLOAD
 );
 
@@ -895,8 +902,19 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
         DhtPayload::StoreBatchAck { accepted } => accepted.to_le_bytes().to_vec(),
         DhtPayload::FindValue { keys } => {
             let mut buf = Vec::with_capacity(1 + keys.len() * 16);
-            buf.write_u8(keys.len() as u8).unwrap();
-            for key in keys {
+            // Same reasoning as `StoreBatch` above: a bare `as u8` truncates the
+            // count while the loop still writes every key, so an over-long
+            // caller would emit a signed frame whose declared count disagrees
+            // with its body. Every current caller truncates first, so clamping
+            // here only makes that a local guarantee rather than a remote one.
+            debug_assert!(
+                keys.len() <= MAX_FIND_VALUE_KEYS,
+                "FIND_VALUE of {} keys exceeds the {MAX_FIND_VALUE_KEYS} maximum",
+                keys.len()
+            );
+            let count = keys.len().min(MAX_FIND_VALUE_KEYS);
+            buf.write_u8(count as u8).unwrap();
+            for key in keys.iter().take(count) {
                 buf.extend_from_slice(key);
             }
             buf
@@ -904,8 +922,18 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
         DhtPayload::FoundValue { key, records } => {
             let mut buf = Vec::with_capacity(16 + 2 + records.len() * 128);
             buf.extend_from_slice(key);
-            buf.write_u16::<LittleEndian>(records.len() as u16).unwrap();
-            for rec in records {
+            debug_assert!(
+                records.len() <= MAX_FOUND_VALUE_RECORDS,
+                "FOUND_VALUE of {} records exceeds the {MAX_FOUND_VALUE_RECORDS} maximum",
+                records.len()
+            );
+            debug_assert!(
+                records.iter().all(|r| r.len() <= u16::MAX as usize),
+                "a FOUND_VALUE blob exceeds what its u16 length prefix can express"
+            );
+            let count = records.len().min(MAX_FOUND_VALUE_RECORDS);
+            buf.write_u16::<LittleEndian>(count as u16).unwrap();
+            for rec in records.iter().take(count) {
                 buf.write_u16::<LittleEndian>(rec.len() as u16).unwrap();
                 buf.extend_from_slice(rec);
             }

@@ -76,6 +76,14 @@ const _: () = assert!(
 
 /// Maximum concurrent sessions before we start evicting oldest.
 const MAX_SESSIONS: usize = 4096;
+/// Ceiling on handshakes held aside pending proof they can decrypt.
+///
+/// Reaching this needs a completed handshake per entry against a slot that
+/// already holds a validated session, so it is not a spoofed-source surface —
+/// but it is driven by remote input, so it gets a bound and a TTL like every
+/// other table here. Far smaller than [`MAX_SESSIONS`] because a staged entry
+/// is transient by construction.
+const MAX_STAGED_SESSIONS: usize = 256;
 
 /// How long an inbound XX handshake may hold our outbound traffic for a peer we
 /// can name before we stop waiting and dial that identity ourselves.
@@ -626,6 +634,12 @@ pub struct EmberTransport {
     local_noise_key: [u8; 32],
     local_noise_pub: [u8; 32],
     sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
+    /// Completed handshakes waiting to replace a slot that already holds a
+    /// *proven* session. Consulted only after every live session at the address
+    /// has failed AEAD, and promoted the moment one of these decrypts a frame.
+    /// See [`EmberTransport::install_session`] for why a proven session is
+    /// never displaced on the strength of a handshake alone.
+    staged_sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
     pending: HashMap<SocketAddr, PendingHandshake>,
     /// BLAKE3 digests of recently-processed handshake-initiation packets
     /// (`IK_INIT`, `XX_MSG1`) with the time we first saw them. An attacker can
@@ -715,6 +729,7 @@ impl EmberTransport {
             local_noise_key,
             local_noise_pub,
             sessions: HashMap::new(),
+            staged_sessions: HashMap::new(),
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
             deferred_ik: HashMap::new(),
@@ -1227,6 +1242,56 @@ impl EmberTransport {
     fn install_session(&mut self, addr: SocketAddr, session: NoiseSession) {
         let arriving_key = session.remote_noise_pub;
         let slot = (addr, arriving_key);
+
+        // A completed handshake for a slot that already holds a *proven*
+        // session does not get to evict it. Stage it instead, and promote only
+        // once it decrypts something.
+        //
+        // This used to overwrite unconditionally, and past
+        // `HANDSHAKE_REPLAY_TTL` a captured `IK_INIT` replayed at a spoofed
+        // source classifies as fresh: we run the responder again with a new
+        // ephemeral, derive keys the genuine peer never sees (its own pending
+        // entry expired long ago, so it rejects our `IK_RESP`), and install
+        // them over the working session. Every frame in both directions then
+        // failed AEAD, and nothing recovered — decrypt failures deliberately do
+        // not tear a session down, and our own sends kept refreshing
+        // `last_activity` so `SESSION_TIMEOUT` never fired. One captured packet
+        // per liveness-ping cycle held the link down indefinitely.
+        //
+        // Staging closes it without breaking a legitimate re-handshake. Forging
+        // a *new* `IK_INIT` needs the peer's static private key, so any init we
+        // can read is genuinely from that peer; the only thing an attacker can
+        // do is replay old bytes, and a replayer cannot derive the new
+        // transport keys (they come from our fresh ephemeral against the peer's
+        // static) so it can never produce the frame that promotes. A peer that
+        // really did restart sends its next frame under the new keys and
+        // promotes immediately.
+        //
+        // `trim_sessions_at` and `evict_one_session` already refuse to shed a
+        // validated session for an unproven one; this closes the same-slot hole
+        // in that reasoning.
+        let incumbent_is_proven = self
+            .sessions
+            .get(&slot)
+            .is_some_and(|existing| existing.addr_validated);
+        if incumbent_is_proven {
+            if self.staged_sessions.len() >= MAX_STAGED_SESSIONS
+                && !self.staged_sessions.contains_key(&slot)
+            {
+                if let Some(oldest) = self
+                    .staged_sessions
+                    .iter()
+                    .min_by_key(|(_, staged)| staged.established)
+                    .map(|(key, _)| *key)
+                {
+                    self.staged_sessions.remove(&oldest);
+                }
+            }
+            self.staged_sessions.insert(slot, session);
+            return;
+        }
+
+        self.staged_sessions.remove(&slot);
         if !self.sessions.contains_key(&slot) && self.sessions.len() >= MAX_SESSIONS {
             self.evict_one_session();
         }
@@ -1289,6 +1354,12 @@ impl EmberTransport {
         let now = Instant::now();
         self.sessions
             .retain(|_, s| now.duration_since(s.last_activity) < SESSION_TIMEOUT);
+        // A staged session that never decrypted anything is a handshake the
+        // peer never followed up on — or a replay that never could. Drop it on
+        // the pending-handshake timescale rather than the session one: the
+        // genuine case promotes on the peer's very next frame.
+        self.staged_sessions
+            .retain(|_, s| now.duration_since(s.established) < Duration::from_secs(30));
         self.pending.retain(|_, p| {
             let created = match p {
                 PendingHandshake::IkInitiator { created, .. } => *created,
@@ -1310,6 +1381,8 @@ impl EmberTransport {
     pub fn remove_session(&mut self, addr: &SocketAddr) {
         self.sessions
             .retain(|(session_addr, _), _| session_addr != addr);
+        self.staged_sessions
+            .retain(|(session_addr, _), _| session_addr != addr);
         self.pending.remove(addr);
         self.deferred_ik.retain(|(deferred, _), _| deferred != addr);
     }
@@ -1321,6 +1394,7 @@ impl EmberTransport {
     /// different intent, possibly different peer trust).
     pub fn cleanup_all(&mut self) {
         self.sessions.clear();
+        self.staged_sessions.clear();
         self.pending.clear();
         self.recent_handshakes.clear();
         self.deferred_ik.clear();
@@ -1631,7 +1705,7 @@ impl EmberTransport {
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
 
-        let remote_noise_pub = match extract_remote_static(&responder) {
+        let remote_noise_pub = match extract_remote_static(&responder, &self.local_noise_key) {
             Some(k) => k,
             None => {
                 debug!("IK responder: handshake completed without remote static key from {from}");
@@ -1854,7 +1928,7 @@ impl EmberTransport {
             return IncomingResult::Rejected;
         };
 
-        let remote_noise_pub = match extract_remote_static(&state) {
+        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
             Some(k) => k,
             None => {
                 debug!("IK initiator: handshake completed without remote static key from {from}");
@@ -2259,7 +2333,7 @@ impl EmberTransport {
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
 
-        let remote_noise_pub = match extract_remote_static(&state) {
+        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
             Some(k) => k,
             None => {
                 debug!("XX initiator: handshake completed without remote static key from {from}");
@@ -2346,7 +2420,7 @@ impl EmberTransport {
             return IncomingResult::Rejected;
         };
 
-        let remote_noise_pub = match extract_remote_static(&state) {
+        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
             Some(k) => k,
             None => {
                 debug!(
@@ -2423,7 +2497,13 @@ impl EmberTransport {
             .filter(|(addr, _)| *addr == from)
             .map(|(_, key)| *key)
             .collect();
-        if candidates.is_empty() {
+        let staged: Vec<[u8; 32]> = self
+            .staged_sessions
+            .keys()
+            .filter(|(addr, _)| *addr == from)
+            .map(|(_, key)| *key)
+            .collect();
+        if candidates.is_empty() && staged.is_empty() {
             debug!("Ember transport packet from {from} with no session");
             return IncomingResult::Rejected;
         }
@@ -2446,6 +2526,50 @@ impl EmberTransport {
                     return IncomingResult::Message {
                         from,
                         remote_noise_pub: session.remote_noise_pub,
+                        payload: payload_buf[..len].to_vec(),
+                    };
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Nothing live could read it. A staged handshake for this address is
+        // the remaining possibility, and decrypting under its keys is exactly
+        // the proof `install_session` withheld promotion for: a replayer cannot
+        // derive them, so only the genuine peer reaches here. Promote it over
+        // the stale incumbent and serve the frame.
+        for key in staged {
+            let slot = (from, key);
+            let Some(session) = self.staged_sessions.get_mut(&slot) else {
+                continue;
+            };
+            if !session.replay_precheck(nonce) {
+                continue;
+            }
+            let mut payload_buf = vec![0u8; ciphertext.len()];
+            match session
+                .transport
+                .read_message(nonce, ciphertext, &mut payload_buf)
+            {
+                Ok(len) => {
+                    let Some(mut promoted) = self.staged_sessions.remove(&slot) else {
+                        continue;
+                    };
+                    promoted.replay_commit(nonce);
+                    promoted.last_activity = Instant::now();
+                    promoted.addr_validated = true;
+                    let remote_noise_pub = promoted.remote_noise_pub;
+                    debug!(
+                        "Ember transport: promoting re-handshaked session for {from} after it decrypted a frame"
+                    );
+                    if !self.sessions.contains_key(&slot) && self.sessions.len() >= MAX_SESSIONS {
+                        self.evict_one_session();
+                    }
+                    self.sessions.insert(slot, promoted);
+                    self.trim_sessions_at(from, key);
+                    return IncomingResult::Message {
+                        from,
+                        remote_noise_pub,
                         payload: payload_buf[..len].to_vec(),
                     };
                 }
@@ -2559,13 +2683,38 @@ fn cookie_tags_match(expected: &[u8; XX_COOKIE_LEN], got: &[u8]) -> bool {
 /// silently bound the session to the well-known zero pubkey, letting
 /// every "successful but malformed" peer collide on that identity in
 /// reputation/friend lookups.
-fn extract_remote_static(state: &snow::HandshakeState) -> Option<[u8; 32]> {
+fn extract_remote_static(
+    state: &snow::HandshakeState,
+    local_noise_key: &[u8; 32],
+) -> Option<[u8; 32]> {
     let rs = state.get_remote_static()?;
     if rs.len() != 32 {
         return None;
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(rs);
+    // snow's default resolver performs no contributory check, so a peer can
+    // present the all-zero point — or any other low-order point — as its
+    // static key and complete the handshake while holding no private key at
+    // all: every DH against such a point is the identity, so the attacker can
+    // substitute the known constant wherever the pattern calls for a DH
+    // against its claimed static. Repeat the `ss` exchange here and refuse a
+    // non-contributory result, which is exactly the test `crypto.rs` applies
+    // on the chat and capability paths.
+    //
+    // This is what keeps "the session carries a static key" equivalent to "the
+    // peer holds the matching private key" — an invariant `dht/engine.rs`
+    // depends on when it adopts the session's static key as a contact's
+    // `noise_pub`. All-zero is also the sentinel the rest of the codebase
+    // reads as "no key", so admitting it let every malformed peer collide on
+    // one identity.
+    let ours = x25519_dalek::StaticSecret::from(*local_noise_key);
+    if !ours
+        .diffie_hellman(&x25519_dalek::PublicKey::from(key))
+        .was_contributory()
+    {
+        return None;
+    }
     Some(key)
 }
 
@@ -2589,6 +2738,74 @@ mod tests {
         assert!(!EmberTransport::is_ember_packet(&[0xEB, 0x3F, 0x01]));
         assert!(!EmberTransport::is_ember_packet(&[0xEB]));
         assert!(!EmberTransport::is_ember_packet(&[]));
+    }
+
+    /// A captured `IK_INIT` replayed once the replay cache has aged out used to
+    /// overwrite the live session with keys the genuine peer never derived — its
+    /// own pending entry had long expired, so it ignored our `IK_RESP` and kept
+    /// the originals. Every frame in both directions then failed AEAD, and
+    /// nothing recovered: decrypt failures do not tear a session down, and our
+    /// own sends kept `last_activity` fresh so the timeout never fired.
+    ///
+    /// The replay cache is swept by `cleanup`, so clearing `recent_handshakes`
+    /// here is exactly what the passage of `HANDSHAKE_REPLAY_TTL` does.
+    #[test]
+    fn a_replayed_init_past_the_replay_window_cannot_wedge_a_live_session() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // Establish, and prove the address so Bob's session is validated.
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let resp = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("expected HandshakeComplete"),
+        };
+        let _ = alice.process_incoming(&resp[0], bob_addr);
+        let probe_answer = alice.dispatch_incoming(&resp[1], bob_addr);
+        let _ = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+
+        // Alice can be heard.
+        let good = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"before") {
+            OutgoingResult::Ready { packet } => packet,
+            other => panic!("expected Ready, got {}", variant_name(&other)),
+        };
+        assert_eq!(
+            bob.dispatch_incoming(&good, alice_addr).app_payloads,
+            vec![b"before".to_vec()],
+            "the established session works"
+        );
+
+        // The replay window lapses, then the attacker replays the captured init
+        // from Alice's address.
+        bob.recent_handshakes.clear();
+        let _ = bob.process_incoming(&init, alice_addr);
+
+        // Alice's next frame, under the ORIGINAL keys, must still be readable.
+        let after = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"after") {
+            OutgoingResult::Ready { packet } => packet,
+            other => panic!("expected Ready, got {}", variant_name(&other)),
+        };
+        // Delivered, therefore the incumbent session survived. Asserting on the
+        // exact payload list would be wrong: the replayed init re-armed its own
+        // embedded payload as a deferred one, and any authenticated frame
+        // releases that, so Alice's original first message rides along a second
+        // time. Duplicate delivery of an already-authenticated payload is
+        // harmless here (the DHT's own replay collapse covers it) and is not
+        // what this test is about.
+        let delivered = bob.dispatch_incoming(&after, alice_addr).app_payloads;
+        assert!(
+            delivered.contains(&b"after".to_vec()),
+            "a replayed init must not wedge the live session; got {delivered:?}"
+        );
     }
 
     #[test]
