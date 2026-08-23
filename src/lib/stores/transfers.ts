@@ -543,7 +543,11 @@ export async function initTransferStore() {
           // immediately removes the row from the active uploads pane.
           // Cumulative upload totals live in the statistics view.
           markUploadRemoved(id);
-          pendingProgress.delete(id);
+          // Full cleanup, not just the queued progress: this row is gone for
+          // good, so every per-id map has to lose it. `lastApiCompleted` and
+          // `progressRewindHold` in particular would otherwise keep an entry
+          // for an id that can never come back.
+          forgetTransfer(id);
           return list.filter((t) => t.id !== id);
         }
         return list.map((t) => {
@@ -585,14 +589,16 @@ export async function initTransferStore() {
           // reason is preserved in statistics and event logs, just not
           // as a sticky row in the upload pane.
           markUploadRemoved(id);
-          pendingProgress.delete(id);
+          // See the `transfer-complete` upload path: removal means every
+          // per-id map drops the row, not just the queued progress.
+          forgetTransfer(id);
           return list.filter((t) => t.id !== id);
         }
         // User cancel must not paint the row red in Completed/Failed —
         // cancel already removes the download; treat the event as removal.
         const errText = typeof error === 'string' ? error : '';
         if (/cancel/i.test(errText)) {
-          pendingProgress.delete(id);
+          forgetTransfer(id);
           return list.filter((t) => t.id !== id);
         }
         return list.map((t) => {

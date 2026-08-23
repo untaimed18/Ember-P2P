@@ -339,7 +339,10 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     if (result.signatureMissing) {
       retryAction = 'check';
       if (staged) {
-        restoreStaged(staged);
+        // The recovery offer is worth more than the error text (see the
+        // `result.error` branch below), but the missing signature is a security
+        // fact about the *new* release and must survive the restore.
+        restoreStaged(staged, true);
         return false;
       }
       updater.set({
@@ -492,7 +495,17 @@ function takeStagedSnapshot(): StagedSnapshot | null {
 }
 
 /** Put a captured staged-installer offer back, exactly as it was. */
-function restoreStaged(staged: StagedSnapshot): void {
+/**
+ * Re-offer a staged installer that a check would otherwise have discarded.
+ *
+ * `signatureMissing` is passed explicitly because this spreads `INITIAL`, which
+ * resets it. The signature-missing caller has to say so: silently clearing the
+ * flag meant a check that could not verify the new release left no trace of
+ * that anywhere in the store, so nothing downstream could tell "we re-offered
+ * the staged copy" from "we re-offered it *because* the new release was
+ * unverifiable".
+ */
+function restoreStaged(staged: StagedSnapshot, signatureMissing = false): void {
   updater.set({
     ...INITIAL,
     phase: 'stalled',
@@ -501,6 +514,7 @@ function restoreStaged(staged: StagedSnapshot): void {
     installerReady: staged.installerReady,
     dismissed: staged.dismissed,
     fromHandoff: true,
+    signatureMissing,
   });
 }
 

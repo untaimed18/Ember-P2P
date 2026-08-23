@@ -1411,6 +1411,15 @@
   }
 
   async function handleSearch(query: string) {
+    // The Search button is disabled in exactly these states, but pressing
+    // Enter in the query box reaches this function directly — so without the
+    // same gate, clicking did nothing while Enter popped the "no network"
+    // dialog. The readiness hint above the results already explains every one
+    // of these states on screen, so refusing quietly is the consistent
+    // behaviour rather than a silent dead end.
+    if (searchSubmitBlocked) {
+      return;
+    }
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
     const q = query.trim().slice(0, MAX_SEARCH_QUERY_LEN);
