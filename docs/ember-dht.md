@@ -1,21 +1,24 @@
 # Ember DHT — remaining work and future improvements
 
-The protocol specification (wire version 2, as implemented in Ember 1.5.6) is
-[ember-dht-specification.pdf](ember-dht-specification.pdf). This file is the
-standing work log: what is left, what was compared against KAD, and what is
-explicitly not planned.
+The protocol specification is
+[ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
+version 2 as implemented in Ember 1.5.6. **The wire is now version 3 and the PDF
+is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
+[item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
+two frame changes. This file is the standing work log: what is left, what was
+compared against KAD, and what is explicitly not planned.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
 load). Keyword/source publish, iterative search,
 join via the KAD rendezvous key, buddy `PROXY_STORE`, peer announce,
 BLAKE3 integrity digests, network-size-adaptive abuse limits, streamed
-search results, and diagnostics are live on `develop`.
+search results, `FIND_VALUE` paging, and diagnostics are live on `develop`.
 
-Start at [Planned next](#planned-next--from-the-kad-comparison-aug-2026) — it is
-the current plan, ordered by leverage and backed by a constant-for-constant
-comparison against this repo's KAD stack. The sections after it are older
-standing work that the comparison did not change.
+Start at [Planned next](#planned-next--from-the-kad-comparison-aug-2026) — every
+item in it is now done, and each section records why the change was made and what
+to watch. The sections after it are older standing work the comparison did not
+change.
 
 Code: [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/).
 
@@ -67,18 +70,20 @@ is a network that does not need the eMule wire at all.
 
 ### 2. Wire versioning rejects cleanly but cannot negotiate
 
-The last wire change touched five places (control version, batched store and
-its ack, contact-list trimming, payload limits), so `EMBER_DHT_VERSION` is now
-**2** and `EMBER_DHT_MIN_VERSION` is 2 alongside it: the decoder accepts a
-*range*, and a frame outside it is refused at the version byte instead of
-becoming a malformed-frame counter that reads like packet loss. A change that
-only adds to the format can lower the minimum rather than raising both.
+`EMBER_DHT_VERSION` is now **3**, with `EMBER_DHT_MIN_VERSION` 3 alongside it:
+the decoder accepts a *range*, and a frame outside it is refused at the version
+byte instead of becoming a malformed-frame counter that reads like packet loss. A
+change that only adds to the format can lower the minimum rather than raising
+both — v3 could not, because it changed the shape of two existing frames
+(contact lists lost `node_id`, `FOUND_VALUE` gained two positions), and a v2
+peer reads both at fixed offsets.
 
-What is still missing is the part that needs a decision. Two peers on
-incompatible versions now fail cleanly, but neither is told why and there is no
-upgrade prompt — they simply never fold each other into a routing table. That
-was tolerable while the overlay shipped off by default; it now ships **on**, so
-the next breaking change reaches users who will not all update at once.
+**This is the breaking change the section used to warn about**, and it has now
+landed on an overlay that ships **on**. Two peers on incompatible versions fail
+cleanly, but neither is told why and there is no upgrade prompt — they simply
+never fold each other into a routing table. A v2 node therefore sees the network
+shrink as peers update, with nothing in the UI to explain it, until it updates
+too. Worth a release note; the negotiation gap itself is still open.
 
 ### 3. Cold join when eMule is not available
 
@@ -111,14 +116,13 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 - Multi-keyword search uses sparse DHT intersection (missing secondary
   keys are skipped) plus a filename match at emit time — not a strict
   worldwide AND of every keyword key.
-- A peer serves roughly five records per keyword query and there is no
-  pagination, so recall is bounded by nodes-walked × 5. Successive queries
-  rotate which window is served, so a late publisher is no longer stuck
-  behind the oldest handful on that node. See
-  [Planned next, item 1](#1-the-serving-ceiling--do-this-first).
-- One publisher may hold 45 records under any one keyword, network-wide, so a
-  user sharing many files with a word in common will not have all of them
-  findable under it.
+- A peer serves roughly five records per keyword *datagram*, but a searcher can
+  now page a node until its key is exhausted, bounded by 8 follow-ups per node
+  and the existing per-node result allowance. See
+  [Planned next, item 1](#1-the-serving-ceiling--done-wire-v3).
+- One publisher may hold 150 records under any one keyword, network-wide (KAD's
+  own allowance), so a user sharing more files than that with a word in common
+  still will not have all of them findable under it.
 - Gossip contacts are unverified until the node hears from them directly
   (same as Kademlia). Admission is bounded by the diversity caps in
   [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), but there is
@@ -152,11 +156,9 @@ was made and what to watch now that it is live.
 **Shipped after 1.5.3 (no wire change):** item 1's cheap path (rotate the served
 window), item 5 (persist the Ember source publish schedule), item 6's leftover
 replication heartbeat, and item 8's store-rejection causes, search-quality
-averages, and persisted verified-contact high-water. Pagination and dropping
-`node_id` still wait on a version bump. Firewalled consume shipped as an
-additive record trailer plus two new message types that older v2 peers ignore.
-Item 2 remains blocked on measuring whether truncation still binds after
-rotation.
+averages, and persisted verified-contact high-water. Firewalled consume shipped
+as an additive record trailer plus two new message types that older v2 peers
+ignore.
 
 **Shipped in 1.5.5 (no wire change):** Ember BLAKE3 pin mismatch is a permanent
 download failure with a visible fail badge (it used to reopen every part and
@@ -166,48 +168,86 @@ Search readiness use verified contacts so gossip does not look like a join.
 The anti-leech filter matches the software label plus the mod tag (outside
 the DHT).
 
-Items 4 and 7 are untouched and remain in this order.
+**Shipped as wire v3 — breaking.** The two items that needed a version bump went
+together, since one bump pays for both and item 2 was only worth having once item
+1 could serve the extra records:
 
-### 1. The serving ceiling — do this first
+- Item 1's real fix: `start_position` paging on `FIND_VALUE`/`FOUND_VALUE`,
+  replacing the responder-side rotation cursor.
+- Item 7: `node_id` dropped from wire contacts (87 → 71 bytes, 14 → 17 contacts
+  per response).
+- Item 2, unblocked by the above: keyword capacity raised to KAD's 150 of 1000.
+
+**Every item in this list is now done.** What remains for the overlay is the
+standing work in the sections above (native transfers, version negotiation, cold
+join without eMule, validation past the happy path) and the "Future improvements"
+below — not this comparison.
+
+### 1. The serving ceiling — done (wire v3)
 
 A peer answers a keyword query with **about five records**. `MAX_FOUND_VALUE_RECORD_BYTES`
-is 1235, a keyword blob for a 40-character filename costs 221, and packing used
+is 1231, a keyword blob for a 40-character filename costs 221, and packing used
 to fill from the front of insertion order, so the oldest five were the only ones
 that node would ever serve.
 
-**Cheap path, shipped:** successive `FIND_VALUE`s rotate the served window per
-key. The cursor advances by how many records the reply actually carried, and
-only when the reply withholds some — if everything fits, rotation is a no-op.
-`local_records` (seeding our own search) does not inherit this packing. Blob-hash
-dedup in `search.rs` is content-based, so rotating windows can only gather more.
+**Shipped, cheap path (1.5.3–1.5.5):** successive `FIND_VALUE`s rotated the
+served window per key, using a cursor the *responder* advanced.
 
-Still missing, and what KAD does:
+**Shipped, real fix (v3):** `FIND_VALUE` carries a `start_position` and
+`FOUND_VALUE` answers with `next_position` plus `total_available`. The searcher
+owns the offset, so a walk pages a well-stocked node until the key is exhausted
+instead of hoping its window had moved.
 
-- **Add `start_position` to `FIND_VALUE`/`FOUND_VALUE`.** The real fix. Costs an
-  `EMBER_DHT_VERSION` bump (see "Wire versioning" above — this is the breaking
-  change that section warns about) and multiplies query traffic on hot keywords.
+The rotation cursor is **gone**, not kept alongside. It could not tell "this
+searcher wants the next page" from "a different searcher wants the first", so two
+searchers on the same hot key advanced each other's window and neither saw a
+contiguous run. Serving is now deterministic: the same request gets the same
+answer every time.
 
-The truncation counter this was waiting on **shipped in 1.5.3**: an inbound
-`FIND_VALUE` we answer now reports how many live matching records the datagram
-could not carry, surfaced on the Ember page as truncated answers over withheld
-records. Read it before paying for pagination. Truncation near zero means the
-ceiling is theoretical on the network as it currently is and item 2 is the
-better buy; a high withheld-per-truncated ratio is the case that justifies the
-wire change, because it says the records exist and nothing can reach them.
+`next_position` is reported rather than inferred. The packer skips a record too
+large for the budget *left* on a page and keeps scanning for one that still fits,
+so the records a page serves are not always a contiguous run, and `start + len`
+would step over the skipped position — the big record is then never first, so
+never faces an empty budget, so never served at all, while `get_live` and the
+diagnostics go on reporting it as held. A page therefore resumes at the earliest
+record it passed over, which costs re-sending the ones after it (absorbed by
+content dedup in `search.rs`) and guarantees nothing is stranded.
+`local_records` (seeding our own search) still does no packing at all.
 
-### 2. Per-publisher keyword capacity — blocked on 1
+Paging is the one mechanism here where a *responder* influences how many queries
+we send, so the searcher bounds it independently of what `total_available`
+claims: `MAX_PAGES_PER_NODE` (8) follow-ups per node, each required to name an
+offset strictly past the one it answered, and the existing
+`MAX_RESULTS_PER_NODE` allowance still caps what one peer may contribute.
+Positions are advisory — the responder's list shifts as records expire — so
+paging may repeat or skip an entry, which content-based dedup in `search.rs`
+already absorbs.
 
-`MAX_RECORDS_PER_PUBLISHER_PER_KEY` is 45 of `MAX_RECORDS_PER_KEY` 300. KAD's
-equivalent is 150 of 1000. Both are 15%, but the absolute number is what a user
-feels: every storer applies the same cap to the same publisher key, so the
-ceiling is network-wide, not per-node. **A user sharing 200 files that share a
-common word gets 45 of them findable under that word, anywhere** — 30% of what
-KAD serves.
+The truncation counters (`ember_dht_found_value_truncated` /
+`ember_dht_found_value_withheld`, shipped 1.5.3) are still the way to read how
+far the datagram ceiling actually binds on real keys.
 
-Raising both to KAD's numbers keeps the ratio and triples capacity. Do not do it
-before item 1: if a peer only ever serves ~5 records per reply, the extra stored
-records have no way to reach a searcher, and the only certain effect is more
+### 2. Per-publisher keyword capacity — done
+
+`MAX_RECORDS_PER_PUBLISHER_PER_KEY` was 45 of `MAX_RECORDS_PER_KEY` 300 against
+KAD's 150 of 1000. Both are 15%, but the absolute number is what a user feels:
+every storer applies the same cap to the same publisher key, so the ceiling is
+network-wide, not per-node. A user sharing 200 files with a common word got 45 of
+them findable under that word *anywhere* — 30% of what KAD serves.
+
+Both are now KAD's numbers, which keeps the ratio and triples capacity.
+`keyword_capacity_matches_kad` pins them together, since raising either alone
+breaks the property that no identity holds more than about a sixth of a key.
+
+This deliberately waited on item 1, and shipped in the same version: while a peer
+could only ever serve its first window, the extra stored records had no way to
+reach a searcher and the one certain effect would have been more
 storer-replication traffic.
+
+`MAX_STORE_BYTES` is unchanged at 48 MiB, so per-key capacity went up without
+raising what the process may resident-hold. When the byte budget binds first it
+still sheds the records this node is least responsible for (furthest key, then
+nearest expiry) rather than refusing newcomers.
 
 ### 3. Stream search results as they arrive — done in 1.5.3
 
@@ -305,13 +345,24 @@ had no equivalent. **Shipped:** each maintenance cycle now logs an
 backlog — on the same cadence as the 60s maintenance tick. The two-hourly
 republish interval is unchanged.
 
-### 7. Contact encoding wastes 18% of every response
+### 7. Contact encoding wasted 18% of every response — done (wire v3)
 
-Each wire contact carries both `node_id` (16 bytes) and `ed25519_pub` (32), but
-the ID *is* BLAKE3 of that key and the receiver re-derives and checks it anyway.
-Dropping it takes a contact from 87 to 71 bytes: **17 contacts per `FOUND_NODE`
-instead of 14**, which also buys a fraction of a hop. Free, but it is a wire
-change, so bundle it with item 1's version bump.
+Each wire contact used to carry both `node_id` (16 bytes) and `ed25519_pub` (32),
+but the ID *is* BLAKE3 of that key and every decoder re-derived and checked it
+rather than trusting the wire — so the only thing those bytes could do was
+disagree with the key beside them.
+
+Dropping them took a contact from 87 to 71 bytes: **17 contacts per `FOUND_NODE`
+instead of 14**, which is most of a hop on a sparse table. Bundled with item 1's
+version bump as planned. `a_found_node_carries_more_contacts_than_v2_could` pins
+both the 71-byte size and the resulting count, because the gain is purely a
+function of the byte budget and any field a future version adds to a contact
+spends it silently.
+
+Note this is the *wire* format only. `nodes_ember.dat` still persists a node ID
+per contact (advisory; `to_contact` re-derives the authoritative one), because
+changing the file format would cost every user their bootstrap set for no
+bandwidth saving.
 
 ### 8. Observability gaps
 
@@ -419,9 +470,10 @@ settled.
 
 Protocol constants live in
 [`dht/mod.rs`](../src-tauri/src/network/ember/dht/mod.rs): 128-bit node IDs
-(BLAKE3 of the Ed25519 public key), k = 20, α = 5.
+(BLAKE3 of the Ed25519 public key), k = 20, α = 5, wire version 3.
 
-`MAX_CONTACTS_PER_RESPONSE` is 20 but is not reachable: `encode_contact_list`
-trims by bytes, and at 87 bytes per IPv4 contact (16 id + 7 address + 32 Noise
-key + 32 Ed25519 key) only 14 fit the 1253-byte payload budget. A `FOUND_NODE`
-therefore never carries a full k-bucket. See "Contact encoding" below.
+`MAX_CONTACTS_PER_RESPONSE` is 20 but is still not reachable: `encode_contact_list`
+trims by bytes, and at 71 bytes per IPv4 contact (7 address + 32 Noise key + 32
+Ed25519 key) 17 fit the 1253-byte payload budget — up from 14 while contacts also
+carried a redundant 16-byte ID. A `FOUND_NODE` therefore never carries a full
+k-bucket. See item 7 above.

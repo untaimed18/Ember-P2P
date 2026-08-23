@@ -15,13 +15,24 @@ use serde::{Deserialize, Serialize};
 
 /// Wire version this build speaks.
 ///
-/// Bumped to 2 because the v1 layout is not compatible: the batched store and
-/// its ack, contact-list trimming, and the payload limits all changed shape
-/// while the byte still read 1, so two peers announced the same version and
-/// then misparsed each other. The byte exists to make that a clean refusal, and
-/// leaving it alone turned a version mismatch into malformed-frame counters that
-/// look like packet loss.
-pub const EMBER_DHT_VERSION: u8 = 2;
+/// Bumped to 3 for two changes that both alter the shape of existing frames, so
+/// neither could ride the additive path earlier versions used:
+///
+/// * Contact lists no longer carry `node_id`. It was always redundant — the ID
+///   *is* `BLAKE3(ed25519_pub)[..16]`, and every decoder re-derived and checked
+///   it rather than trusting the wire — so it cost 16 of 87 bytes per contact to
+///   restate something the receiver had to compute anyway. At 71 bytes a
+///   `FOUND_NODE` carries 17 contacts instead of 14.
+/// * `FIND_VALUE` carries a `start_position` and `FOUND_VALUE` answers with the
+///   position to resume from plus the live total. A datagram fits roughly five
+///   keyword records, so before this a searcher had no way to reach past the
+///   first window of a popular key except by re-asking and hoping the responder
+///   had rotated it.
+///
+/// v2 read the contact list at a fixed stride and the `FOUND_VALUE` header at a
+/// fixed offset, so a v2 peer handed a v3 frame does not fail cleanly on its
+/// own — the version byte is what makes it a refusal instead of a misparse.
+pub const EMBER_DHT_VERSION: u8 = 3;
 
 /// Oldest wire version this build can still parse.
 ///
@@ -29,7 +40,7 @@ pub const EMBER_DHT_VERSION: u8 = 2;
 /// another. A future change that only *adds* to the format can lower this
 /// instead of raising both, which is the whole point of keeping them separate:
 /// the decoder then accepts the range rather than a single value.
-pub const EMBER_DHT_MIN_VERSION: u8 = 2;
+pub const EMBER_DHT_MIN_VERSION: u8 = 3;
 pub const K_BUCKET_SIZE: usize = 20;
 pub const ALPHA: usize = 5;
 pub const ID_BITS: usize = 128;

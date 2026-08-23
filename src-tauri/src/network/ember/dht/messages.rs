@@ -131,8 +131,12 @@ pub const MAX_UNFRAGMENTED_DATAGRAM: usize = 1400;
 pub const MAX_UNFRAGMENTED_PAYLOAD: usize =
     MAX_UNFRAGMENTED_DATAGRAM - TRANSPORT_OVERHEAD - FRAME_OVERHEAD;
 
-/// Byte budget for the record blobs in a `FOUND_VALUE`, after its 16-byte key
-/// and 2-byte record count. Each blob also costs a 2-byte length prefix.
+/// Bytes a `FOUND_VALUE` spends before its first blob: `key(16) ||
+/// next_position(2) || total_available(2) || record_count(2)`.
+const FOUND_VALUE_HEADER_LEN: usize = 16 + 2 + 2 + 2;
+
+/// Byte budget for the record blobs in a `FOUND_VALUE`, after
+/// [`FOUND_VALUE_HEADER_LEN`]. Each blob also costs a 2-byte length prefix.
 ///
 /// Budgeted against the unfragmented limit like every other response whose
 /// size we choose (FOUND_NODE, PEER_LIST, STORE_BATCH). Using the 4 KB decode
@@ -141,7 +145,8 @@ pub const MAX_UNFRAGMENTED_PAYLOAD: usize =
 /// whose answers were then most likely to be dropped in transit. The searcher
 /// read that as a timeout and charged the responder a failure, so after three
 /// of them a healthy, well-stocked storer was evicted from the routing table.
-pub const MAX_FOUND_VALUE_RECORD_BYTES: usize = MAX_UNFRAGMENTED_PAYLOAD - 16 - 2;
+pub const MAX_FOUND_VALUE_RECORD_BYTES: usize =
+    MAX_UNFRAGMENTED_PAYLOAD - FOUND_VALUE_HEADER_LEN;
 
 /// Length prefix each `FOUND_VALUE` blob carries on the wire.
 const FOUND_VALUE_BLOB_LEN_PREFIX: usize = 2;
@@ -169,21 +174,33 @@ const _: () = assert!(
     FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
         <= MAX_FOUND_VALUE_RECORD_BYTES
 );
-// A single-blob `FOUND_VALUE` payload is `key(16) || record_count(2) ||
-// blob_len(2) || body || signature(64)` — see the `DhtPayload::FoundValue`
-// encoder. The leading `1` this used to carry does not exist on the wire, and
-// the blob length prefix is two bytes, not one, so the guard came out a byte
-// under the real payload: it would still have passed at the exact point the
-// payload first exceeded the unfragmented budget, which is the one case it
-// exists to catch. With current constants both sides are exactly equal.
+// A single-blob `FOUND_VALUE` payload is the header plus `blob_len(2) || body ||
+// signature(64)` — see the `DhtPayload::FoundValue` encoder. This used to spell
+// the header out as `16 + 2` and drifted the moment paging widened it, which is
+// why it now shares [`FOUND_VALUE_HEADER_LEN`] with both the encoder's budget
+// and the decoder's offset. With current constants both sides are exactly equal.
 const _: () = assert!(
-    16 + 2 + FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
+    FOUND_VALUE_HEADER_LEN
+        + FOUND_VALUE_BLOB_LEN_PREFIX
+        + MAX_STORE_RECORD_BYTES
+        + FOUND_VALUE_BLOB_SIGNATURE_LEN
         <= MAX_UNFRAGMENTED_PAYLOAD
 );
 
 // Address type flags
 const ADDR_IPV4: u8 = 0x04;
 const ADDR_IPV6: u8 = 0x06;
+
+/// Wire size of one IPv4 contact in a contact list: `addr_type(1) + ip(4) +
+/// port(2) + noise_pub(32) + ed25519_pub(32)`.
+///
+/// v2 spent another 16 bytes per contact restating the node ID, which is
+/// `BLAKE3(ed25519_pub)[..16]` and was re-derived by every decoder rather than
+/// trusted — so the only thing those bytes could do was disagree with the key
+/// beside them. Dropping them took a contact from 87 to 71 and a `FOUND_NODE`
+/// from 14 contacts to 17, which is most of a hop on a sparse table.
+/// `a_found_node_carries_more_contacts_than_v2_could` pins the count.
+pub const CONTACT_WIRE_LEN_IPV4: usize = 1 + 4 + 2 + 32 + 32;
 
 /// Header size without public key (used after encrypted session established):
 /// version(1) + msg_type(1) + request_id(4) + sender_node_id(16) = 22 bytes
@@ -280,10 +297,35 @@ pub enum DhtPayload {
     },
     FindValue {
         keys: Vec<[u8; 16]>,
+        /// Index into the responder's live record list for `keys[0]` at which
+        /// this answer should begin.
+        ///
+        /// A datagram fits roughly five keyword records, so a popular key holds
+        /// far more than one reply can carry. Without an offset the only records
+        /// a node would ever serve were the first that fit, and the rest were
+        /// held but unreachable — visible in `get_live` and the diagnostics,
+        /// invisible to every searcher.
+        ///
+        /// Positions are advisory: the responder's list shifts as records expire
+        /// and are evicted, so paging is best-effort and may repeat or skip an
+        /// entry across pages. That is the same guarantee a Kademlia walk gives
+        /// for contacts, and the searcher dedups by blob hash regardless.
+        start_position: u16,
     },
     FoundValue {
         key: [u8; 16],
         records: Vec<Vec<u8>>,
+        /// Where the searcher should resume to continue past this page.
+        ///
+        /// The responder reports this rather than letting the searcher add
+        /// `records.len()` to what it asked, because the packer skips records
+        /// too large for the remaining budget and keeps scanning — so the
+        /// records served are not always a contiguous run. Adding the count
+        /// would step over the skipped positions and hide them permanently.
+        next_position: u16,
+        /// Live records matching the query, whether or not this page carries
+        /// them. `next_position >= total_available` means the key is exhausted.
+        total_available: u16,
     },
     AnnouncePeer {
         contacts: Vec<EmberContact>,
@@ -879,11 +921,13 @@ pub fn peek_store_batch_count(frame: &[u8]) -> Option<u32> {
         .map(|count| (*count as u32).min(MAX_STORE_BATCH_RECORDS as u32))
 }
 
-/// Build a FIND_VALUE request for one or more keys.
+/// Build a FIND_VALUE request for one or more keys, starting at
+/// `start_position` in the responder's live list for `keys[0]`.
 pub fn build_find_value(
     sender_id: EmberNodeId,
     request_id: u32,
     keys: Vec<[u8; 16]>,
+    start_position: u16,
 ) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
@@ -891,17 +935,23 @@ pub fn build_find_value(
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::FindValue { keys },
+        payload: DhtPayload::FindValue {
+            keys,
+            start_position,
+        },
         signature: [0u8; 64],
     }
 }
 
-/// Build a FOUND_VALUE response carrying the records held for `key`.
+/// Build a FOUND_VALUE response carrying one page of the records held for
+/// `key`. See [`DhtPayload::FoundValue`] for what the two positions mean.
 pub fn build_found_value(
     sender_id: EmberNodeId,
     request_id: u32,
     key: [u8; 16],
     records: Vec<Vec<u8>>,
+    next_position: u16,
+    total_available: u16,
 ) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
@@ -909,7 +959,12 @@ pub fn build_found_value(
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::FoundValue { key, records },
+        payload: DhtPayload::FoundValue {
+            key,
+            records,
+            next_position,
+            total_available,
+        },
         signature: [0u8; 64],
     }
 }
@@ -979,8 +1034,11 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             buf
         }
         DhtPayload::StoreBatchAck { accepted } => accepted.to_le_bytes().to_vec(),
-        DhtPayload::FindValue { keys } => {
-            let mut buf = Vec::with_capacity(1 + keys.len() * 16);
+        DhtPayload::FindValue {
+            keys,
+            start_position,
+        } => {
+            let mut buf = Vec::with_capacity(1 + keys.len() * 16 + 2);
             // Same reasoning as `StoreBatch` above: a bare `as u8` truncates the
             // count while the loop still writes every key, so an over-long
             // caller would emit a signed frame whose declared count disagrees
@@ -996,11 +1054,22 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             for key in keys.iter().take(count) {
                 buf.extend_from_slice(key);
             }
+            // Trails the keys so the fixed-size prefix a decoder needs to size
+            // the key run stays first.
+            buf.write_u16::<LittleEndian>(*start_position).unwrap();
             buf
         }
-        DhtPayload::FoundValue { key, records } => {
-            let mut buf = Vec::with_capacity(16 + 2 + records.len() * 128);
+        DhtPayload::FoundValue {
+            key,
+            records,
+            next_position,
+            total_available,
+        } => {
+            let mut buf =
+                Vec::with_capacity(FOUND_VALUE_HEADER_LEN + records.len() * 128);
             buf.extend_from_slice(key);
+            buf.write_u16::<LittleEndian>(*next_position).unwrap();
+            buf.write_u16::<LittleEndian>(*total_available).unwrap();
             debug_assert!(
                 records.len() <= MAX_FOUND_VALUE_RECORDS,
                 "FOUND_VALUE of {} records exceeds the {MAX_FOUND_VALUE_RECORDS} maximum",
@@ -1077,18 +1146,24 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
 /// Encode a contact list, bounded by both the declared count limit and a byte
 /// budget that keeps the resulting datagram from fragmenting.
 ///
-/// A count limit alone is not enough: 20 IPv4 contacts encode to roughly 1740
+/// A count limit alone is not enough: 20 IPv4 contacts encode to roughly 1420
 /// bytes, which fragments, and an IPv6 list is larger still. Contacts are
 /// already ordered closest-first, so trimming the tail drops the least useful
 /// entries.
+///
+/// No `node_id` is written — see [`CONTACT_WIRE_LEN_IPV4`]. The receiver derives
+/// it from `ed25519_pub`, which is the only value that could ever have been
+/// authoritative.
 fn encode_contact_list(contacts: &[EmberContact]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + MAX_UNFRAGMENTED_PAYLOAD.min(1 + 20 * 100));
+    // Exact for an IPv4 list, which is all we currently dial; an IPv6 entry is
+    // 12 bytes wider and costs one realloc. The byte cap below is what actually
+    // bounds the result either way.
+    let mut buf = Vec::with_capacity(1 + MAX_CONTACTS_PER_RESPONSE * CONTACT_WIRE_LEN_IPV4);
     buf.write_u8(0).unwrap(); // placeholder, rewritten once the count is known
 
     let mut count = 0usize;
     for contact in contacts.iter().take(MAX_CONTACTS_PER_RESPONSE) {
         let before = buf.len();
-        buf.extend_from_slice(&contact.node_id.0);
         encode_socket_addr(&contact.addr, &mut buf);
         buf.extend_from_slice(&contact.noise_pub);
         buf.extend_from_slice(&contact.ed25519_pub);
@@ -1287,7 +1362,7 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             if count > MAX_FIND_VALUE_KEYS {
                 anyhow::bail!("FIND_VALUE keys count {count} exceeds max {MAX_FIND_VALUE_KEYS}");
             }
-            if data.len() < 1 + count * 16 {
+            if data.len() < 1 + count * 16 + 2 {
                 anyhow::bail!("FIND_VALUE truncated");
             }
             let mut keys = Vec::with_capacity(count);
@@ -1296,15 +1371,22 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 key.copy_from_slice(&data[1 + i * 16..1 + (i + 1) * 16]);
                 keys.push(key);
             }
-            Ok(DhtPayload::FindValue { keys })
+            let pos_at = 1 + count * 16;
+            let start_position = u16::from_le_bytes([data[pos_at], data[pos_at + 1]]);
+            Ok(DhtPayload::FindValue {
+                keys,
+                start_position,
+            })
         }
         MSG_FOUND_VALUE => {
-            if data.len() < 18 {
+            if data.len() < FOUND_VALUE_HEADER_LEN {
                 anyhow::bail!("FOUND_VALUE too short");
             }
             let mut key = [0u8; 16];
             key.copy_from_slice(&data[..16]);
             let mut cursor = Cursor::new(&data[16..]);
+            let next_position = cursor.read_u16::<LittleEndian>()?;
+            let total_available = cursor.read_u16::<LittleEndian>()?;
             let record_count = cursor.read_u16::<LittleEndian>()? as usize;
             if record_count > MAX_FOUND_VALUE_RECORDS {
                 anyhow::bail!(
@@ -1317,7 +1399,7 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             // bytes), so only reserve what the remaining bytes could contain
             // to avoid a large eager alloc.
             let mut records = Vec::with_capacity(record_count.min(data.len() / 2 + 1));
-            let mut offset = 18usize;
+            let mut offset = FOUND_VALUE_HEADER_LEN;
             for _ in 0..record_count {
                 // A declared record count that the buffer can't satisfy is a
                 // framing error, not a partial list to be silently accepted —
@@ -1339,7 +1421,12 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 records.push(data[offset..offset + rlen].to_vec());
                 offset += rlen;
             }
-            Ok(DhtPayload::FoundValue { key, records })
+            Ok(DhtPayload::FoundValue {
+                key,
+                records,
+                next_position,
+                total_available,
+            })
         }
         MSG_CHANNEL_MSG => {
             if data.len() > MAX_DHT_PAYLOAD {
@@ -1448,16 +1535,12 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
     let mut offset = 1usize;
 
     for _ in 0..count {
-        // node_id (16) + addr_type (1) + ip (4 or 16) + port (2) + noise_pub (32) + ed25519_pub (32)
+        // addr_type (1) + ip (4 or 16) + port (2) + noise_pub (32) + ed25519_pub (32).
         // A declared count the buffer can't satisfy is a framing error: reject
         // the whole frame instead of returning a silently-truncated prefix.
-        if offset + 16 + 1 > data.len() {
+        if offset + 1 > data.len() {
             anyhow::bail!("contact list truncated (declared {count} contacts)");
         }
-        // The wire still carries a node_id for format stability, but we never
-        // trust it — a contact's identity is re-derived from its Ed25519 key
-        // below. Consume the bytes to keep the cursor aligned.
-        offset += 16;
 
         let addr_type = data[offset];
         offset += 1;
@@ -1504,13 +1587,14 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
         ed25519_pub.copy_from_slice(&data[offset..offset + 32]);
         offset += 32;
 
-        // Re-derive the node ID from the Ed25519 key rather than trusting the
-        // wire-supplied value. This mirrors the identity binding `decode_message`
-        // enforces for direct senders and `BootstrapNode::to_contact` applies to
-        // rendezvous peers: an indirectly-learned contact cannot be injected
-        // under an ID it doesn't control. A contact whose key isn't a valid
-        // Ed25519 point can never be dialed or verified, so drop it silently
-        // (one bad entry must not void the rest of an otherwise honest list).
+        // The node ID is derived here because the key is the only place it can
+        // come from — v3 does not carry one. This mirrors the identity binding
+        // `decode_message` enforces for direct senders and
+        // `BootstrapNode::to_contact` applies to rendezvous peers: an
+        // indirectly-learned contact cannot be injected under an ID it doesn't
+        // control. A contact whose key isn't a valid Ed25519 point can never be
+        // dialed or verified, so drop it silently (one bad entry must not void
+        // the rest of an otherwise honest list).
         let Some(derived_id) = crypto::node_id_from_ed25519_bytes(&ed25519_pub) else {
             continue;
         };
@@ -1951,7 +2035,6 @@ mod tests {
         let mut encoded = encode_contact_list(&[good.clone()]);
         // Append a second hand-rolled contact with the invalid key.
         encoded[0] = 2; // bump declared count
-        encoded.extend_from_slice(&[0u8; 16]); // node_id (ignored on decode)
         encoded.push(ADDR_IPV4);
         encoded.extend_from_slice(&[8, 8, 8, 8]);
         encoded.extend_from_slice(&2000u16.to_be_bytes());
@@ -1961,6 +2044,47 @@ mod tests {
         let decoded = decode_contact_list(&encoded).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].node_id, good.node_id);
+    }
+
+    /// v3 dropped the `node_id` from each wire contact, which buys three more
+    /// contacts per response — most of a hop on a sparse table.
+    ///
+    /// Pinned because the gain is purely a function of the byte budget: any
+    /// field a future version adds to a contact spends it silently, and the
+    /// symptom (shorter contact lists, so slower lookups) is not one anybody
+    /// would trace back to an encoder change.
+    #[test]
+    fn a_found_node_carries_more_contacts_than_v2_could() {
+        let contacts: Vec<EmberContact> = (1u8..=MAX_CONTACTS_PER_RESPONSE as u8)
+            .map(|i| test_contact(i, &format!("10.0.0.{i}:{}", 1000 + i as u16), i))
+            .collect();
+        let encoded = encode_contact_list(&contacts);
+        let carried = encoded[0] as usize;
+
+        assert_eq!(
+            encoded.len(),
+            1 + carried * CONTACT_WIRE_LEN_IPV4,
+            "an IPv4 contact must cost exactly CONTACT_WIRE_LEN_IPV4"
+        );
+        assert!(
+            encoded.len() <= MAX_UNFRAGMENTED_PAYLOAD,
+            "a contact list must not fragment"
+        );
+        assert_eq!(carried, 17, "the byte budget fits 17 contacts at 71 bytes");
+
+        // What the same budget bought while every contact restated its ID.
+        const V2_CONTACT_WIRE_LEN_IPV4: usize = CONTACT_WIRE_LEN_IPV4 + 16;
+        assert_eq!((MAX_UNFRAGMENTED_PAYLOAD - 1) / V2_CONTACT_WIRE_LEN_IPV4, 14);
+
+        // And the trimmed list still decodes, with every ID derived from its key.
+        let decoded = decode_contact_list(&encoded).expect("a trimmed list decodes");
+        assert_eq!(decoded.len(), carried);
+        for contact in &decoded {
+            assert_eq!(
+                contact.node_id.0,
+                crypto::node_id_from_ed25519_bytes(&contact.ed25519_pub).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -2046,6 +2170,8 @@ mod tests {
             payload: DhtPayload::FoundValue {
                 key: [0xCD; 16],
                 records: vec![blob],
+                next_position: 1,
+                total_available: 1,
             },
             signature: [0u8; 64],
         };
@@ -2068,11 +2194,70 @@ mod tests {
             payload: DhtPayload::FoundValue {
                 key: [0xCD; 16],
                 records: vec![too_big],
+                next_position: 1,
+                total_available: 1,
             },
             signature: [0u8; 64],
         };
         let encoded = encode_message(&msg, &sk, true);
         assert!(decode_message(&encoded, true).is_err());
+    }
+
+    /// Both paging positions have to survive the wire, and the `start_position`
+    /// has to survive sitting *after* a variable-length key run.
+    #[test]
+    fn find_value_paging_positions_round_trip() {
+        let (sk, id) = test_keypair();
+
+        let ask = build_find_value(id, 1, vec![[0xA1; 16], [0xA2; 16]], 4321);
+        let decoded = decode_message(&encode_message(&ask, &sk, true), true).unwrap();
+        match decoded.payload {
+            DhtPayload::FindValue {
+                keys,
+                start_position,
+            } => {
+                assert_eq!(keys, vec![[0xA1; 16], [0xA2; 16]]);
+                assert_eq!(start_position, 4321);
+            }
+            other => panic!("expected FindValue, got {other:?}"),
+        }
+
+        let answer = build_found_value(id, 2, [0xB0; 16], vec![vec![7u8; 40]], 9, 900);
+        let decoded = decode_message(&encode_message(&answer, &sk, true), true).unwrap();
+        match decoded.payload {
+            DhtPayload::FoundValue {
+                key,
+                records,
+                next_position,
+                total_available,
+            } => {
+                assert_eq!(key, [0xB0; 16]);
+                assert_eq!(records, vec![vec![7u8; 40]]);
+                assert_eq!(next_position, 9);
+                assert_eq!(total_available, 900);
+            }
+            other => panic!("expected FoundValue, got {other:?}"),
+        }
+    }
+
+    /// A `FIND_VALUE` whose `start_position` is missing must be refused, not
+    /// read as position zero. Silently defaulting would make a truncated frame
+    /// look like a first-page request and re-serve records the searcher already
+    /// had, for as many pages as it asked for.
+    #[test]
+    fn a_find_value_without_its_start_position_is_refused() {
+        let (_, id) = test_keypair();
+        let ask = build_find_value(id, 1, vec![[0xA1; 16]], 7);
+        let full = encode_payload(&ask.payload);
+        assert!(decode_payload(MSG_FIND_VALUE, &full).is_ok());
+        assert!(
+            decode_payload(MSG_FIND_VALUE, &full[..full.len() - 1]).is_err(),
+            "a half-written position must not decode"
+        );
+        assert!(
+            decode_payload(MSG_FIND_VALUE, &full[..full.len() - 2]).is_err(),
+            "an absent position must not decode as zero"
+        );
     }
 
     #[test]

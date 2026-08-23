@@ -813,9 +813,9 @@ pub struct EmberDiagnostics {
     #[serde(default)]
     pub ember_dht_find_value_misses: u32,
     /// Inbound FIND_VALUE answers that could not carry every matching record
-    /// this node holds, because one datagram fits only about five. Successive
-    /// queries rotate which window is served, so a publisher behind the first
-    /// handful is no longer permanently invisible here.
+    /// this node holds, because one datagram fits only about five. Each such
+    /// answer reports where to resume, so a searcher can page through the rest;
+    /// this counts how often that is needed at all.
     #[serde(default)]
     pub ember_dht_found_value_truncated: u32,
     /// Records left out of those answers. Read against
