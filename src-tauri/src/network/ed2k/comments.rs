@@ -42,6 +42,42 @@ pub struct FileCommentInfo {
 const MAX_COMMENT_FILES: usize = 5000;
 const MAX_COMMENTS_PER_FILE: usize = 100;
 
+/// Ceilings on retained peer-comment text.
+///
+/// Two limits, because they bound different things.
+/// [`crate::security::sanitize_remote_text`] takes a *character* count — which
+/// is the right unit for "how much text will we display" — but the worst-case
+/// memory these tables hold is bytes, and one character can be four of them.
+/// Bounding only characters raised the ceiling on
+/// `MAX_COMMENT_FILES * MAX_COMMENTS_PER_FILE` retained comments fourfold for
+/// any peer sending multi-byte UTF-8. Keeping a generous character limit and a
+/// separate byte ceiling means an ordinary ASCII comment is untouched while the
+/// memory bound is the one the byte-based check used to give.
+const MAX_COMMENT_CHARS: usize = 4096;
+const MAX_COMMENT_BYTES: usize = 4096;
+const MAX_COMMENT_USER_CHARS: usize = 256;
+const MAX_COMMENT_USER_BYTES: usize = 256;
+
+/// Truncate to at most `max_bytes`, never splitting a character.
+fn clamp_to_bytes(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+fn sanitize_comment_field(text: &str, max_chars: usize, max_bytes: usize) -> String {
+    clamp_to_bytes(
+        crate::security::sanitize_remote_text(text, max_chars),
+        max_bytes,
+    )
+}
+
 pub struct CommentManager {
     /// file_hash_hex -> comment info
     comments: HashMap<String, FileCommentInfo>,
@@ -72,9 +108,15 @@ impl CommentManager {
         if !self.comments.contains_key(file_hash) && self.comments.len() >= MAX_COMMENT_FILES {
             return;
         }
-        let user_name = crate::security::sanitize_remote_text(&user_name, 256);
-        let comment = crate::security::sanitize_remote_text(&comment, 4096);
-        if user_name.is_empty() && comment.is_empty() {
+        let user_name =
+            sanitize_comment_field(&user_name, MAX_COMMENT_USER_CHARS, MAX_COMMENT_USER_BYTES);
+        let comment = sanitize_comment_field(&comment, MAX_COMMENT_CHARS, MAX_COMMENT_BYTES);
+        let rating = rating.min(RATING_EXCELLENT);
+        // A rating with no text is a real vote, and a common one — eMule peers
+        // rate far more often than they write. Requiring text discarded those
+        // votes entirely, so they never reached `average_rating` or
+        // `fake_rating_stats`. Bail only when the packet carried nothing at all.
+        if user_name.is_empty() && comment.is_empty() && rating == RATING_NOT_RATED {
             return;
         }
         let entry = self.comments.entry(file_hash.to_string()).or_default();
@@ -83,7 +125,7 @@ impl CommentManager {
             .iter_mut()
             .find(|c| c.user_name == user_name)
         {
-            existing.rating = rating.min(RATING_EXCELLENT);
+            existing.rating = rating;
             existing.comment = comment;
             existing.origin = origin;
             return;
@@ -93,7 +135,7 @@ impl CommentManager {
         }
         entry.peer_comments.push(FileComment {
             user_name,
-            rating: rating.min(RATING_EXCELLENT),
+            rating,
             comment,
             origin,
         });
@@ -221,6 +263,63 @@ mod tests {
         cm.set_our_comment("bb", RATING_FAKE, "nope".into());
         let (fake, total) = cm.fake_rating_stats("bb");
         assert_eq!((fake, total), (1, 1));
+    }
+
+    /// eMule peers rate far more often than they comment, so a rating with no
+    /// text has to count. Requiring text dropped the vote before it reached
+    /// `average_rating` / `fake_rating_stats`.
+    #[test]
+    fn a_rating_with_no_text_still_counts_as_a_vote() {
+        let mut cm = CommentManager::new();
+        cm.add_peer_comment("aa", String::new(), RATING_FAKE, String::new(), 0);
+        let (fake, total) = cm.fake_rating_stats("aa");
+        assert_eq!(
+            (fake, total),
+            (1, 1),
+            "a rating-only comment must register as a fake vote"
+        );
+
+        // Nothing at all is still nothing: no name, no text, no rating.
+        let mut empty = CommentManager::new();
+        empty.add_peer_comment("bb", String::new(), RATING_NOT_RATED, String::new(), 0);
+        assert!(
+            empty.get_comments("bb").is_none(),
+            "an empty packet must not create an entry"
+        );
+    }
+
+    /// The sanitizer's limit is in characters, but what these tables hold is
+    /// bytes, and one character can be four of them.
+    #[test]
+    fn retained_comment_text_is_bounded_in_bytes_not_just_characters() {
+        let mut cm = CommentManager::new();
+        // Four bytes per character, so a character-only bound would let this
+        // through at four times the intended size.
+        let wide = "\u{10348}".repeat(MAX_COMMENT_CHARS);
+        let wide_name = "\u{10348}".repeat(MAX_COMMENT_USER_CHARS);
+        cm.add_peer_comment("aa", wide_name, RATING_GOOD, wide, 0);
+        let c = &cm.get_comments("aa").unwrap().peer_comments[0];
+        assert!(
+            c.comment.len() <= MAX_COMMENT_BYTES,
+            "comment kept {} bytes, over the {MAX_COMMENT_BYTES} ceiling",
+            c.comment.len()
+        );
+        assert!(
+            c.user_name.len() <= MAX_COMMENT_USER_BYTES,
+            "user name kept {} bytes, over the {MAX_COMMENT_USER_BYTES} ceiling",
+            c.user_name.len()
+        );
+        // Truncation must not split a character.
+        assert!(std::str::from_utf8(c.comment.as_bytes()).is_ok());
+
+        // An ordinary ASCII comment is unaffected by the byte ceiling.
+        let plain = "a".repeat(MAX_COMMENT_CHARS);
+        cm.add_peer_comment("cc", "bob".into(), RATING_GOOD, plain, 0);
+        assert_eq!(
+            cm.get_comments("cc").unwrap().peer_comments[0].comment.len(),
+            MAX_COMMENT_CHARS,
+            "a plain-ASCII comment must still keep its full character allowance"
+        );
     }
 
     #[test]
