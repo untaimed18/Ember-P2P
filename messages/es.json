@@ -105,6 +105,8 @@
   "ember_stat_serve_hit_miss": "Aciertos / fallos al servir",
   "ember_stat_serve_truncated": "Respuestas truncadas / registros omitidos",
   "ember_stat_buddy_pub_fwd": "Publicación / reenvío buddy",
+  "ember_stat_buddy_unendorsed": "Buddies sin aval aparcados",
+  "ember_stat_buddy_compat_publish": "Modo compatibilidad del tráiler buddy",
   "ember_stat_callback_sent_fwd_conn": "Callback enviado / reenviado / conectado",
   "ember_stat_malformed": "Tramas malformadas",
   "ember_stat_version_mismatch": "Incompatibilidades de versión",

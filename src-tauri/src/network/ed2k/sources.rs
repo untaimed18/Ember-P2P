@@ -157,6 +157,12 @@ pub struct DownloadSourceEntry {
     /// record. When set, the consume path sends Ember `CALLBACK_REQ` instead
     /// of KAD `CallbackReq`.
     pub callback_ember_buddy_noise: Option<[u8; 32]>,
+    /// DHT node ID of that buddy, derived from the identity key whose
+    /// endorsement the ingest path verified. Carried so a reask can only aim at
+    /// a buddy that really signed for this endpoint: a firewalled source record
+    /// is exempt from the storer's sender-IP bind, so the address by itself is
+    /// only the publisher's claim.
+    pub callback_ember_buddy_id: Option<[u8; 16]>,
     /// Ember node ID of the firewalled publisher (`CALLBACK_REQ` target).
     pub callback_ember_publisher: Option<[u8; 16]>,
     /// Token from the signed Ember source trailer; reask copies it into
@@ -189,6 +195,7 @@ impl DownloadSourceEntry {
             callback_buddy_port: None,
             callback_buddy_hash: None,
             callback_ember_buddy_noise: None,
+            callback_ember_buddy_id: None,
             callback_ember_publisher: None,
             callback_ember_token: None,
             source_user_hash: None,
@@ -248,12 +255,14 @@ impl DownloadSourceEntry {
     }
 
     /// Ember `CALLBACK_REQ` reask: same cadence as KAD, but requires the
-    /// buddy Noise key and publisher node ID from the signed source record.
+    /// buddy Noise key, the buddy node ID, and the publisher node ID from the
+    /// signed source record.
     pub fn ember_callback_reask_due(&self) -> bool {
         matches!(self.state, DownloadSourceState::WaitCallbackKad)
             && !self.callback_route_exhausted()
             && self.callback_buddy_ip.is_some()
             && self.callback_ember_buddy_noise.is_some()
+            && self.callback_ember_buddy_id.is_some()
             && self.callback_ember_publisher.is_some()
             && self.callback_ember_token.is_some()
             && self.last_asked.elapsed().as_secs() >= KAD_CALLBACK_REASK_SECS as u64
@@ -634,6 +643,7 @@ impl PerFileSourceList {
             // and every reask opened a handshake that can never complete —
             // while `WaitCallbackKad` kept the row out of the TCP dial pool.
             s.callback_ember_buddy_noise = None;
+            s.callback_ember_buddy_id = None;
             s.callback_ember_publisher = None;
             s.callback_ember_token = None;
             if source_user_hash.is_some() {
@@ -650,6 +660,7 @@ impl PerFileSourceList {
     /// Record Ember callback buddy metadata from a signed firewalled source
     /// record and transition to `WaitCallbackKad` (same parked-until-connect-back
     /// state the KAD path uses).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_ember_callback_buddy(
         &mut self,
         ip: Ipv4Addr,
@@ -657,6 +668,7 @@ impl PerFileSourceList {
         buddy_ip: Ipv4Addr,
         buddy_port: u16,
         buddy_noise: [u8; 32],
+        buddy_node_id: [u8; 16],
         publisher_id: [u8; 16],
         source_user_hash: Option<[u8; 16]>,
         callback_token: Option<[u8; 16]>,
@@ -668,6 +680,7 @@ impl PerFileSourceList {
             s.callback_buddy_ip = Some(buddy_ip);
             s.callback_buddy_port = Some(buddy_port);
             s.callback_ember_buddy_noise = Some(buddy_noise);
+            s.callback_ember_buddy_id = Some(buddy_node_id).filter(|id| *id != [0u8; 16]);
             s.callback_ember_publisher = Some(publisher_id);
             s.callback_ember_token = callback_token.filter(|t| *t != [0u8; 16]);
             // Mirror of `set_kad_callback_buddy`: the buddy address now
@@ -2625,6 +2638,7 @@ mod tests {
             buddy,
             4672,
             [0xAAu8; 32],
+            [0xB2u8; 16],
             [0xBBu8; 16],
             Some([0xCCu8; 16]),
             Some([0xDDu8; 16]),
@@ -2637,6 +2651,36 @@ mod tests {
         );
         pfs.mark_callback_requested(ip, 4662, None);
         assert!(!pfs.sources[0].ember_callback_reask_due());
+    }
+
+    /// A record published before the trailer carried an endorsement has no
+    /// identity key, so it reaches this row with a zero ID. The reask must not
+    /// fire for it: nothing signed for that endpoint.
+    #[test]
+    fn an_ember_buddy_with_no_node_id_never_reasks() {
+        let hash = [0x49; 16];
+        let ip = Ipv4Addr::new(5, 5, 5, 6);
+        let buddy = Ipv4Addr::new(6, 6, 6, 7);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_ember_callback_buddy(
+            ip,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0u8; 16],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            true,
+        );
+        assert!(pfs.sources[0].callback_ember_buddy_id.is_none());
+        assert!(!pfs.sources[0].ember_callback_reask_due());
+        assert!(
+            !pfs.sources[0].kad_callback_reask_due(),
+            "and it must not fall through to the KAD route either"
+        );
     }
 
     /// A peer that publishes both an Ember firewalled source record and a KAD
@@ -2662,6 +2706,7 @@ mod tests {
             ember_buddy,
             4672,
             [0xAAu8; 32],
+            [0xB2u8; 16],
             [0xBBu8; 16],
             Some(user),
             Some([0xDDu8; 16]),
@@ -2679,6 +2724,7 @@ mod tests {
         assert_eq!(s.callback_buddy_ip, Some(kad_buddy));
         assert!(
             s.callback_ember_buddy_noise.is_none()
+                && s.callback_ember_buddy_id.is_none()
                 && s.callback_ember_publisher.is_none()
                 && s.callback_ember_token.is_none(),
             "Ember identity must not survive next to a KAD buddy address"
@@ -2763,6 +2809,7 @@ mod tests {
             buddy,
             4672,
             [0xAAu8; 32],
+            [0xB2u8; 16],
             [0xBBu8; 16],
             Some([0xCCu8; 16]),
             Some([0xDDu8; 16]),

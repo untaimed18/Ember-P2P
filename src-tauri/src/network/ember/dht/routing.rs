@@ -218,8 +218,27 @@ impl RoutingTable {
                 removed += 1;
             }
         }
-        if removed > 0 {
-            debug!("Ember DHT: purged {removed} stale contact(s)");
+
+        // Sweep the replacement caches on the same rule. Promotion and cache
+        // eviction both now prefer contacts we have heard from, which is only
+        // safe if a verified entry that has since gone silent can leave: a dead
+        // one would otherwise hold a cache slot against fresh leads forever,
+        // and be preferred for promotion when a bucket slot opened.
+        let mut stale_cached = 0usize;
+        for bucket in &mut self.buckets {
+            let before = bucket.replacement_cache.len();
+            bucket.replacement_cache.retain(|c| {
+                !c.is_verified()
+                    || !dht_common::is_stale(now, c.last_seen, max_age_secs)
+                    || in_use.contains(&c.node_id)
+            });
+            stale_cached += before - bucket.replacement_cache.len();
+        }
+
+        if removed > 0 || stale_cached > 0 {
+            debug!(
+                "Ember DHT: purged {removed} stale contact(s) and {stale_cached} stale cache entry(s)"
+            );
         }
         removed
     }
@@ -281,35 +300,7 @@ impl RoutingTable {
                 continue;
             }
             while !self.buckets[idx].is_full() {
-                let scale = self.scale();
-                let max_per_ip = scale.max_contacts_per_ip();
-                let max_subnet_global = scale.max_contacts_per_subnet_global();
-                let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
-                let bucket = &self.buckets[idx];
-                let chosen = (0..bucket.replacement_cache.len()).rev().find(|&i| {
-                    let candidate = &bucket.replacement_cache[i];
-                    if bucket.find(&candidate.node_id).is_some() {
-                        return false;
-                    }
-                    if !self.admits_addr(&candidate.addr) {
-                        return false;
-                    }
-                    let subnet = candidate.subnet_key();
-                    bucket.subnet_count(subnet) < max_subnet_bucket
-                        && self
-                            .global_subnet_count
-                            .get(&subnet)
-                            .copied()
-                            .unwrap_or(0)
-                            < max_subnet_global
-                        && self
-                            .global_ip_count
-                            .get(&candidate.addr.ip())
-                            .copied()
-                            .unwrap_or(0)
-                            < max_per_ip
-                });
-                let Some(i) = chosen else {
+                let Some(i) = self.best_promotable_cached(idx, None) else {
                     break;
                 };
                 let contact = self.buckets[idx].replacement_cache.remove(i).unwrap();
@@ -662,8 +653,71 @@ impl RoutingTable {
         AddResult::Added
     }
 
+    /// The replacement-cache entry `bucket_idx` should promote next, or `None`
+    /// if nothing there is currently eligible.
+    ///
+    /// Preference is verified-first, then newest — the same rule
+    /// [`Self::find_closest_prefer_verified`] applies everywhere else a contact
+    /// is chosen. Promotion used to take the newest eligible entry outright,
+    /// which quietly made this the one selection point in the table that
+    /// treated hearsay as equal to a contact we had actually spoken to. Since
+    /// the cache is filled from `FOUND_NODE` / `PEER_LIST` gossip, and one peer
+    /// can offer twenty contacts per frame, that handed a single gossiping peer
+    /// the backfill for all natural bucket churn.
+    ///
+    /// `exclude` is the contact `evict_and_replace` just removed: `find` no
+    /// longer sees it, and promoting its own cache entry would undo the
+    /// eviction and hand it a clean failure count.
+    fn best_promotable_cached(
+        &self,
+        bucket_idx: usize,
+        exclude: Option<&EmberNodeId>,
+    ) -> Option<usize> {
+        let scale = self.scale();
+        let max_per_ip = scale.max_contacts_per_ip();
+        let max_subnet_global = scale.max_contacts_per_subnet_global();
+        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
+        let bucket = &self.buckets[bucket_idx];
+        let mut lead: Option<usize> = None;
+        // Newest first, so the first hit at either rank is also the freshest.
+        for i in (0..bucket.replacement_cache.len()).rev() {
+            let candidate = &bucket.replacement_cache[i];
+            // Never promote a peer that already holds a slot in this bucket:
+            // that would give one contact two.
+            if Some(&candidate.node_id) == exclude || bucket.find(&candidate.node_id).is_some() {
+                continue;
+            }
+            // A cache entry can be stale: the policy may have tightened, or the
+            // user may have blocked its address, since it was cached.
+            if !self.admits_addr(&candidate.addr) {
+                continue;
+            }
+            let subnet = candidate.subnet_key();
+            let eligible = bucket.subnet_count(subnet) < max_subnet_bucket
+                && self.global_subnet_count.get(&subnet).copied().unwrap_or(0) < max_subnet_global
+                && self
+                    .global_ip_count
+                    .get(&candidate.addr.ip())
+                    .copied()
+                    .unwrap_or(0)
+                    < max_per_ip;
+            if !eligible {
+                continue;
+            }
+            if candidate.is_verified() {
+                return Some(i);
+            }
+            if lead.is_none() {
+                lead = Some(i);
+            }
+        }
+        // No proven contact is promotable, so a lead is still better than
+        // leaving the slot empty — it is how a cold table grows at all.
+        lead
+    }
+
     /// Called when a liveness ping to the oldest contact in a bucket fails.
-    /// Evicts the dead contact and promotes the newest replacement cache entry.
+    /// Evicts the dead contact and promotes the best replacement cache entry.
     pub fn evict_and_replace(&mut self, dead_id: &EmberNodeId) -> bool {
         let bucket_idx = match self.local_id.bucket_index(dead_id) {
             Some(idx) => idx,
@@ -684,47 +738,12 @@ impl RoutingTable {
         self.release_subnet(removed.subnet_key());
         self.release_ip(removed.addr.ip());
 
-        // Promote the newest replacement-cache entry that still satisfies the
-        // diversity limits. Blindly promoting the newest entry (the old
+        // Promote the best replacement-cache entry that still satisfies the
+        // diversity limits. Blindly promoting the newest entry (the original
         // behaviour) let a bucket fill up with contacts from one subnet via the
         // cache, defeating the eclipse-resistance the `add_contact` checks
-        // provide. We scan newest→oldest so the freshest eligible contact wins.
-        let scale = self.scale();
-        let max_per_ip = scale.max_contacts_per_ip();
-        let max_subnet_global = scale.max_contacts_per_subnet_global();
-        let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
-        let bucket = &self.buckets[bucket_idx];
-        let mut chosen: Option<usize> = None;
-        for i in (0..bucket.replacement_cache.len()).rev() {
-            let candidate = &bucket.replacement_cache[i];
-            let cand_subnet = candidate.subnet_key();
-            let cand_ip = candidate.addr.ip();
-            // Never promote a peer that is already resident: that would give
-            // one contact two slots in the same bucket. `dead_id` needs saying
-            // separately because it was removed above, so `find` no longer
-            // sees it — promoting its own entry would undo the eviction that
-            // just happened and hand the contact a clean failure count.
-            if candidate.node_id == *dead_id || bucket.find(&candidate.node_id).is_some() {
-                continue;
-            }
-            // A cache entry can be stale: the policy may have tightened, or
-            // the user may have blocked its address, since it was cached.
-            if !self.admits_addr(&candidate.addr) {
-                continue;
-            }
-            let per_bucket_ok = bucket.subnet_count(cand_subnet) < max_subnet_bucket;
-            let global_ok = self
-                .global_subnet_count
-                .get(&cand_subnet)
-                .copied()
-                .unwrap_or(0)
-                < max_subnet_global;
-            let ip_ok = self.global_ip_count.get(&cand_ip).copied().unwrap_or(0) < max_per_ip;
-            if per_bucket_ok && global_ok && ip_ok {
-                chosen = Some(i);
-                break;
-            }
-        }
+        // provide — and treated gossip as equal to a proven contact.
+        let chosen = self.best_promotable_cached(bucket_idx, Some(dead_id));
 
         match chosen {
             Some(i) => {
@@ -1223,7 +1242,26 @@ impl RoutingTable {
                     bucket.replacement_cache.remove(pos);
                 }
                 None => {
-                    bucket.replacement_cache.pop_front();
+                    // Then the oldest entry we have never heard from. Pure
+                    // oldest-first let gossip recycle the whole cache: one peer
+                    // may offer `MAX_CONTACTS_PER_RESPONSE` contacts per
+                    // `FOUND_NODE`, all of them `last_seen == 0`, so a few
+                    // frames displaced every firsthand observation in the
+                    // bucket and left that peer owning the backfill for all
+                    // natural churn. `remove_stale` sweeps this cache too, so
+                    // preferring proven entries cannot ossify it.
+                    let lead = bucket
+                        .replacement_cache
+                        .iter()
+                        .position(|c| !c.is_verified());
+                    match lead {
+                        Some(pos) => {
+                            bucket.replacement_cache.remove(pos);
+                        }
+                        None => {
+                            bucket.replacement_cache.pop_front();
+                        }
+                    }
                 }
             }
         }
@@ -1418,6 +1456,95 @@ mod tests {
         // The replacement should now be in the table
         assert!(rt.get_contact(&make_id(replacement_id)).is_some());
         assert!(rt.get_contact(&dead_id).is_none());
+    }
+
+    /// Fill one bucket, each contact in its own /24 so subnet diversity is not
+    /// what is under test. Returns the table with `K_BUCKET_SIZE` residents.
+    fn table_with_one_full_bucket() -> RoutingTable {
+        let mut rt = RoutingTable::new(make_id(0), false);
+        for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
+            rt.add_contact(contact_at(i, 80, i, 1, 1));
+        }
+        assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
+        rt
+    }
+
+    /// Promotion was the one selection point in the table that ranked hearsay
+    /// equal to a contact we had spoken to: it took the newest eligible cache
+    /// entry outright. Since the cache is fed from `FOUND_NODE` / `PEER_LIST`,
+    /// and one peer may offer twenty contacts in a frame, that let a single
+    /// gossiping peer supply the backfill for all natural bucket churn.
+    #[test]
+    fn cache_promotion_prefers_contacts_that_have_answered_us() {
+        let mut rt = table_with_one_full_bucket();
+
+        // A proven contact lands in the cache, then gossip arrives on top of it.
+        let proven = contact_at(0xA0, 80, 0xA0, 1, 1);
+        rt.add_contact(proven.clone());
+        for i in 0xB0..0xB5u8 {
+            let mut lead = contact_at(i, 80, i, 1, 1);
+            lead.last_seen = 0;
+            rt.add_contact(lead);
+        }
+
+        assert!(rt.evict_and_replace(&make_id(0x80)));
+        assert!(
+            rt.get_contact(&proven.node_id).is_some(),
+            "the proven cache entry must be promoted over newer gossip"
+        );
+    }
+
+    /// The other half: pure oldest-first cache eviction let gossip recycle the
+    /// whole cache, so the proven entry was gone before a slot ever opened.
+    #[test]
+    fn gossip_cannot_flush_proven_entries_out_of_the_replacement_cache() {
+        let mut rt = table_with_one_full_bucket();
+
+        let proven = contact_at(0xA0, 80, 0xA0, 1, 1);
+        rt.add_contact(proven.clone());
+
+        // Enough gossip to turn the cache over more than once.
+        for i in 0..(K_BUCKET_SIZE as u8 * 2) {
+            let mut lead = contact_at(0xC0 ^ i, 81, i, 1, 1);
+            lead.last_seen = 0;
+            rt.add_contact(lead);
+        }
+
+        assert!(rt.evict_and_replace(&make_id(0x81)));
+        assert!(
+            rt.get_contact(&proven.node_id).is_some(),
+            "a firsthand observation must outlive a gossip flood in the cache"
+        );
+    }
+
+    /// Preferring proven cache entries is only safe if one that has since gone
+    /// silent can leave, or a dead entry would hold a slot against fresh leads
+    /// and win promotion forever. `remove_stale` sweeps the cache for that.
+    #[test]
+    fn the_stale_sweep_reaches_the_replacement_cache() {
+        let mut rt = table_with_one_full_bucket();
+        let mut old = contact_at(0xA0, 80, 0xA0, 1, 1);
+        old.last_seen = 1_000;
+        rt.add_contact(old.clone());
+        let mut lead = contact_at(0xA1, 80, 0xA1, 1, 1);
+        lead.last_seen = 0;
+        rt.add_contact(lead.clone());
+        assert_eq!(rt.cached_len(), 2);
+
+        let removed = rt.remove_stale(1_000_000, 3600, &HashSet::new());
+        assert_eq!(removed, 0, "no resident contact was stale");
+        assert_eq!(
+            rt.cached_len(),
+            1,
+            "the stale proven entry goes; the lead has no timestamp to judge"
+        );
+
+        assert!(rt.evict_and_replace(&make_id(0x80)));
+        assert!(
+            rt.get_contact(&lead.node_id).is_some(),
+            "with the dead entry swept, the lead is promotable again"
+        );
+        assert!(rt.get_contact(&old.node_id).is_none());
     }
 
     fn contact_at(id: u8, a: u8, b: u8, c: u8, d: u8) -> EmberContact {

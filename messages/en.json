@@ -110,6 +110,8 @@
   "ember_stat_serve_hit_miss": "Serve hits / misses",
   "ember_stat_serve_truncated": "Truncated answers / withheld records",
   "ember_stat_buddy_pub_fwd": "Buddy publish / forward",
+  "ember_stat_buddy_unendorsed": "Unendorsed buddies parked",
+  "ember_stat_buddy_compat_publish": "Buddy trailer compatibility mode",
   "ember_stat_callback_sent_fwd_conn": "Callback sent / forwarded / connected",
   "ember_stat_malformed": "Malformed frames",
   "ember_stat_version_mismatch": "Version mismatches",

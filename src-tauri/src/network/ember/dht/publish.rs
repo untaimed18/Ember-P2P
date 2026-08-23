@@ -54,19 +54,75 @@ pub(super) const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
 
 /// Optional callback trailer after the contact block, present on firewalled
 /// source records: publisher eD2K user_hash(16) + buddy ip(4) + buddy
-/// udp_port(2) + buddy noise_pub(32) + callback token(16). HighID records stay
-/// 41 bytes. v2 parsers that ignore trailing bytes still accept the contact;
-/// this build reads the extra 70 when they are there. Not a version bump.
-pub(super) const SOURCE_CALLBACK_TRAILER_LEN: usize = 16 + 4 + 2 + 32 + 16;
+/// udp_port(2) + buddy noise_pub(32) + callback token(16), then the buddy's
+/// endorsement of that endpoint — its ed25519 key(32) + expiry(8) +
+/// signature(64). HighID records stay 41 bytes. v2 parsers that ignore
+/// trailing bytes still accept the contact; this build reads the extra 174
+/// when they are there. Not a version bump.
+pub(super) const SOURCE_CALLBACK_TRAILER_LEN: usize =
+    SOURCE_CALLBACK_TRAILER_V1_LEN + BUDDY_ENDORSEMENT_TRAILER_LEN;
+
+/// The trailer as it shipped before the buddy endorsed its own endpoint:
+/// user_hash(16) + buddy ip(4) + udp(2) + noise_pub(32) + token(16).
+///
+/// Records of this shape are already on the live network, and
+/// `decode_source_contact` infers trailer presence from residual length alone
+/// (deliberately, so a longer trailer is forward-compatible rather than a
+/// version bump). So the endorsement had to go on the *end*: a 70-byte
+/// residual still decodes as "buddy, unendorsed" — which
+/// [`DiscoveredSource::takes_callback`] then refuses to dial, because nothing
+/// but the publisher vouches for the address.
+pub(super) const SOURCE_CALLBACK_TRAILER_V1_LEN: usize = 16 + 4 + 2 + 32 + 16;
+
+/// Endorsement bytes appended to the v1 trailer: the buddy's Ed25519 identity
+/// key, the expiry, and its signature over its own endpoint.
+pub(super) const BUDDY_ENDORSEMENT_TRAILER_LEN: usize = 32 + 8 + 64;
+
+/// Domain separator for the buddy endorsement signature.
+///
+/// Without one, a signature this scheme accepts could be harvested from
+/// another Ember protocol that happens to sign a byte string with the same
+/// shape under the same identity key.
+const BUDDY_ENDORSE_DOMAIN: &[u8] = b"ember-buddy-endorse-v1";
+
+/// The exact bytes a buddy signs to endorse itself as `publisher_id`'s buddy.
+///
+/// Covers the endpoint a searcher will dial (`ip`, `udp_port`, `noise_pub`),
+/// the publisher the endorsement is issued to, and when it lapses. Binding the
+/// publisher is what stops the endorsement being a bearer token any node could
+/// lift out of someone else's record and reuse to name this buddy.
+///
+/// Shared by the signer (`EmberDht::build_buddy_endorse`) and the verifier
+/// ([`SourceBuddy::endorsement_covers`]) so the two cannot drift.
+pub fn buddy_endorsement_signing_bytes(
+    ip: Ipv4Addr,
+    udp_port: u16,
+    noise_pub: &[u8; 32],
+    publisher_id: &[u8; 16],
+    expires_at: i64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(BUDDY_ENDORSE_DOMAIN.len() + 4 + 2 + 32 + 16 + 8);
+    buf.extend_from_slice(BUDDY_ENDORSE_DOMAIN);
+    buf.extend_from_slice(&ip.octets());
+    buf.extend_from_slice(&udp_port.to_le_bytes());
+    buf.extend_from_slice(noise_pub);
+    buf.extend_from_slice(publisher_id);
+    buf.extend_from_slice(&expires_at.to_le_bytes());
+    buf
+}
 
 /// Whether a buddy would survive `decode_source_contact`.
 ///
 /// The decoder discards a trailer whose buddy has port 0 or an unspecified IP
 /// (and with it the `user_hash` and `callback_token` that share the trailer),
-/// so writing one is a 70-byte round-trip loss: `decode(encode(sc)) != sc`, and
-/// re-encoding the parsed contact would give 41 bytes where
-/// `source_contact_encoded_len` promised 111. Both the encoder and the length
+/// so writing one is a 174-byte round-trip loss: `decode(encode(sc)) != sc`,
+/// and re-encoding the parsed contact would give 41 bytes where
+/// `source_contact_encoded_len` promised 215. Both the encoder and the length
 /// helper ask this question so all three agree on when the trailer exists.
+///
+/// The endorsement is deliberately not part of the question: an unendorsed or
+/// forged buddy is one the decoder keeps and the dial gate then rejects, not a
+/// trailer the encoder should silently drop.
 ///
 /// Not reachable from the current publish path — `ember_named_source_buddy`
 /// applies the stricter `SourceBuddy::is_routable` before naming anyone — but
@@ -97,6 +153,9 @@ fn encode_source_contact(data: &mut Vec<u8>, sc: &SourceContact) {
         data.write_u16::<LittleEndian>(buddy.udp_port).unwrap();
         data.extend_from_slice(&buddy.noise_pub);
         data.extend_from_slice(&sc.callback_token.unwrap_or([0u8; 16]));
+        data.extend_from_slice(&buddy.ed25519_pub);
+        data.write_i64::<LittleEndian>(buddy.endorsed_until).unwrap();
+        data.extend_from_slice(&buddy.endorsement);
     }
 }
 
@@ -121,7 +180,10 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
         callback_token: None,
     };
     let rest = off + SOURCE_CONTACT_WIRE_LEN;
-    if data.len() >= rest + SOURCE_CALLBACK_TRAILER_LEN {
+    // Trailer presence is still inferred from residual length, and the
+    // endorsement sits last, so a record published before it existed reads
+    // back as an unendorsed buddy rather than as no buddy at all.
+    if data.len() >= rest + SOURCE_CALLBACK_TRAILER_V1_LEN {
         let mut user_hash = [0u8; 16];
         user_hash.copy_from_slice(&data[rest..rest + 16]);
         let b = rest + 16;
@@ -131,12 +193,24 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
         buddy_noise.copy_from_slice(&data[b + 6..b + 38]);
         let mut token = [0u8; 16];
         token.copy_from_slice(&data[b + 38..b + 54]);
+        let mut ed25519_pub = [0u8; 32];
+        let mut endorsed_until = 0i64;
+        let mut endorsement = [0u8; 64];
+        if data.len() >= rest + SOURCE_CALLBACK_TRAILER_LEN {
+            let e = b + 54;
+            ed25519_pub.copy_from_slice(&data[e..e + 32]);
+            endorsed_until = i64::from_le_bytes(data[e + 32..e + 40].try_into().ok()?);
+            endorsement.copy_from_slice(&data[e + 40..e + 104]);
+        }
         if buddy_udp != 0 && !buddy_ip.is_unspecified() {
             contact.user_hash = (user_hash != [0u8; 16]).then_some(user_hash);
             contact.buddy = Some(SourceBuddy {
                 ip: buddy_ip,
                 udp_port: buddy_udp,
                 noise_pub: buddy_noise,
+                ed25519_pub,
+                endorsed_until,
+                endorsement,
             });
             contact.callback_token = (token != [0u8; 16]).then_some(token);
         }
@@ -165,11 +239,32 @@ pub fn source_key(file_hash: &[u8; 16]) -> [u8; 16] {
 
 /// HighID buddy a firewalled publisher names so a searcher can send
 /// `CALLBACK_REQ` instead of dialling the unverified source address.
+///
+/// Every field except `ip`/`udp_port`/`noise_pub` exists to answer one
+/// question: did the node at this endpoint actually agree to be named here?
+/// `SOURCE_FLAG_FIREWALLED` exempts a source record from the storer's
+/// anti-reflection sender-IP bind, so without an answer a publisher could name
+/// any victim and have every reachable searcher open an unsolicited Noise
+/// handshake to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceBuddy {
     pub ip: Ipv4Addr,
     pub udp_port: u16,
     pub noise_pub: [u8; 32],
+    /// The buddy's Ed25519 identity key. Its `BLAKE3` prefix is the buddy's
+    /// DHT node ID (see [`Self::node_id`]), and it is the key
+    /// [`Self::endorsement`] verifies under.
+    ///
+    /// Zero on a record published before the trailer carried an endorsement.
+    /// Those are never dialled: see [`Self::has_identity`].
+    pub ed25519_pub: [u8; 32],
+    /// Unix seconds after which the endorsement is stale.
+    pub endorsed_until: i64,
+    /// The buddy's own signature over its own endpoint, bound to the
+    /// publishing node. Forging one needs the buddy's private key, which is
+    /// what makes naming a third party impossible rather than merely
+    /// implausible.
+    pub endorsement: [u8; 64],
 }
 
 impl SourceBuddy {
@@ -179,6 +274,50 @@ impl SourceBuddy {
         self.udp_port != 0
             && !self.ip.is_unspecified()
             && !crate::security::is_special_use_v4(self.ip)
+    }
+
+    /// Whether the trailer carried an identity key at all — i.e. whether there
+    /// is an endorsement to check. False for a record published before the
+    /// endorsement existed, which parks rather than dialling.
+    pub fn has_identity(&self) -> bool {
+        self.ed25519_pub != [0u8; 32]
+    }
+
+    /// The buddy's DHT node ID, derived from its identity key exactly as
+    /// every other Ember subsystem derives one. `None` if the key is absent or
+    /// not a valid curve point.
+    pub fn node_id(&self) -> Option<[u8; 16]> {
+        if !self.has_identity() {
+            return None;
+        }
+        crypto::node_id_from_ed25519_bytes(&self.ed25519_pub)
+    }
+
+    /// Whether the buddy really signed this endpoint, for this publisher, and
+    /// the signature has not lapsed.
+    ///
+    /// This is the whole defence. The publisher chose the bytes in the trailer,
+    /// but it cannot produce this signature for an endpoint whose private key
+    /// it does not hold — so either the endpoint belongs to a node that agreed
+    /// to receive `CALLBACK_REQ` there, or the record does not pass here.
+    pub fn endorsement_covers(&self, publisher_id: &[u8; 16], now: i64) -> bool {
+        if !self.is_routable() || !self.has_identity() {
+            return false;
+        }
+        if self.endorsed_until <= now {
+            return false;
+        }
+        let Some(key) = crypto::verifying_key_from_bytes(&self.ed25519_pub) else {
+            return false;
+        };
+        let signed = buddy_endorsement_signing_bytes(
+            self.ip,
+            self.udp_port,
+            &self.noise_pub,
+            publisher_id,
+            self.endorsed_until,
+        );
+        crypto::verify(&key, &signed, &self.endorsement)
     }
 }
 
@@ -247,10 +386,15 @@ pub struct DiscoveredSource {
 impl DiscoveredSource {
     /// Whether a reachable searcher should `CALLBACK_REQ` this source instead
     /// of parking it. A firewalled searcher, a HighID record, a missing
-    /// publisher id, or an unusable buddy all return false — the caller then
-    /// falls back to the firewalled EPX park path rather than dropping the
-    /// source or TCP-dialling the unverified NAT address.
-    pub fn takes_callback(&self, searcher_tcp_firewalled: bool) -> bool {
+    /// publisher id, an unusable buddy, or a buddy that did not endorse the
+    /// endpoint for *this* publisher all return false — the caller then falls
+    /// back to the firewalled EPX park path rather than dropping the source or
+    /// TCP-dialling the unverified NAT address.
+    ///
+    /// This is the complete gate: it needs no routing-table lookup and no
+    /// network round trip, so no caller can reach the dial path having checked
+    /// less than this.
+    pub fn takes_callback(&self, searcher_tcp_firewalled: bool, now: i64) -> bool {
         if searcher_tcp_firewalled {
             return false;
         }
@@ -266,7 +410,8 @@ impl DiscoveredSource {
         if token == [0u8; 16] {
             return false;
         }
-        self.buddy.is_some_and(|b| b.is_routable())
+        self.buddy
+            .is_some_and(|b| b.endorsement_covers(&self.publisher_id, now))
     }
 }
 
@@ -734,11 +879,44 @@ mod tests {
         }
     }
 
+    const BUDDY_IP: Ipv4Addr = Ipv4Addr::new(8, 8, 4, 4);
+    const BUDDY_UDP: u16 = 4672;
+    const BUDDY_NOISE: [u8; 32] = [0xB1; 32];
+    /// `discovered_firewalled` publishes under this identity, so an endorsement
+    /// has to be bound to it.
+    const TEST_PUBLISHER: [u8; 16] = [0xAAu8; 16];
+
+    /// A buddy whose endorsement bytes are structurally present but not a real
+    /// signature. Enough for the wire round-trip and length tests, which do not
+    /// care whether the endorsement verifies; the gate tests use
+    /// [`endorsed_buddy`].
     fn test_buddy() -> SourceBuddy {
         SourceBuddy {
-            ip: Ipv4Addr::new(8, 8, 4, 4),
-            udp_port: 4672,
-            noise_pub: [0xB1; 32],
+            ip: BUDDY_IP,
+            udp_port: BUDDY_UDP,
+            noise_pub: BUDDY_NOISE,
+            ed25519_pub: [0xB2; 32],
+            endorsed_until: 4_000_000_000,
+            endorsement: [0xB3; 64],
+        }
+    }
+
+    /// A buddy that really did sign its own endpoint for `publisher_id`.
+    fn endorsed_buddy(buddy_sk: &SigningKey, publisher_id: &[u8; 16], until: i64) -> SourceBuddy {
+        let signed = buddy_endorsement_signing_bytes(
+            BUDDY_IP,
+            BUDDY_UDP,
+            &BUDDY_NOISE,
+            publisher_id,
+            until,
+        );
+        SourceBuddy {
+            ip: BUDDY_IP,
+            udp_port: BUDDY_UDP,
+            noise_pub: BUDDY_NOISE,
+            ed25519_pub: buddy_sk.verifying_key().to_bytes(),
+            endorsed_until: until,
+            endorsement: crypto::sign(buddy_sk, &signed),
         }
     }
 
@@ -800,6 +978,62 @@ mod tests {
         let from_blob = SignedRecord::from_value_blob(&blob).unwrap();
         assert_eq!(from_blob.source_contact, Some(contact));
         assert!(SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    /// The trailer grew a 16-byte buddy node ID on the end, and trailer
+    /// presence is inferred from residual length. Records signed before that
+    /// are on the live network and cannot be re-signed, so the shorter form
+    /// must still decode as a buddy — just one with no identity to
+    /// verify, which the dial gate then refuses.
+    #[test]
+    fn a_trailer_from_before_the_endorsement_still_decodes_as_a_buddy() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let contact = SourceContact {
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            user_hash: Some([0xCCu8; 16]),
+            buddy: Some(test_buddy()),
+            callback_token: Some([0xDDu8; 16]),
+            ..test_contact()
+        };
+        assert_eq!(
+            (SOURCE_CALLBACK_TRAILER_V1_LEN, SOURCE_CALLBACK_TRAILER_LEN),
+            (70, 174),
+            "records already on the network carry the 70-byte prefix; it cannot move"
+        );
+        let record = SignedRecord::source([0xAA; 16], [0xBB; 32], 9, "old.mp3", contact, &sk);
+        // Drop the endorsement, exactly as a v1 publisher would never have
+        // written it. The signature no longer covers the body, so decode
+        // directly.
+        let legacy = &record.data[..record.data.len() - BUDDY_ENDORSEMENT_TRAILER_LEN];
+        assert_eq!(
+            legacy.len(),
+            115 + "old.mp3".len() + SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_V1_LEN
+        );
+        let parsed = decode_source_contact(legacy, 115 + "old.mp3".len()).expect("v1 trailer");
+        let buddy = parsed.buddy.expect("v1 trailer still names a buddy");
+        assert_eq!(buddy.ip, BUDDY_IP);
+        assert_eq!(buddy.udp_port, BUDDY_UDP);
+        assert_eq!(buddy.noise_pub, BUDDY_NOISE);
+        assert_eq!(parsed.user_hash, Some([0xCCu8; 16]));
+        assert_eq!(parsed.callback_token, Some([0xDDu8; 16]));
+        assert!(
+            !buddy.has_identity() && buddy.node_id().is_none(),
+            "a v1 buddy carries no key, so there is no endorsement to check"
+        );
+        assert!(
+            !DiscoveredSource {
+                ip: parsed.ip,
+                tcp_port: parsed.tcp_port,
+                udp_port: parsed.udp_port,
+                flags: parsed.flags,
+                user_hash: parsed.user_hash,
+                buddy: parsed.buddy,
+                callback_token: parsed.callback_token,
+                publisher_id: TEST_PUBLISHER,
+            }
+            .takes_callback(false, 1_000),
+            "and so must park rather than be dialled"
+        );
     }
 
     #[test]
@@ -985,33 +1219,42 @@ mod tests {
         assert!(test_buddy().is_routable());
         assert!(!SourceBuddy {
             ip: Ipv4Addr::new(10, 0, 0, 1),
-            udp_port: 4672,
-            noise_pub: [0xB1; 32],
+            ..test_buddy()
         }
         .is_routable());
         assert!(!SourceBuddy {
-            ip: Ipv4Addr::new(8, 8, 4, 4),
             udp_port: 0,
-            noise_pub: [0xB1; 32],
+            ..test_buddy()
         }
         .is_routable());
         assert!(
             !SourceBuddy {
                 ip: Ipv4Addr::new(203, 0, 113, 10),
-                udp_port: 4672,
-                noise_pub: [0xB1; 32],
+                ..test_buddy()
             }
             .is_routable(),
             "TEST-NET documentation addresses are not callback destinations"
+        );
+        assert!(
+            test_buddy().has_identity()
+                && !SourceBuddy {
+                    ed25519_pub: [0u8; 32],
+                    ..test_buddy()
+                }
+                .has_identity(),
+            "identity is the key, independent of whether the address routes"
         );
     }
 
     #[test]
     fn takes_callback_requires_a_reachable_searcher_and_a_usable_buddy() {
-        let src = discovered_firewalled(Some(test_buddy()));
-        assert!(src.takes_callback(false));
+        let buddy_sk = SigningKey::generate(&mut OsRng);
+        let now = 1_000_000i64;
+        let buddy = endorsed_buddy(&buddy_sk, &TEST_PUBLISHER, now + 3600);
+        let src = discovered_firewalled(Some(buddy));
+        assert!(src.takes_callback(false, now));
         assert!(
-            !src.takes_callback(true),
+            !src.takes_callback(true, now),
             "a firewalled searcher must park, not CALLBACK_REQ"
         );
 
@@ -1019,31 +1262,110 @@ mod tests {
             flags: 0,
             ..src
         };
-        assert!(!highid.takes_callback(false));
+        assert!(!highid.takes_callback(false, now));
 
+        // A different publisher cannot ride this endorsement, and with a zero
+        // publisher id there is nothing for one to be bound to.
         let no_id = DiscoveredSource {
             publisher_id: [0u8; 16],
             ..src
         };
-        assert!(!no_id.takes_callback(false));
+        assert!(!no_id.takes_callback(false, now));
+        let other_publisher = DiscoveredSource {
+            publisher_id: [0x77u8; 16],
+            ..src
+        };
+        assert!(
+            !other_publisher.takes_callback(false, now),
+            "an endorsement lifted from another publisher's record must not verify"
+        );
 
         let lan_buddy = discovered_firewalled(Some(SourceBuddy {
             ip: Ipv4Addr::new(192, 168, 1, 1),
-            udp_port: 4672,
-            noise_pub: [0xB1; 32],
+            ..buddy
         }));
         assert!(
-            !lan_buddy.takes_callback(false),
+            !lan_buddy.takes_callback(false, now),
             "unusable buddy must not take the callback path (park instead)"
         );
 
+        let unendorsed = discovered_firewalled(Some(SourceBuddy {
+            ed25519_pub: [0u8; 32],
+            ..buddy
+        }));
+        assert!(
+            !unendorsed.takes_callback(false, now),
+            "a buddy with no identity key has no endorsement to check, so park"
+        );
+
         let no_buddy = discovered_firewalled(None);
-        assert!(!no_buddy.takes_callback(false));
+        assert!(!no_buddy.takes_callback(false, now));
 
         let no_token = DiscoveredSource {
             callback_token: None,
             ..src
         };
-        assert!(!no_token.takes_callback(false));
+        assert!(!no_token.takes_callback(false, now));
+
+        assert!(
+            !src.takes_callback(false, buddy.endorsed_until),
+            "an endorsement is not valid at the instant it lapses"
+        );
+        assert!(!src.takes_callback(false, buddy.endorsed_until + 1));
+    }
+
+    /// The attack this whole mechanism exists to stop: a validly-signed
+    /// firewalled source record for a popular file naming a victim's address as
+    /// the buddy, so every reachable searcher opens an unsolicited Noise
+    /// handshake to it. The publisher chooses the trailer bytes freely, but it
+    /// cannot produce the victim's signature over them.
+    #[test]
+    fn a_buddy_endpoint_its_owner_did_not_sign_is_never_dialled() {
+        let buddy_sk = SigningKey::generate(&mut OsRng);
+        let now = 1_000_000i64;
+        let honest = endorsed_buddy(&buddy_sk, &TEST_PUBLISHER, now + 3600);
+        assert!(discovered_firewalled(Some(honest)).takes_callback(false, now));
+
+        let victim_ip = Ipv4Addr::new(9, 9, 9, 9);
+        // Repoint the endpoint, keeping the real key and a real signature.
+        for aimed in [
+            SourceBuddy { ip: victim_ip, ..honest },
+            SourceBuddy { udp_port: 53, ..honest },
+            SourceBuddy {
+                noise_pub: [0xC1; 32],
+                ..honest
+            },
+        ] {
+            assert!(
+                !discovered_firewalled(Some(aimed)).takes_callback(false, now),
+                "moving any signed field must invalidate the endorsement"
+            );
+        }
+
+        // Substituting a key the attacker *does* hold changes the node ID the
+        // trailer names, so it is no longer the victim being named at all.
+        let attacker_sk = SigningKey::generate(&mut OsRng);
+        let self_signed = SourceBuddy {
+            ip: victim_ip,
+            ..endorsed_buddy(&attacker_sk, &TEST_PUBLISHER, now + 3600)
+        };
+        assert!(
+            !discovered_firewalled(Some(self_signed)).takes_callback(false, now),
+            "the attacker can only sign for the endpoint it actually signed"
+        );
+
+        // And the domain separator means a signature over the same fields
+        // without it does not transfer.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&BUDDY_IP.octets());
+        raw.extend_from_slice(&BUDDY_UDP.to_le_bytes());
+        raw.extend_from_slice(&BUDDY_NOISE);
+        raw.extend_from_slice(&TEST_PUBLISHER);
+        raw.extend_from_slice(&(now + 3600).to_le_bytes());
+        let undomained = SourceBuddy {
+            endorsement: crypto::sign(&buddy_sk, &raw),
+            ..honest
+        };
+        assert!(!discovered_firewalled(Some(undomained)).takes_callback(false, now));
     }
 }

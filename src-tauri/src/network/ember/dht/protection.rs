@@ -11,8 +11,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use super::messages::{
-    MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE, MSG_STORE_BATCH,
-    MSG_STORE_RECORD,
+    MSG_BUDDY_ENDORSE_REQ, MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE,
+    MSG_STORE_BATCH, MSG_STORE_RECORD,
 };
 
 /// Sliding window for per-IP message counts.
@@ -53,6 +53,21 @@ const MAX_LOOKUPS_PER_WINDOW: u32 = 60;
 /// roughly double per minute sustained, for the half-window reason in
 /// [`MAX_LOOKUPS_PER_WINDOW`].
 const STORE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many full per-node STORE budgets one address may spend in total.
+///
+/// The per-node budget is keyed on a node ID, which costs an attacker a keypair,
+/// so without an address ceiling identity rotation buys an unbounded store rate
+/// from a single host. This is what makes the split defensible rather than a
+/// hole: peers behind one NAT still get their own allowances, up to eight of
+/// them publishing flat out.
+///
+/// Eight, not two or three, because the honest case this protects is a NAT or a
+/// seedbox host running several instances, each republishing its own library on
+/// the same two-hour cadence — and refusing an honest publisher's STOREs is
+/// worse than admitting a slow flood, which the operator can see and filter.
+const MAX_STORE_IDENTITIES_PER_ADDR: u32 = 8;
+
 const MAX_IP_ENTRIES: usize = 10_000;
 
 /// A two-bucket approximation of a sliding window.
@@ -243,11 +258,51 @@ impl DhtProtection {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
             }
+
+            // Then an aggregate ceiling on the *address*, because the budget
+            // above is keyed on a node ID and a node ID is a free keypair.
+            //
+            // Rotating identities bought a fresh per-node budget each time, and
+            // `STORE_BATCH` charges per record while the per-IP frame cap above
+            // charges per frame — so one host could place records at
+            // `MAX_MSGS_PER_WINDOW * MAX_STORE_BATCH_RECORDS` per second and
+            // fill a 50,000-key store in well under a minute. That is the
+            // supply side of the store's per-publisher share problem: the share
+            // is keyed on a keypair too, so a Sybil spending one identity per
+            // record is never "over share" and eviction falls back to pure XOR
+            // distance from our node ID, which an attacker can grind toward.
+            //
+            // This does not solve that — bounding it properly still needs
+            // something scarcer than a keypair — but it prices it, turning
+            // "under a minute from one host" into a sustained flood that a rate
+            // graph and an IP filter can act on.
+            if sender_id.is_some() {
+                let addr_key = StoreBudgetKey::Addr(ip);
+                if self.store_counters.len() >= MAX_IP_ENTRIES
+                    && !self.store_counters.contains_key(&addr_key)
+                {
+                    self.dropped_rate = self.dropped_rate.saturating_add(1);
+                    return false;
+                }
+                let addr_ok = self.store_counters.entry(addr_key).or_default().allow_n(
+                    now,
+                    STORE_WINDOW,
+                    self.max_stores
+                        .saturating_mul(MAX_STORE_IDENTITIES_PER_ADDR),
+                    store_records.max(1),
+                );
+                if !addr_ok {
+                    self.dropped_rate = self.dropped_rate.saturating_add(1);
+                    return false;
+                }
+            }
         }
 
+        // `BUDDY_ENDORSE_REQ` shares this budget because answering one costs a
+        // signature, the same order of work as serving a lookup.
         if matches!(
             msg_type,
-            MSG_FIND_NODE | MSG_FIND_VALUE | MSG_CALLBACK_REQ
+            MSG_FIND_NODE | MSG_FIND_VALUE | MSG_CALLBACK_REQ | MSG_BUDDY_ENDORSE_REQ
         ) {
             let budget_key = match sender_id {
                 Some(id) => StoreBudgetKey::Node(id),
@@ -416,6 +471,41 @@ mod tests {
             p.allow_message(ip, MSG_STORE_RECORD, Some([2u8; 16]), 1),
             "a different identity at the same address keeps its own budget"
         );
+    }
+
+    /// The per-node STORE budget is keyed on a node ID, and a node ID costs a
+    /// keypair. Without an address ceiling, rotating identities bought a fresh
+    /// budget per identity — and since a batch charges per record while the
+    /// per-IP frame cap charges per frame, one host could fill a 50,000-key
+    /// store in under a minute.
+    #[test]
+    fn rotating_node_ids_cannot_buy_unlimited_store_budget_from_one_address() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(50);
+        let ip = IpAddr::V4(Ipv4Addr::new(6, 6, 6, 6));
+
+        // Eight identities may each spend a full per-node budget.
+        for id in 0..MAX_STORE_IDENTITIES_PER_ADDR as u8 {
+            assert!(
+                p.allow_message(ip, MSG_STORE_BATCH, Some([id; 16]), 50),
+                "identity {id} is within the address ceiling"
+            );
+        }
+        // The ninth has an untouched per-node budget and is refused anyway.
+        assert!(
+            !p.allow_message(ip, MSG_STORE_BATCH, Some([0xFF; 16]), 1),
+            "a fresh identity must not reset the address's aggregate budget"
+        );
+        // A different host is unaffected: the ceiling is per address. It needs a
+        // fresh identity to show that, because the per-node budget is keyed on
+        // the node ID and follows it across addresses — and the refused frame
+        // above already charged `0xFF`'s node budget before the address check.
+        assert!(p.allow_message(
+            IpAddr::V4(Ipv4Addr::new(6, 6, 6, 7)),
+            MSG_STORE_BATCH,
+            Some([0xFE; 16]),
+            50
+        ));
     }
 
     /// A batch does N records' worth of signature verification for one frame,

@@ -105,6 +105,8 @@
   "ember_stat_serve_hit_miss": "Bedientreffer / Fehltreffer",
   "ember_stat_serve_truncated": "Gekürzte Antworten / ausgelassene Einträge",
   "ember_stat_buddy_pub_fwd": "Buddy-Veröffentlichung / -Weiterleitung",
+  "ember_stat_buddy_unendorsed": "Nicht bestätigte Buddys geparkt",
+  "ember_stat_buddy_compat_publish": "Buddy-Trailer-Kompatibilitätsmodus",
   "ember_stat_callback_sent_fwd_conn": "Callback gesendet / weitergeleitet / verbunden",
   "ember_stat_malformed": "Fehlerhafte Frames",
   "ember_stat_version_mismatch": "Versionskonflikte",
