@@ -2406,11 +2406,18 @@
   {:else}
     <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked}>{m.search_title()}</button>
   {/if}
+  <div class="search-syntax">
+    {#if searchMethod !== 'ember'}
+      <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
+    {/if}
+    {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
+      <p class="search-syntax-ember" role="note">
+        <span class="search-syntax-ember-tag">{m.search_origin_ember()}</span>
+        <span>{m.search_query_syntax_hint_ember()}</span>
+      </p>
+    {/if}
+  </div>
 </div>
-<p class="search-syntax-hint">{m.search_query_syntax_hint()}</p>
-{#if searchMethod === 'ember' || searchMethod === 'global'}
-  <p class="search-syntax-hint">{m.search_query_syntax_hint_ember()}</p>
-{/if}
 
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
@@ -3214,6 +3221,7 @@
     align-items: stretch;
     background: var(--bg-secondary);
     flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
   }
 
   .search-area :global(.search-bar-wrap) {
@@ -3579,13 +3587,46 @@
     padding: 0 4px;
   }
 
-  .search-syntax-hint {
+  .search-syntax {
+    flex: 1 1 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .search-syntax-ed2k {
     margin: 0;
-    padding: 0 20px 12px;
-    font-size: 11px;
-    color: var(--text-muted);
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .search-syntax-ember {
+    margin: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--ember-color) 8%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--ember-color) 22%, var(--border));
+    border-radius: var(--radius-md);
+  }
+
+  .search-syntax-ember-tag {
+    flex-shrink: 0;
+    margin-top: 1px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ember-color);
+    padding: 1px 7px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--ember-color) 14%, transparent);
   }
 
   .results-info {
