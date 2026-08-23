@@ -130,6 +130,10 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             name: if name.is_empty() { None } else { Some(name) },
             size: None,
             hash: Some(hex::encode(invite.channel_id)),
+            // A channel invite carries no file, so there is no `eh=` digest to
+            // show. This branch only exists on this line of development, which
+            // is why adding the field to the other previews did not cover it.
+            ember: None,
             endpoint: None,
             host: None,
         });
