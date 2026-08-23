@@ -271,11 +271,19 @@
       ? m.ember_health_sharing_published_count({ count: publishedCount })
       : m.ember_health_sharing_waiting(),
   );
-  let sharingTone: PillTone = $derived(sharingPublished ? 'ok' : 'muted');
+  // A green "Published" next to "Connecting…" is a contradiction: the count
+  // is restored from the last successful STORE (still inside TTL) even
+  // while this session has nobody who has answered. Warn until a live peer
+  // exists so the badge is not read as "you are on the network".
+  let sharingTone: PillTone = $derived(
+    !sharingPublished ? 'muted' : isConnected ? 'ok' : 'warn',
+  );
   let sharingHint = $derived(
-    sharingPublished
-      ? m.ember_health_sharing_published_hint()
-      : m.ember_health_sharing_waiting_hint(),
+    !sharingPublished
+      ? m.ember_health_sharing_waiting_hint()
+      : isConnected
+        ? m.ember_health_sharing_published_hint()
+        : m.ember_health_sharing_published_rejoining_hint(),
   );
 
   // The estimate is a density measurement, so it is shown as approximate and
@@ -441,7 +449,7 @@
 
   {#if isActive}
     <section class="stat-grid" aria-label={m.ember_health_title()}>
-      <div class="stat">
+      <div class="stat" title={peerCount > verifiedCount ? m.ember_overview_peers_of_hint({ verified: verifiedCount, total: peerCount }) : undefined}>
         <div class="stat-value">
           {#if peerCount > verifiedCount}
             {m.ember_overview_peers_of({ verified: verifiedCount, total: peerCount })}
@@ -480,9 +488,11 @@
       </div>
 
       <div class="check-row">
-        <div class="check-indicator" class:ok={sharingTone === 'ok'} class:muted={sharingTone === 'muted'} aria-hidden="true">
+        <div class="check-indicator" class:ok={sharingTone === 'ok'} class:warn={sharingTone === 'warn'} class:muted={sharingTone === 'muted'} aria-hidden="true">
           {#if sharingTone === 'ok'}
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
+          {:else if sharingTone === 'warn'}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3l6 10H2L8 3z" /><path d="M8 7v3M8 11.5h.01" /></svg>
           {:else}
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M5.5 8h5" /></svg>
           {/if}
@@ -490,7 +500,7 @@
         <div class="check-body">
           <div class="check-head">
             <span class="check-label">{m.ember_health_sharing()}</span>
-            <span class="pill" class:ok={sharingTone === 'ok'} class:muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+            <span class="pill" class:ok={sharingTone === 'ok'} class:warn={sharingTone === 'warn'} class:muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
           </div>
           <p class="hint">{sharingHint}</p>
         </div>
