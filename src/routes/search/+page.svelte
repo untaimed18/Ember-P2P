@@ -497,6 +497,7 @@
   };
   let columnVis = $state<Record<MediaColumn, boolean>>({ ...DEFAULT_COLUMN_VIS });
   let showColumnMenu = $state(false);
+  let syntaxHelpEl: HTMLDetailsElement | null = $state(null);
 
   function toggleColumn(key: MediaColumn) {
     // Reassign (rather than mutate in place) so the persistence $effect, which
@@ -836,19 +837,23 @@
     }
   }
 
-  function originLabel(origin: string): string {
-    if (!origin.trim()) return '';
+  function originTokens(origin: string): { token: string; label: string; kind: string }[] {
+    if (!origin.trim()) return [];
     return origin.split(' · ').map((token) => {
       switch (token) {
-        case 'Local': return m.search_origin_local();
-        case 'KAD': return m.search_origin_kad();
-        case 'Server': return m.search_origin_server();
-        case 'UDP': return m.search_origin_udp();
-        case 'Notes': return m.search_origin_notes();
-        case 'Ember': return m.search_origin_ember();
-        default: return token;
+        case 'Local': return { token, label: m.search_origin_local(), kind: 'local' };
+        case 'KAD': return { token, label: m.search_origin_kad(), kind: 'kad' };
+        case 'Server': return { token, label: m.search_origin_server(), kind: 'ed2k' };
+        case 'UDP': return { token, label: m.search_origin_udp(), kind: 'ed2k' };
+        case 'Notes': return { token, label: m.search_origin_notes(), kind: 'notes' };
+        case 'Ember': return { token, label: m.search_origin_ember(), kind: 'ember' };
+        default: return { token, label: token, kind: 'other' };
       }
-    }).join(' · ');
+    });
+  }
+
+  function originLabel(origin: string): string {
+    return originTokens(origin).map((t) => t.label).join(' · ');
   }
 
   function searchPhaseLabel(phase: string): string | null {
@@ -900,7 +905,7 @@
   }
 
   $effect(() => {
-    // Re-arm joining UX when Ember is toggled on (mirrors /ember).
+    // Re-arm joining UX when Ember becomes usable (mirrors /ember).
     void emberEnabled;
     void emberContacts;
     void emberDiagnosticsStale;
@@ -2336,8 +2341,20 @@
 
 </script>
 
-<svelte:document onkeydown={(e) => {
+<svelte:document
+  onpointerdown={(e) => {
+    if (!syntaxHelpEl || !syntaxHelpEl.open) return;
+    if (e.target instanceof Node && syntaxHelpEl.contains(e.target)) return;
+    syntaxHelpEl.open = false;
+  }}
+  onkeydown={(e) => {
   if (e.key === 'Escape') {
+    if (syntaxHelpEl?.open) {
+      syntaxHelpEl.open = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (showColumnMenu) {
       showColumnMenu = false;
       e.preventDefault();
@@ -2405,6 +2422,20 @@
       <option value={ft.value}>{ft.label}</option>
     {/each}
   </select>
+  <details class="syntax-help" bind:this={syntaxHelpEl}>
+    <summary title={m.search_syntax_help()} aria-label={m.search_syntax_help()}>?</summary>
+    <div class="syntax-popover" role="note">
+      {#if searchMethod !== 'ember'}
+        <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
+      {/if}
+      {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
+        <p class="search-syntax-ember">
+          <span class="search-syntax-ember-tag">{m.search_origin_ember()}</span>
+          <span>{m.search_query_syntax_hint_ember()}</span>
+        </p>
+      {/if}
+    </div>
+  </details>
   {#if activeTab?.isSearching}
     <button class="stop-btn" type="button" onclick={() => stopSearch()}>
       <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
@@ -2415,17 +2446,6 @@
   {:else}
     <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked}>{m.search_title()}</button>
   {/if}
-  <div class="search-syntax">
-    {#if searchMethod !== 'ember'}
-      <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
-    {/if}
-    {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
-      <p class="search-syntax-ember" role="note">
-        <span class="search-syntax-ember-tag">{m.search_origin_ember()}</span>
-        <span>{m.search_query_syntax_hint_ember()}</span>
-      </p>
-    {/if}
-  </div>
 </div>
 
 {#if $searchTabs.length > 0}
@@ -2864,6 +2884,7 @@
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
           {@const blockingDl = getBlockingDownloadTransfer(result)}
+          {@const originChips = originTokens(result.result_origin || '')}
           {@const originText = originLabel(result.result_origin || '')}
           {@const spamExplain = spamExplainFor(result)}
           <tr
@@ -2930,7 +2951,17 @@
             </td>
             <td class="col-size">{formatSize(result.file.size)}</td>
             <td class="col-type">{resultTypeLabel(result) || result.file.extension || '\u2014'}</td>
-            <td class="col-origin" title={originText}>{originText || '\u2014'}</td>
+            <td class="col-origin" title={originText}>
+              {#if originChips.length > 0}
+                <span class="origin-chips">
+                  {#each originChips as chip (chip.token)}
+                    <span class="origin-chip {chip.kind}">{chip.label}</span>
+                  {/each}
+                </span>
+              {:else}
+                {'\u2014'}
+              {/if}
+            </td>
             <td class="col-sources">
               <span class="source-count" class:high-sources={result.availability >= 10}>
                 {result.availability}
@@ -3596,12 +3627,58 @@
     padding: 0 4px;
   }
 
-  .search-syntax {
-    flex: 1 1 100%;
+  .syntax-help {
+    position: relative;
+    flex-shrink: 0;
+    align-self: stretch;
+  }
+
+  .syntax-help summary {
+    list-style: none;
+    width: 32px;
+    height: 100%;
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    cursor: pointer;
+  }
+
+  .syntax-help summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .syntax-help summary:hover,
+  .syntax-help[open] summary {
+    color: var(--text-primary);
+    border-color: var(--accent);
+  }
+
+  .syntax-help summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .syntax-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    width: min(420px, calc(100vw - 48px));
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    min-width: 0;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
   }
 
   .search-syntax-ed2k {
@@ -3817,10 +3894,50 @@
 
   .col-origin {
     width: 12%;
-    max-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
     font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .origin-chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    vertical-align: middle;
+  }
+
+  .origin-chip {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 0 5px;
+    border-radius: var(--radius-pill);
+    line-height: 16px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+
+  .origin-chip.kad {
+    background: color-mix(in srgb, var(--kad-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--kad-color) 30%, transparent);
+    color: var(--kad-color);
+  }
+
+  .origin-chip.ember {
+    background: color-mix(in srgb, var(--ember-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ember-color) 30%, transparent);
+    color: var(--ember-color);
+  }
+
+  .origin-chip.ed2k {
+    background: color-mix(in srgb, var(--ed2k-color) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ed2k-color) 30%, transparent);
+    color: var(--ed2k-color);
+  }
+
+  .origin-chip.local,
+  .origin-chip.notes,
+  .origin-chip.other {
+    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 28%, transparent);
     color: var(--text-secondary);
   }
 

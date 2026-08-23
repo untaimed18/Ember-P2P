@@ -257,7 +257,7 @@ export interface NetworkStats {
   public_udp_port?: number;
   public_tcp_port?: number;
   tcp_mapping_hold_ok?: boolean;
-  /** Ember-native Noise DHT enabled — drives the status-bar EmberDHT dot. */
+  /** Ember-native Noise overlay enabled — drives the status-bar Ember dot. */
   ember_native_enabled: boolean;
   /** Live Ember DHT routing-table contacts for the status-bar peer count. */
   ember_dht_contacts: number;
@@ -757,8 +757,8 @@ export interface AppSettings {
   /** Join the Ember-native Noise-encrypted overlay (UDP transport + DHT).
    *  Always on: the DHT bootstraps from other clients rather than a
    *  central pool, so it only works when ordinary profiles take part.
-   *  The Settings / Ember-page switches are shown but cannot turn this off —
-   *  which is enforced by `BACKEND_OWNED_SETTINGS_FIELDS`
+   *  Settings and the Ember page show status only; they cannot turn this off.
+   *  Enforced by `BACKEND_OWNED_SETTINGS_FIELDS`
    *  (`src-tauri/src/commands/settings.rs`) restoring it on every save. */
   readonly ember_native_enabled: boolean;
   /** Whether this node carries relay traffic for other peers. Relaying is what

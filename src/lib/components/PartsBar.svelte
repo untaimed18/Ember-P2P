@@ -106,10 +106,13 @@
 
   let background = $derived(separator ? `${separator}, ${gradient}` : gradient);
 
-  // Overlay matches the green segments (whole parts served this session),
-  // not unique-byte coverage and never session wire bytes. Unique bytes
-  // count partial parts the bar does not light; wire bytes reach file size
-  // while the bar is still half empty.
+  // aria-valuenow matches the green segments (whole parts served this
+  // session), not unique-byte coverage and never session wire bytes.
+  // Unique bytes count partial parts the bar does not light; wire bytes
+  // reach file size while the bar is still half empty. No on-bar percent
+  // overlay: that figure is not session completion, and the digits sat
+  // on top of the part map the cell is there to show. The tooltip and
+  // sr-only label already carry the served/total counts.
   let rawPct = $derived(
     count > 0
       ? (servedCount / count) * 100
@@ -130,7 +133,6 @@
   {title}
 >
   <div class="parts-fill" style="background: {background};"></div>
-  <span class="parts-text">{pct.toFixed(1)}%</span>
   <span class="sr-only"
     >{m.transfers_parts({ have: servedCount, total: count })}{peerOnlyCount > 0
       ? `, ${m.transfers_parts_peer({ peer: peerOnlyCount })}`
@@ -153,23 +155,6 @@
     position: absolute;
     inset: 0;
     transition: background 0.3s ease;
-  }
-
-  .parts-text {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-primary);
-    pointer-events: none;
-    /* Halo so the readout stays legible over both filled and empty
-       segments without the two-layer clip trick a single-colour bar uses. */
-    text-shadow:
-      0 0 2px var(--bg-input),
-      0 0 3px var(--bg-input);
   }
 
   .sr-only {

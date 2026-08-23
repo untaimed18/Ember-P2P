@@ -2179,26 +2179,12 @@
             <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
           </div>
 
-          <div class="field ember-lock-field">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <span class="toggle-title">{m.settings_ember_native_label()} <span class="badge-experimental">{m.ember_experimental()}</span></span>
-                <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
-              </div>
-              <ToggleSwitch checked={true} disabled ariaLabel={m.settings_ember_native_label()} />
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_ember_native_label()}</span>
+              <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
             </div>
-            <div class="ember-lock-notice" role="status">
-              <span class="ember-lock-icon" aria-hidden="true">
-                <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="4" y="9" width="12" height="8" rx="1.6"/>
-                  <path d="M7 9V6.6a3 3 0 0 1 6 0V9"/>
-                </svg>
-              </span>
-              <div class="ember-lock-text">
-                <strong>{m.ember_beta_lock_title()}</strong>
-                {m.ember_beta_lock_body()}
-              </div>
-            </div>
+            <span class="ember-on-badge">{m.settings_ember_status_on()}</span>
           </div>
 
           <div class="divider"></div>
@@ -3095,7 +3081,7 @@
     margin-bottom: 0;
   }
 
-  .field:not(.toggle-row):not(.ember-lock-field) {
+  .field:not(.toggle-row) {
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -3153,20 +3139,6 @@
     line-height: 1.5;
   }
 
-  .badge-experimental {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    vertical-align: middle;
-    line-height: 1.5;
-  }
-
   /* ── Toggle row ────────────────────────────────── */
   .toggle-row {
     display: flex;
@@ -3197,47 +3169,12 @@
     margin-top: 0;
   }
 
-  .ember-lock-field {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .ember-lock-notice {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 10px 12px;
-    background: color-mix(in srgb, var(--ember-color, var(--accent)) 8%, var(--bg-secondary));
-    border: 1px solid color-mix(in srgb, var(--ember-color, var(--accent)) 22%, var(--border));
-    border-radius: var(--radius-md);
-  }
-
-  .ember-lock-icon {
-    width: 26px;
-    height: 26px;
-    border-radius: var(--radius-sm);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+  .ember-on-badge {
     flex-shrink: 0;
-    color: var(--ember-color, var(--accent));
-    background: color-mix(in srgb, var(--ember-color, var(--accent)) 14%, transparent);
-  }
-
-  .ember-lock-text {
-    min-width: 0;
-    font-size: 12px;
-    line-height: 1.45;
-    color: var(--text-muted);
-  }
-
-  .ember-lock-text strong {
-    display: block;
     font-size: 12px;
     font-weight: 600;
-    color: var(--text-primary);
-    margin-bottom: 1px;
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   .nested {
