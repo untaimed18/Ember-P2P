@@ -227,7 +227,20 @@ struct ChannelFileAssembly {
     buf: Vec<u8>,
     got: Vec<u8>,
     received: usize,
+    /// Last percentage reported to the UI, in `CHANNEL_FILE_PROGRESS_STEP`
+    /// buckets. Chunks are 1 KB, so a 256 KB attachment lands 256 of them —
+    /// emitting per chunk would spend more time in IPC than in transfer.
+    reported_pct: u8,
+    /// When the last chunk landed, so the cap below sheds the most stalled
+    /// transfer rather than an arbitrary one.
+    updated_at: std::time::Instant,
 }
+
+/// Granularity of attachment progress events, in percent.
+const CHANNEL_FILE_PROGRESS_STEP: u8 = 5;
+
+/// Concurrent inbound attachment reassemblies held at once.
+const CHANNEL_FILE_ASSEMBLY_MAX: usize = 8;
 
 fn relay_ticket_next_round_delay(
     round_started_at: tokio::time::Instant,
@@ -10125,6 +10138,8 @@ pub enum NetworkCommand {
     /// Manually seed an Ember DHT contact into the routing table
     /// (harness / dev: bootstrap a node without waiting for live
     /// traffic). The node ID is derived from `ed25519_pub`.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     AddEmberDhtContact {
         addr: SocketAddr,
         ed25519_pub: [u8; 32],
@@ -10148,6 +10163,8 @@ pub enum NetworkCommand {
     /// PING/PONG path (and so populates the routing table on both
     /// ends). `peer_pubkey` is the peer's Noise key; when `None` it is
     /// resolved from the KAD-fed cache.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtPing {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -10158,6 +10175,8 @@ pub enum NetworkCommand {
     /// lands in a later slice). `peer_pubkey` is the peer's Noise key;
     /// when `None` it is resolved from the KAD-fed cache. A `None`
     /// `target` asks the peer for the contacts closest to a random ID.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtFindNode {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -10169,6 +10188,8 @@ pub enum NetworkCommand {
     /// hops (α-parallel `FIND_NODE` rounds over the closest contacts it
     /// learns) until it converges, then returns the closest contacts
     /// that responded. A `None` `target` runs a random self-style probe.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtIterativeFindNode {
         target: Option<[u8; 16]>,
         tx: oneshot::Sender<Result<EmberDhtLookupPending, String>>,
@@ -10177,6 +10198,8 @@ pub enum NetworkCommand {
     /// task signs the record with our identity, finds the closest known
     /// contacts to the keyword's key, and `STORE`s on them, returning how
     /// many acknowledged. `file_hash` is random per dev-published record.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     PublishEmberKeyword {
         keyword: String,
         file_name: String,
@@ -10188,6 +10211,8 @@ pub enum NetworkCommand {
     /// network task drives a `SearchManager` search that sends `FIND_VALUE`
     /// (falling back to `FOUND_NODE` hops) until it gathers signed records
     /// or converges, then returns the verified records it collected.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     FindEmberValue {
         keyword: String,
         tx: oneshot::Sender<Result<EmberValueLookupPending, String>>,
@@ -10213,6 +10238,8 @@ pub enum NetworkCommand {
     /// records. With the timer this happens automatically; the command
     /// forces a cycle (ignoring staleness gates) so it can be observed
     /// immediately. Returns a tally of what it kicked off.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     RunEmberMaintenance {
         tx: oneshot::Sender<Result<EmberMaintenanceResult, String>>,
     },
@@ -10246,6 +10273,7 @@ pub struct EmberPingPending {
 /// Returned by the network task when an outgoing Ember DHT `FIND_NODE`
 /// has been scheduled. The Tauri command awaits `contacts_rx` with a
 /// timeout; the waiter resolves with the contacts the peer returned.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberDhtFindPending {
     pub contacts_rx: oneshot::Receiver<Vec<EmberDhtContactInfo>>,
@@ -10255,6 +10283,7 @@ pub struct EmberDhtFindPending {
 /// The Tauri command awaits `contacts_rx` with a timeout; the waiter
 /// resolves with the closest contacts that responded once the multi-hop
 /// search converges.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberDhtLookupPending {
     pub contacts_rx: oneshot::Receiver<Vec<EmberDhtContactInfo>>,
@@ -10266,7 +10295,10 @@ pub struct EmberDhtLookupPending {
 #[derive(Debug)]
 pub struct EmberPublishPending {
     /// The DHT key (hex) the record was published under, so the caller
-    /// can later `FIND_VALUE` the same key.
+    /// can later `FIND_VALUE` the same key. Only the harness publish
+    /// command reads this; production channel publishes wait on
+    /// `result_rx` alone.
+    #[cfg(debug_assertions)]
     pub key: String,
     pub result_rx: oneshot::Receiver<EmberPublishResult>,
 }
@@ -12032,6 +12064,10 @@ struct NetworkState {
     channel_gossip_sent_times: VecDeque<std::time::Instant>,
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
+    /// Inbound chat timestamps keyed by (room, signed author), so one member
+    /// cannot flood a room by spreading the load across many hops.
+    channel_gossip_author_times:
+        HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
     /// Last history-sync request per (channel_id, neighbor pubkey).
     channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
@@ -12195,6 +12231,27 @@ fn remember_channel_gossip(state: &mut NetworkState, msg_id: [u8; 16]) -> bool {
         msg_id,
         std::time::Instant::now(),
     )
+}
+
+fn channel_author_gossip_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+) -> bool {
+    ember::channel::author_gossip_allow(
+        &mut state.channel_gossip_author_times,
+        channel_id,
+        author,
+        std::time::Instant::now(),
+    )
+}
+
+fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
+    ember::channel::forget_gossip_id(
+        &mut state.channel_gossip_seen,
+        &mut state.channel_gossip_seen_order,
+        msg_id,
+    );
 }
 
 fn channel_gossip_rate_ok(state: &mut NetworkState) -> bool {
@@ -12493,12 +12550,17 @@ fn ingest_channel_moderation_records(
         moderation.timestamp,
         &moderation.banned_pubkeys,
         &moderation.moderator_pubkeys,
+        moderation.owner_pubkey.as_ref(),
     )
     .unwrap_or(false)
 }
 
-/// Owners re-STORE the moderation record so the 24h DHT TTL cannot age out.
-async fn maybe_publish_channel_moderation(
+/// Owners re-STORE the records only they can sign, so the 24h DHT TTL cannot
+/// age them out: the moderation record, plus the public-index listing for
+/// public rooms. Both share that TTL, and remaining life is derived from the
+/// publisher's signed creation time, so replication between storers cannot
+/// stand in for the owner re-signing (see `DhtStore::store`).
+async fn maybe_publish_owned_channel_records(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
@@ -12543,9 +12605,14 @@ async fn maybe_publish_channel_moderation(
         if ident.channel_id != channel_id {
             continue;
         }
-        let bans = db
+        let mut bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
+        // Same rule as `commands::channels::load_banned_pubkeys`: never re-sign
+        // our own key into the ban list of a room we own, or a moderator's
+        // gossip becomes an owner-signed ban that outlives every republish.
+        let our_pk = state.local_ed25519_pubkey;
+        bans.retain(|pk| pk != &our_pk);
         let mods = db
             .list_moderator_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
@@ -12555,6 +12622,9 @@ async fn maybe_publish_channel_moderation(
             &ch.welcome,
             &bans,
             &mods,
+            // We own this room, so our own identity is the owner identity every
+            // member needs in order to refuse a ban aimed at us.
+            Some(&our_pk),
             channel_id,
             ident.pubkey,
             private,
@@ -12567,6 +12637,26 @@ async fn maybe_publish_channel_moderation(
             state.channel_moderation_publish_at.insert(channel_id, now);
             drive_ember_publish(socket, state, publish_id).await;
             started += 1;
+            // The listing Discover walks was published once, at creation, so an
+            // established room aged out of the index after a day while its
+            // members carried on none the wiser. Renewed on the same cadence
+            // because this is the only loop that already holds the room key,
+            // and 6h against a 24h TTL survives a missed pass.
+            if !private {
+                let index = ember::dht::publish::SignedRecord::channel_index(
+                    &ch.name,
+                    channel_id,
+                    ident.pubkey,
+                    false,
+                    &ident.signing_key,
+                );
+                if let Some(index_id) = state
+                    .ember_publish
+                    .start_publish(index, state.ember_dht.routing())
+                {
+                    drive_ember_publish(socket, state, index_id).await;
+                }
+            }
         }
     }
 }
@@ -13407,6 +13497,15 @@ async fn handle_inbound_channel_gossip(
     if let Some((sender_pk, size, digest, name)) =
         ember::channel::decode_channel_file_offer(&plain)
     {
+        // Shares the author's chat budget: an offer mints a room message just
+        // as a chat line does, so the two should not be separately floodable.
+        // File *chunks* are deliberately left out — a 256 KB attachment is 256
+        // of them, so a per-second cap would break transfers outright.
+        if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: rate-limited file offer in {channel_id_hex}");
+            return;
+        }
         apply_channel_file_offer(
             socket,
             state,
@@ -13534,6 +13633,29 @@ async fn handle_inbound_channel_gossip(
         {
             return;
         }
+        // Same author budget as chat: a moderator spraying ban/unban actions
+        // rewrites every peer's member list as fast as they can send.
+        if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: rate-limited mod action in {channel_id_hex}");
+            return;
+        }
+        // A moderator cannot ban the room owner, on anyone's device.
+        //
+        // `ch.owner_pubkey` comes from the owner's signed moderation record, so
+        // every member can apply this rule rather than only the owner's own
+        // machine — which was the hole: elsewhere the ban landed and the
+        // owner's messages were silently dropped by every peer. The `is_owner`
+        // arm still covers us before we have ingested our own record. Not
+        // relayed either, to stop it spreading further. An unban still applies:
+        // that direction only ever clears a bad row.
+        let target_hex_lower = hex::encode(target_pk);
+        let targets_owner = ch.owner_pubkey.eq_ignore_ascii_case(&target_hex_lower)
+            || (ch.is_owner && target_pk == state.local_ed25519_pubkey);
+        if banned && targets_owner {
+            debug!("Ember channel gossip: refused a moderator ban on the owner of {channel_id_hex}");
+            return;
+        }
         let target_hex = hex::encode(target_pk);
         let _ = db.apply_channel_ban_action(
             &channel_id_hex,
@@ -13553,6 +13675,15 @@ async fn handle_inbound_channel_gossip(
     let Some((sender_pk, text)) = ember::channel::decode_channel_chat_plain(&plain) else {
         return;
     };
+    // Ahead of any DB work, and ahead of the relay below: a member flooding a
+    // room must not be forwarded on by us, or the mesh amplifies it.
+    if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+        // Release the dedup slot: this was refused for rate, not validity, so a
+        // retransmit once the window rolls off has to still be admissible.
+        forget_channel_gossip(state, &gossip.msg_id);
+        debug!("Ember channel gossip: rate-limited author in {channel_id_hex}");
+        return;
+    }
     let sender_hex = hex::encode(sender_pk);
     if db
         .channel_member_is_banned(&channel_id_hex, &sender_hex)
@@ -13815,7 +13946,10 @@ async fn apply_channel_file_chunk(
             buf: vec![0u8; size as usize],
             got: vec![0u8; size as usize],
             received: 0,
+            reported_pct: 0,
+            updated_at: std::time::Instant::now(),
         });
+    entry.updated_at = std::time::Instant::now();
     for (i, byte) in data.iter().enumerate() {
         let idx = offset as usize + i;
         if entry.got[idx] == 0 {
@@ -13823,6 +13957,20 @@ async fn apply_channel_file_chunk(
             entry.received = entry.received.saturating_add(1);
         }
         entry.buf[idx] = *byte;
+    }
+    let pct = ((entry.received as u64 * 100) / size.max(1)) as u8;
+    if pct / CHANNEL_FILE_PROGRESS_STEP > entry.reported_pct / CHANNEL_FILE_PROGRESS_STEP {
+        entry.reported_pct = pct;
+        let received = entry.received;
+        let _ = app_handle.emit(
+            "ember:channel-file-progress",
+            serde_json::json!({
+                "channel_id": ch.channel_id,
+                "digest": digest_hex,
+                "received": received,
+                "size": size,
+            }),
+        );
     }
     if entry.received as u64 == size && *blake3::hash(&entry.buf).as_bytes() == digest {
         let sealed =
@@ -13847,10 +13995,20 @@ async fn apply_channel_file_chunk(
             .channel_file_assembly
             .remove(&(gossip.channel_id, digest));
     }
-    if state.channel_file_assembly.len() > 8 {
-        if let Some(oldest) = state.channel_file_assembly.keys().next().copied() {
-            state.channel_file_assembly.remove(&oldest);
-        }
+    // Shed by staleness, not by whatever `keys()` happens to yield first.
+    // Dropping an assembly discards every byte collected so far and the sender
+    // will not resend them, so evicting a transfer that is actively receiving
+    // stalls it for good — the arbitrary pick made that a coin toss.
+    while state.channel_file_assembly.len() > CHANNEL_FILE_ASSEMBLY_MAX {
+        let Some(stalest) = state
+            .channel_file_assembly
+            .iter()
+            .min_by_key(|(_, entry)| entry.updated_at)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        state.channel_file_assembly.remove(&stalest);
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
@@ -18399,6 +18557,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_handoff_fetch_at.clear();
     state.channel_file_assembly.clear();
     state.channel_gossip_from_times.clear();
+    state.channel_gossip_author_times.clear();
     state.channel_history_sync_at.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
@@ -19376,6 +19535,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
         channel_gossip_from_times: HashMap::new(),
+        channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
@@ -37587,7 +37747,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &identity,
                     )
                     .await;
-                    maybe_publish_channel_moderation(
+                    maybe_publish_owned_channel_records(
                         &udp_socket,
                         &mut state,
                         &db,
@@ -37596,6 +37756,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     .await;
                 }
                 if settings.ember_native_enabled {
+                    // Release per-author flood slots for members who have gone
+                    // quiet. Without this the map fills in a busy room and then
+                    // refuses newcomers, since an untracked author has to be
+                    // refused rather than waved through.
+                    ember::channel::prune_author_gossip(
+                        &mut state.channel_gossip_author_times,
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(60),
+                    );
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings)
                         .await;
                     maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)

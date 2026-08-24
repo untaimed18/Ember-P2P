@@ -1,12 +1,15 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ChatConversation from '$lib/components/ChatConversation.svelte';
+  import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import IconX from '$lib/components/IconX.svelte';
   import { appSettings } from '$lib/stores/settings';
-  import { copyToClipboard } from '$lib/utils';
+  import { copyToClipboard, formatRelativeTime } from '$lib/utils';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -20,18 +23,25 @@
     leaveChannel,
     listChannelMembers,
     removeChannelModerator,
+    searchChannelMessages,
     transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
     type ChannelMemberInfo,
+    type ChannelMessageInfo,
     type GatheredChannelInfo,
   } from '$lib/api/channels';
   import {
     activeChannelId,
     channels as channelsStore,
     clearChannelUnread,
+    forgetChannelMute,
+    ignoredMembers,
+    mutedChannels,
     refreshChannels,
     replaceChannel,
+    toggleChannelMute,
+    toggleMemberIgnore,
   } from '$lib/stores/channels';
 
   let channelList = $derived($channelsStore);
@@ -52,10 +62,63 @@
   let moderatingMember = $state<string | null>(null);
   let transferTarget = $state<ChannelMemberInfo | null>(null);
   let transferOpen = $state(false);
+  let composeMode = $state<'create' | 'join' | null>(null);
+  let membersOpen = $state(true);
+  let roomInfoOpen = $state(false);
+  let listQuery = $state('');
+  /** Separate in-flight flags per operation. One shared "form busy" gate meant
+   *  creating a room, pasting an invite, and joining from Discover all blocked
+   *  each other despite touching nothing in common. */
+  let creating = $state(false);
+  let joiningForm = $state(false);
+  let joiningIds = $state<string[]>([]);
+  /** Which member a handoff offer went to this session, per room. `ChannelInfo`
+   *  carries no pending-handoff field, and the backend refuses only a switch to
+   *  a different member — re-offering to the same one is the retry path for a
+   *  dropped gossip offer, so keep that action reachable. */
+  let transferSent = $state<Record<string, string>>({});
+  /** A `?join=` invite is waiting on the user, so the list must not open a
+   *  room over the top of it. Separate from `joinUri` so dismissing the form
+   *  doesn't have to discard what they typed. */
+  let deepLinkJoin = $state(false);
+  /** In-room history search. Local only, so it finds what this device kept. */
+  let searchOpen = $state(false);
+  let searchQuery = $state('');
+  let searchHits: ChannelMessageInfo[] = $state([]);
+  let searching = $state(false);
+  let searchRan = $state(false);
+  /** Guards against a superseded query's reply landing last and showing hits
+   *  for text the box no longer contains. */
+  let searchGen = 0;
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   let selected = $derived(channelList.find((c) => c.channel_id === selectedId) ?? null);
   let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
+  /**
+   * The one gate that has to serialise. Every owner moderation command —
+   * topic/welcome, ban, unban, promote, demote — is a read-modify-write of the
+   * whole signed snapshot on the backend (`load_banned_pubkeys` then
+   * `commit_channel_moderation`). Two in flight would build from the same base
+   * and the later would silently discard the earlier's change, so they share a
+   * gate rather than getting one each.
+   */
+  let moderationBusy = $derived(savingModeration || moderatingMember !== null);
+  let transferPendingTo = $derived(
+    selected && !selected.successor_id ? transferSent[selected.channel_id] ?? null : null,
+  );
+  /**
+   * Memoised primitives for `ChatConversation`. Passing `selected.name` and
+   * friends inline made its props depend on `selected`'s object *identity*, and
+   * every write to the channels store allocates fresh row objects — so the
+   * effect in that component which calls `clearChannelUnread` re-triggered
+   * itself, wiping the composer on each pass. A `$derived` only propagates when
+   * the value really differs, which keeps that boundary stable no matter how
+   * often the store churns.
+   */
+  let selectedMuted = $derived(!!selected && $mutedChannels.includes(selected.channel_id));
+  let selectedChannelId = $derived(selected?.channel_id ?? '');
+  let selectedName = $derived(selected?.name ?? '');
+  let selectedBanned = $derived(selected?.you_are_banned ?? false);
   let memberNames = $derived(
     Object.fromEntries(
       members.map((mem) => [
@@ -64,11 +127,111 @@
       ]),
     ),
   );
+  let visibleChannels = $derived.by(() => {
+    const q = listQuery.trim().toLowerCase();
+    if (!q) return channelList;
+    return channelList.filter(
+      (ch) =>
+        ch.name.toLowerCase().includes(q) ||
+        ch.topic.toLowerCase().includes(q),
+    );
+  });
+  let sortedMembers = $derived(
+    members.slice().sort((a, b) => {
+      if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
+      if (a.banned !== b.banned) return a.banned ? 1 : -1;
+      if (a.moderator !== b.moderator) return a.moderator ? -1 : 1;
+      const an = (a.nickname || a.member_pubkey).toLowerCase();
+      const bn = (b.nickname || b.member_pubkey).toLowerCase();
+      return an.localeCompare(bn);
+    }),
+  );
+
+  function autoFocus(node: HTMLElement) {
+    node.focus();
+  }
+
+  function closeCardMenu(from: HTMLElement) {
+    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+  }
+
+  function closeCardMenus(keepContaining?: Element | null) {
+    for (const el of document.querySelectorAll<HTMLDetailsElement>('.card-more[open]')) {
+      if (keepContaining && el.contains(keepContaining)) continue;
+      el.open = false;
+    }
+  }
+
+  function onCardMenuPointerDown(e: PointerEvent) {
+    const target = e.target instanceof Element ? e.target : null;
+    closeCardMenus(target);
+  }
+
+  function onPageKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    if (document.querySelector('.card-more[open]')) {
+      closeCardMenus();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (roomInfoOpen) {
+      roomInfoOpen = false;
+      e.preventDefault();
+      return;
+    }
+    if (composeMode) {
+      composeMode = null;
+      deepLinkJoin = false;
+      error = null;
+      e.preventDefault();
+      return;
+    }
+    if (membersOpen && typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
+      membersOpen = false;
+      e.preventDefault();
+    }
+  }
+
+  /**
+   * Whether a member has been heard from recently enough to call them present.
+   *
+   * `last_seen` advances on their presence record (republished every
+   * `PRESENCE_REPUBLISH_SECS`, ten minutes) and on any message of theirs we
+   * ingest. Two intervals of slack means one missed republish does not blink
+   * somebody offline; the DHT drops the record entirely at 45 minutes, so
+   * anything beyond that would be claiming more than we know.
+   */
+  const PRESENCE_FRESH_SECS = 20 * 60;
+
+  /** Ticks the clock the presence check reads. Freshness is measured against
+   *  wall-clock, which no amount of roster reactivity refreshes on its own, so
+   *  without this a member keeps whatever dot they had when the list was last
+   *  fetched — potentially long past the window. */
+  let presenceNow = $state(Math.floor(Date.now() / 1000));
+
+  function isPresent(mem: ChannelMemberInfo, nowSecs: number): boolean {
+    if (mem.last_seen <= 0) return false;
+    return nowSecs - mem.last_seen <= PRESENCE_FRESH_SECS;
+  }
+
+  function channelHue(id: string): number {
+    let h = 0;
+    for (let i = 0; i < Math.min(id.length, 8); i++) {
+      h = (h * 33 + id.charCodeAt(i)) % 360;
+    }
+    return h;
+  }
+
+  function toggleCompose(mode: 'create' | 'join') {
+    composeMode = composeMode === mode ? null : mode;
+    if (composeMode !== 'join') deepLinkJoin = false;
+    error = null;
+  }
 
   onMount(() => {
-    const joinParam = $page.url.searchParams.get('join');
-    if (joinParam) {
-      joinUri = joinParam;
+    if (typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
+      membersOpen = false;
     }
     loadChannels();
     let cancelled = false;
@@ -76,13 +239,7 @@
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
       refreshChannels().catch(() => {});
-      if (id === selectedId) {
-        listChannelMembers(id)
-          .then((mems) => {
-            members = mems;
-          })
-          .catch(() => {});
-      }
+      if (id === selectedId) void refreshMembers(id);
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenMembers = fn;
@@ -99,39 +256,45 @@
           }
         })
         .catch(() => {});
-      if (id === selectedId) {
-        listChannelMembers(id)
-          .then((mems) => {
-            members = mems;
-          })
-          .catch(() => {});
-      }
+      if (id === selectedId) void refreshMembers(id);
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenModeration = fn;
     });
     let unlistenHandoff: UnlistenFn | undefined;
-    listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', () => {
+    listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', (event) => {
+      // Only the room that actually moved: wiping the map cleared the pending
+      // banner for every other room too.
+      const moved = event.payload?.channel_id;
+      if (moved) {
+        transferSent = Object.fromEntries(
+          Object.entries(transferSent).filter(([key]) => key !== moved),
+        );
+      }
       refreshChannels()
         .then(() => {
-          if (selectedId) {
-            listChannelMembers(selectedId)
-              .then((mems) => {
-                members = mems;
-              })
-              .catch(() => {});
-          }
+          if (selectedId) void refreshMembers(selectedId);
         })
         .catch(() => {});
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenHandoff = fn;
     });
+    document.addEventListener('pointerdown', onCardMenuPointerDown);
+    document.addEventListener('keydown', onPageKeydown);
+    // Half the presence-republish interval, so a member crossing the freshness
+    // line is reflected within a minute or so without polling the backend.
+    const presenceTimer = setInterval(() => {
+      presenceNow = Math.floor(Date.now() / 1000);
+    }, 30_000);
     return () => {
       cancelled = true;
+      clearInterval(presenceTimer);
       unlistenMembers?.();
       unlistenModeration?.();
       unlistenHandoff?.();
+      document.removeEventListener('pointerdown', onCardMenuPointerDown);
+      document.removeEventListener('keydown', onPageKeydown);
     };
   });
 
@@ -141,14 +304,49 @@
     }
   });
 
+  $effect(() => {
+    const joinParam = $page.url.searchParams.get('join');
+    if (!joinParam) return;
+    joinUri = joinParam;
+    composeMode = 'join';
+    deepLinkJoin = true;
+    error = null;
+    untrack(() => {
+      const next = new URL($page.url);
+      next.searchParams.delete('join');
+      void goto(`${next.pathname}${next.search}${next.hash}`, {
+        replaceState: true,
+        keepFocus: true,
+        noScroll: true,
+      }).catch(() => {});
+    });
+  });
+
   async function loadChannels() {
     loading = true;
     error = null;
     try {
       await refreshChannels();
-      if (selectedId && !$channelsStore.some((c) => c.channel_id === selectedId)) {
+      const current = selectedId;
+      if (current && !$channelsStore.some((c) => c.channel_id === current)) {
         activeChannelId.set(null);
         members = [];
+      } else if (current) {
+        // `activeChannelId` is a module-level store, but the roster and the
+        // moderation drafts are component state and the layout keys this page
+        // on the pathname — so navigating away and back keeps the selection
+        // while resetting everything around it. Re-seed both: otherwise the
+        // members pane sits on its loading text forever, and the owner's topic
+        // and welcome come up blank, which saving from there would persist.
+        const ch = $channelsStore.find((c) => c.channel_id === current);
+        if (!editingModeration) {
+          editTopic = ch?.topic ?? '';
+          editWelcome = ch?.welcome ?? '';
+        }
+        if (members.length === 0) await refreshMembers(current, true);
+      } else if ($channelsStore.length > 0 && !deepLinkJoin) {
+        const newest = $channelsStore.slice().sort((a, b) => b.last_active - a.last_active)[0];
+        if (newest) await selectChannel(newest.channel_id);
       }
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -157,54 +355,161 @@
     }
   }
 
-  async function selectChannel(id: string) {
-    activeChannelId.set(id);
+  /** Apply only while `id` is still the open room, so a slow reply from a
+   *  previous selection cannot replace the current roster. */
+  async function refreshMembers(id: string, notify = false) {
     try {
-      members = await listChannelMembers(id);
-      const ch = $channelsStore.find((c) => c.channel_id === id);
-      editTopic = ch?.topic ?? '';
-      editWelcome = ch?.welcome ?? '';
-      editingModeration = false;
-      clearChannelUnread(id);
+      const mems = await listChannelMembers(id);
+      if (id === selectedId) members = mems;
     } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      if (notify && id === selectedId) {
+        toastError(translateError(e, m.error_operation_failed()));
+      }
     }
   }
 
+  async function selectChannel(id: string) {
+    activeChannelId.set(id);
+    members = [];
+    const ch = $channelsStore.find((c) => c.channel_id === id);
+    editTopic = ch?.topic ?? '';
+    editWelcome = ch?.welcome ?? '';
+    editingModeration = false;
+    roomInfoOpen = false;
+    resetSearch();
+    // Ahead of the fetch: a roster that fails to load must not leave an unread
+    // badge on the room the user is now reading.
+    clearChannelUnread(id);
+    await refreshMembers(id, true);
+  }
+
+  function resetSearch() {
+    searchGen++;
+    searchOpen = false;
+    searchQuery = '';
+    searchHits = [];
+    searchRan = false;
+    searching = false;
+  }
+
+  async function runSearch() {
+    const id = selectedId;
+    const query = searchQuery.trim();
+    if (!id || !query) {
+      searchHits = [];
+      searchRan = false;
+      return;
+    }
+    const gen = ++searchGen;
+    searching = true;
+    try {
+      const hits = await searchChannelMessages(id, query);
+      // Apply only if this is still the newest query for the still-open room:
+      // a slower earlier search must not overwrite a later one's hits.
+      if (gen === searchGen && id === selectedId) {
+        searchHits = hits;
+        searchRan = true;
+      }
+    } catch (e) {
+      if (gen === searchGen && id === selectedId) {
+        toastError(translateError(e, m.error_operation_failed()));
+      }
+    } finally {
+      if (gen === searchGen) searching = false;
+    }
+  }
+
+  function clearSelection() {
+    activeChannelId.set(null);
+    members = [];
+    roomInfoOpen = false;
+  }
+
   async function handleCreate() {
+    if (creating) return;
     error = null;
+    creating = true;
     try {
       const invite = await createChannel(createName.trim(), createPrivate);
       createName = '';
       createPrivate = false;
-      await loadChannels();
+      composeMode = null;
+      deepLinkJoin = false;
+      // The clipboard write needs nothing from the list refresh, so overlap
+      // them. `refreshChannels` rather than `loadChannels`: we select the new
+      // room explicitly below, so the latter's roster fetch for whatever was
+      // previously open would be thrown away.
+      const [copied] = await Promise.all([
+        copyToClipboard(invite.uri),
+        refreshChannels(),
+      ]);
       await selectChannel(invite.channel_id);
-      await copyToClipboard(invite.uri);
-      toastSuccess(m.channels_invite_copied());
+      if (copied) {
+        toastSuccess(m.channels_invite_copied());
+      } else {
+        toastError(m.kad_clipboard_unavailable());
+      }
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
+    } finally {
+      creating = false;
     }
   }
 
-  async function handleJoin(uri = joinUri) {
+  /** `discoveredId` marks a join started from the Discover list. Those must not
+   *  touch the invite box or close a form the user is still filling in, and
+   *  each row gets its own in-flight slot so several can run at once. */
+  async function handleJoin(uri = joinUri, discoveredId?: string) {
+    if (discoveredId) {
+      if (joiningIds.includes(discoveredId)) return;
+      joiningIds = [...joiningIds, discoveredId];
+    } else {
+      if (joiningForm) return;
+      joiningForm = true;
+    }
     error = null;
     try {
       const joined = await joinChannel(uri.trim());
-      joinUri = '';
-      await loadChannels();
+      if (!discoveredId) {
+        joinUri = '';
+        composeMode = null;
+        deepLinkJoin = false;
+      }
+      discovered = discovered.map((item) =>
+        item.channel_id === joined.channel_id ? { ...item, joined: true } : item,
+      );
+      await refreshChannels();
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
+    } finally {
+      if (discoveredId) {
+        joiningIds = joiningIds.filter((channelId) => channelId !== discoveredId);
+      } else {
+        joiningForm = false;
+      }
     }
   }
 
   async function handleLeave() {
-    if (!selectedId) return;
+    const id = selectedId;
+    if (!id) return;
     try {
-      await leaveChannel(selectedId);
+      await leaveChannel(id);
       activeChannelId.set(null);
       members = [];
-      await loadChannels();
+      transferSent = Object.fromEntries(
+        Object.entries(transferSent).filter(([key]) => key !== id),
+      );
+      forgetChannelMute(id);
+      discovered = discovered.map((item) =>
+        item.channel_id === id ? { ...item, joined: false } : item,
+      );
+      resetSearch();
+      // `refreshChannels` rather than `loadChannels`: the latter would treat
+      // the now-empty selection as "nothing open yet" and drop the user
+      // straight into another room, which is not what leaving one means.
+      await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     }
@@ -214,8 +519,11 @@
     if (!selectedId) return;
     try {
       const invite = await getChannelInvite(selectedId);
-      await copyToClipboard(invite.uri);
-      toastSuccess(m.channels_invite_copied());
+      if (await copyToClipboard(invite.uri)) {
+        toastSuccess(m.channels_invite_copied());
+      } else {
+        toastError(m.kad_clipboard_unavailable());
+      }
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     }
@@ -237,14 +545,15 @@
 
   async function joinDiscovered(item: GatheredChannelInfo) {
     const uri = `ember-channel:${item.channel_id}?pk=${item.pubkey}&name=${encodeURIComponent(item.name)}`;
-    await handleJoin(uri);
+    await handleJoin(uri, item.channel_id);
   }
 
   async function handleSaveModeration() {
-    if (!selectedId || savingModeration) return;
+    const id = selectedId;
+    if (!id || moderationBusy) return;
     savingModeration = true;
     try {
-      const updated = await updateChannelModeration(selectedId, editTopic, editWelcome);
+      const updated = await updateChannelModeration(id, editTopic, editWelcome);
       replaceChannel(updated);
       editingModeration = false;
       toastSuccess(m.channels_moderation_saved());
@@ -256,11 +565,12 @@
   }
 
   async function handleBan(memberPubkey: string) {
-    if (!selectedId || moderatingMember) return;
+    const id = selectedId;
+    if (!id || moderationBusy) return;
     moderatingMember = memberPubkey;
     try {
-      await banChannelMember(selectedId, memberPubkey);
-      members = await listChannelMembers(selectedId);
+      await banChannelMember(id, memberPubkey);
+      await refreshMembers(id, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -269,11 +579,12 @@
   }
 
   async function handleUnban(memberPubkey: string) {
-    if (!selectedId || moderatingMember) return;
+    const id = selectedId;
+    if (!id || moderationBusy) return;
     moderatingMember = memberPubkey;
     try {
-      await unbanChannelMember(selectedId, memberPubkey);
-      members = await listChannelMembers(selectedId);
+      await unbanChannelMember(id, memberPubkey);
+      await refreshMembers(id, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -282,11 +593,12 @@
   }
 
   async function handleAddModerator(memberPubkey: string) {
-    if (!selectedId || moderatingMember) return;
+    const id = selectedId;
+    if (!id || moderationBusy) return;
     moderatingMember = memberPubkey;
     try {
-      await addChannelModerator(selectedId, memberPubkey);
-      members = await listChannelMembers(selectedId);
+      await addChannelModerator(id, memberPubkey);
+      await refreshMembers(id, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -295,11 +607,12 @@
   }
 
   async function handleRemoveModerator(memberPubkey: string) {
-    if (!selectedId || moderatingMember) return;
+    const id = selectedId;
+    if (!id || moderationBusy) return;
     moderatingMember = memberPubkey;
     try {
-      await removeChannelModerator(selectedId, memberPubkey);
-      members = await listChannelMembers(selectedId);
+      await removeChannelModerator(id, memberPubkey);
+      await refreshMembers(id, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -313,9 +626,12 @@
   }
 
   async function handleTransfer() {
-    if (!selectedId || !transferTarget) return;
+    const id = selectedId;
+    const target = transferTarget;
+    if (!id || !target) return;
     try {
-      await transferChannelOwnership(selectedId, transferTarget.member_pubkey);
+      await transferChannelOwnership(id, target.member_pubkey);
+      transferSent = { ...transferSent, [id]: target.member_pubkey };
       toastSuccess(m.channels_transfer_started());
       await refreshChannels();
     } catch (e) {
@@ -331,29 +647,68 @@
     await refreshChannels().catch(() => {});
     if ($channelsStore.some((c) => c.channel_id === id)) {
       await selectChannel(id);
+    } else {
+      toastError(m.error_channels_not_found());
     }
   }
 
   function shortId(id: string): string {
     return id.slice(0, 8) + '\u2026';
   }
+
+  /** Anyone other than yourself has a menu now: ignoring is available to every
+   *  member, where the moderation items below are not. */
+  function memberHasMenu(mem: ChannelMemberInfo): boolean {
+    return !!selected && !mem.is_self;
+  }
 </script>
 
 <div class="page-header">
-  <h2>{m.nav_channels()}</h2>
+  <div class="header-title">
+    <h2>{m.nav_channels()}</h2>
+    {#if channelList.length > 0}
+      <span class="header-count">
+        {channelList.length === 1
+          ? m.channels_count_one()
+          : m.channels_count_other({ count: channelList.length })}
+      </span>
+    {/if}
+  </div>
   <div class="header-actions">
-    <button class="ghost" onclick={handleDiscover} disabled={discovering}>
+    <button class="ghost" onclick={handleDiscover} disabled={discovering || emberOff}>
       {discovering ? m.channels_discovering() : m.channels_discover()}
+    </button>
+    <button
+      class="ghost"
+      class:active-toggle={composeMode === 'join'}
+      onclick={() => toggleCompose('join')}
+      disabled={emberOff}
+    >
+      {composeMode === 'join' ? m.common_cancel() : m.channels_join()}
+    </button>
+    <button
+      class="add-btn primary"
+      class:danger={composeMode === 'create'}
+      onclick={() => toggleCompose('create')}
+      disabled={emberOff}
+    >
+      {composeMode === 'create' ? m.common_cancel() : m.channels_create()}
     </button>
   </div>
 </div>
 
 <div class="page-content channels-page">
-  <p class="lede">{m.channels_page_subtitle()}</p>
-  <p class="limits-note">{m.channels_limits_note()}</p>
+  <details class="how-panel">
+    <summary class="how-title">{m.channels_how_title()}</summary>
+    <p class="how-lede">{m.channels_page_subtitle()}</p>
+    <p class="how-limits">{m.channels_limits_note()}</p>
+  </details>
 
   {#if error}
-    <div class="banner error-banner" role="alert">{error}</div>
+    <div class="banner error-banner" role="alert">
+      <span>{error}</span>
+      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+    </div>
   {/if}
 
   {#if emberOff}
@@ -362,204 +717,541 @@
       {m.channels_disabled_body()}
     </div>
   {:else}
-    <div class="composer-row">
-      <form class="create-form" onsubmit={(e) => { e.preventDefault(); handleCreate(); }}>
-        <input
-          bind:value={createName}
-          placeholder={m.channels_name_placeholder()}
-          maxlength="64"
-          aria-label={m.channels_name_placeholder()}
-        />
-        <label class="private-toggle">
-          <input type="checkbox" bind:checked={createPrivate} />
-          {m.channels_private_label()}
-        </label>
-        <button type="submit" disabled={!createName.trim()}>{m.channels_create()}</button>
+    {#if composeMode === 'create'}
+      <form
+        class="add-form"
+        onsubmit={(e) => {
+          e.preventDefault();
+          handleCreate();
+        }}
+      >
+        <p class="form-title">{m.channels_create_title()}</p>
+        <div class="add-form-inner">
+          <input
+            bind:value={createName}
+            placeholder={m.channels_name_placeholder()}
+            maxlength="64"
+            aria-label={m.channels_name_placeholder()}
+            use:autoFocus
+          />
+          <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
+          <button type="submit" disabled={!createName.trim() || creating}>{m.channels_create()}</button>
+        </div>
       </form>
-      <form class="join-form" onsubmit={(e) => { e.preventDefault(); handleJoin(); }}>
-        <input
-          bind:value={joinUri}
-          placeholder={m.channels_join_placeholder()}
-          aria-label={m.channels_join_title()}
-        />
-        <button type="submit" disabled={!joinUri.trim()}>{m.channels_join()}</button>
+    {:else if composeMode === 'join'}
+      <form
+        class="add-form"
+        onsubmit={(e) => {
+          e.preventDefault();
+          handleJoin();
+        }}
+      >
+        <p class="form-title">{m.channels_join_title()}</p>
+        <div class="add-form-inner">
+          <input
+            class="join-input"
+            bind:value={joinUri}
+            placeholder={m.channels_join_placeholder()}
+            aria-label={m.channels_join_title()}
+            spellcheck="false"
+            autocomplete="off"
+            use:autoFocus
+          />
+          <button type="submit" disabled={!joinUri.trim() || joiningForm}>{m.channels_join()}</button>
+        </div>
       </form>
-    </div>
+    {/if}
 
     {#if discovered.length > 0}
-      <div class="discovered">
-        {#each discovered as item}
-          <button
-            class="disc-row"
-            disabled={item.joined}
-            onclick={() => joinDiscovered(item)}
-          >
-            <span class="disc-name">{item.name || shortId(item.channel_id)}</span>
-            <span class="badge">{item.joined ? m.channels_joined() : m.channels_public_badge()}</span>
-          </button>
-        {/each}
+      <div class="requests-section">
+        <div class="requests-header">
+          <span class="requests-title">{m.channels_discover()}</span>
+          <span class="requests-badge">{discovered.length}</span>
+          <button class="ghost requests-dismiss" onclick={() => (discovered = [])}>{m.common_dismiss()}</button>
+        </div>
+        <div class="requests-list">
+          {#each discovered as item (item.channel_id)}
+            <div class="request-card">
+              <div
+                class="chan-avatar"
+                style="--chan-hue: {channelHue(item.channel_id)}"
+                aria-hidden="true"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 7h16M4 12h10M4 17h16"/>
+                </svg>
+              </div>
+              <div class="request-info">
+                <span class="request-name"><bdi dir="auto">{item.name || shortId(item.channel_id)}</bdi></span>
+                <span class="request-hash">{item.joined ? m.channels_joined() : m.channels_public_badge()}</span>
+              </div>
+              <button
+                class="req-accept"
+                disabled={item.joined || joiningIds.includes(item.channel_id)}
+                onclick={() => joinDiscovered(item)}
+              >
+                {item.joined ? m.channels_joined() : m.channels_join()}
+              </button>
+            </div>
+          {/each}
+        </div>
       </div>
     {/if}
 
-    <div class="split">
-      <aside class="list">
-        {#if loading}
-          <p class="muted">{m.common_loading()}</p>
-        {:else if channelList.length === 0}
-          <p class="muted">{m.channels_empty()}</p>
-        {:else}
-          {#each channelList as ch}
-            <button
-              class="chan-row"
-              class:active={ch.channel_id === selectedId}
-              onclick={() => selectChannel(ch.channel_id)}
-            >
-              <span class="chan-name">{ch.name}</span>
-              <span class="badge">{ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</span>
-              {#if ch.successor_id}
-                <span class="badge">{m.channels_transferred_badge()}</span>
-              {/if}
-              {#if ch.unread > 0}
-                <span class="unread">{ch.unread}</span>
-              {/if}
-            </button>
-          {/each}
-        {/if}
-      </aside>
-
-      <section class="conversation">
-        {#if !selected}
-          <p class="muted pad">{m.channels_no_selection()}</p>
-        {:else}
-          <header class="conv-header">
-            <div>
-              <h3>{selected.name}</h3>
-              {#if selected.topic}
-                <p class="topic">{selected.topic}</p>
-              {/if}
-              {#if selected.welcome}
-                <p class="welcome">{selected.welcome}</p>
-              {/if}
-              {#if !selected.topic && !selected.welcome}
-                <p class="topic">{shortId(selected.channel_id)}</p>
-              {/if}
-            </div>
-            <div class="conv-actions">
-              <button class="ghost" onclick={handleCopyInvite}>{m.channels_invite()}</button>
-              <button class="ghost danger" onclick={() => (leaveOpen = true)}>{m.channels_leave()}</button>
-            </div>
-          </header>
-          {#if selected.successor_id}
-            <div class="successor-banner" role="status">
-              <span>{m.channels_successor_banner()}</span>
-              <button class="ghost" onclick={openSuccessor}>{m.channels_open_successor()}</button>
-            </div>
-          {/if}
-          {#if selected.is_owner}
-            <form
-              class="moderation-form"
-              onsubmit={(e) => {
-                e.preventDefault();
-                handleSaveModeration();
-              }}
-            >
-              <p class="mod-label">{m.channels_edit_moderation()}</p>
+    {#if loading && channelList.length === 0}
+      <div class="empty-state">
+        <div class="spinner lg"></div>
+        <p>{m.common_loading()}</p>
+      </div>
+    {:else if channelList.length === 0}
+      <div class="empty-state">
+        <div class="empty-icon">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 14h32v22H8z"/>
+            <path d="M8 14l16 10 16-10"/>
+            <circle cx="36" cy="12" r="4"/>
+          </svg>
+        </div>
+        <p class="empty-title">{m.channels_empty_title()}</p>
+        <p class="empty-sub">{m.channels_empty()}</p>
+        <div class="empty-actions">
+          <button
+            class="empty-action"
+            onclick={() => {
+              composeMode = 'create';
+              error = null;
+            }}
+          >{m.channels_create()}</button>
+          <button
+            class="ghost"
+            onclick={() => {
+              composeMode = 'join';
+              error = null;
+            }}
+          >{m.channels_join_title()}</button>
+        </div>
+      </div>
+    {:else}
+      <div class="workspace" class:members-open={membersOpen && !!selected}>
+        <aside class="list-pane" class:hidden-when-chat={!!selected}>
+          {#if channelList.length > 5}
+            <div class="search-wrap">
+              <span class="search-icon">
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                  <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                </svg>
+              </span>
               <input
-                bind:value={editTopic}
-                maxlength="64"
-                placeholder={m.channels_topic_placeholder()}
-                aria-label={m.channels_topic_placeholder()}
-                oninput={() => (editingModeration = true)}
+                type="text"
+                class="search-input"
+                bind:value={listQuery}
+                placeholder={m.common_search() + '…'}
+                aria-label={m.common_search()}
+                onkeydown={(e) => {
+                  if (e.key !== 'Escape' || !listQuery) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  listQuery = '';
+                }}
               />
-              <textarea
-                bind:value={editWelcome}
-                maxlength="512"
-                rows="2"
-                placeholder={m.channels_welcome_placeholder()}
-                aria-label={m.channels_welcome_placeholder()}
-                oninput={() => (editingModeration = true)}
-              ></textarea>
-              <button type="submit" disabled={savingModeration}>{m.channels_save_moderation()}</button>
-            </form>
+              {#if listQuery}
+                <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.common_close()} aria-label={m.common_close()}><IconX size={12} /></button>
+              {/if}
+            </div>
           {/if}
-          <div class="transcript">
-            <ChatConversation
-              friendHash=""
-              friendName={selected.name}
-              channelId={selected.channel_id}
-              hideHeader
-              youAreBanned={selected.you_are_banned}
-              memberNames={memberNames}
-            />
-          </div>
-          {#if members.length > 0}
-            <div class="members">
-              <p class="members-label">{m.channels_members()}</p>
-              <ul class="member-list">
-                {#each members as mem (mem.member_pubkey)}
-                  <li>
-                    <span class="member-name">
-                      {mem.is_self ? m.channels_you() : mem.nickname || shortId(mem.member_pubkey)}
+          <div class="list-scroll">
+            {#if visibleChannels.length === 0}
+              <p class="muted list-empty">{m.channels_no_matches()}</p>
+            {:else}
+              {#each visibleChannels as ch (ch.channel_id)}
+                <button
+                  class="chan-row"
+                  class:active={ch.channel_id === selectedId}
+                  aria-current={ch.channel_id === selectedId ? 'true' : undefined}
+                  onclick={() => selectChannel(ch.channel_id)}
+                >
+                  <div
+                    class="chan-avatar"
+                    class:private={ch.visibility === 'private'}
+                    style="--chan-hue: {channelHue(ch.channel_id)}"
+                    aria-hidden="true"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 7h16M4 12h10M4 17h16"/>
+                    </svg>
+                    {#if ch.visibility === 'private'}
+                      <span class="lock-dot">
+                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                          <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
+                          <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
+                        </svg>
+                      </span>
+                    {/if}
+                  </div>
+                  <span class="chan-identity">
+                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                    <span class="chan-sub">
+                      {#if ch.successor_id}
+                        {m.channels_transferred_badge()}
+                      {:else if ch.topic}
+                        <bdi dir="auto">{ch.topic}</bdi>
+                      {:else}
+                        {ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}
+                      {/if}
                     </span>
-                    {#if mem.banned}
-                      <span class="badge banned">{m.channels_banned_badge()}</span>
+                  </span>
+                  {#if ch.member_count > 0 && ch.unread === 0}
+                    <span class="chan-count" title={m.channels_members()}>{ch.member_count}</span>
+                  {/if}
+                  {#if ch.unread > 0}
+                    <span class="unread" class:silenced={$mutedChannels.includes(ch.channel_id)}>{ch.unread}</span>
+                  {/if}
+                </button>
+              {/each}
+            {/if}
+          </div>
+        </aside>
+
+        <section class="conversation-pane" class:hidden-when-list={!selected}>
+          {#if !selected}
+            <div class="empty-state compact">
+              <div class="empty-icon">
+                <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 14h32v22H8z"/>
+                  <path d="M8 14l16 10 16-10"/>
+                </svg>
+              </div>
+              <p class="empty-title">{m.channels_select_title()}</p>
+              <p class="empty-sub">{m.channels_no_selection()}</p>
+            </div>
+          {:else}
+            <header class="conv-header">
+              <button class="back-btn" onclick={clearSelection} aria-label={m.common_back()}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 3L5 8l5 5"/>
+                </svg>
+              </button>
+              <div
+                class="chan-avatar sm"
+                class:private={selected.visibility === 'private'}
+                style="--chan-hue: {channelHue(selected.channel_id)}"
+                aria-hidden="true"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 7h16M4 12h10M4 17h16"/>
+                </svg>
+              </div>
+              <div class="conv-heading">
+                <h3><bdi dir="auto">{selected.name}</bdi></h3>
+                {#if selected.topic.trim()}
+                  <p class="topic"><bdi dir="auto">{selected.topic}</bdi></p>
+                {:else}
+                  <p class="topic">{selected.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</p>
+                {/if}
+              </div>
+              <div class="conv-actions">
+                <span class="enc-lock" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+                    <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+                  </svg>
+                </span>
+                {#if selected.is_owner}
+                  <button
+                    class="icon-btn"
+                    class:on={roomInfoOpen}
+                    onclick={() => (roomInfoOpen = !roomInfoOpen)}
+                    title={m.channels_edit_moderation()}
+                    aria-pressed={roomInfoOpen}
+                    aria-label={m.channels_edit_moderation()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="8" cy="8" r="2.2"/>
+                      <path d="M8 2.5v1.5M8 12v1.5M2.5 8h1.5M12 8h1.5M4.1 4.1l1.1 1.1M10.8 10.8l1.1 1.1M4.1 11.9l1.1-1.1M10.8 5.2l1.1-1.1"/>
+                    </svg>
+                  </button>
+                {/if}
+                <button
+                  class="icon-btn"
+                  class:on={membersOpen}
+                  onclick={() => (membersOpen = !membersOpen)}
+                  title={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                  aria-pressed={membersOpen}
+                  aria-label={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="6" cy="6" r="2.2"/>
+                    <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
+                    <circle cx="11.5" cy="6.5" r="1.7"/>
+                    <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
+                  </svg>
+                </button>
+                <button
+                  class="icon-btn"
+                  class:on={searchOpen}
+                  onclick={() => {
+                    searchOpen = !searchOpen;
+                    if (!searchOpen) resetSearch();
+                  }}
+                  title={m.channels_search_room()}
+                  aria-pressed={searchOpen}
+                  aria-label={m.channels_search_room()}
+                >
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                  </svg>
+                </button>
+                <button
+                  class="icon-btn"
+                  class:on={selectedMuted}
+                  onclick={() => toggleChannelMute(selectedChannelId)}
+                  title={selectedMuted ? m.channels_unmute() : m.channels_mute()}
+                  aria-pressed={selectedMuted}
+                  aria-label={selectedMuted ? m.channels_unmute() : m.channels_mute()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
+                    <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
+                    {#if selectedMuted}
+                      <path d="M2.6 2.6l10.8 10.8"/>
                     {/if}
-                    {#if mem.moderator}
-                      <span class="badge">{m.channels_moderator_badge()}</span>
-                    {/if}
-                    {#if canModerate && !mem.is_self}
-                      {#if mem.banned}
-                        <button
-                          class="ghost"
-                          disabled={moderatingMember === mem.member_pubkey}
-                          onclick={() => handleUnban(mem.member_pubkey)}
-                        >
-                          {m.channels_unban()}
-                        </button>
-                      {:else}
-                        <button
-                          class="ghost danger"
-                          disabled={moderatingMember === mem.member_pubkey}
-                          onclick={() => handleBan(mem.member_pubkey)}
-                        >
-                          {m.channels_ban()}
-                        </button>
+                  </svg>
+                </button>
+                <button class="ghost" onclick={handleCopyInvite}>{m.channels_invite()}</button>
+                <button class="ghost danger" onclick={() => (leaveOpen = true)}>{m.channels_leave()}</button>
+              </div>
+            </header>
+            {#if selected.welcome.trim()}
+              <div class="welcome-banner" role="note">
+                <p><bdi dir="auto">{selected.welcome}</bdi></p>
+              </div>
+            {/if}
+            {#if selected.successor_id}
+              <div class="successor-banner" role="status">
+                <span>{m.channels_successor_banner()}</span>
+                <button class="ghost" onclick={openSuccessor}>{m.channels_open_successor()}</button>
+              </div>
+            {:else if transferPendingTo}
+              <div class="successor-banner" role="status">
+                <span>{m.channels_transfer_started()}</span>
+              </div>
+            {/if}
+            {#if selected.is_owner && roomInfoOpen}
+              <form
+                class="moderation-form"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  handleSaveModeration();
+                }}
+              >
+                <p class="mod-label">{m.channels_edit_moderation()}</p>
+                <input
+                  bind:value={editTopic}
+                  maxlength="64"
+                  placeholder={m.channels_topic_placeholder()}
+                  aria-label={m.channels_topic_placeholder()}
+                  oninput={() => (editingModeration = true)}
+                />
+                <textarea
+                  bind:value={editWelcome}
+                  maxlength="512"
+                  rows="2"
+                  placeholder={m.channels_welcome_placeholder()}
+                  aria-label={m.channels_welcome_placeholder()}
+                  oninput={() => (editingModeration = true)}
+                ></textarea>
+                <button type="submit" disabled={moderationBusy}>{m.channels_save_moderation()}</button>
+              </form>
+            {/if}
+            {#if searchOpen}
+              <form
+                class="room-search"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  runSearch();
+                }}
+              >
+                <input
+                  bind:value={searchQuery}
+                  placeholder={m.channels_search_placeholder()}
+                  aria-label={m.channels_search_room()}
+                  use:autoFocus
+                  onkeydown={(e) => {
+                    if (e.key !== 'Escape') return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    resetSearch();
+                  }}
+                />
+                <button type="submit" disabled={!searchQuery.trim() || searching}>
+                  {searching ? m.common_loading() : m.common_search()}
+                </button>
+              </form>
+              {#if searchRan}
+                <div class="search-results">
+                  {#if searchHits.length === 0}
+                    <p class="muted list-empty">{m.channels_search_none()}</p>
+                  {:else}
+                    {#each searchHits as hit (hit.id)}
+                      <div class="search-hit">
+                        <span class="search-hit-who">
+                          <bdi dir="auto">{memberNames[hit.sender_pubkey] || shortId(hit.sender_pubkey)}</bdi>
+                        </span>
+                        <span class="search-hit-text"><bdi dir="auto">{hit.message}</bdi></span>
+                        <span class="search-hit-when">{formatRelativeTime(hit.timestamp, presenceNow)}</span>
+                      </div>
+                    {/each}
+                  {/if}
+                </div>
+              {/if}
+            {/if}
+            <div class="transcript">
+              <ChatConversation
+                friendHash=""
+                friendName={selectedName}
+                channelId={selectedChannelId}
+                hideHeader
+                youAreBanned={selectedBanned}
+                memberNames={memberNames}
+                ignoredSenders={$ignoredMembers}
+                mentionName={$appSettings?.nickname ?? ''}
+              />
+            </div>
+          {/if}
+        </section>
+
+        {#if selected && membersOpen}
+          <button
+            class="members-backdrop"
+            type="button"
+            onclick={() => (membersOpen = false)}
+            aria-label={m.channels_hide_members()}
+          ></button>
+          <aside class="members-pane">
+            <div class="members-header">
+              <span class="members-label">{m.channels_members()}</span>
+              <span class="members-count">{members.length || selected.member_count}</span>
+              <button
+                class="icon-btn members-close"
+                onclick={() => (membersOpen = false)}
+                aria-label={m.channels_hide_members()}
+              >
+                <IconX size={14} />
+              </button>
+            </div>
+            {#if members.length === 0}
+              <p class="muted list-empty">{m.common_loading()}</p>
+            {:else}
+              <ul class="member-list">
+                {#each sortedMembers as mem (mem.member_pubkey)}
+                  {@const present = mem.is_self || isPresent(mem, presenceNow)}
+                  <li class:banned={mem.banned}>
+                    <div class="member-avatar" class:present>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="8" r="4"/>
+                        <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
+                      </svg>
+                      {#if present}
+                        <span class="present-dot" role="img" title={m.channels_member_online()} aria-label={m.channels_member_online()}></span>
                       {/if}
-                    {/if}
-                    {#if selected.is_owner && !mem.is_self && !mem.banned && !selected.successor_id}
-                      {#if mem.moderator}
-                        <button
-                          class="ghost"
-                          disabled={moderatingMember === mem.member_pubkey}
-                          onclick={() => handleRemoveModerator(mem.member_pubkey)}
-                        >
-                          {m.channels_remove_moderator()}
-                        </button>
-                      {:else}
-                        <button
-                          class="ghost"
-                          disabled={moderatingMember === mem.member_pubkey}
-                          onclick={() => handleAddModerator(mem.member_pubkey)}
-                        >
-                          {m.channels_add_moderator()}
-                        </button>
-                      {/if}
-                      <button
-                        class="ghost"
-                        disabled={moderatingMember === mem.member_pubkey}
-                        onclick={() => requestTransfer(mem)}
-                      >
-                        {m.channels_transfer_ownership()}
-                      </button>
+                    </div>
+                    <div class="member-identity">
+                      <span class="member-name">
+                        <bdi dir="auto">{mem.is_self ? m.channels_you() : mem.nickname || shortId(mem.member_pubkey)}</bdi>
+                      </span>
+                      <span class="member-badges">
+                        {#if mem.is_self && selected.is_owner}
+                          <span class="badge owner">{m.channels_owner()}</span>
+                        {:else if mem.moderator}
+                          <span class="badge">{m.channels_moderator_badge()}</span>
+                        {/if}
+                        {#if mem.banned}
+                          <span class="badge banned">{m.channels_banned_badge()}</span>
+                        {/if}
+                        {#if $ignoredMembers.includes(mem.member_pubkey.toLowerCase())}
+                          <span class="badge">{m.channels_ignored_badge()}</span>
+                        {/if}
+                        {#if !present && mem.last_seen > 0}
+                          <span class="member-seen">
+                            {m.channels_member_last_seen({
+                              when: formatRelativeTime(mem.last_seen, presenceNow),
+                            })}
+                          </span>
+                        {/if}
+                      </span>
+                    </div>
+                    {#if memberHasMenu(mem)}
+                      <details class="card-more">
+                        <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
+                          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                            <circle cx="3.5" cy="8" r="1.4"/>
+                            <circle cx="8" cy="8" r="1.4"/>
+                            <circle cx="12.5" cy="8" r="1.4"/>
+                          </svg>
+                        </summary>
+                        <div class="card-more-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey); }}
+                          >{$ignoredMembers.includes(mem.member_pubkey.toLowerCase())
+                            ? m.channels_unignore()
+                            : m.channels_ignore()}</button>
+                          {#if canModerate}
+                            {#if mem.banned}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                disabled={moderationBusy}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
+                              >{m.channels_unban()}</button>
+                            {:else}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                class="menu-item-danger"
+                                disabled={moderationBusy}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); handleBan(mem.member_pubkey); }}
+                              >{m.channels_ban()}</button>
+                            {/if}
+                          {/if}
+                          {#if selected.is_owner && !mem.banned && !selected.successor_id}
+                            {#if mem.moderator}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                disabled={moderationBusy}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); handleRemoveModerator(mem.member_pubkey); }}
+                              >{m.channels_remove_moderator()}</button>
+                            {:else}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                disabled={moderationBusy}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); handleAddModerator(mem.member_pubkey); }}
+                              >{m.channels_add_moderator()}</button>
+                            {/if}
+                            {#if !transferPendingTo || transferPendingTo === mem.member_pubkey}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                class="menu-item-danger"
+                                disabled={moderationBusy}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); requestTransfer(mem); }}
+                              >{m.channels_transfer_ownership()}</button>
+                            {/if}
+                          {/if}
+                        </div>
+                      </details>
                     {/if}
                   </li>
                 {/each}
               </ul>
-            </div>
-          {/if}
+            {/if}
+          </aside>
         {/if}
-      </section>
-    </div>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -584,163 +1276,925 @@
 />
 
 <style>
-  .lede {
-    color: var(--text-secondary);
-    margin: 0 0 8px;
-    max-width: 52rem;
+  .page-header {
+    flex-wrap: wrap;
+    gap: 10px;
   }
-  .limits-note {
-    color: var(--text-tertiary, var(--text-secondary));
-    font-size: 0.85rem;
-    margin: 0 0 16px;
-    max-width: 52rem;
-    line-height: 1.45;
+
+  .header-title {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
   }
-  .banner {
-    padding: 10px 12px;
-    border-radius: 8px;
+
+  .header-count {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .header-actions .ghost.active-toggle {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .add-btn.primary {
+    padding: 6px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    background: var(--accent);
+    color: var(--on-accent);
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 12px;
+  }
+
+  .add-btn.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+
+  .add-btn.primary.danger {
+    background: transparent;
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
+
+  .add-btn.primary.danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  .channels-page {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 16px 16px;
+    gap: 10px;
+    --scroll-cover: var(--bg-primary);
+  }
+
+  .how-panel {
+    flex-shrink: 0;
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    margin-bottom: 12px;
+    border-radius: var(--radius-lg);
+    padding: 0 16px;
   }
-  .error-banner { border-color: var(--danger, #c44); color: var(--danger, #c44); }
-  .composer-row {
+
+  .how-title {
     display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 16px;
-  }
-  .create-form, .join-form {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
     align-items: center;
-    flex: 1;
-    min-width: 280px;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 10px 0;
+    list-style: none;
   }
-  input, textarea {
+
+  .how-title::-webkit-details-marker { display: none; }
+
+  .how-title::after {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid var(--text-muted);
+    border-bottom: 1.5px solid var(--text-muted);
+    transform: rotate(-45deg);
+    transition: transform var(--transition-fast);
+    flex-shrink: 0;
+  }
+
+  details[open] > .how-title::after {
+    transform: rotate(45deg);
+  }
+
+  .how-lede,
+  .how-limits {
+    margin: 0 0 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    max-width: 52rem;
+  }
+
+  .how-lede { color: var(--text-secondary); }
+
+  .banner {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+  }
+
+  .error-banner {
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+    color: var(--badge-danger-text);
+    background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
+  }
+
+  .add-form {
+    flex-shrink: 0;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 14px 16px;
+  }
+
+  .form-title {
+    margin: 0 0 10px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-secondary);
+  }
+
+  .add-form-inner {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .add-form-inner input,
+  .moderation-form input,
+  .moderation-form textarea {
+    flex: 1;
+    min-width: 180px;
+  }
+
+  .join-input {
+    font-family: var(--font-mono);
+    letter-spacing: 0.2px;
+  }
+
+  .requests-section {
+    flex-shrink: 0;
+    background: var(--bg-surface);
+    border: 1px solid var(--accent-dim);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+
+  .requests-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .requests-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+  }
+
+  .requests-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0 5px;
+  }
+
+  .requests-dismiss { margin-left: auto; }
+
+  .request-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+  }
+
+  .request-card + .request-card {
+    border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+
+  .request-info {
     flex: 1;
     min-width: 0;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-    border-radius: 6px;
-    padding: 8px 10px;
-  }
-  .private-toggle {
     display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--text-secondary);
+    flex-direction: column;
+    gap: 1px;
   }
-  .split {
-    display: grid;
-    grid-template-columns: minmax(220px, 280px) 1fr;
-    gap: 12px;
-    min-height: 420px;
+
+  .request-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .list, .conversation {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+
+  .request-hash {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .req-accept {
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .workspace {
+    flex: 1;
     min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+    gap: 10px;
+    position: relative;
   }
-  .list { padding: 8px; overflow: auto; }
-  .chan-row, .disc-row {
+
+  .workspace.members-open {
+    grid-template-columns: minmax(200px, 260px) minmax(0, 1fr) minmax(200px, 240px);
+  }
+
+  .list-pane,
+  .conversation-pane,
+  .members-pane {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .list-pane { padding: 8px; }
+
+  .search-wrap {
+    position: relative;
+    margin: 2px 4px 8px;
+  }
+
+  .search-icon {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    pointer-events: none;
+    display: flex;
+  }
+
+  .search-input {
+    width: 100%;
+    padding: 5px 26px 5px 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  .search-clear {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .search-clear:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .list-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  .list-empty { padding: 16px 10px; text-align: center; font-size: 12px; }
+
+  .chan-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     width: 100%;
     text-align: left;
     padding: 8px 10px;
     border: 0;
     background: transparent;
     color: inherit;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: pointer;
   }
-  .chan-row.active, .chan-row:hover, .disc-row:hover { background: var(--bg-primary); }
-  .chan-name, .disc-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .badge {
-    font-size: 11px;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 1px 7px;
+
+  .chan-row:hover { background: var(--bg-hover); }
+
+  .chan-row.active {
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
   }
+
+  .chan-avatar {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: hsl(var(--chan-hue, 210) 38% 42%);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .chan-avatar svg { width: 16px; height: 16px; }
+  .chan-avatar.sm { width: 28px; height: 28px; }
+  .chan-avatar.sm svg { width: 13px; height: 13px; }
+  .chan-avatar.private {
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, #000 20%, transparent);
+  }
+
+  .lock-dot {
+    position: absolute;
+    bottom: -1px;
+    right: -1px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    display: grid;
+    place-items: center;
+    box-shadow: 0 0 0 1px var(--border);
+  }
+
+  .lock-dot svg { width: 8px; height: 8px; }
+
+  .chan-identity {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .chan-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chan-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .unread {
     min-width: 18px;
     height: 18px;
     border-radius: 9px;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     font-size: 11px;
+    font-weight: 700;
     display: grid;
     place-items: center;
     padding: 0 5px;
+    flex-shrink: 0;
   }
-  .conversation { display: flex; flex-direction: column; }
-  .transcript { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+  .chan-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A silenced room still counts its unread, it just stops shouting about it. */
+  .unread.silenced {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+
+  .conversation-pane { background: var(--bg-primary); }
+
   .conv-header {
     display: flex;
-    justify-content: space-between;
-    gap: 12px;
+    align-items: center;
+    gap: 10px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
+    flex-wrap: wrap;
   }
-  .conv-header h3 { margin: 0; font-size: 16px; }
-  .topic { margin: 2px 0 0; font-size: 12px; color: var(--text-secondary); }
-  .welcome { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); }
-  .conv-actions { display: flex; gap: 8px; }
+
+  .conv-heading { flex: 1; min-width: 0; }
+  .conv-heading h3 {
+    margin: 0;
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topic {
+    margin: 2px 0 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .conv-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+
+  .enc-lock {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .enc-lock svg { width: 12px; height: 12px; }
+
+  .back-btn { display: none; }
+
+  .icon-btn {
+    width: 30px;
+    height: 30px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .icon-btn:hover,
+  .icon-btn.on {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .icon-btn svg { width: 16px; height: 16px; }
+
   .successor-banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     padding: 8px 14px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
     font-size: 13px;
-    color: var(--text-secondary);
+    color: var(--badge-warning-text);
+    flex-shrink: 0;
   }
+
+  .welcome-banner {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.45;
+    flex-shrink: 0;
+    max-height: 4.8em;
+    overflow: auto;
+  }
+
+  .welcome-banner p { margin: 0; }
+
   .moderation-form {
     display: flex;
     flex-direction: column;
     gap: 8px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
   }
+
   .mod-label { margin: 0; font-size: 12px; color: var(--text-secondary); }
-  .members { margin: 0; padding: 6px 14px; font-size: 12px; color: var(--text-secondary); border-top: 1px solid var(--border); }
-  .members-label { margin: 0 0 6px; }
-  .member-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .member-list li { display: flex; align-items: center; gap: 8px; }
-  .member-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .badge.banned { color: var(--danger, #c44); border-color: var(--danger, #c44); }
-  .banned-banner {
-    margin: 0;
+
+  .room-search {
+    display: flex;
+    gap: 8px;
     padding: 10px 14px;
-    border-top: 1px solid var(--border);
-    color: var(--danger, #c44);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
+  }
+
+  .room-search input { flex: 1; min-width: 0; }
+
+  /* Capped rather than flexible: the transcript below stays the main event, and
+     a long hit list scrolls within its own band. */
+  .search-results {
+    flex-shrink: 0;
+    max-height: 33%;
+    overflow: auto;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+  }
+
+  .search-hit {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 7px 14px;
+    font-size: 12px;
+  }
+
+  .search-hit + .search-hit {
+    border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+
+  .search-hit-who {
+    font-weight: 600;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+    max-width: 30%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-hit-text {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-hit-when {
+    color: var(--text-muted);
+    flex-shrink: 0;
+    font-size: 11px;
+  }
+
+  .transcript {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .members-backdrop {
+    display: none;
+  }
+
+  .members-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .members-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+
+  .members-count {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .members-close { margin-left: auto; }
+
+  .member-list {
+    list-style: none;
+    margin: 0;
+    padding: 6px;
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .member-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-md);
+  }
+
+  .member-list li.banned { opacity: 0.65; }
+
+  .member-avatar {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--accent-dim);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .member-avatar svg { width: 14px; height: 14px; }
+
+  .member-avatar {
+    position: relative;
+  }
+
+  .member-avatar.present {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 16%, transparent);
+  }
+
+  .present-dot {
+    position: absolute;
+    right: -1px;
+    bottom: -1px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 2px var(--bg-secondary);
+  }
+
+  .member-seen {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .member-identity {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .member-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-size: 13px;
   }
-  .composer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
-  .messages { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
-  .bubble {
-    max-width: 80%;
-    align-self: flex-start;
-    background: var(--bg-primary);
-    border-radius: 10px;
-    padding: 6px 10px;
+
+  .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    padding: 0 6px;
+    line-height: 16px;
+    text-transform: none;
+    letter-spacing: 0;
+    background: transparent;
   }
-  .bubble.mine { align-self: flex-end; background: var(--accent-dim, var(--bg-primary)); }
-  .who { display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 2px; }
-  .bubble p { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+  .badge.owner {
+    color: var(--badge-accent-text);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  }
+
+  .badge.banned {
+    color: var(--badge-danger-text);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
+
+  .card-more { position: relative; flex-shrink: 0; }
+
+  .card-more > summary {
+    list-style: none;
+    width: 26px;
+    height: 26px;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .card-more > summary::-webkit-details-marker { display: none; }
+
+  .card-more > summary:hover,
+  .card-more[open] > summary {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .card-more-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 20;
+    min-width: 180px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .card-more-menu button {
+    text-align: left;
+    font-size: 12px;
+    font-family: inherit;
+    padding: 6px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .card-more-menu button:hover:not(:disabled) { background: var(--bg-hover); }
+  .card-more-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .menu-item-danger:hover:not(:disabled) { color: var(--danger); }
+
+  .empty-state {
+    text-align: center;
+    padding: 56px 24px;
+    color: var(--text-muted);
+    margin: auto;
+  }
+
+  .empty-state.compact { padding: 40px 24px; }
+
+  .empty-icon {
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 16px;
+    border-radius: 50%;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+  }
+
+  .empty-icon svg { width: 32px; height: 32px; }
+
+  .empty-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 0 0 6px;
+  }
+
+  .empty-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    max-width: 360px;
+    margin: 0 auto;
+    line-height: 1.5;
+  }
+
+  .empty-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
+
+  .empty-action {
+    font-size: 12px;
+    padding: 7px 20px;
+  }
+
   .muted { color: var(--text-secondary); }
-  .pad { padding: 24px; }
-  .danger { color: var(--danger, #c44); }
-  .discovered { margin-bottom: 12px; }
-  @media (max-width: 800px) {
-    .split { grid-template-columns: 1fr; }
+  .danger { color: var(--danger); }
+
+  @media (max-width: 1200px) {
+    .workspace.members-open {
+      grid-template-columns: minmax(200px, 240px) minmax(0, 1fr);
+    }
+
+    .members-backdrop {
+      display: block;
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      border: 0;
+      padding: 0;
+      background: color-mix(in srgb, #000 28%, transparent);
+      cursor: pointer;
+    }
+
+    .members-pane {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(280px, 90%);
+      z-index: 5;
+      box-shadow: var(--shadow-panel-left);
+    }
+  }
+
+  @media (max-width: 980px) {
+    .workspace,
+    .workspace.members-open {
+      grid-template-columns: 1fr;
+    }
+
+    .back-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text-primary);
+      cursor: pointer;
+      padding: 0;
+      flex-shrink: 0;
+    }
+
+    .back-btn:hover { background: var(--bg-hover); }
+    .back-btn svg { width: 16px; height: 16px; }
+
+    .list-pane.hidden-when-chat { display: none; }
+    .conversation-pane.hidden-when-list { display: none; }
+
+    .conv-actions .ghost { padding: 5px 8px; font-size: 12px; }
+  }
+
+  @media (max-width: 760px) {
+    .channels-page { padding: 8px 10px 12px; }
   }
 </style>

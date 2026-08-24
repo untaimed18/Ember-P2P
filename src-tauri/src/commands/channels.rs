@@ -191,6 +191,47 @@ fn parse_channel_id(hex_str: &str) -> Result<String, String> {
     Ok(canonical)
 }
 
+/// Write our own row into `channel_members`. Not optional: gossip fanout picks
+/// neighbors out of that table and bails when it is empty, so a room without
+/// this row is joined in name only. `fail_code` lets the caller keep its own
+/// translated framing (create vs join).
+async fn record_self_member(
+    state: &AppState,
+    channel_id: &str,
+    nickname: &str,
+    fail_code: &'static str,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let pk = hex::encode(state.identity.ed25519_public_key);
+    let nick = nickname.to_string();
+    tokio::task::spawn_blocking(move || {
+        db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp())
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx(fail_code, "Could not record your membership", e))
+}
+
+/// Drop a room whose member row could not be written. Nothing has been
+/// published at that point, so leaving no trace lets the user simply retry
+/// instead of owning a room that can never mesh.
+async fn discard_partial_channel(state: &AppState, channel_id: &str) {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let outcome = tokio::task::spawn_blocking(move || db.delete_channel(&id, None)).await;
+    let failure = match outcome {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(
+        channel_id = %channel_id,
+        error = %failure,
+        "could not roll back a channel whose member row failed to write"
+    );
+}
+
 #[tauri::command]
 pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     require_ember(&state).await?;
@@ -200,12 +241,12 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
         let rows = db.list_channels()?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let you_are_banned = db
-                .channel_member_is_banned(&row.channel_id, &our_pk)
-                .unwrap_or(false);
-            let you_are_moderator = db
-                .channel_member_is_moderator(&row.channel_id, &our_pk)
-                .unwrap_or(false);
+            // Not `unwrap_or(false)`: reporting a banned member as unbanned
+            // hands them a composer whose sends every peer will drop. Owners
+            // are exempt for the reasons in `self_banned_from`.
+            let you_are_banned =
+                !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
+            let you_are_moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
             out.push(ChannelInfo::from_stored(
                 row,
                 you_are_banned,
@@ -267,24 +308,16 @@ pub async fn create_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_create_failed", "Failed to create channel", e))?;
 
-    let our_pk = hex::encode(state.identity.ed25519_public_key);
     let nickname = {
         let cfg = state.config.read().await;
         crate::security::sanitize_display_name(&cfg.settings.nickname)
     };
-    let db = state.db.clone();
-    let member_id = channel_id_hex.clone();
-    let member_pk = our_pk.clone();
-    let member_nick = nickname.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        db.upsert_channel_member(
-            &member_id,
-            &member_pk,
-            &member_nick,
-            chrono::Utc::now().timestamp(),
-        )
-    })
-    .await;
+    if let Err(e) =
+        record_self_member(&state, &channel_id_hex, &nickname, "channels_create_failed").await
+    {
+        discard_partial_channel(&state, &channel_id_hex).await;
+        return Err(e);
+    }
 
     if !private {
         let record = SignedRecord::channel_index(
@@ -312,6 +345,9 @@ pub async fn create_channel(
         "",
         &[],
         &[],
+        // Names us as owner from the very first record, so a member who joins
+        // before any moderation edit already knows who cannot be banned.
+        Some(&state.identity.ed25519_public_key),
         ident.channel_id,
         ident.pubkey,
         private,
@@ -408,24 +444,14 @@ pub async fn join_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
 
-    let our_pk = hex::encode(state.identity.ed25519_public_key);
     let nickname = {
         let cfg = state.config.read().await;
         crate::security::sanitize_display_name(&cfg.settings.nickname)
     };
-    let db2 = state.db.clone();
-    let member_id = db_id.clone();
-    let member_pk = our_pk;
-    let member_nick = nickname.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        db2.upsert_channel_member(
-            &member_id,
-            &member_pk,
-            &member_nick,
-            chrono::Utc::now().timestamp(),
-        )
-    })
-    .await;
+    if let Err(e) = record_self_member(&state, &db_id, &nickname, "channels_join_failed").await {
+        discard_partial_channel(&state, &db_id).await;
+        return Err(e);
+    }
 
     let presence = SignedRecord::channel_presence(
         &nickname,
@@ -456,12 +482,29 @@ pub async fn leave_channel(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let db = state.db.clone();
-    let removed = tokio::task::spawn_blocking(move || db.delete_channel(&channel_id))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    let delete_id = channel_id.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        db.delete_channel(&delete_id, Some(&our_pk))
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
     if !removed {
         return Err(coded("channels_not_found", "Channel not found"));
+    }
+    // Sealed attachment bytes are the one thing the DB cannot reach. Best
+    // effort: the rows describing them are already gone, so a failure here
+    // leaves unreferenced files rather than anything the app will act on.
+    let files = channel_files_dir(&channel_id);
+    if let Err(e) = tokio::fs::remove_dir_all(&files).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                channel_id = %channel_id,
+                error = %e,
+                "left a channel but could not remove its stored attachments"
+            );
+        }
     }
     Ok(())
 }
@@ -586,6 +629,68 @@ pub async fn get_channel_messages(
         .collect())
 }
 
+/// Substring search over one room's stored history. Local only — nothing is
+/// asked of the network, so this finds what this device has kept.
+#[tauri::command]
+pub async fn search_channel_messages(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<ChannelMessageInfo>, String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let needle = crate::security::sanitize_chat_text(&query);
+    if needle.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let db = state.db.clone();
+    let lim = limit.unwrap_or(50).clamp(1, 200);
+    let rows = tokio::task::spawn_blocking(move || {
+        db.search_channel_messages(&channel_id, &needle, lim)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_messages_failed", "Failed to search messages", e))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, sender_pubkey, direction, message, timestamp, read)| ChannelMessageInfo {
+                id,
+                sender_pubkey,
+                direction,
+                message,
+                timestamp,
+                read,
+            },
+        )
+        .collect())
+}
+
+/// Remove one message from this device. Deliberately does not propagate: the
+/// protocol has no redaction, so pretending otherwise would be a lie about
+/// what every other member still holds.
+#[tauri::command]
+pub async fn delete_channel_message(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    message_id: i64,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        db.delete_channel_message(&channel_id, message_id)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_messages_failed", "Could not remove the message", e))?;
+    if !removed {
+        return Err(coded("channels_not_found", "Message not found"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn send_channel_message(
     state: tauri::State<'_, AppState>,
@@ -615,16 +720,7 @@ pub async fn send_channel_message(
         .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
     let sender = hex::encode(state.identity.ed25519_public_key);
-    let db = state.db.clone();
-    let banned_id = channel_id.clone();
-    let banned_pk = sender.clone();
-    let banned = tokio::task::spawn_blocking(move || {
-        db.channel_member_is_banned(&banned_id, &banned_pk)
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
-    if banned {
+    if self_banned_from(&state, &row, "channels_send_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
@@ -731,6 +827,10 @@ async fn load_owned_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
     let row = row.ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    // Deliberately no ban check: everything below requires ownership, and
+    // `self_banned_from` exempts an owner, so a ban here could only ever be a
+    // moderator's gossip or a stale row locking the owner out of the very
+    // tools needed to undo it.
     if !row.is_owner {
         return Err(coded(
             "channels_not_owner",
@@ -763,6 +863,25 @@ async fn load_owned_channel(
     })
 }
 
+/// Serialises the whole read-modify-write behind every owner moderation
+/// command.
+///
+/// `load_banned_pubkeys` / `load_moderator_pubkeys` read the current lists, the
+/// caller mutates them in memory, and `commit_channel_moderation` writes a
+/// fresh signed snapshot of the result. Two of those interleaved both build
+/// from the same base and the later one silently discards the earlier's change,
+/// so the whole sequence has to be exclusive — a lock inside the commit alone
+/// would be too late.
+///
+/// One global gate rather than one per room: these are human-paced actions, and
+/// the bookkeeping for per-channel locks buys nothing at this rate. It is held
+/// across the DHT publish too, which is bounded by that call's own timeout.
+static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn moderation_lock() -> &'static tokio::sync::Mutex<()> {
+    MODERATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn commit_channel_moderation(
     state: &AppState,
     owned: &OwnedChannel,
@@ -772,11 +891,15 @@ async fn commit_channel_moderation(
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    // We are the owner on this path, so our identity is what every member needs
+    // in order to refuse a moderator's ban aimed at us.
+    let our_pk = state.identity.ed25519_public_key;
     let record = SignedRecord::channel_moderation(
         topic,
         welcome,
         bans,
         mods,
+        Some(&our_pk),
         owned.channel_id,
         owned.ident.pubkey,
         private,
@@ -790,7 +913,15 @@ async fn commit_channel_moderation(
     let bans_v = bans.to_vec();
     let mods_v = mods.to_vec();
     let applied = tokio::task::spawn_blocking(move || {
-        db.apply_channel_moderation(&id, &topic_s, &welcome_s, ts, &bans_v, &mods_v)
+        db.apply_channel_moderation(
+            &id,
+            &topic_s,
+            &welcome_s,
+            ts,
+            &bans_v,
+            &mods_v,
+            Some(&our_pk),
+        )
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -801,7 +932,20 @@ async fn commit_channel_moderation(
             "A newer moderation record is already stored",
         ));
     }
-    let _ = publish_signed_record(state, record).await;
+    // Not fatal: the rows above are already committed, and the owner's
+    // periodic republish (`maybe_republish_channel_moderation`) rebuilds this
+    // record from them, so a failure here delays propagation by up to
+    // MODERATION_REPUBLISH_SECS rather than losing it. A timeout also does not
+    // prove the store failed, so refusing the whole command would report a
+    // false failure for a change that did land.
+    if let Err(e) = publish_signed_record(state, record).await {
+        tracing::warn!(
+            channel_id = %owned.row.channel_id,
+            error = %e,
+            "channel moderation saved locally but not published; other members \
+             keep the previous record until the next owner republish"
+        );
+    }
     Ok(())
 }
 
@@ -811,10 +955,19 @@ async fn load_banned_pubkeys(
 ) -> Result<Vec<[u8; 32]>, String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
-    tokio::task::spawn_blocking(move || db.list_banned_channel_pubkeys(&id))
+    let ours = state.identity.ed25519_public_key;
+    let mut bans = tokio::task::spawn_blocking(move || db.list_banned_channel_pubkeys(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load bans", e))
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load bans", e))?;
+    // Every caller is an owner-only path, so a row banning us can only be
+    // moderator gossip or a stale snapshot. Signing it into the record we
+    // publish would promote that to an owner-signed ban the whole room honours,
+    // and would keep re-signing it forever. Dropping it here also clears the
+    // stale row, since `commit_channel_moderation` applies this same list
+    // locally.
+    bans.retain(|pk| pk != &ours);
+    Ok(bans)
 }
 
 async fn load_moderator_pubkeys(
@@ -836,8 +989,9 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
     let our = our_pk.clone();
     let (row, you_are_banned, you_are_moderator) = tokio::task::spawn_blocking(move || {
         let row = db.get_channel(&id)?;
-        let banned = db.channel_member_is_banned(&id, &our).unwrap_or(false);
-        let moderator = db.channel_member_is_moderator(&id, &our).unwrap_or(false);
+        let owned = row.as_ref().is_some_and(|r| r.is_owner);
+        let banned = !owned && db.channel_member_is_banned(&id, &our)?;
+        let moderator = db.channel_member_is_moderator(&id, &our)?;
         Ok::<_, anyhow::Error>((row, banned, moderator))
     })
     .await
@@ -860,28 +1014,53 @@ async fn load_joined_channel(
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))
 }
 
+/// Whether *we* are barred from taking part in this room.
+///
+/// Ownership wins over the ban list, always. A ban is only legitimate because
+/// the owner's signed moderation record says so, and moderator ban gossip
+/// cannot exclude the owner because nothing on the wire identifies which pubkey
+/// owns a room — only our own `is_owner` flag does. Honouring a ban against
+/// ourselves in a room we own therefore let a moderator we appointed silence us
+/// and strip the moderation tools needed to undo it.
+///
+/// `fail_code` lets the caller keep its own translated framing.
+async fn self_banned_from(
+    state: &AppState,
+    row: &StoredChannel,
+    fail_code: &'static str,
+) -> Result<bool, String> {
+    if row.is_owner {
+        return Ok(false);
+    }
+    let db = state.db.clone();
+    let id = row.channel_id.clone();
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    tokio::task::spawn_blocking(move || db.channel_member_is_banned(&id, &our_pk))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx(fail_code, "Could not check your membership", e))
+}
+
 async fn moderation_power(
     state: &AppState,
     channel_id: &str,
 ) -> Result<(StoredChannel, bool, bool), String> {
     let row = load_joined_channel(state, channel_id).await?;
-    let our_pk = hex::encode(state.identity.ed25519_public_key);
-    let db = state.db.clone();
-    let id = channel_id.to_string();
-    let (banned, moderator) = tokio::task::spawn_blocking(move || {
-        let banned = db.channel_member_is_banned(&id, &our_pk)?;
-        let moderator = db.channel_member_is_moderator(&id, &our_pk)?;
-        Ok::<_, anyhow::Error>((banned, moderator))
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
-    if banned {
+    if self_banned_from(state, &row, "channels_moderation_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
         ));
     }
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let moderator = tokio::task::spawn_blocking(move || {
+        db.channel_member_is_moderator(&id, &our_pk)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
     let is_owner = row.is_owner;
     Ok((row, is_owner, moderator))
 }
@@ -979,6 +1158,7 @@ pub async fn update_channel_moderation(
     let channel_id = parse_channel_id(&channel_id)?;
     let topic = sanitize_topic(&topic)?;
     let welcome = sanitize_welcome(&welcome)?;
+    let _snapshot = moderation_lock().lock().await;
     let owned = load_owned_channel(&state, &channel_id).await?;
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mods = load_moderator_pubkeys(&state, &channel_id).await?;
@@ -1007,6 +1187,7 @@ pub async fn ban_channel_member(
             "You cannot ban yourself",
         ));
     }
+    let _snapshot = moderation_lock().lock().await;
     let (row, is_owner, is_mod) = moderation_power(&state, &channel_id).await?;
     if !is_owner && !is_mod {
         return Err(coded(
@@ -1059,6 +1240,7 @@ pub async fn unban_channel_member(
     }
     let channel_id = parse_channel_id(&channel_id)?;
     let pk = parse_member_pubkey(&member_pubkey)?;
+    let _snapshot = moderation_lock().lock().await;
     let (row, is_owner, is_mod) = moderation_power(&state, &channel_id).await?;
     if !is_owner && !is_mod {
         return Err(coded(
@@ -1107,6 +1289,7 @@ pub async fn add_channel_moderator(
             "You cannot appoint yourself as a moderator",
         ));
     }
+    let _snapshot = moderation_lock().lock().await;
     let owned = load_owned_channel(&state, &channel_id).await?;
     let mut bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mut mods = load_moderator_pubkeys(&state, &channel_id).await?;
@@ -1148,6 +1331,7 @@ pub async fn remove_channel_moderator(
     }
     let channel_id = parse_channel_id(&channel_id)?;
     let pk = parse_member_pubkey(&member_pubkey)?;
+    let _snapshot = moderation_lock().lock().await;
     let owned = load_owned_channel(&state, &channel_id).await?;
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mut mods = load_moderator_pubkeys(&state, &channel_id).await?;
@@ -1329,6 +1513,24 @@ pub async fn transfer_channel_ownership(
             "This room has already been transferred",
         ));
     }
+    // `set_channel_pending_handoff` overwrites, so a second offer to a
+    // different member would orphan the first and leave the room in an
+    // ambiguous handoff. Re-offering to the same member stays allowed, since a
+    // dropped gossip offer otherwise has no retry.
+    let db = state.db.clone();
+    let pending_id = channel_id.clone();
+    let pending = tokio::task::spawn_blocking(move || db.channel_pending_handoff(&pending_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
+    if let Some((waiting_on, _)) = pending {
+        if !waiting_on.eq_ignore_ascii_case(&hex::encode(pk)) {
+            return Err(coded(
+                "channels_handoff_pending",
+                "A transfer to another member is already waiting to be accepted",
+            ));
+        }
+    }
     let member_hex = hex::encode(pk);
     let db = state.db.clone();
     let id = channel_id.clone();
@@ -1433,16 +1635,7 @@ pub async fn offer_channel_file(
     let channel_id = parse_channel_id(&channel_id)?;
     let row = load_joined_channel(&state, &channel_id).await?;
     let sender = hex::encode(state.identity.ed25519_public_key);
-    let db = state.db.clone();
-    let banned_id = channel_id.clone();
-    let banned_pk = sender.clone();
-    let banned = tokio::task::spawn_blocking(move || {
-        db.channel_member_is_banned(&banned_id, &banned_pk)
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_attach_failed", "Could not attach the file", e))?;
-    if banned {
+    if self_banned_from(&state, &row, "channels_attach_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
@@ -1516,6 +1709,15 @@ pub async fn request_channel_file(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let row = load_joined_channel(&state, &channel_id).await?;
+    // This originates gossip, so it carries the same ban check as
+    // `offer_channel_file`. Reading an attachment already on disk does not:
+    // a ban stops you taking part, it does not revoke what you received.
+    if self_banned_from(&state, &row, "channels_file_failed").await? {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
     let digest = parse_file_digest(&digest)?;
     let Some(join_secret) = join_secret_for_channel(&state, &row).await else {
         return Err(coded(

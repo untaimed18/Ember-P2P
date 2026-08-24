@@ -770,6 +770,10 @@ impl EmberDht {
     /// Insert a contact directly (manual harness seeding). Returns
     /// `true` if it landed in a bucket, `false` if rejected (self,
     /// subnet-diversity limit) or only cached behind a full bucket.
+    /// Live traffic uses [`RoutingTable::add_contact`] via signed frames;
+    /// this wrapper exists for the `add_ember_dht_contact` harness
+    /// command and for unit tests.
+    #[cfg(any(test, debug_assertions))]
     pub fn add_contact(&mut self, contact: EmberContact) -> bool {
         matches!(self.routing.add_contact(contact), AddResult::Added)
     }

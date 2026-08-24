@@ -39,20 +39,7 @@ const MESSAGE_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * sure an entry cannot outlive its reason: once a key gains a call site, this
  * test fails until it is removed from here.
  */
-const ALLOWED_ORPHANS = new Map([
-  [
-    "channels_owner",
-    "Channel UI in progress on develop; the roster does not render an owner badge yet.",
-  ],
-  [
-    "channels_create_title",
-    "Channel UI in progress on develop; the create dialog is not wired up yet.",
-  ],
-  [
-    "channels_attach_too_large",
-    "Channel UI in progress on develop; attachment size refusal is not implemented yet.",
-  ],
-]);
+const ALLOWED_ORPHANS = new Map();
 
 /** Compiled Paraglide output is generated from these same keys; skip it. */
 const SKIP_DIRS = new Set(["paraglide", "node_modules"]);

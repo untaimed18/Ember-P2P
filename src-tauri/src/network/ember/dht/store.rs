@@ -3031,6 +3031,82 @@ mod tests {
         );
     }
 
+    /// A room's public-index record is published once, when the room is created
+    /// (`commands::channels::create_channel`), and nothing republishes it.
+    /// Replication cannot make up the difference, which is the point of this
+    /// test: remaining life is derived from the publisher's signed creation
+    /// time, so a storer offered the identical bytes past the TTL refuses them
+    /// rather than granting a fresh 24 hours. Discover (`gather_channels`)
+    /// walks exactly these keys, so a public room stops being discoverable one
+    /// TTL after creation whether or not its owner is online.
+    #[test]
+    fn a_channel_index_record_cannot_outlive_its_signed_creation_time() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let ttl = KEYWORD_RECORD_TTL.as_secs() as i64;
+
+        let mut inside = DhtStore::new();
+        assert!(
+            inside.store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+                record.publisher_key,
+                now_ts() - ttl + 600,
+            ),
+            "ten minutes short of the TTL a storer still holds the listing"
+        );
+        assert_eq!(inside.get_live(&record.keyword_hash).len(), 1);
+
+        // What a replica re-offering the record looks like once the owner has
+        // not re-signed a newer one.
+        let mut lapsed = DhtStore::new();
+        assert!(
+            !lapsed.store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+                record.publisher_key,
+                now_ts() - ttl - 600,
+            ),
+            "past the TTL the same signed bytes buy no further life"
+        );
+        assert!(lapsed.get_live(&record.keyword_hash).is_empty());
+
+        // And what the owner's republish does instead: index records dedupe on
+        // publisher plus room id, so a newly signed listing takes the aged
+        // one's place with a full TTL rather than piling up beside it.
+        let renewed = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert!(inside.store(
+            renewed.keyword_hash,
+            renewed.data.clone(),
+            renewed.signature,
+            renewed.publisher_key,
+            now_ts(),
+        ));
+        let held = inside.get_live(&renewed.keyword_hash);
+        assert_eq!(held.len(), 1, "a republish replaces, it does not accumulate");
+        assert!(
+            held[0].expires_at > Instant::now() + Duration::from_secs((ttl - 3600) as u64),
+            "the replacement carries a fresh full lifetime"
+        );
+    }
+
     #[test]
     fn get_live_skips_expired_records() {
         let mut store = DhtStore::new();

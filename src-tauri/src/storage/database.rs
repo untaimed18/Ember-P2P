@@ -18,7 +18,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 31;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 32;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -65,6 +65,11 @@ pub struct StoredChannel {
     pub successor_id: String,
     /// Empty unless we joined this room by following a handoff.
     pub predecessor_id: String,
+    /// The owner's user pubkey (64-char hex) as published in their signed
+    /// moderation record, or empty when we have not learned it. Load-bearing:
+    /// it is the only thing that lets a member refuse a moderator's ban aimed
+    /// at the owner.
+    pub owner_pubkey: String,
 }
 
 /// One member of a joined channel. `member_pubkey` is 64-char hex.
@@ -1527,6 +1532,24 @@ impl Database {
                 );",
             )?;
             set_version(&tx, 31)?;
+            tx.commit()?;
+        }
+
+        if version < 32 {
+            // The owner's own user identity, learned from their signed
+            // moderation record. Members need it to refuse a moderator's ban
+            // gossip that names the owner: nothing else on the wire says which
+            // pubkey owns a room, so before this every member applied such a
+            // ban and silently dropped the owner's messages. Empty means "not
+            // learned yet" — no record seen, or one predating the field.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "owner_pubkey",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 32)?;
             tx.commit()?;
         }
 
@@ -3707,7 +3730,7 @@ impl Database {
                     (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
                     (SELECT COUNT(*) FROM channel_messages msg
                      WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
-                    c.successor_id, c.predecessor_id
+                    c.successor_id, c.predecessor_id, c.owner_pubkey
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -3727,6 +3750,7 @@ impl Database {
                     unread: row.get(10)?,
                     successor_id: row.get::<_, String>(11).unwrap_or_default(),
                     predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
+                    owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3742,7 +3766,7 @@ impl Database {
                         (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
                         (SELECT COUNT(*) FROM channel_messages msg
                          WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
-                        c.successor_id, c.predecessor_id
+                        c.successor_id, c.predecessor_id, c.owner_pubkey
                  FROM channels c WHERE c.channel_id = ?1",
                 params![channel_id],
                 |row| {
@@ -3760,6 +3784,7 @@ impl Database {
                         unread: row.get(10)?,
                         successor_id: row.get::<_, String>(11).unwrap_or_default(),
                         predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
+                        owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
                     })
                 },
             )
@@ -3815,17 +3840,47 @@ impl Database {
         Ok(())
     }
 
-    pub fn delete_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
+    /// Forget a channel. A ban recorded against `keep_banned_member` survives,
+    /// because a ban belongs to the room rather than to the membership: wiping
+    /// it made leaving and rejoining a client-side ban reset, and the local
+    /// flag is what stops the composer accepting sends that every remaining
+    /// member will discard. Pass `None` when there is nothing to preserve
+    /// (rolling back a room that was never published).
+    pub fn delete_channel(
+        &self,
+        channel_id: &str,
+        keep_banned_member: Option<&str>,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM channel_messages WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        // Attachment bookkeeping and any half-finished handoff go with the
+        // room. Left behind they are unreachable rows keyed to a channel that
+        // no longer exists, and a rejoin would inherit stale "complete" flags
+        // for files whose sealed bytes the caller has since removed.
         tx.execute(
-            "DELETE FROM channel_members WHERE channel_id = ?1",
+            "DELETE FROM channel_attachments WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        tx.execute(
+            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![channel_id],
+        )?;
+        match keep_banned_member {
+            Some(pk) => tx.execute(
+                "DELETE FROM channel_members
+                 WHERE channel_id = ?1
+                   AND NOT (banned = 1 AND lower(member_pubkey) = lower(?2))",
+                params![channel_id, pk],
+            )?,
+            None => tx.execute(
+                "DELETE FROM channel_members WHERE channel_id = ?1",
+                params![channel_id],
+            )?,
+        };
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],
@@ -4353,6 +4408,12 @@ impl Database {
     /// Apply an owner-signed moderation snapshot if it is newer than what we hold.
     /// Replaces bans and the moderator list; a later gossip action can still
     /// override an individual ban via `ban_revised_at`.
+    /// Apply an owner-signed snapshot.
+    ///
+    /// `owner_pubkey` is remembered when the record carries one, and is never
+    /// added to the ban list even if the snapshot names it — the owner is the
+    /// authority a ban derives from, so a record banning them is either
+    /// corrupt or hostile.
     pub fn apply_channel_moderation(
         &self,
         channel_id: &str,
@@ -4361,6 +4422,7 @@ impl Database {
         timestamp: i64,
         banned_pubkeys: &[[u8; 32]],
         moderator_pubkeys: &[[u8; 32]],
+        owner_pubkey: Option<&[u8; 32]>,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let current: i64 = conn
@@ -4394,8 +4456,15 @@ impl Database {
             "UPDATE channel_members SET moderator = 0 WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        let owner_hex = owner_pubkey.map(hex::encode);
         for pk in banned_pubkeys.iter().take(32) {
             let hex_pk = hex::encode(pk);
+            // The owner is the authority a ban derives from, so a snapshot
+            // naming them is corrupt or hostile either way. Skipping is enough:
+            // the sweep above has already cleared their row.
+            if owner_hex.as_deref() == Some(hex_pk.as_str()) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO channel_members
                     (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
@@ -4415,6 +4484,21 @@ impl Database {
                  VALUES (?1, ?2, '', 0, 0, 1, 0)
                  ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET moderator = 1",
                 params![channel_id, hex_pk],
+            )?;
+        }
+        // Only overwrite when this record actually carries an owner: a record
+        // predating the field must not erase what a newer one already told us.
+        if let Some(hex_owner) = owner_hex.as_deref() {
+            tx.execute(
+                "UPDATE channels SET owner_pubkey = ?2 WHERE channel_id = ?1",
+                params![channel_id, hex_owner],
+            )?;
+            // A ban recorded against the owner before we knew who they were is
+            // exactly the state this whole change exists to undo.
+            tx.execute(
+                "UPDATE channel_members SET banned = 0
+                 WHERE channel_id = ?1 AND lower(member_pubkey) = lower(?2)",
+                params![channel_id, hex_owner],
             )?;
         }
         tx.commit()?;
@@ -4516,6 +4600,75 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(new_id)
+    }
+
+    /// Substring match over a room's history, newest first.
+    ///
+    /// Cannot be a SQL `LIKE`: `encrypt_channel_message_body` binds each body
+    /// to its own row id, room, direction and timestamp, so the stored column
+    /// is ciphertext and every candidate has to be decrypted here. Bounded by
+    /// the per-room retention cap above, and stops as soon as `limit` matches
+    /// are found so the common case walks only the recent tail.
+    pub fn search_channel_messages(
+        &self,
+        channel_id: &str,
+        needle: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, sender_pubkey, direction, message, timestamp, read
+                 FROM channel_messages WHERE channel_id = ?1
+                 ORDER BY id DESC",
+            )?;
+            let mapped = stmt.query_map(params![channel_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        // No key means no plaintext to match against; report nothing rather
+        // than a page of "unavailable" placeholders that all "match".
+        let Some(chat_key) = self.chat_key.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut hits = Vec::new();
+        for (id, sender, direction, stored, timestamp, read) in rows {
+            if hits.len() as i64 >= limit {
+                break;
+            }
+            let Ok(message) = Self::decrypt_channel_message_body(
+                chat_key, id, channel_id, &direction, timestamp, &stored,
+            ) else {
+                continue;
+            };
+            if message.to_lowercase().contains(&needle) {
+                hits.push((id, sender, direction, message, timestamp, read));
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Forget one message on this device. Local only: the copy every other
+    /// member holds is untouched, and nothing is gossiped.
+    pub fn delete_channel_message(&self, channel_id: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
+            params![channel_id, id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn get_channel_messages(
@@ -5683,7 +5836,7 @@ mod tests {
         let banned = [0x33u8; 32];
         let banned_hex = hex::encode(banned);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
@@ -5693,12 +5846,12 @@ mod tests {
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
         assert!(!db
-            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[])
+            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None)
             .unwrap());
         assert!(!db
             .channel_member_is_banned(&channel_id, &banned_hex)
@@ -5707,7 +5860,7 @@ mod tests {
         let moderator = [0x44u8; 32];
         let mod_hex = hex::encode(moderator);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None)
             .unwrap());
         assert!(db
             .channel_member_is_moderator(&channel_id, &mod_hex)
@@ -5722,7 +5875,7 @@ mod tests {
             .channel_member_is_banned(&channel_id, &banned_hex)
             .unwrap());
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator])
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None)
             .unwrap());
         assert!(
             db.channel_member_is_banned(&channel_id, &banned_hex)
@@ -5757,8 +5910,203 @@ mod tests {
         assert_eq!(listed[0].name, "Lobby");
         assert!(listed[0].is_owner);
 
-        assert!(db.delete_channel(&channel_id).unwrap());
+        assert!(db.delete_channel(&channel_id, None).unwrap());
         assert!(db.list_channels().unwrap().is_empty());
+        assert!(
+            db.list_channel_members(&channel_id).unwrap().is_empty(),
+            "no member is preserved when the caller keeps nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A moderator could name the room owner in ban gossip and every member
+    /// applied it, silently dropping the owner's messages — nothing on the wire
+    /// said who the owner was, so no recipient had grounds to refuse. The owner
+    /// now signs their own identity into the moderation record; this covers the
+    /// storage half of that: the key is remembered, a snapshot naming the owner
+    /// cannot ban them, and learning who the owner is undoes a ban recorded
+    /// before we knew.
+    #[test]
+    fn a_moderation_snapshot_can_never_ban_the_room_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-owner-ban-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "3c".repeat(16);
+        let channel_pubkey = "4d".repeat(32);
+        let owner = [0x0Au8; 32];
+        let owner_hex = hex::encode(owner);
+        let nuisance = [0x0Bu8; 32];
+        let nuisance_hex = hex::encode(nuisance);
+
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        // Stand in for the hole: a moderator's gossip ban on the owner, applied
+        // before this device had ever seen an owner-signed record.
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &owner_hex, true, 40)
+            .unwrap());
+        assert!(db.channel_member_is_banned(&channel_id, &owner_hex).unwrap());
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey, "");
+
+        // The owner's own snapshot arrives. It names them, so the stale ban goes
+        // and the identity is remembered for the gossip path to check against.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "topic",
+                "",
+                50,
+                &[nuisance],
+                &[],
+                Some(&owner),
+            )
+            .unwrap());
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &owner_hex).unwrap(),
+            "learning who the owner is must undo a ban recorded before we knew"
+        );
+        assert!(
+            db.channel_member_is_banned(&channel_id, &nuisance_hex).unwrap(),
+            "everyone else in the snapshot is still banned"
+        );
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
+            owner_hex
+        );
+
+        // And a snapshot that names the owner in its own ban list is refused
+        // that one entry rather than being applied wholesale.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "topic",
+                "",
+                60,
+                &[owner, nuisance],
+                &[],
+                Some(&owner),
+            )
+            .unwrap());
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &owner_hex).unwrap(),
+            "a record banning its own owner is corrupt or hostile either way"
+        );
+        assert!(db.channel_member_is_banned(&channel_id, &nuisance_hex).unwrap());
+
+        // A later record that predates the field must not erase what we know.
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None)
+            .unwrap());
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
+            owner_hex,
+            "a record that says nothing about the owner is not a record saying nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Leaving used to wipe `channel_members`, so rejoining re-inserted the
+    /// member with `banned = 0` and the client offered a composer whose sends
+    /// every remaining member discards. A ban belongs to the room, not to the
+    /// membership, so it has to outlive an explicit leave.
+    #[test]
+    fn leaving_keeps_our_own_ban_but_forgets_everything_else() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-leave-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "1a".repeat(16);
+        let channel_pubkey = "2b".repeat(32);
+        let us = [0x55u8; 32];
+        let us_hex = hex::encode(us);
+        let other = [0x66u8; 32];
+        let other_hex = hex::encode(other);
+
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 100)
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &other_hex, "Them", 100)
+            .unwrap();
+        assert!(db
+            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None)
+            .unwrap());
+
+        assert!(db.delete_channel(&channel_id, Some(&us_hex)).unwrap());
+        assert!(db.get_channel(&channel_id).unwrap().is_none());
+        assert!(
+            db.channel_member_is_banned(&channel_id, &us_hex).unwrap(),
+            "our ban must outlive leaving the room"
+        );
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &other_hex).unwrap(),
+            "another member's ban is not ours to keep once we have left"
+        );
+
+        // Rejoining must not launder the ban: `upsert_channel_member` refreshes
+        // the nickname and last-seen but leaves `banned` alone.
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("rejoin channel");
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 200)
+            .unwrap();
+        assert!(
+            db.channel_member_is_banned(&channel_id, &us_hex).unwrap(),
+            "rejoining must not clear the ban"
+        );
+
+        // The owner lifting it still does, on the next moderation snapshot.
+        assert!(db
+            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None)
+            .unwrap());
+        assert!(!db.channel_member_is_banned(&channel_id, &us_hex).unwrap());
 
         drop(db);
         let _ = std::fs::remove_file(&path);

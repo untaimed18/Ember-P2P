@@ -492,6 +492,11 @@ pub struct ChannelModeration {
     pub welcome: String,
     pub banned_pubkeys: Vec<[u8; 32]>,
     pub moderator_pubkeys: Vec<[u8; 32]>,
+    /// The owner's own user identity, signed by the room key so every member
+    /// can tell who it is. Without it a moderator's ban gossip could name the
+    /// owner and no recipient had grounds to refuse. `None` for records
+    /// published before this field existed — unknown, not "nobody".
+    pub owner_pubkey: Option<[u8; 32]>,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
 }
@@ -655,6 +660,7 @@ impl SignedRecord {
         welcome: &str,
         banned_pubkeys: &[[u8; 32]],
         moderator_pubkeys: &[[u8; 32]],
+        owner_pubkey: Option<&[u8; 32]>,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         private: bool,
@@ -662,7 +668,8 @@ impl SignedRecord {
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
-        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys);
+        let extra =
+            encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, owner_pubkey);
         Self::build(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
@@ -895,12 +902,14 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_MODERATION {
             return None;
         }
-        let (welcome, banned_pubkeys, moderator_pubkeys) = decode_moderation_extra(&meta.extra)?;
+        let (welcome, banned_pubkeys, moderator_pubkeys, owner_pubkey) =
+            decode_moderation_extra(&meta.extra)?;
         Some(ChannelModeration {
             topic: rec.file_name,
             welcome,
             banned_pubkeys,
             moderator_pubkeys,
+            owner_pubkey,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
         })
@@ -1075,6 +1084,7 @@ fn encode_moderation_extra(
     welcome: &str,
     banned_pubkeys: &[[u8; 32]],
     moderator_pubkeys: &[[u8; 32]],
+    owner_pubkey: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
     let bans = banned_pubkeys
@@ -1086,7 +1096,7 @@ fn encode_moderation_extra(
         .take(CHANNEL_MOD_LIST_MAX)
         .collect::<Vec<_>>();
     let mut extra =
-        Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32);
+        Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32 + 32);
     extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
     extra.extend_from_slice(welcome.as_bytes());
     extra.extend_from_slice(&(bans.len() as u16).to_le_bytes());
@@ -1097,15 +1107,23 @@ fn encode_moderation_extra(
     for pk in mods {
         extra.extend_from_slice(pk);
     }
+    if let Some(owner) = owner_pubkey {
+        extra.extend_from_slice(owner);
+    }
     extra
 }
 
 /// Decode the extra blob from a moderation record.
 ///
-/// Records published before moderator delegations omit the trailing list;
-/// treat that as an empty delegation set so a mixed network can still apply
-/// topic/welcome/bans.
-pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+/// Two fields have been appended over time and both are optional on the way
+/// in, so a mixed network still applies whatever a record does carry: records
+/// from before moderator delegation omit the delegation list, and records from
+/// before owner identity omit the trailing owner key. A missing owner means
+/// "this record does not say", which readers must treat as unknown rather than
+/// as nobody.
+type ModerationExtra = (String, Vec<[u8; 32]>, Vec<[u8; 32]>, Option<[u8; 32]>);
+
+pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
     if extra.len() < 4 {
         return None;
     }
@@ -1131,7 +1149,7 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>, V
     }
     let rest = &extra[bans_end..];
     if rest.is_empty() {
-        return Some((welcome, bans, Vec::new()));
+        return Some((welcome, bans, Vec::new(), None));
     }
     if rest.len() < 2 {
         return None;
@@ -1140,17 +1158,29 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<(String, Vec<[u8; 32]>, V
     if mod_count > CHANNEL_MOD_LIST_MAX {
         return None;
     }
-    let mods_bytes = &rest[2..];
-    if mods_bytes.len() != mod_count * 32 {
+    let mods_end = 2 + mod_count * 32;
+    if rest.len() < mods_end {
         return None;
     }
     let mut mods = Vec::with_capacity(mod_count);
-    for chunk in mods_bytes.chunks_exact(32) {
+    for chunk in rest[2..mods_end].chunks_exact(32) {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(chunk);
         mods.push(pk);
     }
-    Some((welcome, bans, mods))
+    // Trailing owner key: present or absent, never partial. A short or
+    // oversized tail is a malformed record rather than an older one.
+    let tail = &rest[mods_end..];
+    let owner = match tail.len() {
+        0 => None,
+        32 => {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(tail);
+            Some(pk)
+        }
+        _ => return None,
+    };
+    Some((welcome, bans, mods, owner))
 }
 
 /// Tracks a single publish operation: store a record on the closest K nodes.
@@ -1800,11 +1830,13 @@ mod tests {
         let ident = channel::ChannelIdentity::generate();
         let banned = [[0x11u8; 32], [0x22u8; 32]];
         let mods = [[0xAAu8; 32]];
+        let owner = [0x77u8; 32];
         let record = SignedRecord::channel_moderation(
             "rules",
             "be kind",
             &banned,
             &mods,
+            Some(&owner),
             ident.channel_id,
             ident.pubkey,
             false,
@@ -1812,12 +1844,13 @@ mod tests {
         );
         assert!(record.channel_store_ok());
         let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
-        let (welcome, bans, parsed_mods) =
+        let (welcome, bans, parsed_mods, parsed_owner) =
             decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
         assert_eq!(parsed.file_name, "rules");
         assert_eq!(welcome, "be kind");
         assert_eq!(bans, banned);
         assert_eq!(parsed_mods, mods);
+        assert_eq!(parsed_owner, Some(owner));
 
         let mut blob = record.data.clone();
         blob.extend_from_slice(&record.signature);
@@ -1826,8 +1859,33 @@ mod tests {
         assert_eq!(mod_info.welcome, "be kind");
         assert_eq!(mod_info.banned_pubkeys, banned);
         assert_eq!(mod_info.moderator_pubkeys, mods);
+        assert_eq!(
+            mod_info.owner_pubkey,
+            Some(owner),
+            "members can only refuse a ban on the owner if the record names them"
+        );
         assert_eq!(mod_info.publisher_key, ident.pubkey);
         assert!(SignedRecord::parse_channel_moderation(&blob, &[0x00; 16]).is_none());
+
+        // A record that omits the owner is readable, and reports unknown rather
+        // than defaulting to some pubkey nobody holds.
+        let anonymous = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &banned,
+            &mods,
+            None,
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let mut anon_blob = anonymous.data.clone();
+        anon_blob.extend_from_slice(&anonymous.signature);
+        let anon_info =
+            SignedRecord::parse_channel_moderation(&anon_blob, &ident.channel_id).unwrap();
+        assert_eq!(anon_info.owner_pubkey, None);
+        assert_eq!(anon_info.banned_pubkeys, banned);
 
         let successor = channel::ChannelIdentity::generate();
         let handoff = SignedRecord::channel_handoff(
@@ -1849,12 +1907,19 @@ mod tests {
         assert!(SignedRecord::parse_channel_handoff(&hblob, &[0u8; 16]).is_none());
 
         // Pre-delegation extra: welcome + bans and nothing after.
-        let mut legacy = encode_moderation_extra("hi", &banned, &[]);
+        let mut legacy = encode_moderation_extra("hi", &banned, &[], None);
         legacy.truncate(legacy.len() - 2);
-        let (w, b, m) = decode_moderation_extra(&legacy).unwrap();
+        let (w, b, m, o) = decode_moderation_extra(&legacy).unwrap();
         assert_eq!(w, "hi");
         assert_eq!(b, banned);
         assert!(m.is_empty());
+        assert_eq!(o, None);
+
+        // A partial owner key is malformed, not an older record: accepting a
+        // short tail would let a truncated pubkey stand in for the owner.
+        let mut short_owner = encode_moderation_extra("hi", &banned, &[], Some(&[0x99u8; 32]));
+        short_owner.truncate(short_owner.len() - 1);
+        assert!(decode_moderation_extra(&short_owner).is_none());
     }
 
     #[test]
@@ -1878,9 +1943,13 @@ mod tests {
     fn decode_moderation_extra_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_E07A);
-        let well_formed =
-            encode_moderation_extra("welcome ☕", &[[0x11u8; 32], [0x22u8; 32]], &[[0xAAu8; 32]]);
-        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[]);
+        let well_formed = encode_moderation_extra(
+            "welcome ☕",
+            &[[0x11u8; 32], [0x22u8; 32]],
+            &[[0xAAu8; 32]],
+            Some(&[0x77u8; 32]),
+        );
+        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[], None);
         legacy.truncate(legacy.len() - 2);
         let mut decoded_ok = 0usize;
         for i in 0..2_000 {
@@ -1903,10 +1972,11 @@ mod tests {
                 decoded_ok += 1;
             }
         }
-        let (welcome, bans, mods) = decode_moderation_extra(&well_formed).unwrap();
+        let (welcome, bans, mods, owner) = decode_moderation_extra(&well_formed).unwrap();
         assert_eq!(welcome, "welcome ☕");
         assert_eq!(bans.len(), 2);
         assert_eq!(mods.len(), 1);
+        assert_eq!(owner, Some([0x77u8; 32]));
         assert!(
             decoded_ok > 0,
             "the fuzz never produced a buffer that reached decode_moderation_extra"
@@ -1935,6 +2005,7 @@ mod tests {
             "be kind",
             &[[0x11u8; 32]],
             &[[0xAAu8; 32]],
+            Some(&[0x77u8; 32]),
             ident.channel_id,
             ident.pubkey,
             false,

@@ -2170,6 +2170,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::AddEmberDhtContact {
             addr,
             ed25519_pub,
@@ -2339,6 +2340,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtPing {
             addr,
             peer_pubkey,
@@ -2425,6 +2427,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtFindNode {
             addr,
             peer_pubkey,
@@ -2518,6 +2521,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberDhtFindPending { contacts_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtIterativeFindNode { target, tx } => {
             // Start a multi-hop lookup and let the driver fan out
             // FIND_NODE rounds across the closest contacts it learns.
@@ -2549,6 +2553,7 @@ async fn handle_command_inner(
             drive_ember_search(socket, state, search_id).await;
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::PublishEmberKeyword {
             keyword,
             file_name,
@@ -2606,6 +2611,7 @@ async fn handle_command_inner(
             drive_ember_publish(socket, state, publish_id).await;
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::FindEmberValue { keyword, tx } => {
             if !settings.ember_native_enabled {
                 let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
@@ -2653,6 +2659,7 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
                 return;
             }
+            #[cfg(debug_assertions)]
             let key_hex = hex::encode(record.keyword_hash);
             let publish_id = match state
                 .ember_publish
@@ -2672,6 +2679,7 @@ async fn handle_command_inner(
                 .ember_dht_pending_publishes
                 .insert(publish_id, result_tx);
             let _ = tx.send(Ok(EmberPublishPending {
+                #[cfg(debug_assertions)]
                 key: key_hex,
                 result_rx,
             }));
@@ -2725,6 +2733,7 @@ async fn handle_command_inner(
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::RunEmberMaintenance { tx } => {
             if !settings.ember_native_enabled {
                 let _ = tx.send(Err("Ember-native transport is disabled".to_string()));

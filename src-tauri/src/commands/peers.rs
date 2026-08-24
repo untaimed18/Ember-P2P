@@ -1554,28 +1554,7 @@ pub async fn ember_ping_peer(
     // (`ember_ping_peer({...})` with no pubkey and
     // `ember_ping_peer({..., peerPubkeyHex: ''})`) both working.
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
-        Some(s) if !s.is_empty() => {
-            let bytes = hex::decode(s).map_err(|e| {
-                coded_ctx(
-                    "peers_pubkey_invalid_hex",
-                    "peer_pubkey_hex is not valid hex",
-                    e,
-                )
-            })?;
-            if bytes.len() != 32 {
-                return Err(coded_ctx(
-                    "peers_pubkey_wrong_length",
-                    format!(
-                        "peer_pubkey_hex must decode to 32 bytes, got {}",
-                        bytes.len()
-                    ),
-                    bytes.len(),
-                ));
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            Some(k)
-        }
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
         _ => None,
     };
 
@@ -1666,28 +1645,7 @@ pub async fn ember_request_sources(
 
     // Same "absent or empty string ⇒ look it up" handling as ember_ping_peer.
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
-        Some(s) if !s.is_empty() => {
-            let bytes = hex::decode(s).map_err(|e| {
-                coded_ctx(
-                    "peers_pubkey_invalid_hex",
-                    "peer_pubkey_hex is not valid hex",
-                    e,
-                )
-            })?;
-            if bytes.len() != 32 {
-                return Err(coded_ctx(
-                    "peers_pubkey_wrong_length",
-                    format!(
-                        "peer_pubkey_hex must decode to 32 bytes, got {}",
-                        bytes.len()
-                    ),
-                    bytes.len(),
-                ));
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            Some(k)
-        }
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
         _ => None,
     };
 
@@ -1753,7 +1711,9 @@ fn require_public_ember_peer_ip(ip: IpAddr, message: &'static str) -> Result<(),
 }
 
 /// Parse a 32-char hex string into a 16-byte Ember node ID / lookup
-/// target.
+/// target. Only the `debug_assertions` DHT harness commands take a
+/// node-id hex argument, so this is compiled out of release builds.
+#[cfg(debug_assertions)]
 fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
     let bytes = hex::decode(hex_str).map_err(|e| {
         coded_ctx(

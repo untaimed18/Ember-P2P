@@ -58,6 +58,17 @@ pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
 /// Cap on distinct hops tracked in the inbound gossip rate map.
 pub const CHANNEL_GOSSIP_IN_PEER_CAP: usize = 512;
+/// Chat messages accepted from one room member per second, counted against the
+/// signed author rather than the hop that handed them over.
+///
+/// The per-hop limit above bounds what any single neighbor can push at us, but
+/// a flood spreads across the mesh and arrives via many hops at once, so it
+/// buys the room nothing on its own: one member could saturate every peer and
+/// each would dutifully relay. Four a second is far above human typing and far
+/// below what makes a room unreadable.
+pub const CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC: usize = 4;
+/// Cap on distinct (room, author) pairs tracked for the limit above.
+pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 /// Recent local messages offered to a neighbor that asks for catch-up.
 pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
 /// How often we ask one neighbor for missed history.
@@ -860,6 +871,47 @@ pub fn rate_window_allow(
     true
 }
 
+/// Admit one chat message from `author` in `channel_id`, or refuse it as a
+/// flood. Keyed on the room as well as the author so a member who is noisy in
+/// one room is not throttled in another.
+///
+/// Refuses outright once `CHANNEL_GOSSIP_AUTHOR_CAP` other pairs are tracked:
+/// the map is the only thing standing between a stream of invented authors and
+/// unbounded growth, and an admitted-but-untracked message would let exactly
+/// that stream past.
+pub fn author_gossip_allow(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let key = (channel_id, *author);
+    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
+        return false;
+    }
+    let times = seen.entry(key).or_default();
+    rate_window_allow(
+        times,
+        now,
+        Duration::from_secs(1),
+        CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
+    )
+}
+
+/// Drop tracking for authors with no activity inside `window`, so a long
+/// session does not hold a slot for everyone who ever spoke.
+pub fn prune_author_gossip(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    now: Instant,
+    window: Duration,
+) {
+    seen.retain(|_, times| {
+        times
+            .back()
+            .is_some_and(|t| now.saturating_duration_since(*t) <= window)
+    });
+}
+
 /// Storers cannot decrypt a private extra; they only check the length so a
 /// truncated or obviously-junk blob is dropped.
 pub fn presence_extra_store_ok(extra: &[u8]) -> bool {
@@ -997,6 +1049,26 @@ pub fn remember_gossip_id(
     seen.insert(msg_id, now);
     order.push_back(msg_id);
     true
+}
+
+/// Undo a [`remember_gossip_id`] for a message refused on grounds that may not
+/// hold next time — a rate limit rather than a validity failure.
+///
+/// Dedup runs before the body can even be decrypted, so a message refused
+/// later in the pipeline has already spent its id. Left spent, every retransmit
+/// is mistaken for a flood cycle and the message is lost on this node for good;
+/// a legitimate burst is exactly the case that produces one.
+pub fn forget_gossip_id(
+    seen: &mut HashMap<[u8; 16], Instant>,
+    order: &mut VecDeque<[u8; 16]>,
+    msg_id: &[u8; 16],
+) {
+    if seen.remove(msg_id).is_none() {
+        return;
+    }
+    if let Some(pos) = order.iter().rposition(|id| id == msg_id) {
+        order.remove(pos);
+    }
 }
 
 impl ChannelGossip {
@@ -1630,6 +1702,113 @@ mod tests {
             window,
             3
         ));
+    }
+
+    /// The per-hop limit cannot bound a flood that arrives spread across the
+    /// mesh, so the author limit is what actually protects a room — and it has
+    /// to stay per-room, refuse unknown authors once full, and free slots again
+    /// as members go quiet.
+    #[test]
+    fn author_flood_control_is_per_room_and_reclaims_quiet_slots() {
+        let mut seen = HashMap::new();
+        let room = [0x01u8; 16];
+        let other_room = [0x02u8; 16];
+        let alice = [0xAAu8; 32];
+        let bob = [0xBBu8; 32];
+        let start = Instant::now();
+
+        for i in 0..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(
+                author_gossip_allow(&mut seen, room, &alice, start),
+                "message {i} is inside the per-second budget"
+            );
+        }
+        assert!(
+            !author_gossip_allow(&mut seen, room, &alice, start),
+            "one past the budget is a flood"
+        );
+        assert!(
+            author_gossip_allow(&mut seen, room, &bob, start),
+            "another member is unaffected by Alice's budget"
+        );
+        assert!(
+            author_gossip_allow(&mut seen, other_room, &alice, start),
+            "and Alice still has a full budget in a different room"
+        );
+
+        // A second later her window has rolled off.
+        let later = start + Duration::from_secs(2);
+        assert!(author_gossip_allow(&mut seen, room, &alice, later));
+
+        // Slots are only reclaimed for authors who have actually gone quiet.
+        prune_author_gossip(&mut seen, later, Duration::from_secs(1));
+        assert!(
+            seen.contains_key(&(room, alice)),
+            "Alice just spoke, so she keeps her slot"
+        );
+        assert!(
+            !seen.contains_key(&(room, bob)),
+            "Bob has been silent past the window"
+        );
+    }
+
+    /// Dedup spends a message's id before the body can be decrypted, so a
+    /// rate-limited message must hand its id back or every retransmit reads as
+    /// a flood cycle and the message is lost on this node permanently.
+    #[test]
+    fn a_forgotten_gossip_id_can_be_admitted_again() {
+        let mut seen = HashMap::new();
+        let mut order = VecDeque::new();
+        let msg = [0x5Au8; 16];
+        let other = [0x11u8; 16];
+        let now = Instant::now();
+
+        assert!(remember_gossip_id(&mut seen, &mut order, 8, msg, now));
+        assert!(remember_gossip_id(&mut seen, &mut order, 8, other, now));
+        assert!(
+            !remember_gossip_id(&mut seen, &mut order, 8, msg, now),
+            "a second copy is a cycle while the id is still held"
+        );
+
+        forget_gossip_id(&mut seen, &mut order, &msg);
+        assert_eq!(order.len(), 1, "only the forgotten id leaves the order queue");
+        assert!(
+            remember_gossip_id(&mut seen, &mut order, 8, msg, now),
+            "and the retransmit is admitted"
+        );
+        assert!(
+            !remember_gossip_id(&mut seen, &mut order, 8, other, now),
+            "unrelated ids are untouched"
+        );
+
+        // Forgetting something never remembered is a no-op, not a corruption.
+        let before = order.len();
+        forget_gossip_id(&mut seen, &mut order, &[0xEEu8; 16]);
+        assert_eq!(order.len(), before);
+    }
+
+    /// Once the map is full an unknown author must be refused, not admitted
+    /// untracked — otherwise a stream of invented authors walks straight past
+    /// the limit that is meant to stop it.
+    #[test]
+    fn a_full_author_map_refuses_newcomers_rather_than_forgetting_them() {
+        let mut seen = HashMap::new();
+        let room = [0x07u8; 16];
+        for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
+            let mut author = [0u8; 32];
+            author[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(author_gossip_allow(&mut seen, room, &author, Instant::now()));
+        }
+        assert_eq!(seen.len(), CHANNEL_GOSSIP_AUTHOR_CAP);
+        assert!(
+            !author_gossip_allow(&mut seen, room, &[0xFFu8; 32], Instant::now()),
+            "the map is full, so an untracked author is refused"
+        );
+        assert_eq!(
+            seen.len(),
+            CHANNEL_GOSSIP_AUTHOR_CAP,
+            "and refusing does not grow the map"
+        );
     }
 
     #[test]

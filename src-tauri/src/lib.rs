@@ -1830,6 +1830,8 @@ pub fn run() {
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::get_channel_messages,
+            commands::channels::search_channel_messages,
+            commands::channels::delete_channel_message,
             commands::channels::send_channel_message,
             commands::channels::mark_channel_messages_read,
             commands::channels::gather_channels,

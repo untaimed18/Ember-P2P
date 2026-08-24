@@ -98,6 +98,25 @@ export async function markChannelMessagesRead(channelId: string): Promise<void> 
   return invoke('mark_channel_messages_read', { channelId });
 }
 
+/** Substring search over this device's stored history for one room. Local
+ *  only — nothing is asked of the network. */
+export async function searchChannelMessages(
+  channelId: string,
+  query: string,
+  limit?: number,
+): Promise<ChannelMessageInfo[]> {
+  return invoke('search_channel_messages', { channelId, query, limit: limit ?? 50 });
+}
+
+/** Remove one message from this device. Does not propagate: the protocol has
+ *  no redaction, so every other member keeps their copy. */
+export async function deleteChannelMessage(
+  channelId: string,
+  messageId: number,
+): Promise<void> {
+  return invoke('delete_channel_message', { channelId, messageId });
+}
+
 export async function gatherChannels(): Promise<GatheredChannelInfo[]> {
   return invoke('gather_channels');
 }

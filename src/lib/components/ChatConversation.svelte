@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
   import {
+    deleteChannelMessage,
     getChannelMessages,
     markChannelMessagesRead,
     offerChannelFile,
@@ -18,6 +19,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { isAppVisible } from '$lib/utils';
+  import IconX from '$lib/components/IconX.svelte';
 
   // The backend rejects chat messages whose UTF-8 encoding exceeds this many
   // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
@@ -38,6 +40,12 @@
     hideHeader?: boolean;
     youAreBanned?: boolean;
     memberNames?: Record<string, string>;
+    /** Senders hidden on this device. Presentational only — their messages are
+     *  still received and stored, they just aren't drawn. */
+    ignoredSenders?: string[];
+    /** Own display name, so a message naming us can be picked out. Empty
+     *  disables the check rather than matching everything. */
+    mentionName?: string;
   }
 
   type ConvMessage = ChatMessage & { sender_pubkey?: string };
@@ -49,6 +57,8 @@
     hideHeader = false,
     youAreBanned = false,
     memberNames = {},
+    ignoredSenders = [],
+    mentionName = '',
   }: Props = $props();
 
   let isChannel = $derived(channelId.length > 0);
@@ -100,10 +110,14 @@
   let unlisten: UnlistenFn | null = null;
   let unlistenDelivery: UnlistenFn | null = null;
   let unlistenFile: UnlistenFn | null = null;
+  let unlistenFileProgress: UnlistenFn | null = null;
   let attaching = $state(false);
   let fileBusy = $state<string | null>(null);
   let readyFiles: Record<string, boolean> = $state({});
   let pendingFiles: Record<string, boolean> = $state({});
+  /** Reassembly progress per digest, driven by `ember:channel-file-progress`. */
+  let fileProgress: Record<string, { received: number; size: number }> = $state({});
+  let removingMessage = $state<number | null>(null);
   let awaitingSave: { digest: string; name: string } | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
@@ -134,6 +148,13 @@
       delivery: 'delivered',
       sender_pubkey: row.sender_pubkey,
     };
+  }
+
+  /** Both channel-file listeners share one lifecycle, so they are torn down
+   *  together rather than leaving five call sites to remember the second. */
+  function teardownChannelFileListeners() {
+    if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+    if (unlistenFileProgress) { unlistenFileProgress(); unlistenFileProgress = null; }
   }
 
   function senderLabel(pubkey?: string): string {
@@ -192,11 +213,12 @@
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-      if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+      teardownChannelFileListeners();
       messages = [];
       earlyDeliveredIds.clear();
       readyFiles = {};
       pendingFiles = {};
+      fileProgress = {};
       awaitingSave = null;
       attaching = false;
       fileBusy = null;
@@ -222,7 +244,7 @@
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-      if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+      teardownChannelFileListeners();
       if (key) setDraft(key, inputText);
       if (!channel) activeChatHash.set(null);
     };
@@ -232,7 +254,7 @@
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+    teardownChannelFileListeners();
     if (channel) {
       let fn: UnlistenFn;
       try {
@@ -285,6 +307,8 @@
           if (!digest) return;
           readyFiles = { ...readyFiles, [digest]: true };
           pendingFiles = { ...pendingFiles, [digest]: false };
+          const { [digest]: _done, ...restProgress } = fileProgress;
+          fileProgress = restProgress;
           const waiting = awaitingSave;
           if (waiting && waiting.digest === digest) {
             awaitingSave = null;
@@ -299,6 +323,31 @@
         unlistenFile = fileFn;
       } catch (e) {
         console.warn('ChatConversation: failed to register channel file listener', e);
+      }
+      try {
+        const progressFn = await listen<{
+          channel_id: string;
+          digest: string;
+          received: number;
+          size: number;
+        }>('ember:channel-file-progress', (event) => {
+          if (gen !== loadGen) return;
+          if (event.payload.channel_id !== channel) return;
+          const digest = event.payload.digest?.toLowerCase();
+          if (!digest || !event.payload.size) return;
+          fileProgress = {
+            ...fileProgress,
+            [digest]: { received: event.payload.received, size: event.payload.size },
+          };
+        });
+        if (gen !== loadGen) {
+          progressFn();
+          return true;
+        }
+        unlistenFileProgress = progressFn;
+      } catch (e) {
+        // Non-fatal: the attachment still completes, just without a bar.
+        console.warn('ChatConversation: failed to register file progress listener', e);
       }
       return true;
     }
@@ -512,7 +561,7 @@
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+    teardownChannelFileListeners();
     liveError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
@@ -591,7 +640,10 @@
       }
       scrollToBottom();
     } catch (e: unknown) {
-      sendError = translateError(e, m.error_operation_failed());
+      const raw = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+      sendError = raw.includes('channels_file_too_large')
+        ? m.channels_attach_too_large()
+        : translateError(e, m.error_operation_failed());
     } finally {
       attaching = false;
     }
@@ -691,6 +743,27 @@
     }
   }
 
+  /** Forget one message on this device only. The protocol has no redaction, so
+   *  every other member keeps their copy — the label says so rather than
+   *  implying a delete that cannot happen. */
+  async function handleRemoveMessage(id: number) {
+    const channel = channelId;
+    if (!channel || id <= 0 || removingMessage !== null) return;
+    removingMessage = id;
+    try {
+      await deleteChannelMessage(channel, id);
+      if (channel === channelId) {
+        messages = messages.filter((msg) => msg.id !== id);
+      }
+    } catch (e: unknown) {
+      if (channel === channelId) {
+        sendError = translateError(e, m.error_operation_failed());
+      }
+    } finally {
+      removingMessage = null;
+    }
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -738,7 +811,31 @@
    * a uniform ladder of identically-spaced bubbles, each repeating a timestamp
    * that almost always matches the one above it.
    */
+  /** Drawn messages. Hiding an ignored sender here rather than at ingest keeps
+   *  the decision reversible: un-ignoring brings their history straight back. */
+  let visibleMessages = $derived(
+    ignoredSenders.length === 0
+      ? messages
+      : messages.filter(
+          (msg) => !msg.sender_pubkey || !ignoredSenders.includes(msg.sender_pubkey.toLowerCase()),
+        ),
+  );
+
+  /** Whole-word, case-insensitive match on our own display name. Word bounds
+   *  stop a short nickname lighting up every message that merely contains it. */
+  function mentionsMe(text: string): boolean {
+    const name = mentionName.trim();
+    if (!name || !isChannel) return false;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    try {
+      return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)`, 'iu').test(text);
+    } catch {
+      return text.toLowerCase().includes(name.toLowerCase());
+    }
+  }
+
   let rows = $derived.by(() => {
+    const messages = visibleMessages;
     // Day boundaries once per message, rather than recomputed for every
     // neighbour comparison. `null` means the row carries no usable date — a
     // zero timestamp is "unknown", and must not produce a 1970 separator.
@@ -776,7 +873,7 @@
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    if (unlistenFile) { unlistenFile(); unlistenFile = null; }
+    teardownChannelFileListeners();
   });
 </script>
 
@@ -871,6 +968,7 @@
           class:received={row.msg.direction === 'received'}
           class:starts-run={row.startsRun}
           class:ends-run={row.endsRun}
+          class:mentions-me={row.msg.direction === 'received' && !file && mentionsMe(row.msg.message)}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -887,7 +985,25 @@
               <div class="file-name">{file.name}</div>
               <div class="file-meta">{formatFileSize(file.size)}</div>
               {#if pendingFiles[file.digest] && !readyFiles[file.digest]}
-                <span class="file-status">{m.channels_file_pending()}</span>
+                {@const prog = fileProgress[file.digest]}
+                {#if prog && prog.size > 0}
+                  <div
+                    class="file-progress"
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax={prog.size}
+                    aria-valuenow={Math.min(prog.received, prog.size)}
+                  >
+                    <div class="file-progress-fill" style="width: {Math.min(100, Math.round((prog.received / prog.size) * 100))}%"></div>
+                  </div>
+                  <span class="file-status">
+                    {m.channels_file_receiving({
+                      percent: Math.min(100, Math.round((prog.received / prog.size) * 100)),
+                    })}
+                  </span>
+                {:else}
+                  <span class="file-status">{m.channels_file_pending()}</span>
+                {/if}
               {:else}
                 <button
                   class="file-action"
@@ -915,6 +1031,19 @@
                 <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
               {/if}
             </div>
+          {/if}
+          <!-- Channels only, and only for rows the DB can actually address:
+               live bubbles carry negative synthetic ids. -->
+          {#if isChannel && row.msg.id > 0}
+            <button
+              class="bubble-remove"
+              disabled={removingMessage === row.msg.id}
+              onclick={() => handleRemoveMessage(row.msg.id)}
+              title={m.channels_remove_local()}
+              aria-label={m.channels_remove_local()}
+            >
+              <IconX size={11} />
+            </button>
           {/if}
         </div>
       {/each}
@@ -1181,11 +1310,66 @@
     line-height: 1.4;
     word-wrap: break-word;
     overflow-wrap: anywhere;
+    /* Anchors the hover-revealed remove control. */
+    position: relative;
   }
 
   /* Consecutive messages from one author read as a single block: the gap only
      opens where the speaker changes, and the corners facing a neighbour in the
      same run flatten so the bubbles visibly belong together. */
+  /* A message naming you is the one thing in a busy room you cannot afford to
+     scroll past, so it gets an edge marker rather than a colour change that
+     would fight the sent/received distinction. */
+  .file-progress {
+    height: 3px;
+    margin: 6px 0 4px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    overflow: hidden;
+  }
+
+  .file-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width var(--transition-fast) linear;
+  }
+
+  /* Revealed on hover of its own bubble: a per-message control that is always
+     visible turns a transcript into a wall of buttons. Hidden with `opacity`
+     rather than `display` so it stays in the tab order — `display: none` would
+     put it out of reach of the keyboard entirely — and it reveals itself on
+     focus so a keyboard user can see what they have landed on. */
+  .bubble-remove {
+    position: absolute;
+    top: 2px;
+    inset-inline-end: 2px;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-sm);
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .conv-bubble:hover .bubble-remove,
+  .bubble-remove:focus-visible { opacity: 1; }
+  .bubble-remove:hover { color: var(--danger); }
+  .bubble-remove:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .conv-bubble.mentions-me {
+    border-inline-start: 2px solid var(--accent);
+    padding-inline-start: 8px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+
   .conv-bubble.starts-run:not(:first-child) {
     margin-top: 8px;
   }
