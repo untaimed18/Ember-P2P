@@ -6953,7 +6953,7 @@ async fn download_parts_from_source(
             // overall queue-wait timeout are both evaluated while we wait. A
             // tick expiry with no packet is NORMAL while queued (it is NOT the
             // timeout — that is the `elapsed > queue_wait_secs` check above).
-            let poll_secs = queue_wait_secs.saturating_sub(elapsed).min(5).max(1);
+            let poll_secs = queue_wait_secs.saturating_sub(elapsed).clamp(1, 5);
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(poll_secs),
                 read_packet_async_ms(&mut *reader),
@@ -9533,7 +9533,7 @@ async fn download_parts_from_source(
         // Cap re-queue wait at the configured slot wait but never less
         // than 60s (eMule's queue rotation interval is typically 30-120s
         // depending on peer load and our queue position).
-        let requeue_timeout_secs = queue_wait_secs.max(60).min(180);
+        let requeue_timeout_secs = queue_wait_secs.clamp(60, 180);
         info!(
         "DIAG: source {} ({}) attempting in-session re-queue after OUTOFPARTREQS (timeout={}s, src_transferred={})",
         _src_idx, addr, requeue_timeout_secs, src_transferred,

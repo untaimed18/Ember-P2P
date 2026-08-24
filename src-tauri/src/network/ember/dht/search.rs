@@ -1223,7 +1223,7 @@ pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
     // tokenizer; this only imposes the most-selective-first ordering the
     // primary/secondary split depends on.
     let mut keywords = crate::network::kad::publish::extract_query_keywords(query);
-    keywords.sort_by(|a, b| b.len().cmp(&a.len()));
+    keywords.sort_by_key(|kw| std::cmp::Reverse(kw.len()));
 
     keywords
         .into_iter()

@@ -323,7 +323,7 @@ pub async fn get_ip_filter_stats(
     let sort = sort.unwrap_or_else(|| "hits".to_string());
     let sort_asc = sort_asc.unwrap_or(false);
     let offset = offset.unwrap_or(0);
-    let limit = limit.unwrap_or(MAX_STATS_PAGE).min(MAX_STATS_PAGE).max(1);
+    let limit = limit.unwrap_or(MAX_STATS_PAGE).clamp(1, MAX_STATS_PAGE);
 
     state
         .network_tx

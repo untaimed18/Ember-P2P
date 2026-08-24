@@ -1062,7 +1062,7 @@ impl FileRequestTracker {
         if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
             let mut by_age: Vec<((Ipv4Addr, [u8; 16]), std::time::Instant)> =
                 self.entries.iter().map(|(k, (t, _))| (*k, *t)).collect();
-            by_age.sort_by(|a, b| b.1.cmp(&a.1));
+            by_age.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             let keep: std::collections::HashSet<(Ipv4Addr, [u8; 16])> = by_age
                 .into_iter()
                 .take(MAX_FILE_REQUEST_ENTRIES)
@@ -11817,11 +11817,12 @@ mod scoring_tests {
     #[test]
     fn peer_high_id_classification_trusts_client_id() {
         let addr: SocketAddr = "8.8.8.8:4662".parse().unwrap();
-        let mut caps = PeerCapabilities::default();
-        caps.tcp_port = 4662;
-
-        // Real LowID must NOT become dialable just because tcp_port is set.
-        caps.client_id = 12345; // < LOWID_THRESHOLD
+        let mut caps = PeerCapabilities {
+            tcp_port: 4662,
+            // Real LowID must NOT become dialable just because tcp_port is set.
+            client_id: 12345, // < LOWID_THRESHOLD
+            ..PeerCapabilities::default()
+        };
         assert!(!peer_is_high_id_for_queue(&caps, addr));
 
         caps.client_id = crate::network::ed2k::server::LOWID_THRESHOLD;

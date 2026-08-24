@@ -1554,7 +1554,7 @@ impl DhtStore {
                 })
             })
             .collect();
-        out.sort_by(|a, b| b.record_count.cmp(&a.record_count));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.record_count));
         out.truncate(max);
         out
     }

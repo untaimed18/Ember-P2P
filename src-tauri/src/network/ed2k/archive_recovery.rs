@@ -678,6 +678,7 @@ fn is_windows_reserved_base(name: &[u8]) -> bool {
 ///   * drop backslashes (Windows path separators — ZIP spec mandates `/`),
 ///   * remove `..` path components so the name cannot escape the target,
 ///   * remove NUL bytes and other control characters.
+///
 /// The result is always a relative path (or a single filename). Empty
 /// names fall back to `_` to keep the archive structurally valid.
 fn sanitize_zip_entry_name(raw: &[u8]) -> Vec<u8> {

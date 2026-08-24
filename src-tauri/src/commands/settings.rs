@@ -1758,8 +1758,10 @@ mod tests {
     /// every download failed with nothing to point the user at.
     #[test]
     fn empty_download_folder_is_rejected_not_skipped() {
-        let mut settings = AppSettings::default();
-        settings.download_folder = String::new();
+        let settings = AppSettings {
+            download_folder: String::new(),
+            ..AppSettings::default()
+        };
         let err = validate_settings(&settings).expect_err("an empty download folder must fail");
         assert!(
             err.contains("settings_download_folder_not_picked"),
@@ -1802,12 +1804,14 @@ mod tests {
 
     #[test]
     fn soft_repair_clamps_ranges_and_enums() {
-        let mut settings = AppSettings::default();
-        settings.tcp_port = 0;
-        settings.max_concurrent_downloads = 999;
-        settings.spam_filter_profile = "nope".to_string();
-        settings.uss_enabled = true;
-        settings.max_upload_speed = 0;
+        let mut settings = AppSettings {
+            tcp_port: 0,
+            max_concurrent_downloads: 999,
+            spam_filter_profile: "nope".to_string(),
+            uss_enabled: true,
+            max_upload_speed: 0,
+            ..AppSettings::default()
+        };
         assert!(soft_repair_settings(&mut settings));
         assert_ne!(settings.tcp_port, 0);
         assert_eq!(settings.max_concurrent_downloads, 50);
@@ -1818,17 +1822,21 @@ mod tests {
 
     #[test]
     fn soft_repair_forces_friend_session_encryption_on() {
-        let mut settings = AppSettings::default();
-        settings.friend_session_encryption = false;
+        let mut settings = AppSettings {
+            friend_session_encryption: false,
+            ..AppSettings::default()
+        };
         assert!(soft_repair_settings(&mut settings));
         assert!(settings.friend_session_encryption);
     }
 
     #[test]
     fn uss_requires_nonzero_upload_limit() {
-        let mut settings = AppSettings::default();
-        settings.uss_enabled = true;
-        settings.max_upload_speed = 0;
+        let mut settings = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 0,
+            ..AppSettings::default()
+        };
         let err = validate_settings(&settings).expect_err("USS + unlimited must fail");
         assert!(
             err.contains("settings_uss_requires_upload_limit"),
@@ -1978,9 +1986,11 @@ mod tests {
 
     #[test]
     fn renderer_settings_cannot_replace_backend_owned_fields() {
-        let mut authoritative = AppSettings::default();
-        authoritative.shared_folders = vec!["/trusted/share".into()];
-        authoritative.default_shared_folder_seeded = true;
+        let mut authoritative = AppSettings {
+            shared_folders: vec!["/trusted/share".into()],
+            default_shared_folder_seeded: true,
+            ..AppSettings::default()
+        };
         authoritative
             .folder_priorities
             .insert("/trusted/share".into(), "high".into());

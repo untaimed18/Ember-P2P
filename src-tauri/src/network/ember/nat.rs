@@ -65,15 +65,17 @@ impl NatType {
     /// the peer's type only after the punch request is already in flight.
     #[allow(dead_code)]
     pub fn can_punch_with(&self, other: &NatType) -> bool {
-        match (self, other) {
-            (NatType::Open, _) | (_, NatType::Open) => true,
-            (NatType::FullCone, _) | (_, NatType::FullCone) => true,
-            (NatType::RestrictedCone, NatType::RestrictedCone) => true,
-            (NatType::RestrictedCone, NatType::PortRestricted) => true,
-            (NatType::PortRestricted, NatType::RestrictedCone) => true,
-            (NatType::PortRestricted, NatType::PortRestricted) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (NatType::Open, _)
+                | (_, NatType::Open)
+                | (NatType::FullCone, _)
+                | (_, NatType::FullCone)
+                | (NatType::RestrictedCone, NatType::RestrictedCone)
+                | (NatType::RestrictedCone, NatType::PortRestricted)
+                | (NatType::PortRestricted, NatType::RestrictedCone)
+                | (NatType::PortRestricted, NatType::PortRestricted)
+        )
     }
 
     pub fn as_u8(&self) -> u8 {

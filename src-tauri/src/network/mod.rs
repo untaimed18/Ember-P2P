@@ -1272,7 +1272,7 @@ fn kad_bridge_candidates_at(
         })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
-    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
     candidates
         .into_iter()
         .take(max)
@@ -1407,7 +1407,7 @@ fn xx_bridge_candidates_at(
         })
         .map(|(key, seen)| (key.0, key.1, *seen))
         .collect();
-    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
     candidates
         .into_iter()
         .take(max)
@@ -2373,7 +2373,7 @@ fn udp_search_leg_should_complete(
 /// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
 /// (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
-    availability.max(1).min(ED2K_SEARCH_SOURCE_CAP)
+    availability.clamp(1, ED2K_SEARCH_SOURCE_CAP)
 }
 
 /// Hashes already shared or downloading — eMule `AddResultCount` skips these
@@ -13280,9 +13280,7 @@ fn ingest_channel_handoff_records(
             best = Some(parsed);
         }
     }
-    let Some(handoff) = best else {
-        return None;
-    };
+    let handoff = best?;
     let keep = handoff.flags & ember::channel::HANDOFF_FLAG_KEEP_JOIN_SECRET != 0;
     let successor_pk = hex::encode(handoff.successor_pubkey);
     let successor_id = hex::encode(handoff.successor_channel_id);
@@ -19005,11 +19003,7 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
             let responded = search.responded_during_lookup.len() as u32;
             let pending = search.pending.len() as u32;
             let load_total = queried.saturating_add(pending);
-            let load_pct = if queried == 0 {
-                0
-            } else {
-                (responded * 100) / queried
-            };
+            let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
             KadSearchInfo {
                 id: sid.0,
                 target: search.target.to_hex(),
@@ -19496,7 +19490,7 @@ async fn known_clients_snapshot(
         .collect();
     // Stable, useful default order: most-recently-seen first. The UI
     // can re-sort by any column.
-    out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
     out
 }
 
@@ -26513,7 +26507,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             local_results =
                                 filter_results_by_type(local_results, &file_type_filter);
                         }
-                        local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
+                        local_results
+                            .sort_by_key(|r| std::cmp::Reverse(r.availability));
                         local_results.truncate(2000);
                         // Intentional: the `search_files` IPC call returns as soon as
                         // the KAD leg (normally the slowest, ~45-60s) finishes, rather
@@ -31984,7 +31979,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
 
                 // High-priority downloads get processed first
-                to_retry.sort_by(|a, b| b.1.cmp(&a.1));
+                to_retry.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
                 // eMule-style: check persistent per-file source lists for sources
                 // whose reask timer has expired. These are sources we already know
@@ -37949,7 +37944,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .filter(|((ip, _), _)| !state.ip_filter.is_blocked_readonly(*ip))
                         .map(|((ip, port), ts)| ((*ip, *port), *ts))
                         .collect();
-                    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
                     candidates
                         .into_iter()
                         .take(ember::MAX_EPX_PEERS)
@@ -39570,7 +39565,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let responded = search.responded_during_lookup.len() as u32;
                         let pending = search.pending.len() as u32;
                         let load_total = queried.saturating_add(pending);
-                        let load_pct = if queried == 0 { 0 } else { (responded * 100) / queried };
+                        let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
                         KadSearchInfo {
                             id: sid.0,
                             target: search.target.to_hex(),
@@ -42400,10 +42395,7 @@ fn majority_ember_digest_with_count(
             *counts.entry(*digest).or_insert(0) += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(d, n)| (d, n))
+    counts.into_iter().max_by_key(|(_, n)| *n)
 }
 
 /// Distinct publishers that must agree before a DHT-sourced digest is allowed
@@ -42822,7 +42814,7 @@ fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
 /// The queue depth, in entries, at which selection should wait a tick.
 fn ember_publish_backpressure_threshold(contacts: usize) -> usize {
     // What one tick's worth of records actually occupies in the queue.
-    let fan_out = contacts.min(K_EMBER_REPLICAS).max(1);
+    let fan_out = contacts.clamp(1, K_EMBER_REPLICAS);
     // Capped at half the queue, or the gate stops existing on a table above about
     // seventy contacts: the threshold grows with the table while the queue does
     // not, so past that point only `enqueue`'s hard ceiling pushes back — and it
@@ -43754,7 +43746,7 @@ async fn maybe_publish_ember_sources(
                     && x.failed_queries == 0
                     && x.is_verified()
             });
-            c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            c.sort_by_key(|contact| std::cmp::Reverse(contact.last_seen));
             let named = c.iter().find_map(|contact| {
                 ember_named_source_buddy(state, contact, now_ts)
                     .map(|buddy| (contact.clone(), buddy))
@@ -43835,7 +43827,7 @@ async fn maybe_publish_ember_sources(
             };
             ranked.push((staleness, i));
         }
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
         ranked.truncate(ember_source_files_per_tick(
             publishable,
@@ -44173,7 +44165,7 @@ async fn maybe_publish_ember_keywords(
         // inside the republish interval. A fixed budget silently stopped
         // republishing everything past the first few thousand files.
         let publishable = files.iter().filter(|f| is_ember_publishable(f)).count();
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
         ranked.truncate(ember_keyword_files_per_tick(
             publishable,

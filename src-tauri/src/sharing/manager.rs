@@ -581,12 +581,10 @@ impl TransferManager {
             let speed = if history.len() >= 2 {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
                 let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
-                if elapsed_ms > 0 {
-                    let bytes_delta = transferred.saturating_sub(*oldest_bytes);
-                    (bytes_delta as u128 * 1000 / elapsed_ms) as u64
-                } else {
-                    transfer.speed
-                }
+                let bytes_delta = transferred.saturating_sub(*oldest_bytes);
+                (bytes_delta as u128 * 1000)
+                    .checked_div(elapsed_ms)
+                    .map_or(transfer.speed, |bytes_per_sec| bytes_per_sec as u64)
             } else {
                 0
             };

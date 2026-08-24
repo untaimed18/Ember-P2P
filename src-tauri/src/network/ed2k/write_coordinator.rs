@@ -310,6 +310,13 @@ fn writer_loop(mut file: std::fs::File, rx: &mut mpsc::Receiver<WriteOp>) {
 }
 
 #[cfg(test)]
+// `await_holding_lock` fires on `test_registry_lock`, which is held across the
+// awaits on purpose: it serialises tests that swap the process-global approved
+// -root registry, and the window it has to cover is exactly the asynchronous
+// file open. Dropping it sooner would reintroduce the race it exists to
+// prevent. These are `#[tokio::test]`s on the current-thread runtime, so there
+// is no executor thread for the guard to strand.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 

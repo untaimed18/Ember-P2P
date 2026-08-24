@@ -763,8 +763,7 @@ impl CreditManager {
         ratio1
             .min(ratio2)
             .min(ratio3)
-            .min(MAX_CREDIT_RATIO)
-            .max(MIN_CREDIT_RATIO)
+            .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
     }
 
     /// Queue score for upload slot selection.
@@ -1206,8 +1205,7 @@ impl CreditManager {
         ratio1
             .min(ratio2)
             .min(ratio3)
-            .min(MAX_CREDIT_RATIO)
-            .max(MIN_CREDIT_RATIO)
+            .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
     }
 
     /// Composite Ember queue score.

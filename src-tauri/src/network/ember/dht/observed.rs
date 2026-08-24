@@ -59,9 +59,7 @@ impl EmberObservedIpVotes {
         if !is_public_reporter(reporter) {
             return None;
         }
-        let Some(net) = reporter_net24(reporter) else {
-            return None;
-        };
+        let net = reporter_net24(reporter)?;
 
         self.prune(now);
 
