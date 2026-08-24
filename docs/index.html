@@ -1061,7 +1061,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.5.6</h3>
+      <h3>Get Ember 1.5.8</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1792,12 +1792,71 @@ npm run tauri build</code></pre>
       </div>
     </article>
 
-    <article class="release" id="release-1-5-6">
+    <article class="release" id="release-1-5-8">
       <div class="release-header">
-        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.6" target="_blank" rel="noopener">Ember v1.5.6</a></h3>
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.8" target="_blank" rel="noopener">Ember v1.5.8</a></h3>
+        <time class="release-date" datetime="2026-08-20">August 20, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.8" target="_blank" rel="noopener"><code>v1.5.8</code></a></p>
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+
+        <ul>
+          <li><strong>The Ember Network actually joins after a fresh install or a restart.</strong> A first overlay contact used to be flooded with publish traffic, or dropped after a few missed lookups, before it had answered. Ember now talks to that peer first, then publishes. Friends you are already connected to also introduce you to the overlay, so you are not waiting on KAD alone</li>
+          <li><strong>Friend connections get through Windows Firewall.</strong> Hole-punches and relays arrive on Ember&rsquo;s own UDP port, but Windows was only allowing the KAD port. Those packets were dropped even when UPnP had forwarded them. Direct punch also starts at the same time as the relay, instead of waiting for the relay to fail first</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Before you upgrade</h5>
+        <ul>
+          <li><strong>Friend chat needs 1.5.8 on both sides.</strong> Mixed versions with 1.5.7 or earlier cannot decrypt each other&rsquo;s messages, and there is no plaintext fallback. Upgrade together. Search, downloads, and the Ember Network still work with older clients</li>
+          <li><strong>Same Ember DHT as 1.5.7.</strong> No protocol bump: 1.5.8 still speaks Ember DHT version 2. Your library and settings move between 1.5.7 and 1.5.8 in either direction</li>
+        </ul>
+
+        <h5>Starting up</h5>
+        <ul>
+          <li><strong>A missing download folder no longer kills the app.</strong> If that folder is on an unplugged USB drive, an offline NAS, or an unmapped share, Ember used to exit immediately with no window. It now opens so you can pick a new folder, and a drive that comes back mid-session is used without a restart</li>
+          <li><strong>The Friends page no longer claims you are discoverable when registration failed.</strong> A failed presence update used to look like success</li>
+        </ul>
+
+        <h5>Ember overlay</h5>
+        <ul>
+          <li><strong>Shared files stay findable.</strong> One peer refusing a keyword used to hide the rest of that file&rsquo;s names for hours. A replica that never stored the record no longer parks the whole file</li>
+          <li><strong>Searches walk peers that have actually answered,</strong> not gossip that has never been heard from. A lookup that never left the machine still finishes instead of hanging until the backstop</li>
+          <li><strong>Your overlay contact list survives a crash the way identity files already do.</strong> An interrupted Windows save could leave the only copy under a backup name, and the next launch treated that as a first run</li>
+          <li><strong>Contacts remembered from last time are not thrown away while the IP filter is still loading.</strong> LAN peers you already have a session with can still gossip</li>
+        </ul>
+
+        <h5>Transfers</h5>
+        <ul>
+          <li><strong>An interrupted save of a download&rsquo;s progress file no longer restarts the download at 0%.</strong> The same Windows replace path that 1.5.7 fixed for identity files was still open for <code>.part.met</code>, which is how a multi-gigabyte partial could vanish</li>
+          <li><strong>A silent uploader no longer stalls a part forever.</strong> If they drop a requested block, Ember lets go of that range and asks someone else</li>
+          <li><strong>A peer that never answers an obfuscated handshake can no longer wedge buddy setup</strong> or use up the connect-back pool</li>
+        </ul>
+
+        <h5>Search, library, and security</h5>
+        <ul>
+          <li><strong>A search no longer drops the last three-letter word.</strong> A query that ends in a short word actually uses that word</li>
+          <li><strong>Unmarking one spam result no longer unmarks others</strong> that were marked with it</li>
+          <li><strong>Your server list is left alone while the IP filter loads,</strong> and permit rows in that list are kept</li>
+          <li><strong>A library larger than 100,000 files pages</strong> instead of stopping until you reload</li>
+          <li><strong>The Security page stays usable with a long list</strong> instead of fetching everything in one shot</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.7...v1.5.8" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.7...v1.5.8</a>
+        </p>
+      </div>
+    </article>
+
+    <article class="release" id="release-1-5-7">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.7" target="_blank" rel="noopener">Ember v1.5.7</a></h3>
         <time class="release-date" datetime="2026-08-16">August 16, 2026</time>
       </div>
-      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.6" target="_blank" rel="noopener"><code>v1.5.6</code></a></p>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.5.7" target="_blank" rel="noopener"><code>v1.5.7</code></a></p>
       <div class="release-notes">
         <h4>What&rsquo;s New</h4>
 
@@ -1812,7 +1871,7 @@ npm run tauri build</code></pre>
 
         <h5>Before you upgrade</h5>
         <ul>
-          <li><strong>Same Ember network as 1.5.5.</strong> No protocol bump: 1.5.6 still speaks Ember DHT version 2. The library database is unchanged, so you can move between 1.5.5 and 1.5.6 in either direction</li>
+          <li><strong>Same Ember network as 1.5.5.</strong> No protocol bump: 1.5.7 still speaks Ember DHT version 2. The library database is unchanged, so you can move between 1.5.5 and 1.5.7 in either direction</li>
         </ul>
 
         <h5>Connections and publishing</h5>
@@ -1858,7 +1917,7 @@ npm run tauri build</code></pre>
 
         <p class="full-changelog">
           <strong>Full Changelog</strong>
-          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.6" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.6</a>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.7" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.5...v1.5.7</a>
         </p>
       </div>
     </article>

@@ -811,7 +811,7 @@ async fn handle_command_inner(
                 let primary_ok = match source_addr.ip() {
                     std::net::IpAddr::V4(primary_v4) => {
                         seen_addrs.insert((primary_v4, source_addr.port()));
-                        is_source_admissible(&state, primary_v4, source_addr.port(), None)
+                        is_source_admissible(state, primary_v4, source_addr.port(), None)
                     }
                     _ => false,
                 };
@@ -833,7 +833,7 @@ async fn handle_command_inner(
                         Ok(ip) => ip,
                         Err(_) => continue,
                     };
-                    if !is_source_admissible(&state, parsed_ip, *extra_port, None) {
+                    if !is_source_admissible(state, parsed_ip, *extra_port, None) {
                         continue;
                     }
                     if !seen_addrs.insert((parsed_ip, *extra_port)) {
@@ -1009,7 +1009,7 @@ async fn handle_command_inner(
                         if validated_extras.len() >= MAX_SEED_EXTRA_SOURCES {
                             break;
                         }
-                        if !is_source_admissible(&state, ip, port, None) {
+                        if !is_source_admissible(state, ip, port, None) {
                             continue;
                         }
                         if !seen_addrs.insert((ip, port)) {
@@ -1037,7 +1037,7 @@ async fn handle_command_inner(
                         if sm.is_session_only_port(&hash_bytes, ip, port) {
                             continue;
                         }
-                        if !is_source_admissible(&state, ip, port, None) {
+                        if !is_source_admissible(state, ip, port, None) {
                             continue;
                         }
                         if !seen_addrs.insert((ip, port)) {
@@ -1142,8 +1142,8 @@ async fn handle_command_inner(
                         download_dir: PathBuf::from(&settings.download_folder),
                         user_hash: state.user_hash,
                         nickname: settings.nickname.clone(),
-                        tcp_port: advertised_tcp_port(&state),
-                        udp_port: advertised_udp_port(&state),
+                        tcp_port: advertised_tcp_port(state),
+                        udp_port: advertised_udp_port(state),
                         bandwidth_limiter: bandwidth_limiter.clone(),
                         control: control.clone(),
                         source_manager: Some(source_manager.clone()),
@@ -1479,7 +1479,17 @@ async fn handle_command_inner(
                                 up_peer_part_status: None,
                                 ember_verified: false,
                             };
-                            let _ = db_ref.save_transfer(&db_transfer);
+                            // Not best-effort: this row is what lets the download
+                            // resume after a restart, so a swallowed failure here
+                            // costs the whole transfer with nothing in the log to
+                            // explain it. Matches the sibling saves elsewhere in
+                            // this file, which all log.
+                            if let Err(e) = db_ref.save_transfer(&db_transfer) {
+                                warn!(
+                                    "Failed to persist download {}; it will not resume after a restart: {e}",
+                                    db_transfer.id
+                                );
+                            }
                         }
                     });
                 }
@@ -2741,7 +2751,7 @@ async fn handle_command_inner(
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
             let snap =
-                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip, &db)
+                known_clients_snapshot(credit_manager, friend_hashes, upload_queue, geoip, db)
                     .await;
             let _ = tx.send(snap);
         }
@@ -3641,8 +3651,8 @@ async fn handle_command_inner(
                 }
                 handle_server_disconnect(
                     state,
-                    &shared_server_addr,
-                    &app_handle,
+                    shared_server_addr,
+                    app_handle,
                     "KAD disconnected",
                 )
                 .await;
@@ -3906,7 +3916,7 @@ async fn handle_command_inner(
                         KadMessage::Firewalled2Req {
                             tcp_port: fw_tcp_port,
                             user_hash: state.user_hash,
-                            connect_options: build_kad_connect_options(&state),
+                            connect_options: build_kad_connect_options(state),
                         },
                         0x53u8,
                     )
@@ -3923,7 +3933,7 @@ async fn handle_command_inner(
                     if let Ok(mut probes) = firewall_probe_ips.lock() {
                         probes.insert(contact.ip);
                     }
-                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
+                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
                     state.firewall_checks_sent += 1;
                     state.firewall_checker.record_tcp_request_sent(contact.ip);
                 }
@@ -3942,14 +3952,14 @@ async fn handle_command_inner(
                 let msg = KadMessage::Ping;
                 if let Ok(packet) = messages::encode_packet(&msg) {
                     state.flood_protection.track_request(addr, 0x60);
-                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
+                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
                     state.firewall_checker.record_udp_port_probe_sent();
                 }
             }
 
             // Eagerly dispatch UDP firewall probes (uses previous external port
             // or falls back to settings.udp_port). Pong handler will also retry.
-            dispatch_udp_firewall_probe_requests(state, app_handle, &settings);
+            dispatch_udp_firewall_probe_requests(state, app_handle, settings);
 
             info!(
                 "Sent {} firewall checks and {} ping probes",
@@ -5102,8 +5112,8 @@ async fn handle_command_inner(
                                     .external_ip
                                     .map(|eip| u32::from_le_bytes(eip.octets()))
                                     .unwrap_or(0);
-                                let tcp = advertised_tcp_port(&state);
-                                let udp = advertised_udp_port(&state);
+                                let tcp = advertised_tcp_port(state);
+                                let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
@@ -5228,8 +5238,8 @@ async fn handle_command_inner(
                                 .external_ip
                                 .map(|eip| u32::from_le_bytes(eip.octets()))
                                 .unwrap_or(0);
-                            let tcp = advertised_tcp_port(&state);
-                            let udp = advertised_udp_port(&state);
+                            let tcp = advertised_tcp_port(state);
+                            let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
@@ -5359,7 +5369,7 @@ async fn handle_command_inner(
                         );
                     }
                 }
-                dispatch_browse_head(state, &app_handle, friend_eh).await;
+                dispatch_browse_head(state, app_handle, friend_eh).await;
             }
         }
 
@@ -5395,7 +5405,7 @@ async fn handle_command_inner(
                             let _ = tx.send(Err("Duplicate browse request".into()));
                         }
                         Ok(()) => {
-                            dispatch_browse_head(state, &app_handle, friend_eh).await;
+                            dispatch_browse_head(state, app_handle, friend_eh).await;
                             if browse_request_is_pending(
                                 &state.pending_browse_requests,
                                 friend_eh,
@@ -5446,8 +5456,8 @@ async fn handle_command_inner(
                                     .external_ip
                                     .map(|eip| u32::from_le_bytes(eip.octets()))
                                     .unwrap_or(0);
-                                let tcp = advertised_tcp_port(&state);
-                                let udp = advertised_udp_port(&state);
+                                let tcp = advertised_tcp_port(state);
+                                let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
                                 let ul_tx = ul_event_tx.clone();
@@ -5561,8 +5571,8 @@ async fn handle_command_inner(
                                 .external_ip
                                 .map(|eip| u32::from_le_bytes(eip.octets()))
                                 .unwrap_or(0);
-                            let tcp = advertised_tcp_port(&state);
-                            let udp = advertised_udp_port(&state);
+                            let tcp = advertised_tcp_port(state);
+                            let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
                             let ultx = ul_event_tx.clone();
@@ -5757,13 +5767,13 @@ async fn handle_command_inner(
                     }),
                 );
                 spawn_rendezvous_friend_lookup(
-                    &settings,
-                    &state,
+                    settings,
+                    state,
                     ember_hash,
                     target_hash,
-                    &app_handle,
-                    &friend_hashes,
-                    &ul_event_tx,
+                    app_handle,
+                    friend_hashes,
+                    ul_event_tx,
                     ed25519_pubkey,
                     ed25519_secret_key,
                 );
@@ -5828,13 +5838,13 @@ async fn handle_command_inner(
             );
 
             spawn_rendezvous_friend_lookup(
-                &settings,
-                &state,
+                settings,
+                state,
                 ember_hash,
                 target_hash,
-                &app_handle,
-                &friend_hashes,
-                &ul_event_tx,
+                app_handle,
+                friend_hashes,
+                ul_event_tx,
                 ed25519_pubkey,
                 ed25519_secret_key,
             );
