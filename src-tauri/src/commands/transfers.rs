@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tauri::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
+use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
 use crate::storage::database::Database;
@@ -253,14 +255,67 @@ fn verify_recovery_ranges(
     Ok(ranges)
 }
 
+/// Persist a status the user just asked for, ordered against the network task's
+/// own writes.
+///
+/// This has to go through `TransferStatusWriteClock` rather than straight to
+/// SQLite. The network task issues fire-and-forget status writes onto the
+/// blocking pool; a clock only orders writes that take a sequence number from
+/// it, so an unsequenced write here could be overtaken by an older queued one
+/// and lose. Restore reads the persisted string and only declines to auto-start
+/// `Paused`/`Stopped`, so losing that race meant a download the user explicitly
+/// paused resumed by itself on the next launch — or a resumed one came back
+/// Failed.
 async fn persist_transfer_status(state: &AppState, transfer_id: &str, status: &TransferStatus) {
     let db = state.db.clone();
     let tid = transfer_id.to_string();
     let status = transfer_status_key(status).to_string();
-    match tokio::task::spawn_blocking(move || db.update_transfer_status(&tid, &status)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("Failed to persist transfer status: {e}"),
-        Err(e) => tracing::warn!("Transfer status persist task panicked: {e}"),
+    let clock = Arc::clone(crate::network::transfer_status_write_clock());
+    let seq = clock.next_seq();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        crate::network::apply_transfer_status_write(&clock, &db, &tid, &status, seq)
+    })
+    .await
+    {
+        tracing::warn!("Transfer status persist task panicked: {e}");
+    }
+}
+
+/// Persist many statuses on **one** blocking thread.
+///
+/// The "all" commands used to `join_all` one `spawn_blocking` per row with no
+/// cap — and unlike the `*_batch` commands they never call `check_batch_size`,
+/// so the set is bounded only by `MAX_PENDING_DOWNLOADS` (10,000). Every task
+/// then serialized on the single `Mutex<Connection>` anyway, so the concurrency
+/// bought nothing but contention: past a few hundred rows it saturated tokio's
+/// default blocking pool (no `max_blocking_threads` is configured, and the
+/// stack size is 8 MiB) and starved every other consumer of it — MD4 part
+/// hashing, `.part.met` saves, approved-path file opens — until it drained,
+/// while the IPC call itself did not return.
+///
+/// Sequence numbers are taken up front so the relative order of these writes is
+/// fixed before any of them runs.
+async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, String)>) {
+    if statuses.is_empty() {
+        return;
+    }
+    let db = state.db.clone();
+    let clock = Arc::clone(crate::network::transfer_status_write_clock());
+    let sequenced: Vec<(String, String, u64)> = statuses
+        .into_iter()
+        .map(|(id, status)| {
+            let seq = clock.next_seq();
+            (id, status, seq)
+        })
+        .collect();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        for (id, status, seq) in sequenced {
+            crate::network::apply_transfer_status_write(&clock, &db, &id, &status, seq);
+        }
+    })
+    .await
+    {
+        tracing::warn!("Transfer status batch persist task panicked: {e}");
     }
 }
 
@@ -309,7 +364,7 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
             let mut manager = state.transfer_manager.write().await;
             let _ = manager.fail(
                 &transfer.id,
-                "Network channel unavailable",
+                TransferFailureCode::NetworkChannelUnavailable,
                 Some("permanent".to_string()),
                 None,
             );
@@ -734,6 +789,7 @@ pub async fn start_download(
         completed_size: 0,
         started_at: chrono::Utc::now().timestamp(),
         failure_reason: None,
+        failure_code: None,
         failure_kind: None,
         failure_stage: None,
         priority: "auto".to_string(),
@@ -745,6 +801,7 @@ pub async fn start_download(
         last_received: None,
         health: crate::types::TransferHealth::Healthy,
         health_reason: None,
+        health_code: None,
         stalled_since: None,
         category: String::new(),
         wait_time: 0,
@@ -853,7 +910,7 @@ pub async fn start_download(
             let mut manager = state.transfer_manager.write().await;
             let _ = manager.fail(
                 &transfer_id,
-                "Network channel unavailable",
+                TransferFailureCode::NetworkChannelUnavailable,
                 Some("permanent".to_string()),
                 None,
             );
@@ -1870,12 +1927,13 @@ pub async fn pause_all_transfers(
     for (id, status) in &statuses {
         emit_transfer_status(&app, id, status);
     }
-    futures::future::join_all(statuses.into_iter().map(|(id, status)| {
-        let state = &state;
-        async move {
-            persist_transfer_status(state, &id, &status).await;
-        }
-    }))
+    persist_transfer_statuses(
+        &state,
+        statuses
+            .into_iter()
+            .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
+            .collect(),
+    )
     .await;
     Ok(())
 }
@@ -1942,7 +2000,8 @@ pub async fn resume_all_transfers(
             emit_transfer_status(&app, id, status);
         }
     }
-    futures::future::join_all(
+    persist_transfer_statuses(
+        &state,
         statuses
             .into_iter()
             .filter(|(_, status)| {
@@ -1951,12 +2010,8 @@ pub async fn resume_all_transfers(
                     TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
                 )
             })
-            .map(|(id, status)| {
-                let state = &state;
-                async move {
-                    persist_transfer_status(state, &id, &status).await;
-                }
-            }),
+            .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
+            .collect(),
     )
     .await;
     let mut to_start = promoted;

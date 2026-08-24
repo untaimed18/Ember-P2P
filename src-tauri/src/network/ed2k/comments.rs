@@ -120,11 +120,21 @@ impl CommentManager {
             return;
         }
         let entry = self.comments.entry(file_hash.to_string()).or_default();
-        if let Some(existing) = entry
-            .peer_comments
-            .iter_mut()
-            .find(|c| c.user_name == user_name)
-        {
+        // An empty `user_name` names nobody, so it cannot serve as the dedup
+        // key: every anonymous vote would collapse onto a single `""` row, so
+        // `average_rating` and `fake_rating_stats` would count N votes as one
+        // and a late `RATING_EXCELLENT` would overwrite accumulated
+        // `RATING_FAKE` evidence. Those rows are appended instead, bounded by
+        // `MAX_COMMENTS_PER_FILE` like every other.
+        let existing = if user_name.is_empty() {
+            None
+        } else {
+            entry
+                .peer_comments
+                .iter_mut()
+                .find(|c| c.user_name == user_name)
+        };
+        if let Some(existing) = existing {
             existing.rating = rating;
             existing.comment = comment;
             existing.origin = origin;
@@ -286,6 +296,36 @@ mod tests {
             empty.get_comments("bb").is_none(),
             "an empty packet must not create an entry"
         );
+    }
+
+    /// Rating-only votes usually carry no name, and the upsert deduped on that
+    /// field alone — so N anonymous votes became one `""` row on a
+    /// last-writer-wins basis. The aggregates count rows, so the count was
+    /// wrong, and a late positive rating erased the fake votes before it.
+    #[test]
+    fn anonymous_rating_votes_are_not_collapsed_into_one_row() {
+        let mut cm = CommentManager::new();
+        for _ in 0..4 {
+            cm.add_peer_comment("aa", String::new(), RATING_FAKE, String::new(), 0);
+        }
+        let (fake, total) = cm.fake_rating_stats("aa");
+        assert_eq!((fake, total), (4, 4), "each anonymous vote must count once");
+        assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 4);
+
+        // A later positive vote is one more vote, not a rewrite of the others.
+        cm.add_peer_comment("aa", String::new(), RATING_EXCELLENT, String::new(), 0);
+        let (fake, total) = cm.fake_rating_stats("aa");
+        assert_eq!(
+            (fake, total),
+            (4, 5),
+            "a late positive vote must not erase accumulated fake evidence"
+        );
+
+        // A real identity still dedupes: that is what the field is for.
+        let mut named = CommentManager::new();
+        named.add_peer_comment("bb", "alice".into(), RATING_FAKE, String::new(), 0);
+        named.add_peer_comment("bb", "alice".into(), RATING_GOOD, String::new(), 0);
+        assert_eq!(named.get_comments("bb").unwrap().peer_comments.len(), 1);
     }
 
     /// The sanitizer's limit is in characters, but what these tables hold is

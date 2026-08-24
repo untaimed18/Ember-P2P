@@ -25,7 +25,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::search::index::LocalIndex;
-use crate::sharing::manager::{TransferControl, TransferHealthUpdate, TransferManager};
+use crate::sharing::manager::{
+    TransferControl, TransferHealthCode, TransferHealthUpdate, TransferManager,
+};
 use crate::storage::database::Database;
 use crate::types::*;
 
@@ -3634,10 +3636,14 @@ async fn maybe_escalate_to_friend_transfer(
         }
         // No identity recorded for this address, so we cannot rule out that it
         // is the friend the download came from — which is exactly the gap the
-        // browse binding exists to cover.
+        // browse binding exists to cover. The hint still has to name a current
+        // friend: it outlives the friendship, so after the user removes that
+        // friend an unidentifiable source was parked as "awaiting the friend's
+        // connect-back" and frozen out of reask until the request timed out —
+        // the same failure the `Some(id)` branch above is guarding against.
         None => match state.transfer_friend_hint.get(transfer_id).copied() {
-            Some(friend) => friend,
-            None => return false,
+            Some(friend) if friend_hashes.read().await.contains(&friend) => friend,
+            _ => return false,
         },
     };
     let file_hash = {
@@ -4183,7 +4189,7 @@ mod friend_transfer_tests {
             callback_token: Some([0xDDu8; 16]),
             publisher_id: [0xAAu8; 16],
         };
-        assert!(!ember_source_uses_callback(&src, false, false, 1_000));
+        assert!(!ember_source_uses_callback(&src, false, false, true, 1_000));
 
         for (why, addr) in [
             ("LAN", SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4672)),
@@ -4300,18 +4306,23 @@ mod friend_transfer_tests {
             callback_token: Some([0xDDu8; 16]),
             publisher_id,
         };
-        assert!(ember_source_uses_callback(&src, false, false, now));
+        assert!(ember_source_uses_callback(&src, false, false, true, now));
         assert!(
-            !ember_source_uses_callback(&src, true, false, now),
+            !ember_source_uses_callback(&src, true, false, true, now),
             "firewalled searcher parks rather than CALLBACK_REQ"
         );
         assert!(
-            !ember_source_uses_callback(&src, false, true, now),
+            !ember_source_uses_callback(&src, false, true, true, now),
             "filtered or banned buddy must fall back to park, not drop"
         );
         assert!(
-            !ember_source_uses_callback(&src, false, false, until + 1),
+            !ember_source_uses_callback(&src, false, false, true, until + 1),
             "a lapsed endorsement parks too"
+        );
+        assert!(
+            !ember_source_uses_callback(&src, false, false, false, now),
+            "an endorsement no verified contact corroborates parks: the signature \
+             is made with a key the publisher supplies, so it names nobody"
         );
 
         let lan = ember::dht::publish::DiscoveredSource {
@@ -4322,7 +4333,7 @@ mod friend_transfer_tests {
             ..src
         };
         assert!(
-            !ember_source_uses_callback(&lan, false, false, now),
+            !ember_source_uses_callback(&lan, false, false, true, now),
             "special-use buddy is not a callback job"
         );
 
@@ -4334,7 +4345,7 @@ mod friend_transfer_tests {
             ..src
         };
         assert!(
-            !ember_source_uses_callback(&unendorsed, false, false, now),
+            !ember_source_uses_callback(&unendorsed, false, false, true, now),
             "a trailer published before endorsements existed has nothing to bind"
         );
 
@@ -4346,7 +4357,7 @@ mod friend_transfer_tests {
             ..src
         };
         assert!(
-            !ember_source_uses_callback(&aimed_elsewhere, false, false, now),
+            !ember_source_uses_callback(&aimed_elsewhere, false, false, true, now),
             "an endpoint its owner did not sign for is a reflection target"
         );
 
@@ -6861,6 +6872,7 @@ mod tests {
             result_origin: "KAD".to_string(),
             origin_server_ip: None,
             spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
         }
     }
 
@@ -10574,16 +10586,6 @@ fn check_disk_space(download_dir: &std::path::Path, needed_bytes: u64) -> bool {
     }
 }
 
-async fn save_registered_part_tracker(state: &NetworkState, transfer_id: &str, reason: &str) {
-    let tracker = state.tracker_registry.lock().get(transfer_id).cloned();
-
-    let Some(tracker) = tracker else {
-        return;
-    };
-
-    save_part_tracker_snapshot(tracker, transfer_id, reason).await;
-}
-
 async fn save_part_tracker_snapshot(
     tracker: Arc<RwLock<ed2k::part_tracker::PartTracker>>,
     transfer_id: &str,
@@ -10619,7 +10621,7 @@ async fn save_part_tracker_snapshot(
 
 /// Serializes fire-and-forget transfer status writes so a later live state
 /// cannot be overwritten by an earlier `spawn_blocking` that lost the race.
-struct TransferStatusWriteClock {
+pub(crate) struct TransferStatusWriteClock {
     seq: std::sync::atomic::AtomicU64,
     last: std::sync::Mutex<HashMap<String, u64>>,
 }
@@ -10632,17 +10634,48 @@ impl TransferStatusWriteClock {
         })
     }
 
-    fn next_seq(&self) -> u64 {
+    pub(crate) fn next_seq(&self) -> u64 {
         self.seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Drop a transfer's entry once its row is gone.
+    ///
+    /// The map is otherwise insert-only, so it retained one `String` + `u64` per
+    /// transfer id that ever received a status write for the life of the
+    /// process. Stale entries were inert — a re-added transfer gets a fresh
+    /// UUID and sequence numbers are monotonic — but this is the same per-id
+    /// map leak the teardown paths clean up for every other map.
+    pub(crate) fn forget(&self, transfer_id: &str) {
+        let mut last = match self.last.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        last.remove(transfer_id);
+    }
+}
+
+/// The one clock every transfer-status writer must order against.
+///
+/// Process-wide because there is exactly one `transfers` table and two
+/// independent writers — the network task's fire-and-forget
+/// `spawn_transfer_status_write` and the IPC handlers in
+/// `commands::transfers` — and a clock only orders writes that go *through*
+/// it. Threading one instance through both `NetworkDeps` and `AppState` would
+/// give the same guarantee, but it would also make "two clocks" a reachable
+/// mistake, and two clocks is precisely the bug this exists to prevent: an
+/// unsequenced command write could land after a newer one and leave the
+/// persisted status disagreeing with live state, which restore then acts on.
+pub(crate) fn transfer_status_write_clock() -> &'static Arc<TransferStatusWriteClock> {
+    static CLOCK: std::sync::OnceLock<Arc<TransferStatusWriteClock>> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(TransferStatusWriteClock::new)
 }
 
 fn transfer_status_write_is_stale(applied: Option<u64>, seq: u64) -> bool {
     applied.is_some_and(|a| seq <= a)
 }
 
-fn apply_transfer_status_write(
+pub(crate) fn apply_transfer_status_write(
     clock: &TransferStatusWriteClock,
     db: &Database,
     transfer_id: &str,
@@ -10696,7 +10729,7 @@ async fn mark_download_insufficient(
         mgr.update_status(transfer_id, TransferStatus::Insufficient);
         mgr.set_failure_context(
             transfer_id,
-            Some("Insufficient disk space".to_string()),
+            Some(ed2k::transfer::TransferFailureCode::InsufficientDisk),
             Some("insufficient_disk".to_string()),
             Some("disk_space".to_string()),
         );
@@ -10714,7 +10747,8 @@ async fn mark_download_insufficient(
         serde_json::json!({
             "id": transfer_id,
             "status": "insufficient",
-            "error": "Insufficient disk space",
+            "error": ed2k::transfer::TransferFailureCode::InsufficientDisk.message(),
+            "failure_code": ed2k::transfer::TransferFailureCode::InsufficientDisk.as_code(),
             "failure_kind": "insufficient_disk",
             "failure_stage": "disk_space",
             "file_name": file_name,
@@ -15951,11 +15985,18 @@ fn sync_shared_friends_only_hashes(
 
 /// Set the Library KAD / eD2K / Ember badges from real publish/offer state,
 /// not mere connectivity.
+/// `ember_live` must be a real liveness test (verified contacts > 0), not
+/// `settings.ember_native_enabled`, which is now permanently true. The Ember
+/// publish set is seeded at startup from `known.met` stamps still inside their
+/// TTL — last session's STOREs — so without a liveness term the Library showed
+/// a green Ember badge on every file while the status bar said Connecting and
+/// the Ember page showed a warning triangle. The KAD and eD2K badges beside it
+/// have always required their connection.
 fn apply_publish_badges(
     files: &mut [FileInfo],
     kad_connected: bool,
     server_connected: bool,
-    ember_enabled: bool,
+    ember_live: bool,
     kad_published: &HashSet<[u8; 16]>,
     ed2k_offered: &HashSet<[u8; 16]>,
     ember_published: &HashSet<[u8; 16]>,
@@ -15971,7 +16012,7 @@ fn apply_publish_badges(
             && server_connected
             && hash.map(|h| ed2k_offered.contains(&h)).unwrap_or(false);
         f.shared_ember = listable
-            && ember_enabled
+            && ember_live
             && hash.map(|h| ember_published.contains(&h)).unwrap_or(false);
     }
 }
@@ -16646,8 +16687,10 @@ fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &TransferHealthUp
             "id": update.id,
             "health": update.health,
             "health_reason": update.health_reason,
+            "health_code": update.health_code,
             "stalled_since": update.stalled_since,
             "failure_reason": update.failure_reason,
+            "failure_code": update.failure_code,
             "failure_kind": update.failure_kind,
             "failure_stage": update.failure_stage,
         }),
@@ -19449,7 +19492,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // stalled behind large known.met / ipfilter.dat parses.
     let mut known_files = KnownFileList::new();
     info!("Known files / AICH / ipfilter load deferred until event loop");
-    let transfer_status_writes = TransferStatusWriteClock::new();
+    let transfer_status_writes = Arc::clone(transfer_status_write_clock());
 
     // Initialize statistics manager
     let mut stats_manager = StatsManager::new();
@@ -22182,7 +22225,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &mut snap,
                                         kad_connected,
                                         state.server_connected,
-                                        settings.ember_native_enabled,
+                                        settings.ember_native_enabled
+                                            && state.ember_dht.routing().verified_len() > 0,
                                         &kad_published,
                                         &state.offered_ed2k_hashes,
                                         &state.ember_published_sources,
@@ -22309,7 +22353,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                     let failure_stage = ed2k::transfer::infer_stage_from_error(error).to_string();
                     let failure_kind_name = ed2k::transfer::failure_kind_name(failure_kind);
-                    let failure_summary = ed2k::transfer::summarize_error(error, failure_kind);
+                    let failure_code = ed2k::transfer::classify_failure(error, failure_kind);
+                    let failure_summary = failure_code.message();
 
                     {
                         let peer_id_str = {
@@ -22321,7 +22366,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             "source": peer_id_str,
                             "stage": &failure_stage,
                             "kind": &failure_kind_name,
-                            "reason": &failure_summary,
+                            "reason": failure_summary,
+                            "reason_code": failure_code.as_code(),
                         }));
                     }
 
@@ -22374,9 +22420,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
                         || ed2k::transfer::is_disk_full_error(error);
                     let is_ember_pin_fail = ed2k::transfer::is_ember_blake3_mismatch(error)
-                        || ed2k::transfer::is_ember_blake3_mismatch(&failure_summary);
+                        || failure_code
+                            == ed2k::transfer::TransferFailureCode::EmberContentHashMismatch;
                     let is_aich_pin_fail = ed2k::transfer::is_expected_aich_mismatch(error)
-                        || ed2k::transfer::is_expected_aich_mismatch(&failure_summary);
+                        || failure_code == ed2k::transfer::TransferFailureCode::AichHashMismatch;
                     if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel {
                         state.pending_downloads.remove(transfer_id);
                         info!(
@@ -22517,19 +22564,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     }
                                     mgr.set_failure_context(
                                         transfer_id,
-                                        Some(failure_summary.clone()),
+                                        Some(failure_code),
                                         Some(failure_kind_name.clone()),
                                         Some(failure_stage.clone()),
                                     );
-                                    let update = mgr.set_health_state(
-                                        transfer_id,
-                                        TransferHealth::Degraded,
-                                        Some(format!(
-                                            "Retrying after {}",
-                                            failure_summary.to_lowercase()
-                                        )),
-                                        chrono::Utc::now().timestamp(),
-                                    );
+                                    let update = mgr.set_retrying_after(transfer_id, failure_code);
                                     mgr.register_control(transfer_id, control.clone());
                                     Some(update)
                                 }
@@ -22569,10 +22608,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 "id": transfer_id,
                                 "status": "searching",
                                 "failure_reason": failure_summary,
+                                "failure_code": failure_code.as_code(),
                                 "failure_kind": failure_kind_name,
                                 "failure_stage": failure_stage,
                                 "health": "degraded",
-                                "health_reason": format!("Retrying after {}", ed2k::transfer::summarize_error(error, failure_kind).to_lowercase()),
+                                "health_reason": TransferHealthCode::retrying_after(failure_code),
+                                "health_code": TransferHealthCode::RetryingAfter.as_code(),
                             }));
                             continue;
                         }
@@ -30371,6 +30412,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         user_hash: Option<[u8; 16]>,
                     }
                     let mut reask_jobs: Vec<EmberCallbackReaskJob> = Vec::new();
+                    let reask_now_ts = chrono::Utc::now().timestamp();
                     for (tid, pfs) in &state.per_file_sources {
                         let is_live = state.pending_downloads.contains_key(tid)
                             || state.active_source_senders.contains_key(tid);
@@ -30378,7 +30420,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             continue;
                         }
                         for src in &pfs.sources {
-                            if !src.ember_callback_reask_due() {
+                            if !src.ember_callback_reask_due(reask_now_ts) {
                                 continue;
                             }
                             let (Some(buddy_ip), Some(buddy_port), Some(buddy_noise), Some(buddy_node_id), Some(publisher_id), Some(callback_token)) = (
@@ -30391,6 +30433,29 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             ) else {
                                 continue;
                             };
+                            // Re-check the endpoint against the routing table on
+                            // every reask, not just at ingest. The stored
+                            // address is a firewalled publisher's claim, and a
+                            // contact can go stale or change address between
+                            // reasks — the initial dial's corroboration does not
+                            // carry forward. Matching on the persisted node ID
+                            // implies the Ed25519 key, since routing admission
+                            // enforces `node_id == BLAKE3(pubkey)[..16]`.
+                            let corroborated = state
+                                .ember_dht
+                                .contact_for(&ember::dht::EmberNodeId(buddy_node_id))
+                                .is_some_and(|c| {
+                                    c.is_verified()
+                                        && c.addr
+                                            == SocketAddr::new(
+                                                IpAddr::V4(buddy_ip),
+                                                buddy_port,
+                                            )
+                                        && c.noise_pub == buddy_noise
+                                });
+                            if !corroborated {
+                                continue;
+                            }
                             reask_jobs.push(EmberCallbackReaskJob {
                                 transfer_id: tid.clone(),
                                 file_hash: pfs.file_hash,
@@ -30532,7 +30597,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 mgr.update_status(tid, TransferStatus::Failed);
                                 mgr.fail(
                                     tid,
-                                    "Cancelled",
+                                    ed2k::transfer::TransferFailureCode::Cancelled,
                                     Some("transient".to_string()),
                                     Some("cancelled".to_string()),
                                 );
@@ -30548,7 +30613,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
                                 "id": tid,
                                 "status": "failed",
-                                "error": "Cancelled by user",
+                                "error": ed2k::transfer::TransferFailureCode::Cancelled.message(),
+                                "failure_code": ed2k::transfer::TransferFailureCode::Cancelled.as_code(),
                             }));
                         }
                     }
@@ -32453,6 +32519,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
                                         origin_server_ip: None,
                                         spam_reasons: Vec::new(),
+                                        spam_reason_details: Vec::new(),
                                         }
                                     }).collect();
 
@@ -33937,6 +34004,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
                                         origin_server_ip: None,
                                         spam_reasons: Vec::new(),
+                                        spam_reason_details: Vec::new(),
                                     }
                                 }).collect();
                                 // Extracted into owned values (rather than an `as_ref()`
@@ -36958,10 +37026,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 state.banned_ips.contains(&b.ip)
                                     || state.ip_filter.is_blocked(b.ip)
                             });
+                            // The endorsement is signed under a key the
+                            // publisher supplies, so it names nobody on its
+                            // own. Require a contact we have actually heard
+                            // from to hold this address and these keys.
+                            let buddy_corroborated = src
+                                .buddy
+                                .is_some_and(|b| state.ember_dht.buddy_endpoint_corroborated(&b));
                             if ember_source_uses_callback(
                                 src,
                                 we_are_unreachable,
                                 buddy_blocked_or_banned,
+                                buddy_corroborated,
                                 now_ts,
                             ) {
                                 callback_jobs.push((*fh, *src));
@@ -36972,6 +37048,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     state.ember_diagnostics.ember_dht_buddy_unendorsed = state
                                         .ember_diagnostics
                                         .ember_dht_buddy_unendorsed
+                                        .saturating_add(1);
+                                } else if !buddy_corroborated && src.buddy.is_some() {
+                                    // Endorsement is well-formed but the named
+                                    // identity is not one we have met at that
+                                    // endpoint. Parked, and retried on the
+                                    // reask cadence once it verifies.
+                                    state.ember_diagnostics.ember_dht_buddy_uncorroborated = state
+                                        .ember_diagnostics
+                                        .ember_dht_buddy_uncorroborated
                                         .saturating_add(1);
                                 }
                                 rest.push((src.ip, src.tcp_port, src.udp_port, src.flags));
@@ -37071,8 +37156,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             // Same defence-in-depth as the address checks
                             // above: the selection loop already required it,
                             // but nothing may open a handshake to an endpoint
-                            // its owner did not sign for.
-                            if !buddy.endorsement_covers(&src.publisher_id, now_ts) {
+                            // its owner did not sign for. Both halves are
+                            // re-checked — the endorsement proves the trailer
+                            // was not tampered with after signing, and the
+                            // corroboration proves the signing key belongs to
+                            // a node we have actually reached at this address
+                            // rather than one the publisher minted.
+                            if !buddy.endorsement_covers(&src.publisher_id, now_ts)
+                                || !state.ember_dht.buddy_endpoint_corroborated(&buddy)
+                            {
                                 continue;
                             }
                             // Infallible once the endorsement verified — the
@@ -37119,6 +37211,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     src.publisher_id,
                                     src.user_hash,
                                     src.callback_token,
+                                    buddy.endorsed_until,
                                     added,
                                 );
                             }
@@ -37611,7 +37704,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let changed_count = updates.len();
                 let kad_connected = state.stats.status == NetworkStatus::Connected;
                 let srv_connected = state.server_connected;
-                let ember_enabled = settings.ember_native_enabled;
+                let ember_live =
+                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
                 let kad_published = state.publish_manager.source_published_md4_hashes();
                 let ed2k_offered = state.offered_ed2k_hashes.clone();
                 let ember_published = state.ember_published_sources.clone();
@@ -37623,7 +37717,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &mut snap,
                             kad_connected,
                             srv_connected,
-                            ember_enabled,
+                            ember_live,
                             &kad_published,
                             &ed2k_offered,
                             &ember_published,
@@ -38225,7 +38319,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let app_for_cache = app_handle.clone();
                 let kad_connected = state.stats.status == NetworkStatus::Connected;
                 let srv_connected = state.server_connected;
-                let ember_enabled = settings.ember_native_enabled;
+                let ember_live =
+                    settings.ember_native_enabled && state.ember_dht.routing().verified_len() > 0;
                 let kad_published = state.publish_manager.source_published_md4_hashes();
                 let ed2k_offered = state.offered_ed2k_hashes.clone();
                 let ember_published = state.ember_published_sources.clone();
@@ -38246,7 +38341,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &mut snap,
                             kad_connected,
                             srv_connected,
-                            ember_enabled,
+                            ember_live,
                             &kad_published,
                             &ed2k_offered,
                             &ember_published,
@@ -40902,6 +40997,7 @@ fn build_ember_keyword_built(
                     result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
                     origin_server_ip: None,
                     spam_reasons: Vec::new(),
+                    spam_reason_details: Vec::new(),
                 };
                 dedup.insert(rec.file_hash, (sr, publisher_digests));
             }
@@ -41964,16 +42060,23 @@ fn ember_unendorsed_source_buddy(
     buddy.is_routable().then_some(buddy)
 }
 
-/// Whether consume should `CALLBACK_REQ` this source. Unusable, unendorsed or
-/// locally blocked buddies fall through to the firewalled park path instead of
-/// being dropped.
+/// Whether consume should `CALLBACK_REQ` this source. Unusable, unendorsed,
+/// uncorroborated or locally blocked buddies fall through to the firewalled park
+/// path instead of being dropped.
+///
+/// `buddy_endpoint_corroborated` must be
+/// `EmberDht::buddy_endpoint_corroborated` for this source's buddy — the
+/// endorsement alone is signed under a publisher-supplied key and so names no
+/// one. See [`ember::dht::publish::DiscoveredSource::takes_callback`].
 fn ember_source_uses_callback(
     src: &ember::dht::publish::DiscoveredSource,
     we_are_unreachable: bool,
     buddy_blocked_or_banned: bool,
+    buddy_endpoint_corroborated: bool,
     now: i64,
 ) -> bool {
-    src.takes_callback(we_are_unreachable, now) && !buddy_blocked_or_banned
+    src.takes_callback(we_are_unreachable, buddy_endpoint_corroborated, now)
+        && !buddy_blocked_or_banned
 }
 
 /// PFS states whose declared IP must not be gossiped as a HighID EPX source.
@@ -42110,6 +42213,28 @@ fn ember_endorsement_supersedes_unendorsed_sources(state: &mut NetworkState) {
     );
 }
 
+/// Drop publish-set entries whose source record has outlived
+/// `EMBER_SOURCE_RECORD_TTL`.
+///
+/// `ember_source_publish_unix` is written in lockstep with
+/// `ember_published_sources`, so it dates each entry without the set having to
+/// carry timestamps of its own. An entry with no stamp is left alone: the only
+/// way to hold one is to have been placed this session by a path that also
+/// stamps it, and guessing would darken a live badge.
+fn prune_expired_ember_published_sources(state: &mut NetworkState) {
+    if state.ember_published_sources.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let ttl = EMBER_SOURCE_RECORD_TTL.as_secs();
+    let stamps = &state.ember_source_publish_unix;
+    state.ember_published_sources.retain(|hash| {
+        stamps
+            .get(hash)
+            .is_none_or(|placed| now.saturating_sub(*placed as u64) < ttl)
+    });
+}
+
 fn prune_ember_pending_proxy_overlay(state: &mut NetworkState) {
     let now = std::time::Instant::now();
     let expired: Vec<(ember::dht::EmberNodeId, u32, EmberRecordRef)> = state
@@ -42204,6 +42329,31 @@ async fn maybe_publish_ember_sources(
     state.ember_diagnostics.ember_dht_waiting_buddy = false;
     state.ember_diagnostics.ember_dht_buddy_unendorsed_publish = false;
 
+    // TTL-expire source records still held for a buddy ACK, genuinely before
+    // anything can return early. It needs no peers, no external IP and no TCP
+    // port, and it must not be reachable only on the paths that get that far:
+    // three of the returns below (empty publishable table, no external IPv4,
+    // IPv6-only mapping) sat above it, and the first of those is exactly what a
+    // node hits when `evict_filtered_contacts` momentarily empties the table on
+    // an ipfilter reload.
+    //
+    // This is the only periodic sweep of `ember_pending_proxy_overlay`, and
+    // `ember_publish_staleness` returns `None` for any file with an `unplaced`
+    // entry. So a firewalled node whose named buddy never ACKs (it can legally
+    // send nothing: budget refused, publish table full, or replica rejected)
+    // pinned its whole library within a couple of ticks on the 5-file-per-tick
+    // floor and never again ran the sweep that would release it — publishing no
+    // Ember source record for the rest of the session while ~10 signed records
+    // stayed resident. The 256-entry cap never fired either, because the map
+    // never grew that far.
+    prune_ember_pending_proxy_overlay(state);
+    // A publish set entry only means "we placed a record"; the record itself
+    // lapses after `EMBER_SOURCE_RECORD_TTL` whether or not we ever re-STORE.
+    // Unshare and friends-only both prune this set, but nothing did when a
+    // replica simply expired — so a node that lost its buddy kept reporting
+    // those files as published for the rest of the session.
+    prune_expired_ember_published_sources(state);
+
     if !settings.ember_native_enabled || tcp_port == 0 || ember_publishable_peer_count(state) == 0 {
         return;
     }
@@ -42286,25 +42436,6 @@ async fn maybe_publish_ember_sources(
     } else if needs_buddy {
         state.ember_diagnostics.ember_dht_firewalled_publishing = true;
     }
-
-    // TTL-expire source records still held for a buddy ACK before anything can
-    // return early.
-    //
-    // This is the only periodic sweep of `ember_pending_proxy_overlay`, and it
-    // used to sit below the `due.is_empty()` bail further down — which is
-    // reached precisely when every publishable file is already pinned, because
-    // `ember_publish_staleness` returns `None` for a file with an `unplaced`
-    // entry. So a firewalled node whose named buddy never ACKs (it can legally
-    // send nothing: budget refused, publish table full, or replica rejected)
-    // pinned its whole library within a couple of ticks on the 5-file-per-tick
-    // floor, went permanently `due`-empty, and never again ran the sweep that
-    // would release it — publishing no Ember source record for the rest of the
-    // session while ~10 signed records stayed resident. The 256-entry cap never
-    // fired either, because the map never grew that far.
-    //
-    // Running it here rather than after `due` is computed also means a file the
-    // TTL releases becomes eligible on this tick instead of losing one.
-    prune_ember_pending_proxy_overlay(state);
 
     // Gauges above are wanted every tick, so this comes after them.
     if ember_publish_queue_is_backed_up(state) {
@@ -44338,7 +44469,16 @@ async fn handle_udp_packet_inner(
                 let file_hash = reask.file_hash;
                 let hash_hex = hex::encode(file_hash);
 
-                let restricted = {
+                // Both inputs report "public" before the deferred known.met load
+                // lands: hashing seeds index rows with `friends_only: false`,
+                // and `find_by_hash` on the unabsorbed catalog returns `None`.
+                // So an unauthenticated prober that knew the hash could get an
+                // `OP_REASKACK` — file size, and for the enhanced form the whole
+                // parts bitmap — confirming we hold a friends-only file. Fail
+                // closed until the catalog is authoritative, matching the
+                // partial branch below and the TCP serve path's
+                // `!snapshot_ready` rule.
+                let restricted = !known_files.is_authoritative() || {
                     let idx = local_index.read().await;
                     idx.get_by_hash(&hash_hex).is_some_and(|f| f.friends_only)
                         || known_files
@@ -47631,12 +47771,13 @@ async fn handle_download_event(
         } => {
             let failure_stage = ed2k::transfer::infer_stage_from_error(&error).to_string();
             let failure_kind_name = ed2k::transfer::failure_kind_name(&failure_kind);
-            let failure_summary = ed2k::transfer::summarize_error(&error, &failure_kind);
+            let failure_code = ed2k::transfer::classify_failure(&error, &failure_kind);
+            let failure_summary = failure_code.message();
             // User cancel is handled by cancel_transfer (history + row removal).
             // Emitting transfer-failed here would briefly turn the progress bar
             // red before the frontend drops the row.
             if ed2k::transfer::is_user_cancel_error(&error)
-                || failure_summary.eq_ignore_ascii_case("cancelled")
+                || failure_code == ed2k::transfer::TransferFailureCode::Cancelled
             {
                 return;
             }
@@ -47685,7 +47826,7 @@ async fn handle_download_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.fail(
                     &transfer_id,
-                    &failure_summary,
+                    failure_code,
                     Some(failure_kind_name.clone()),
                     Some(failure_stage.clone()),
                 )
@@ -47711,6 +47852,7 @@ async fn handle_download_event(
                 serde_json::json!({
                     "id": transfer_id,
                     "error": failure_summary,
+                    "failure_code": failure_code.as_code(),
                     "failure_kind": failure_kind_name,
                     "failure_stage": failure_stage,
                 }),
@@ -47773,6 +47915,7 @@ async fn handle_upload_event(
                 completed_size: 0,
                 started_at: chrono::Utc::now().timestamp(),
                 failure_reason: None,
+                failure_code: None,
                 failure_kind: None,
                 failure_stage: None,
                 priority: "auto".to_string(),
@@ -47784,6 +47927,7 @@ async fn handle_upload_event(
                 last_received: None,
                 health: TransferHealth::Healthy,
                 health_reason: None,
+                health_code: None,
                 stalled_since: None,
                 category: String::new(),
                 wait_time: wait_seconds,
@@ -47960,14 +48104,14 @@ async fn handle_upload_event(
             // backend record around for 5s only created a window where
             // a poll could re-add the failed row to the store.
             // Redact the raw upload error the same way the download path does
-            // (`summarize_error` only ever returns fixed, canned strings), so peer
+            // (`classify_failure` only ever yields fixed, canned strings), so peer
             // IPs / local paths from anyhow chains don't leak into the UI's
             // `failure_reason` or upload history.
-            let upload_failure_summary =
-                ed2k::transfer::summarize_error(&error, &ed2k::transfer::classify_error(&error));
+            let upload_failure =
+                ed2k::transfer::classify_failure(&error, &ed2k::transfer::classify_error(&error));
             let promoted = match {
                 let mut mgr = transfer_manager.write().await;
-                let promoted = mgr.fail(&event.transfer_id, &upload_failure_summary, None, None);
+                let promoted = mgr.fail(&event.transfer_id, upload_failure, None, None);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
             } {
@@ -47983,7 +48127,12 @@ async fn handle_upload_event(
             promoted_out.extend(promoted);
             let _ = app_handle.emit(
                 "transfer-failed",
-                serde_json::json!({ "id": event.transfer_id, "error": upload_failure_summary, "direction": "upload" }),
+                serde_json::json!({
+                    "id": event.transfer_id,
+                    "error": upload_failure.message(),
+                    "failure_code": upload_failure.as_code(),
+                    "direction": "upload",
+                }),
             );
         }
         UploadEventKind::EmberSources { .. }
@@ -48434,6 +48583,7 @@ fn convert_search_results(
                     result_origin: crate::search::merge::ORIGIN_KAD.to_string(),
                     origin_server_ip: None,
                     spam_reasons: Vec::new(),
+                    spam_reason_details: Vec::new(),
                 },
             );
         }
@@ -48558,6 +48708,7 @@ fn convert_note_search_results(
                 result_origin: crate::search::merge::ORIGIN_NOTES.to_string(),
                 origin_server_ip: None,
                 spam_reasons: Vec::new(),
+                spam_reason_details: Vec::new(),
             })
         })
         .collect()

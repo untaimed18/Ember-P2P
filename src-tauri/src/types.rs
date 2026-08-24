@@ -134,6 +134,13 @@ pub struct Transfer {
     pub started_at: i64,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// Stable discriminator for [`failure_reason`](Self::failure_reason), from
+    /// `TransferFailureCode` in `network::ed2k::transfer`. The English above is
+    /// what logs and history read; this is what the UI translates, so a
+    /// re-wording there cannot drop the row back to English. `None` on rows
+    /// written before the codes existed.
+    #[serde(default)]
+    pub failure_code: Option<String>,
     #[serde(default)]
     pub failure_kind: Option<String>,
     #[serde(default)]
@@ -172,6 +179,12 @@ pub struct Transfer {
     pub health: TransferHealth,
     #[serde(default)]
     pub health_reason: Option<String>,
+    /// Stable discriminator for [`health_reason`](Self::health_reason), from
+    /// `TransferHealthCode` in `sharing::manager`. `retrying_after` composes
+    /// with [`failure_code`](Self::failure_code), which the row carries at the
+    /// same time.
+    #[serde(default)]
+    pub health_code: Option<String>,
     #[serde(default)]
     pub stalled_since: Option<i64>,
     /// Category name (eMule: category tabs)
@@ -454,6 +467,11 @@ pub struct SearchResult {
     /// cannot reconstruct batch-local heuristics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spam_reasons: Vec<String>,
+    /// The same reasons carrying the discriminator and numbers the UI needs to
+    /// render them in the active locale. Additive alongside `spam_reasons`,
+    /// which stays the English the logs and older frontends read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spam_reason_details: Vec<crate::search::spam::SpamReason>,
 }
 
 /// Response from [`crate::commands::transfers::start_download`].
@@ -785,6 +803,15 @@ pub struct EmberDiagnostics {
     /// us and downloads are falling back to the relay/park route.
     #[serde(default)]
     pub ember_dht_buddy_unendorsed: u32,
+    /// Firewalled source records we parked because the endorsement was
+    /// well-formed but the identity it names is not one we have heard from at
+    /// that address. The endorsement is signed under a key the publisher
+    /// supplies, so on its own it binds the endpoint to nobody; this counter is
+    /// the second gate refusing. Expected to be non-zero on a cold routing
+    /// table and to fall as contacts verify — sustained growth means the
+    /// callback path is unavailable and downloads use the relay/park route.
+    #[serde(default)]
+    pub ember_dht_buddy_uncorroborated: u32,
     /// Ember `CALLBACK_REQ` frames we sent (searcher → buddy).
     #[serde(default)]
     pub ember_dht_callback_sent: u32,
@@ -1560,11 +1587,21 @@ fn default_update_check_frequency() -> String {
 /// Fresh-install download root: `Downloads/Ember` under the user's known
 /// downloads directory, or `~/Downloads/Ember` when that XDG path is unset.
 ///
-/// Never fall back to `std::env::temp_dir()`. On Linux that is `/tmp`, and on
-/// Windows it is typically under `AppData\Local\Temp` — both have a basename
-/// in `SENSITIVE_DIR_NAMES`, so `validate_settings` would reject the defaults
-/// and config load would reset in a loop. Linux CI and servers often have no
-/// `xdg-user-dirs` setup, so `UserDirs::download_dir()` is `None` there.
+/// Never fall back to `std::env::temp_dir()` directly. On Linux that is `/tmp`,
+/// and on Windows it is typically under `AppData\Local\Temp` — both have a
+/// basename in `SENSITIVE_DIR_NAMES`, so `validate_settings` would reject the
+/// defaults and config load would reset in a loop. Linux CI and servers often
+/// have no `xdg-user-dirs` setup, so `UserDirs::download_dir()` is `None` there.
+///
+/// The last resort is the data directory, not an empty string. With no base,
+/// `AppSettings::default()` composes the *relative* path `Downloads`, which
+/// resolves against whatever the process CWD happens to be — and because
+/// `validate_settings` skipped its path-safety block on an empty value, that
+/// relative path was accepted, never created, and never registered as an
+/// approved root. Reaching this branch at all means no home directory could be
+/// found, so the result may still be rejected downstream (`resolve_data_dir`
+/// can land under `AppData` or `/tmp`); it is absolute and attributable, which
+/// an empty string is not.
 fn default_download_folder() -> String {
     if let Some(user_dirs) = directories::UserDirs::new() {
         if let Some(downloads) = user_dirs.download_dir() {
@@ -1591,7 +1628,10 @@ fn default_download_folder() -> String {
             .to_string_lossy()
             .into_owned();
     }
-    String::new()
+    crate::storage::paths::resolve_data_dir()
+        .join("Downloads")
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl Default for AppSettings {

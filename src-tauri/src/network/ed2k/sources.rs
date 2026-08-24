@@ -115,6 +115,11 @@ pub enum DownloadSourceState {
 /// [`KAD_CALLBACK_REASK_SECS`] cadence is roughly nine minutes — far longer
 /// than a working buddy needs to relay one frame, and comfortably shorter than
 /// the indefinite park this replaces.
+///
+/// Returning the row to the dial pool is gated on
+/// [`DownloadSourceEntry::callback_addr_unverified_claim`]: this budget exists
+/// for rows whose address we could already reach, not to make an unverified
+/// publisher claim dialable.
 const MAX_CALLBACK_REASKS: u32 = 6;
 
 fn source_state_blocks_outbound_tcp(state: &DownloadSourceState) -> bool {
@@ -168,6 +173,26 @@ pub struct DownloadSourceEntry {
     /// Token from the signed Ember source trailer; reask copies it into
     /// `CALLBACK_REQ`.
     pub callback_ember_token: Option<[u8; 16]>,
+    /// Whether this row's address is known *only* from an Ember firewalled DHT
+    /// source record — that is, a publisher's unverified claim about its own
+    /// address, which `SOURCE_FLAG_FIREWALLED` exempts from the storer's
+    /// sender-IP bind.
+    ///
+    /// Such an address has no witness at all, so it must never reach an
+    /// outbound TCP dialer even after the callback route is written off: see
+    /// [`Self::blocks_outbound_tcp`]. Rows that already existed when the
+    /// firewalled record arrived keep `false`, because those are the
+    /// user-hash-dedup case [`Self::callback_route_exhausted`] was written for —
+    /// a peer we could previously dial, reclassified by a later publish.
+    pub callback_addr_unverified_claim: bool,
+    /// `endorsed_until` from the trailer whose endorsement admitted this row.
+    ///
+    /// Carried so a reask enforces the same expiry the initial dial did. The
+    /// endorsement is the buddy's consent to receive `CALLBACK_REQ` at that
+    /// endpoint, and consent that has lapsed is not consent — without this a
+    /// row admitted one second before expiry kept sending for the rest of its
+    /// six-attempt budget.
+    pub callback_ember_endorsed_until: Option<i64>,
     /// Publisher's ED2K user hash from the KAD source record.
     pub source_user_hash: Option<[u8; 16]>,
     /// Callback requests sent since this row entered the callback route.
@@ -198,6 +223,8 @@ impl DownloadSourceEntry {
             callback_ember_buddy_id: None,
             callback_ember_publisher: None,
             callback_ember_token: None,
+            callback_addr_unverified_claim: false,
+            callback_ember_endorsed_until: None,
             source_user_hash: None,
             callback_reasks_sent: 0,
             available_parts: Vec::new(),
@@ -233,8 +260,20 @@ impl DownloadSourceEntry {
     /// Whether this row's address must not be handed to an outbound TCP
     /// dialer. Wraps [`source_state_blocks_outbound_tcp`] so the
     /// `WaitCallbackKad` park can expire; every other park is unconditional.
+    ///
+    /// The park expires only for a row whose address predates the firewalled
+    /// record — the reclassified-HighID case the budget exists for. An address
+    /// carried *only* by an Ember firewalled DHT claim keeps the park forever,
+    /// because nothing whatsoever vouches for it: `SOURCE_FLAG_FIREWALLED`
+    /// exempts the record from the storer's sender-IP bind, so letting the
+    /// budget release it meant that after ~9 minutes every downloader of a
+    /// chosen file hash TCP-dialled an address the publisher picked, including
+    /// one the user had blocked in `ipfilter.dat`.
     fn blocks_outbound_tcp(&self) -> bool {
         if matches!(self.state, DownloadSourceState::WaitCallbackKad) {
+            if self.callback_addr_unverified_claim {
+                return true;
+            }
             return !self.callback_route_exhausted();
         }
         source_state_blocks_outbound_tcp(&self.state)
@@ -257,7 +296,10 @@ impl DownloadSourceEntry {
     /// Ember `CALLBACK_REQ` reask: same cadence as KAD, but requires the
     /// buddy Noise key, the buddy node ID, and the publisher node ID from the
     /// signed source record.
-    pub fn ember_callback_reask_due(&self) -> bool {
+    /// `now` is a unix timestamp, used only to enforce the endorsement expiry
+    /// the initial dial checked. A row whose trailer has lapsed stops reasking
+    /// rather than spending the rest of its budget on consent that has expired.
+    pub fn ember_callback_reask_due(&self, now: i64) -> bool {
         matches!(self.state, DownloadSourceState::WaitCallbackKad)
             && !self.callback_route_exhausted()
             && self.callback_buddy_ip.is_some()
@@ -265,6 +307,9 @@ impl DownloadSourceEntry {
             && self.callback_ember_buddy_id.is_some()
             && self.callback_ember_publisher.is_some()
             && self.callback_ember_token.is_some()
+            && self
+                .callback_ember_endorsed_until
+                .is_some_and(|until| until > now)
             && self.last_asked.elapsed().as_secs() >= KAD_CALLBACK_REASK_SECS as u64
     }
 
@@ -308,8 +353,13 @@ impl DownloadSourceEntry {
             // the callback route still has attempts left. Once spent, fall
             // through to the ordinary interval so the row can be reasked and
             // dialed instead of sitting out the transfer.
+            // Except when the address is the publisher's own unverified claim,
+            // which stays parked permanently. This has to agree with
+            // `blocks_outbound_tcp`, or the row would be scheduled for a reask
+            // that aims UDP at an address nothing vouches for — the same
+            // reflection primitive one protocol down.
             DownloadSourceState::WaitCallbackKad => {
-                if self.callback_route_exhausted() {
+                if self.callback_route_exhausted() && !self.callback_addr_unverified_claim {
                     FILEREASKTIME_SECS as u64
                 } else {
                     return u64::MAX;
@@ -646,6 +696,7 @@ impl PerFileSourceList {
             s.callback_ember_buddy_id = None;
             s.callback_ember_publisher = None;
             s.callback_ember_token = None;
+            s.callback_ember_endorsed_until = None;
             if source_user_hash.is_some() {
                 s.source_user_hash = source_user_hash;
             }
@@ -672,6 +723,7 @@ impl PerFileSourceList {
         publisher_id: [u8; 16],
         source_user_hash: Option<[u8; 16]>,
         callback_token: Option<[u8; 16]>,
+        endorsed_until: i64,
         is_new: bool,
     ) {
         let target_idx = self.resolve_idx(ip, port, source_user_hash);
@@ -683,6 +735,14 @@ impl PerFileSourceList {
             s.callback_ember_buddy_id = Some(buddy_node_id).filter(|id| *id != [0u8; 16]);
             s.callback_ember_publisher = Some(publisher_id);
             s.callback_ember_token = callback_token.filter(|t| *t != [0u8; 16]);
+            s.callback_ember_endorsed_until = Some(endorsed_until);
+            // Only a row this record *created* has an address with no witness
+            // but the publisher's own claim. A pre-existing row got its address
+            // from somewhere we could already reach it, so leave the flag clear
+            // and let the callback budget hand it back to the dial pool.
+            if is_new {
+                s.callback_addr_unverified_claim = true;
+            }
             // Mirror of `set_kad_callback_buddy`: the buddy address now
             // describes the Ember buddy, so a stale KAD buddy hash on the same
             // row would point the KAD route at the wrong host.
@@ -2526,6 +2586,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Fixed unix "now" for the reask-expiry checks, with an endorsement that
+    /// outlives it by a wide margin so tests unrelated to expiry are unaffected.
+    const TEST_NOW: i64 = 1_000_000;
+    const TEST_ENDORSED_UNTIL: i64 = 4_000_000_000;
+
     #[test]
     fn failure_score_decays_after_queue_progress() {
         let hash = [0x11; 16];
@@ -2642,15 +2707,51 @@ mod tests {
             [0xBBu8; 16],
             Some([0xCCu8; 16]),
             Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
             true,
         );
-        assert!(pfs.sources[0].ember_callback_reask_due());
+        assert!(pfs.sources[0].ember_callback_reask_due(TEST_NOW));
         assert!(
             !pfs.sources[0].kad_callback_reask_due(),
             "Ember-buddy rows must not also fire the KAD CallbackReq path"
         );
         pfs.mark_callback_requested(ip, 4662, None);
-        assert!(!pfs.sources[0].ember_callback_reask_due());
+        assert!(!pfs.sources[0].ember_callback_reask_due(TEST_NOW));
+    }
+
+    /// The endorsement is the buddy's consent to receive `CALLBACK_REQ` at that
+    /// endpoint, and it carries an expiry. A row admitted just before the
+    /// endorsement lapses used to keep spending its remaining budget for
+    /// roughly another 54 minutes.
+    #[test]
+    fn a_lapsed_endorsement_stops_the_ember_callback_reask() {
+        let hash = [0x4A; 16];
+        let ip = Ipv4Addr::new(5, 5, 5, 7);
+        let buddy = Ipv4Addr::new(6, 6, 6, 8);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_ember_callback_buddy(
+            ip,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xB2u8; 16],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            TEST_NOW + 60,
+            true,
+        );
+        assert!(
+            pfs.sources[0].ember_callback_reask_due(TEST_NOW),
+            "live endorsement still reasks (positive control)"
+        );
+        assert!(
+            !pfs.sources[0].ember_callback_reask_due(TEST_NOW + 60),
+            "an endorsement is not valid at the instant it lapses"
+        );
+        assert!(!pfs.sources[0].ember_callback_reask_due(TEST_NOW + 61));
     }
 
     /// A record published before the trailer carried an endorsement has no
@@ -2673,10 +2774,11 @@ mod tests {
             [0xBBu8; 16],
             Some([0xCCu8; 16]),
             Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
             true,
         );
         assert!(pfs.sources[0].callback_ember_buddy_id.is_none());
-        assert!(!pfs.sources[0].ember_callback_reask_due());
+        assert!(!pfs.sources[0].ember_callback_reask_due(TEST_NOW));
         assert!(
             !pfs.sources[0].kad_callback_reask_due(),
             "and it must not fall through to the KAD route either"
@@ -2710,9 +2812,10 @@ mod tests {
             [0xBBu8; 16],
             Some(user),
             Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
             true,
         );
-        assert!(pfs.sources[0].ember_callback_reask_due());
+        assert!(pfs.sources[0].ember_callback_reask_due(TEST_NOW));
         assert!(
             pfs.sources[0].callback_buddy_hash.is_none(),
             "the Ember publish owns the buddy address, so no KAD hash may linger"
@@ -2726,7 +2829,8 @@ mod tests {
             s.callback_ember_buddy_noise.is_none()
                 && s.callback_ember_buddy_id.is_none()
                 && s.callback_ember_publisher.is_none()
-                && s.callback_ember_token.is_none(),
+                && s.callback_ember_token.is_none()
+                && s.callback_ember_endorsed_until.is_none(),
             "Ember identity must not survive next to a KAD buddy address"
         );
         assert!(
@@ -2734,7 +2838,7 @@ mod tests {
             "the KAD route must actually fire once it owns the row"
         );
         assert!(
-            !s.ember_callback_reask_due(),
+            !s.ember_callback_reask_due(TEST_NOW),
             "and the Ember route must not aim at the KAD buddy"
         );
     }
@@ -2789,6 +2893,90 @@ mod tests {
         assert!(pfs.dialable_sources().is_empty());
     }
 
+    /// The callback budget must not turn an unverified publisher claim into a
+    /// TCP dial. A firewalled Ember record is exempt from the storer's
+    /// sender-IP bind, so its declared address has no witness; spending the
+    /// budget used to hand exactly that address to the dialer, which let a
+    /// publisher aim every downloader of a chosen hash at a third party.
+    #[test]
+    fn an_unverified_dht_claim_never_rejoins_the_dial_pool() {
+        let hash = [0x4B; 16];
+        // A routable address, so nothing but the provenance rule can refuse it.
+        let claimed = Ipv4Addr::new(9, 9, 9, 9);
+        let buddy = Ipv4Addr::new(8, 8, 8, 8);
+        let mut pfs = PerFileSourceList::new(hash);
+
+        // The record itself creates the row: `add_source_with_identity` reports
+        // `true`, which is what marks the address as claim-only.
+        let is_new = pfs.add_source_with_identity(claimed, 4662, 4672, Some([0xCCu8; 16]));
+        assert!(is_new);
+        pfs.set_ember_callback_buddy(
+            claimed,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xB2u8; 16],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
+            is_new,
+        );
+        assert!(pfs.sources[0].callback_addr_unverified_claim);
+        assert!(pfs.dialable_sources().is_empty());
+
+        for _ in 0..MAX_CALLBACK_REASKS {
+            pfs.sources[0].last_asked = Instant::now()
+                .checked_sub(Duration::from_secs(KAD_CALLBACK_REASK_SECS as u64 + 1))
+                .unwrap();
+            pfs.mark_callback_requested(claimed, 4662, Some([0xCCu8; 16]));
+        }
+        assert!(
+            pfs.sources[0].callback_route_exhausted(),
+            "the budget is still spent (positive control: the route is written off)"
+        );
+        assert!(
+            pfs.dialable_sources().is_empty(),
+            "but a claim-only address must stay parked rather than be dialled"
+        );
+        assert_eq!(pfs.sources[0].time_until_reask(), u64::MAX);
+
+        // Positive control for the case the budget *was* written for: a row that
+        // already existed when the firewalled record arrived does rejoin.
+        let mut pfs2 = PerFileSourceList::new(hash);
+        let peer = Ipv4Addr::new(7, 7, 7, 7);
+        assert!(pfs2.add_source_with_identity(peer, 4662, 4672, Some([0xCCu8; 16])));
+        let rediscovered =
+            pfs2.add_source_with_identity(peer, 4662, 4672, Some([0xCCu8; 16]));
+        assert!(!rediscovered, "second discovery of the same peer is not new");
+        pfs2.set_ember_callback_buddy(
+            peer,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xB2u8; 16],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
+            rediscovered,
+        );
+        assert!(!pfs2.sources[0].callback_addr_unverified_claim);
+        for _ in 0..MAX_CALLBACK_REASKS {
+            pfs2.sources[0].last_asked = Instant::now()
+                .checked_sub(Duration::from_secs(KAD_CALLBACK_REASK_SECS as u64 + 1))
+                .unwrap();
+            pfs2.mark_callback_requested(peer, 4662, Some([0xCCu8; 16]));
+        }
+        assert_eq!(
+            pfs2.dialable_sources(),
+            vec![(peer, 4662, 4672)],
+            "a previously reachable address still returns to the dial pool"
+        );
+    }
+
     #[test]
     fn wait_callback_kad_is_never_offered_for_a_tcp_dial() {
         let hash = [0x46; 16];
@@ -2813,6 +3001,7 @@ mod tests {
             [0xBBu8; 16],
             Some([0xCCu8; 16]),
             Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
             true,
         );
         pfs.set_kad_callback_buddy(kad_fw, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), true);
@@ -2821,7 +3010,10 @@ mod tests {
         let later = Instant::now() + Duration::from_secs(2000);
         let ready = pfs.sources_ready_for_reask_at(later);
         assert_eq!(ready, vec![(highid, 4662)]);
-        assert!(pfs.sources.iter().any(|s| s.ember_callback_reask_due()));
+        assert!(pfs
+            .sources
+            .iter()
+            .any(|s| s.ember_callback_reask_due(TEST_NOW)));
 
         let dialable = pfs.dialable_sources();
         assert_eq!(dialable, vec![(highid, 4662, 0)]);

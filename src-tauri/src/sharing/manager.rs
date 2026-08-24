@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::types::*;
 
 /// eMule-style rolling window speed measurement.
@@ -193,13 +194,78 @@ pub struct TransferManager {
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
 }
 
+/// Declares the closed set of health explanations a download row can show,
+/// each bound to a stable code.
+///
+/// Same split, and the same reasons, as `TransferFailureCode` in
+/// `network::ed2k::transfer`: the English is for logs and for a UI older than
+/// the backend, the code is what the UI translates.
+/// `scripts/backend-codes.test.mjs` parses this table to require a translation
+/// in all nine locales before a new variant can ship.
+macro_rules! transfer_health_codes {
+    ($($variant:ident => $code:literal, $message:literal;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum TransferHealthCode {
+            $($variant,)+
+        }
+
+        impl TransferHealthCode {
+            /// Every variant, in declaration order. Test-only: production code
+            /// always has a variant in hand.
+            #[cfg(test)]
+            pub const ALL: &'static [TransferHealthCode] = &[$(TransferHealthCode::$variant,)+];
+
+            /// Stable identifier carried to the UI as `Transfer::health_code`.
+            pub fn as_code(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $code,)+
+                }
+            }
+
+            /// English rendering, stored in `Transfer::health_reason`.
+            /// `{reason}` is filled from the row's failure code.
+            pub fn message(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $message,)+
+                }
+            }
+        }
+    };
+}
+
+transfer_health_codes! {
+    QueuedSources => "queued_sources", "Waiting on queued sources";
+    WaitingSources => "waiting_sources", "Waiting for sources";
+    NoData => "no_data", "Connected but not receiving data";
+    Idle => "idle", "Transfer is active but idle";
+    RetryingSources => "retrying_sources", "Retrying known sources";
+    StillSearching => "still_searching", "Still searching for sources";
+    NoSources => "no_sources", "No sources available";
+    WaitingSlot => "waiting_slot", "Waiting for an upload slot";
+    RetryingAfter => "retrying_after", "Retrying after {reason}";
+}
+
+impl TransferHealthCode {
+    /// The composed English for [`Self::RetryingAfter`]. The tail is the
+    /// case-flattened failure the retry is reacting to, which the row also
+    /// carries as `failure_code` — so the UI recomposes it from two translated
+    /// halves rather than needing a message per failure.
+    pub fn retrying_after(failure: TransferFailureCode) -> String {
+        Self::RetryingAfter
+            .message()
+            .replace("{reason}", &failure.message().to_lowercase())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TransferHealthUpdate {
     pub id: String,
     pub health: TransferHealth,
     pub health_reason: Option<String>,
+    pub health_code: Option<String>,
     pub stalled_since: Option<i64>,
     pub failure_reason: Option<String>,
+    pub failure_code: Option<String>,
     pub failure_kind: Option<String>,
     pub failure_stage: Option<String>,
 }
@@ -253,16 +319,28 @@ impl TransferManager {
     fn clear_runtime_health(transfer: &mut Transfer) {
         transfer.health = TransferHealth::Healthy;
         transfer.health_reason = None;
+        transfer.health_code = None;
         transfer.stalled_since = None;
     }
 
     fn clear_failure_context(transfer: &mut Transfer) {
         transfer.failure_reason = None;
+        transfer.failure_code = None;
         transfer.failure_kind = None;
         transfer.failure_stage = None;
     }
 
-    fn compute_health_state(transfer: &Transfer, now: i64) -> (TransferHealth, Option<String>) {
+    /// Write a health verdict onto a row, keeping `health_reason` and
+    /// `health_code` derived from the same variant.
+    fn apply_health_code(transfer: &mut Transfer, code: Option<TransferHealthCode>) {
+        transfer.health_reason = code.map(|c| c.message().to_string());
+        transfer.health_code = code.map(|c| c.as_code().to_string());
+    }
+
+    fn compute_health_state(
+        transfer: &Transfer,
+        now: i64,
+    ) -> (TransferHealth, Option<TransferHealthCode>) {
         if transfer.direction != TransferDirection::Download {
             return (TransferHealth::Healthy, None);
         }
@@ -275,45 +353,39 @@ impl TransferManager {
                     return (TransferHealth::Healthy, None);
                 }
                 if idle_secs >= ACTIVE_STALLED_SECS {
-                    let reason = if transfer.active_sources == 0 && transfer.queued_sources > 0 {
-                        "Waiting on queued sources".to_string()
+                    let code = if transfer.active_sources == 0 && transfer.queued_sources > 0 {
+                        TransferHealthCode::QueuedSources
                     } else if transfer.sources == 0 {
-                        "Waiting for sources".to_string()
+                        TransferHealthCode::WaitingSources
                     } else {
-                        "Connected but not receiving data".to_string()
+                        TransferHealthCode::NoData
                     };
-                    return (TransferHealth::Stalled, Some(reason));
+                    return (TransferHealth::Stalled, Some(code));
                 }
                 if idle_secs >= ACTIVE_DEGRADED_SECS {
-                    return (
-                        TransferHealth::Degraded,
-                        Some("Transfer is active but idle".to_string()),
-                    );
+                    return (TransferHealth::Degraded, Some(TransferHealthCode::Idle));
                 }
             }
             TransferStatus::Searching => {
                 let age_secs = now.saturating_sub(transfer.started_at);
                 if age_secs >= SEARCHING_DEGRADED_SECS {
-                    let reason = if transfer.sources > 0 {
-                        "Retrying known sources".to_string()
+                    let code = if transfer.sources > 0 {
+                        TransferHealthCode::RetryingSources
                     } else {
-                        "Still searching for sources".to_string()
+                        TransferHealthCode::StillSearching
                     };
-                    return (TransferHealth::Degraded, Some(reason));
+                    return (TransferHealth::Degraded, Some(code));
                 }
             }
             TransferStatus::Queued => {
                 if transfer.sources == 0 {
-                    return (
-                        TransferHealth::Degraded,
-                        Some("No sources available".to_string()),
-                    );
+                    return (TransferHealth::Degraded, Some(TransferHealthCode::NoSources));
                 }
                 let age_secs = now.saturating_sub(transfer.started_at);
                 if age_secs >= QUEUED_DEGRADED_SECS {
                     return (
                         TransferHealth::Degraded,
-                        Some("Waiting for an upload slot".to_string()),
+                        Some(TransferHealthCode::WaitingSlot),
                     );
                 }
             }
@@ -624,10 +696,12 @@ impl TransferManager {
         None
     }
 
+    /// Move a row to Failed. Takes the code rather than a sentence so a
+    /// failure cannot reach the UI without a discriminator to translate.
     pub fn fail(
         &mut self,
         id: &str,
-        reason: &str,
+        failure: TransferFailureCode,
         failure_kind: Option<String>,
         failure_stage: Option<String>,
     ) -> Option<Vec<Transfer>> {
@@ -643,7 +717,8 @@ impl TransferManager {
         };
         transfer.status = TransferStatus::Failed;
         transfer.speed = 0;
-        transfer.failure_reason = Some(reason.to_string());
+        transfer.failure_reason = Some(failure.message().to_string());
+        transfer.failure_code = Some(failure.as_code().to_string());
         transfer.failure_kind = failure_kind;
         transfer.failure_stage = failure_stage;
         Self::clear_runtime_health(&mut transfer);
@@ -1170,26 +1245,34 @@ impl TransferManager {
         }
     }
 
+    /// Record why a row failed without moving it out of the active set (the
+    /// re-queue and disk-full paths both keep the row alive).
     pub fn set_failure_context(
         &mut self,
         id: &str,
-        reason: Option<String>,
+        failure: Option<TransferFailureCode>,
         failure_kind: Option<String>,
         failure_stage: Option<String>,
     ) {
         if let Some(transfer) = self.get_transfer_mut(id) {
-            transfer.failure_reason = reason;
+            transfer.failure_reason = failure.map(|f| f.message().to_string());
+            transfer.failure_code = failure.map(|f| f.as_code().to_string());
             transfer.failure_kind = failure_kind;
             transfer.failure_stage = failure_stage;
         }
     }
 
-    pub fn set_health_state(
+    /// Mark a row as degraded because it is retrying after `failure`.
+    ///
+    /// Kept apart from [`Self::refresh_health`] because only the network loop
+    /// knows which failure is being retried, and apart from a generic setter
+    /// because this is the one health reason whose English is composed — the
+    /// pairing of `retrying_after` with the failure naming its tail has to be
+    /// made in one place or the two halves can disagree.
+    pub fn set_retrying_after(
         &mut self,
         id: &str,
-        health: TransferHealth,
-        reason: Option<String>,
-        now: i64,
+        failure: TransferFailureCode,
     ) -> Option<TransferHealthUpdate> {
         let transfer = self.get_transfer_mut(id)?;
         let previous = (
@@ -1197,13 +1280,10 @@ impl TransferManager {
             transfer.health_reason.clone(),
             transfer.stalled_since,
         );
-        transfer.health = health;
-        transfer.health_reason = reason;
-        transfer.stalled_since = if transfer.health == TransferHealth::Stalled {
-            Some(previous.2.unwrap_or(now))
-        } else {
-            None
-        };
+        transfer.health = TransferHealth::Degraded;
+        transfer.health_reason = Some(TransferHealthCode::retrying_after(failure));
+        transfer.health_code = Some(TransferHealthCode::RetryingAfter.as_code().to_string());
+        transfer.stalled_since = None;
         if previous
             == (
                 transfer.health.clone(),
@@ -1213,15 +1293,21 @@ impl TransferManager {
         {
             return None;
         }
-        Some(TransferHealthUpdate {
+        Some(Self::health_update(transfer))
+    }
+
+    fn health_update(transfer: &Transfer) -> TransferHealthUpdate {
+        TransferHealthUpdate {
             id: transfer.id.clone(),
             health: transfer.health.clone(),
             health_reason: transfer.health_reason.clone(),
+            health_code: transfer.health_code.clone(),
             stalled_since: transfer.stalled_since,
             failure_reason: transfer.failure_reason.clone(),
+            failure_code: transfer.failure_code.clone(),
             failure_kind: transfer.failure_kind.clone(),
             failure_stage: transfer.failure_stage.clone(),
-        })
+        }
     }
 
     pub fn refresh_health(&mut self, now: i64) -> (Vec<TransferHealthUpdate>, Vec<SpeedReset>) {
@@ -1253,9 +1339,9 @@ impl TransferManager {
                 transfer.health_reason.clone(),
                 transfer.stalled_since,
             );
-            let (health, reason) = Self::compute_health_state(transfer, now);
+            let (health, code) = Self::compute_health_state(transfer, now);
             transfer.health = health;
-            transfer.health_reason = reason;
+            Self::apply_health_code(transfer, code);
             transfer.stalled_since = if transfer.health == TransferHealth::Stalled {
                 Some(previous.2.unwrap_or(now))
             } else {
@@ -1267,15 +1353,7 @@ impl TransferManager {
                 transfer.stalled_since,
             );
             if previous != current {
-                updates.push(TransferHealthUpdate {
-                    id: transfer.id.clone(),
-                    health: transfer.health.clone(),
-                    health_reason: transfer.health_reason.clone(),
-                    stalled_since: transfer.stalled_since,
-                    failure_reason: transfer.failure_reason.clone(),
-                    failure_kind: transfer.failure_kind.clone(),
-                    failure_stage: transfer.failure_stage.clone(),
-                });
+                updates.push(Self::health_update(transfer));
             }
         }
 
@@ -1285,9 +1363,9 @@ impl TransferManager {
                 transfer.health_reason.clone(),
                 transfer.stalled_since,
             );
-            let (health, reason) = Self::compute_health_state(transfer, now);
+            let (health, code) = Self::compute_health_state(transfer, now);
             transfer.health = health;
-            transfer.health_reason = reason;
+            Self::apply_health_code(transfer, code);
             transfer.stalled_since = if transfer.health == TransferHealth::Stalled {
                 Some(previous.2.unwrap_or(now))
             } else {
@@ -1299,15 +1377,7 @@ impl TransferManager {
                 transfer.stalled_since,
             );
             if previous != current {
-                updates.push(TransferHealthUpdate {
-                    id: transfer.id.clone(),
-                    health: transfer.health.clone(),
-                    health_reason: transfer.health_reason.clone(),
-                    stalled_since: transfer.stalled_since,
-                    failure_reason: transfer.failure_reason.clone(),
-                    failure_kind: transfer.failure_kind.clone(),
-                    failure_stage: transfer.failure_stage.clone(),
-                });
+                updates.push(Self::health_update(transfer));
             }
         }
 
@@ -1385,6 +1455,156 @@ impl TransferManager {
 mod tests {
     use super::*;
 
+    /// Same contract as the failure codes: the frontend keys a table on these
+    /// exact strings, so a duplicate or a stray character costs a translation.
+    #[test]
+    fn every_health_code_is_a_distinct_identifier() {
+        let mut seen = std::collections::HashSet::new();
+        for health in TransferHealthCode::ALL {
+            let code = health.as_code();
+            assert!(
+                !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{code} is not a snake_case identifier"
+            );
+            assert!(seen.insert(code), "{code} is used by two variants");
+            assert!(!health.message().is_empty(), "{code} has no English");
+        }
+        assert_eq!(seen.len(), TransferHealthCode::ALL.len());
+    }
+
+    /// `retrying_after` is the one health reason whose English is composed, so
+    /// its placeholder has to survive into the rendered sentence — the UI fills
+    /// the same slot with the translated failure.
+    #[test]
+    fn the_retry_notice_names_the_failure_it_is_retrying() {
+        let composed = TransferHealthCode::retrying_after(TransferFailureCode::ConnectionFailed);
+        assert_eq!(composed, "Retrying after connection failed");
+        assert!(
+            !composed.contains('{'),
+            "the {{reason}} placeholder was left unfilled"
+        );
+        assert!(
+            TransferHealthCode::RetryingAfter.message().contains("{reason}"),
+            "the template must keep a slot for the failure, or the UI has nothing to fill"
+        );
+    }
+
+    /// Walks every branch of `compute_health_state`. Health text is the other
+    /// half of the transfer surface the frontend translates, so a branch that
+    /// returns a reason without a code would silently fall back to English.
+    #[test]
+    fn every_health_verdict_carries_a_code() {
+        let stalled = |mutate: fn(&mut Transfer)| {
+            let mut t = download("h");
+            t.status = TransferStatus::Active;
+            t.last_received = Some(t.started_at);
+            mutate(&mut t);
+            TransferManager::compute_health_state(&t, t.started_at + ACTIVE_STALLED_SECS).1
+        };
+        assert_eq!(
+            stalled(|t| {
+                t.active_sources = 0;
+                t.queued_sources = 2;
+                t.sources = 2;
+            }),
+            Some(TransferHealthCode::QueuedSources)
+        );
+        assert_eq!(stalled(|_| {}), Some(TransferHealthCode::WaitingSources));
+        assert_eq!(
+            stalled(|t| {
+                t.sources = 3;
+                t.active_sources = 1;
+            }),
+            Some(TransferHealthCode::NoData)
+        );
+
+        let mut active = download("i");
+        active.status = TransferStatus::Active;
+        active.last_received = Some(active.started_at);
+        assert_eq!(
+            TransferManager::compute_health_state(&active, active.started_at + ACTIVE_DEGRADED_SECS)
+                .1,
+            Some(TransferHealthCode::Idle)
+        );
+
+        let mut searching = download("j");
+        searching.status = TransferStatus::Searching;
+        let searched_at = searching.started_at + SEARCHING_DEGRADED_SECS;
+        assert_eq!(
+            TransferManager::compute_health_state(&searching, searched_at).1,
+            Some(TransferHealthCode::StillSearching)
+        );
+        searching.sources = 1;
+        assert_eq!(
+            TransferManager::compute_health_state(&searching, searched_at).1,
+            Some(TransferHealthCode::RetryingSources)
+        );
+
+        let mut queued = download("k");
+        queued.status = TransferStatus::Queued;
+        assert_eq!(
+            TransferManager::compute_health_state(&queued, queued.started_at).1,
+            Some(TransferHealthCode::NoSources)
+        );
+        queued.sources = 4;
+        assert_eq!(
+            TransferManager::compute_health_state(&queued, queued.started_at + QUEUED_DEGRADED_SECS)
+                .1,
+            Some(TransferHealthCode::WaitingSlot)
+        );
+
+        // `retrying_after` is the only variant `compute_health_state` cannot
+        // reach: only the network loop knows a retry is in progress.
+        assert!(TransferHealthCode::ALL
+            .iter()
+            .any(|c| *c == TransferHealthCode::RetryingAfter));
+    }
+
+    /// The row the UI renders must never carry one half of the pair: English
+    /// with no code degrades the eight non-English locales silently.
+    #[test]
+    fn a_health_verdict_writes_reason_and_code_together() {
+        let mut manager = TransferManager::new(1);
+        let mut row = download("a");
+        row.status = TransferStatus::Searching;
+        manager.enqueue(row);
+
+        let updates = manager
+            .refresh_health(1_700_000_000 + SEARCHING_DEGRADED_SECS)
+            .0;
+        let update = updates.first().expect("a stale search must degrade");
+        assert_eq!(
+            update.health_reason.as_deref(),
+            Some("Still searching for sources")
+        );
+        assert_eq!(update.health_code.as_deref(), Some("still_searching"));
+
+        let retry = manager
+            .set_retrying_after("a", TransferFailureCode::HashsetRequestFailed)
+            .expect("the retry notice replaces the search verdict");
+        assert_eq!(
+            retry.health_reason.as_deref(),
+            Some("Retrying after hashset request failed")
+        );
+        assert_eq!(retry.health_code.as_deref(), Some("retrying_after"));
+
+        manager.set_failure_context(
+            "a",
+            Some(TransferFailureCode::HashsetRequestFailed),
+            None,
+            None,
+        );
+        let row = manager.get_transfer("a").expect("the row is still tracked");
+        assert_eq!(
+            row.failure_code.as_deref(),
+            Some("hashset_request_failed"),
+            "the retry tail is recomposed from this code on the frontend"
+        );
+    }
+
     /// A download row shaped like the one `start_download` builds: no sources
     /// discovered yet, normal priority, nothing on the wire.
     fn download(id: &str) -> Transfer {
@@ -1403,6 +1623,7 @@ mod tests {
             completed_size: 0,
             started_at: 1_700_000_000,
             failure_reason: None,
+            failure_code: None,
             failure_kind: None,
             failure_stage: None,
             priority: "normal".to_string(),
@@ -1414,6 +1635,7 @@ mod tests {
             last_received: None,
             health: TransferHealth::Healthy,
             health_reason: None,
+            health_code: None,
             stalled_since: None,
             category: String::new(),
             wait_time: 0,
@@ -1496,7 +1718,7 @@ mod tests {
         manager.enqueue(sourced("c", 1));
 
         let promoted = manager
-            .fail("b", "no sources", None, None)
+            .fail("b", TransferFailureCode::RemoteMissingFile, None, None)
             .expect("a queued row still gets the Failed lifecycle");
         assert!(
             promoted.is_empty(),
@@ -1506,7 +1728,12 @@ mod tests {
         assert_eq!(manager.active.len(), 1);
 
         let promoted = manager
-            .fail("a", "disk error", Some("io".into()), Some("write".into()))
+            .fail(
+                "a",
+                TransferFailureCode::InsufficientDisk,
+                Some("io".into()),
+                Some("write".into()),
+            )
             .expect("an active row fails and frees its slot");
         assert_eq!(ids(&promoted), ["c"]);
         let failed = manager
@@ -1515,11 +1742,21 @@ mod tests {
             .find(|t| t.id == "a")
             .expect("the failed row must be retained");
         assert_eq!(failed.status, TransferStatus::Failed);
-        assert_eq!(failed.failure_reason.as_deref(), Some("disk error"));
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("Insufficient disk space")
+        );
+        assert_eq!(
+            failed.failure_code.as_deref(),
+            Some("insufficient_disk_space"),
+            "the row must carry the discriminator the UI translates, not just the English"
+        );
         assert_eq!(failed.failure_kind.as_deref(), Some("io"));
         assert_eq!(failed.speed, 0);
         assert!(
-            manager.fail("nope", "x", None, None).is_none(),
+            manager
+                .fail("nope", TransferFailureCode::TransientFailure, None, None)
+                .is_none(),
             "an unknown id must not promote anything"
         );
     }
@@ -1553,7 +1790,7 @@ mod tests {
             let id = format!("f{i:04}");
             manager.enqueue(download(&id));
             manager
-                .fail(&id, "boom", None, None)
+                .fail(&id, TransferFailureCode::TransientFailure, None, None)
                 .expect("each row fails in turn");
         }
 
@@ -1635,7 +1872,7 @@ mod tests {
     fn cancelling_after_a_failure_event_clears_the_sticky_failed_row() {
         let mut manager = TransferManager::new(1);
         manager.enqueue(sourced("a", 1));
-        manager.fail("a", "connection reset", None, None);
+        manager.fail("a", TransferFailureCode::TransientFailure, None, None);
         assert!(manager.completed.iter().any(|t| t.id == "a"));
 
         manager.cancel("a");

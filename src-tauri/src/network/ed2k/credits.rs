@@ -396,7 +396,31 @@ impl CreditManager {
         // first run would mint a new SecIdent key and then `atomic_write` would
         // restore the bak only to overwrite it with the replacement.
         crate::security::recover_interrupted_replace(&key_path);
-        if let Ok(raw) = std::fs::read(&key_path) {
+        // A read failure is NOT "no file yet". `cryptkey.dat` can be present
+        // and intact but momentarily unreadable — an antivirus or backup agent
+        // holding it open produces `ERROR_SHARING_VIOLATION` on Windows and
+        // `EACCES` elsewhere, the same causes `identity.rs` names. Treating
+        // that as a first run fell through to `generate_rsa_keypair` and
+        // atomically overwrote the real keypair with no backup, permanently
+        // destroying the SecIdent identity and every credit balance peers hold
+        // against it. Only a genuine absence may mint a key; anything else
+        // fails closed for the session exactly as the undecryptable and
+        // corrupt paths below do.
+        let existing = match std::fs::read(&key_path) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::error!(
+                    "cryptkey.dat exists but could not be read ({e}); leaving SecIdent \
+                     disabled this session and NOT regenerating (the keypair is intact \
+                     and will load once whatever holds the file releases it)"
+                );
+                self.crypto_available = false;
+                self.crypto_unreadable = true;
+                return;
+            }
+        };
+        if let Some(raw) = existing {
             let was_protected = crate::storage::secret_store::is_protected(&raw);
             // Unwrap DPAPI at-rest protection; legacy plaintext passes through
             // unchanged. `unprotect` only returns Err when the file carries
@@ -461,10 +485,16 @@ impl CreditManager {
                             self.crypto_available = true;
                             self.crypto_unreadable = false;
                             tracing::info!("Loaded RSA keypair from {}", key_path.display());
-                            // Rewrite when the public key was SPKI-normalised OR
+                            // Rewrite when the public key was SPKI-normalised,
                             // the file was still legacy plaintext (so it gets
-                            // wrapped with DPAPI at-rest protection).
-                            if migrated || !was_protected {
+                            // wrapped with at-rest protection), or it is wrapped
+                            // under a superseded scheme — a Unix
+                            // `EMBRSEC2`/`EMBRSEC3` blob is keyed by `$USER` and
+                            // only stops depending on that once rewritten.
+                            if migrated
+                                || !was_protected
+                                || crate::storage::secret_store::needs_rewrap(&raw)
+                            {
                                 let mut out = Vec::new();
                                 out.extend_from_slice(
                                     &(self.our_public_key.len() as u32).to_le_bytes(),

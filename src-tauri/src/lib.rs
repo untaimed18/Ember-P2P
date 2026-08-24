@@ -1885,7 +1885,6 @@ pub fn run() {
             commands::collections::download_collection_files,
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
-            commands::deeplink::take_pending_deep_links,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,

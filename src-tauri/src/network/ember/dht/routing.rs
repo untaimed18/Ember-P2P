@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tracing::{debug, info, trace};
@@ -1049,6 +1049,51 @@ impl RoutingTable {
             .collect()
     }
 
+    /// The distance of the `k`th closest contact to `target`, or `None` when
+    /// fewer than `k` are eligible.
+    ///
+    /// Exactly the number [`Self::find_closest`] puts last in a `k`-long result,
+    /// under the same verified-only rule — the proximity gate reads nothing else
+    /// out of that call, and a `STORE_BATCH` asks it once per record. Going
+    /// through `find_closest` therefore cost a table scan, a full sort and `k`
+    /// [`EmberContact`] clones per record, up to sixty-four times for one
+    /// datagram, for a value the caller compares and drops.
+    ///
+    /// A bounded max-heap of `k` distances answers the same question in one pass
+    /// with no clone and no sort: the largest of the `k` smallest is the root
+    /// once every contact has been offered. Contacts at equal distance can swap
+    /// places against the stable sort `find_closest` uses, which is invisible
+    /// here because only the distance leaves this function.
+    pub fn kth_closest_distance(&self, target: &EmberNodeId, k: usize) -> Option<EmberNodeId> {
+        if k == 0 {
+            return None;
+        }
+        // `verified_len() > 0` with the count dropped: the gate is a boolean and
+        // the first verified contact settles it.
+        let verified_only = self
+            .buckets
+            .iter()
+            .any(|b| b.contacts.iter().any(|c| c.is_verified()));
+
+        let mut furthest: BinaryHeap<[u8; 16]> = BinaryHeap::with_capacity(k);
+        for bucket in &self.buckets {
+            for contact in &bucket.contacts {
+                if verified_only && !contact.is_verified() {
+                    continue;
+                }
+                let dist = target.distance(&contact.node_id).0;
+                if furthest.len() < k {
+                    furthest.push(dist);
+                } else if furthest.peek().is_some_and(|worst| dist < *worst) {
+                    furthest.pop();
+                    furthest.push(dist);
+                }
+            }
+        }
+
+        (furthest.len() == k).then(|| EmberNodeId(furthest.pop().expect("k contacts, k > 0")))
+    }
+
     /// Contacts worth writing to `nodes_ember.dat`, closest-to-home first.
     ///
     /// Proven contacts lead: mute gossip must not crowd them out or come back
@@ -1643,6 +1688,59 @@ mod tests {
         assert_eq!(closest[0].node_id, make_id(0x01));
         assert_eq!(closest[1].node_id, make_id(0x40));
         assert_eq!(closest[2].node_id, make_id(0x80));
+    }
+
+    /// `store_proximity_ok` reads one number out of `find_closest`: the distance
+    /// of the entry that lands last in a `k`-long result, and `true` outright
+    /// when fewer than `k` came back. `kth_closest_distance` has to answer both
+    /// halves identically at every table size — a disagreement at the boundary
+    /// would silently change which keys this node accepts stores for.
+    #[test]
+    fn kth_closest_distance_agrees_with_find_closest() {
+        let local = make_id(0);
+        let target = make_id(0x33);
+
+        // 0, 1, k-1, k and k+1 contacts. Distinct /24s so subnet diversity
+        // admits every one of them, and IDs spread over buckets 120..124 so no
+        // single bucket overflows at k+1.
+        for size in [0, 1, K_BUCKET_SIZE - 1, K_BUCKET_SIZE, K_BUCKET_SIZE + 1] {
+            for verified in [true, false] {
+                let mut rt = RoutingTable::new(local, false);
+                for i in 0..size {
+                    let id = (i + 1) as u8;
+                    let mut c = contact_at(id, 80, id, 1, 1);
+                    if !verified {
+                        // The cold-start branch: with nothing verified,
+                        // `find_closest` falls back to every lead it holds.
+                        c.last_seen = 0;
+                    }
+                    assert!(matches!(rt.add_contact(c), AddResult::Added));
+                }
+                assert_eq!(rt.total_contacts(), size, "table size {size}");
+
+                for k in [1, 3, K_BUCKET_SIZE] {
+                    let closest = rt.find_closest(&target, k);
+                    let expected = (closest.len() == k)
+                        .then(|| closest.last().expect("k > 0").node_id.distance(&target));
+                    assert_eq!(
+                        rt.kth_closest_distance(&target, k),
+                        expected,
+                        "size {size}, k {k}, verified {verified}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `k == 0` is the one input with no `find_closest` entry to name: it
+    /// returns an empty vector, whose `last()` is `None`.
+    #[test]
+    fn kth_closest_distance_of_zero_names_nothing() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        rt.add_contact(contact_at(1, 80, 1, 1, 1));
+        assert!(rt.find_closest(&make_id(0x33), 0).last().is_none());
+        assert_eq!(rt.kth_closest_distance(&make_id(0x33), 0), None);
     }
 
     #[test]

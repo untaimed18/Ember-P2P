@@ -635,6 +635,11 @@ pub struct SourceExchangeEntry {
 /// not match. Distinct from an ed2k/AICH mismatch: the MD4 parts can all
 /// be correct while the Ember digest is wrong, and retrying those parts
 /// cannot fix a bad pin.
+///
+/// This reads raw anyhow chains, so it stays a substring test. Once a failure
+/// has been through [`classify_failure`], compare against
+/// [`TransferFailureCode::EmberContentHashMismatch`] instead — that is what the
+/// UI does, and it is the reason the badge no longer depends on the wording.
 pub fn is_ember_blake3_mismatch(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("ember blake3 mismatch") || lower.contains("ember content hash mismatch")
@@ -645,7 +650,8 @@ pub fn is_ember_blake3_mismatch(err: &str) -> bool {
 /// cannot change the digest of a complete, hash-verified file.
 pub fn is_expected_aich_mismatch(err: &str) -> bool {
     let lower = err.to_lowercase();
-    // Raw completion error, plus `summarize_error`'s canned UI string.
+    // Raw completion error, plus the canned sentence for
+    // `TransferFailureCode::AichHashMismatch`.
     lower.contains("expected aich hash mismatch") || lower == "aich hash mismatch"
 }
 
@@ -697,48 +703,120 @@ pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
     }
 }
 
-pub(crate) fn summarize_error(error: &str, kind: &SourceFailureKind) -> String {
+/// Declares the closed set of failure sentences a transfer row can show, each
+/// bound to a stable code.
+///
+/// The English stays because logs, download history, and a UI older than the
+/// backend it is talking to all read it. The code is what the UI translates,
+/// which is what stops a re-wording here from silently dropping a row back to
+/// English for the eight non-English locales.
+///
+/// Both come out of one table on purpose: a variant cannot compile without a
+/// code and a sentence, `ALL` is generated from the same list so it cannot go
+/// stale, and `scripts/backend-codes.test.mjs` parses this table to require a
+/// translation in all nine locales before a new variant can ship.
+macro_rules! transfer_failure_codes {
+    ($($variant:ident => $code:literal, $message:literal;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum TransferFailureCode {
+            $($variant,)+
+        }
+
+        impl TransferFailureCode {
+            /// Every variant, in declaration order. Only the exhaustiveness
+            /// tests walk the set; production code always has a variant in
+            /// hand, so this is not compiled into the shipped binary.
+            #[cfg(test)]
+            pub const ALL: &'static [TransferFailureCode] = &[$(TransferFailureCode::$variant,)+];
+
+            /// Stable identifier carried to the UI as `Transfer::failure_code`.
+            pub fn as_code(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $code,)+
+                }
+            }
+
+            /// English rendering, stored in `Transfer::failure_reason`.
+            pub fn message(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $message,)+
+                }
+            }
+        }
+    };
+}
+
+transfer_failure_codes! {
+    Cancelled => "cancelled", "Cancelled";
+    RemoteMissingFile => "remote_missing_file", "Remote missing file";
+    EmberContentHashMismatch => "ember_content_hash_mismatch", "Ember content hash mismatch";
+    AichHashMismatch => "aich_hash_mismatch", "AICH hash mismatch";
+    HashMismatch => "hash_mismatch", "Hash mismatch";
+    DownloadTimedOut => "download_timed_out", "Download timed out";
+    InsufficientDisk => "insufficient_disk_space", "Insufficient disk space";
+    ConnectionFailed => "connection_failed", "Connection failed";
+    PeerHandshakeFailed => "peer_handshake_failed", "Peer handshake failed";
+    QueueWaitInterrupted => "queue_wait_interrupted", "Queue wait interrupted";
+    HashsetRequestFailed => "hashset_request_failed", "Hashset request failed";
+    ConnectionLost => "connection_lost", "Connection lost during transfer";
+    PermanentFailure => "permanent_failure", "Permanent transfer failure";
+    TransientFailure => "transient_failure", "Transient connection failure";
+    NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
+    EmberPinCorrupt => "ember_pin_corrupt",
+        "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
+    AichPinCorrupt => "aich_pin_corrupt",
+        "Persisted AICH pin was corrupt; cancel and re-add the AICH link";
+}
+
+/// Reduce a raw error to the canned failure the UI shows.
+///
+/// The redaction this performs is load-bearing: peer IPs and local paths from
+/// anyhow chains must not reach `Transfer::failure_reason`. Callers that need
+/// to branch on *which* failure it was compare the returned variant rather than
+/// re-matching its sentence.
+pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> TransferFailureCode {
     let lower = error.to_lowercase();
     if lower.contains("cancelled") {
-        return "Cancelled".to_string();
+        return TransferFailureCode::Cancelled;
     }
     if lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
         || lower.contains("file not found")
     {
-        return "Remote missing file".to_string();
+        return TransferFailureCode::RemoteMissingFile;
     }
     if is_ember_blake3_mismatch(error) {
-        return "Ember content hash mismatch".to_string();
+        return TransferFailureCode::EmberContentHashMismatch;
     }
     if is_expected_aich_mismatch(error) {
-        return "AICH hash mismatch".to_string();
+        return TransferFailureCode::AichHashMismatch;
     }
     if lower.contains("hash mismatch") || lower.contains("hash verification failed") {
-        return "Hash mismatch".to_string();
+        return TransferFailureCode::HashMismatch;
     }
     if matches!(kind, SourceFailureKind::DownloadTimeout) {
-        return "Download timed out".to_string();
+        return TransferFailureCode::DownloadTimedOut;
     }
     if matches!(kind, SourceFailureKind::InsufficientDisk) || is_disk_full_error(error) {
-        return "Insufficient disk space".to_string();
+        return TransferFailureCode::InsufficientDisk;
     }
     match infer_stage_from_error(error) {
-        "tcp_connect" => "Connection failed".to_string(),
+        "tcp_connect" => TransferFailureCode::ConnectionFailed,
         "hello_wait" | "emule_info_wait" | "file_status_wait" => {
-            "Peer handshake failed".to_string()
+            TransferFailureCode::PeerHandshakeFailed
         }
-        "queue_wait" => "Queue wait interrupted".to_string(),
-        "hashset_wait" => "Hashset request failed".to_string(),
-        "data_wait" => "Connection lost during transfer".to_string(),
+        "queue_wait" => TransferFailureCode::QueueWaitInterrupted,
+        "hashset_wait" => TransferFailureCode::HashsetRequestFailed,
+        "data_wait" => TransferFailureCode::ConnectionLost,
         _ => match kind {
-            SourceFailureKind::Permanent => "Permanent transfer failure".to_string(),
-            SourceFailureKind::Transient => "Transient connection failure".to_string(),
-            SourceFailureKind::DownloadTimeout => "Download timed out".to_string(),
-            SourceFailureKind::InsufficientDisk => "Insufficient disk space".to_string(),
+            SourceFailureKind::Permanent => TransferFailureCode::PermanentFailure,
+            SourceFailureKind::Transient => TransferFailureCode::TransientFailure,
+            SourceFailureKind::DownloadTimeout => TransferFailureCode::DownloadTimedOut,
+            SourceFailureKind::InsufficientDisk => TransferFailureCode::InsufficientDisk,
         },
     }
 }
+
 
 pub(crate) fn infer_stage_from_error(error: &str) -> &'static str {
     if error.contains("stage:tcp_connect") {
@@ -817,6 +895,120 @@ mod tests {
     use super::*;
     use crate::network::ed2k::hash::{ed2k_hash_bytes, PARTSIZE};
     use md4::{Digest, Md4};
+
+    /// The codes are an IPC contract with the frontend, which looks each one up
+    /// in a table keyed by exactly this string. A duplicate would make two
+    /// failures indistinguishable there; a stray character would silently miss.
+    #[test]
+    fn every_failure_code_is_a_distinct_identifier() {
+        let mut seen = std::collections::HashSet::new();
+        for failure in TransferFailureCode::ALL {
+            let code = failure.as_code();
+            assert!(
+                !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{code} is not a snake_case identifier"
+            );
+            assert!(seen.insert(code), "{code} is used by two variants");
+            assert!(
+                !failure.message().is_empty(),
+                "{code} has no English fallback"
+            );
+        }
+        assert_eq!(seen.len(), TransferFailureCode::ALL.len());
+    }
+
+    /// Every canned sentence has to round-trip back to the variant that owns
+    /// it, or a row assigned by English elsewhere in the tree would land on the
+    /// wrong translation.
+    #[test]
+    fn no_two_failure_codes_share_a_sentence() {
+        let mut seen = std::collections::HashSet::new();
+        for failure in TransferFailureCode::ALL {
+            assert!(
+                seen.insert(failure.message()),
+                "{:?} repeats a sentence another variant already owns",
+                failure
+            );
+        }
+    }
+
+    /// The classifier is the only producer of a download failure, so its output
+    /// is what decides whether the eight non-English locales see a translation.
+    /// Walks one raw error per branch and pins the code, not the wording.
+    #[test]
+    fn the_classifier_emits_a_code_for_every_branch_it_has() {
+        use SourceFailureKind::*;
+        use TransferFailureCode as C;
+        let cases: &[(&str, SourceFailureKind, TransferFailureCode)] = &[
+            ("download cancelled by user", Transient, C::Cancelled),
+            ("peer does not have the file", Permanent, C::RemoteMissingFile),
+            ("FileReqAnsNoFil", Permanent, C::RemoteMissingFile),
+            (EMBER_BLAKE3_MISMATCH_MSG, Permanent, C::EmberContentHashMismatch),
+            (
+                "Expected AICH hash mismatch: expected aa, got bb",
+                Permanent,
+                C::AichHashMismatch,
+            ),
+            ("hash verification failed", Permanent, C::HashMismatch),
+            ("no data for 100s", DownloadTimeout, C::DownloadTimedOut),
+            ("no space left on device", Transient, C::InsufficientDisk),
+            ("stage:tcp_connect refused", Transient, C::ConnectionFailed),
+            ("stage:hello_wait timed out", Transient, C::PeerHandshakeFailed),
+            (
+                "stage:emule_info_wait timed out",
+                Transient,
+                C::PeerHandshakeFailed,
+            ),
+            (
+                "stage:file_status_wait timed out",
+                Transient,
+                C::PeerHandshakeFailed,
+            ),
+            (
+                "stage:queue_wait dropped",
+                Transient,
+                C::QueueWaitInterrupted,
+            ),
+            (
+                "stage:hashset_wait no answer",
+                Transient,
+                C::HashsetRequestFailed,
+            ),
+            ("stage:data_wait eof", Transient, C::ConnectionLost),
+            ("unrecognised", Permanent, C::PermanentFailure),
+            ("unrecognised", Transient, C::TransientFailure),
+            ("unrecognised", DownloadTimeout, C::DownloadTimedOut),
+            ("unrecognised", InsufficientDisk, C::InsufficientDisk),
+        ];
+        for (error, kind, expected) in cases {
+            assert_eq!(
+                classify_failure(error, kind),
+                *expected,
+                "{error:?} with {kind:?}"
+            );
+        }
+
+        // The three variants the classifier cannot reach are assigned directly:
+        // two by the database loader for a corrupt persisted pin, one by the
+        // command layer when the network channel is gone. Named here so a
+        // variant added without a producer is visible rather than assumed.
+        let assigned_elsewhere = [
+            C::EmberPinCorrupt,
+            C::AichPinCorrupt,
+            C::NetworkChannelUnavailable,
+        ];
+        let produced: std::collections::HashSet<_> =
+            cases.iter().map(|(_, _, code)| *code).collect();
+        for failure in TransferFailureCode::ALL {
+            assert!(
+                produced.contains(failure) || assigned_elsewhere.contains(failure),
+                "{failure:?} has no producer"
+            );
+        }
+    }
 
     /// The verification watcher parks on `wait_cancelled` for a transfer that
     /// may never be cancelled, so it has to die with the scope that spawned it
@@ -964,12 +1156,12 @@ mod tests {
 
     #[test]
     fn summarize_timeout_error_is_user_friendly() {
-        let kind = classify_error("stage:data_wait download timeout: no data for 100s");
+        let error = "stage:data_wait download timeout: no data for 100s";
+        let kind = classify_error(error);
         assert_eq!(kind, SourceFailureKind::DownloadTimeout);
-        assert_eq!(
-            summarize_error("stage:data_wait download timeout: no data for 100s", &kind),
-            "Download timed out"
-        );
+        let failure = classify_failure(error, &kind);
+        assert_eq!(failure, TransferFailureCode::DownloadTimedOut);
+        assert_eq!(failure.message(), "Download timed out");
         assert_eq!(failure_kind_name(&kind), "download_timeout");
     }
 
@@ -977,10 +1169,9 @@ mod tests {
     fn summarize_missing_file_error_is_user_friendly() {
         let kind = classify_error("peer does not have the file");
         assert_eq!(kind, SourceFailureKind::Permanent);
-        assert_eq!(
-            summarize_error("peer does not have the file", &kind),
-            "Remote missing file"
-        );
+        let failure = classify_failure("peer does not have the file", &kind);
+        assert_eq!(failure, TransferFailureCode::RemoteMissingFile);
+        assert_eq!(failure.message(), "Remote missing file");
     }
 
     #[test]
@@ -988,7 +1179,10 @@ mod tests {
         let raw = "ember blake3 mismatch: expected=aa got=bb";
         let kind = classify_error(raw);
         assert_eq!(kind, SourceFailureKind::Permanent);
-        assert_eq!(summarize_error(raw, &kind), "Ember content hash mismatch");
+        assert_eq!(
+            classify_failure(raw, &kind),
+            TransferFailureCode::EmberContentHashMismatch
+        );
         assert!(is_ember_blake3_mismatch(raw));
         assert!(is_ember_blake3_mismatch(EMBER_BLAKE3_MISMATCH_MSG));
         assert!(
@@ -1007,8 +1201,8 @@ mod tests {
         assert!(is_expected_aich_mismatch(raw));
         assert!(!is_ember_blake3_mismatch(raw));
         assert_eq!(
-            summarize_error(raw, &classify_error(raw)),
-            "AICH hash mismatch"
+            classify_failure(raw, &classify_error(raw)),
+            TransferFailureCode::AichHashMismatch
         );
         assert!(
             !is_expected_aich_mismatch("Download hash mismatch for file: expected=x, got=y"),

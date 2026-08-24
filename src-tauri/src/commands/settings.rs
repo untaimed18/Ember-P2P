@@ -759,7 +759,22 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 .components()
                 .any(|c| matches!(c, std::path::Component::Normal(_)))
     };
-    if !settings.download_folder.is_empty() {
+    // Rejected rather than skipped. An empty value used to bypass the whole
+    // path-safety block below, then compose the *relative* path `Downloads`
+    // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
+    // the approved-root registration for it — leaving `open_or_create_approved`
+    // with no root to admit and every download failing with nothing to point at.
+    // The picker code is reused because an empty value means no folder has been
+    // chosen, which is the same remedy.
+    if settings.download_folder.is_empty() {
+        return Err(coded(
+            "settings_download_folder_not_picked",
+            "Choose the download folder with Browse before saving",
+        ));
+    }
+    // Braced to keep `path`/`canonical` out of the shared-folder loop below,
+    // which binds the same names.
+    {
         let path = std::path::Path::new(&settings.download_folder);
         if path
             .components()
@@ -1712,6 +1727,41 @@ mod tests {
         // every launch would reset the config in a loop — assert they don't.
         if let Err(e) = validate_settings(&AppSettings::default()) {
             panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
+        }
+    }
+
+    /// An empty download folder used to skip the path-safety block instead of
+    /// failing it, then compose the relative path `Downloads` against the
+    /// process CWD — never created, never registered as an approved root, so
+    /// every download failed with nothing to point the user at.
+    #[test]
+    fn empty_download_folder_is_rejected_not_skipped() {
+        let mut settings = AppSettings::default();
+        settings.download_folder = String::new();
+        let err = validate_settings(&settings).expect_err("an empty download folder must fail");
+        assert!(
+            err.contains("settings_download_folder_not_picked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The default has to be absolute, or `AppSettings::default()` composes
+    /// `completed_dir` against whatever directory the process happens to be in.
+    #[test]
+    fn default_download_folder_is_absolute() {
+        let settings = AppSettings::default();
+        assert!(
+            std::path::Path::new(&settings.download_folder).is_absolute(),
+            "default download folder must be absolute, got {:?}",
+            settings.download_folder
+        );
+        // `Default` derives the seeded shared folder from the same base, so an
+        // empty base made this relative too.
+        for folder in &settings.shared_folders {
+            assert!(
+                std::path::Path::new(folder).is_absolute(),
+                "default shared folder must be absolute, got {folder:?}"
+            );
         }
     }
 

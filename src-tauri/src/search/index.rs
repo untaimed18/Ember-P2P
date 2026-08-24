@@ -193,6 +193,7 @@ impl LocalIndex {
                     result_origin: ORIGIN_LOCAL.to_string(),
                     origin_server_ip: None,
                     spam_reasons: Vec::new(),
+                    spam_reason_details: Vec::new(),
                 })
             })
             .collect()
@@ -267,7 +268,7 @@ impl LocalIndex {
         mut completed: FileInfo,
     ) -> Option<FileInfo> {
         let pos = self.position_by_id(pending_id)?;
-        let pending = self.swap_remove_indexed(pos);
+        let pending = self.swap_remove_indexed(pos)?;
         completed.shared = pending.shared;
         completed.priority = pending.priority;
         completed.bytes_transferred = pending.bytes_transferred;
@@ -360,7 +361,7 @@ impl LocalIndex {
             self.id_map.entry(content_id).or_default().push(pos);
             return None;
         }
-        Some(self.swap_remove_indexed(pos))
+        self.swap_remove_indexed(pos)
     }
 
     /// Remove only the pending (unhashed) entries that fall under one of
@@ -390,7 +391,7 @@ impl LocalIndex {
     /// removed file's token count, not O(n) per call.
     pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {
         let pos = self.position_by_id(id)?;
-        Some(self.swap_remove_indexed(pos))
+        self.swap_remove_indexed(pos)
     }
 
     /// Lowest index of a row carrying `id`, matching the semantics of the
@@ -411,14 +412,32 @@ impl LocalIndex {
             .min()
     }
 
+    /// Remove a file by path.
+    ///
+    /// The stored index is re-checked against `files` for the same reason
+    /// [`Self::position_by_id`] re-checks its buckets: a drifted map must only
+    /// fail to find a row, never resolve onto an unrelated one — and here a
+    /// stale entry would also index past the end of `files`.
     pub fn remove_file_by_path(&mut self, path: &str) -> Option<FileInfo> {
-        let pos = *self.path_map.get(&normalize_path_key(path))?;
-        Some(self.swap_remove_indexed(pos))
+        let key = normalize_path_key(path);
+        let pos = *self.path_map.get(&key)?;
+        if self.files.get(pos).map(|f| normalize_path_key(&f.path)) != Some(key) {
+            return None;
+        }
+        self.swap_remove_indexed(pos)
     }
 
     /// swap_remove the file at `pos` and incrementally patch path_map,
     /// hash_map, and name_tokens so callers don't need a full rebuild.
-    fn swap_remove_indexed(&mut self, pos: usize) -> FileInfo {
+    ///
+    /// `None` for an out-of-range `pos`. Callers resolve `pos` from one of the
+    /// index maps, so an entry that outlived its row would otherwise panic here
+    /// — on the unsigned `len() - 1` when `files` is empty, or inside
+    /// `swap_remove` otherwise.
+    fn swap_remove_indexed(&mut self, pos: usize) -> Option<FileInfo> {
+        if pos >= self.files.len() {
+            return None;
+        }
         let last_idx = self.files.len() - 1;
         let moved = pos != last_idx;
         let moved_key = if moved {
@@ -487,7 +506,7 @@ impl LocalIndex {
             }
         }
 
-        removed
+        Some(removed)
     }
 
     pub fn update_alltime_stats(
@@ -1190,6 +1209,46 @@ mod local_index_tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    /// `path_map` entries are patched incrementally, so a bug anywhere in that
+    /// bookkeeping leaves an index pointing past the end of `files` or at an
+    /// unrelated row. Removal must degrade to "not found" the way
+    /// `position_by_id` already does, rather than panicking on the unsigned
+    /// `len() - 1` or swap-removing whatever now occupies the slot.
+    #[test]
+    fn removal_ignores_a_stale_path_map_entry() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file(
+            "A/keep.bin",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            true,
+            "normal",
+        )]);
+
+        // Out of range: the row this entry described is gone entirely.
+        index
+            .path_map
+            .insert(super::normalize_path_key("A/ghost.bin"), 99);
+        assert!(index.remove_file_by_path("A/ghost.bin").is_none());
+
+        // In range but pointing at a different file than the key names.
+        index
+            .path_map
+            .insert(super::normalize_path_key("A/wrong.bin"), 0);
+        assert!(index.remove_file_by_path("A/wrong.bin").is_none());
+
+        assert!(
+            index.get_by_path("A/keep.bin").is_some(),
+            "a stale entry must not take an unrelated row with it"
+        );
+
+        // An empty index is the case that made `len() - 1` underflow.
+        let mut empty = LocalIndex::new();
+        empty
+            .path_map
+            .insert(super::normalize_path_key("A/ghost.bin"), 0);
+        assert!(empty.remove_file_by_path("A/ghost.bin").is_none());
     }
 
     #[test]

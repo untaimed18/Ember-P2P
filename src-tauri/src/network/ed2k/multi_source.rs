@@ -2298,7 +2298,12 @@ impl MultiSourceDownload {
         // receiver here lets the retry phase keep adopting callbacks.
         let mut post_phase_new_established_rx: Option<mpsc::Receiver<EstablishedSource>> = None;
 
-        if let Some(mut new_source_rx) = self.new_source_rx.take() {
+        if let Some(metadata_rx) = self.new_source_rx.take() {
+            // Held as an `Option` for the same reason as
+            // `new_established_rx` below: a closed channel has its receiver
+            // dropped so the select! arm falls to the `std::future::pending()`
+            // sentinel instead of resolving `None` on every turn.
+            let mut new_source_rx = Some(metadata_rx);
             // Established-stream injection channel — populated by the
             // KAD/server callback path in `network/mod.rs` when a
             // LowID peer connects back to our upload listener for a
@@ -2419,7 +2424,12 @@ impl MultiSourceDownload {
                         anyhow::bail!("cancelled by user");
                     }
                     // Accept new source from the injection channel
-                    new_src = new_source_rx.recv() => {
+                    new_src = async {
+                        match &mut new_source_rx {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
                         if let Some(source) = new_src {
                             injection_deadline = None;
 
@@ -2635,6 +2645,13 @@ impl MultiSourceDownload {
                             injected_abort_handles.push(handle.abort_handle());
                             pending_futs.push(handle);
                         } else {
+                            // Drop the receiver, not just the flag. Keeping it
+                            // meant `recv()` resolved `None` instantly on every
+                            // later turn, so with source tasks still pending
+                            // (`injection_wait_action` returns `Continue`) the
+                            // loop spun at full CPU re-taking `tracker.read()`.
+                            // The established arm below already does this.
+                            new_source_rx = None;
                             injection_channel_open = false;
                             if pending_futs.is_empty() {
                                 info!("Source injection channel closed with no active source tasks left; proceeding to retry rounds");
@@ -2928,7 +2945,7 @@ impl MultiSourceDownload {
             // scope so the retry-rounds loop below can keep accepting
             // fresh sources during cooldown sleeps.
             if injection_channel_open {
-                post_phase_new_source_rx = Some(new_source_rx);
+                post_phase_new_source_rx = new_source_rx;
             }
             // Hand the established-stream channel back to the outer scope too so
             // the retry-rounds loop can keep adopting inbound KAD/server

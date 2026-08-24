@@ -257,10 +257,12 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.origin_server_ip.is_none() {
         existing.origin_server_ip = incoming.origin_server_ip;
     }
-    if incoming.is_spam && !existing.is_spam {
+    if (incoming.is_spam && !existing.is_spam) || incoming.spam_rating > existing.spam_rating {
+        // Both lists describe the same verdict, so they move together — a row
+        // whose English came from one scoring pass and whose codes came from
+        // another would render two different explanations.
         existing.spam_reasons = incoming.spam_reasons;
-    } else if incoming.spam_rating > existing.spam_rating {
-        existing.spam_reasons = incoming.spam_reasons;
+        existing.spam_reason_details = incoming.spam_reason_details;
     }
     existing.spam_rating = existing.spam_rating.max(incoming.spam_rating);
     existing.is_spam = existing.is_spam || incoming.is_spam;
@@ -401,6 +403,7 @@ mod tests {
             result_origin: origin.into(),
             origin_server_ip: None,
             spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
         }
     }
 

@@ -95,6 +95,18 @@ impl WindowCounter {
     /// Charge `cost` units against the window at once, for a frame whose work
     /// is proportional to something other than the frame itself.
     fn allow_n(&mut self, now: Instant, window: Duration, limit: u32, cost: u32) -> bool {
+        if !self.would_allow_n(now, window, limit, cost) {
+            return false;
+        }
+        self.commit_n(cost);
+        true
+    }
+
+    /// [`Self::allow_n`] split in two, for a caller that has to consult a
+    /// second window before either may be spent. The buckets still age here —
+    /// a refused frame ages them today as well — but nothing is charged until
+    /// [`Self::commit_n`].
+    fn would_allow_n(&mut self, now: Instant, window: Duration, limit: u32, cost: u32) -> bool {
         let half = window / 2;
         match self.window_start {
             Some(start) if now.saturating_duration_since(start) < half => {}
@@ -119,11 +131,12 @@ impl WindowCounter {
         let carry_fraction = 1.0 - (elapsed.as_secs_f64() / half.as_secs_f64().max(f64::EPSILON));
         let effective = self.count as f64 + self.previous as f64 * carry_fraction;
 
-        if effective + cost as f64 > limit as f64 {
-            return false;
-        }
+        effective + cost as f64 <= limit as f64
+    }
+
+    /// Spend `cost` on a counter [`Self::would_allow_n`] has just agreed to.
+    fn commit_n(&mut self, cost: u32) {
         self.count = self.count.saturating_add(cost);
-        true
     }
 
     /// When this counter last saw traffic, for the idle-entry sweep.
@@ -248,12 +261,20 @@ impl DhtProtection {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
             }
-            let store_ok = self.store_counters.entry(budget_key).or_default().allow_n(
-                now,
-                STORE_WINDOW,
-                self.max_stores,
-                store_records.max(1),
-            );
+            // Peeked, not charged. Both windows have to agree before either is
+            // spent: charging this one first and only then asking the address
+            // gate meant a frame the address gate refused had already cost the
+            // node its allowance, and a refused `STORE_BATCH` is never acked, so
+            // the sender pays for the whole batch as well. That lands on exactly
+            // the population the split exists for — several honest instances
+            // behind one NAT, each double-charged once their shared ceiling
+            // saturates.
+            let cost = store_records.max(1);
+            let store_ok = self
+                .store_counters
+                .entry(budget_key)
+                .or_default()
+                .would_allow_n(now, STORE_WINDOW, self.max_stores, cost);
             if !store_ok {
                 self.dropped_rate = self.dropped_rate.saturating_add(1);
                 return false;
@@ -276,25 +297,38 @@ impl DhtProtection {
             // something scarcer than a keypair — but it prices it, turning
             // "under a minute from one host" into a sustained flood that a rate
             // graph and an IP filter can act on.
-            if sender_id.is_some() {
-                let addr_key = StoreBudgetKey::Addr(ip);
+            //
+            // Only reached when the sender has a verified identity; without one
+            // `budget_key` is already this address, and charging it twice would
+            // halve the budget of the peers with the least to prove.
+            let addr_key = sender_id.map(|_| StoreBudgetKey::Addr(ip));
+            if let Some(addr_key) = addr_key {
                 if self.store_counters.len() >= MAX_IP_ENTRIES
                     && !self.store_counters.contains_key(&addr_key)
                 {
                     self.dropped_rate = self.dropped_rate.saturating_add(1);
                     return false;
                 }
-                let addr_ok = self.store_counters.entry(addr_key).or_default().allow_n(
-                    now,
-                    STORE_WINDOW,
-                    self.max_stores
-                        .saturating_mul(MAX_STORE_IDENTITIES_PER_ADDR),
-                    store_records.max(1),
-                );
+                let addr_ok = self
+                    .store_counters
+                    .entry(addr_key)
+                    .or_default()
+                    .would_allow_n(
+                        now,
+                        STORE_WINDOW,
+                        self.max_stores
+                            .saturating_mul(MAX_STORE_IDENTITIES_PER_ADDR),
+                        cost,
+                    );
                 if !addr_ok {
                     self.dropped_rate = self.dropped_rate.saturating_add(1);
                     return false;
                 }
+            }
+
+            self.charge_store(budget_key, cost);
+            if let Some(addr_key) = addr_key {
+                self.charge_store(addr_key, cost);
             }
         }
 
@@ -326,6 +360,14 @@ impl DhtProtection {
         }
 
         true
+    }
+
+    /// Spend an already-peeked STORE budget. The entry exists — `allow_message`
+    /// created it to peek — so a miss here is unreachable rather than tolerated.
+    fn charge_store(&mut self, key: StoreBudgetKey, cost: u32) {
+        if let Some(counter) = self.store_counters.get_mut(&key) {
+            counter.commit_n(cost);
+        }
     }
 
     fn maybe_trim(&mut self, now: Instant) {
@@ -498,14 +540,53 @@ mod tests {
         );
         // A different host is unaffected: the ceiling is per address. It needs a
         // fresh identity to show that, because the per-node budget is keyed on
-        // the node ID and follows it across addresses — and the refused frame
-        // above already charged `0xFF`'s node budget before the address check.
+        // the node ID and follows a peer across addresses.
         assert!(p.allow_message(
             IpAddr::V4(Ipv4Addr::new(6, 6, 6, 7)),
             MSG_STORE_BATCH,
             Some([0xFE; 16]),
             50
         ));
+    }
+
+    /// Both STORE windows are consulted before either is charged. Charging the
+    /// per-node budget first and only then asking the address gate spent an
+    /// honest peer's allowance on a frame that was never processed — and since
+    /// a refused `STORE_BATCH` is never acked, the sender had already paid for
+    /// the whole batch. The victims are the case the split exists for: several
+    /// instances behind one NAT, double-charged from the moment their shared
+    /// ceiling saturates.
+    #[test]
+    fn a_frame_the_address_gate_refuses_leaves_the_node_budget_unspent() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(5);
+        let crowded = IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4));
+
+        // Saturate the address ceiling with other identities.
+        for id in 0..MAX_STORE_IDENTITIES_PER_ADDR as u8 {
+            assert!(p.allow_message(crowded, MSG_STORE_BATCH, Some([id; 16]), 5));
+        }
+
+        let honest = Some([0xAA; 16]);
+        assert!(
+            !p.allow_message(crowded, MSG_STORE_RECORD, honest, 1),
+            "the shared address ceiling is spent"
+        );
+
+        // The per-node budget follows the identity, so an address with room
+        // shows whether the refusal above cost it anything. All five must
+        // still be there.
+        let quiet = IpAddr::V4(Ipv4Addr::new(4, 4, 4, 5));
+        for i in 0..5 {
+            assert!(
+                p.allow_message(quiet, MSG_STORE_RECORD, honest, 1),
+                "store {i} of an untouched per-node budget"
+            );
+        }
+        assert!(
+            !p.allow_message(quiet, MSG_STORE_RECORD, honest, 1),
+            "and no more than five, or the budget is not being charged at all"
+        );
     }
 
     /// A batch does N records' worth of signature verification for one frame,

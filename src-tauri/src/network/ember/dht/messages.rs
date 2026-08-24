@@ -165,15 +165,49 @@ pub const MAX_STORE_RECORD_BYTES: usize = MAX_FOUND_VALUE_RECORD_BYTES
     .saturating_sub(FOUND_VALUE_BLOB_LEN_PREFIX)
     .saturating_sub(FOUND_VALUE_BLOB_SIGNATURE_LEN);
 
+/// Minimum STORE / PROXY_STORE / STORE_BATCH record body size: the fixed
+/// header every record carries ahead of its (possibly empty) file name.
+///
+/// `SignedRecord::from_wire` reads that header at fixed offsets and refuses
+/// anything shorter, so a shorter body could never be parsed, verified against
+/// its own key, or served — only held, counted, and rejected again by every
+/// reader. `DhtStore::store_attributed` enforces it at acceptance, which is
+/// what allows [`MIN_FOUND_VALUE_RECORD_BYTES`] to be a real record's floor
+/// rather than the wire format's.
+pub const MIN_STORE_RECORD_BYTES: usize = super::publish::RECORD_HEADER_LEN;
+
 /// Maximum `FOUND_VALUE` blob (`record_body || signature`). Distinct from
 /// [`MAX_STORE_RECORD_BYTES`], which is the body alone.
 pub const MAX_FOUND_VALUE_BLOB_BYTES: usize =
     MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN;
 
+/// Fewest bytes a record can possibly cost a `FOUND_VALUE` page: the length
+/// prefix, the shortest body the store will hold, and the signature.
+///
+/// The packer stops scanning a key once less than this is left, which bounds
+/// the tail walk on a key holding a thousand records instead of touching every
+/// one of them to learn that none of them fits. The floor may only be as high
+/// as what [`MIN_STORE_RECORD_BYTES`] guarantees at acceptance — assume more
+/// and the packer skips a record it is holding rather than merely stopping
+/// early. It was once the *format's* floor (a prefix and a signature around an
+/// empty body) for want of that guarantee, and at 66 bytes the stop fired only
+/// when the budget was all but spent, so on a hot key of similarly sized
+/// records it usually never fired at all.
+pub const MIN_FOUND_VALUE_RECORD_BYTES: usize =
+    FOUND_VALUE_BLOB_LEN_PREFIX + MIN_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN;
+
 const _: () = assert!(
     FOUND_VALUE_BLOB_LEN_PREFIX + MAX_STORE_RECORD_BYTES + FOUND_VALUE_BLOB_SIGNATURE_LEN
         <= MAX_FOUND_VALUE_RECORD_BYTES
 );
+// Forward progress in the `FOUND_VALUE` packer, which is what makes paging
+// terminate: the record at the requested start faces an untouched budget, so
+// the early stop must not fire there or a page could serve nothing and the
+// searcher would be handed a `next_position` it has already asked for. Implied
+// today by the assert above plus `MIN_STORE_RECORD_BYTES <=
+// MAX_STORE_RECORD_BYTES`, and spelled out because those two are free to move
+// independently of each other.
+const _: () = assert!(MIN_FOUND_VALUE_RECORD_BYTES <= MAX_FOUND_VALUE_RECORD_BYTES);
 // A single-blob `FOUND_VALUE` payload is the header plus `blob_len(2) || body ||
 // signature(64)` — see the `DhtPayload::FoundValue` encoder. This used to spell
 // the header out as `16 + 2` and drifted the moment paging widened it, which is
