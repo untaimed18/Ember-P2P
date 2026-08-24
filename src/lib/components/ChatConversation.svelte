@@ -6,9 +6,6 @@
     deleteChannelMessage,
     getChannelMessages,
     markChannelMessagesRead,
-    offerChannelFile,
-    requestChannelFile,
-    saveChannelFile,
     sendChannelMessage,
     type ChannelMessageInfo,
   } from '$lib/api/channels';
@@ -30,8 +27,6 @@
   // this so a very long history can't grow the array (and the rendered DOM)
   // without bound; the rest stays in the DB and on disk.
   const MAX_LOADED_MESSAGES = 2000;
-  const CHANNEL_FILE_PREFIX = 'EMBERFILE:';
-  const CHANNEL_FILE_MAX_BYTES = 256 * 1024;
 
   interface Props {
     friendHash: string;
@@ -109,16 +104,7 @@
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
   let unlistenDelivery: UnlistenFn | null = null;
-  let unlistenFile: UnlistenFn | null = null;
-  let unlistenFileProgress: UnlistenFn | null = null;
-  let attaching = $state(false);
-  let fileBusy = $state<string | null>(null);
-  let readyFiles: Record<string, boolean> = $state({});
-  let pendingFiles: Record<string, boolean> = $state({});
-  /** Reassembly progress per digest, driven by `ember:channel-file-progress`. */
-  let fileProgress: Record<string, { received: number; size: number }> = $state({});
   let removingMessage = $state<number | null>(null);
-  let awaitingSave: { digest: string; name: string } | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
   // Delivery events can beat the IPC response that appends an optimistic
@@ -150,37 +136,11 @@
     };
   }
 
-  /** Both channel-file listeners share one lifecycle, so they are torn down
-   *  together rather than leaving five call sites to remember the second. */
-  function teardownChannelFileListeners() {
-    if (unlistenFile) { unlistenFile(); unlistenFile = null; }
-    if (unlistenFileProgress) { unlistenFileProgress(); unlistenFileProgress = null; }
-  }
-
   function senderLabel(pubkey?: string): string {
     if (!pubkey) return '';
     const name = memberNames[pubkey];
     if (name) return name;
     return pubkey.slice(0, 8) + '\u2026';
-  }
-
-  function parseChannelFile(text: string): { digest: string; size: number; name: string } | null {
-    if (!text.startsWith(CHANNEL_FILE_PREFIX)) return null;
-    const rest = text.slice(CHANNEL_FILE_PREFIX.length);
-    if (rest.length < 66) return null;
-    const digest = rest.slice(0, 64).toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(digest) || rest[64] !== ':') return null;
-    const sizeEnd = rest.indexOf(':', 65);
-    if (sizeEnd < 0) return null;
-    const size = Number(rest.slice(65, sizeEnd));
-    const name = rest.slice(sizeEnd + 1);
-    if (!name || !Number.isInteger(size) || size < 1 || size > CHANNEL_FILE_MAX_BYTES) return null;
-    return { digest, size, name };
-  }
-
-  function formatFileSize(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    return `${Math.round(bytes / 1024)} KB`;
   }
 
   $effect(() => {
@@ -213,15 +173,8 @@
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-      teardownChannelFileListeners();
       messages = [];
       earlyDeliveredIds.clear();
-      readyFiles = {};
-      pendingFiles = {};
-      fileProgress = {};
-      awaitingSave = null;
-      attaching = false;
-      fileBusy = null;
       loadError = null;
       liveError = false;
       loading = true;
@@ -244,7 +197,6 @@
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-      teardownChannelFileListeners();
       if (key) setDraft(key, inputText);
       if (!channel) activeChatHash.set(null);
     };
@@ -254,7 +206,6 @@
     if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    teardownChannelFileListeners();
     if (channel) {
       let fn: UnlistenFn;
       try {
@@ -295,60 +246,6 @@
       }
       if (gen !== loadGen) { fn(); return false; }
       unlisten = fn;
-      try {
-        const fileFn = await listen<{
-          channel_id: string;
-          digest: string;
-          file_name?: string;
-        }>('ember:channel-file', (event) => {
-          if (gen !== loadGen) return;
-          if (event.payload.channel_id !== channel) return;
-          const digest = event.payload.digest?.toLowerCase();
-          if (!digest) return;
-          readyFiles = { ...readyFiles, [digest]: true };
-          pendingFiles = { ...pendingFiles, [digest]: false };
-          const { [digest]: _done, ...restProgress } = fileProgress;
-          fileProgress = restProgress;
-          const waiting = awaitingSave;
-          if (waiting && waiting.digest === digest) {
-            awaitingSave = null;
-            sendError = null;
-            void pickAndSaveChannelFile(digest, waiting.name);
-          }
-        });
-        if (gen !== loadGen) {
-          fileFn();
-          return false;
-        }
-        unlistenFile = fileFn;
-      } catch (e) {
-        console.warn('ChatConversation: failed to register channel file listener', e);
-      }
-      try {
-        const progressFn = await listen<{
-          channel_id: string;
-          digest: string;
-          received: number;
-          size: number;
-        }>('ember:channel-file-progress', (event) => {
-          if (gen !== loadGen) return;
-          if (event.payload.channel_id !== channel) return;
-          const digest = event.payload.digest?.toLowerCase();
-          if (!digest || !event.payload.size) return;
-          fileProgress = {
-            ...fileProgress,
-            [digest]: { received: event.payload.received, size: event.payload.size },
-          };
-        });
-        if (gen !== loadGen) {
-          progressFn();
-          return true;
-        }
-        unlistenFileProgress = progressFn;
-      } catch (e) {
-        // Non-fatal: the attachment still completes, just without a bar.
-        console.warn('ChatConversation: failed to register file progress listener', e);
-      }
       return true;
     }
     let fn: UnlistenFn;
@@ -561,7 +458,6 @@
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    teardownChannelFileListeners();
     liveError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
@@ -611,62 +507,6 @@
     const el = messagesContainerEl;
     if (!el) return true;
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
-  }
-
-  async function pickAndSaveChannelFile(digest: string, name: string) {
-    const { save } = await import('@tauri-apps/plugin-dialog');
-    const dest = await save({ defaultPath: name });
-    if (!dest) return;
-    await saveChannelFile(channelId, digest, dest);
-    readyFiles = { ...readyFiles, [digest]: true };
-    pendingFiles = { ...pendingFiles, [digest]: false };
-  }
-
-  async function handleAttach() {
-    if (!isChannel || sending || attaching || youAreBanned) return;
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const selected = await open({ multiple: false, title: m.channels_attach() });
-    if (!selected || Array.isArray(selected)) return;
-    attaching = true;
-    sendError = null;
-    try {
-      const sent = await offerChannelFile(channelId, selected);
-      if (!messages.some((message) => message.id === sent.id)) {
-        messages = [...messages, fromChannelRow(sent)];
-      }
-      const parsed = parseChannelFile(sent.message);
-      if (parsed) {
-        readyFiles = { ...readyFiles, [parsed.digest]: true };
-      }
-      scrollToBottom();
-    } catch (e: unknown) {
-      const raw = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
-      sendError = raw.includes('channels_file_too_large')
-        ? m.channels_attach_too_large()
-        : translateError(e, m.error_operation_failed());
-    } finally {
-      attaching = false;
-    }
-  }
-
-  async function handleFileDownload(digest: string, name: string) {
-    if (!channelId || fileBusy) return;
-    fileBusy = digest;
-    sendError = null;
-    try {
-      await pickAndSaveChannelFile(digest, name);
-    } catch (e: unknown) {
-      try {
-        await requestChannelFile(channelId, digest);
-        pendingFiles = { ...pendingFiles, [digest]: true };
-        awaitingSave = { digest, name };
-        sendError = m.channels_file_pending();
-      } catch (requestErr: unknown) {
-        sendError = translateError(requestErr, translateError(e, m.error_operation_failed()));
-      }
-    } finally {
-      fileBusy = null;
-    }
   }
 
   async function handleSend() {
@@ -873,7 +713,6 @@
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
-    teardownChannelFileListeners();
   });
 </script>
 
@@ -961,14 +800,13 @@
         {/if}
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
-        {@const file = isChannel ? parseChannelFile(row.msg.message) : null}
         <div
           class="conv-bubble"
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
           class:starts-run={row.startsRun}
           class:ends-run={row.endsRun}
-          class:mentions-me={row.msg.direction === 'received' && !file && mentionsMe(row.msg.message)}
+          class:mentions-me={row.msg.direction === 'received' && mentionsMe(row.msg.message)}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -978,45 +816,11 @@
             written; only its bidi influence is scoped to this element.
           -->
           {#if isChannel && row.startsRun && row.msg.direction === 'received'}
-            <div class="bubble-who">{senderLabel(row.msg.sender_pubkey)}</div>
-          {/if}
-          {#if file}
-            <div class="bubble-file">
-              <div class="file-name">{file.name}</div>
-              <div class="file-meta">{formatFileSize(file.size)}</div>
-              {#if pendingFiles[file.digest] && !readyFiles[file.digest]}
-                {@const prog = fileProgress[file.digest]}
-                {#if prog && prog.size > 0}
-                  <div
-                    class="file-progress"
-                    role="progressbar"
-                    aria-valuemin="0"
-                    aria-valuemax={prog.size}
-                    aria-valuenow={Math.min(prog.received, prog.size)}
-                  >
-                    <div class="file-progress-fill" style="width: {Math.min(100, Math.round((prog.received / prog.size) * 100))}%"></div>
-                  </div>
-                  <span class="file-status">
-                    {m.channels_file_receiving({
-                      percent: Math.min(100, Math.round((prog.received / prog.size) * 100)),
-                    })}
-                  </span>
-                {:else}
-                  <span class="file-status">{m.channels_file_pending()}</span>
-                {/if}
-              {:else}
-                <button
-                  class="file-action"
-                  disabled={fileBusy === file.digest}
-                  onclick={() => handleFileDownload(file.digest, file.name)}
-                >
-                  {readyFiles[file.digest] ? m.channels_file_save() : m.channels_file_download()}
-                </button>
-              {/if}
+            <div class="bubble-who">
+              <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
             </div>
-          {:else}
-            <div class="bubble-text"><bdi dir="auto">{row.msg.message}</bdi></div>
           {/if}
+          <div class="bubble-text"><bdi dir="auto">{row.msg.message}</bdi></div>
           <!--
             Once per run, not once per message: within a burst the timestamps
             repeat the same minute and add nothing. Delivery state is per
@@ -1061,19 +865,6 @@
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
     <div class="conv-input-area">
-      {#if isChannel}
-        <button
-          class="conv-attach"
-          onclick={handleAttach}
-          disabled={sending || attaching}
-          title={m.channels_attach()}
-          aria-label={m.channels_attach()}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M7.5 9.5l5-5a2.5 2.5 0 013.5 3.5l-6.5 6.5a4 4 0 01-5.5-5.5L11 2.5"/>
-          </svg>
-        </button>
-      {/if}
       <textarea
         class="conv-input"
         bind:value={inputText}
@@ -1320,20 +1111,6 @@
   /* A message naming you is the one thing in a busy room you cannot afford to
      scroll past, so it gets an edge marker rather than a colour change that
      would fight the sent/received distinction. */
-  .file-progress {
-    height: 3px;
-    margin: 6px 0 4px;
-    border-radius: var(--radius-pill);
-    background: color-mix(in srgb, var(--text-muted) 30%, transparent);
-    overflow: hidden;
-  }
-
-  .file-progress-fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width var(--transition-fast) linear;
-  }
-
   /* Revealed on hover of its own bubble: a per-message control that is always
      visible turns a transcript into a wall of buttons. Hidden with `opacity`
      rather than `display` so it stays in the tab order — `display: none` would
@@ -1522,69 +1299,6 @@
   .conv-send svg {
     width: 18px;
     height: 18px;
-  }
-
-  .conv-attach {
-    width: 40px;
-    height: 40px;
-    border: 1px solid var(--border);
-    border-radius: 50%;
-    background: var(--bg-primary);
-    color: var(--text-secondary);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .conv-attach:hover:not(:disabled) {
-    color: var(--text-primary);
-    border-color: var(--accent);
-  }
-
-  .conv-attach:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  .conv-attach svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  .bubble-file {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 140px;
-  }
-
-  .file-name {
-    font-weight: 600;
-    word-break: break-all;
-  }
-
-  .file-meta, .file-status {
-    font-size: 11px;
-    opacity: 0.75;
-  }
-
-  .file-action {
-    align-self: flex-start;
-    margin-top: 4px;
-    padding: 4px 10px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg-surface);
-    color: inherit;
-    cursor: pointer;
-    font-size: 12px;
-  }
-
-  .file-action:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
 
   .sr-only {

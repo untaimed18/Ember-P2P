@@ -9,7 +9,8 @@ pub mod relay;
 
 // `dht` is live on the Noise path when `ember_native_enabled` (routing,
 // STORE/FIND_VALUE, bootstrap, auto-publish, ANNOUNCE_PEER/PEER_LIST).
-// `transfer` is still dormant.
+// `transfer` holds the chunk/hash-tree primitives; `xfer` is the first
+// working use of them, moving a file between two channel members.
 // `reputation` is persisted and consulted by the live eD2K/EPX paths in
 // network/mod.rs (ban/credit events); `transport` backs the Ember UDP
 // control-message dispatch (Ping/ExchangeRequest, is_ember_packet routing)
@@ -19,6 +20,7 @@ pub mod reputation;
 #[allow(dead_code)]
 pub mod transfer;
 pub mod transport;
+pub mod xfer;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_dalek::SigningKey;

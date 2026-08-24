@@ -222,26 +222,6 @@ enum ChannelRelayEvent {
     },
 }
 
-struct ChannelFileAssembly {
-    name: String,
-    buf: Vec<u8>,
-    got: Vec<u8>,
-    received: usize,
-    /// Last percentage reported to the UI, in `CHANNEL_FILE_PROGRESS_STEP`
-    /// buckets. Chunks are 1 KB, so a 256 KB attachment lands 256 of them —
-    /// emitting per chunk would spend more time in IPC than in transfer.
-    reported_pct: u8,
-    /// When the last chunk landed, so the cap below sheds the most stalled
-    /// transfer rather than an arbitrary one.
-    updated_at: std::time::Instant,
-}
-
-/// Granularity of attachment progress events, in percent.
-const CHANNEL_FILE_PROGRESS_STEP: u8 = 5;
-
-/// Concurrent inbound attachment reassemblies held at once.
-const CHANNEL_FILE_ASSEMBLY_MAX: usize = 8;
-
 fn relay_ticket_next_round_delay(
     round_started_at: tokio::time::Instant,
     completed_at: tokio::time::Instant,
@@ -10364,6 +10344,43 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
+    /// Ember Transfer: offer one file to one channel member. The file is
+    /// already hashed by the caller, so the network task never blocks on a
+    /// 100 MB read.
+    OfferChannelTransfer {
+        channel_id: [u8; 16],
+        peer: [u8; 32],
+        xfer_id: [u8; 16],
+        path: PathBuf,
+        name: String,
+        size: u64,
+        root: [u8; 32],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Answer an offer that is waiting on the user. `download_folder` comes
+    /// from the caller because settings live on that side; the network task
+    /// only knows the file name.
+    RespondChannelTransfer {
+        xfer_id: [u8; 16],
+        accept: bool,
+        download_folder: PathBuf,
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Stop a transfer in either direction and tell the other end why.
+    CancelChannelTransfer {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Everything in flight, for the Channels page to draw.
+    ListChannelTransfers {
+        tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
+    },
+    /// Drop every transfer tied to a room, because it has just been left.
+    /// Sends no cancel: the room's content key is what those frames travel
+    /// under, and it is gone along with the membership.
+    DropChannelTransfers {
+        channel_id: [u8; 16],
+    },
     /// Run one Ember DHT maintenance cycle on demand (dev/harness): refresh
     /// stale buckets, liveness-ping stale contacts, and republish stored
     /// records. With the timer this happens automatically; the command
@@ -10487,6 +10504,25 @@ struct EmberVerifiedHighwater {
 #[derive(Debug)]
 pub struct EmberValueLookupPending {
     pub records_rx: oneshot::Receiver<Vec<Vec<u8>>>,
+}
+
+/// One in-flight Ember Transfer, flattened for IPC.
+///
+/// Deliberately not persisted: a transfer belongs to the session that started
+/// it. Resuming across a restart would mean keeping half-written files and the
+/// peer's agreement to send them, neither of which survives a restart today.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelTransferSnapshot {
+    pub xfer_id: String,
+    pub channel_id: String,
+    pub peer_pubkey: String,
+    /// `"send"` or `"receive"`.
+    pub direction: String,
+    pub name: String,
+    pub size: u64,
+    pub transferred: u64,
+    /// `"offered"`, `"awaiting"`, `"active"`.
+    pub status: String,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.
@@ -12230,8 +12266,25 @@ struct NetworkState {
     ember_channel_handoff_searches: HashMap<u32, [u8; 16]>,
     ember_pending_channel_handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
     channel_handoff_fetch_at: HashMap<[u8; 16], i64>,
-    /// Partial attachment reassembly (channel_id, blake3) → bytes.
-    channel_file_assembly: HashMap<([u8; 16], [u8; 32]), ChannelFileAssembly>,
+    /// Our Ed25519 seed, for deriving the pairwise key that authenticates
+    /// transfer frames. Held here because the gossip handlers have to verify
+    /// an inbound frame before anything else looks at it, and they are far
+    /// from the command loop that owns the identity.
+    local_ed25519_seed: [u8; 32],
+    /// Ember Transfer: files we have offered or are sending, by transfer id.
+    xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
+    /// Ember Transfer: files we accepted and are pulling in.
+    xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
+    /// Offers waiting on the user to accept or decline.
+    xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
+    /// Data-block send budget. Separate from the chat one on purpose — see
+    /// [`xfer_block_rate_ok`].
+    xfer_block_times: VecDeque<std::time::Instant>,
+    /// Mirror of `channel_file_offers`, so an inbound offer can be judged
+    /// without reaching back into the settings the command loop owns.
+    xfer_offer_policy: String,
+    /// Read-only view of the friends list, for the `"friends"` offer policy.
+    xfer_friend_hashes: crate::app_state::SharedFriendHashes,
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
@@ -14084,67 +14137,51 @@ async fn handle_inbound_channel_gossip(
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         return;
     };
-    if let Some((sender_pk, size, digest, name)) =
-        ember::channel::decode_channel_file_offer(&plain)
-    {
-        // Shares the author's chat budget: an offer mints a room message just
-        // as a chat line does, so the two should not be separately floodable.
-        // File *chunks* are deliberately left out — a 256 KB attachment is 256
-        // of them, so a per-second cap would break transfers outright.
-        if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
-            forget_channel_gossip(state, &gossip.msg_id);
-            debug!("Ember channel gossip: rate-limited file offer in {channel_id_hex}");
+    // Ember Transfer frames are addressed to one member and never relayed on,
+    // so they are matched before the gossip types and always return.
+    //
+    // One gate for all of them: the frame has to name us, and its
+    // authenticator has to check out under the key only we and the claimed
+    // sender can derive. Everything past this point can treat `sender` as the
+    // member it says it is, which the room's shared content key alone would
+    // not establish.
+    if let Some((sender, target, xfer_id)) = ember::channel::xfer_frame_peek(&plain) {
+        if target != state.local_ed25519_pubkey {
             return;
         }
-        apply_channel_file_offer(
-            socket,
-            state,
-            db,
-            app_handle,
-            &ch,
-            &gossip,
-            from_id,
-            sender_pk,
-            size,
-            digest,
-            name,
-        )
-        .await;
-        return;
-    }
-    if let Some((sender_pk, digest)) = ember::channel::decode_channel_file_want(&plain) {
-        apply_channel_file_want(
-            socket,
-            state,
-            db,
-            &ch,
-            &key,
-            &gossip,
-            from_id,
-            sender_pk,
-            digest,
-        )
-        .await;
-        return;
-    }
-    if let Some((sender_pk, digest, offset, data)) =
-        ember::channel::decode_channel_file_chunk(&plain)
-    {
-        apply_channel_file_chunk(
-            socket,
-            state,
-            db,
-            app_handle,
-            &ch,
-            &key,
-            &gossip,
-            from_id,
-            sender_pk,
-            digest,
-            offset,
-            data,
-        )
-        .await;
+        let Some(key) = ember::channel::derive_xfer_key(
+            &state.local_ed25519_seed,
+            &sender,
+            &gossip.channel_id,
+            &xfer_id,
+        ) else {
+            return;
+        };
+        let Some(body) = ember::channel::xfer_verify(&key, &plain) else {
+            debug!(
+                "Ember Transfer: dropped a frame in {channel_id_hex} whose authenticator did not \
+                 match the member it named"
+            );
+            return;
+        };
+        if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(body) {
+            apply_xfer_block_data(
+                socket, state, db, app_handle, xfer_id, sender, offset, data,
+            )
+            .await;
+        } else if let Some((_, _, _, offset, count)) =
+            ember::channel::decode_xfer_block_request(body)
+        {
+            apply_xfer_block_request(state, xfer_id, sender, offset, count);
+        } else if let Some(offer) = ember::channel::decode_xfer_offer(body) {
+            apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
+        } else if let Some((_, _, _, reply)) = ember::channel::decode_xfer_reply(body) {
+            apply_xfer_reply(state, app_handle, xfer_id, sender, reply).await;
+        } else if let Some((_, _, _, reason)) = ember::channel::decode_xfer_cancel(body) {
+            apply_xfer_cancel(state, app_handle, xfer_id, sender, reason);
+        } else if ember::channel::decode_xfer_done(body).is_some() {
+            apply_xfer_done(state, app_handle, xfer_id, sender);
+        }
         return;
     }
     let channel_pk = hex::decode(&ch.pubkey)
@@ -14327,284 +14364,6 @@ async fn handle_inbound_channel_gossip(
     }
 }
 
-fn channel_file_disk_path(channel_id: &str, digest_hex: &str) -> std::path::PathBuf {
-    crate::storage::paths::resolve_data_dir()
-        .join("channel-files")
-        .join(channel_id)
-        .join(digest_hex)
-}
-
-async fn apply_channel_file_offer(
-    socket: &UdpSocket,
-    state: &mut NetworkState,
-    db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
-    ch: &crate::storage::database::StoredChannel,
-    gossip: &ember::channel::ChannelGossip,
-    from_id: ember::dht::EmberNodeId,
-    sender_pk: [u8; 32],
-    size: u64,
-    digest: [u8; 32],
-    name: String,
-) {
-    let sender_hex = hex::encode(sender_pk);
-    if db
-        .channel_member_is_banned(&ch.channel_id, &sender_hex)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let name = crate::security::sanitize_filename(&name);
-    if name.is_empty() {
-        return;
-    }
-    let digest_hex = hex::encode(digest);
-    let _ = db.upsert_channel_attachment(
-        &ch.channel_id,
-        &digest_hex,
-        &name,
-        size as i64,
-        &sender_hex,
-        false,
-    );
-    let marker = ember::channel::format_channel_file_message(&digest, size, &name);
-    let msg_id_hex = hex::encode(gossip.msg_id);
-    if !db
-        .channel_message_exists(&ch.channel_id, &msg_id_hex)
-        .unwrap_or(false)
-    {
-        if let Ok(row_id) = db.insert_channel_message(
-            &ch.channel_id,
-            &sender_hex,
-            "received",
-            &marker,
-            &msg_id_hex,
-            gossip.timestamp,
-        ) {
-            let _ = app_handle.emit(
-                "ember:channel-message",
-                serde_json::json!({
-                    "id": row_id,
-                    "channel_id": ch.channel_id,
-                    "sender_pubkey": sender_hex,
-                    "direction": "received",
-                    "message": marker,
-                    "timestamp": gossip.timestamp,
-                }),
-            );
-        }
-    }
-    if let Some(next) = gossip.decremented_ttl() {
-        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
-    }
-}
-
-async fn apply_channel_file_want(
-    socket: &UdpSocket,
-    state: &mut NetworkState,
-    db: &Arc<Database>,
-    ch: &crate::storage::database::StoredChannel,
-    key: &[u8; 32],
-    gossip: &ember::channel::ChannelGossip,
-    from_id: ember::dht::EmberNodeId,
-    sender_pk: [u8; 32],
-    digest: [u8; 32],
-) {
-    let sender_hex = hex::encode(sender_pk);
-    if db
-        .channel_member_is_banned(&ch.channel_id, &sender_hex)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let digest_hex = hex::encode(digest);
-    if db
-        .channel_attachment_complete(&ch.channel_id, &digest_hex)
-        .unwrap_or(false)
-    {
-        let path = channel_file_disk_path(&ch.channel_id, &digest_hex);
-        if let Ok(sealed) = std::fs::read(&path) {
-            // Sealed on disk under whatever epoch was current when it landed,
-            // which may no longer be the current one.
-            if let Some(plain) = channel_content_keys(db, ch).into_iter().find_map(|candidate| {
-                ember::channel::open_channel_file(&candidate, &gossip.channel_id, &digest, &sealed)
-            }) {
-                send_channel_file_chunks(socket, state, db, ch, key, &digest, &plain).await;
-            }
-        }
-    }
-    if let Some(next) = gossip.decremented_ttl() {
-        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
-    }
-}
-
-async fn send_channel_file_chunks(
-    socket: &UdpSocket,
-    state: &mut NetworkState,
-    db: &Arc<Database>,
-    ch: &crate::storage::database::StoredChannel,
-    key: &[u8; 32],
-    digest: &[u8; 32],
-    plain: &[u8],
-) {
-    let sender = state.local_ed25519_pubkey;
-    let mut offset = 0usize;
-    while offset < plain.len() {
-        if !channel_gossip_rate_ok(state) {
-            break;
-        }
-        let end = (offset + ember::channel::CHANNEL_FILE_CHUNK_SIZE).min(plain.len());
-        let Some(plain_chunk) = ember::channel::encode_channel_file_chunk(
-            &sender,
-            digest,
-            offset as u32,
-            &plain[offset..end],
-        ) else {
-            break;
-        };
-        let chunk_gossip = ember::channel::ChannelGossip::new_plaintext(
-            gossip_channel_id(ch),
-            key,
-            offset as u64 + 1,
-            &plain_chunk,
-            4,
-        );
-        let _ = remember_channel_gossip(state, chunk_gossip.msg_id);
-        fanout_channel_gossip_body(socket, state, db, chunk_gossip.encode(), None).await;
-        offset = end;
-    }
-}
-
-fn gossip_channel_id(ch: &crate::storage::database::StoredChannel) -> [u8; 16] {
-    let mut id = [0u8; 16];
-    if let Ok(bytes) = hex::decode(&ch.channel_id) {
-        if bytes.len() == 16 {
-            id.copy_from_slice(&bytes);
-        }
-    }
-    id
-}
-
-async fn apply_channel_file_chunk(
-    socket: &UdpSocket,
-    state: &mut NetworkState,
-    db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
-    ch: &crate::storage::database::StoredChannel,
-    key: &[u8; 32],
-    gossip: &ember::channel::ChannelGossip,
-    from_id: ember::dht::EmberNodeId,
-    sender_pk: [u8; 32],
-    digest: [u8; 32],
-    offset: u32,
-    data: &[u8],
-) {
-    let sender_hex = hex::encode(sender_pk);
-    if db
-        .channel_member_is_banned(&ch.channel_id, &sender_hex)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let digest_hex = hex::encode(digest);
-    if db
-        .channel_attachment_complete(&ch.channel_id, &digest_hex)
-        .unwrap_or(false)
-    {
-        if let Some(next) = gossip.decremented_ttl() {
-            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
-        }
-        return;
-    }
-    let meta = db
-        .get_channel_attachment(&ch.channel_id, &digest_hex)
-        .ok()
-        .flatten();
-    let size = meta.as_ref().map(|m| m.1 as u64).unwrap_or(0);
-    if size == 0 || size > ember::channel::CHANNEL_FILE_MAX_BYTES as u64 {
-        return;
-    }
-    let end = offset as usize + data.len();
-    if end as u64 > size {
-        return;
-    }
-    let entry = state
-        .channel_file_assembly
-        .entry((gossip.channel_id, digest))
-        .or_insert_with(|| ChannelFileAssembly {
-            name: meta.as_ref().map(|m| m.0.clone()).unwrap_or_default(),
-            buf: vec![0u8; size as usize],
-            got: vec![0u8; size as usize],
-            received: 0,
-            reported_pct: 0,
-            updated_at: std::time::Instant::now(),
-        });
-    entry.updated_at = std::time::Instant::now();
-    for (i, byte) in data.iter().enumerate() {
-        let idx = offset as usize + i;
-        if entry.got[idx] == 0 {
-            entry.got[idx] = 1;
-            entry.received = entry.received.saturating_add(1);
-        }
-        entry.buf[idx] = *byte;
-    }
-    let pct = ((entry.received as u64 * 100) / size.max(1)) as u8;
-    if pct / CHANNEL_FILE_PROGRESS_STEP > entry.reported_pct / CHANNEL_FILE_PROGRESS_STEP {
-        entry.reported_pct = pct;
-        let received = entry.received;
-        let _ = app_handle.emit(
-            "ember:channel-file-progress",
-            serde_json::json!({
-                "channel_id": ch.channel_id,
-                "digest": digest_hex,
-                "received": received,
-                "size": size,
-            }),
-        );
-    }
-    if entry.received as u64 == size && *blake3::hash(&entry.buf).as_bytes() == digest {
-        let sealed =
-            ember::channel::seal_channel_file(key, &gossip.channel_id, &digest, &entry.buf);
-        let dir = channel_file_disk_path(&ch.channel_id, &digest_hex);
-        if let Some(parent) = dir.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            crate::security::restrict_file_permissions(parent);
-        }
-        if crate::security::atomic_write(&dir, &sealed, true).is_ok() {
-            let _ = db.mark_channel_attachment_complete(&ch.channel_id, &digest_hex);
-            let _ = app_handle.emit(
-                "ember:channel-file",
-                serde_json::json!({
-                    "channel_id": ch.channel_id,
-                    "digest": digest_hex,
-                    "file_name": entry.name,
-                }),
-            );
-        }
-        state
-            .channel_file_assembly
-            .remove(&(gossip.channel_id, digest));
-    }
-    // Shed by staleness, not by whatever `keys()` happens to yield first.
-    // Dropping an assembly discards every byte collected so far and the sender
-    // will not resend them, so evicting a transfer that is actively receiving
-    // stalls it for good — the arbitrary pick made that a coin toss.
-    while state.channel_file_assembly.len() > CHANNEL_FILE_ASSEMBLY_MAX {
-        let Some(stalest) = state
-            .channel_file_assembly
-            .iter()
-            .min_by_key(|(_, entry)| entry.updated_at)
-            .map(|(key, _)| *key)
-        else {
-            break;
-        };
-        state.channel_file_assembly.remove(&stalest);
-    }
-    if let Some(next) = gossip.decremented_ttl() {
-        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
-    }
-}
-
 async fn apply_channel_handoff_offer(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -14734,6 +14493,737 @@ async fn send_channel_gossip_unicast(
     }
     let (_rid, frame) = state.ember_dht.build_channel_msg(body);
     send_ember_dht_frame(socket, state, &contact, &frame).await;
+}
+
+// --- Ember Transfer -------------------------------------------------------
+
+/// Data-block budget, deliberately separate from the chat one.
+///
+/// The withdrawn attachment path spent `CHANNEL_GOSSIP_OUT_PER_SEC` on file
+/// chunks, which had two consequences: a transfer silenced the room's chat
+/// while it ran, and it abandoned itself the moment the shared allowance ran
+/// out — a few kilobytes in, with no way to resume. Blocks get their own
+/// allowance; the small control frames keep using the chat one, where they
+/// belong.
+fn xfer_block_rate_ok(state: &mut NetworkState) -> bool {
+    ember::channel::rate_window_allow(
+        &mut state.xfer_block_times,
+        std::time::Instant::now(),
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        ember::channel::XFER_BLOCKS_OUT_PER_SEC,
+    )
+}
+
+/// Seal one transfer frame and send it to a single member.
+///
+/// Direct Noise session first, then the channel WebSocket relay, then the
+/// overlay — the same ladder chat uses, so two firewalled members can still
+/// move a file. Never fans out: a transfer is nobody's business but the two
+/// ends', and broadcasting it is exactly what made the old path unusable.
+async fn send_xfer_frame(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+) -> bool {
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Some(key) = channel_content_key(db, &ch) else {
+        return false;
+    };
+    // TTL 1: addressed, so no one should ever relay it onward as gossip.
+    let gossip = ember::channel::ChannelGossip::new_plaintext(
+        channel_id,
+        &key,
+        chrono::Utc::now().timestamp().max(0) as u64,
+        plain,
+        1,
+    );
+    let body = gossip.encode();
+    // Remember our own id: a relay can loop the frame back, and the dedup set
+    // is what stops us reading our own block as an inbound one.
+    let _ = remember_channel_gossip(state, gossip.msg_id);
+    let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
+    if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+        let (_rid, frame) = state.ember_dht.build_channel_msg(body);
+        send_ember_dht_frame(socket, state, &contact, &frame).await;
+        return true;
+    }
+    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+        return tx.try_send(body).is_ok();
+    }
+    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer]).await;
+    true
+}
+
+fn emit_xfer_update(
+    app_handle: &tauri::AppHandle,
+    xfer_id: &[u8; 16],
+    channel_id: &[u8; 16],
+    peer: &[u8; 32],
+    direction: &str,
+    name: &str,
+    size: u64,
+    transferred: u64,
+    status: &str,
+) {
+    let _ = app_handle.emit(
+        "ember:xfer-update",
+        serde_json::json!({
+            "xfer_id": hex::encode(xfer_id),
+            "channel_id": hex::encode(channel_id),
+            "peer_pubkey": hex::encode(peer),
+            "direction": direction,
+            "name": name,
+            "size": size,
+            "transferred": transferred,
+            "status": status,
+        }),
+    );
+}
+
+/// Whether `peer` is allowed to put an offer in front of the user.
+///
+/// This gates the *prompt*, not the transfer — accepting is always a separate,
+/// explicit act. So the permissive default costs at most a dialog you dismiss,
+/// and the stricter settings exist for people who do not want even that.
+async fn xfer_offer_allowed(state: &NetworkState, peer: &[u8; 32]) -> bool {
+    match state.xfer_offer_policy.as_str() {
+        crate::types::CHANNEL_FILE_OFFERS_NOBODY => false,
+        crate::types::CHANNEL_FILE_OFFERS_FRIENDS => {
+            // Channel members and friends are the same identity keyed two
+            // ways: a friend's Ember hash is BLAKE3 of this same pubkey.
+            let hash = ember::channel::channel_id_from_pubkey(peer);
+            state.xfer_friend_hashes.read().await.contains(&hash)
+        }
+        _ => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_xfer_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    offer: ember::channel::XferOffer,
+    key: [u8; 32],
+) {
+    let sender_hex = hex::encode(offer.sender);
+    if db
+        .channel_member_is_banned(&ch.channel_id, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Only someone we can see in the room may offer. Without this a member
+    // who left, or was never here, could still put a dialog on screen.
+    if !channel_member_pubkeys(db, &ch.channel_id).contains(&offer.sender) {
+        return;
+    }
+    // An offer costs the recipient a prompt, so it is rate-limited exactly
+    // like a chat line from the same author.
+    if !channel_author_gossip_ok(state, gossip.channel_id, &offer.sender) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    let name = crate::security::sanitize_filename(&offer.name);
+    if name.is_empty() {
+        return;
+    }
+
+    let refusal = if !xfer_offer_allowed(state, &offer.sender).await {
+        Some(ember::channel::XferReply::NotAllowed)
+    } else if offer.size > ember::channel::XFER_MAX_BYTES {
+        Some(ember::channel::XferReply::TooLarge)
+    } else if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE
+        || state.xfer_pending.len() >= ember::channel::XFER_MAX_ACTIVE
+    {
+        Some(ember::channel::XferReply::Busy)
+    } else {
+        None
+    };
+    if let Some(reply) = refusal {
+        let plain = ember::channel::encode_xfer_reply(
+            &key,
+            &state.local_ed25519_pubkey,
+            &offer.sender,
+            &offer.xfer_id,
+            reply,
+        );
+        send_xfer_frame(socket, state, db, gossip.channel_id, offer.sender, &plain).await;
+        return;
+    }
+
+    state.xfer_pending.insert(
+        offer.xfer_id,
+        ember::xfer::PendingOffer {
+            channel_id: gossip.channel_id,
+            peer: offer.sender,
+            key,
+            name: name.clone(),
+            size: offer.size,
+            root: offer.root,
+            received_at: std::time::Instant::now(),
+        },
+    );
+    let _ = app_handle.emit(
+        "ember:xfer-offer",
+        serde_json::json!({
+            "xfer_id": hex::encode(offer.xfer_id),
+            "channel_id": ch.channel_id,
+            "peer_pubkey": sender_hex,
+            "name": name,
+            "size": offer.size,
+        }),
+    );
+}
+
+async fn apply_xfer_reply(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    reply: ember::channel::XferReply,
+) {
+    let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+        return;
+    };
+    // Only the member we offered it to gets to answer.
+    if send.peer != sender {
+        return;
+    }
+    // An offer is answered once. Without this a second reply — a duplicate
+    // that took the relay's slower path, or one forged by another member —
+    // could tear down a transfer that is already running.
+    if send.accepted {
+        return;
+    }
+    if reply == ember::channel::XferReply::Accept {
+        send.accepted = true;
+        send.updated_at = std::time::Instant::now();
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &send.channel_id,
+            &send.peer,
+            "send",
+            &send.name,
+            send.size,
+            0,
+            "accepted",
+        );
+        return;
+    }
+    let (channel_id, peer, name, size) = (send.channel_id, send.peer, send.name.clone(), send.size);
+    state.xfer_send.remove(&xfer_id);
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &channel_id,
+        &peer,
+        "send",
+        &name,
+        size,
+        0,
+        reply.as_str(),
+    );
+}
+
+fn apply_xfer_block_request(
+    state: &mut NetworkState,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    offset: u64,
+    count: u16,
+) {
+    let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+        return;
+    };
+    if send.peer != sender || !send.accepted {
+        return;
+    }
+    send.enqueue(offset, count);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_xfer_block_data(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    offset: u64,
+    data: &[u8],
+) {
+    let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+        return;
+    };
+    if recv.peer != sender {
+        return;
+    }
+    match recv.write_block(offset, data) {
+        Ok(_) => {}
+        Err(e) => {
+            let (channel_id, peer, name, size) =
+                (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
+            tracing::warn!(error = %e, "Ember Transfer: could not write an incoming block");
+            if let Some(dead) = state.xfer_recv.remove(&xfer_id) {
+                // Half a file helps nobody, and leaving it behind means the
+                // download folder collects `.part` files nothing will finish.
+                let _ = std::fs::remove_file(&dead.part_path);
+            }
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &channel_id,
+                &peer,
+                "receive",
+                &name,
+                size,
+                0,
+                "failed",
+            );
+            return;
+        }
+    }
+    if let Some(_pct) = recv.progress_step() {
+        let (channel_id, peer, name, size, done) = (
+            recv.channel_id,
+            recv.peer,
+            recv.name.clone(),
+            recv.size,
+            recv.bytes_received(),
+        );
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &channel_id,
+            &peer,
+            "receive",
+            &name,
+            size,
+            done,
+            "active",
+        );
+    }
+    if recv.is_complete() {
+        finish_xfer_recv(socket, state, db, app_handle, xfer_id).await;
+    }
+}
+
+/// `path`, or `name (2).ext` beside it if something is already there.
+///
+/// Two people sending you `photo.jpg` should give you two files, not one
+/// overwritten one. Gives up after a bounded number of tries and returns the
+/// last candidate, letting the rename fail rather than spinning.
+fn unique_download_path(path: &std::path::Path) -> std::path::PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let mut candidate = path.to_path_buf();
+    for n in 2..1000u32 {
+        let name = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+/// Verify a finished download and move it into place.
+///
+/// The root is recomputed with the same [`ember::transfer::HashTree`] the
+/// sender used, so "the file I have" and "the file you offered" are compared
+/// by the same function rather than by two that merely agree today.
+async fn finish_xfer_recv(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+) {
+    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
+        return;
+    };
+    let (channel_id, peer, name, size) =
+        (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
+    let outcome = (|| -> std::io::Result<bool> {
+        recv.finish()?;
+        let file = std::fs::File::open(&recv.part_path)?;
+        let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
+        if tree.root_hash != recv.root {
+            return Ok(false);
+        }
+        if let Some(parent) = recv.final_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = unique_download_path(&recv.final_path);
+        std::fs::rename(&recv.part_path, &target)?;
+        Ok(true)
+    })();
+    let status = match outcome {
+        Ok(true) => "complete",
+        Ok(false) => {
+            // Content did not match what was offered. Keep nothing.
+            let _ = std::fs::remove_file(&recv.part_path);
+            tracing::warn!("Ember Transfer: {name} failed its hash check and was discarded");
+            "failed"
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&recv.part_path);
+            tracing::warn!(error = %e, "Ember Transfer: could not finalise {name}");
+            "failed"
+        }
+    };
+    // Tell the sender how it ended either way. It has no other way to find
+    // out: it answers requests and then hears nothing, so without this its
+    // own stall timer would eventually report a finished transfer as failed.
+    let plain = if status == "complete" {
+        ember::channel::encode_xfer_done(&recv.key, &state.local_ed25519_pubkey, &peer, &xfer_id)
+    } else {
+        ember::channel::encode_xfer_cancel(
+            &recv.key,
+            &state.local_ed25519_pubkey,
+            &peer,
+            &xfer_id,
+            ember::channel::XferCancel::User,
+        )
+    };
+    send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+    let done = if status == "complete" { size } else { 0 };
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &channel_id,
+        &peer,
+        "receive",
+        &name,
+        size,
+        done,
+        status,
+    );
+}
+
+/// The recipient has the whole file and it matched. Retire the send side.
+fn apply_xfer_done(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+) {
+    let Some(send) = state.xfer_send.get(&xfer_id) else {
+        return;
+    };
+    if send.peer != sender {
+        return;
+    }
+    let send = state.xfer_send.remove(&xfer_id).expect("just checked");
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &send.channel_id,
+        &send.peer,
+        "send",
+        &send.name,
+        send.size,
+        send.size,
+        "complete",
+    );
+}
+
+fn apply_xfer_cancel(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    reason: ember::channel::XferCancel,
+) {
+    if let Some(pending) = state.xfer_pending.get(&xfer_id) {
+        if pending.peer == sender {
+            let pending = state.xfer_pending.remove(&xfer_id).expect("just checked");
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &pending.channel_id,
+                &pending.peer,
+                "receive",
+                &pending.name,
+                pending.size,
+                0,
+                reason.as_str(),
+            );
+        }
+        return;
+    }
+    if let Some(recv) = state.xfer_recv.get(&xfer_id) {
+        if recv.peer != sender {
+            return;
+        }
+        let recv = state.xfer_recv.remove(&xfer_id).expect("just checked");
+        // Half a file is not a file. Nothing is left in the download folder.
+        let _ = std::fs::remove_file(&recv.part_path);
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &recv.channel_id,
+            &recv.peer,
+            "receive",
+            &recv.name,
+            recv.size,
+            0,
+            reason.as_str(),
+        );
+        return;
+    }
+    if let Some(send) = state.xfer_send.get(&xfer_id) {
+        if send.peer != sender {
+            return;
+        }
+        let send = state.xfer_send.remove(&xfer_id).expect("just checked");
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &send.channel_id,
+            &send.peer,
+            "send",
+            &send.name,
+            send.size,
+            0,
+            reason.as_str(),
+        );
+    }
+}
+
+/// One pass of the transfer engine: answer block requests, top up the
+/// receivers' request windows, and shed anything that has gone quiet.
+async fn drive_channel_transfers(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+) {
+    if state.xfer_send.is_empty() && state.xfer_recv.is_empty() && state.xfer_pending.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let me = state.local_ed25519_pubkey;
+
+    // Offers nobody answered. Dropping them keeps a stale dialog from
+    // accepting into a transfer the other side has long forgotten.
+    let lapsed: Vec<[u8; 16]> = state
+        .xfer_pending
+        .iter()
+        .filter(|(_, offer)| {
+            now.saturating_duration_since(offer.received_at)
+                > std::time::Duration::from_secs(ember::channel::XFER_OFFER_TTL_SECS as u64)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in lapsed {
+        if let Some(offer) = state.xfer_pending.remove(&xfer_id) {
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &offer.channel_id,
+                &offer.peer,
+                "receive",
+                &offer.name,
+                offer.size,
+                0,
+                "expired",
+            );
+        }
+    }
+
+    // Answer whatever the far ends have asked for, within this tick's budget.
+    let senders: Vec<[u8; 16]> = state
+        .xfer_send
+        .iter()
+        .filter(|(_, send)| send.has_work())
+        .map(|(id, _)| *id)
+        .collect();
+    // Labelled so running out of send budget breaks out to the receive side
+    // below rather than returning. A node doing both at once would otherwise
+    // stop asking for its own blocks whenever it was busy answering someone
+    // else's, and the two transfers would take turns stalling each other.
+    'sending: for xfer_id in senders {
+        // Everything the block needs is copied out while the borrow is live,
+        // so the body below is free to touch `state` again for the send.
+        while let Some((block, channel_id, peer, key, size)) =
+            state.xfer_send.get_mut(&xfer_id).and_then(|send| {
+                if !send.has_work() {
+                    return None;
+                }
+                let block = send.next_block()?;
+                Some((block, send.channel_id, send.peer, send.key, send.size))
+            })
+        {
+            if !xfer_block_rate_ok(state) {
+                // Out of budget for this tick. Put the block back so the next
+                // tick picks it up rather than dropping it on the floor — the
+                // old path abandoned the rest of the file here, which is
+                // precisely why attachments never finished.
+                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                    send.enqueue(block, 1);
+                }
+                break 'sending;
+            }
+            let offset = block * ember::channel::XFER_BLOCK_SIZE as u64;
+            let want = ((size - offset) as usize).min(ember::channel::XFER_BLOCK_SIZE);
+            let read = state
+                .xfer_send
+                .get_mut(&xfer_id)
+                .map(|send| send.read_block(offset, want));
+            let Some(Ok(buf)) = read else {
+                // The file moved or became unreadable mid-transfer. Say so
+                // rather than letting the other end time out guessing.
+                let plain = ember::channel::encode_xfer_cancel(
+                    &key,
+                    &me,
+                    &peer,
+                    &xfer_id,
+                    ember::channel::XferCancel::SourceGone,
+                );
+                send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+                if let Some(send) = state.xfer_send.remove(&xfer_id) {
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &channel_id,
+                        &peer,
+                        "send",
+                        &send.name,
+                        send.size,
+                        0,
+                        "source_gone",
+                    );
+                }
+                continue 'sending;
+            };
+            let Some(plain) =
+                ember::channel::encode_xfer_block_data(&key, &me, &peer, &xfer_id, offset, &buf)
+            else {
+                break;
+            };
+            send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                send.note_sent();
+                if let Some(_pct) = send.progress_step() {
+                    let (name, sent) = (send.name.clone(), send.bytes_sent());
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &channel_id,
+                        &peer,
+                        "send",
+                        &name,
+                        size,
+                        sent,
+                        "active",
+                    );
+                }
+            }
+        }
+    }
+
+    // Top up each receiver's window.
+    let receivers: Vec<[u8; 16]> = state.xfer_recv.keys().copied().collect();
+    for xfer_id in receivers {
+        let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+            continue;
+        };
+        let (channel_id, peer, key) = (recv.channel_id, recv.peer, recv.key);
+        let runs = recv.next_requests(now);
+        for (start, count) in runs {
+            let plain =
+                ember::channel::encode_xfer_block_request(&key, &me, &peer, &xfer_id, start, count);
+            send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+        }
+    }
+
+    // Shed transfers that have gone quiet in either direction.
+    let stalled_send: Vec<[u8; 16]> = state
+        .xfer_send
+        .iter()
+        .filter(|(_, send)| send.is_stalled(now))
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in stalled_send {
+        if let Some(send) = state.xfer_send.remove(&xfer_id) {
+            let plain = ember::channel::encode_xfer_cancel(
+                &send.key,
+                &me,
+                &send.peer,
+                &xfer_id,
+                ember::channel::XferCancel::Stalled,
+            );
+            send_xfer_frame(socket, state, db, send.channel_id, send.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &send.channel_id,
+                &send.peer,
+                "send",
+                &send.name,
+                send.size,
+                send.bytes_sent(),
+                // Nobody ever answered, versus a transfer that started and
+                // then went quiet. The two read very differently to whoever
+                // offered the file.
+                if send.accepted { "stalled" } else { "expired" },
+            );
+        }
+    }
+    let stalled_recv: Vec<[u8; 16]> = state
+        .xfer_recv
+        .iter()
+        .filter(|(_, recv)| recv.is_stalled(now))
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in stalled_recv {
+        if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+            let _ = std::fs::remove_file(&recv.part_path);
+            let plain = ember::channel::encode_xfer_cancel(
+                &recv.key,
+                &me,
+                &recv.peer,
+                &xfer_id,
+                ember::channel::XferCancel::Stalled,
+            );
+            send_xfer_frame(socket, state, db, recv.channel_id, recv.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &recv.channel_id,
+                &recv.peer,
+                "receive",
+                &recv.name,
+                recv.size,
+                0,
+                "stalled",
+            );
+        }
+    }
 }
 
 async fn reply_channel_history_sync(
@@ -19145,7 +19635,10 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_handoff_searches.clear();
     state.ember_pending_channel_handoff.clear();
     state.channel_handoff_fetch_at.clear();
-    state.channel_file_assembly.clear();
+    state.xfer_send.clear();
+    state.xfer_recv.clear();
+    state.xfer_pending.clear();
+    state.xfer_block_times.clear();
     state.ember_channel_epoch_searches.clear();
     state.ember_pending_channel_epoch.clear();
     state.channel_epoch_fetch_at.clear();
@@ -19251,6 +19744,7 @@ fn apply_network_settings(
         // Do not clear on unrelated settings saves while already enabled.
         reset_stun_keepalive_session(state);
     }
+    state.xfer_offer_policy = new_settings.channel_file_offers.clone();
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,
@@ -20147,7 +20641,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_handoff_searches: HashMap::new(),
         ember_pending_channel_handoff: Vec::new(),
         channel_handoff_fetch_at: HashMap::new(),
-        channel_file_assembly: HashMap::new(),
+        local_ed25519_seed: ed25519_secret_key,
+        xfer_send: HashMap::new(),
+        xfer_recv: HashMap::new(),
+        xfer_pending: HashMap::new(),
+        xfer_block_times: VecDeque::new(),
+        xfer_offer_policy: settings.channel_file_offers.clone(),
+        xfer_friend_hashes: friend_hashes.clone(),
         ember_channel_epoch_searches: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
@@ -30337,6 +30837,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Ember Transfer pacing shares this 100ms tick rather than
+                // taking its own arm — `tokio::select!` tops out at 64
+                // branches and this loop is already at the limit. It runs
+                // ahead of the KAD status gate below because Ember is a
+                // separate overlay: a room transfer has no reason to stop
+                // because the eMule network is disconnected. Returns straight
+                // away when nothing is in flight.
+                if settings.ember_native_enabled {
+                    drive_channel_transfers(&udp_socket, &mut state, &db, &app_handle).await;
+                }
                 if state.stats.status == NetworkStatus::Disconnected { return; }
                 let now_bt = chrono::Utc::now().timestamp();
                 if let Some(target) =

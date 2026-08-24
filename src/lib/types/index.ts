@@ -783,6 +783,9 @@ export interface AppSettings {
   friend_browse_disabled: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */
   friend_session_encryption: boolean;
+  /** Who may offer you a file in a channel. Gates the prompt only — accepting
+   *  is always a separate, explicit choice. */
+  channel_file_offers: 'everyone' | 'friends' | 'nobody';
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /** Rendezvous server URL for Ember friend discovery */

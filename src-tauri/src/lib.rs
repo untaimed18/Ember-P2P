@@ -808,6 +808,19 @@ pub fn run() {
             {
                 let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
                 storage::known_files::migrate_aich_v2(&data_dir);
+                // Sealed bytes from the withdrawn room-attachment feature. The
+                // rows that described them went with schema v34, so without
+                // this the blobs are unreferenced files nothing will ever open
+                // or clean up.
+                let legacy_channel_files = data_dir.join("channel-files");
+                if legacy_channel_files.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&legacy_channel_files) {
+                        tracing::warn!(
+                            error = %e,
+                            "could not remove stored room attachments from the previous version"
+                        );
+                    }
+                }
             }
 
             // Allow WebView media playback for files under shared/download dirs.
@@ -1843,10 +1856,11 @@ pub fn run() {
             commands::channels::transfer_channel_ownership,
             commands::channels::set_channel_successor_nominee,
             commands::channels::claim_channel_ownership,
-            commands::channels::offer_channel_file,
-            commands::channels::request_channel_file,
-            commands::channels::get_channel_file,
-            commands::channels::save_channel_file,
+            commands::channels::channel_member_friend_code,
+            commands::channels::offer_channel_transfer,
+            commands::channels::respond_channel_transfer,
+            commands::channels::cancel_channel_transfer,
+            commands::channels::list_channel_transfers,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::pick_download_folder,

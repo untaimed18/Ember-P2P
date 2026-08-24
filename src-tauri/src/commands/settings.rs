@@ -449,6 +449,18 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let offers = settings.channel_file_offers.trim().to_ascii_lowercase();
+    if offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
+        && offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
+        && offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
+    {
+        settings.channel_file_offers = crate::types::CHANNEL_FILE_OFFERS_EVERYONE.to_string();
+        changed = true;
+    } else if offers != settings.channel_file_offers {
+        settings.channel_file_offers = offers;
+        changed = true;
+    }
+
     let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
     if freq != "daily" && freq != "weekly" && freq != "monthly" {
         settings.update_check_frequency = "daily".to_string();
@@ -562,6 +574,15 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_close_behavior_invalid",
             "Close behavior must be 'ask', 'tray', or 'exit'",
+        ));
+    }
+    if settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
+        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
+        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
+    {
+        return Err(coded(
+            "settings_channel_file_offers_invalid",
+            "Channel file offers must be 'everyone', 'friends', or 'nobody'",
         ));
     }
     if settings.update_check_frequency != "daily"
@@ -942,6 +963,7 @@ pub async fn update_settings(
     let mut settings = merge_renderer_settings(settings, &old_settings)?;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
+    settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;

@@ -756,6 +756,7 @@
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_browse_disabled: settings.friend_browse_disabled,
         friend_session_encryption: true,
+        channel_file_offers: settings.channel_file_offers,
       });
     }
     if (friendTogglePersistInFlight) {
@@ -776,6 +777,7 @@
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_browse_disabled: settings.friend_browse_disabled,
             friend_session_encryption: true,
+            channel_file_offers: settings.channel_file_offers,
           };
           try {
             const result = await updateSettings(candidate);
@@ -787,6 +789,7 @@
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
+              baseline.channel_file_offers = result.settings.channel_file_offers;
               baseline.settings_revision = result.settings.settings_revision;
               originalSettings = JSON.stringify(baseline);
             }
@@ -810,6 +813,7 @@
           settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
+          settings.channel_file_offers = persisted.channel_file_offers;
           settings.settings_revision = persisted.settings_revision;
         }
         // Move the baseline with it. If the revision advanced out from under us
@@ -821,6 +825,7 @@
           baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
+          baseline.channel_file_offers = persisted.channel_file_offers;
           baseline.settings_revision = persisted.settings_revision;
           originalSettings = JSON.stringify(baseline);
         }
@@ -2452,6 +2457,20 @@
               <span class="hint">{m.settings_friend_browse_disabled_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
+          </div>
+
+          <div class="field">
+            <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
+            <select
+              id="channel-file-offers"
+              bind:value={settings.channel_file_offers}
+              onchange={() => void applyFriendTogglesLive()}
+            >
+              <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
+              <option value="friends">{m.settings_channel_file_offers_friends()}</option>
+              <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
+            </select>
+            <span class="hint">{m.settings_channel_file_offers_hint()}</span>
           </div>
 
           <!-- Friend session encryption stays forced on (see handleSave /

@@ -35,7 +35,6 @@ const EPOCH_ENVELOPE_VERSION: u8 = 1;
 pub const EPOCH_ENVELOPE_LEN: usize = 1 + GOSSIP_NONCE_LEN + 32 + GOSSIP_TAG_LEN;
 const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
 const GOSSIP_AAD_DOMAIN: &[u8] = b"ember-channel-gossip-v1\0";
-const FILE_AAD_DOMAIN: &[u8] = b"ember-channel-file-v1\0";
 
 /// How many public-index shards Gather walks. Sized so each shard stays under
 /// the 300-records-per-key FIND_VALUE cap for longer.
@@ -83,13 +82,49 @@ pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
 pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
 /// How often members walk the owner-signed handoff key.
 pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
-/// Largest attachment that rides the channel mesh (not friend TCP).
-pub const CHANNEL_FILE_MAX_BYTES: usize = 256 * 1024;
-/// Unicast chunk size; stays under the unfragmented DHT payload budget.
-pub const CHANNEL_FILE_CHUNK_SIZE: usize = 1024;
-pub const CHANNEL_FILE_NAME_MAX: usize = 128;
-/// Local chat-row marker for a file offer (`EMBERFILE:{blake3}:{size}:{name}`).
-pub const CHANNEL_FILE_PREFIX: &str = "EMBERFILE:";
+// --- Ember Transfer -------------------------------------------------------
+//
+// One member hands a file to one other member. Nothing is broadcast: the
+// offer, the reply, and every block are addressed to a single peer, and the
+// recipient has to accept before any bytes move.
+//
+// This is the first version of the Ember transfer system, so it deliberately
+// runs on what the room already has — the authenticated Noise/UDP session
+// between members, with the channel relay as a fallback. The framing keeps
+// the file identified by its BLAKE3 root, so a later QUIC or multi-source
+// implementation can carry the same offers without a new handshake.
+
+/// Largest file one member may offer another.
+pub const XFER_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Payload bytes per block. Chosen so a data frame plus its plaintext header,
+/// authenticator, gossip envelope, and a relay wrapper still fit one
+/// unfragmented datagram. `xfer_block_frame_fits_one_unfragmented_datagram`
+/// pins the arithmetic; a fragmented block is one plenty of consumer NATs
+/// simply drop, which would show up as a transfer that never finishes.
+pub const XFER_BLOCK_SIZE: usize = 1008;
+/// Truncated BLAKE3 authenticator on every transfer frame. See
+/// [`derive_xfer_key`].
+pub const XFER_MAC_LEN: usize = 16;
+/// Longest file name carried on the wire.
+pub const XFER_NAME_MAX: usize = 160;
+/// Blocks the receiver leaves outstanding at once. This is the flow control:
+/// the sender only ever answers requests, so it cannot outrun the receiver.
+pub const XFER_WINDOW_BLOCKS: usize = 64;
+/// Re-request a block that has not landed within this long.
+pub const XFER_BLOCK_TIMEOUT_MS: u64 = 4_000;
+/// Abandon a transfer that has made no progress at all for this long.
+pub const XFER_STALL_SECS: u64 = 90;
+/// Data frames one node emits per second.
+///
+/// Deliberately its own budget rather than the chat one. Sharing
+/// `CHANNEL_GOSSIP_OUT_PER_SEC` is what made the old attachment path stall a
+/// few kilobytes in: a transfer would spend the room's entire gossip
+/// allowance and then abandon itself.
+pub const XFER_BLOCKS_OUT_PER_SEC: usize = 192;
+/// Concurrent transfers, counted per direction.
+pub const XFER_MAX_ACTIVE: usize = 4;
+/// How long an offer waits for an answer before it lapses.
+pub const XFER_OFFER_TTL_SECS: i64 = 300;
 /// Private rooms keep the existing join secret across ownership transfer.
 pub const HANDOFF_FLAG_KEEP_JOIN_SECRET: u8 = 0x01;
 pub const CHANNEL_MSG_VERSION: u8 = 1;
@@ -632,11 +667,17 @@ pub struct ChannelGossip {
 const CHAT_PLAIN_VERSION: u8 = 1;
 const MOD_ACTION_PLAIN_VERSION: u8 = 2;
 const SYNC_REQUEST_PLAIN_VERSION: u8 = 3;
-const FILE_OFFER_PLAIN_VERSION: u8 = 4;
-const FILE_WANT_PLAIN_VERSION: u8 = 5;
+// 4, 5, and 8 belonged to the withdrawn broadcast-attachment path. Builds
+// still running it are on the network, so the numbers stay retired rather
+// than being recycled into something a stale peer would misread.
 const HANDOFF_OFFER_PLAIN_VERSION: u8 = 6;
 const HANDOFF_READY_PLAIN_VERSION: u8 = 7;
-const FILE_CHUNK_PLAIN_VERSION: u8 = 8;
+const XFER_OFFER_PLAIN_VERSION: u8 = 9;
+const XFER_REPLY_PLAIN_VERSION: u8 = 10;
+const XFER_BLOCK_REQUEST_PLAIN_VERSION: u8 = 11;
+const XFER_BLOCK_DATA_PLAIN_VERSION: u8 = 12;
+const XFER_CANCEL_PLAIN_VERSION: u8 = 13;
+const XFER_DONE_PLAIN_VERSION: u8 = 14;
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
@@ -717,97 +758,455 @@ pub fn decode_channel_sync_request(bytes: &[u8]) -> Option<([u8; 32], i64)> {
     Some((sender, since_ts))
 }
 
-/// File offer: `v(1) || sender(32) || size(8) || blake3(32) || name`.
-pub fn encode_channel_file_offer(
-    sender_pubkey: &[u8; 32],
-    size: u64,
-    digest: &[u8; 32],
-    name: &str,
-) -> Vec<u8> {
-    let name = truncate_utf8_owned(name, CHANNEL_FILE_NAME_MAX);
-    let mut out = Vec::with_capacity(1 + 32 + 8 + 32 + name.len());
-    out.push(FILE_OFFER_PLAIN_VERSION);
-    out.extend_from_slice(sender_pubkey);
-    out.extend_from_slice(&size.to_le_bytes());
-    out.extend_from_slice(digest);
+/// Why a transfer offer was refused, or that it was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferReply {
+    Accept,
+    Decline,
+    /// The recipient already has as many transfers running as it will take.
+    Busy,
+    /// Over [`XFER_MAX_BYTES`], or over whatever the recipient will accept.
+    TooLarge,
+    /// Refused by the recipient's "who may offer me files" setting.
+    NotAllowed,
+}
+
+impl XferReply {
+    fn code(self) -> u8 {
+        match self {
+            Self::Accept => 0,
+            Self::Decline => 1,
+            Self::Busy => 2,
+            Self::TooLarge => 3,
+            Self::NotAllowed => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Accept,
+            1 => Self::Decline,
+            2 => Self::Busy,
+            3 => Self::TooLarge,
+            4 => Self::NotAllowed,
+            _ => return None,
+        })
+    }
+
+    /// The status the UI shows for this answer. Kept in step with the
+    /// `ChannelTransferStatus` union in `src/lib/api/channels.ts`; a value
+    /// that has no case there renders as a bare "failed".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accepted",
+            Self::Decline => "declined",
+            Self::Busy => "busy",
+            Self::TooLarge => "too_large",
+            Self::NotAllowed => "not_allowed",
+        }
+    }
+}
+
+/// Why a transfer stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferCancel {
+    /// Either side pressed cancel.
+    User,
+    /// The sender can no longer read the file it offered.
+    SourceGone,
+    /// No progress for [`XFER_STALL_SECS`].
+    Stalled,
+}
+
+impl XferCancel {
+    fn code(self) -> u8 {
+        match self {
+            Self::User => 0,
+            Self::SourceGone => 1,
+            Self::Stalled => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::User,
+            1 => Self::SourceGone,
+            2 => Self::Stalled,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "cancelled",
+            Self::SourceGone => "source_gone",
+            Self::Stalled => "stalled",
+        }
+    }
+}
+
+/// Every transfer frame names both ends: `sender(32) || target(32) ||
+/// xfer_id(16)` after the version byte.
+///
+/// The target is on the wire even though these are unicast, because the
+/// channel relay can hand a frame to a member it merely forwards for. A
+/// member that is not the target drops the frame instead of acting on it.
+///
+/// `sender` is backed by the authenticator every frame carries — see
+/// [`derive_xfer_key`]. A room member cannot put another member's name on a
+/// transfer frame, which is a stronger guarantee than the chat sharing the
+/// room gets.
+const XFER_HEADER_LEN: usize = 1 + 32 + 32 + 16;
+
+/// Key authenticating every transfer frame between one pair of members.
+///
+/// The room's content key is held by *every* member, so on its own it proves
+/// only that a frame came from someone in the room — any of them could put
+/// another member's key in the `sender` field, exactly as they can forge the
+/// author of a chat line. That is tolerable for chat and not for transfers: a
+/// forged offer would put a trusted member's name on a prompt for a file they
+/// never sent.
+///
+/// So each frame also carries a tag under a key only the two ends can compute:
+/// static X25519 Diffie-Hellman between their Ed25519 identities, which the
+/// room's presence records already publish. `derive_pairwise_capability` sorts
+/// the two public keys, so both sides arrive at the same value without any
+/// handshake, and the purpose binds the room and the transfer so a frame
+/// cannot be lifted into a different one. The `target` field is inside the
+/// authenticated bytes, so a frame cannot be reflected back at its sender
+/// either.
+///
+/// Symmetric rather than a signature because it is a quarter the size, and
+/// the 64 bytes an Ed25519 signature costs would push a block frame past the
+/// unfragmented datagram budget. Nothing here needs to be provable to a third
+/// party — only unforgeable by one.
+pub fn derive_xfer_key(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    xfer_id: &[u8; 16],
+) -> Option<[u8; 32]> {
+    // Pairwise purpose is capped at 64 bytes; this is 42.
+    let mut purpose = Vec::with_capacity(10 + 16 + 16);
+    purpose.extend_from_slice(b"ch-xfer-v1");
+    purpose.extend_from_slice(channel_id);
+    purpose.extend_from_slice(xfer_id);
+    // Epoch 0: a transfer is short-lived and already bound to its own id, so
+    // it wants a key stable for its lifetime rather than one that rotates
+    // underneath it mid-file.
+    crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)
+}
+
+fn xfer_tag(key: &[u8; 32], body: &[u8]) -> [u8; XFER_MAC_LEN] {
+    let full = blake3::keyed_hash(key, body);
+    let mut tag = [0u8; XFER_MAC_LEN];
+    tag.copy_from_slice(&full.as_bytes()[..XFER_MAC_LEN]);
+    tag
+}
+
+fn append_xfer_tag(key: &[u8; 32], out: &mut Vec<u8>) {
+    let tag = xfer_tag(key, out);
+    out.extend_from_slice(&tag);
+}
+
+/// Read a transfer frame's header without checking it.
+///
+/// Deliberately unauthenticated: the key needed to verify the frame is derived
+/// from the very fields this returns. Callers use it to work out *which* key
+/// to derive and must then call [`xfer_verify`] before believing any of it.
+pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
+    if bytes.len() < XFER_HEADER_LEN + XFER_MAC_LEN {
+        return None;
+    }
+    if !matches!(
+        bytes[0],
+        XFER_OFFER_PLAIN_VERSION
+            | XFER_REPLY_PLAIN_VERSION
+            | XFER_BLOCK_REQUEST_PLAIN_VERSION
+            | XFER_BLOCK_DATA_PLAIN_VERSION
+            | XFER_CANCEL_PLAIN_VERSION
+            | XFER_DONE_PLAIN_VERSION
+    ) {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes[33..65]);
+    let mut xfer_id = [0u8; 16];
+    xfer_id.copy_from_slice(&bytes[65..81]);
+    Some((sender, target, xfer_id))
+}
+
+/// Check the authenticator and hand back the frame body without it.
+pub fn xfer_verify<'a>(key: &[u8; 32], bytes: &'a [u8]) -> Option<&'a [u8]> {
+    if bytes.len() < XFER_HEADER_LEN + XFER_MAC_LEN {
+        return None;
+    }
+    let (body, tag) = bytes.split_at(bytes.len() - XFER_MAC_LEN);
+    let expected = xfer_tag(key, body);
+    // Constant-time: a byte-at-a-time compare would leak how much of a guess
+    // was right, which is the one thing that turns forging a 128-bit tag from
+    // hopeless into merely expensive.
+    let mut diff = 0u8;
+    for (a, b) in tag.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    if diff == 0 {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn put_xfer_header(out: &mut Vec<u8>, version: u8, sender: &[u8; 32], target: &[u8; 32], xfer_id: &[u8; 16]) {
+    out.push(version);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(target);
+    out.extend_from_slice(xfer_id);
+}
+
+fn take_xfer_header(bytes: &[u8], version: u8) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
+    if bytes.len() < XFER_HEADER_LEN || bytes[0] != version {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes[33..65]);
+    let mut xfer_id = [0u8; 16];
+    xfer_id.copy_from_slice(&bytes[65..81]);
+    Some((sender, target, xfer_id))
+}
+
+/// What one member proposes to send another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XferOffer {
+    pub sender: [u8; 32],
+    pub target: [u8; 32],
+    pub xfer_id: [u8; 16],
+    pub size: u64,
+    /// `HashTree` root over the file, which is also the Ember file hash.
+    pub root: [u8; 32],
+    pub name: String,
+}
+
+/// `hdr || size(8) || root(32) || name || tag(16)`.
+pub fn encode_xfer_offer(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
+    let name = truncate_utf8_owned(&offer.name, XFER_NAME_MAX);
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + 32 + name.len() + XFER_MAC_LEN);
+    put_xfer_header(
+        &mut out,
+        XFER_OFFER_PLAIN_VERSION,
+        &offer.sender,
+        &offer.target,
+        &offer.xfer_id,
+    );
+    out.extend_from_slice(&offer.size.to_le_bytes());
+    out.extend_from_slice(&offer.root);
     out.extend_from_slice(name.as_bytes());
+    append_xfer_tag(key, &mut out);
     out
 }
 
-pub fn decode_channel_file_offer(bytes: &[u8]) -> Option<([u8; 32], u64, [u8; 32], String)> {
-    if bytes.len() < 1 + 32 + 8 + 32 || bytes[0] != FILE_OFFER_PLAIN_VERSION {
+pub fn decode_xfer_offer(bytes: &[u8]) -> Option<XferOffer> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_PLAIN_VERSION)?;
+    let rest = bytes.get(XFER_HEADER_LEN..)?;
+    if rest.len() < 8 + 32 {
         return None;
     }
-    let mut sender = [0u8; 32];
-    sender.copy_from_slice(&bytes[1..33]);
-    let size = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
-    if size == 0 || size > CHANNEL_FILE_MAX_BYTES as u64 {
+    let size = u64::from_le_bytes(rest[..8].try_into().ok()?);
+    if size == 0 || size > XFER_MAX_BYTES {
         return None;
     }
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&bytes[41..73]);
-    if bytes.len() - 73 > CHANNEL_FILE_NAME_MAX {
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&rest[8..40]);
+    let name_bytes = &rest[40..];
+    if name_bytes.is_empty() || name_bytes.len() > XFER_NAME_MAX {
         return None;
     }
-    let name = std::str::from_utf8(&bytes[73..]).ok()?.to_string();
-    if name.is_empty() {
-        return None;
-    }
-    Some((sender, size, digest, name))
+    let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+    Some(XferOffer {
+        sender,
+        target,
+        xfer_id,
+        size,
+        root,
+        name,
+    })
 }
 
-pub fn encode_channel_file_want(sender_pubkey: &[u8; 32], digest: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + 32);
-    out.push(FILE_WANT_PLAIN_VERSION);
-    out.extend_from_slice(sender_pubkey);
-    out.extend_from_slice(digest);
+/// `hdr || status(1) || tag(16)`.
+pub fn encode_xfer_reply(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    reply: XferReply,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 1 + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_REPLY_PLAIN_VERSION, sender, target, xfer_id);
+    out.push(reply.code());
+    append_xfer_tag(key, &mut out);
     out
 }
 
-pub fn decode_channel_file_want(bytes: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-    if bytes.len() != 65 || bytes[0] != FILE_WANT_PLAIN_VERSION {
+pub fn decode_xfer_reply(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16], XferReply)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_REPLY_PLAIN_VERSION)?;
+    if bytes.len() != XFER_HEADER_LEN + 1 {
         return None;
     }
-    let mut sender = [0u8; 32];
-    sender.copy_from_slice(&bytes[1..33]);
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&bytes[33..65]);
-    Some((sender, digest))
+    let reply = XferReply::from_code(bytes[XFER_HEADER_LEN])?;
+    Some((sender, target, xfer_id, reply))
 }
 
-/// Unicast chunk: `v(1) || sender(32) || blake3(32) || offset(4) || data`.
-pub fn encode_channel_file_chunk(
-    sender_pubkey: &[u8; 32],
-    digest: &[u8; 32],
-    offset: u32,
+/// `hdr || offset(8) || count(2)` — `count` consecutive blocks from `offset`.
+///
+/// Receiver-driven on purpose. The sender only ever answers a request, so it
+/// cannot run ahead of what the other side can absorb, and a block that goes
+/// missing is simply asked for again rather than lost for good.
+pub fn encode_xfer_block_request(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    offset: u64,
+    count: u16,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + 2 + XFER_MAC_LEN);
+    put_xfer_header(
+        &mut out,
+        XFER_BLOCK_REQUEST_PLAIN_VERSION,
+        sender,
+        target,
+        xfer_id,
+    );
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+pub fn decode_xfer_block_request(
+    bytes: &[u8],
+) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, u16)> {
+    let (sender, target, xfer_id) =
+        take_xfer_header(bytes, XFER_BLOCK_REQUEST_PLAIN_VERSION)?;
+    if bytes.len() != XFER_HEADER_LEN + 8 + 2 {
+        return None;
+    }
+    let offset = u64::from_le_bytes(bytes[XFER_HEADER_LEN..XFER_HEADER_LEN + 8].try_into().ok()?);
+    let count = u16::from_le_bytes(
+        bytes[XFER_HEADER_LEN + 8..XFER_HEADER_LEN + 10]
+            .try_into()
+            .ok()?,
+    );
+    if count == 0 || count as usize > XFER_WINDOW_BLOCKS {
+        return None;
+    }
+    Some((sender, target, xfer_id, offset, count))
+}
+
+/// `hdr || offset(8) || data || tag(16)`.
+///
+/// Block data is authenticated like everything else rather than leaning on
+/// the whole-file hash at the end. That check would catch injected bytes, but
+/// only after the last block, and the answer would be to discard the entire
+/// file — so an unauthenticated stream hands any room member a cheap way to
+/// make every transfer fail.
+pub fn encode_xfer_block_data(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    offset: u64,
     data: &[u8],
 ) -> Option<Vec<u8>> {
-    if data.is_empty() || data.len() > CHANNEL_FILE_CHUNK_SIZE {
+    if data.is_empty() || data.len() > XFER_BLOCK_SIZE {
         return None;
     }
-    let mut out = Vec::with_capacity(1 + 32 + 32 + 4 + data.len());
-    out.push(FILE_CHUNK_PLAIN_VERSION);
-    out.extend_from_slice(sender_pubkey);
-    out.extend_from_slice(digest);
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + data.len() + XFER_MAC_LEN);
+    put_xfer_header(
+        &mut out,
+        XFER_BLOCK_DATA_PLAIN_VERSION,
+        sender,
+        target,
+        xfer_id,
+    );
     out.extend_from_slice(&offset.to_le_bytes());
     out.extend_from_slice(data);
+    append_xfer_tag(key, &mut out);
     Some(out)
 }
 
-pub fn decode_channel_file_chunk(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], u32, &[u8])> {
-    if bytes.len() < 1 + 32 + 32 + 4 + 1 || bytes[0] != FILE_CHUNK_PLAIN_VERSION {
+pub fn decode_xfer_block_data(
+    bytes: &[u8],
+) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, &[u8])> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_BLOCK_DATA_PLAIN_VERSION)?;
+    let rest = bytes.get(XFER_HEADER_LEN..)?;
+    if rest.len() < 8 + 1 {
         return None;
     }
-    let data = &bytes[69..];
-    if data.len() > CHANNEL_FILE_CHUNK_SIZE {
+    let offset = u64::from_le_bytes(rest[..8].try_into().ok()?);
+    let data = &rest[8..];
+    if data.len() > XFER_BLOCK_SIZE {
         return None;
     }
-    let mut sender = [0u8; 32];
-    sender.copy_from_slice(&bytes[1..33]);
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&bytes[33..65]);
-    let offset = u32::from_le_bytes(bytes[65..69].try_into().ok()?);
-    Some((sender, digest, offset, data))
+    Some((sender, target, xfer_id, offset, data))
+}
+
+/// `hdr || reason(1) || tag(16)`.
+pub fn encode_xfer_cancel(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    reason: XferCancel,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + 1 + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_CANCEL_PLAIN_VERSION, sender, target, xfer_id);
+    out.push(reason.code());
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+pub fn decode_xfer_cancel(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16], XferCancel)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_CANCEL_PLAIN_VERSION)?;
+    if bytes.len() != XFER_HEADER_LEN + 1 {
+        return None;
+    }
+    let reason = XferCancel::from_code(bytes[XFER_HEADER_LEN])?;
+    Some((sender, target, xfer_id, reason))
+}
+
+/// `hdr` only — "I have the whole file, and it matched."
+///
+/// Without this the sender has no way to learn it is finished: it answers
+/// requests and never hears anything again, so its own stall timer would
+/// eventually fire and report a successful transfer as a failure.
+pub fn encode_xfer_done(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_DONE_PLAIN_VERSION, sender, target, xfer_id);
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+pub fn decode_xfer_done(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
+    let parsed = take_xfer_header(bytes, XFER_DONE_PLAIN_VERSION)?;
+    if bytes.len() != XFER_HEADER_LEN {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// Total blocks a file of `size` bytes is cut into.
+pub fn xfer_block_count(size: u64) -> u64 {
+    size.div_ceil(XFER_BLOCK_SIZE as u64)
 }
 
 /// Offer signed by the **old channel key**, not the owner's user key.
@@ -928,31 +1327,6 @@ pub fn decode_handoff_extra(extra: &[u8]) -> Option<(u64, [u8; 32], [u8; 16], u8
     Some((version, successor_pubkey, successor_id, extra[56]))
 }
 
-pub fn format_channel_file_message(digest: &[u8; 32], size: u64, name: &str) -> String {
-    format!(
-        "{CHANNEL_FILE_PREFIX}{}:{size}:{}",
-        hex::encode(digest),
-        truncate_utf8_owned(name, CHANNEL_FILE_NAME_MAX)
-    )
-}
-
-#[allow(dead_code)]
-pub fn parse_channel_file_message(text: &str) -> Option<([u8; 32], u64, String)> {
-    let rest = text.strip_prefix(CHANNEL_FILE_PREFIX)?;
-    let (hash_hex, rest) = rest.split_once(':')?;
-    let (size_str, name) = rest.split_once(':')?;
-    if hash_hex.len() != 64 || name.is_empty() {
-        return None;
-    }
-    let mut digest = [0u8; 32];
-    hex::decode_to_slice(hash_hex, &mut digest).ok()?;
-    let size: u64 = size_str.parse().ok()?;
-    if size == 0 || size > CHANNEL_FILE_MAX_BYTES as u64 {
-        return None;
-    }
-    Some((digest, size, name.to_string()))
-}
-
 fn truncate_utf8_owned(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -962,62 +1336,6 @@ fn truncate_utf8_owned(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
-}
-
-/// Seal attachment bytes for local disk. Relays never see this; gossip
-/// chunks are sealed separately under the content key.
-pub fn seal_channel_file(
-    content_key: &[u8; 32],
-    channel_id: &[u8; 16],
-    digest: &[u8; 32],
-    plaintext: &[u8],
-) -> Vec<u8> {
-    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
-    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
-    let mut aad = Vec::with_capacity(FILE_AAD_DOMAIN.len() + 16 + 32);
-    aad.extend_from_slice(FILE_AAD_DOMAIN);
-    aad.extend_from_slice(channel_id);
-    aad.extend_from_slice(digest);
-    let encrypted = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad: &aad,
-            },
-        )
-        .expect("XChaCha20-Poly1305 encryption cannot fail for channel file");
-    let mut out = Vec::with_capacity(1 + GOSSIP_NONCE_LEN + encrypted.len());
-    out.push(1);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&encrypted);
-    out
-}
-
-pub fn open_channel_file(
-    content_key: &[u8; 32],
-    channel_id: &[u8; 16],
-    digest: &[u8; 32],
-    envelope: &[u8],
-) -> Option<Vec<u8>> {
-    if envelope.len() < 1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN || envelope[0] != 1 {
-        return None;
-    }
-    let mut aad = Vec::with_capacity(FILE_AAD_DOMAIN.len() + 16 + 32);
-    aad.extend_from_slice(FILE_AAD_DOMAIN);
-    aad.extend_from_slice(channel_id);
-    aad.extend_from_slice(digest);
-    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
-    cipher
-        .decrypt(
-            XNonce::from_slice(&envelope[1..1 + GOSSIP_NONCE_LEN]),
-            Payload {
-                msg: &envelope[1 + GOSSIP_NONCE_LEN..],
-                aad: &aad,
-            },
-        )
-        .ok()
 }
 
 const CHANNEL_RELAY_ENVELOPE_VERSION: u8 = 1;
@@ -2168,52 +2486,244 @@ mod tests {
         assert!(decode_handoff_extra(&broken).is_none());
     }
 
+    const K: [u8; 32] = [0x5Au8; 32];
+
+    /// Verify with `K` and hand back the body, as the dispatcher does.
+    fn opened(bytes: &[u8]) -> Vec<u8> {
+        xfer_verify(&K, bytes).expect("frame must verify under its own key").to_vec()
+    }
+
+    fn sample_offer() -> XferOffer {
+        XferOffer {
+            sender: [0xAAu8; 32],
+            target: [0xBBu8; 32],
+            xfer_id: [7u8; 16],
+            size: 5,
+            root: *blake3::hash(b"hello").as_bytes(),
+            name: "note.txt".into(),
+        }
+    }
+
     #[test]
-    fn file_offer_want_chunk_and_marker_round_trip() {
-        let sender = [0xAAu8; 32];
-        let digest = *blake3::hash(b"hello").as_bytes();
-        let offer = encode_channel_file_offer(&sender, 5, &digest, "note.txt");
-        let (pk, size, got, name) = decode_channel_file_offer(&offer).unwrap();
-        assert_eq!(pk, sender);
-        assert_eq!(size, 5);
-        assert_eq!(got, digest);
-        assert_eq!(name, "note.txt");
-        assert!(decode_channel_file_offer(&encode_channel_file_offer(
-            &sender,
-            CHANNEL_FILE_MAX_BYTES as u64 + 1,
-            &digest,
-            "x"
-        ))
+    fn xfer_offer_round_trip_and_bounds() {
+        let offer = sample_offer();
+        assert_eq!(
+            decode_xfer_offer(&opened(&encode_xfer_offer(&K, &offer))),
+            Some(offer.clone())
+        );
+
+        let too_big = XferOffer {
+            size: XFER_MAX_BYTES + 1,
+            ..offer.clone()
+        };
+        assert!(decode_xfer_offer(&opened(&encode_xfer_offer(&K, &too_big))).is_none());
+
+        let empty = XferOffer {
+            size: 0,
+            ..offer.clone()
+        };
+        assert!(decode_xfer_offer(&opened(&encode_xfer_offer(&K, &empty))).is_none());
+
+        // A long name is truncated on a char boundary rather than refused.
+        let long = XferOffer {
+            name: "é".repeat(XFER_NAME_MAX),
+            ..offer
+        };
+        let decoded = decode_xfer_offer(&opened(&encode_xfer_offer(&K, &long))).unwrap();
+        assert!(decoded.name.len() <= XFER_NAME_MAX);
+        assert!(long.name.starts_with(&decoded.name));
+    }
+
+    #[test]
+    fn xfer_reply_and_cancel_round_trip() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        for reply in [
+            XferReply::Accept,
+            XferReply::Decline,
+            XferReply::Busy,
+            XferReply::TooLarge,
+            XferReply::NotAllowed,
+        ] {
+            let bytes = encode_xfer_reply(&K, &s, &t, &id, reply);
+            assert_eq!(decode_xfer_reply(&opened(&bytes)), Some((s, t, id, reply)));
+        }
+        for reason in [XferCancel::User, XferCancel::SourceGone, XferCancel::Stalled] {
+            let bytes = encode_xfer_cancel(&K, &s, &t, &id, reason);
+            assert_eq!(decode_xfer_cancel(&opened(&bytes)), Some((s, t, id, reason)));
+        }
+    }
+
+    #[test]
+    fn xfer_block_frames_round_trip() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let req = encode_xfer_block_request(&K, &s, &t, &id, 4096, 8);
+        assert_eq!(
+            decode_xfer_block_request(&opened(&req)),
+            Some((s, t, id, 4096, 8))
+        );
+
+        // A window-busting or empty run is refused rather than clamped: it can
+        // only come from a peer that is not playing by the same rules.
+        let greedy = encode_xfer_block_request(&K, &s, &t, &id, 0, XFER_WINDOW_BLOCKS as u16 + 1);
+        assert!(decode_xfer_block_request(&opened(&greedy)).is_none());
+        assert!(decode_xfer_block_request(&opened(&encode_xfer_block_request(
+            &K, &s, &t, &id, 0, 0
+        )))
         .is_none());
 
-        let want = encode_channel_file_want(&sender, &digest);
-        assert_eq!(decode_channel_file_want(&want), Some((sender, digest)));
+        let data = vec![9u8; XFER_BLOCK_SIZE];
+        let frame = encode_xfer_block_data(&K, &s, &t, &id, 1024, &data).unwrap();
+        let body = opened(&frame);
+        let (gs, gt, gid, offset, got) = decode_xfer_block_data(&body).unwrap();
+        assert_eq!((gs, gt, gid, offset), (s, t, id, 1024));
+        assert_eq!(got, &data[..]);
 
-        let chunk = encode_channel_file_chunk(&sender, &digest, 0, b"hello").unwrap();
-        let (pk, got, offset, data) = decode_channel_file_chunk(&chunk).unwrap();
-        assert_eq!(pk, sender);
-        assert_eq!(got, digest);
-        assert_eq!(offset, 0);
-        assert_eq!(data, b"hello");
-
-        let marker = format_channel_file_message(&digest, 5, "note.txt");
-        assert_eq!(
-            parse_channel_file_message(&marker),
-            Some((digest, 5, "note.txt".into()))
+        assert!(encode_xfer_block_data(&K, &s, &t, &id, 0, &[]).is_none());
+        assert!(
+            encode_xfer_block_data(&K, &s, &t, &id, 0, &vec![0u8; XFER_BLOCK_SIZE + 1]).is_none()
         );
     }
 
     #[test]
-    fn sealed_channel_file_opens_with_matching_aad() {
-        let key = content_key(&[9u8; 32]);
-        let channel_id = [0x33u8; 16];
-        let digest = *blake3::hash(b"pic").as_bytes();
-        let sealed = seal_channel_file(&key, &channel_id, &digest, b"pic");
-        assert_eq!(
-            open_channel_file(&key, &channel_id, &digest, &sealed).as_deref(),
-            Some(b"pic".as_ref())
+    fn xfer_done_round_trips() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let bytes = encode_xfer_done(&K, &s, &t, &id);
+        assert_eq!(decode_xfer_done(&opened(&bytes)), Some((s, t, id)));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(xfer_verify(&K, &trailing).is_none());
+    }
+
+    /// The property the whole authenticator exists for: a room member holding
+    /// the shared content key still cannot put another member's name on a
+    /// transfer frame, because it cannot compute their pairwise key.
+    #[test]
+    fn a_frame_forged_under_another_key_does_not_verify() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let forger = [0x99u8; 32];
+        let frame = encode_xfer_reply(&forger, &s, &t, &id, XferReply::Accept);
+        // The header still reads as a well-formed frame naming `s`...
+        assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
+        // ...and that is exactly as far as it gets.
+        assert!(xfer_verify(&K, &frame).is_none());
+    }
+
+    #[test]
+    fn tampering_with_any_authenticated_byte_is_caught() {
+        let offer = sample_offer();
+        let frame = encode_xfer_offer(&K, &offer);
+        for i in 0..frame.len() {
+            let mut broken = frame.clone();
+            broken[i] ^= 0x01;
+            assert!(
+                xfer_verify(&K, &broken).is_none(),
+                "flipping byte {i} went unnoticed"
+            );
+        }
+    }
+
+    /// The key binds the room and the transfer, so a frame cannot be lifted
+    /// out of one and replayed into another.
+    #[test]
+    fn the_transfer_key_binds_the_room_and_the_transfer() {
+        let a = ChannelIdentity::generate();
+        let b = ChannelIdentity::generate();
+        let room = [0x31u8; 16];
+        let other_room = [0x32u8; 16];
+        let xfer = [7u8; 16];
+        let other_xfer = [8u8; 16];
+
+        let a_seed = a.signing_key.to_bytes();
+        let b_seed = b.signing_key.to_bytes();
+
+        // Both ends derive the same key without exchanging anything.
+        let from_a = derive_xfer_key(&a_seed, &b.pubkey, &room, &xfer).unwrap();
+        let from_b = derive_xfer_key(&b_seed, &a.pubkey, &room, &xfer).unwrap();
+        assert_eq!(from_a, from_b);
+
+        assert_ne!(
+            from_a,
+            derive_xfer_key(&a_seed, &b.pubkey, &other_room, &xfer).unwrap()
         );
-        assert!(open_channel_file(&key, &[0u8; 16], &digest, &sealed).is_none());
+        assert_ne!(
+            from_a,
+            derive_xfer_key(&a_seed, &b.pubkey, &room, &other_xfer).unwrap()
+        );
+
+        // A third member of the same room derives something else entirely.
+        let c = ChannelIdentity::generate();
+        assert_ne!(
+            from_a,
+            derive_xfer_key(&c.signing_key.to_bytes(), &b.pubkey, &room, &xfer).unwrap()
+        );
+    }
+
+    /// Every answer has to name a status the UI knows, or a peer declining
+    /// shows up as a bare "failed". These strings are the contract with
+    /// `ChannelTransferStatus` on the TypeScript side.
+    #[test]
+    fn xfer_reply_statuses_are_the_ones_the_ui_renders() {
+        assert_eq!(XferReply::Accept.as_str(), "accepted");
+        assert_eq!(XferReply::Decline.as_str(), "declined");
+        assert_eq!(XferReply::Busy.as_str(), "busy");
+        assert_eq!(XferReply::TooLarge.as_str(), "too_large");
+        assert_eq!(XferReply::NotAllowed.as_str(), "not_allowed");
+        assert_eq!(XferCancel::User.as_str(), "cancelled");
+        assert_eq!(XferCancel::SourceGone.as_str(), "source_gone");
+        assert_eq!(XferCancel::Stalled.as_str(), "stalled");
+    }
+
+    #[test]
+    fn xfer_frames_do_not_decode_as_each_other() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let body = opened(&encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept));
+        assert!(decode_xfer_cancel(&body).is_none());
+        assert!(decode_xfer_offer(&body).is_none());
+        assert!(decode_xfer_block_request(&body).is_none());
+        assert!(decode_xfer_block_data(&body).is_none());
+        assert!(decode_xfer_done(&body).is_none());
+        // And the retired attachment versions are not mistaken for transfers,
+        // nor picked up by the dispatcher's peek.
+        for retired in [4u8, 5, 8] {
+            let mut bytes = body.clone();
+            bytes[0] = retired;
+            assert!(decode_xfer_reply(&bytes).is_none());
+            assert!(xfer_frame_peek(&bytes).is_none());
+        }
+        // Chat and handoff frames are not mistaken for transfer frames either.
+        assert!(xfer_frame_peek(&encode_channel_chat_plain(&s, "hello there")).is_none());
+        assert!(xfer_frame_peek(&encode_channel_sync_request(&s, 1)).is_none());
+    }
+
+    #[test]
+    fn xfer_block_count_covers_the_tail() {
+        assert_eq!(xfer_block_count(0), 0);
+        assert_eq!(xfer_block_count(1), 1);
+        assert_eq!(xfer_block_count(XFER_BLOCK_SIZE as u64), 1);
+        assert_eq!(xfer_block_count(XFER_BLOCK_SIZE as u64 + 1), 2);
+    }
+
+    /// A block plus every wrapper has to fit one unfragmented datagram.
+    ///
+    /// Fragmented UDP is dropped outright by plenty of consumer NATs, so an
+    /// oversized block would not be slow — it would never arrive, and the
+    /// receiver would re-request it forever. The relay header is included
+    /// because the firewalled path is the one that needs this most.
+    #[test]
+    fn xfer_block_frame_fits_one_unfragmented_datagram() {
+        let budget = crate::network::ember::dht::messages::MAX_UNFRAGMENTED_PAYLOAD;
+        let framed = XFER_HEADER_LEN
+            + 8
+            + XFER_BLOCK_SIZE
+            + XFER_MAC_LEN
+            + GOSSIP_HEADER_LEN
+            + GOSSIP_ENVELOPE_OVERHEAD
+            + CHANNEL_RELAY_ENVELOPE_HEADER;
+        assert!(
+            framed <= budget,
+            "a block frame is {framed} bytes, over the {budget}-byte unfragmented budget — \
+             lower XFER_BLOCK_SIZE rather than letting blocks fragment"
+        );
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

@@ -10,19 +10,24 @@
   import IconX from '$lib/components/IconX.svelte';
   import { appSettings } from '$lib/stores/settings';
   import { copyToClipboard, formatRelativeTime } from '$lib/utils';
-  import { toastError, toastSuccess } from '$lib/stores/toast';
+  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import {
     addChannelModerator,
     banChannelMember,
+    cancelChannelTransfer,
+    channelMemberFriendCode,
     createChannel,
     gatherChannels,
     getChannelInvite,
     joinChannel,
     leaveChannel,
     listChannelMembers,
+    listChannelTransfers,
+    offerChannelTransfer,
     removeChannelModerator,
+    respondChannelTransfer,
     claimChannelOwnership,
     searchChannelMessages,
     setChannelSuccessorNominee,
@@ -31,8 +36,10 @@
     updateChannelModeration,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
+    type ChannelTransferInfo,
     type GatheredChannelInfo,
   } from '$lib/api/channels';
+  import { addFriend } from '$lib/api/friends';
   import {
     activeChannelId,
     channels as channelsStore,
@@ -96,6 +103,18 @@
   /** Guards against a superseded query's reply landing last and showing hits
    *  for text the box no longer contains. */
   let searchGen = 0;
+  /**
+   * Ember Transfers this session, keyed by transfer id.
+   *
+   * Not persisted, because the backend does not persist them either: a
+   * transfer belongs to the session that started it. Terminal rows are kept
+   * briefly so "complete" or "declined" is actually seen before it vanishes.
+   */
+  let transfers = $state<Record<string, ChannelTransferInfo>>({});
+  /** Members we have a send action in flight for, so the menu item can't be
+   *  double-fired while the file is being hashed. */
+  let sendingTo = $state<string[]>([]);
+  let addingFriend = $state<string[]>([]);
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   let selected = $derived(channelList.find((c) => c.channel_id === selectedId) ?? null);
@@ -301,6 +320,82 @@
       if (cancelled) fn();
       else unlistenHandoff = fn;
     });
+    // Ember Transfer. `xfer-offer` is an offer waiting on the user;
+    // `xfer-update` carries every state change including progress.
+    let unlistenXferOffer: UnlistenFn | undefined;
+    listen<{
+      xfer_id: string;
+      channel_id: string;
+      peer_pubkey: string;
+      name: string;
+      size: number;
+    }>('ember:xfer-offer', (event) => {
+      const p = event.payload;
+      transfers = {
+        ...transfers,
+        [p.xfer_id]: {
+          xfer_id: p.xfer_id,
+          channel_id: p.channel_id,
+          peer_pubkey: p.peer_pubkey,
+          direction: 'receive',
+          name: p.name,
+          size: p.size,
+          transferred: 0,
+          status: 'awaiting',
+        },
+      };
+      // The panel only draws the open room's transfers, so an offer made
+      // while the user is reading somewhere else would sit unseen until it
+      // expired. Say which room it is in instead.
+      if (p.channel_id !== selectedId) {
+        const room = channelList.find((c) => c.channel_id === p.channel_id);
+        toast(
+          room
+            ? m.channels_xfer_offer_elsewhere({ room: room.name })
+            : m.channels_xfer_offer_elsewhere_unknown(),
+        );
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenXferOffer = fn;
+    });
+    let unlistenXferUpdate: UnlistenFn | undefined;
+    // Keyed by transfer, so a row that reports two terminal states in a row
+    // replaces its own timer instead of stacking a second one.
+    const xferClearTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    listen<ChannelTransferInfo>('ember:xfer-update', (event) => {
+      const t = event.payload;
+      transfers = { ...transfers, [t.xfer_id]: t };
+      // A finished row is worth seeing, not worth keeping. Clearing it after a
+      // few seconds saves the user dismissing every transfer by hand.
+      if (TERMINAL_XFER.includes(t.status)) {
+        const existing = xferClearTimers.get(t.xfer_id);
+        if (existing) clearTimeout(existing);
+        xferClearTimers.set(
+          t.xfer_id,
+          setTimeout(() => {
+            xferClearTimers.delete(t.xfer_id);
+            const { [t.xfer_id]: _done, ...rest } = transfers;
+            transfers = rest;
+          }, 8000),
+        );
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenXferUpdate = fn;
+    });
+    // Anything already in flight when this page mounted. Merged rather than
+    // assigned, and with live rows winning: the listeners above are already
+    // running, so an offer arriving while this call is in flight would
+    // otherwise be wiped by a snapshot taken before it existed.
+    listChannelTransfers()
+      .then((list) => {
+        if (cancelled) return;
+        transfers = { ...Object.fromEntries(list.map((t) => [t.xfer_id, t])), ...transfers };
+      })
+      .catch((e) => {
+        console.warn('Channels: could not list transfers already in flight', e);
+      });
     document.addEventListener('pointerdown', onCardMenuPointerDown);
     document.addEventListener('keydown', onPageKeydown);
     // Half the presence-republish interval, so a member crossing the freshness
@@ -311,9 +406,13 @@
     return () => {
       cancelled = true;
       clearInterval(presenceTimer);
+      for (const timer of xferClearTimers.values()) clearTimeout(timer);
+      xferClearTimers.clear();
       unlistenMembers?.();
       unlistenModeration?.();
       unlistenHandoff?.();
+      unlistenXferOffer?.();
+      unlistenXferUpdate?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
       document.removeEventListener('keydown', onPageKeydown);
     };
@@ -716,6 +815,159 @@
    *  member, where the moderation items below are not. */
   function memberHasMenu(mem: ChannelMemberInfo): boolean {
     return !!selected && !mem.is_self;
+  }
+
+  /** Right-click opens the same menu the button does, rather than a second one
+   *  that would have to be kept in step with it. */
+  function openMemberMenu(e: MouseEvent) {
+    const row = e.currentTarget as HTMLElement;
+    const menu = row.querySelector('details.card-more') as HTMLDetailsElement | null;
+    if (!menu) return;
+    e.preventDefault();
+    closeCardMenus(menu);
+    menu.open = true;
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  async function handleAddFriend(mem: ChannelMemberInfo) {
+    const pk = mem.member_pubkey;
+    if (addingFriend.includes(pk)) return;
+    addingFriend = [...addingFriend, pk];
+    try {
+      const code = await channelMemberFriendCode(pk);
+      await addFriend(code, mem.nickname || undefined);
+      toastSuccess(m.channels_friend_added({ name: mem.nickname || shortId(pk) }));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      addingFriend = addingFriend.filter((k) => k !== pk);
+    }
+  }
+
+  async function handleCopyMemberId(mem: ChannelMemberInfo) {
+    if (await copyToClipboard(mem.member_pubkey)) {
+      toastSuccess(m.channels_member_id_copied());
+    } else {
+      toastError(m.kad_clipboard_unavailable());
+    }
+  }
+
+  async function handleSendFile(mem: ChannelMemberInfo) {
+    const id = selectedId;
+    const pk = mem.member_pubkey;
+    if (!id || sendingTo.includes(pk)) return;
+    // Claimed before the picker opens, not after. Hashing a large file takes a
+    // moment, and the menu item is only disabled once this is set — so a
+    // second click while the dialog was up used to start a second offer.
+    sendingTo = [...sendingTo, pk];
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({ multiple: false, title: m.channels_send_file() });
+      if (!picked || Array.isArray(picked)) return;
+      await offerChannelTransfer(id, pk, picked);
+      toastSuccess(m.channels_xfer_offer_sent({ name: mem.nickname || shortId(pk) }));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      sendingTo = sendingTo.filter((k) => k !== pk);
+    }
+  }
+
+  /** Transfers with an answer in flight. Without this a second click sends a
+   *  second reply, and the backend answers the first one and rejects the
+   *  second with "no longer waiting" — an error for doing nothing wrong. */
+  let respondingTo = $state<string[]>([]);
+
+  async function handleRespondTransfer(xferId: string, accept: boolean) {
+    if (respondingTo.includes(xferId)) return;
+    respondingTo = [...respondingTo, xferId];
+    try {
+      await respondChannelTransfer(xferId, accept);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      respondingTo = respondingTo.filter((id) => id !== xferId);
+    }
+  }
+
+  async function handleCancelTransfer(xferId: string) {
+    if (respondingTo.includes(xferId)) return;
+    respondingTo = [...respondingTo, xferId];
+    try {
+      await cancelChannelTransfer(xferId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      respondingTo = respondingTo.filter((id) => id !== xferId);
+    }
+  }
+
+  /** Transfers belonging to the room on screen. A transfer is between two
+   *  people in one room, so showing another room's would be noise. */
+  /** Offers waiting on an answer come first — they are the only rows that
+   *  need the user to do something, and they expire. Everything else keeps a
+   *  stable order so a progress bar does not jump around as it fills. */
+  let roomTransfers = $derived(
+    Object.values(transfers)
+      .filter((t) => t.channel_id === selectedChannelId)
+      .sort((a, b) => {
+        const waiting = (t: ChannelTransferInfo) => (t.status === 'awaiting' ? 0 : 1);
+        return waiting(a) - waiting(b) || a.xfer_id.localeCompare(b.xfer_id);
+      }),
+  );
+  const TERMINAL_XFER: string[] = [
+    'complete',
+    'declined',
+    'cancelled',
+    'stalled',
+    'expired',
+    'failed',
+    'busy',
+    'too_large',
+    'not_allowed',
+    'source_gone',
+  ];
+
+  function transferLabel(t: ChannelTransferInfo): string {
+    const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
+    switch (t.status) {
+      case 'awaiting':
+        return m.channels_xfer_awaiting({ name: who });
+      case 'offered':
+        return m.channels_xfer_offered({ name: who });
+      case 'accepted':
+      case 'active':
+        return t.direction === 'send'
+          ? m.channels_xfer_sending({ name: who })
+          : m.channels_xfer_receiving({ name: who });
+      case 'complete':
+        return t.direction === 'send'
+          ? m.channels_xfer_sent({ name: who })
+          : m.channels_xfer_received({ name: who });
+      case 'declined':
+        return m.channels_xfer_declined({ name: who });
+      case 'busy':
+        return m.channels_xfer_peer_busy({ name: who });
+      case 'too_large':
+        return m.channels_xfer_peer_too_large({ name: who });
+      case 'not_allowed':
+        return m.channels_xfer_peer_refuses({ name: who });
+      case 'expired':
+        return m.channels_xfer_expired();
+      case 'stalled':
+        return m.channels_xfer_stalled();
+      case 'source_gone':
+        return m.channels_xfer_source_gone();
+      case 'cancelled':
+        return m.channels_xfer_cancelled();
+      default:
+        return m.channels_xfer_failed();
+    }
   }
 </script>
 
@@ -1166,6 +1418,65 @@
                 {/if}
               </div>
             {/if}
+            {#if roomTransfers.length > 0}
+              <!-- Polite, not assertive: an arriving offer is worth announcing
+                   but must not cut across whatever is being read. -->
+              <div class="xfer-panel" aria-live="polite">
+                {#each roomTransfers as t (t.xfer_id)}
+                  {@const pct = t.size > 0 ? Math.min(100, Math.round((t.transferred / t.size) * 100)) : 0}
+                  {@const busy = respondingTo.includes(t.xfer_id)}
+                  <div class="xfer-row" class:awaiting={t.status === 'awaiting'}>
+                    <div class="xfer-text">
+                      <span class="xfer-name"><bdi dir="auto">{t.name}</bdi></span>
+                      <span class="xfer-meta">
+                        {formatBytes(t.size)} &middot; {transferLabel(t)}
+                      </span>
+                      {#if t.status === 'active' || t.status === 'accepted'}
+                        <div
+                          class="xfer-progress"
+                          role="progressbar"
+                          aria-label={t.name}
+                          aria-valuemin="0"
+                          aria-valuemax={t.size}
+                          aria-valuenow={Math.min(t.transferred, t.size)}
+                          aria-valuetext="{pct}%"
+                        >
+                          <div class="xfer-progress-fill" style="width: {pct}%"></div>
+                        </div>
+                      {/if}
+                    </div>
+                    <div class="xfer-actions">
+                      {#if t.status === 'awaiting'}
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onclick={() => handleRespondTransfer(t.xfer_id, true)}
+                        >
+                          {m.channels_xfer_accept()}
+                        </button>
+                        <button
+                          type="button"
+                          class="ghost"
+                          disabled={busy}
+                          onclick={() => handleRespondTransfer(t.xfer_id, false)}
+                        >
+                          {m.channels_xfer_decline()}
+                        </button>
+                      {:else if t.status === 'offered' || t.status === 'accepted' || t.status === 'active'}
+                        <button
+                          type="button"
+                          class="ghost danger"
+                          disabled={busy}
+                          onclick={() => handleCancelTransfer(t.xfer_id)}
+                        >
+                          {m.common_cancel()}
+                        </button>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             {#if searchOpen}
               <form
                 class="room-search"
@@ -1248,7 +1559,10 @@
               <ul class="member-list">
                 {#each sortedMembers as mem (mem.member_pubkey)}
                   {@const present = mem.is_self || isPresent(mem, presenceNow)}
-                  <li class:banned={mem.banned}>
+                  <li
+                    class:banned={mem.banned}
+                    oncontextmenu={memberHasMenu(mem) ? openMemberMenu : undefined}
+                  >
                     <div class="member-avatar" class:present>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <circle cx="12" cy="8" r="4"/>
@@ -1293,6 +1607,23 @@
                           </svg>
                         </summary>
                         <div class="card-more-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
+                          >{m.channels_send_file()}</button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={addingFriend.includes(mem.member_pubkey)}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
+                          >{m.channels_add_friend()}</button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onclick={(e) => { closeCardMenu(e.currentTarget); handleCopyMemberId(mem); }}
+                          >{m.channels_copy_member_id()}</button>
                           <button
                             type="button"
                             role="menuitem"
@@ -1926,6 +2257,73 @@
   .key-behind-banner strong {
     font-size: 13px;
     color: var(--text-primary);
+  }
+
+  .xfer-panel {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+  }
+
+  .xfer-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 14px;
+  }
+
+  .xfer-row + .xfer-row {
+    border-top: 1px solid var(--border);
+  }
+
+  /* An offer waiting on the user is the only row that needs to be noticed;
+     the rest are progress the user already knows about. */
+  .xfer-row.awaiting {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+
+  .xfer-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .xfer-name {
+    font-size: 13px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .xfer-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .xfer-progress {
+    height: 3px;
+    margin-top: 4px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    overflow: hidden;
+  }
+
+  .xfer-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width var(--transition-fast) linear;
+  }
+
+  .xfer-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
   }
 
   .succession-form {

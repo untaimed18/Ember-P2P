@@ -59,14 +59,46 @@ identity-to-IP map of every participant.
 
 ## What's left
 
-### 1. Ember-native transfers are dormant
+### 1. Ember-native transfers are partly wired
 
 [`network/ember/transfer.rs`](../src-tauri/src/network/ember/transfer.rs)
-holds the 256 KiB chunk protocol and the BLAKE3 hash tree, but nothing
-imports it — there is no reference to `ember::transfer::` anywhere in the
-tree. Ember discovers the source; the bytes still move over eD2K
-client-to-client. Wiring it up is the largest remaining piece if the goal
-is a network that does not need the eMule wire at all.
+holds the 256 KiB chunk protocol and the BLAKE3 hash tree. Its `HashTree` is
+now live: **Ember Transfer**
+([`network/ember/xfer.rs`](../src-tauri/src/network/ember/xfer.rs)) uses it to
+identify a file that one channel member hands to another, over the
+authenticated Noise/UDP session the room already provides. One sender, one
+recipient, an explicit accept before any bytes move, receiver-driven block
+requests, and its own send budget so a transfer never starves chat.
+
+Every transfer frame is authenticated to the two members it is between. The
+room's content key is shared by all of them, so on its own it proves only that
+a frame came from *somebody* in the room — enough for chat, not enough for a
+prompt that names who is sending you a file. Each frame therefore carries a
+16-byte tag under a key derived from static X25519 Diffie-Hellman between the
+two Ed25519 identities the presence records already publish
+(`channel::derive_xfer_key`), bound to the room and the transfer id. A member
+cannot forge another member's offer, accept, cancel, block request, or block
+data; a non-member cannot produce a frame at all. Symmetric rather than a
+signature because 64 bytes per frame would push a block past the unfragmented
+datagram budget, and nothing here needs to be provable to a third party.
+
+What is still dormant is the rest of that module — the QUIC stream framing
+(`MSG_REQUEST_CHUNKS` and friends) and any multi-source notion. Ordinary
+library downloads still discover sources over Ember and move bytes over eD2K
+client-to-client. The two remaining pieces, if the goal is a network that
+does not need the eMule wire at all:
+
+- **Reach.** Rendezvous publishes presence for the 8 XOR-closest members of at
+  most 4 rooms, so an arbitrary member holding a file may not be dialable.
+  Ember Transfer falls back to the channel relay, which works but is slower
+  than a direct session.
+- **Throughput.** Blocks are 1008 bytes and paced by
+  `XFER_BLOCKS_OUT_PER_SEC`, sized so the block plus its authenticator, gossip
+  envelope, and relay header stay inside one unfragmented datagram
+  (`xfer_block_frame_fits_one_unfragmented_datagram` pins the arithmetic).
+  Moving the same offers onto QUIC would lift that ceiling without changing the
+  offer/accept handshake, which is why the file is identified by its hash-tree
+  root rather than by anything transport-specific.
 
 ### 2. Wire versioning rejects cleanly but cannot negotiate
 

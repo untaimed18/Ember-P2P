@@ -1215,6 +1215,15 @@ pub struct AppSettings {
     /// Encrypt friend sessions with RC4 obfuscation (default true)
     #[serde(default = "default_true")]
     pub friend_session_encryption: bool,
+    /// Who may offer you a file in a channel: `"everyone"`, `"friends"`, or
+    /// `"nobody"`.
+    ///
+    /// Only governs whether the offer is *shown*. Accepting is always an
+    /// explicit choice, so the permissive default cannot cost more than a
+    /// prompt you dismiss. `"friends"` compares the member's Ed25519 key
+    /// against the friends list by its derived Ember hash.
+    #[serde(default = "default_channel_file_offers")]
+    pub channel_file_offers: String,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -1510,6 +1519,15 @@ fn default_max_friends() -> u32 {
     200
 }
 
+/// Anyone in the room may offer, because an offer is only ever a prompt.
+pub const CHANNEL_FILE_OFFERS_EVERYONE: &str = "everyone";
+pub const CHANNEL_FILE_OFFERS_FRIENDS: &str = "friends";
+pub const CHANNEL_FILE_OFFERS_NOBODY: &str = "nobody";
+
+fn default_channel_file_offers() -> String {
+    CHANNEL_FILE_OFFERS_EVERYONE.to_string()
+}
+
 /// Default rendezvous server URL.
 ///
 /// L13: trust model for the V1 default rendezvous host.
@@ -1704,6 +1722,7 @@ impl Default for AppSettings {
             friend_chat_disabled: false,
             friend_browse_disabled: false,
             friend_session_encryption: true,
+            channel_file_offers: default_channel_file_offers(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,

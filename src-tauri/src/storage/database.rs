@@ -18,7 +18,7 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 33;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 34;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -1634,6 +1634,22 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 33)?;
+            tx.commit()?;
+        }
+
+        if version < 34 {
+            // Room attachments are gone. They broadcast a file to everyone in
+            // the room whether or not anybody asked for it, capped at 256 KB,
+            // with no acknowledgement and no way to resume — so in practice a
+            // transfer died a few kilobytes in and could not recover. Ember
+            // Transfer replaces it: one member offers a file to one member,
+            // who has to accept before any bytes move.
+            //
+            // The sealed blobs these rows pointed at live outside the database,
+            // so startup removes the `channel-files` directory separately.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("DROP TABLE IF EXISTS channel_attachments;")?;
+            set_version(&tx, 34)?;
             tx.commit()?;
         }
 
@@ -3988,14 +4004,8 @@ impl Database {
             "DELETE FROM channel_messages WHERE channel_id = ?1",
             params![channel_id],
         )?;
-        // Attachment bookkeeping and any half-finished handoff go with the
-        // room. Left behind they are unreachable rows keyed to a channel that
-        // no longer exists, and a rejoin would inherit stale "complete" flags
-        // for files whose sealed bytes the caller has since removed.
-        tx.execute(
-            "DELETE FROM channel_attachments WHERE channel_id = ?1",
-            params![channel_id],
-        )?;
+        // Any half-finished handoff goes with the room. Left behind it is an
+        // unreachable row keyed to a channel that no longer exists.
         tx.execute(
             "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
             params![channel_id],
@@ -4499,79 +4509,6 @@ impl Database {
         }
         let _ = self.clear_handoff_pending(old_channel_id);
         Ok(true)
-    }
-
-    pub fn upsert_channel_attachment(
-        &self,
-        channel_id: &str,
-        digest: &str,
-        file_name: &str,
-        file_size: i64,
-        sender_pubkey: &str,
-        complete: bool,
-    ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO channel_attachments
-                (channel_id, digest, file_name, file_size, sender_pubkey, complete, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(channel_id, digest) DO UPDATE SET
-                complete = MAX(complete, excluded.complete),
-                file_name = excluded.file_name",
-            params![
-                channel_id,
-                digest,
-                file_name,
-                file_size,
-                sender_pubkey,
-                if complete { 1 } else { 0 },
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn channel_attachment_complete(&self, channel_id: &str, digest: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let complete: Option<i64> = conn
-            .query_row(
-                "SELECT complete FROM channel_attachments WHERE channel_id = ?1 AND digest = ?2",
-                params![channel_id, digest],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(complete.unwrap_or(0) != 0)
-    }
-
-    pub fn mark_channel_attachment_complete(
-        &self,
-        channel_id: &str,
-        digest: &str,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE channel_attachments SET complete = 1 WHERE channel_id = ?1 AND digest = ?2",
-            params![channel_id, digest],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_channel_attachment(
-        &self,
-        channel_id: &str,
-        digest: &str,
-    ) -> anyhow::Result<Option<(String, i64, String, bool)>> {
-        let conn = self.conn.lock();
-        let row = conn
-            .query_row(
-                "SELECT file_name, file_size, sender_pubkey, complete
-                 FROM channel_attachments WHERE channel_id = ?1 AND digest = ?2",
-                params![channel_id, digest],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
-            )
-            .optional()?;
-        Ok(row)
     }
 
     pub fn upsert_channel_member(

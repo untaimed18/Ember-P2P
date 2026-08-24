@@ -566,17 +566,15 @@ pub async fn leave_channel(
     if !removed {
         return Err(coded("channels_not_found", "Channel not found"));
     }
-    // Sealed attachment bytes are the one thing the DB cannot reach. Best
-    // effort: the rows describing them are already gone, so a failure here
-    // leaves unreferenced files rather than anything the app will act on.
-    let files = channel_files_dir(&channel_id);
-    if let Err(e) = tokio::fs::remove_dir_all(&files).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                channel_id = %channel_id,
-                error = %e,
-                "left a channel but could not remove its stored attachments"
-            );
+    // Transfers belong to the room. Leaving takes the content key with it, so
+    // anything still in flight can neither continue nor be cancelled on the
+    // wire — drop it now rather than leaving the UI a row that only clears
+    // when it eventually times out.
+    if let Ok(bytes) = hex::decode(&channel_id) {
+        if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::DropChannelTransfers { channel_id: id });
         }
     }
     Ok(())
@@ -1985,29 +1983,6 @@ async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<
     }
 }
 
-fn channel_files_dir(channel_id: &str) -> std::path::PathBuf {
-    crate::storage::paths::resolve_data_dir()
-        .join("channel-files")
-        .join(channel_id)
-}
-
-fn write_sealed_channel_file(
-    channel_id: &str,
-    digest_hex: &str,
-    sealed: &[u8],
-) -> Result<std::path::PathBuf, String> {
-    let dir = channel_files_dir(channel_id);
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        coded_ctx("channels_attach_failed", "Could not store the attachment", e)
-    })?;
-    crate::security::restrict_file_permissions(&dir);
-    let path = dir.join(digest_hex);
-    crate::security::atomic_write(&path, sealed, true).map_err(|e| {
-        coded_ctx("channels_attach_failed", "Could not store the attachment", e)
-    })?;
-    Ok(path)
-}
-
 /// Owner starts a transfer: the named member mints a new channel key; the
 /// old key then signs a DHT handoff. The seed is never copied.
 #[tauri::command]
@@ -2101,296 +2076,214 @@ pub async fn transfer_channel_ownership(
     Ok(())
 }
 
-/// Attach a small file to a room. Bytes travel on the channel mesh, never
-/// the friend file-offer path.
+/// The v2 friend code for a room member, so they can be added as a friend.
+///
+/// Channel members and friends are the same identity keyed two ways: a
+/// friend's Ember hash is BLAKE3 of the Ed25519 key the room already shows us.
+/// Deriving it here rather than in the UI keeps one implementation of that
+/// binding, and hands `add_friend` a code whose pubkey it can verify instead
+/// of a bare hash it would have to learn the key for later.
 #[tauri::command]
-pub async fn offer_channel_file(
+pub async fn channel_member_friend_code(
+    _state: tauri::State<'_, AppState>,
+    member_pubkey: String,
+) -> Result<String, String> {
+    let pk = parse_member_pubkey(&member_pubkey)?;
+    let hash = crypto::node_id_from_ed25519_bytes(&pk).ok_or_else(|| {
+        coded("channels_member_invalid", "Invalid member key")
+    })?;
+    Ok(format!("ember2:{}:{}", hex::encode(hash), hex::encode(pk)))
+}
+
+// --- Ember Transfer -------------------------------------------------------
+
+/// Offer a file to one member of a room.
+///
+/// Nothing leaves this machine until they accept. The file is hashed here
+/// rather than in the network task so a 100 MB read never stalls the loop
+/// that is also carrying everyone's chat.
+#[tauri::command]
+pub async fn offer_channel_transfer(
     state: tauri::State<'_, AppState>,
     channel_id: String,
+    member_pubkey: String,
     path: String,
-) -> Result<ChannelMessageInfo, String> {
+) -> Result<String, String> {
     require_ember(&state).await?;
-    if state.db.chat_locked() {
-        return Err(coded(
-            "channels_chat_locked",
-            "Chat history is locked; restore the key file to attach a file",
-        ));
-    }
-    let canonical = std::path::PathBuf::from(&path)
-        .canonicalize()
-        .map_err(|e| coded_ctx("channels_attach_failed", "Cannot open that file", e))?;
-    if !canonical.is_file() {
-        return Err(coded(
-            "channels_attach_failed",
-            "That is not a file",
-        ));
-    }
-    crate::security::filesystem::ensure_not_reparse(&canonical).map_err(|e| {
-        coded_ctx("channels_attach_failed", "Cannot open that file", e)
-    })?;
-    let meta = std::fs::metadata(&canonical).map_err(|e| {
-        coded_ctx("channels_attach_failed", "Cannot open that file", e)
-    })?;
-    if meta.len() == 0 || meta.len() > channel::CHANNEL_FILE_MAX_BYTES as u64 {
-        return Err(coded(
-            "channels_file_too_large",
-            "Attachments must be between 1 byte and 256 KB",
-        ));
-    }
-    let file_name = canonical
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let name = crate::security::sanitize_filename(file_name);
-    if name.is_empty() {
-        return Err(coded(
-            "channels_attach_failed",
-            "That file name is not allowed",
-        ));
-    }
-    let contents = tokio::fs::read(&canonical).await.map_err(|e| {
-        coded_ctx("channels_attach_failed", "Cannot read that file", e)
-    })?;
-    if contents.is_empty() || contents.len() > channel::CHANNEL_FILE_MAX_BYTES {
-        return Err(coded(
-            "channels_file_too_large",
-            "Attachments must be between 1 byte and 256 KB",
-        ));
-    }
     let channel_id = parse_channel_id(&channel_id)?;
+    let peer = parse_member_pubkey(&member_pubkey)?;
+    if peer == state.identity.ed25519_public_key {
+        return Err(coded(
+            "channels_xfer_self",
+            "You cannot send a file to yourself",
+        ));
+    }
+
     let row = load_joined_channel(&state, &channel_id).await?;
-    let sender = hex::encode(state.identity.ed25519_public_key);
-    if self_banned_from(&state, &row, "channels_attach_failed").await? {
+    if self_banned_from(&state, &row, "channels_xfer_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
         ));
     }
-    let Some(join_secret) = join_secret_for_channel(&state, &row).await else {
-        return Err(coded(
-            "channels_attach_failed",
-            "Could not attach the file",
-        ));
-    };
-    let digest = *blake3::hash(&contents).as_bytes();
-    let digest_hex = hex::encode(digest);
-    let mut channel_id_bytes = [0u8; 16];
-    hex::decode_to_slice(&channel_id, &mut channel_id_bytes).map_err(|_| {
-        coded("channels_not_found", "Channel not found")
-    })?;
-    let key = channel::content_key(&join_secret);
-    let sealed = channel::seal_channel_file(&key, &channel_id_bytes, &digest, &contents);
-    write_sealed_channel_file(&channel_id, &digest_hex, &sealed)?;
-    let db = state.db.clone();
-    let attach_id = channel_id.clone();
-    let attach_name = name.clone();
-    let attach_sender = sender.clone();
-    let size = contents.len() as i64;
-    tokio::task::spawn_blocking(move || {
-        db.upsert_channel_attachment(&attach_id, &digest_hex, &attach_name, size, &attach_sender, true)
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_attach_failed", "Could not attach the file", e))?;
-
-    let marker = channel::format_channel_file_message(&digest, contents.len() as u64, &name);
-    let mut msg_id = [0u8; 16];
-    OsRng.fill_bytes(&mut msg_id);
-    let msg_id_hex = hex::encode(msg_id);
-    let sent_at = chrono::Utc::now().timestamp();
+    // The recipient has to be someone the room can currently see, or the
+    // offer has nowhere to go and would sit "offered" until it lapsed.
     let db = state.db.clone();
     let id = channel_id.clone();
-    let sender2 = sender.clone();
-    let text = marker.clone();
-    let row_id = tokio::task::spawn_blocking(move || {
-        db.insert_channel_message(&id, &sender2, "sent", &text, &msg_id_hex, sent_at)
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_attach_failed", "Could not attach the file", e))?;
-    let offer_plain = channel::encode_channel_file_offer(
-        &state.identity.ed25519_public_key,
-        contents.len() as u64,
-        &digest,
-        &name,
-    );
-    enqueue_channel_gossip(&state, &channel_id, join_secret, offer_plain);
-    Ok(ChannelMessageInfo {
-        id: row_id,
-        sender_pubkey: sender,
-        direction: "sent".into(),
-        message: marker,
-        timestamp: sent_at,
-        read: true,
-    })
-}
-
-#[tauri::command]
-pub async fn request_channel_file(
-    state: tauri::State<'_, AppState>,
-    channel_id: String,
-    digest: String,
-) -> Result<(), String> {
-    require_ember(&state).await?;
-    let channel_id = parse_channel_id(&channel_id)?;
-    let row = load_joined_channel(&state, &channel_id).await?;
-    // This originates gossip, so it carries the same ban check as
-    // `offer_channel_file`. Reading an attachment already on disk does not:
-    // a ban stops you taking part, it does not revoke what you received.
-    if self_banned_from(&state, &row, "channels_file_failed").await? {
-        return Err(coded(
-            "channels_banned",
-            "You are banned from this channel",
-        ));
-    }
-    let digest = parse_file_digest(&digest)?;
-    let Some(join_secret) = join_secret_for_channel(&state, &row).await else {
-        return Err(coded(
-            "channels_file_failed",
-            "Could not request the file",
-        ));
-    };
-    let plain = channel::encode_channel_file_want(&state.identity.ed25519_public_key, &digest);
-    enqueue_channel_gossip(&state, &channel_id, join_secret, plain);
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn get_channel_file(
-    state: tauri::State<'_, AppState>,
-    channel_id: String,
-    digest: String,
-) -> Result<ChannelFileBytes, String> {
-    let (file_name, contents) = open_stored_channel_file(&state, channel_id, digest).await?;
-    Ok(ChannelFileBytes {
-        file_name,
-        contents,
-    })
-}
-
-/// Write a completed attachment to a path the user picked in the save dialog.
-/// Never uses the friend file-offer path.
-#[tauri::command]
-pub async fn save_channel_file(
-    state: tauri::State<'_, AppState>,
-    channel_id: String,
-    digest: String,
-    dest: String,
-) -> Result<(), String> {
-    let (suggested_name, contents) =
-        open_stored_channel_file(&state, channel_id, digest).await?;
-    let dest = std::path::PathBuf::from(dest);
-    let file_name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .unwrap_or(&suggested_name);
-    let name = crate::security::sanitize_filename(file_name);
-    if name.is_empty() {
-        return Err(coded(
-            "channels_file_failed",
-            "That file name is not allowed",
-        ));
-    }
-    let parent = dest.parent().ok_or_else(|| {
-        coded("channels_file_failed", "Cannot write to that location")
-    })?;
-    let parent = parent.canonicalize().map_err(|e| {
-        coded_ctx("channels_file_failed", "Cannot write to that location", e)
-    })?;
-    crate::security::filesystem::ensure_not_reparse(&parent).map_err(|e| {
-        coded_ctx("channels_file_failed", "Cannot write to that location", e)
-    })?;
-    let target = parent.join(&name);
-    if target.exists() {
-        crate::security::filesystem::ensure_not_reparse(&target).map_err(|e| {
-            coded_ctx("channels_file_failed", "Cannot write to that location", e)
-        })?;
-    }
-    crate::security::atomic_write(&target, &contents, false).map_err(|e| {
-        coded_ctx("channels_file_failed", "Could not save the attachment", e)
-    })?;
-    Ok(())
-}
-
-async fn open_stored_channel_file(
-    state: &AppState,
-    channel_id: String,
-    digest: String,
-) -> Result<(String, Vec<u8>), String> {
-    require_ember(state).await?;
-    if state.db.chat_locked() {
-        return Err(coded(
-            "channels_chat_locked",
-            "Chat history is locked; restore the key file to open attachments",
-        ));
-    }
-    let channel_id = parse_channel_id(&channel_id)?;
-    let row = load_joined_channel(state, &channel_id).await?;
-    let digest = parse_file_digest(&digest)?;
-    let digest_hex = hex::encode(digest);
-    let db = state.db.clone();
-    let id = channel_id.clone();
-    let meta = tokio::task::spawn_blocking(move || db.get_channel_attachment(&id, &digest_hex))
+    let peer_hex = hex::encode(peer);
+    let known = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_file_failed", "Could not load the file", e))?
-        .ok_or_else(|| coded("channels_file_failed", "File is not available yet"))?;
-    if !meta.3 {
+        .map_err(|e| coded_ctx("channels_xfer_failed", "Could not check the member list", e))?
+        .into_iter()
+        .any(|m| m.member_pubkey.eq_ignore_ascii_case(&peer_hex) && !m.banned);
+    if !known {
         return Err(coded(
-            "channels_file_failed",
-            "File is not available yet",
+            "channels_xfer_no_member",
+            "That member is not in this channel",
         ));
     }
-    // Candidates, not the current key: this file was sealed under whichever
-    // epoch was live when it arrived, which a later ban has since replaced.
-    let secrets = join_secrets_for_channel(state, &row).await;
-    if secrets.is_empty() {
-        return Err(coded(
-            "channels_file_failed",
-            "Could not load the file",
+
+    let canonical = std::path::PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+    if !canonical.is_file() {
+        return Err(coded("channels_xfer_failed", "That is not a file"));
+    }
+    crate::security::filesystem::ensure_not_reparse(&canonical)
+        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+    if meta.len() == 0 || meta.len() > channel::XFER_MAX_BYTES {
+        return Err(coded_ctx(
+            "channels_xfer_too_large",
+            "Files must be between 1 byte and 100 MB",
+            channel::XFER_MAX_BYTES,
         ));
     }
-    let mut channel_id_bytes = [0u8; 16];
-    hex::decode_to_slice(&channel_id, &mut channel_id_bytes).map_err(|_| {
-        coded("channels_not_found", "Channel not found")
-    })?;
-    let path = channel_files_dir(&channel_id).join(hex::encode(digest));
-    let sealed = tokio::fs::read(&path).await.map_err(|_| {
-        coded("channels_file_failed", "File is not available yet")
-    })?;
-    let plain = secrets
-        .iter()
-        .find_map(|secret| {
-            channel::open_channel_file(
-                &channel::content_key(secret),
-                &channel_id_bytes,
-                &digest,
-                &sealed,
-            )
+    let name = crate::security::sanitize_filename(
+        canonical
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file"),
+    );
+    if name.is_empty() {
+        return Err(coded(
+            "channels_xfer_failed",
+            "That file name is not allowed",
+        ));
+    }
+
+    // The same hash tree the dormant Ember transfer module defines, so the
+    // identifier here is the Ember file hash rather than a one-off digest.
+    let hash_path = canonical.clone();
+    let tree = tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&hash_path).and_then(|f| {
+            crate::network::ember::transfer::HashTree::from_reader(std::io::BufReader::new(f))
         })
-        .ok_or_else(|| coded("channels_file_failed", "Could not decrypt the attachment"))?;
-    if *blake3::hash(&plain).as_bytes() != digest {
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_xfer_failed", "Could not read that file", e))?;
+    if tree.file_size != meta.len() {
         return Err(coded(
-            "channels_file_failed",
-            "Attachment failed integrity check",
+            "channels_xfer_failed",
+            "That file changed while it was being prepared",
         ));
     }
-    Ok((meta.0, plain))
+
+    let mut channel_id_bytes = [0u8; 16];
+    hex::decode_to_slice(&channel_id, &mut channel_id_bytes)
+        .map_err(|_| coded("channels_not_found", "Channel not found"))?;
+    let mut xfer_id = [0u8; 16];
+    OsRng.fill_bytes(&mut xfer_id);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::OfferChannelTransfer {
+            channel_id: channel_id_bytes,
+            peer,
+            xfer_id,
+            path: canonical,
+            name,
+            size: meta.len(),
+            root: tree.root_hash,
+            tx,
+        })
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
+    Ok(hex::encode(xfer_id))
 }
 
-#[derive(serde::Serialize)]
-pub struct ChannelFileBytes {
-    pub file_name: String,
-    pub contents: Vec<u8>,
+/// Accept or decline an offer someone made you.
+#[tauri::command]
+pub async fn respond_channel_transfer(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+    accept: bool,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let download_folder = {
+        let config = state.config.read().await;
+        std::path::PathBuf::from(&config.settings.download_folder)
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::RespondChannelTransfer {
+            xfer_id,
+            accept,
+            download_folder,
+            tx,
+        })
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
+    Ok(())
 }
 
-fn parse_file_digest(hex_str: &str) -> Result<[u8; 32], String> {
+/// Stop a transfer in either direction, and tell the other end.
+#[tauri::command]
+pub async fn cancel_channel_transfer(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::CancelChannelTransfer { xfer_id, tx })
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
+    Ok(())
+}
+
+/// Everything currently offered, awaiting an answer, or moving.
+#[tauri::command]
+pub async fn list_channel_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::network::ChannelTransferSnapshot>, String> {
+    if !state.config.read().await.settings.ember_native_enabled {
+        return Ok(Vec::new());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state
+        .network_tx
+        .try_send(NetworkCommand::ListChannelTransfers { tx })
+        .is_err()
+    {
+        return Ok(Vec::new());
+    }
+    Ok(rx.await.unwrap_or_default())
+}
+
+fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
-    let bytes = hex::decode(&canonical).map_err(|_| {
-        coded("channels_file_failed", "Invalid file id")
-    })?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        coded("channels_file_failed", "Invalid file id")
-    })
+    let bytes = hex::decode(&canonical)
+        .map_err(|_| coded("channels_xfer_not_found", "Invalid transfer id"))?;
+    <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| coded("channels_xfer_not_found", "Invalid transfer id"))
 }
+

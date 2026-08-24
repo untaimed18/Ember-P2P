@@ -172,25 +172,61 @@ export async function claimChannelOwnership(channelId: string): Promise<ChannelI
   return invoke('claim_channel_ownership', { channelId });
 }
 
-export async function offerChannelFile(channelId: string, path: string): Promise<ChannelMessageInfo> {
-  return invoke('offer_channel_file', { channelId, path });
+/** `ember2:<hash>:<pubkey>` for a room member, ready to hand to `addFriend`.
+ *  The hash is derived from the member's Ed25519 key on the backend, which is
+ *  the one place that binding is implemented. */
+export async function channelMemberFriendCode(memberPubkey: string): Promise<string> {
+  return invoke('channel_member_friend_code', { memberPubkey });
 }
 
-export async function requestChannelFile(channelId: string, digest: string): Promise<void> {
-  return invoke('request_channel_file', { channelId, digest });
+/** Direction and stage of one Ember Transfer. `awaiting` is an offer sitting
+ *  in front of the user; `offered` is one we sent and nobody has answered. */
+export type ChannelTransferStatus =
+  | 'offered'
+  | 'awaiting'
+  | 'accepted'
+  | 'active'
+  | 'complete'
+  | 'declined'
+  | 'cancelled'
+  | 'stalled'
+  | 'expired'
+  | 'failed'
+  | 'busy'
+  | 'too_large'
+  | 'not_allowed'
+  | 'source_gone';
+
+export interface ChannelTransferInfo {
+  xfer_id: string;
+  channel_id: string;
+  peer_pubkey: string;
+  direction: 'send' | 'receive';
+  name: string;
+  size: number;
+  transferred: number;
+  status: ChannelTransferStatus;
 }
 
-export async function getChannelFile(
+/** Offer one file to one member. Returns the transfer id. Nothing is sent
+ *  until they accept. */
+export async function offerChannelTransfer(
   channelId: string,
-  digest: string,
-): Promise<{ file_name: string; contents: number[] }> {
-  return invoke('get_channel_file', { channelId, digest });
+  memberPubkey: string,
+  path: string,
+): Promise<string> {
+  return invoke('offer_channel_transfer', { channelId, memberPubkey, path });
 }
 
-export async function saveChannelFile(
-  channelId: string,
-  digest: string,
-  dest: string,
-): Promise<void> {
-  return invoke('save_channel_file', { channelId, digest, dest });
+export async function respondChannelTransfer(xferId: string, accept: boolean): Promise<void> {
+  return invoke('respond_channel_transfer', { xferId, accept });
 }
+
+export async function cancelChannelTransfer(xferId: string): Promise<void> {
+  return invoke('cancel_channel_transfer', { xferId });
+}
+
+export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
+  return invoke('list_channel_transfers');
+}
+

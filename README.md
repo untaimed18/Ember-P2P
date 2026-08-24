@@ -74,7 +74,7 @@ Shared files are published as keyword records (findable by name) and source reco
 
 ### Current limits
 
-- **Content still moves over eD2K.** [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) holds a 256 KiB chunk protocol and a BLAKE3 hash tree, but nothing imports it yet. Ember discovers the source; the bytes travel the eMule wire. Wiring it up is the largest remaining piece toward a network that does not need the eMule wire at all.
+- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 100 MB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
 - **Bootstrap depends on eMule** — as described above; seed lists are deliberately not planned.
 - **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
