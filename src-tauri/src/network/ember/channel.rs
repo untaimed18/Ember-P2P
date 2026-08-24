@@ -480,7 +480,7 @@ pub fn xor_closest_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize
             (*pk, self_id.distance(&id))
         })
         .collect();
-    ranked.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+    ranked.sort_by_key(|a| a.1 .0);
     ranked.truncate(k);
     ranked.into_iter().map(|(pk, _)| pk).collect()
 }
@@ -2144,7 +2144,7 @@ mod tests {
                 expected.as_bytes(),
                 CHANNEL_MSG_TTL_DEFAULT,
             );
-            let mut delivered = vec![0u8; N];
+            let mut delivered = [0u8; N];
             let mut q = VecDeque::new();
             {
                 let (map, order) = &mut seen[origin];

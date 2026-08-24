@@ -2262,7 +2262,7 @@ mod tests {
         let r = cm.get_ember_record(&pk).unwrap();
         assert_eq!(r.total_sessions, 1);
         assert_eq!(r.completed_sessions, 1);
-        let expected = (1_048_576u64 as f64 / 10.0).round() as u64;
+        let expected = (1_048_576_f64 / 10.0).round() as u64;
         assert_eq!(
             r.avg_upload_speed, expected,
             "first sample must seed EWMA without prior-zero mixing"

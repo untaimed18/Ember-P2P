@@ -3448,7 +3448,7 @@ mod tests {
         }
 
         assert!(
-            sm.sources.get(&hash).map_or(true, |e| e.is_empty()),
+            sm.sources.get(&hash).is_none_or(|e| e.is_empty()),
             "a zero LowID must never be tracked, however many times it is offered"
         );
     }

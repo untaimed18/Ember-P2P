@@ -824,7 +824,7 @@ mod tests {
                 ip: Ipv4Addr::new(90, 1, 1, 2),
                 tcp_port: 4662,
             }],
-            &[attestation.clone()],
+            std::slice::from_ref(&attestation),
         );
 
         let parsed = parse_exchange_payload(&udp).expect("a truncated build must still parse");
@@ -893,7 +893,7 @@ mod tests {
     fn relay_attestation_round_trip_and_verifies() {
         let now: u64 = 1_700_000_000;
         let att = make_attestation(now + 600);
-        let payload = build_exchange_payload_with_relay_attestations(&[], &[], &[att.clone()]);
+        let payload = build_exchange_payload_with_relay_attestations(&[], &[], std::slice::from_ref(&att));
         let result = parse_exchange_payload(&payload).unwrap();
         assert_eq!(result.relay_attestations, vec![att.clone()]);
         assert!(verify_relay_attestation(&att, now));

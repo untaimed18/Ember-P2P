@@ -44,20 +44,17 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const NAT_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum NatType {
     Open,
     FullCone,
     RestrictedCone,
     PortRestricted,
     Symmetric,
+    #[default]
     Unknown,
 }
 
-impl Default for NatType {
-    fn default() -> Self {
-        NatType::Unknown
-    }
-}
 
 impl NatType {
     /// Whether a hole-punch between two NAT types is likely to succeed.
@@ -487,11 +484,10 @@ pub(crate) fn parse_binding_response(
                     xor_mapped = parse_xor_mapped_address(attr_data);
                 }
             }
-            ATTR_MAPPED_ADDRESS => {
-                if mapped.is_none() {
+            ATTR_MAPPED_ADDRESS
+                if mapped.is_none() => {
                     mapped = parse_mapped_address(attr_data);
                 }
-            }
             _ => {}
         }
 

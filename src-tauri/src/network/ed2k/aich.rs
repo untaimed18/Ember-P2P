@@ -153,7 +153,7 @@ pub(crate) fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8;
         return all_leaves[0];
     }
 
-    let num_parts = ((file_size as u64 + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize;
+    let num_parts = ((file_size + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize;
     if num_parts <= 1 {
         return build_tree_recursive(all_leaves, true);
     }
@@ -978,7 +978,7 @@ mod tests {
     fn corrupt_blocks_from_aich_recovery_roundtrip() {
         let data = vec![0x42u8; AICH_BLOCK_SIZE * 2];
         let trusted = AICHRecoveryHashSet::build_from_data(&data);
-        let recovery = trusted.create_part_recovery_data(0, PARTSIZE as usize);
+        let recovery = trusted.create_part_recovery_data(0, PARTSIZE);
         let mut bad = data.clone();
         bad[AICH_BLOCK_SIZE + 10] ^= 0xFF;
         let corrupt = corrupt_blocks_from_aich_recovery(

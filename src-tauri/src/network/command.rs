@@ -5224,7 +5224,7 @@ async fn handle_command_inner(
 
                     let part_path = crate::security::filesystem::verify_existing_path(
                         &part_path,
-                        &[download_folder.clone()],
+                        std::slice::from_ref(&download_folder),
                     )
                     .map_err(|e| format!("Invalid or changed part-file path: {e}"))?;
                     let file_name_for_preview = file_name.clone();
@@ -6097,10 +6097,8 @@ async fn handle_command_inner(
                     "FindFriendAndConnect: {} already online/connected, skipping",
                     hex::encode(target_hash),
                 );
-            } else if !state.outbound_session_tasks.contains_key(&target_hash) {
-                state
-                    .outbound_session_tasks
-                    .insert(target_hash, std::time::Instant::now());
+            } else if let std::collections::hash_map::Entry::Vacant(e) = state.outbound_session_tasks.entry(target_hash) {
+                e.insert(std::time::Instant::now());
                 let _ = app_handle.emit(
                     "ember:friend-searching",
                     serde_json::json!({

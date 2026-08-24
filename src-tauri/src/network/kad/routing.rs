@@ -977,7 +977,7 @@ fn apply_existing_contact_update(
         existing.verified = true;
     }
     if contact.udp_key.is_some() {
-        existing.udp_key = contact.udp_key.clone();
+        existing.udp_key = contact.udp_key;
     }
     existing.kad_options = contact.kad_options;
     if contact.received_hello {

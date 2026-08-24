@@ -1389,7 +1389,7 @@ pub fn sanitize_filename(name: &str) -> String {
             Component::Normal(s) => s.to_str(),
             _ => None,
         })
-        .last()
+        .next_back()
         .unwrap_or("unnamed_file");
 
     let safe = safe_name

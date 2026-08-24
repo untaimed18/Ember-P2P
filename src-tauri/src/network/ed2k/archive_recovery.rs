@@ -798,7 +798,7 @@ fn recover_rar(
     let is_new_format = if filled.first().map(|r| r.0).unwrap_or(0) == 0 {
         input.seek(SeekFrom::Start(0))?;
         if input.read_exact(&mut sig_buf).is_ok() {
-            &sig_buf == RAR_SIGNATURE_NEW
+            sig_buf == RAR_SIGNATURE_NEW
         } else {
             true
         }

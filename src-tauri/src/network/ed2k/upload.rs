@@ -7594,11 +7594,11 @@ impl UploadHandler {
                                 is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
-                            let rank_val = compute_queue_rank(
+                            
+                            compute_queue_rank(
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, queue[pos].join_time,
-                            );
-                            rank_val
+                            )
                         } else if queue
                             .iter()
                             .filter(|e| {
@@ -7751,11 +7751,11 @@ impl UploadHandler {
                                 is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
-                            let rank_val = compute_queue_rank(
+                            
+                            compute_queue_rank(
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, join_time,
-                            );
-                            rank_val
+                            )
                         };
                         drop(queue);
                         drop(idx_snap);
@@ -7975,11 +7975,7 @@ impl UploadHandler {
                             if end > total_size {
                                 debug!("Peer requested range past file end: {end} > {total_size}");
                                 false
-                            } else if start >= end {
-                                false
-                            } else {
-                                true
-                            }
+                            } else { start < end }
                         })
                         .collect();
 
@@ -10393,12 +10389,12 @@ impl UploadHandler {
                                         stale.close();
                                         sessions.remove(&eh);
                                     }
-                                    if !sessions.contains_key(&eh) {
+                                    if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(eh) {
                                         let handle =
                                             EmberSessionHandle::new(outbound_tx.clone(), pk);
                                         ember_shutdown_rx = Some(handle.subscribe_shutdown());
                                         ember_session_handle = Some(handle.clone());
-                                        sessions.insert(eh, handle);
+                                        e.insert(handle);
                                         owns_ember_slot = true;
                                     }
                                 }

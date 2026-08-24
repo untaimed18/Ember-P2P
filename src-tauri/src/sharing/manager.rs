@@ -558,7 +558,7 @@ impl TransferManager {
             let history = self
                 .speed_history
                 .entry(id.to_string())
-                .or_insert_with(VecDeque::new);
+                .or_default();
 
             history.push_back((transferred, now));
 
@@ -1558,9 +1558,7 @@ mod tests {
 
         // `retrying_after` is the only variant `compute_health_state` cannot
         // reach: only the network loop knows a retry is in progress.
-        assert!(TransferHealthCode::ALL
-            .iter()
-            .any(|c| *c == TransferHealthCode::RetryingAfter));
+        assert!(TransferHealthCode::ALL.contains(&TransferHealthCode::RetryingAfter));
     }
 
     /// The row the UI renders must never carry one half of the pair: English

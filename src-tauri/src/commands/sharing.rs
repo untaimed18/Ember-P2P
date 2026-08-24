@@ -2670,7 +2670,7 @@ pub async fn set_file_priority(
         // path while it was still hashing, or a later rehash would revert the
         // user's choice. Best-effort: a stale entry is also swept by the
         // post-scan prune.
-        if let Err(e) = persist_pending_intents(&state, &[], &[], &[], &[file_path.clone()]).await {
+        if let Err(e) = persist_pending_intents(&state, &[], &[], &[], std::slice::from_ref(&file_path)).await {
             warn!("Failed to clear pending priority intent for {file_path}: {e}");
         }
     } else {

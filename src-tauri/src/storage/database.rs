@@ -5673,9 +5673,8 @@ mod tests {
 
         // `Ok(false)`, not an error: the caller has to tell a block from a
         // genuine save failure so it can name the reason the user must act on.
-        assert_eq!(
-            db.add_friend("11", "Mallory", None).expect("no db error"),
-            false,
+        assert!(
+            !db.add_friend("11", "Mallory", None).expect("no db error"),
             "a blocked identity must be refused, not written"
         );
         assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);

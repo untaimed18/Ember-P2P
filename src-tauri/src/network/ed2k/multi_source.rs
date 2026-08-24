@@ -1363,7 +1363,7 @@ where
                 ));
             }
             Err(_) => {
-                return InSessionRequeueResult::Timeout(format!("read timeout during re-queue"));
+                return InSessionRequeueResult::Timeout("read timeout during re-queue".to_string());
             }
         };
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -7436,11 +7436,7 @@ async fn download_parts_from_source(
                     .map(|&(gs, ge)| {
                         let s = gs.max(ps);
                         let e = ge.min(pe);
-                        if s < e {
-                            e - s
-                        } else {
-                            0
-                        }
+                        e.saturating_sub(s)
                     })
                     .sum()
             };
@@ -7754,11 +7750,11 @@ async fn download_parts_from_source(
                             // Tag the error so `classify_error` can surface
                             // it distinctly in the UI and so the log grep
                             // is easy.
-                            return Err(anyhow::Error::from(e).context(
+                            return Err(e.context(
                             "stage:peer_dropped_after_accept peer FINed after OP_REQUESTPARTS with 0 bytes received",
                         ));
                         }
-                        return Err(e.into());
+                        return Err(e);
                     }
                     Err(()) => {
                         if outstanding_ranges.is_empty() && sent_idx >= batches.len() {
@@ -9014,11 +9010,7 @@ async fn download_parts_from_source(
                     .map(|&(gs, ge)| {
                         let s = gs.max(ps);
                         let e = ge.min(pe);
-                        if s < e {
-                            e - s
-                        } else {
-                            0
-                        }
+                        e.saturating_sub(s)
                     })
                     .sum()
             };
@@ -10696,7 +10688,7 @@ where
             }
             None => out.push(0),
         }
-        ember_trailer.extend_from_slice(&ember.map(|digest| *digest).unwrap_or([0u8; 32]));
+        ember_trailer.extend_from_slice(&ember.copied().unwrap_or([0u8; 32]));
         count += 1;
     }
     out[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());

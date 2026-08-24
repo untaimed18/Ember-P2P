@@ -828,9 +828,7 @@ fn matching_active_transfer_ids_for_hash(
     file_hash_hex: &str,
 ) -> Vec<String> {
     state
-        .active_source_senders
-        .iter()
-        .filter_map(|(tid, _)| {
+        .active_source_senders.keys().filter_map(|tid| {
             transfer_manager
                 .get_transfer(tid)
                 .filter(|transfer| transfer.file_hash == file_hash_hex)
@@ -4544,7 +4542,7 @@ mod friend_transfer_tests {
             relay_offer_digest(&[b.clone(), a.clone()], now)
         );
         assert_ne!(
-            relay_offer_digest(&[a.clone()], now),
+            relay_offer_digest(std::slice::from_ref(&a), now),
             relay_offer_digest(&[a, b], now)
         );
     }
@@ -5907,8 +5905,8 @@ async fn process_inbound_friend_request(
                 debug!("Revoked auto-confirm for {} — blocked mid-flight", hash_hex);
                 return;
             }
-            if !online_friends.contains_key(&req_hash) {
-                online_friends.insert(req_hash, chrono::Utc::now().timestamp());
+            if let std::collections::hash_map::Entry::Vacant(e) = online_friends.entry(req_hash) {
+                e.insert(chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(
                     "ember:friend-online",
                     serde_json::json!({
@@ -15851,14 +15849,14 @@ fn hydrate_ember_publish_schedule(
             if age < EMBER_SOURCE_RECORD_TTL.as_secs() {
                 published_sources.insert(record.file_hash);
             }
-            if !source_dest.contains_key(&record.file_hash) {
+            if let std::collections::hash_map::Entry::Vacant(e) = source_dest.entry(record.file_hash) {
                 if let Some(at) = ember_publish_instant(
                     record.last_ember_source_publish,
                     now_unix,
                     now_inst,
                     EMBER_SOURCE_REPUBLISH,
                 ) {
-                    source_dest.insert(record.file_hash, at);
+                    e.insert(at);
                 }
             }
         }
@@ -15866,14 +15864,14 @@ fn hydrate_ember_publish_schedule(
             keyword_unix
                 .entry(record.file_hash)
                 .or_insert(record.last_ember_keyword_publish);
-            if !keyword_dest.contains_key(&record.file_hash) {
+            if let std::collections::hash_map::Entry::Vacant(e) = keyword_dest.entry(record.file_hash) {
                 if let Some(at) = ember_publish_instant(
                     record.last_ember_keyword_publish,
                     now_unix,
                     now_inst,
                     EMBER_KEYWORD_REPUBLISH,
                 ) {
-                    keyword_dest.insert(record.file_hash, at);
+                    e.insert(at);
                 }
             }
         }
@@ -23154,7 +23152,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     let mut fh = [0u8; 16];
                                     fh.copy_from_slice(&fh_bytes);
                                     if let Ok(mut map) = state.aich_recovery_pending.write() {
-                                        map.retain(|&(ref h, _), _| *h != fh);
+                                        map.retain(|(h, _), _| *h != fh);
                                     }
                                 }
                             }
@@ -24977,13 +24975,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ember_hash,
                         ip,
                         port,
-                    } => {
+                    }
                         // Gate on current membership: FriendSeen fires post-PoP for a
                         // peer that was a friend at emit time, but a concurrent
                         // removal can still race it. Without this a just-removed
                         // friend could be resurrected as "online" in the UI until the
                         // 5-minute sweep.
-                        if friend_hashes.read().await.contains(ember_hash) {
+                        if friend_hashes.read().await.contains(ember_hash) => {
                             let hash_hex = hex::encode(ember_hash);
                             let now = chrono::Utc::now().timestamp();
                             state.online_friends.insert(*ember_hash, now);
@@ -25042,7 +25040,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             )
                             .await;
                         }
-                    }
                     _ => {}
                 }
 
@@ -26916,7 +26913,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         buddy_ip,
                                         buddy_port_raw,
                                         buddy_hash,
-                                        fh.clone(),
+                                        fh,
                                     ).await {
                                         if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                                             pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
@@ -33014,7 +33011,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     {
                         let mgr = transfer_manager.read().await;
                         let sm = source_manager.read().await;
-                        for (tid, _sender) in &state.active_source_senders {
+                        for tid in state.active_source_senders.keys() {
                             if state.pending_downloads.contains_key(tid) { continue; }
                             let (last_at, count) = state.active_kad_search_state
                                 .get(tid)
@@ -33421,7 +33418,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .map(|pfs| pfs.file_hash)
                         .collect();
                     let mut a4af = a4af_shared.write().await;
-                    for (_tid, pfs) in &state.per_file_sources {
+                    for pfs in state.per_file_sources.values() {
                         for src in &pfs.sources {
                             if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
                                 let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
@@ -39214,7 +39211,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 {
                     let mgr = transfer_manager.read().await;
                     let mut seen: std::collections::HashSet<[u8; 16]> = all_for_udp.iter().map(|(fh, _)| *fh).collect();
-                    for (tid, _sender) in &state.active_source_senders {
+                    for tid in state.active_source_senders.keys() {
                         if let Some(transfer) = mgr.get_transfer(tid) {
                             if let Ok(hash_bytes) = hex::decode(&transfer.file_hash) {
                                 if hash_bytes.len() == 16 {
@@ -39290,7 +39287,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let mgr = transfer_manager.read().await;
                     let sm = source_manager.read().await;
                     let seen: std::collections::HashSet<String> = all_downloads.iter().map(|(t, _, _, _)| t.clone()).collect();
-                    for (tid, _sender) in &state.active_source_senders {
+                    for tid in state.active_source_senders.keys() {
                         if seen.contains(tid) { continue; }
                         if let Some(transfer) = mgr.get_transfer(tid) {
                             if let Ok(raw) = hex::decode(&transfer.file_hash) {
@@ -45856,7 +45853,7 @@ async fn handle_udp_packet_inner(
                                     file.size,
                                     vec![
                                         true;
-                                        ed2k::messages::ed2k_wire_part_count(file.size) as usize
+                                        ed2k::messages::ed2k_wire_part_count(file.size)
                                     ],
                                 )
                             })
@@ -48513,7 +48510,7 @@ async fn handle_udp_packet_inner(
                 };
                 let allow_obfuscation = settings.obfuscation_enabled;
                 let mut mgr_clone = BuddyManager::new(
-                    state.buddy_manager.local_id().clone(),
+                    *state.buddy_manager.local_id(),
                     state.user_hash,
                     settings.nickname.clone(),
                     advertised_tcp_port(state),
@@ -48521,7 +48518,7 @@ async fn handle_udp_packet_inner(
                     state.pending_buddy_hashes.clone(),
                 );
                 state.pending_outgoing_buddy = Some(tokio::spawn(async move {
-                    match mgr_clone
+                    mgr_clone
                         .handle_findbuddy_response(
                             buddy_id,
                             buddy_ip,
@@ -48530,13 +48527,7 @@ async fn handle_udp_packet_inner(
                             connect_options,
                             allow_obfuscation,
                         )
-                        .await
-                    {
-                        Some((rx, writer, reader_handle)) => {
-                            Some((buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
-                        }
-                        None => None,
-                    }
+                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
                 }));
             }
         }
@@ -49420,14 +49411,16 @@ async fn handle_upload_event(
             // Cumulative byte totals live in `StatsManager`, not in the
             // per-session `Transfer`, so dropping the row loses no
             // historical data.
-            let promoted = match {
+            // Bound so the write guard is released before anything below it
+            // runs, rather than living as long as the `match` it scrutinises.
+            let completed = {
                 let mut mgr = transfer_manager.write().await;
                 let promoted = mgr.complete(&event.transfer_id);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
-            } {
-                Some(promoted) => promoted,
-                None => return,
+            };
+            let Some(promoted) = completed else {
+                return;
             };
             // Only count Statistics "Completed Uploads" when this peer
             // received the entire file — matching hash-verified download
@@ -49464,14 +49457,16 @@ async fn handle_upload_event(
             // `failure_reason` or upload history.
             let upload_failure =
                 ed2k::transfer::classify_failure(&error, &ed2k::transfer::classify_error(&error));
-            let promoted = match {
+            // Same as the Completed arm: bind the block so the write guard
+            // does not outlive it.
+            let failed = {
                 let mut mgr = transfer_manager.write().await;
                 let promoted = mgr.fail(&event.transfer_id, upload_failure, None, None);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
-            } {
-                Some(promoted) => promoted,
-                None => return,
+            };
+            let Some(promoted) = failed else {
+                return;
             };
             for t in &promoted {
                 info!(

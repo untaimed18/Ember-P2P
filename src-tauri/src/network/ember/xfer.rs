@@ -509,7 +509,7 @@ mod tests {
             .write_block(XFER_BLOCK_SIZE as u64, &vec![2u8; XFER_BLOCK_SIZE])
             .unwrap());
         assert!(recv
-            .write_block(XFER_BLOCK_SIZE as u64, &vec![2u8; 10])
+            .write_block(XFER_BLOCK_SIZE as u64, &[2u8; 10])
             .unwrap());
         assert!(recv.is_complete());
     }

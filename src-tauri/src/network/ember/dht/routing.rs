@@ -1149,10 +1149,7 @@ impl RoutingTable {
     /// only `contacts` reported almost every remembered target as gone, which is not
     /// what "gone" is supposed to mean here.
     pub fn get_contact(&self, node_id: &EmberNodeId) -> Option<&EmberContact> {
-        let bucket_idx = match self.local_id.bucket_index(node_id) {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let bucket_idx = self.local_id.bucket_index(node_id)?;
         if bucket_idx >= ID_BITS {
             return None;
         }

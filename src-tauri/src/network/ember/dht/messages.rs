@@ -2066,7 +2066,7 @@ mod tests {
         // verified or dialed; decode must drop it rather than admit a contact
         // under an unverifiable identity.
         let good = test_contact(21, "9.9.9.9:1111", 0x01);
-        let mut encoded = encode_contact_list(&[good.clone()]);
+        let mut encoded = encode_contact_list(std::slice::from_ref(&good));
         // Append a second hand-rolled contact with the invalid key.
         encoded[0] = 2; // bump declared count
         encoded.push(ADDR_IPV4);

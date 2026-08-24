@@ -434,9 +434,9 @@ impl PublishManager {
         // from hash-map iteration order, silently starving some files of
         // ever being advertised under a popular keyword. Sorting by file
         // hash gives a stable, repeatable selection.
-        let mut file_hashes: Vec<KadId> = match self.keyword_index.get(&keyword_hash) {
-            Some(hashes) => hashes.iter().copied().collect(),
-            None => return None,
+        let mut file_hashes: Vec<KadId> = {
+            let hashes = self.keyword_index.get(&keyword_hash)?;
+            hashes.iter().copied().collect()
         };
         file_hashes.sort();
 

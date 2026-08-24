@@ -906,7 +906,7 @@ impl DhtStore {
             republish_due: false,
         };
 
-        let records = self.entries.entry(key).or_insert_with(Vec::new);
+        let records = self.entries.entry(key).or_default();
 
         // Deduplicate on (publisher, file), not on publisher alone. A keyword
         // key legitimately holds one record per file a publisher shares under
