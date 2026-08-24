@@ -19,6 +19,7 @@ import {
   parseArtifactPaths,
 } from "./harden-update-manifest.mjs";
 import {
+  verifyEmberDhtVersion,
   verifyReleasePolicy,
   verifySecurityEpoch,
   verifyVersions,
@@ -37,6 +38,8 @@ const policyFiles = [
   "src-tauri/Cargo.lock",
   ".github/workflows/release.yml",
   "src-tauri/src/commands/updater.rs",
+  "src-tauri/src/network/ember/dht/mod.rs",
+  "docs/index.html",
 ];
 
 function policyFixture() {
@@ -131,6 +134,157 @@ test("security epoch stays aligned between workflow and updater", () => {
     assert.throws(
       () => verifySecurityEpoch({ root: fixture }),
       /security epoch mismatch/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+const articleId = `release-${packageVersion.split(".").join("-")}`;
+
+function notesArticle(bullets) {
+  return `
+    <article class="release" id="${articleId}">
+      <div class="release-notes">
+        <h4>What&rsquo;s New</h4>
+        <ul>${bullets.map((text) => `<li>${text}</li>`).join("")}</ul>
+      </div>
+    </article>`;
+}
+
+/**
+ * A policy fixture whose `v1.0.0` tag speaks Ember DHT `previous` while the
+ * working tree speaks `current`, with the declared version's release notes
+ * replaced by `bullets` (or removed entirely when it is `null`).
+ *
+ * Owning both sides matters: the real checkout only ever exhibits one of these
+ * situations at a time, and the interesting one — a bump whose notes forgot to
+ * mention it — is by definition not a state the repository should be left in.
+ */
+function emberDhtFixture({ previous, current, bullets = null }) {
+  const fixture = policyFixture();
+  const dhtPath = join(fixture, "src-tauri/src/network/ember/dht/mod.rs");
+  const setWireVersion = (value) =>
+    writeFileSync(
+      dhtPath,
+      readFileSync(dhtPath, "utf8").replace(
+        /pub const EMBER_DHT_VERSION:\s*u8\s*=\s*\d+\s*;/,
+        `pub const EMBER_DHT_VERSION: u8 = ${value};`,
+      ),
+    );
+
+  const docsPath = join(fixture, "docs/index.html");
+  const stripped = readFileSync(docsPath, "utf8").replace(
+    new RegExp(`<article\\b[^>]*id="${articleId}"[\\s\\S]*?</article>`, "i"),
+    "",
+  );
+  writeFileSync(docsPath, bullets ? stripped + notesArticle(bullets) : stripped);
+
+  setWireVersion(previous);
+  const git = (...args) =>
+    execFileSync("git", args, { cwd: fixture, stdio: "ignore" });
+  git("init", "--quiet");
+  git("add", "--all");
+  git(
+    "-c",
+    "user.email=tests@ember.invalid",
+    "-c",
+    "user.name=Ember policy tests",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--quiet",
+    "--message",
+    "ember dht fixture",
+  );
+  git("tag", "v1.0.0");
+  setWireVersion(current);
+  return fixture;
+}
+
+test("an Ember DHT wire bump has to be stated in the release notes", () => {
+  const fixture = emberDhtFixture({
+    previous: 2,
+    current: 3,
+    bullets: [
+      "<strong>Transfers.</strong> Failure reasons are translated rather than shown as backend English",
+      "<strong>Search.</strong> A wedged diagnostics poll no longer disables the Search button",
+    ],
+  });
+  try {
+    assert.throws(
+      () => verifyEmberDhtVersion({ root: fixture }),
+      /wire version went from 2 .* to 3, but the .* notes .* never say so/s,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("notes that state the new wire version satisfy the check", () => {
+  const fixture = emberDhtFixture({
+    previous: 2,
+    current: 3,
+    bullets: [
+      "<strong>Ember DHT version 3.</strong> The wire format changed, so this build and older ones will not see each other on the overlay until both sides update",
+      "<strong>Search.</strong> A wedged diagnostics poll no longer disables the Search button",
+    ],
+  });
+  try {
+    assert.deepEqual(verifyEmberDhtVersion({ root: fixture }), {
+      wireVersion: 3,
+      previousWireVersion: 2,
+      checked: true,
+    });
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("an unbumped wire version and unwritten notes are both left alone", () => {
+  // Two situations that must never fail a build: nothing moved, and the notes
+  // for a freshly bumped version have not been written yet. The second is what
+  // `release-notes.test.mjs` covers at tag time; requiring it here would leave
+  // main red for the whole gap between a bump and its changelog.
+  const unchanged = emberDhtFixture({ previous: 3, current: 3, bullets: null });
+  try {
+    assert.equal(verifyEmberDhtVersion({ root: unchanged }).checked, false);
+  } finally {
+    rmSync(unchanged, { recursive: true, force: true });
+  }
+
+  const unwritten = emberDhtFixture({ previous: 2, current: 3, bullets: null });
+  try {
+    assert.deepEqual(verifyEmberDhtVersion({ root: unwritten }), {
+      wireVersion: 3,
+      previousWireVersion: 2,
+      checked: false,
+    });
+  } finally {
+    rmSync(unwritten, { recursive: true, force: true });
+  }
+});
+
+test("the declared Ember DHT wire version is the one this release ships", () => {
+  // Hardcoded like the security epoch above: a bump is supposed to be noticed
+  // here, not absorbed by a check that reads whatever the source happens to say.
+  assert.equal(verifyEmberDhtVersion({ root }).wireVersion, 3);
+});
+
+test("a missing wire-version constant is a hard error, not a skip", () => {
+  const fixture = policyFixture();
+  try {
+    const dhtPath = join(fixture, "src-tauri/src/network/ember/dht/mod.rs");
+    writeFileSync(
+      dhtPath,
+      readFileSync(dhtPath, "utf8").replace(
+        /pub const EMBER_DHT_VERSION:\s*u8\s*=\s*\d+\s*;/,
+        "pub const EMBER_DHT_WIRE: u8 = 3;",
+      ),
+    );
+    assert.throws(
+      () => verifyEmberDhtVersion({ root: fixture }),
+      /EMBER_DHT_VERSION constant not found/,
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });

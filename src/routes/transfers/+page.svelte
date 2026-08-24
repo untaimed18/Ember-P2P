@@ -26,7 +26,14 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
+  import {
+    translateError,
+    transferFailureKindText,
+    transferFailureReasonText,
+    transferFailureStageText,
+    transferHealthReasonText,
+  } from '$lib/i18n';
+  import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -1645,8 +1652,7 @@
 
   // --- eMule-style status labels ---
   function isEmberHashMismatch(t: Transfer): boolean {
-    const reason = (t.failure_reason || '').toLowerCase();
-    return reason.includes('ember content hash mismatch') || reason.includes('ember blake3');
+    return isEmberBlake3Mismatch(t.failure_code);
   }
 
   function failureBadgeLabel(t: Transfer): string {
@@ -1655,8 +1661,21 @@
     if (t.failure_kind === 'permanent') return m.transfers_failure_permanent_error();
     if (t.failure_stage === 'queue_wait') return m.transfers_failure_queue_wait();
     if (t.failure_stage === 'tcp_connect') return m.transfers_failure_connect_error();
-    if (t.failure_reason) return t.failure_reason;
+    if (t.failure_reason || t.failure_code) {
+      return transferFailureReasonText(t.failure_reason, t.failure_code);
+    }
     return m.transfers_failure_generic();
+  }
+
+  /** The status tooltip's " — "-joined stage/kind trailer, both localized. */
+  function failureContextTooltip(t: Transfer): string {
+    return [
+      transferFailureReasonText(t.failure_reason, t.failure_code),
+      transferFailureStageText(t.failure_stage),
+      transferFailureKindText(t.failure_kind),
+    ]
+      .filter(Boolean)
+      .join(' — ');
   }
 
   function dlStatusLabel(t: Transfer): string {
@@ -1778,17 +1797,20 @@
         // What the peer actually holds is in the parts bar and its tooltip.
         return m.transfers_ul_status_transferring();
       case 'completed': return m.transfers_dl_status_complete();
-      case 'failed': {
-        const reason = (t.failure_reason || '').toLowerCase();
-        // Map common failure messages to short, human labels so the
-        // Completed / Failed section doesn't just say "Error" for every row.
-        if (reason.includes('timeout') || reason.includes('timed out')) return m.transfers_failure_timeout();
-        if (reason.includes('refused')) return m.transfers_ul_failure_refused();
-        if (reason.includes('reset') || reason.includes('eof')) return m.transfers_ul_failure_disconnected();
-        if (reason.includes('cancel')) return m.transfers_ul_failure_cancelled();
-        if (reason.includes('hash') && reason.includes('mismatch')) return m.transfers_ul_failure_bad_data();
-        return m.transfers_failure_generic();
-      }
+      case 'failed':
+        // Map the failure onto one of the short, human labels this section
+        // uses, so Completed / Failed doesn't just say "Error" for every row.
+        switch (t.failure_code) {
+          case 'download_timed_out': return m.transfers_failure_timeout();
+          case 'connection_failed': return m.transfers_ul_failure_refused();
+          case 'connection_lost':
+          case 'transient_failure': return m.transfers_ul_failure_disconnected();
+          case 'cancelled': return m.transfers_ul_failure_cancelled();
+          case 'hash_mismatch':
+          case 'aich_hash_mismatch':
+          case 'ember_content_hash_mismatch': return m.transfers_ul_failure_bad_data();
+          default: return m.transfers_failure_generic();
+        }
       default: return m.common_unknown();
     }
   }
@@ -2994,18 +3016,19 @@
         // D6: mirror dlStatusLabel's health-sensitive branches so the
         // tooltip never contradicts the label (e.g. label "Stalled" +
         // tooltip "Actively downloading").
+        const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
         if (t.health === 'stalled') {
-          return t.health_reason
-            ? m.transfers_dl_tooltip_stalled_reason({ reason: t.health_reason })
+          return health
+            ? m.transfers_dl_tooltip_stalled_reason({ reason: health })
             : m.transfers_dl_tooltip_stalled_base();
         }
         if (t.health === 'degraded') {
-          return t.health_reason
-            ? m.transfers_dl_tooltip_degraded_reason({ reason: t.health_reason })
+          return health
+            ? m.transfers_dl_tooltip_degraded_reason({ reason: health })
             : m.transfers_dl_tooltip_degraded_base();
         }
-        return t.health_reason
-          ? m.transfers_dl_tooltip_active_reason({ reason: t.health_reason })
+        return health
+          ? m.transfers_dl_tooltip_active_reason({ reason: health })
           : m.transfers_dl_tooltip_active_base();
       }
       case 'searching': {
@@ -3013,25 +3036,30 @@
         const base = conn
           ? m.transfers_dl_tooltip_searching_base()
           : m.transfers_dl_tooltip_searching_disconnected_base();
-        return t.health_reason
-          ? m.transfers_dl_tooltip_searching_reason({ base, reason: t.health_reason })
+        const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
+        return health
+          ? m.transfers_dl_tooltip_searching_reason({ base, reason: health })
           : base;
       }
-      case 'queued':
+      case 'queued': {
         if (t.sources === 0) return m.transfers_dl_tooltip_queued_no_sources();
-        return t.health_reason
-          ? m.transfers_dl_tooltip_queued_reason({ reason: t.health_reason })
+        const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
+        return health
+          ? m.transfers_dl_tooltip_queued_reason({ reason: health })
           : m.transfers_dl_tooltip_queued_base();
+      }
       case 'paused': return m.transfers_dl_tooltip_paused();
       case 'stopped': return m.transfers_dl_tooltip_stopped();
       case 'verifying': return m.transfers_dl_tooltip_verifying();
       case 'completing': return m.transfers_dl_tooltip_completing();
       case 'completed': return m.transfers_dl_tooltip_completed();
-      case 'failed':
+      case 'failed': {
         if (isEmberHashMismatch(t)) return m.transfers_ember_mismatch_title();
-        return t.failure_reason
-          ? m.transfers_dl_tooltip_failed_reason({ reason: t.failure_reason })
+        const reason = transferFailureReasonText(t.failure_reason, t.failure_code);
+        return reason
+          ? m.transfers_dl_tooltip_failed_reason({ reason })
           : m.transfers_dl_tooltip_failed();
+      }
       case 'hashing': return m.transfers_dl_tooltip_hashing();
       case 'insufficient': return m.transfers_dl_tooltip_insufficient();
       case 'noneneeded': return m.transfers_dl_tooltip_noneneeded();
@@ -3051,7 +3079,7 @@
         // Prefer the backend-supplied reason over a generic "failed" so the
         // user can understand why an upload dropped out (timeout, refused,
         // peer reset, hash mismatch, etc.).
-        const reason = t.failure_reason?.trim();
+        const reason = transferFailureReasonText(t.failure_reason?.trim(), t.failure_code);
         return reason
           ? m.transfers_ul_tooltip_failed_reason({ reason })
           : m.transfers_ul_tooltip_failed();
@@ -3641,10 +3669,11 @@
                         tooltip so the user can distinguish transient from
                         terminal failures without opening the context menu.
                       -->
-                      {#if t.status === 'failed' && t.failure_reason}
-                        <span class="failure-hint" title={[t.failure_reason, t.failure_stage, t.failure_kind].filter(Boolean).join(' — ')}>{t.failure_reason}</span>
-                      {:else if t.health !== 'healthy' && t.health_reason}
-                        <span class="failure-hint" title={t.health_reason}>{t.health_reason}</span>
+                      {#if t.status === 'failed' && (t.failure_reason || t.failure_code)}
+                        <span class="failure-hint" title={failureContextTooltip(t)}>{transferFailureReasonText(t.failure_reason, t.failure_code)}</span>
+                      {:else if t.health !== 'healthy' && (t.health_reason || t.health_code)}
+                        {@const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code)}
+                        <span class="failure-hint" title={health}>{health}</span>
                       {/if}
                     </td>
                   {:else if column.key === 'remaining'}

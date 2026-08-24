@@ -4,6 +4,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { extractReleaseNotes } from "./release-notes.mjs";
+
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+$/;
@@ -172,8 +174,8 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/** The highest `vX.Y.Z` tag in the repository, or `null` if there are none. */
-function latestReleaseTag(root) {
+/** Every `X.Y.Z` release tag in the repository, tag prefix stripped. */
+function releaseTags(root) {
   let output;
   try {
     output = execFileSync("git", ["tag", "--list", "v*.*.*"], {
@@ -185,15 +187,37 @@ function latestReleaseTag(root) {
     // No git, no repository, or no tags: nothing to compare against. Callers
     // treat that as "cannot check" rather than as a failure, so a source
     // tarball build is not blocked by the absence of history.
-    return null;
+    return [];
   }
-  const versions = output
+  return output
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => /^v\d+\.\d+\.\d+$/.test(line))
     .map((line) => line.slice(1));
+}
+
+/** The highest `vX.Y.Z` tag in the repository, or `null` if there are none. */
+function latestReleaseTag(root) {
+  const versions = releaseTags(root);
   if (versions.length === 0) return null;
   return versions.reduce((best, next) =>
+    compareVersions(next, best) > 0 ? next : best,
+  );
+}
+
+/**
+ * The newest release tag strictly older than `version`.
+ *
+ * Deliberately not `latestReleaseTag`: the release workflow builds from the tag
+ * it is cutting, where the newest tag *is* the declared version, and comparing
+ * a release against itself would report no change and skip every check below.
+ */
+function previousReleaseTag(root, version) {
+  const older = releaseTags(root).filter(
+    (tag) => compareVersions(tag, version) < 0,
+  );
+  if (older.length === 0) return null;
+  return older.reduce((best, next) =>
     compareVersions(next, best) > 0 ? next : best,
   );
 }
@@ -391,12 +415,100 @@ export function verifySecurityEpoch({ root = scriptRoot } = {}) {
   return epoch;
 }
 
+const EMBER_DHT_SOURCE = "src-tauri/src/network/ember/dht/mod.rs";
+const EMBER_DHT_VERSION_RE = /^\s*pub const EMBER_DHT_VERSION:\s*u8\s*=\s*(\d+)\s*;/m;
+
+/** `EMBER_DHT_VERSION` as of a given release tag, or `null` if unreadable. */
+function emberDhtVersionAtTag(root, tag) {
+  let source;
+  try {
+    source = execFileSync("git", ["show", `v${tag}:${EMBER_DHT_SOURCE}`], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    // The file did not exist at that tag, or there is no git history here.
+    return null;
+  }
+  const match = source.match(EMBER_DHT_VERSION_RE);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * A bumped Ember DHT wire version has to be in the release notes.
+ *
+ * Nothing else connects the two. `docs/ember-dht.md` spells out the
+ * consequence: incompatible peers fail cleanly but neither is told why, so a
+ * node left on the old version just watches the network shrink as everyone
+ * else updates, with nothing in the UI to explain it. The release notes are
+ * the only place that can say so, and 1.5.5, 1.5.7 and 1.5.8 all set the
+ * precedent by stating the wire version explicitly even when it did not move.
+ *
+ * Two things are deliberately *not* required here. Whether the section exists
+ * at all is `release-notes.test.mjs`'s job, which is what runs at tag time —
+ * notes for a freshly bumped version are legitimately unwritten for a while,
+ * and failing on that would leave main red between a bump and its changelog.
+ * And a repository with no older tag to read simply cannot be checked, which
+ * is treated the same way `verifyVersionAdvanced` treats a tagless checkout.
+ */
+export function verifyEmberDhtVersion({ root = scriptRoot } = {}) {
+  const version = JSON.parse(read(root, "package.json")).version;
+  const source = read(root, EMBER_DHT_SOURCE);
+  const match = source.match(EMBER_DHT_VERSION_RE);
+  if (!match) {
+    throw new Error(
+      `Release Ember DHT policy failed:\n- ${EMBER_DHT_SOURCE}: EMBER_DHT_VERSION constant not found`,
+    );
+  }
+  const wireVersion = Number(match[1]);
+  const skipped = { wireVersion, previousWireVersion: null, checked: false };
+
+  const previousTag = previousReleaseTag(root, version);
+  if (!previousTag) return skipped;
+  const previousWireVersion = emberDhtVersionAtTag(root, previousTag);
+  if (previousWireVersion === null) return skipped;
+  if (previousWireVersion === wireVersion) {
+    return { wireVersion, previousWireVersion, checked: false };
+  }
+
+  const html = read(root, "docs/index.html");
+  const articleId = `release-${version.split(".").join("-")}`;
+  if (!new RegExp(`<article\\b[^>]*id="${articleId}"`, "i").test(html)) {
+    return { wireVersion, previousWireVersion, checked: false };
+  }
+
+  // Both precedents put the statement in one bullet, so require one line to
+  // carry the protocol name and the number rather than hoping two distant
+  // mentions are about each other.
+  const mentions = new RegExp(String.raw`\b(?:version\s+|v)${wireVersion}\b`, "i");
+  const stated = extractReleaseNotes(html, version)
+    .split("\n")
+    .some((line) => /ember dht/i.test(line) && mentions.test(line));
+  if (!stated) {
+    throw new Error(
+      `Release Ember DHT policy failed:\n- the Ember DHT wire version went from ${previousWireVersion} ` +
+        `(v${previousTag}) to ${wireVersion}, but the ${version} notes in docs/index.html never say so; ` +
+        `add a bullet naming "Ember DHT" and "version ${wireVersion}", as 1.5.8 did for the unchanged case`,
+    );
+  }
+  return { wireVersion, previousWireVersion, checked: true };
+}
+
 export function verifyReleasePolicy(options = {}) {
   const version = verifyVersions(options);
   const { latestTag, checked: versionAdvanced } = verifyVersionAdvanced(options);
   const actions = verifyWorkflow(options);
   const securityEpoch = verifySecurityEpoch(options);
-  return { version, latestTag, versionAdvanced, actions, securityEpoch };
+  const emberDht = verifyEmberDhtVersion(options);
+  return {
+    version,
+    latestTag,
+    versionAdvanced,
+    actions,
+    securityEpoch,
+    emberDht,
+  };
 }
 
 function parseArgs(argv) {
@@ -427,7 +539,9 @@ if (
         ? `ahead of v${result.latestTag}`
         : `release tag matches v${result.version}`;
     console.log(
-      `release policy verified: version ${result.version} (${against}), security epoch ${result.securityEpoch}, ${result.actions} SHA-pinned action uses`,
+      `release policy verified: version ${result.version} (${against}), security epoch ${result.securityEpoch}, ` +
+        `Ember DHT wire version ${result.emberDht.wireVersion}${result.emberDht.checked ? " (bump documented)" : ""}, ` +
+        `${result.actions} SHA-pinned action uses`,
     );
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

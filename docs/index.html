@@ -910,7 +910,7 @@
     <a href="#ember-search" class="toc-link toc-child">Search &amp; Publishing</a>
     <a href="#ember-crypto" class="toc-link toc-child">Encryption &amp; Identity</a>
     <a href="#ember-status" class="toc-link toc-child">Status Page</a>
-    <a href="#ember-limits" class="toc-link toc-child">Beta Limits</a>
+    <a href="#ember-limits" class="toc-link toc-child">Current Limits</a>
   </div>
 
   <div class="toc-section">
@@ -1012,7 +1012,7 @@
       </div>
       <div class="hl-card">
         <div class="hl-icon">&#x1F525;</div>
-        <h4>Ember Network (Beta)</h4>
+        <h4>Ember Network</h4>
         <p>Ember&rsquo;s own encrypted overlay. No servers, no central directory, no shipped seed list &mdash; nodes find each other, publish shared files, and look up sources over their own DHT, alongside KAD and eD2K.</p>
       </div>
       <div class="hl-card">
@@ -1128,7 +1128,7 @@
 
     <h3>Networking</h3>
     <ul>
-      <li><strong>Ember Network</strong> (Beta) &mdash; Ember&rsquo;s own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. On by default, joins automatically, and runs alongside KAD and eD2K. See the <a href="#ember">Ember Network section</a>.</li>
+      <li><strong>Ember Network</strong> &mdash; Ember&rsquo;s own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. Always on, joins automatically, and runs alongside KAD and eD2K. See the <a href="#ember">Ember Network section</a>.</li>
       <li><strong>KAD Network</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Optional Auto-Connect KAD in Settings; otherwise press Connect on the KAD Network page. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
       <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally Auto-Connect Server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
       <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
@@ -1195,11 +1195,11 @@
 
   <!-- Ember Network -->
   <section id="ember">
-    <h2>Ember Network <span class="release-badge upcoming" style="vertical-align: middle;">Beta</span></h2>
+    <h2>Ember Network</h2>
 
     <p>The Ember Network is Ember&rsquo;s own peer-to-peer overlay: a second network that Ember nodes run between themselves, in parallel with KAD and eD2K. Nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. There is no directory server, no tracker, and no shipped seed list, and every frame between nodes travels inside an encrypted session.</p>
 
-    <p>It is <strong>always on</strong> and joins on its own &mdash; there is no Connect button. The switch on the <strong>Ember Network</strong> page and in <strong>Settings &gt; Network</strong> stays visible but cannot be turned off. Because it runs alongside the eMule networks rather than replacing them, taking part costs you nothing on KAD or eD2K.</p>
+    <p>It is <strong>always on</strong> and joins on its own &mdash; there is no Connect button and no switch to turn it off. Because it runs alongside the eMule networks rather than replacing them, taking part costs you nothing on KAD or eD2K.</p>
 
     <div class="callout-info callout">
       <p><strong>What it does not change:</strong> Ember finds the source; the file itself still transfers over eD2K client-to-client. An Ember search result downloads through the same multi-source engine, credits, and AICH verification as any other result.</p>
@@ -1270,7 +1270,7 @@
         </tr>
         <tr>
           <td><strong>Wire versioning</strong></td>
-          <td>Version 2. The decoder accepts a version range and refuses anything outside it at the version byte, so an incompatible peer is a clean rejection rather than a stream of malformed-packet counters that read like packet loss.</td>
+          <td>Version 3. The decoder accepts a version range and refuses anything outside it at the version byte, so an incompatible peer is a clean rejection rather than a stream of malformed-packet counters that read like packet loss.</td>
         </tr>
         <tr>
           <td><strong>Abuse resistance</strong></td>
@@ -1282,14 +1282,14 @@
     <h3 id="ember-status">The Ember Network page</h3>
     <p>The page leads with the questions a user actually has &mdash; is it on, am I connected, can people reach me, are my shared files findable &mdash; and keeps the protocol detail behind a disclosure.</p>
     <ul>
-      <li><strong>Status</strong> &mdash; Off, Connecting, Connected, or No peers found, with the on/off switch beside it.</li>
+      <li><strong>Status</strong> &mdash; Off, Connecting, Connected, or No peers found. There is nothing to switch: the overlay reports what it is doing, it does not ask you to start it.</li>
       <li><strong>Peers and Published files</strong> &mdash; How many nodes you are in touch with, and how many of your shared files are findable.</li>
       <li><strong>Health checklist</strong> &mdash; Whether you are on the network, whether people can reach you <strong>directly</strong> or through a <strong>relay</strong>, and whether your shares are published.</li>
       <li><strong>Technical details</strong> &mdash; Collapsed by default: your node ID and public keys, around twenty protocol counters (search hits and misses, store acks and failures, average replication, buddy publishes and forwards, malformed frames, observed address votes, EPX exchange stats, storage rejections), plus live tables of contacts, in-flight searches, and the keys this node is serving to others.</li>
     </ul>
 
-    <h3 id="ember-limits">Beta limits</h3>
-    <p>The overlay is on by default and in daily use, but it is labelled Beta for concrete reasons:</p>
+    <h3 id="ember-limits">Current limits</h3>
+    <p>The overlay is always on and in daily use, but these are the things it does not do yet:</p>
     <ul>
       <li><strong>Bootstrap depends on eMule</strong> &mdash; A first run with KAD off and no servers cannot join, as described above.</li>
       <li><strong>Version mismatches are silent</strong> &mdash; Incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never appear in each other&rsquo;s routing tables.</li>

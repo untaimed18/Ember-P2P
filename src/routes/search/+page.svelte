@@ -28,10 +28,16 @@
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
-  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
+  import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
-  import { translateError, degradedReasonText } from '$lib/i18n';
+  import {
+    translateError,
+    degradedReasonText,
+    spamReasonTexts,
+    spamProfileText,
+    transferFailureReasonText,
+  } from '$lib/i18n';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   /** Request ids whose invoke has settled (success or error). Prevents a late
@@ -497,7 +503,7 @@
   };
   let columnVis = $state<Record<MediaColumn, boolean>>({ ...DEFAULT_COLUMN_VIS });
   let showColumnMenu = $state(false);
-  let syntaxHelpEl: HTMLDetailsElement | null = $state(null);
+  let syntaxHelpEl = $state<HTMLDetailsElement | undefined>(undefined);
 
   function toggleColumn(key: MediaColumn) {
     // Reassign (rather than mutate in place) so the persistence $effect, which
@@ -879,9 +885,21 @@
   let emberJoinActiveSince = $state<number | null>(null);
   let emberDiagnosticsStale = $state(false);
   let emberSearchUsable = $derived(emberEnabled && emberContacts > 0);
+  // A wedged diagnostics poll leaves `emberContacts` at whatever it last was —
+  // 0 for the whole session if the very first poll never landed. Gating submit
+  // on that number then disables Search and blames the DHT for having no
+  // peers, with a restart as the only way out. Once readiness is unknown,
+  // let the search through and let the backend answer.
+  let emberReadinessUnknown = $derived(emberEnabled && emberDiagnosticsStale);
+  let emberSearchAllowed = $derived(emberSearchUsable || emberReadinessUnknown);
   let searchSubmitBlocked = $derived(
-    (searchMethod === 'ember' && !emberSearchUsable)
-      || (searchMethod === 'global' && !kadUpLive && !serverUpLive && !emberSearchUsable),
+    (searchMethod === 'ember' && !emberSearchAllowed)
+      || (searchMethod === 'global' && !kadUpLive && !serverUpLive && !emberSearchAllowed),
+  );
+  // Whether the current method depends on Ember at all, i.e. whether a broken
+  // diagnostics poll is worth telling the user about here.
+  let emberDrivesThisSearch = $derived(
+    searchMethod === 'ember' || (searchMethod === 'global' && !kadUpLive && !serverUpLive),
   );
 
   function recomputeEmberJoinState() {
@@ -905,11 +923,16 @@
   }
 
   $effect(() => {
-    // Re-arm joining UX when Ember becomes usable (mirrors /ember).
+    // Re-arm joining UX when Ember becomes usable (mirrors /ember). The three
+    // reads above are the whole intended dependency set; the recompute reads
+    // the same state it writes, so keep its reads out of the graph. It settles
+    // today only because every write lands on an unchanged primitive — one
+    // branch assigning a fresh `Date.now()` on the settled path would make
+    // this a hard update-depth loop.
     void emberEnabled;
     void emberContacts;
     void emberDiagnosticsStale;
-    recomputeEmberJoinState();
+    untrack(recomputeEmberJoinState);
   });
 
   onMount(() => {
@@ -927,6 +950,10 @@
     // strip can show "joining" vs "ready" without navigating to /ember.
     let emberPoll: ReturnType<typeof setInterval> | undefined;
     let joinPoll: ReturnType<typeof setInterval> | undefined;
+    // Tolerate transient blips the way /ember does — one lost poll is not a
+    // broken service — and only declare readiness unknown once the command has
+    // been unreachable for several ticks in a row.
+    let emberDiagFailures = 0;
     const refreshEmber = () => {
       if (!$appSettings?.ember_native_enabled) {
         emberContacts = 0;
@@ -935,10 +962,12 @@
       getEmberDiagnostics()
         .then((d) => {
           emberContacts = d.ember_dht_verified_contacts ?? 0;
+          emberDiagFailures = 0;
           emberDiagnosticsStale = false;
         })
         .catch((e) => {
-          emberDiagnosticsStale = true;
+          emberDiagFailures += 1;
+          if (emberDiagFailures >= EMBER_DIAG_FAILURE_THRESHOLD) emberDiagnosticsStale = true;
           console.error('Failed to poll Ember DHT readiness:', e);
         });
     };
@@ -983,7 +1012,14 @@
       profile: spamProfile,
       is_spam: !!result.is_spam,
       reasons: result.spam_reasons,
+      reason_details: result.spam_reason_details,
     };
+  }
+
+  /** The signals to render, localized from their codes where the backend
+   *  supplied them and shown as-is otherwise (see `spamReasonTexts`). */
+  function spamSignals(explain: SpamExplanation): string[] {
+    return spamReasonTexts(explain.reason_details, explain.reasons);
   }
 
   function rowIsCleanOfSpam(result: SearchResult): boolean {
@@ -1450,7 +1486,10 @@
     const kadUp = $networkStats.status === 'connected';
     const serverUp = $serverStatus === 'connected';
     const emberJoining = emberEnabled && emberContacts === 0 && !emberJoinTimedOut;
-    const emberReady = emberEnabled && emberContacts > 0;
+    // Unknown readiness counts as allowed here for the same reason it does in
+    // `searchSubmitBlocked`: refusing would report "no peers" for what is
+    // really a dead diagnostics command.
+    const emberReady = emberSearchAllowed;
     const emberNoPeers = emberEnabled && emberContacts === 0 && emberJoinTimedOut;
     const methodAllowed =
       method === 'kad' ? kadUp :
@@ -1886,7 +1925,7 @@
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, true, spamThreshold, ['Manually marked as spam']);
+    patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markSpam(
@@ -1917,7 +1956,7 @@
     spamToggleGen.set(hash, gen);
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, false, 0, ['Manually marked as not spam']);
+    patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markNotSpam(hash);
@@ -2682,7 +2721,11 @@
 </div>
 
 <div class="page-content">
-  {#if (searchMethod === 'kad' && $networkStats.status !== 'connected')
+  {#if emberDrivesThisSearch && emberReadinessUnknown}
+    <div class="search-readiness-hint" role="status">
+      {m.search_network_ember_diagnostics_hint()}
+    </div>
+  {:else if (searchMethod === 'kad' && $networkStats.status !== 'connected')
     || (searchMethod === 'server' && $serverStatus !== 'connected')
     || (searchMethod === 'ember' && (!emberEnabled || (emberContacts === 0 && !emberJoinTimedOut)))
     || (searchMethod === 'global'
@@ -2935,10 +2978,14 @@
                           <div class="spam-tooltip-title">{spamExplainErrors[resultKey(result)]}</div>
                         {:else if spamExplain}
                           <div class="spam-tooltip-title">
-                            {m.search_spam_score({ score: spamExplain.score, threshold: spamExplain.threshold, profile: spamExplain.profile })}
+                            {m.search_spam_score({
+                              score: spamExplain.score,
+                              threshold: spamExplain.threshold,
+                              profile: spamProfileText(spamExplain.profile)
+                            })}
                           </div>
                           <ul>
-                            {#each spamExplain.reasons.slice(0, 4) as reason}
+                            {#each spamSignals(spamExplain).slice(0, 4) as reason}
                               <li>{reason}</li>
                             {/each}
                           </ul>
@@ -3156,7 +3203,7 @@
             <div class="detail-row">
               <strong>{m.search_spam_signals()}</strong>
               <ul class="spam-reasons">
-                {#each selectedSpam.reasons as reason}
+                {#each spamSignals(selectedSpam) as reason}
                   <li>{reason}</li>
                 {/each}
               </ul>
@@ -3181,8 +3228,8 @@
               {#if selectedDlTransfer.sources > 0}
                 <div class="detail-row"><strong>{m.search_sources_label()}</strong> {m.search_sources_value({ active: selectedDlTransfer.active_sources || 0, total: selectedDlTransfer.sources })}</div>
               {/if}
-              {#if selectedDlTransfer.failure_reason}
-                <div class="detail-row"><strong>{m.search_error_label()}</strong> <span class="error-msg">{selectedDlTransfer.failure_reason}</span></div>
+              {#if selectedDlTransfer.failure_reason || selectedDlTransfer.failure_code}
+                <div class="detail-row"><strong>{m.search_error_label()}</strong> <span class="error-msg">{transferFailureReasonText(selectedDlTransfer.failure_reason, selectedDlTransfer.failure_code)}</span></div>
               {/if}
             </div>
           {/if}

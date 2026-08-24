@@ -139,6 +139,17 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     // a later unflagged hit must not erase an earlier warning for the same file
     // unless the user explicitly unmarked it (override above).
     : existing.is_spam || incoming.is_spam;
+  // The English list and the coded list explain the same verdict, so they have
+  // to travel together: prose from one scoring pass beside codes from another
+  // would render two different explanations for one row. A user override
+  // carries no codes — its text is already in the active locale.
+  const spamSignals = override?.reasons
+    ? { spam_reasons: override.reasons, spam_reason_details: undefined }
+    : incoming.is_spam && (incoming.spam_reasons?.length ?? 0) > 0
+      ? incoming
+      : existing.spam_reasons?.length
+        ? existing
+        : incoming;
   return {
     ...existing,
     ...incoming,
@@ -167,13 +178,8 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     spam_rating,
     is_spam,
     origin_server_ip: existing.origin_server_ip || incoming.origin_server_ip,
-    spam_reasons: override?.reasons
-      ? override.reasons
-      : incoming.is_spam && (incoming.spam_reasons?.length ?? 0) > 0
-        ? incoming.spam_reasons
-        : existing.spam_reasons?.length
-          ? existing.spam_reasons
-          : incoming.spam_reasons,
+    spam_reasons: spamSignals.spam_reasons,
+    spam_reason_details: spamSignals.spam_reason_details,
     // `clean_name` is derived from whichever `file.name` its own row carried, so
     // it has to follow the name we kept above. Taking the incoming one while
     // `file.name` keeps the first meant the row could display one filename and
@@ -306,6 +312,10 @@ export function patchSpamFlagByHash(
         is_spam: isSpam,
         spam_rating: spamRating,
         spam_reasons: reasons ?? current.spam_reasons,
+        // The override's text is already translated, so it has no codes to
+        // localize from; leaving the previous ones would re-render the
+        // pre-override explanation.
+        spam_reason_details: reasons ? undefined : current.spam_reason_details,
       };
       return { ...tab, results };
     });
@@ -483,6 +493,7 @@ async function rescoreOpenTabs() {
             spam_rating: override?.spamRating ?? n.spam_rating,
             is_spam: override?.isSpam ?? n.is_spam,
             spam_reasons: override?.reasons ?? n.spam_reasons,
+            spam_reason_details: override?.reasons ? undefined : n.spam_reason_details,
           };
         });
         const next = [...current];

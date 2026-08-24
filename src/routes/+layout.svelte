@@ -510,8 +510,14 @@
             }
           } else {
             console.error('Persistent settings fetch failure; blocking main app entry', settingsError);
-            initError = settingsError instanceof Error
-              ? m.layout_settings_load_error_detail({ detail: settingsError.message })
+            // A rejected Tauri command hands back a bare string, not an Error,
+            // so the detail has to come through `translateError` — it also
+            // decodes a `coded()` envelope, which would otherwise reach this
+            // blocking screen as raw JSON. An empty result means there was no
+            // usable text at all, which is what the generic message is for.
+            const detail = translateError(settingsError, '');
+            initError = detail
+              ? m.layout_settings_load_error_detail({ detail })
               : m.layout_settings_load_error();
           }
 

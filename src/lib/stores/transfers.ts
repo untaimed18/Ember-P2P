@@ -232,10 +232,14 @@ interface TransferEventPayload {
   id: string;
   error?: string;
   failure_reason?: string;
+  /** Stable discriminator for the failure; see `Transfer['failure_code']`.
+   *  Travels with `failure_reason`/`error` so the row can be localized. */
+  failure_code?: string;
   failure_kind?: Transfer['failure_kind'];
   failure_stage?: string;
   health?: Transfer['health'];
   health_reason?: string;
+  health_code?: string;
   stalled_since?: number;
   sources?: number;
   active_sources?: number;
@@ -436,6 +440,7 @@ function flushProgress() {
         status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
         health: clearStaleHealth ? 'healthy' : existing.health,
         health_reason: clearStaleHealth ? undefined : existing.health_reason,
+        health_code: clearStaleHealth ? undefined : existing.health_code,
         stalled_since: clearStaleHealth ? undefined : existing.stalled_since,
         ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
         ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
@@ -577,7 +582,7 @@ export async function initTransferStore() {
     });
     await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
-      const { id, error, failure_kind, failure_stage, direction } = event.payload;
+      const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
       transfers.update((list) => {
@@ -596,8 +601,7 @@ export async function initTransferStore() {
         }
         // User cancel must not paint the row red in Completed/Failed —
         // cancel already removes the download; treat the event as removal.
-        const errText = typeof error === 'string' ? error : '';
-        if (/cancel/i.test(errText)) {
+        if (failure_code === 'cancelled') {
           forgetTransfer(id);
           return list.filter((t) => t.id !== id);
         }
@@ -612,6 +616,7 @@ export async function initTransferStore() {
             status: 'failed' as const,
             speed: 0,
             failure_reason: error,
+            failure_code,
             failure_kind,
             failure_stage,
           };
@@ -631,10 +636,12 @@ export async function initTransferStore() {
           queued_sources,
           error,
           failure_reason,
+          failure_code,
           failure_kind,
           failure_stage,
           health,
           health_reason,
+          health_code,
           stalled_since,
         } = event.payload;
         transfers.update((list) =>
@@ -686,11 +693,13 @@ export async function initTransferStore() {
                 narrowed === 'verifying' ||
                 narrowed === 'completing') &&
               failure_reason === undefined &&
+              failure_code === undefined &&
               failure_kind === undefined &&
               failure_stage === undefined &&
               error === undefined
             ) {
               delete updated.failure_reason;
+              delete updated.failure_code;
               delete updated.failure_kind;
               delete updated.failure_stage;
             }
@@ -713,10 +722,12 @@ export async function initTransferStore() {
             }
             if (failure_reason !== undefined) updated.failure_reason = failure_reason;
             else if (error !== undefined) updated.failure_reason = error;
+            if (failure_code !== undefined) updated.failure_code = failure_code;
             if (failure_kind !== undefined) updated.failure_kind = failure_kind;
             if (failure_stage !== undefined) updated.failure_stage = failure_stage;
             if (health !== undefined) updated.health = health;
             if (health_reason !== undefined) updated.health_reason = health_reason;
+            if (health_code !== undefined) updated.health_code = health_code;
             if (stalled_since !== undefined) updated.stalled_since = stalled_since;
             // Backend clears runtime health on these transitions but usually
             // omits `health` from the event — drop stale `degraded` so the
@@ -729,6 +740,7 @@ export async function initTransferStore() {
             ) {
               updated.health = 'healthy';
               updated.health_reason = undefined;
+              updated.health_code = undefined;
               updated.stalled_since = undefined;
             }
             return updated;
@@ -739,13 +751,14 @@ export async function initTransferStore() {
     await safeListen<TransferEventPayload>('transfer-health', (event) => {
       // Sub-row update (health/stall colour) — not a status transition, so it
       // must not defer the reconciling poll.
-      const { id, error, failure_reason, failure_kind, failure_stage, health, health_reason, stalled_since } = event.payload;
+      const { id, error, failure_reason, failure_code, failure_kind, failure_stage, health, health_reason, health_code, stalled_since } = event.payload;
       transfers.update((list) =>
         list.map((t) =>
           t.id === id
             ? {
                 ...t,
                 failure_reason: failure_reason ?? error ?? t.failure_reason,
+                failure_code: failure_code ?? t.failure_code,
                 failure_kind: failure_kind ?? t.failure_kind,
                 failure_stage: failure_stage ?? t.failure_stage,
                 health: health ?? t.health,
@@ -755,6 +768,7 @@ export async function initTransferStore() {
                 // 'healthy' transition). When `health` is omitted, preserve the
                 // existing values instead of clobbering them to undefined.
                 health_reason: health !== undefined ? health_reason : t.health_reason,
+                health_code: health !== undefined ? health_code : t.health_code,
                 stalled_since: health !== undefined ? stalled_since : t.stalled_since,
               }
             : t
@@ -849,8 +863,10 @@ export async function initTransferStore() {
             // prior `degraded` on the event row would otherwise stick forever.
             health: apiItem.health ?? eventItem.health,
             health_reason: apiItem.health_reason ?? eventItem.health_reason,
+            health_code: apiItem.health_code ?? eventItem.health_code,
             stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
+            failure_code: eventItem.failure_code ?? apiItem.failure_code,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
             failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
             sources: apiItem.sources ?? eventItem.sources ?? 0,
@@ -1127,8 +1143,10 @@ export function startTransferPoll() {
               // Prefer API health over a possibly-stale event value.
               health: apiItem.health ?? eventItem.health,
               health_reason: apiItem.health_reason ?? eventItem.health_reason,
+              health_code: apiItem.health_code ?? eventItem.health_code,
               stalled_since: apiItem.stalled_since ?? eventItem.stalled_since,
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
+              failure_code: eventItem.failure_code ?? apiItem.failure_code,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
               sources: apiItem.sources ?? eventItem.sources ?? 0,
