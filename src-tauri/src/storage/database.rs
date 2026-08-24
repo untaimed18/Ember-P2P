@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
+use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::storage::paths;
 use crate::types::*;
 
@@ -244,9 +245,14 @@ impl Database {
                 // stays readable in the freed stack frames of `Database::new`.
                 let mut key = Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&plaintext);
-                // Transparently wrap a legacy restricted plaintext key. Never
-                // rewrite a key that failed unprotect/validation.
-                if !was_protected {
+                // Transparently wrap a legacy restricted plaintext key, and
+                // likewise one sealed under a superseded scheme — a Unix
+                // `EMBRSEC2`/`EMBRSEC3` blob is keyed by `$USER`, which a
+                // launcher need not export, so it only stops depending on that
+                // variable once rewritten. Never rewrite a key that failed
+                // unprotect/validation: this is reached only after a successful
+                // one.
+                if !was_protected || crate::storage::secret_store::needs_rewrap(&stored) {
                     let protected = crate::storage::secret_store::protect(key.as_slice())?;
                     crate::security::atomic_write(&key_path, &protected, true)?;
                 }
@@ -1366,6 +1372,25 @@ impl Database {
         Ok(())
     }
 
+    /// Every address recorded for one peer id.
+    ///
+    /// The ban and unban paths used to reach this through `get_peers`, which
+    /// reads the whole table *and* deserializes every row's address list to
+    /// answer a question about a single id — synchronously on the network task.
+    /// It is also `LIMIT MAX_PEERS_ROWS`, so a peer whose row had fallen outside
+    /// that window contributed no IPs at all and the ban silently covered only
+    /// the user-hash paths.
+    pub fn get_peer_addresses(&self, peer_id: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT addresses FROM peers WHERE id = ?1")?;
+        let mut rows = stmt.query(params![peer_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(Vec::new());
+        };
+        let addresses_str: String = row.get(0)?;
+        Ok(serde_json::from_str(&addresses_str)?)
+    }
+
     pub fn get_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
         let conn = self.conn.lock();
         // Banned rows first, then by recency. Exempting them from eviction
@@ -1713,6 +1738,16 @@ impl Database {
                         },
                     };
                     let pin_corrupt = aich_corrupt || ember_corrupt;
+                    // Ember first: a row can be corrupt on both pins, and the
+                    // Ember digest is the one the user must re-add an `eh=`
+                    // link to fix.
+                    let pin_failure = if ember_corrupt {
+                        Some(TransferFailureCode::EmberPinCorrupt)
+                    } else if aich_corrupt {
+                        Some(TransferFailureCode::AichPinCorrupt)
+                    } else {
+                        None
+                    };
                     let mut status = match status_str.trim_matches('"') {
                         "searching" => TransferStatus::Searching,
                         "queued" => TransferStatus::Queued,
@@ -1757,15 +1792,8 @@ impl Database {
                         transferred: transferred_val,
                         completed_size: transferred_val,
                         started_at: row.get(11)?,
-                        failure_reason: pin_corrupt.then(|| {
-                            if ember_corrupt {
-                                "Persisted Ember digest was corrupt; cancel and re-add the eh= link"
-                                    .to_string()
-                            } else {
-                                "Persisted AICH pin was corrupt; cancel and re-add the AICH link"
-                                    .to_string()
-                            }
-                        }),
+                        failure_reason: pin_failure.map(|f| f.message().to_string()),
+                        failure_code: pin_failure.map(|f| f.as_code().to_string()),
                         failure_kind: pin_corrupt.then(|| "permanent".to_string()),
                         failure_stage: None,
                         priority: row
@@ -1779,6 +1807,7 @@ impl Database {
                         last_received: None,
                         health: TransferHealth::Healthy,
                         health_reason: None,
+                        health_code: None,
                         stalled_since: None,
                         category: row.get::<_, String>(13).unwrap_or_default(),
                         wait_time: 0,

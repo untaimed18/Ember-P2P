@@ -930,6 +930,18 @@ async fn register_capability_presence(
 /// than trusting the server to enforce it correctly forever.
 const MAX_LOOKUP_SIG_AGE_SECS: i64 = 600;
 
+/// Whether a lookup response's signed `ts` is too far from local time to trust.
+///
+/// `ts` arrives as an unvalidated `i64` from the rendezvous server's JSON, so it
+/// spans the full range including `i64::MIN`. `[profile.release]` sets
+/// `overflow-checks = true`, so a plain `now - ts` panics in shipped builds on a
+/// value a compromised operator or MITM picks — the exact adversary the signature
+/// freshness check exists to defend against. Saturating both steps keeps an
+/// implausible timestamp a *refusal* instead of an abort.
+fn lookup_signature_age_exceeded(now: i64, ts: i64) -> bool {
+    now.saturating_sub(ts).saturating_abs() > MAX_LOOKUP_SIG_AGE_SECS
+}
+
 pub async fn lookup(
     base_url: &str,
     our_ember_hash: &[u8; 16],
@@ -1097,7 +1109,7 @@ pub async fn lookup(
         return Ok(None);
     }
     let now = current_timestamp();
-    if (now - ts).abs() > MAX_LOOKUP_SIG_AGE_SECS {
+    if lookup_signature_age_exceeded(now, ts) {
         warn!(
             "Rendezvous: lookup for {}… returned a stale signed registration (ts={}); refusing to connect",
             &friend_id[..8],
@@ -1288,6 +1300,36 @@ mod lookup_filter_tests {
         assert!(is_routable_public_v4(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(is_routable_public_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(is_routable_public_v4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+
+    /// `ts` is unvalidated server-supplied JSON, so the extremes of `i64` are
+    /// reachable input. With `overflow-checks = true` on release builds a plain
+    /// subtraction aborts the process instead of refusing the lookup.
+    #[test]
+    fn extreme_signed_timestamps_are_refused_not_panicked_on() {
+        let now = current_timestamp();
+        assert!(lookup_signature_age_exceeded(now, i64::MIN));
+        assert!(lookup_signature_age_exceeded(now, i64::MAX));
+        // A far-future `ts` must be refused too, not treated as fresh.
+        assert!(lookup_signature_age_exceeded(
+            now,
+            now.saturating_add(MAX_LOOKUP_SIG_AGE_SECS + 1)
+        ));
+        assert!(lookup_signature_age_exceeded(
+            now,
+            now.saturating_sub(MAX_LOOKUP_SIG_AGE_SECS + 1)
+        ));
+    }
+
+    #[test]
+    fn fresh_signed_timestamps_are_accepted() {
+        let now = current_timestamp();
+        assert!(!lookup_signature_age_exceeded(now, now));
+        assert!(!lookup_signature_age_exceeded(now, now - 60));
+        assert!(!lookup_signature_age_exceeded(
+            now,
+            now - MAX_LOOKUP_SIG_AGE_SECS
+        ));
     }
 
     #[test]

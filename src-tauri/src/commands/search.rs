@@ -159,10 +159,12 @@ pub fn apply_search_enrichment_with_batch(
             result.spam_rating = details.score;
             result.is_spam = details.is_spam;
             result.spam_reasons = details.reasons;
+            result.spam_reason_details = details.reason_details;
         } else {
             result.spam_rating = 0;
             result.is_spam = false;
             result.spam_reasons.clear();
+            result.spam_reason_details.clear();
         }
         result.clean_name = cleanup_filename(&result.file.name, cleanup_strings);
         if let Some(ref comment) = result.comment {
@@ -467,6 +469,7 @@ pub async fn find_notes(
         result.spam_rating = 0;
         result.is_spam = false;
         result.spam_reasons.clear();
+        result.spam_reason_details.clear();
     }
     Ok(results)
 }
@@ -978,6 +981,7 @@ pub async fn mark_spam(
         result_origin: String::new(),
         origin_server_ip: server_ip.clone(),
         spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
     };
     let save_data = {
         let mut spam = state.spam_filter.write().await;
@@ -1106,6 +1110,7 @@ pub async fn explain_spam_result(
         result_origin: result_origin.unwrap_or_default(),
         origin_server_ip: server_ip.clone(),
         spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
     };
 
     let cfg = state.config.read().await;
@@ -1202,6 +1207,7 @@ pub async fn rescore_search_results(
             result.spam_rating = 0;
             result.is_spam = false;
             result.spam_reasons.clear();
+            result.spam_reason_details.clear();
         }
     }
     Ok(results)

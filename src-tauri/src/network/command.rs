@@ -472,7 +472,7 @@ async fn handle_command_inner(
 
         NetworkCommand::CancelDownload {
             transfer_id,
-            cleanup_ack,
+            mut cleanup_ack,
         } => {
             // eMule: CPartFile::DeletePartFile -> StopFile -> PauseFile ->
             //   CSearchManager::StopSearch(GetKadFileSearchID(), true)
@@ -543,15 +543,41 @@ async fn handle_command_inner(
                 state.per_file_sources.remove(&transfer_id);
             }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
-                if cleanup_ack.is_none() {
-                    // Stop path: preserve .part.met for resume
-                    save_registered_part_tracker(state, &transfer_id, "cancel/stop").await;
-                }
+                // Stop path: preserve .part.met for resume. Snapshot the
+                // tracker `Arc` here (a cheap registry lookup) so the save can
+                // run off-loop with the rest of the teardown.
+                let stop_tracker = if cleanup_ack.is_none() {
+                    state.tracker_registry.lock().get(&transfer_id).cloned()
+                } else {
+                    None
+                };
                 handle.abort();
-                // Bounded wait: abort() cannot interrupt a task parked in
-                // spawn_blocking (fsync / hashing), so a slow unwind must not
-                // freeze the entire single-threaded network task.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                // Join off the network task. `abort()` cannot pre-empt a worker
+                // parked in `spawn_blocking` (final verify, MD4, fsync) — which
+                // is precisely the state a cancel interrupts — so awaiting the
+                // join here stalled UDP receive, all 41 timers and every IPC
+                // snapshot for up to 5 s *per row*, and batch cancel enqueues
+                // one command per selected row. Bounding the wait did not fix
+                // that; a bounded freeze is still a freeze. This mirrors what
+                // `KadDisconnect` already does with its own aborts.
+                //
+                // The ack moves into the spawned task rather than staying at
+                // the tail of this handler because `cancel_transfers_batch`
+                // deletes `.part` files on the strength of it — it has to keep
+                // meaning "the worker is really gone", or a live worker could
+                // write after the delete. Everything still done inline below is
+                // in-memory state with no such dependency.
+                let ack = cleanup_ack.take();
+                let tid = transfer_id.clone();
+                tokio::spawn(async move {
+                    if let Some(tracker) = stop_tracker {
+                        save_part_tracker_snapshot(tracker, &tid, "cancel/stop").await;
+                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
+                });
             }
             if cleanup_ack.is_some() {
                 state.tracker_registry.lock().remove(&transfer_id);
@@ -587,6 +613,12 @@ async fn handle_command_inner(
             state
                 .callback_row_pending_since
                 .retain(|(tid, _, _), _| tid != &transfer_id);
+            // The last two per-transfer maps without a teardown. The friend
+            // hint additionally outlives the friendship, so a stale one could
+            // park a stranger's source as the friend's; the status clock's map
+            // is inert once the row is gone but grew for the process lifetime.
+            state.transfer_friend_hint.remove(&transfer_id);
+            transfer_status_write_clock().forget(&transfer_id);
 
             if removed_pending.is_some() || !search_ids.is_empty() {
                 info!(
@@ -612,9 +644,21 @@ async fn handle_command_inner(
                 }
             }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
-                save_registered_part_tracker(state, &transfer_id, "pause").await;
+                // Same reasoning as `CancelDownload`: snapshot the tracker
+                // `Arc` on the loop, then save and join off it. Pause was the
+                // worse of the two — `save_registered_part_tracker` is itself a
+                // 2 s lock wait plus a 5 s `spawn_blocking` fsync, so this
+                // handler could hold the network task for ~12 s per row before
+                // the next command was even looked at.
+                let tracker = state.tracker_registry.lock().get(&transfer_id).cloned();
                 handle.abort();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                let tid = transfer_id.clone();
+                tokio::spawn(async move {
+                    if let Some(tracker) = tracker {
+                        save_part_tracker_snapshot(tracker, &tid, "pause").await;
+                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                });
             }
             // Drop KAD-callback placeholder timestamps: the manager
             // clears `source_details` for this transfer on pause
@@ -628,6 +672,10 @@ async fn handle_command_inner(
             state
                 .callback_row_pending_since
                 .retain(|(tid, _, _), _| tid != &transfer_id);
+            // Pause keeps the row, so the status clock entry stays live; only
+            // the friend hint is dropped, because a paused transfer's next
+            // resume re-derives it from the browse binding if it still applies.
+            state.transfer_friend_hint.remove(&transfer_id);
             state.active_source_senders.remove(&transfer_id);
             // Pause = worker is gone; keep both sender maps in lockstep
             // so a callback that arrives mid-pause doesn't try to
@@ -1397,6 +1445,7 @@ async fn handle_command_inner(
                                 completed_size: 0,
                                 started_at: now,
                                 failure_reason: None,
+                                failure_code: None,
                                 failure_kind: None,
                                 failure_stage: None,
                                 priority: "auto".to_string(),
@@ -1408,6 +1457,7 @@ async fn handle_command_inner(
                                 last_received: None,
                                 health: TransferHealth::Healthy,
                                 health_reason: None,
+                                health_code: None,
                                 stalled_since: None,
                                 category: String::new(),
                                 wait_time: 0,
@@ -1783,17 +1833,18 @@ async fn handle_command_inner(
                 if let Some(ip) = contact_ip {
                     ips_to_ban.push(ip);
                 }
-                if let Ok(peers) = db.get_peers() {
-                    for peer in &peers {
-                        if peer.id == peer_id_hex {
-                            for addr_str in &peer.addresses {
-                                if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
-                                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                                        ips_to_ban.push(ip);
-                                    }
+                match db.get_peer_addresses(&peer_id_hex) {
+                    Ok(addresses) => {
+                        for addr_str in &addresses {
+                            if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
+                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                    ips_to_ban.push(ip);
                                 }
                             }
                         }
+                    }
+                    Err(e) => {
+                        warn!("Could not read stored addresses for peer {peer_id_hex}: {e}")
                     }
                 }
                 {
@@ -1838,26 +1889,27 @@ async fn handle_command_inner(
                     }
                 }
             }
-            if let Ok(peers) = db.get_peers() {
-                for peer in &peers {
-                    if peer.id == peer_id_hex {
-                        for addr_str in &peer.addresses {
-                            if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
-                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                                    state.banned_ips.remove(&ip);
-                                    // Also clear any persistent auto-ban for this IP.
-                                    if let Err(e) = db.unban_ip(ip) {
-                                        warn!(
-                                            "Failed to clear persisted IP ban for {ip} (peer {peer_id_hex}): {e}"
-                                        );
-                                    }
-                                    // Soften IP-reputation so the next scored
-                                    // event cannot immediately re-arm an IP ban.
-                                    let _ = state.reputation.clear_ip_ban(ip);
+            match db.get_peer_addresses(&peer_id_hex) {
+                Ok(addresses) => {
+                    for addr_str in &addresses {
+                        if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
+                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                state.banned_ips.remove(&ip);
+                                // Also clear any persistent auto-ban for this IP.
+                                if let Err(e) = db.unban_ip(ip) {
+                                    warn!(
+                                        "Failed to clear persisted IP ban for {ip} (peer {peer_id_hex}): {e}"
+                                    );
                                 }
+                                // Soften IP-reputation so the next scored
+                                // event cannot immediately re-arm an IP ban.
+                                let _ = state.reputation.clear_ip_ban(ip);
                             }
                         }
                     }
+                }
+                Err(e) => {
+                    warn!("Could not read stored addresses for peer {peer_id_hex}: {e}")
                 }
             }
             if let Ok(mut shared) = shared_banned_ips.write() {
@@ -3217,35 +3269,44 @@ async fn handle_command_inner(
             // Save routing table before clearing (eMule saves on Stop)
             let contacts = state.routing_table.export_bootstrap_contacts(200);
             let nodes_path = state.data_dir.join("nodes.dat");
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                state.nodes_save_lock.clone().lock_owned(),
-            )
-            .await
-            {
-                Ok(ownership) => {
-                    // Off the loop, exactly like the periodic nodes_save_timer
-                    // arm: `save_nodes_dat` commits through `atomic_write`, which
-                    // fsyncs the file *and* its parent directory inline, so
-                    // running it here stalled UDP receive and every timer for the
-                    // duration — long enough for a full receive buffer to drop KAD
-                    // and Ember packets outright. The blocking task keeps the lock
-                    // guard, so the shutdown writer still serializes behind this
-                    // save instead of renaming an older snapshot over a newer one.
-                    let contact_count = contacts.len();
-                    tokio::task::spawn_blocking(move || {
-                        let _ownership = ownership;
-                        if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                            error!("Failed to save nodes.dat on disconnect: {e}");
-                        } else {
-                            info!("Saved {contact_count} contacts to nodes.dat on disconnect");
-                        }
-                    });
+            let nodes_save_lock = state.nodes_save_lock.clone();
+            // The *write* was already off the loop; the wait for the lock was
+            // not, and that was the stall. Acquiring `nodes_save_lock` can take
+            // as long as the periodic writer's own fsync, so one Disconnect
+            // click could hold the network task for up to 5 s here — and KAD is
+            // only what the user asked to tear down: the Ember overlay and eD2K
+            // peer UDP ride the same socket and the same task, so both went
+            // deaf and in-flight Ember lookups timed out.
+            //
+            // Moving the wait into the task is safe because the lock is what
+            // provides the ordering, not this call site: the blocking save
+            // still holds the guard, so the shutdown writer continues to
+            // serialize behind it rather than renaming an older snapshot over a
+            // newer one.
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    nodes_save_lock.lock_owned(),
+                )
+                .await
+                {
+                    Ok(ownership) => {
+                        let contact_count = contacts.len();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ownership = ownership;
+                            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                                error!("Failed to save nodes.dat on disconnect: {e}");
+                            } else {
+                                info!("Saved {contact_count} contacts to nodes.dat on disconnect");
+                            }
+                        })
+                        .await;
+                    }
+                    Err(_) => warn!(
+                        "Skipped disconnect nodes.dat checkpoint because the serialized periodic writer did not finish"
+                    ),
                 }
-                Err(_) => warn!(
-                    "Skipped disconnect nodes.dat checkpoint because the serialized periodic writer did not finish"
-                ),
-            }
+            });
 
             // Stop all searches and cancel pending oneshot channels
             state.search_manager = SearchManager::new();
@@ -3373,17 +3434,30 @@ async fn handle_command_inner(
                 .iter()
                 .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
                 .collect();
-            let tracker_saves = futures::future::join_all(disconnect_trackers.into_iter().map(
-                |(tid, tracker)| async move {
-                    save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
-                },
-            ));
-            if tokio::time::timeout(std::time::Duration::from_secs(8), tracker_saves)
-                .await
-                .is_err()
-            {
-                warn!("Timed out saving some .part.met file(s) during disconnect");
-            }
+            // Also off the loop: joining every registered tracker's save added
+            // up to 8 s to the stall above. The snapshots hold cloned `Arc`s, so
+            // clearing `tracker_registry` below cannot invalidate them.
+            //
+            // This does let a save race the aborts that follow, where before it
+            // completed first. That is an acceptable trade: the abort could
+            // already land mid-write regardless of this ordering, a missed tail
+            // of ranges only costs re-downloading them (the part file itself is
+            // written by the coordinator, not the tracker), and
+            // `save_part_tracker_snapshot` already degrades to a warning if it
+            // cannot take the read lock within its own 2 s bound.
+            tokio::spawn(async move {
+                let tracker_saves = futures::future::join_all(disconnect_trackers.into_iter().map(
+                    |(tid, tracker)| async move {
+                        save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
+                    },
+                ));
+                if tokio::time::timeout(std::time::Duration::from_secs(8), tracker_saves)
+                    .await
+                    .is_err()
+                {
+                    warn!("Timed out saving some .part.met file(s) during disconnect");
+                }
+            });
 
             // Cancel each active download's control BEFORE aborting its worker
             // handle. The per-source connection tasks are detached

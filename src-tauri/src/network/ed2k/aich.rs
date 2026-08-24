@@ -826,6 +826,11 @@ pub fn save_known2_met(
 
 /// Load AICH hash sets from known2_64.met.
 pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20], Vec<[u8; 20]>)>> {
+    // `save_known2_met` publishes through `atomic_write`, whose Windows
+    // replace-fallback can park the only copy under the backup name. Treating
+    // that absence as "no hashsets yet" means every shared file has to be
+    // re-hashed before it can serve an AICH recovery request again.
+    crate::security::recover_interrupted_replace(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_KNOWN2_MET_BYTES {
             return Err(std::io::Error::new(
@@ -1253,5 +1258,47 @@ mod tests {
         )
         .expect("part 0 recovery should still verify against the master");
         assert_eq!(corrupt, vec![2]);
+    }
+
+    /// A crash inside `atomic_write`'s Windows replace-fallback leaves nothing at
+    /// `known2_64.met` and the only copy parked under the fixed
+    /// `.ember-replace-bak` name. Without a `recover_interrupted_replace` on the
+    /// load path the read fails with `NotFound`, which callers treat as "no
+    /// hashsets yet" — every shared file has to be fully re-hashed before it can
+    /// answer an AICH recovery request again.
+    #[test]
+    fn load_known2_met_recovers_a_file_parked_by_an_interrupted_replace() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-known2-interrupted-{}-{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hash_set = AICHRecoveryHashSet {
+            root_hash: [0x77; 20],
+            leaf_hashes: vec![[0x88; 20], [0x99; 20]],
+            file_size: (AICH_BLOCK_SIZE * 2) as u64,
+        };
+        save_known2_met(&path, std::slice::from_ref(&hash_set)).expect("save known2_64.met");
+
+        // Reproduce the crash window: the destination has been moved aside and
+        // the replacement never landed.
+        let mut backup_name = path.file_name().unwrap().to_os_string();
+        backup_name.push(".ember-replace-bak");
+        let backup = path.with_file_name(backup_name);
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(!path.exists());
+
+        let recovered = load_known2_met(&path).expect("parked hashsets must still load");
+        let restored_in_place = path.exists();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+
+        assert_eq!(recovered.len(), 1, "the parked hashset must be recovered");
+        assert_eq!(recovered[0].0, [0x77; 20]);
+        assert_eq!(recovered[0].1, vec![[0x88; 20], [0x99; 20]]);
+        assert!(restored_in_place, "the parked copy should be restored in place");
     }
 }

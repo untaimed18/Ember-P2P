@@ -693,6 +693,42 @@ impl EmberDht {
         self.routing.get_contact(node_id)
     }
 
+    /// Whether a routing-table contact we have *actually heard from* vouches for
+    /// a firewalled source trailer's buddy endpoint.
+    ///
+    /// This is the half [`SourceBuddy::endorsement_covers`] cannot supply. That
+    /// predicate proves only that whoever authored the trailer holds the private
+    /// key for the trailer's *own* `ed25519_pub` — and a publisher is free to
+    /// generate that keypair itself, then sign any endpoint it likes. The
+    /// signature is therefore self-referential: it binds the endorsement to no
+    /// one, and a publisher could name a third party's address and have every
+    /// searcher open an unsolicited handshake to it.
+    ///
+    /// So the named identity must also be one we independently know at exactly
+    /// the address and keys the trailer claims. [`EmberContact::is_verified`] is
+    /// required rather than mere residency: a contact we were only *told* about
+    /// (gossip from `FOUND_NODE`/`PEER_LIST`, or a `nodes_ember.dat` restore,
+    /// both of which arrive with `last_seen == 0`) is itself third-party
+    /// hearsay, so accepting one would leave the same aiming primitive one hop
+    /// further back.
+    ///
+    /// Failing this parks the source rather than dropping it, and the caller
+    /// retries on the `CALLBACK_REQ` reask cadence — so an honest buddy we have
+    /// simply not met yet becomes dialable as soon as ordinary DHT traffic
+    /// verifies it, without us sending anything to an unverified endpoint.
+    pub fn buddy_endpoint_corroborated(&self, buddy: &SourceBuddy) -> bool {
+        let Some(id) = buddy.node_id() else {
+            return false;
+        };
+        let Some(contact) = self.routing.get_contact(&EmberNodeId(id)) else {
+            return false;
+        };
+        contact.is_verified()
+            && contact.addr == SocketAddr::new(std::net::IpAddr::V4(buddy.ip), buddy.udp_port)
+            && contact.ed25519_pub == buddy.ed25519_pub
+            && contact.noise_pub == buddy.noise_pub
+    }
+
     /// Contacts worth persisting for the next session: proven, healthy, and
     /// closest to home first. See
     /// [`RoutingTable::export_bootstrap_contacts`].
@@ -1291,17 +1327,17 @@ impl EmberDht {
     ///
     /// Knowing fewer than k contacts means we are among the k closest by
     /// definition, so everything is stored.
+    ///
+    /// Asked once per record, so a 64-record `STORE_BATCH` asks it 64 times for
+    /// one datagram — which is why it takes the k-th distance straight from the
+    /// routing table rather than materialising the k closest contacts and
+    /// reading the last one's.
     fn store_proximity_ok(&self, key: &[u8; 16]) -> bool {
         let key_id = EmberNodeId(*key);
-        let closest = self.routing.find_closest(&key_id, K_BUCKET_SIZE);
-        if closest.len() < K_BUCKET_SIZE {
+        let Some(kth) = self.routing.kth_closest_distance(&key_id, K_BUCKET_SIZE) else {
             return true;
-        }
+        };
         let ours = self.local_id.distance(&key_id);
-        let kth = closest
-            .last()
-            .map(|c| c.node_id.distance(&key_id))
-            .unwrap_or(EmberNodeId([0xFF; 16]));
         ours.0 <= kth.0
     }
 
@@ -1608,8 +1644,19 @@ impl EmberDht {
         self.store.reject_stats()
     }
 
+    /// Records refused because nothing could have parsed them: the inbound
+    /// frames wire decode turned away, plus the bodies the store's own length
+    /// floor refused.
+    ///
+    /// One cause reached from two sides. `accept_record` bails at `from_wire`
+    /// before the store is asked, so the wire path can only ever reach the
+    /// first; the paths that skip wire decode entirely — `store_own_record`,
+    /// the proxy replica, restore — can only ever reach the second. Nothing
+    /// double-counts, and splitting them would leave the store's half with no
+    /// diagnostic surfacing it.
     pub fn store_reject_verify(&self) -> u64 {
         self.store_reject_verify
+            .saturating_add(self.store.reject_stats().unparseable)
     }
 
     pub fn store_reject_source_ip(&self) -> u64 {
@@ -2300,6 +2347,16 @@ fn intersect_find_value_records(
         if blobs.len() >= messages::MAX_FOUND_VALUE_RECORDS {
             break;
         }
+        // Nothing this key can hold fits in what is left, so the rest of the
+        // scan can only re-decide what has already been decided: `next` is
+        // whichever of the two markers is smaller and both are fixed by here.
+        // Left as a `continue` the loop touched every record under the key —
+        // a thousand of them since the wire-v3 capacity raise — once per
+        // inbound `FIND_VALUE`, on the task that also runs eD2K and KAD.
+        if used + messages::MIN_FOUND_VALUE_RECORD_BYTES > messages::MAX_FOUND_VALUE_RECORD_BYTES {
+            first_passed_over = first_passed_over.or(Some(i));
+            break;
+        }
         let cost = 2 + r.data.len() + 64;
         if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
             // Records vary in size, so keep scanning for a smaller one that
@@ -2333,7 +2390,13 @@ fn intersect_find_value_records(
     Some(FoundValueReply {
         key: primary,
         blobs,
-        withheld: n - next,
+        // Counted from the end of the window, not from `next`. Rewinding the
+        // resume point re-sends the records between the one it passed over and
+        // the end of this page, and charging those to `withheld` as well
+        // reported records this very reply is carrying as ones it could not
+        // carry — on the counters the spec names as the way to read how hard
+        // the datagram ceiling binds on real keys.
+        withheld: n - past_last_taken,
         next_position: next.min(u16::MAX as usize) as u16,
         total_available: n.min(u16::MAX as usize) as u16,
     })
@@ -2377,18 +2440,38 @@ fn intersect_live_records<'a>(
 
     let mut allowed: Option<HashSet<[u8; 16]>> = None;
     for key in keys.iter().skip(1) {
-        let secondary = store.get_live(key);
-        if secondary.is_empty() {
+        // Iterated, not collected: a secondary key is read only for the file
+        // hashes its records declare, and a hot key holds up to
+        // `MAX_RECORDS_PER_KEY` of them. Collecting each of the seven a
+        // `FIND_VALUE` may carry was an allocation per key, per datagram.
+        let mut held = false;
+        let mut narrowed: HashSet<[u8; 16]> = HashSet::new();
+        for r in store.live_records(key) {
+            held = true;
+            let Some(hash) = file_hash_from_record_data(&r.data) else {
+                continue;
+            };
+            // Built against what is still a candidate rather than at the
+            // secondary's own size and intersected afterwards, so the working
+            // set only ever shrinks. Identical result: intersection is
+            // commutative and a hash the previous keys dropped cannot return.
+            if allowed.as_ref().is_none_or(|prev| prev.contains(&hash)) {
+                narrowed.insert(hash);
+            }
+        }
+        // Sparse-DHT locality: a key this node does not hold is skipped rather
+        // than treated as an empty intersection.
+        if !held {
             continue;
         }
-        let hashes: HashSet<[u8; 16]> = secondary
-            .iter()
-            .filter_map(|r| file_hash_from_record_data(&r.data))
-            .collect();
-        allowed = Some(match allowed {
-            None => hashes,
-            Some(prev) => prev.intersection(&hashes).copied().collect(),
-        });
+        let exhausted = narrowed.is_empty();
+        allowed = Some(narrowed);
+        // No candidates left, and none can come back. The primary is then
+        // served unfiltered (see below), so the remaining keys cannot change
+        // the answer and reading them would only cost the scan.
+        if exhausted {
+            break;
+        }
     }
 
     let filtered: Vec<&_> = match &allowed {
@@ -3290,6 +3373,176 @@ mod tests {
             seen.len(),
             names.len(),
             "every record must be reachable, including the oversized one"
+        );
+    }
+
+    /// `withheld` is what lies past a page's window, and a page that rewinds its
+    /// resume point does not withhold the records it just served. Counting from
+    /// `next_position` instead had a reply carrying three of four records report
+    /// three of them as ones it could not carry — on the counter pair the spec
+    /// names as the way to read how hard the datagram ceiling binds on real keys.
+    #[test]
+    fn a_rewound_page_does_not_report_what_it_served_as_withheld() {
+        let mut a = dht(44);
+        let mut b = dht(45);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(44, 4672);
+
+        // The same shape as `a_record_skipped_mid_page_is_served_by_a_later_one`:
+        // one record at the body cap, which nothing can share a datagram with,
+        // stored second so the packer passes over it and keeps scanning.
+        let big_name =
+            "b".repeat(messages::MAX_STORE_RECORD_BYTES - super::super::publish::RECORD_HEADER_LEN);
+        let names: Vec<&str> = vec!["small-one.iso", &big_name, "small-two.iso", "small-three.iso"];
+
+        let mut key = [0u8; 16];
+        for (i, name) in names.iter().enumerate() {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i as u8;
+            let record = a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 4096, name);
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000 + i as i64)
+                    .stored_record,
+                "record {i} should be accepted"
+            );
+        }
+
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(on_b.find_value_hit);
+        assert_eq!(
+            on_b.find_value_withheld, 0,
+            "the page reached the end of the key, so nothing lies past its window"
+        );
+    }
+
+    /// The packer stops scanning a key once the budget left on the page cannot
+    /// fit the smallest record the store will hold. That floor was the wire
+    /// format's — a length prefix and a signature around an empty body — for as
+    /// long as nothing bounded a record body from below, and at 66 bytes it
+    /// fired only when the budget was all but spent: on a key of similarly
+    /// sized records, never at all. `MIN_STORE_RECORD_BYTES` at acceptance
+    /// raises it to what a record really costs.
+    ///
+    /// Stopping sooner has to be invisible from the outside. No record that
+    /// could still have fitted can lie past the stop, because none costs less
+    /// than the floor — so the page must serve the same blobs, resume at the
+    /// same offset and withhold the same count as a scan that walked the key to
+    /// its end.
+    #[test]
+    fn the_tightened_pack_floor_serves_the_page_the_old_one_did() {
+        /// What `MIN_FOUND_VALUE_RECORD_BYTES` was while a record body was
+        /// bounded from above only. Spelled out here rather than exported: only
+        /// this comparison has any use for it.
+        const FORMAT_FLOOR: usize = 2 + 64;
+
+        let mut a = dht(46);
+        let mut b = dht(47);
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(46, 4672);
+        let b_addr = addr(47, 4672);
+
+        // One name length for every record, so what a datagram holds is a plain
+        // division — with a remainder too small for another record but larger
+        // than the format floor, which is the case the two floors disagree on.
+        const PUBLISHED: usize = 20;
+        let mut key = [0u8; 16];
+        for i in 0..PUBLISHED {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i as u8;
+            let record = a.build_keyword_record(
+                "ubuntu",
+                file_hash,
+                [0u8; 32],
+                4096,
+                &format!("ubuntu-server-22.04.{i:02}-amd64-live.iso"),
+            );
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(
+                b.handle_message(&bytes, a_addr, a_noise, 1000)
+                    .stored_record,
+                "record {i} should be accepted"
+            );
+        }
+
+        // What the responder holds, in the order the packer walks it.
+        let held: Vec<(usize, [u8; 16])> = b
+            .store
+            .get_live(&key)
+            .iter()
+            .map(|r| {
+                (
+                    2 + r.data.len() + 64,
+                    file_hash_from_record_data(&r.data).expect("a stored record"),
+                )
+            })
+            .collect();
+        assert_eq!(held.len(), PUBLISHED);
+
+        // The same first-fit walk with no early stop at all — the answer the
+        // tightened floor has to reproduce.
+        let mut used = 0usize;
+        let mut expected: Vec<[u8; 16]> = Vec::new();
+        let mut past_last_taken = 0usize;
+        let mut first_passed_over: Option<usize> = None;
+        for (i, (cost, hash)) in held.iter().enumerate() {
+            if used + cost > messages::MAX_FOUND_VALUE_RECORD_BYTES {
+                first_passed_over = first_passed_over.or(Some(i));
+                continue;
+            }
+            used += cost;
+            expected.push(*hash);
+            past_last_taken = i + 1;
+        }
+        assert!(
+            past_last_taken < PUBLISHED,
+            "the key has to overflow a datagram for any of this to be in play"
+        );
+
+        let left = messages::MAX_FOUND_VALUE_RECORD_BYTES - used;
+        assert!(
+            left < messages::MIN_FOUND_VALUE_RECORD_BYTES,
+            "the tightened floor has to stop this page, or it is not under test"
+        );
+        assert!(
+            left >= FORMAT_FLOOR,
+            "and the format floor must not, or both floors are the same test"
+        );
+
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![key]);
+        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
+        assert!(on_b.find_value_hit);
+        let page = a
+            .handle_message(&on_b.responses[0], b_addr, b_noise, 1002)
+            .found_value
+            .expect("FOUND_VALUE");
+
+        assert_eq!(
+            page.records
+                .iter()
+                .filter_map(|blob| file_hash_from_record_data(blob))
+                .collect::<Vec<_>>(),
+            expected,
+            "the page must serve exactly what a full scan would have"
+        );
+        assert_eq!(
+            page.next_position as usize,
+            first_passed_over.unwrap_or(past_last_taken),
+            "and resume where a full scan would have"
+        );
+        assert_eq!(
+            on_b.find_value_withheld as usize,
+            PUBLISHED - past_last_taken,
+            "and withhold what lies past its window"
+        );
+        assert_eq!(page.total_available as usize, PUBLISHED);
+        assert!(
+            page.next_position > 0,
+            "the record at the start faces an untouched budget, so a page always advances"
         );
     }
 

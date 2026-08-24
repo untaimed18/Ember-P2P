@@ -1,6 +1,7 @@
 use crate::app_state::AppState;
 use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
+use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::types::{Transfer, TransferDirection, TransferStatus};
 use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
@@ -556,6 +557,7 @@ pub async fn download_collection_files(
             completed_size: 0,
             started_at: chrono::Utc::now().timestamp(),
             failure_reason: None,
+            failure_code: None,
             failure_kind: None,
             failure_stage: None,
             priority: "auto".to_string(),
@@ -567,6 +569,7 @@ pub async fn download_collection_files(
             last_received: None,
             health: crate::types::TransferHealth::Healthy,
             health_reason: None,
+            health_code: None,
             stalled_since: None,
             category: String::new(),
             wait_time: 0,
@@ -672,7 +675,7 @@ pub async fn download_collection_files(
                     let mut mgr = state.transfer_manager.write().await;
                     let _ = mgr.fail(
                         &transfer_id,
-                        "Network channel unavailable",
+                        TransferFailureCode::NetworkChannelUnavailable,
                         Some("permanent".to_string()),
                         None,
                     );
@@ -725,7 +728,7 @@ pub async fn download_collection_files(
                     let mut mgr = state.transfer_manager.write().await;
                     let _ = mgr.fail(
                         &transfer_id,
-                        "Network channel unavailable",
+                        TransferFailureCode::NetworkChannelUnavailable,
                         Some("permanent".to_string()),
                         None,
                     );

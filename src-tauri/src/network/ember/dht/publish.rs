@@ -293,13 +293,26 @@ impl SourceBuddy {
         crypto::node_id_from_ed25519_bytes(&self.ed25519_pub)
     }
 
-    /// Whether the buddy really signed this endpoint, for this publisher, and
-    /// the signature has not lapsed.
+    /// Whether the endorsement in this trailer is a well-formed, live signature
+    /// over this endpoint, bound to this publisher.
     ///
-    /// This is the whole defence. The publisher chose the bytes in the trailer,
-    /// but it cannot produce this signature for an endpoint whose private key
-    /// it does not hold — so either the endpoint belongs to a node that agreed
-    /// to receive `CALLBACK_REQ` there, or the record does not pass here.
+    /// **This is only half the check, and it is the weaker half.** The signature
+    /// verifies under [`Self::ed25519_pub`], which the publisher also supplies,
+    /// so all it establishes is that whoever wrote the trailer holds the private
+    /// key for the key *in* the trailer. A publisher can generate a throwaway
+    /// keypair and sign any endpoint with it, including a third party's — the
+    /// endorsement would verify here and the endpoint would still be a
+    /// reflection target. What it does buy: the endorsement cannot be lifted
+    /// from another publisher's record (`publisher_id` is signed), cannot be
+    /// moved to a different endpoint after signing, and cannot outlive
+    /// `endorsed_until`.
+    ///
+    /// The binding to a real identity comes from
+    /// `EmberDht::buddy_endpoint_corroborated`, and
+    /// [`DiscoveredSource::takes_callback`] requires both. On the publisher side
+    /// the binding instead comes from the authenticated frame sender — see
+    /// `EmberDht::absorb_buddy_endorsement`, which refuses an endorsement whose
+    /// key does not derive to the node ID the frame was attributed to.
     pub fn endorsement_covers(&self, publisher_id: &[u8; 16], now: i64) -> bool {
         if !self.is_routable() || !self.has_identity() {
             return false;
@@ -391,11 +404,26 @@ impl DiscoveredSource {
     /// back to the firewalled EPX park path rather than dropping the source or
     /// TCP-dialling the unverified NAT address.
     ///
-    /// This is the complete gate: it needs no routing-table lookup and no
-    /// network round trip, so no caller can reach the dial path having checked
-    /// less than this.
-    pub fn takes_callback(&self, searcher_tcp_firewalled: bool, now: i64) -> bool {
+    /// `buddy_endpoint_corroborated` **must** come from
+    /// `EmberDht::buddy_endpoint_corroborated`, which asks whether a contact we
+    /// have actually heard from holds the trailer's address and keys. It is a
+    /// required argument rather than something this function derives because
+    /// `DiscoveredSource` has no routing table — but it is not optional
+    /// *information*: [`SourceBuddy::endorsement_covers`] verifies the
+    /// endorsement under a key the publisher itself supplies, so on its own it
+    /// binds the endpoint to nobody. Passing `true` without asking the routing
+    /// table re-opens a third-party reflection primitive; there is no caller for
+    /// which that is correct.
+    pub fn takes_callback(
+        &self,
+        searcher_tcp_firewalled: bool,
+        buddy_endpoint_corroborated: bool,
+        now: i64,
+    ) -> bool {
         if searcher_tcp_firewalled {
+            return false;
+        }
+        if !buddy_endpoint_corroborated {
             return false;
         }
         if self.flags & crate::network::ember::SOURCE_FLAG_FIREWALLED == 0 {
@@ -902,22 +930,42 @@ mod tests {
     }
 
     /// A buddy that really did sign its own endpoint for `publisher_id`.
-    fn endorsed_buddy(buddy_sk: &SigningKey, publisher_id: &[u8; 16], until: i64) -> SourceBuddy {
-        let signed = buddy_endorsement_signing_bytes(
-            BUDDY_IP,
-            BUDDY_UDP,
-            &BUDDY_NOISE,
-            publisher_id,
-            until,
-        );
+    /// Sign an endorsement over an **arbitrary** endpoint.
+    ///
+    /// The point of taking the endpoint as a parameter rather than hardcoding
+    /// [`BUDDY_IP`] is that it lets a test sign over a victim's address *from
+    /// the start*. Building an honest buddy and then overriding `ip` afterwards
+    /// via struct-update syntax produces a signature/endpoint mismatch, which
+    /// fails for the wrong reason and cannot exercise the aiming attack at all.
+    fn endorsed_buddy_at(
+        buddy_sk: &SigningKey,
+        ip: Ipv4Addr,
+        udp_port: u16,
+        noise_pub: [u8; 32],
+        publisher_id: &[u8; 16],
+        until: i64,
+    ) -> SourceBuddy {
+        let signed =
+            buddy_endorsement_signing_bytes(ip, udp_port, &noise_pub, publisher_id, until);
         SourceBuddy {
-            ip: BUDDY_IP,
-            udp_port: BUDDY_UDP,
-            noise_pub: BUDDY_NOISE,
+            ip,
+            udp_port,
+            noise_pub,
             ed25519_pub: buddy_sk.verifying_key().to_bytes(),
             endorsed_until: until,
             endorsement: crypto::sign(buddy_sk, &signed),
         }
+    }
+
+    fn endorsed_buddy(buddy_sk: &SigningKey, publisher_id: &[u8; 16], until: i64) -> SourceBuddy {
+        endorsed_buddy_at(
+            buddy_sk,
+            BUDDY_IP,
+            BUDDY_UDP,
+            BUDDY_NOISE,
+            publisher_id,
+            until,
+        )
     }
 
     #[test]
@@ -1031,7 +1079,7 @@ mod tests {
                 callback_token: parsed.callback_token,
                 publisher_id: TEST_PUBLISHER,
             }
-            .takes_callback(false, 1_000),
+            .takes_callback(false, true, 1_000),
             "and so must park rather than be dialled"
         );
     }
@@ -1252,9 +1300,9 @@ mod tests {
         let now = 1_000_000i64;
         let buddy = endorsed_buddy(&buddy_sk, &TEST_PUBLISHER, now + 3600);
         let src = discovered_firewalled(Some(buddy));
-        assert!(src.takes_callback(false, now));
+        assert!(src.takes_callback(false, true, now));
         assert!(
-            !src.takes_callback(true, now),
+            !src.takes_callback(true, true, now),
             "a firewalled searcher must park, not CALLBACK_REQ"
         );
 
@@ -1262,7 +1310,7 @@ mod tests {
             flags: 0,
             ..src
         };
-        assert!(!highid.takes_callback(false, now));
+        assert!(!highid.takes_callback(false, true, now));
 
         // A different publisher cannot ride this endorsement, and with a zero
         // publisher id there is nothing for one to be bound to.
@@ -1270,13 +1318,13 @@ mod tests {
             publisher_id: [0u8; 16],
             ..src
         };
-        assert!(!no_id.takes_callback(false, now));
+        assert!(!no_id.takes_callback(false, true, now));
         let other_publisher = DiscoveredSource {
             publisher_id: [0x77u8; 16],
             ..src
         };
         assert!(
-            !other_publisher.takes_callback(false, now),
+            !other_publisher.takes_callback(false, true, now),
             "an endorsement lifted from another publisher's record must not verify"
         );
 
@@ -1285,7 +1333,7 @@ mod tests {
             ..buddy
         }));
         assert!(
-            !lan_buddy.takes_callback(false, now),
+            !lan_buddy.takes_callback(false, true, now),
             "unusable buddy must not take the callback path (park instead)"
         );
 
@@ -1294,37 +1342,49 @@ mod tests {
             ..buddy
         }));
         assert!(
-            !unendorsed.takes_callback(false, now),
+            !unendorsed.takes_callback(false, true, now),
             "a buddy with no identity key has no endorsement to check, so park"
         );
 
         let no_buddy = discovered_firewalled(None);
-        assert!(!no_buddy.takes_callback(false, now));
+        assert!(!no_buddy.takes_callback(false, true, now));
 
         let no_token = DiscoveredSource {
             callback_token: None,
             ..src
         };
-        assert!(!no_token.takes_callback(false, now));
+        assert!(!no_token.takes_callback(false, true, now));
 
         assert!(
-            !src.takes_callback(false, buddy.endorsed_until),
+            !src.takes_callback(false, true, buddy.endorsed_until),
             "an endorsement is not valid at the instant it lapses"
         );
-        assert!(!src.takes_callback(false, buddy.endorsed_until + 1));
+        assert!(!src.takes_callback(false, true, buddy.endorsed_until + 1));
     }
 
     /// The attack this whole mechanism exists to stop: a validly-signed
     /// firewalled source record for a popular file naming a victim's address as
     /// the buddy, so every reachable searcher opens an unsolicited Noise
-    /// handshake to it. The publisher chooses the trailer bytes freely, but it
-    /// cannot produce the victim's signature over them.
+    /// handshake to it.
+    ///
+    /// Note what the endorsement does **not** buy, asserted explicitly below: an
+    /// attacker who mints its own keypair and signs the victim's endpoint from
+    /// the start produces an endorsement that `endorsement_covers` accepts. The
+    /// signature is verified under a key the trailer itself carries, so it can
+    /// only ever prove self-consistency. The routing-table corroboration is what
+    /// actually refuses the aimed record, which is why `takes_callback` requires
+    /// both.
+    ///
+    /// An earlier version of this test appeared to cover the attack but did not:
+    /// it built an honest buddy and overrode `ip` afterwards, so every case
+    /// failed on a signature/endpoint mismatch and the self-minted-key path was
+    /// never reached.
     #[test]
     fn a_buddy_endpoint_its_owner_did_not_sign_is_never_dialled() {
         let buddy_sk = SigningKey::generate(&mut OsRng);
         let now = 1_000_000i64;
         let honest = endorsed_buddy(&buddy_sk, &TEST_PUBLISHER, now + 3600);
-        assert!(discovered_firewalled(Some(honest)).takes_callback(false, now));
+        assert!(discovered_firewalled(Some(honest)).takes_callback(false, true, now));
 
         let victim_ip = Ipv4Addr::new(9, 9, 9, 9);
         // Repoint the endpoint, keeping the real key and a real signature.
@@ -1337,21 +1397,38 @@ mod tests {
             },
         ] {
             assert!(
-                !discovered_firewalled(Some(aimed)).takes_callback(false, now),
+                !discovered_firewalled(Some(aimed)).takes_callback(false, true, now),
                 "moving any signed field must invalidate the endorsement"
             );
         }
 
-        // Substituting a key the attacker *does* hold changes the node ID the
-        // trailer names, so it is no longer the victim being named at all.
+        // The real attack: mint a keypair and sign the *victim's* endpoint with
+        // it from the start, so nothing is tampered with after signing.
         let attacker_sk = SigningKey::generate(&mut OsRng);
-        let self_signed = SourceBuddy {
-            ip: victim_ip,
-            ..endorsed_buddy(&attacker_sk, &TEST_PUBLISHER, now + 3600)
-        };
+        let aimed_at_victim = endorsed_buddy_at(
+            &attacker_sk,
+            victim_ip,
+            53,
+            [0xC1; 32],
+            &TEST_PUBLISHER,
+            now + 3600,
+        );
         assert!(
-            !discovered_firewalled(Some(self_signed)).takes_callback(false, now),
-            "the attacker can only sign for the endpoint it actually signed"
+            aimed_at_victim.endorsement_covers(&TEST_PUBLISHER, now),
+            "a self-minted endorsement over a victim endpoint is self-consistent \
+             and passes the signature check — this is precisely why the signature \
+             alone cannot be the gate"
+        );
+        assert!(
+            !discovered_firewalled(Some(aimed_at_victim)).takes_callback(false, false, now),
+            "an endpoint no verified contact holds must never be dialled"
+        );
+        // And the honest buddy is refused on the same footing when we have not
+        // actually met it, so the corroboration is load-bearing rather than
+        // incidental to some other field.
+        assert!(
+            !discovered_firewalled(Some(honest)).takes_callback(false, false, now),
+            "corroboration is required even for a genuinely honest endorsement"
         );
 
         // And the domain separator means a signature over the same fields
@@ -1366,6 +1443,6 @@ mod tests {
             endorsement: crypto::sign(&buddy_sk, &raw),
             ..honest
         };
-        assert!(!discovered_firewalled(Some(undomained)).takes_callback(false, now));
+        assert!(!discovered_firewalled(Some(undomained)).takes_callback(false, true, now));
     }
 }

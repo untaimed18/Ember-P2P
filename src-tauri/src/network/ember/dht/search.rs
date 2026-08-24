@@ -37,10 +37,17 @@ const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
 /// flooder now needs four distinct nodes on the shortlist to crowd the walk
 /// out early, instead of managing it alone.
 ///
-/// Charged per blob *offered*, not per blob accepted. Counting only what
-/// survives verification would leave junk free: it costs a slot in the dedup
-/// set and a signature check either way, and a peer that sends nothing but
-/// junk would never reach its own limit.
+/// Charged per *distinct* blob offered, not per blob accepted. Counting only
+/// what survives verification would leave junk free: a forged blob costs a slot
+/// in the dedup set and a signature check either way, and a peer that sends
+/// nothing but junk would never reach its own limit.
+///
+/// A repeat of a blob this search already holds is the one thing not charged,
+/// because the responder is not the only reason one arrives: a page resuming at
+/// a record it passed over re-sends the tail of the previous page by design.
+/// Duplicates cannot fill the result budget this cap protects — dedup drops
+/// them before `MAX_SEARCH_RESULTS` sees them — so charging for them only ever
+/// cut a well-stocked storer off part-way through its own key.
 const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 
 /// How many times one node may be queried within a single search.
@@ -595,13 +602,21 @@ impl IterativeSearch {
             if *offered >= MAX_RESULTS_PER_NODE {
                 continue;
             }
-            *offered += 1;
             // Dedup before the cap, not after: counting copies against
             // `MAX_SEARCH_RESULTS` is what let a well-replicated record end
             // the search before the closer hops were reached.
             if !self.seen_results.insert(*blake3::hash(&data).as_bytes()) {
+                // And before the *allowance*, because a page that resumes at a
+                // record it passed over deliberately re-sends everything
+                // between that record and the end of the previous page. Those
+                // duplicates cost bandwidth either way, but charging them here
+                // spent a well-stocked storer's offer allowance on records we
+                // already had, cutting it off before it ran out of either pages
+                // or key — so the searcher saw fewer *distinct* records than
+                // paging exists to reach.
                 continue;
             }
+            *offered += 1;
             // Check the signature before the blob takes a slot. Consumers
             // re-parse through `from_value_blob` and drop anything forged, so
             // a junk blob was never going to reach the caller — but until it
@@ -1725,6 +1740,75 @@ mod tests {
             MAX_PAGES_PER_NODE + 1,
             "the first query plus MAX_PAGES_PER_NODE follow-ups, and no more"
         );
+    }
+
+    /// A responder resuming at a record it passed over re-sends the tail of the
+    /// page it just served: the packer skips a record too large for the budget
+    /// *left*, then rewinds so a later page can lead with it. Those duplicates
+    /// cost bandwidth, and nothing can be done about that from here — but
+    /// charging them to the per-node offer allowance as well spent a
+    /// well-stocked storer's budget on records this search already held, cutting
+    /// it off before it ran out of either pages or key.
+    #[test]
+    fn a_re_sent_record_costs_bandwidth_but_not_offer_allowance() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let peer = make_contact(0xF0);
+        rt.add_contact(peer.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Four records that do not divide evenly into a datagram: record 1 is
+        // too large for the budget left after record 0, so page one takes 0, 2
+        // and 3 and resumes at 1. Page two leads with 1 — where it always fits —
+        // and re-sends 2 and 3 behind it.
+        const TOTAL: u16 = 4;
+        let script: [(u16, &[u16], u16); 2] = [(0, &[0, 2, 3], 1), (1, &[1, 2, 3], TOTAL)];
+
+        let mut blobs_on_the_wire = 0usize;
+        for (expected_start, served, next_position) in script {
+            let batch = search.next_to_query();
+            assert_eq!(batch.len(), 1, "only one node is known");
+            let query = &batch[0];
+            assert_eq!(query.start_position, expected_start);
+            blobs_on_the_wire += served.len();
+            let blobs = served
+                .iter()
+                .map(|i| signed_value_blob("ubuntu", *i))
+                .collect();
+            search.process_response(
+                query.request_id,
+                &peer.node_id,
+                vec![],
+                blobs,
+                Some(ValuePage {
+                    next_position,
+                    total_available: TOTAL,
+                }),
+            );
+        }
+
+        assert_eq!(
+            blobs_on_the_wire, 6,
+            "the rewind is what puts two of the four records on the wire twice"
+        );
+        assert_eq!(
+            search.results.len(),
+            TOTAL as usize,
+            "and every distinct record still reaches the caller exactly once"
+        );
+        assert_eq!(
+            search.offered_results.get(&peer.node_id).copied(),
+            Some(TOTAL as usize),
+            "the allowance is charged per distinct record, not per blob received"
+        );
+        assert!(
+            search.next_to_query().is_empty(),
+            "the key is exhausted, so there is nothing left to page"
+        );
+        assert!(search.poll_complete());
     }
 
     /// A responder that names an offset it has already served would otherwise

@@ -184,8 +184,11 @@ pub struct AppState {
     /// Deep-link payloads (ed2k:// URIs or `.emulecollection` file paths)
     /// captured from the launch arguments or a second instance's argv before
     /// the webview was ready to handle them. The frontend drains this buffer
-    /// via `take_pending_deep_links` on mount and whenever a
-    /// `deep-link-received` event wakes it. A synchronous `parking_lot::Mutex`
+    /// via `list_pending_deep_links` plus a per-payload `ack_pending_deep_link`
+    /// on mount and whenever a `deep-link-received` event wakes it — each
+    /// payload is acknowledged only after the user confirms it, so an
+    /// unconfirmed link survives a reload instead of being consumed by the
+    /// read. A synchronous `parking_lot::Mutex`
     /// is used because the single-instance callback runs on the OS event
     /// thread (no async context) and pushes into it directly.
     pub pending_deep_links: Arc<parking_lot::Mutex<Vec<PendingDeepLink>>>,

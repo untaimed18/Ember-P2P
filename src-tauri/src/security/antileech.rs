@@ -449,6 +449,11 @@ pub type SharedAntiLeechFilter = Arc<RwLock<AntiLeechFilter>>;
 /// are left unchanged.
 pub fn load_or_seed_defaults(data_dir: &Path, enabled: bool) -> AntiLeechFilter {
     let path = data_dir.join(DEFAULT_FILE_NAME);
+    // `save_to_file` publishes through `atomic_write`, whose Windows
+    // replace-fallback can park the only copy under the backup name. Without
+    // this, that absence reads as "never seeded" and the seed write below
+    // replaces a hand-edited pattern list with the factory defaults.
+    crate::security::recover_interrupted_replace(&path);
     if path.exists() {
         let loaded = AntiLeechFilter::load_from_file(&path, enabled);
         if is_unmodified_legacy_defaults(loaded.patterns()) {
@@ -817,6 +822,47 @@ MagicMule
             !loaded.patterns().iter().any(|p| p == "easyMule"),
             "custom lists must not be rewritten"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash inside `atomic_write`'s Windows replace-fallback leaves nothing at
+    /// `antileech.dat` and the only copy parked under the fixed
+    /// `.ember-replace-bak` name. Without a `recover_interrupted_replace` on the
+    /// load path that absence reads as "never seeded", so the seed write replaces
+    /// a hand-edited pattern list with the factory defaults and then overwrites
+    /// the parked copy — the user's edits are unrecoverable.
+    #[test]
+    fn load_or_seed_recovers_a_file_parked_by_an_interrupted_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-antileech-interrupted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DEFAULT_FILE_NAME);
+        let (custom, _) =
+            AntiLeechFilter::from_patterns(vec!["HandEdited".to_string()], true);
+        custom.save_to_file(&path).unwrap();
+
+        // Reproduce the crash window: the destination has been moved aside and
+        // the replacement never landed.
+        let mut backup_name = path.file_name().unwrap().to_os_string();
+        backup_name.push(".ember-replace-bak");
+        let backup = path.with_file_name(backup_name);
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(!path.exists());
+
+        let recovered = load_or_seed_defaults(&dir, true);
+        assert_eq!(
+            recovered.patterns(),
+            &["HandEdited".to_string()],
+            "the hand-edited list must be recovered, not replaced by factory defaults"
+        );
+        assert!(path.exists(), "the parked copy should be restored in place");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

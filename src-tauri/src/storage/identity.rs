@@ -10,6 +10,34 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::network::ember::crypto;
 use crate::network::kad::types::KadId;
 
+/// Contents written to the `identity.protected` tripwire once a wrapped
+/// identity has been stored. The scheme is recorded in the payload rather than
+/// inferred from the running platform, so a profile copied between machines
+/// still names the file the user actually has to recover.
+#[cfg(target_os = "windows")]
+const PROTECTION_MARKER: &[u8] = b"DPAPI-v1";
+#[cfg(not(target_os = "windows"))]
+const PROTECTION_MARKER: &[u8] = b"EMBRSEC-v1";
+
+fn protection_scheme_description(marker: &[u8]) -> &'static str {
+    if marker.starts_with(b"DPAPI") {
+        "a DPAPI-protected identity"
+    } else {
+        "an identity wrapped by this machine's key store"
+    }
+}
+
+fn protection_recovery_step(marker: &[u8]) -> &'static str {
+    if marker.starts_with(b"DPAPI") {
+        "Restore the identity.json that was protected for the original Windows user account, \
+         or delete identity.json and identity.protected together to consent to a new identity."
+    } else {
+        "Restore the identity.json that was wrapped on this machine (unlocking your login \
+         keyring first if it is locked), or delete identity.json and identity.protected \
+         together to consent to a new identity."
+    }
+}
+
 /// Persistent node identity, equivalent to eMule's preferencesKad.dat + preferences.dat.
 /// The KAD ID and user hash are generated once and reused across sessions so other
 /// nodes recognize us in their routing tables and credit systems.
@@ -120,7 +148,6 @@ impl NodeIdentity {
     /// generation.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
-        #[cfg(target_os = "windows")]
         let protected_marker = data_dir.join("identity.protected");
         // A crash inside `atomic_write`'s Windows replace-fallback can leave the
         // identity parked under its backup name with nothing at `path`. Reaching
@@ -129,21 +156,34 @@ impl NodeIdentity {
         // otherwise goes out of its way to refuse. Restore first; a no-op when
         // there is nothing parked.
         crate::security::recover_interrupted_replace(&path);
-        #[cfg(target_os = "windows")]
         crate::security::recover_interrupted_replace(&protected_marker);
         match std::fs::read(&path) {
             Ok(raw) => {
-                // Unwrap DPAPI at-rest protection. Legacy plaintext files pass
+                // Unwrap at-rest protection. Legacy plaintext files pass
                 // through unchanged and are re-saved in protected form below.
                 let was_protected = crate::storage::secret_store::is_protected(&raw);
-                #[cfg(target_os = "windows")]
-                if protected_marker.exists() && !was_protected {
-                    anyhow::bail!(
-                        "Identity protection downgrade detected at {}: this installation has \
-                         previously stored a DPAPI-protected identity, but identity.json is now \
-                         plaintext. Refusing the replacement to prevent silent identity takeover.",
-                        path.display()
-                    );
+                // Deliberately not gated on the platform. This tripwire was
+                // Windows-only while the Unix secret store was a documented
+                // pass-through and a plaintext identity.json was simply what
+                // Unix looked like; `secret_store` now really wraps on Unix, so
+                // an unguarded Unix build accepts a plaintext file carrying an
+                // attacker's keypair as a migration and re-wraps it as its own.
+                if let Ok(marker) = std::fs::read(&protected_marker) {
+                    if !was_protected {
+                        // The marker records which scheme wrapped the identity,
+                        // so a profile carried between platforms is still told
+                        // which file it actually needs back.
+                        let scheme = protection_scheme_description(&marker);
+                        let recovery = protection_recovery_step(&marker);
+                        anyhow::bail!(
+                            "Identity protection downgrade detected at {}: this installation has \
+                             previously stored {}, but identity.json is now plaintext. Refusing \
+                             the replacement to prevent silent identity takeover. {}",
+                            path.display(),
+                            scheme,
+                            recovery
+                        );
+                    }
                 }
                 let data = match crate::storage::secret_store::unprotect(&raw) {
                     Ok(d) => d,
@@ -196,8 +236,13 @@ impl NodeIdentity {
                 match serde_json::from_slice::<NodeIdentity>(&data) {
                     Ok(mut id) => {
                         // A legacy (unprotected) file is treated as needing
-                        // migration so it gets re-saved in DPAPI-wrapped form.
-                        let mut migrated = !was_protected;
+                        // migration so it gets re-saved in wrapped form. So is
+                        // one wrapped under a superseded scheme: a Unix
+                        // `EMBRSEC2`/`EMBRSEC3` blob is keyed by `$USER`, and it
+                        // only stops depending on that variable being exported
+                        // once it has been rewritten under the uid-keyed scheme.
+                        let mut migrated = !was_protected
+                            || crate::storage::secret_store::needs_rewrap(&raw);
 
                         // Migrate: older identities lack Ed25519 keys
                         if id.ed25519_secret_key == [0u8; 32] {
@@ -259,9 +304,12 @@ impl NodeIdentity {
                                 Zeroizing::new(crate::storage::secret_store::protect(&updated)?);
                             crate::security::atomic_write(&path, &protected, true)?;
                         }
-                        #[cfg(target_os = "windows")]
                         if was_protected || migrated {
-                            crate::security::atomic_write(&protected_marker, b"DPAPI-v1", true)?;
+                            crate::security::atomic_write(
+                                &protected_marker,
+                                PROTECTION_MARKER,
+                                true,
+                            )?;
                         }
                         info!(
                             "Loaded persistent identity (KAD ID={}…)",
@@ -303,8 +351,7 @@ impl NodeIdentity {
                 let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
                 std::fs::create_dir_all(data_dir)?;
                 crate::security::atomic_write(&path, &protected, true)?;
-                #[cfg(target_os = "windows")]
-                crate::security::atomic_write(&protected_marker, b"DPAPI-v1", true)?;
+                crate::security::atomic_write(&protected_marker, PROTECTION_MARKER, true)?;
                 info!(
                     "Generated new identity (KAD ID={}…)",
                     &hex::encode(id.kad_id)[..4]
@@ -326,10 +373,13 @@ impl NodeIdentity {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every platform now wraps the identity at rest, so a plaintext
+    /// `identity.json` next to a marker is an attacker's keypair being offered
+    /// as a migration on any of them — not just Windows.
     #[test]
     fn protected_marker_rejects_plaintext_replacement() {
         let dir = std::env::temp_dir().join(format!(
@@ -344,9 +394,19 @@ mod tests {
             serde_json::to_vec_pretty(&identity).unwrap(),
         )
         .unwrap();
-        std::fs::write(dir.join("identity.protected"), b"DPAPI-v1").unwrap();
+        std::fs::write(dir.join("identity.protected"), PROTECTION_MARKER).unwrap();
         let error = NodeIdentity::load_or_create(&dir).unwrap_err().to_string();
-        assert!(error.contains("downgrade"));
+        assert!(error.contains("downgrade"), "unexpected error: {error}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A marker travels with the profile, so the recovery step is chosen from
+    /// what wrapped the file rather than from the platform now reading it.
+    #[test]
+    fn recovery_step_follows_the_marker_not_the_host() {
+        assert!(protection_recovery_step(b"DPAPI-v1").contains("Windows user account"));
+        assert!(protection_recovery_step(b"EMBRSEC-v1").contains("keyring"));
+        assert!(protection_scheme_description(b"DPAPI-v1").contains("DPAPI"));
+        assert!(protection_scheme_description(b"EMBRSEC-v1").contains("key store"));
     }
 }

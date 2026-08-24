@@ -456,6 +456,11 @@ impl ReputationManager {
     /// `banned_until = u64::MAX` for a permanent ban, or
     /// `score = i32::MAX` to whitewash a known-bad peer).
     pub fn load_checked(path: &Path) -> Result<Self, String> {
+        // `save` publishes through `atomic_write`, whose Windows replace-fallback
+        // can leave the only copy parked under the backup name with nothing at
+        // `path`. Reading that as a first run un-bans every flooder, and the next
+        // 5-minute save overwrites the parked copy — making the loss permanent.
+        crate::security::recover_interrupted_replace(path);
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             // A missing file is the expected first-run state, not a
@@ -779,6 +784,46 @@ mod tests {
 
         assert_eq!(loaded.tracked_count(), 1);
         assert_eq!(loaded.score(&[30u8; 16]), SCORE_SUCCESSFUL_HANDSHAKE);
+    }
+
+    /// A crash inside `atomic_write`'s Windows replace-fallback leaves nothing at
+    /// `reputation.json` and the only copy parked under the fixed
+    /// `.ember-replace-bak` name. Without a `recover_interrupted_replace` on the
+    /// load path that absence reads as a first run, silently un-banning every
+    /// peer the ban database was holding — and the next save (every 5 minutes)
+    /// overwrites the parked copy, making it permanent.
+    #[test]
+    fn load_recovers_state_parked_by_an_interrupted_replace() {
+        let path = unique_temp_path("interrupted_replace");
+        let node_id = [32u8; 16];
+        let mut mgr = ReputationManager::new();
+        for _ in 0..10 {
+            mgr.record_event(&node_id, ReputationEvent::CorruptData);
+        }
+        assert!(mgr.is_banned(&node_id));
+        mgr.save(&path).expect("save reputation");
+
+        // Reproduce the crash window: the destination has been moved aside and
+        // the replacement never landed.
+        let mut backup_name = path.file_name().unwrap().to_os_string();
+        backup_name.push(".ember-replace-bak");
+        let backup = path.with_file_name(backup_name);
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(!path.exists());
+
+        let recovered = ReputationManager::load_checked(&path).unwrap();
+        let still_banned = recovered.is_banned(&node_id);
+        let tracked = recovered.tracked_count();
+        let restored_in_place = path.exists();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+
+        assert!(
+            still_banned,
+            "a ban must be recovered from the parked file, not reset to a clean first run"
+        );
+        assert_eq!(tracked, 1);
+        assert!(restored_in_place, "the parked copy should be restored in place");
     }
 
     #[test]

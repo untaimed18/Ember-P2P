@@ -67,6 +67,12 @@ impl PartialEq for ObjectIdentity {
 /// time can, when both records have it. A `0` value means "unknown" (Windows,
 /// old `approved_roots.json`, filesystems without `STATX_BTIME`) and is not
 /// treated as a mismatch, so an upgrade cannot revoke every existing approval.
+///
+/// The body happens to be symmetric today, but callers must still pass the
+/// persisted record as `stored` and the freshly-`lstat`ed one as `live`. The
+/// obvious tightening — honouring `0` only from `stored`, because a live stat on
+/// a btime-capable filesystem always reports one — reads as a no-op change and
+/// would silently fail open at any call site that had them the other way round.
 fn same_approved_object(stored: &ObjectIdentity, live: &ObjectIdentity) -> bool {
     stored == live
         && (stored.created_ns == 0 || live.created_ns == 0 || stored.created_ns == live.created_ns)
@@ -201,8 +207,8 @@ impl ApprovedRoot {
         let canonical = configured.canonicalize()?;
         let configured_identity = object_identity(&configured)?;
         let target_identity = object_identity(&canonical)?;
-        if !same_approved_object(&configured_identity, &self.configured_identity)
-            || !same_approved_object(&target_identity, &self.target_identity)
+        if !same_approved_object(&self.configured_identity, &configured_identity)
+            || !same_approved_object(&self.target_identity, &target_identity)
             || path_key(&canonical) != path_key(Path::new(&self.canonical))
         {
             return Err(io::Error::new(
@@ -2101,6 +2107,10 @@ mod tests {
         );
     }
 
+    /// Both orderings are asserted because the predicate is symmetric as
+    /// written, not because callers may choose an order: `verify` passes the
+    /// persisted record as `stored`. If a future change makes the `0` wildcard
+    /// one-sided, the second assertion here is the one expected to fail.
     #[test]
     fn same_approved_object_ignores_unknown_birth_time_but_not_a_known_mismatch() {
         let base = ObjectIdentity {

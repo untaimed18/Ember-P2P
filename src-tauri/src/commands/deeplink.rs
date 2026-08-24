@@ -251,9 +251,10 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
 /// Buffer `payloads` for the frontend and emit a wake signal.
 ///
 /// The buffer — not the event payload — is the single source of truth:
-/// `take_pending_deep_links` drains it atomically, so a cold-start link
-/// (buffered before any listener exists) and a running-instance link (buffered
-/// + signalled) flow through exactly the same path with no risk of
+/// `list_pending_deep_links` reads it and `ack_pending_deep_link` removes each
+/// entry only once its action has completed, so a cold-start link (buffered
+/// before any listener exists) and a running-instance link (buffered +
+/// signalled) flow through exactly the same path with no risk of
 /// double-processing. The main window is also brought forward so a link
 /// clicked while Ember is minimised or in the tray produces a visible result.
 pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
@@ -315,20 +316,6 @@ pub fn list_pending_deep_links(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PendingDeepLink>, String> {
     Ok(state.pending_deep_links.lock().clone())
-}
-
-/// Compatibility alias for older frontends. It intentionally no longer drains
-/// the queue, so a setup-wizard relaunch cannot lose unacknowledged links.
-#[tauri::command]
-pub fn take_pending_deep_links(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    Ok(state
-        .pending_deep_links
-        .lock()
-        .iter()
-        .map(|entry| entry.payload.clone())
-        .collect())
 }
 
 #[tauri::command]

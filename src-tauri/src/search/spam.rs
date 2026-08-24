@@ -372,6 +372,7 @@ impl StreamedSpamSnapshot {
             result_origin: self.result_origin.clone(),
             origin_server_ip: self.origin_server_ip.clone(),
             spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
         }
     }
 }
@@ -460,6 +461,160 @@ impl From<FifoSet> for Vec<String> {
     }
 }
 
+/// One named number a spam reason interpolates. A closed set rather than free
+/// strings so the placeholder names in the English below are the same names the
+/// UI's Paraglide messages declare, and a test can hold the two together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpamParam {
+    Weight,
+    Percent,
+    Count,
+    Votes,
+    Total,
+}
+
+impl SpamParam {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Weight => "weight",
+            Self::Percent => "percent",
+            Self::Count => "count",
+            Self::Votes => "votes",
+            Self::Total => "total",
+        }
+    }
+}
+
+/// Declares every reason the spam scorer can give for a verdict, each bound to
+/// a stable code and an English template.
+///
+/// The English is what logs and the `explain_spam_result` diagnostics read, and
+/// what a UI older than the backend falls back to. The code plus its numeric
+/// parameters are what the UI translates, so the eight non-English locales stop
+/// reading English in the spam tooltip.
+///
+/// One table for both halves is what keeps them honest: a variant cannot
+/// compile without a code and a template, and `scripts/backend-codes.test.mjs`
+/// parses this table to require both a translation in all nine locales and the
+/// same `{placeholders}` on each side.
+macro_rules! spam_reason_codes {
+    ($($variant:ident => $code:literal, $message:literal;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum SpamReasonCode {
+            $($variant,)+
+        }
+
+        impl SpamReasonCode {
+            /// Every variant, in declaration order. Only the exhaustiveness
+            /// tests walk the set, so it stays out of the shipped binary.
+            #[cfg(test)]
+            pub const ALL: &'static [SpamReasonCode] = &[$(SpamReasonCode::$variant,)+];
+
+            /// Stable identifier carried to the UI as `SpamReason::code`.
+            pub fn as_code(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $code,)+
+                }
+            }
+
+            /// English template; `{name}` placeholders are filled from the
+            /// [`SpamParam`]s the producer supplies.
+            pub fn message(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $message,)+
+                }
+            }
+        }
+    };
+}
+
+spam_reason_codes! {
+    NotSpamMarked => "not_spam_marked", "Manually marked as not spam";
+    KnownHash => "known_hash", "Known spam hash (+{weight})";
+    ExactFilename => "exact_filename", "Exact spam filename match (+{weight})";
+    VerySimilarName => "very_similar_name", "Very similar spam pattern ({percent}% match, +{weight})";
+    SimilarName => "similar_name", "Similar spam pattern ({percent}% match, +{weight})";
+    ReorderedName => "reordered_name", "Reordered spam pattern ({percent}% token match, +{weight})";
+    LooselySimilarName => "loosely_similar_name", "Loosely similar spam pattern ({percent}% match, +{weight})";
+    SizeSignature => "size_signature", "Matches known spam size signature (+{weight})";
+    FakePattern => "fake_pattern", "Contains known fake/suspicious pattern (+{weight})";
+    CommunityFakeMajority => "community_fake_majority",
+        "Majority of community ratings are 'fake' ({votes}/{total}, +{weight})";
+    CommunityFakeSome => "community_fake_some",
+        "Several community ratings are 'fake' ({votes}/{total}, +{weight})";
+    ResultRatedFake => "result_rated_fake", "Search result rated fake (+{weight})";
+    BatchNameManyHashes => "batch_name_many_hashes",
+        "Same filename advertised under {count} different hashes in this search (+{weight})";
+    BatchHashManyNames => "batch_hash_many_names",
+        "Same file advertised under {count} different names in this search (+{weight})";
+    BatchSourceConcentration => "batch_source_concentration",
+        "Sources dominated by a result-flooding IP (+{weight})";
+    SpamSourceIp => "spam_source_ip", "Source IP seen in spam hits (+{weight})";
+    SpamServerAllSources => "spam_server_all_sources",
+        "Result from spam-heavy server, all sources spam (+{weight})";
+    SpamServerInfluence => "spam_server_influence", "Result influenced by spam server (+{weight})";
+    ServerRatioHigh => "server_ratio_high", "Server spam ratio is high ({percent}%, +{weight})";
+    ServerRatioElevated => "server_ratio_elevated",
+        "Server spam ratio is elevated ({percent}%, +{weight})";
+    AggressiveBoost => "aggressive_boost", "Aggressive profile sensitivity boost (+{weight})";
+    NoSignals => "no_signals", "No strong spam signals";
+}
+
+/// One scored spam signal: a stable code, the numbers its message interpolates,
+/// and the English the code renders to.
+///
+/// `text` is redundant with `code` for any UI that knows the code, and is kept
+/// anyway — it is what the tooltip shows on a frontend that predates the code,
+/// and what makes a logged explanation readable without a message catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpamReason {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    pub text: String,
+}
+
+impl SpamReason {
+    fn new(code: SpamReasonCode, params: &[(SpamParam, u32)]) -> Self {
+        let mut reason = SpamReason {
+            code: code.as_code().to_string(),
+            weight: None,
+            percent: None,
+            count: None,
+            votes: None,
+            total: None,
+            text: code.message().to_string(),
+        };
+        for &(param, value) in params {
+            reason.text = reason
+                .text
+                .replace(&format!("{{{}}}", param.name()), &value.to_string());
+            match param {
+                SpamParam::Weight => reason.weight = Some(value),
+                SpamParam::Percent => reason.percent = Some(value),
+                SpamParam::Count => reason.count = Some(value),
+                SpamParam::Votes => reason.votes = Some(value),
+                SpamParam::Total => reason.total = Some(value),
+            }
+        }
+        reason
+    }
+}
+
+/// A similarity or share expressed as a whole percent, matching the `{:.0}`
+/// these messages used before they carried the number as a parameter.
+fn as_percent(fraction: f64) -> u32 {
+    (fraction * 100.0).round().clamp(0.0, 100.0) as u32
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpamExplanation {
     pub score: u32,
@@ -467,6 +622,11 @@ pub struct SpamExplanation {
     pub profile: String,
     pub is_spam: bool,
     pub reasons: Vec<String>,
+    /// The same reasons, each with the discriminator and numbers the UI needs
+    /// to render them in the active locale. Additive: `reasons` above stays the
+    /// authoritative English for logs and for older frontends.
+    #[serde(default)]
+    pub reason_details: Vec<SpamReason>,
 }
 
 /// Per-hash undo record so Mark Not Spam can reverse the collateral that
@@ -802,17 +962,16 @@ impl SpamFilter {
         let network_signals = profile != SpamFilterProfile::Relaxed;
 
         if self.db.not_spam_hashes.contains(&hash) {
-            return SpamExplanation {
-                score: 0,
+            return Self::explanation(
+                0,
                 threshold,
-                profile: profile_name(profile),
-                is_spam: false,
-                reasons: vec!["Manually marked as not spam".to_string()],
-            };
+                profile,
+                vec![SpamReason::new(SpamReasonCode::NotSpamMarked, &[])],
+            );
         }
 
         let mut score: u32 = 0;
-        let mut reasons = Vec::new();
+        let mut reasons: Vec<SpamReason> = Vec::new();
         // Aggressive ×1.2 is for corroborated spam (hash, exact name, URL /
         // strong token, batch name/hash collision). Similar-name + size of
         // two legitimate ISOs must not cross the Aggressive threshold alone.
@@ -820,7 +979,10 @@ impl SpamFilter {
 
         if self.db.spam_hashes.contains(&hash) {
             score += SPAM_FILEHASH_HIT;
-            reasons.push(format!("Known spam hash (+{SPAM_FILEHASH_HIT})"));
+            reasons.push(SpamReason::new(
+                SpamReasonCode::KnownHash,
+                &[(SpamParam::Weight, SPAM_FILEHASH_HIT)],
+            ));
             strong_local = true;
         }
 
@@ -833,7 +995,10 @@ impl SpamFilter {
                     SPAM_FULLNAME_HIT
                 };
                 score += bump;
-                reasons.push(format!("Exact spam filename match (+{bump})"));
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::ExactFilename,
+                    &[(SpamParam::Weight, bump)],
+                ));
                 if bump >= SPAM_FULLNAME_HIT {
                     strong_local = true;
                 }
@@ -863,27 +1028,45 @@ impl SpamFilter {
                 };
                 if sim > 0.95 {
                     score += SPAM_SIMILARNAME_HIT;
-                    reasons.push(format!(
-                        "Very similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_HIT})",
-                        sim * 100.0
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::VerySimilarName,
+                        &[
+                            (SpamParam::Percent, as_percent(sim)),
+                            (SpamParam::Weight, SPAM_SIMILARNAME_HIT),
+                        ],
                     ));
                     break;
                 } else if sim > 0.85 {
                     score += SPAM_SIMILARNAME_NEARHIT;
-                    reasons.push(format!(
-                        "Similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_NEARHIT})",
-                        sim * 100.0
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::SimilarName,
+                        &[
+                            (SpamParam::Percent, as_percent(sim)),
+                            (SpamParam::Weight, SPAM_SIMILARNAME_NEARHIT),
+                        ],
                     ));
                     break;
                 } else {
                     let jac = jaccard(&stripped_tokens, similar_tokens);
                     if jac >= SIMILAR_NAME_JACCARD_HIT {
                         score += SPAM_SIMILARNAME_NEARHIT;
-                        reasons.push(format!("Reordered spam pattern ({:.0}% token match, +{SPAM_SIMILARNAME_NEARHIT})", jac * 100.0));
+                        reasons.push(SpamReason::new(
+                            SpamReasonCode::ReorderedName,
+                            &[
+                                (SpamParam::Percent, as_percent(jac)),
+                                (SpamParam::Weight, SPAM_SIMILARNAME_NEARHIT),
+                            ],
+                        ));
                         break;
                     } else if sim > 0.70 {
                         score += SPAM_SIMILARNAME_FARHIT;
-                        reasons.push(format!("Loosely similar spam pattern ({:.0}% match, +{SPAM_SIMILARNAME_FARHIT})", sim * 100.0));
+                        reasons.push(SpamReason::new(
+                            SpamReasonCode::LooselySimilarName,
+                            &[
+                                (SpamParam::Percent, as_percent(sim)),
+                                (SpamParam::Weight, SPAM_SIMILARNAME_FARHIT),
+                            ],
+                        ));
                         break;
                     }
                 }
@@ -896,8 +1079,9 @@ impl SpamFilter {
                 && (spam_size == 0 || (diff as f64 / spam_size as f64) < SIZE_TOLERANCE_PERCENT)
             {
                 score += SPAM_SIMILARSIZE_HIT;
-                reasons.push(format!(
-                    "Matches known spam size signature (+{SPAM_SIMILARSIZE_HIT})"
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::SizeSignature,
+                    &[(SpamParam::Weight, SPAM_SIMILARSIZE_HIT)],
                 ));
                 break;
             }
@@ -906,8 +1090,9 @@ impl SpamFilter {
         let pattern_score = fake_pattern_score(name);
         if pattern_score > 0 {
             score += pattern_score;
-            reasons.push(format!(
-                "Contains known fake/suspicious pattern (+{pattern_score})"
+            reasons.push(SpamReason::new(
+                SpamReasonCode::FakePattern,
+                &[(SpamParam::Weight, pattern_score)],
             ));
             if fake_pattern_is_strong(name) {
                 strong_local = true;
@@ -920,9 +1105,13 @@ impl SpamFilter {
             let frac = community.fake_votes as f32 / community.total_votes as f32;
             if frac >= FAKE_RATING_MAJORITY {
                 score += SPAM_FAKE_RATING_HIT;
-                reasons.push(format!(
-                    "Majority of community ratings are 'fake' ({}/{}, +{SPAM_FAKE_RATING_HIT})",
-                    community.fake_votes, community.total_votes
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::CommunityFakeMajority,
+                    &[
+                        (SpamParam::Votes, community.fake_votes),
+                        (SpamParam::Total, community.total_votes),
+                        (SpamParam::Weight, SPAM_FAKE_RATING_HIT),
+                    ],
                 ));
                 community_applied = true;
                 // ≥3-vote majority is enough corroboration for Aggressive ×1.2
@@ -930,9 +1119,13 @@ impl SpamFilter {
                 strong_local = true;
             } else if frac >= FAKE_RATING_SOME {
                 score += SPAM_FAKE_RATING_NEARHIT;
-                reasons.push(format!(
-                    "Several community ratings are 'fake' ({}/{}, +{SPAM_FAKE_RATING_NEARHIT})",
-                    community.fake_votes, community.total_votes
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::CommunityFakeSome,
+                    &[
+                        (SpamParam::Votes, community.fake_votes),
+                        (SpamParam::Total, community.total_votes),
+                        (SpamParam::Weight, SPAM_FAKE_RATING_NEARHIT),
+                    ],
                 ));
                 community_applied = true;
             }
@@ -941,8 +1134,9 @@ impl SpamFilter {
         // weak prior, not enough to hide a row on its own.
         if network_signals && !community_applied && result.rating == Some(1) {
             score += SPAM_FAKE_RATING_NEARHIT;
-            reasons.push(format!(
-                "Search result rated fake (+{SPAM_FAKE_RATING_NEARHIT})"
+            reasons.push(SpamReason::new(
+                SpamReasonCode::ResultRatedFake,
+                &[(SpamParam::Weight, SPAM_FAKE_RATING_NEARHIT)],
             ));
         }
 
@@ -950,23 +1144,32 @@ impl SpamFilter {
         if network_signals && batch.enabled {
             if batch.name_collision(&name_norm) {
                 score += SPAM_BATCH_NAME_MANY_HASHES_HIT;
-                reasons.push(format!(
-                    "Same filename advertised under {} different hashes in this search (+{SPAM_BATCH_NAME_MANY_HASHES_HIT})",
-                    batch.name_hash_count(&name_norm)
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::BatchNameManyHashes,
+                    &[
+                        (SpamParam::Count, batch.name_hash_count(&name_norm) as u32),
+                        (SpamParam::Weight, SPAM_BATCH_NAME_MANY_HASHES_HIT),
+                    ],
                 ));
                 strong_local = true;
             }
             if batch.hash_collision(&hash) {
                 score += SPAM_BATCH_HASH_MANY_NAMES_HIT;
-                reasons.push(format!(
-                    "Same file advertised under {} different names in this search (+{SPAM_BATCH_HASH_MANY_NAMES_HIT})",
-                    batch.hash_name_count(&hash)
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::BatchHashManyNames,
+                    &[
+                        (SpamParam::Count, batch.hash_name_count(&hash) as u32),
+                        (SpamParam::Weight, SPAM_BATCH_HASH_MANY_NAMES_HIT),
+                    ],
                 ));
                 strong_local = true;
             }
             if batch.source_concentrated(result) {
                 score += SPAM_BATCH_SOURCE_CONCENTRATION_HIT;
-                reasons.push(format!("Sources dominated by a result-flooding IP (+{SPAM_BATCH_SOURCE_CONCENTRATION_HIT})"));
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::BatchSourceConcentration,
+                    &[(SpamParam::Weight, SPAM_BATCH_SOURCE_CONCENTRATION_HIT)],
+                ));
             }
         }
 
@@ -980,7 +1183,10 @@ impl SpamFilter {
         }
         if spam_source_count > 0 {
             score += SPAM_SOURCE_HIT;
-            reasons.push(format!("Source IP seen in spam hits (+{SPAM_SOURCE_HIT})"));
+            reasons.push(SpamReason::new(
+                SpamReasonCode::SpamSourceIp,
+                &[(SpamParam::Weight, SPAM_SOURCE_HIT)],
+            ));
         }
 
         if let Some(sip) = server_ip.and_then(extract_ip) {
@@ -994,26 +1200,36 @@ impl SpamFilter {
                     total_sources > 0 && total_sources as u32 == spam_source_count;
                 if all_sources_spam || total_sources == 0 {
                     score += SPAM_UDPSERVERRES_HIT;
-                    reasons.push(format!("Result from spam-heavy server, all sources spam (+{SPAM_UDPSERVERRES_HIT})"));
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::SpamServerAllSources,
+                        &[(SpamParam::Weight, SPAM_UDPSERVERRES_HIT)],
+                    ));
                 } else {
                     score += SPAM_UDPSERVERRES_NEARHIT;
-                    reasons.push(format!(
-                        "Result influenced by spam server (+{SPAM_UDPSERVERRES_NEARHIT})"
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::SpamServerInfluence,
+                        &[(SpamParam::Weight, SPAM_UDPSERVERRES_NEARHIT)],
                     ));
                 }
             }
             if let Some(&ratio) = self.db.udp_server_spam_ratios.get(&sip) {
                 if ratio > 0.5 {
                     score += SPAM_ONLYUDPSPAMSERVERS_HIT;
-                    reasons.push(format!(
-                        "Server spam ratio is high ({:.0}%, +{SPAM_ONLYUDPSPAMSERVERS_HIT})",
-                        ratio * 100.0
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::ServerRatioHigh,
+                        &[
+                            (SpamParam::Percent, as_percent(ratio as f64)),
+                            (SpamParam::Weight, SPAM_ONLYUDPSPAMSERVERS_HIT),
+                        ],
                     ));
                 } else if ratio > 0.3 {
                     score += SPAM_UDPSERVERRES_FARHIT;
-                    reasons.push(format!(
-                        "Server spam ratio is elevated ({:.0}%, +{SPAM_UDPSERVERRES_FARHIT})",
-                        ratio * 100.0
+                    reasons.push(SpamReason::new(
+                        SpamReasonCode::ServerRatioElevated,
+                        &[
+                            (SpamParam::Percent, as_percent(ratio as f64)),
+                            (SpamParam::Weight, SPAM_UDPSERVERRES_FARHIT),
+                        ],
                     ));
                 }
             }
@@ -1022,24 +1238,36 @@ impl SpamFilter {
         if profile == SpamFilterProfile::Aggressive && strong_local {
             let boosted = (score as f32 * 1.2).round() as u32;
             if boosted > score {
-                reasons.push(format!(
-                    "Aggressive profile sensitivity boost (+{})",
-                    boosted - score
+                reasons.push(SpamReason::new(
+                    SpamReasonCode::AggressiveBoost,
+                    &[(SpamParam::Weight, boosted - score)],
                 ));
                 score = boosted;
             }
         }
 
         if reasons.is_empty() {
-            reasons.push("No strong spam signals".to_string());
+            reasons.push(SpamReason::new(SpamReasonCode::NoSignals, &[]));
         }
 
+        Self::explanation(score, threshold, profile, reasons)
+    }
+
+    /// Wrap a scored reason list, deriving the English `reasons` from the coded
+    /// ones so the two lists cannot fall out of step.
+    fn explanation(
+        score: u32,
+        threshold: u32,
+        profile: SpamFilterProfile,
+        reason_details: Vec<SpamReason>,
+    ) -> SpamExplanation {
         SpamExplanation {
             score,
             threshold,
             profile: profile_name(profile),
             is_spam: Self::is_spam(score, profile),
-            reasons,
+            reasons: reason_details.iter().map(|r| r.text.clone()).collect(),
+            reason_details,
         }
     }
 
@@ -1640,6 +1868,7 @@ mod tests {
             result_origin: String::new(),
             origin_server_ip: None,
             spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
         }
     }
 
@@ -1648,6 +1877,185 @@ mod tests {
         r.file.size = size;
         r.source_addresses = sources.iter().map(|s| s.to_string()).collect();
         r
+    }
+
+    const ALL_SPAM_PARAMS: [SpamParam; 5] = [
+        SpamParam::Weight,
+        SpamParam::Percent,
+        SpamParam::Count,
+        SpamParam::Votes,
+        SpamParam::Total,
+    ];
+
+    /// The parameters a code's English template asks for, with distinct stand-in
+    /// values so a message that interpolates the wrong one is visible.
+    fn declared_params(code: SpamReasonCode) -> Vec<(SpamParam, u32)> {
+        ALL_SPAM_PARAMS
+            .iter()
+            .filter(|param| code.message().contains(&format!("{{{}}}", param.name())))
+            .enumerate()
+            .map(|(index, param)| (*param, 11 + index as u32))
+            .collect()
+    }
+
+    fn field(reason: &SpamReason, param: SpamParam) -> Option<u32> {
+        match param {
+            SpamParam::Weight => reason.weight,
+            SpamParam::Percent => reason.percent,
+            SpamParam::Count => reason.count,
+            SpamParam::Votes => reason.votes,
+            SpamParam::Total => reason.total,
+        }
+    }
+
+    /// The codes are an IPC contract: the search tooltip looks each one up in a
+    /// table keyed by exactly this string.
+    #[test]
+    fn every_spam_reason_code_is_a_distinct_identifier() {
+        let mut seen = std::collections::HashSet::new();
+        for code in SpamReasonCode::ALL {
+            let text = code.as_code();
+            assert!(
+                !text.is_empty()
+                    && text
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{text} is not a snake_case identifier"
+            );
+            assert!(seen.insert(text), "{text} is used by two variants");
+            assert!(!code.message().is_empty(), "{text} has no English");
+        }
+        assert_eq!(seen.len(), SpamReasonCode::ALL.len());
+    }
+
+    /// The numbers are carried as named parameters rather than baked into the
+    /// text, because the UI re-interpolates them into a translated sentence. A
+    /// template slot with no matching field, or a field the template never
+    /// asks for, means the tooltip renders a hole or drops a number.
+    #[test]
+    fn every_spam_reason_renders_the_parameters_its_template_declares() {
+        for code in SpamReasonCode::ALL {
+            let params = declared_params(*code);
+            let reason = SpamReason::new(*code, &params);
+            assert_eq!(reason.code, code.as_code());
+            assert!(
+                !reason.text.contains('{'),
+                "{} left a placeholder unfilled: {}",
+                code.as_code(),
+                reason.text
+            );
+            for param in ALL_SPAM_PARAMS {
+                let declared = params.iter().find(|(p, _)| *p == param);
+                assert_eq!(
+                    field(&reason, param),
+                    declared.map(|(_, value)| *value),
+                    "{} disagrees with its template about {}",
+                    code.as_code(),
+                    param.name()
+                );
+            }
+        }
+    }
+
+    /// Scoring is the only producer of a spam reason, and the tooltip is the
+    /// surface that used to read English in all nine locales. Every reason it
+    /// emits has to arrive with a code and the numbers to re-render it.
+    #[test]
+    fn scoring_reports_a_code_and_parameters_beside_the_english() {
+        let dir = temp_dir("coded-reasons");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "d".repeat(32);
+        filter.db.spam_hashes.insert(hash.clone(), MAX_SPAM_HASHES);
+
+        let explanation = filter.explain_result(
+            &sample_result(&hash, "install_codec www.example.com/movie.exe"),
+            &[],
+            None,
+            SpamFilterProfile::Aggressive,
+            CommunityRating {
+                fake_votes: 4,
+                total_votes: 5,
+            },
+            &BatchSpamContext::default(),
+        );
+
+        let known: std::collections::HashSet<&str> =
+            SpamReasonCode::ALL.iter().map(|c| c.as_code()).collect();
+        assert_eq!(
+            explanation.reasons.len(),
+            explanation.reason_details.len(),
+            "the English list and the coded list describe the same verdict"
+        );
+        for (english, detail) in explanation
+            .reasons
+            .iter()
+            .zip(explanation.reason_details.iter())
+        {
+            assert_eq!(english, &detail.text);
+            assert!(known.contains(detail.code.as_str()), "{} is not a declared code", detail.code);
+            assert!(!detail.text.contains('{'), "{} rendered a hole", detail.code);
+        }
+
+        let codes: Vec<&str> = explanation
+            .reason_details
+            .iter()
+            .map(|r| r.code.as_str())
+            .collect();
+        assert!(codes.contains(&"known_hash"));
+        assert!(codes.contains(&"fake_pattern"));
+        assert!(codes.contains(&"community_fake_majority"));
+        assert!(
+            codes.contains(&"aggressive_boost"),
+            "corroborated spam on the aggressive profile boosts, and says so"
+        );
+
+        let hash_hit = explanation
+            .reason_details
+            .iter()
+            .find(|r| r.code == "known_hash")
+            .expect("the known-hash signal is present");
+        assert_eq!(hash_hit.weight, Some(SPAM_FILEHASH_HIT));
+        let votes = explanation
+            .reason_details
+            .iter()
+            .find(|r| r.code == "community_fake_majority")
+            .expect("the community signal is present");
+        assert_eq!((votes.votes, votes.total), (Some(4), Some(5)));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A whitelisted hash takes an early return of its own, which is exactly
+    /// the sort of path that keeps returning a bare sentence after the rest of
+    /// the function has been converted.
+    #[test]
+    fn the_not_spam_verdict_is_coded_too() {
+        let dir = temp_dir("coded-not-spam");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "e".repeat(32);
+        filter.mark_not_spam(&hash);
+
+        let explanation = filter.explain_result(
+            &sample_result(&hash, "anything.bin"),
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &BatchSpamContext::default(),
+        );
+
+        assert!(!explanation.is_spam);
+        assert_eq!(
+            explanation
+                .reason_details
+                .iter()
+                .map(|r| r.code.as_str())
+                .collect::<Vec<_>>(),
+            ["not_spam_marked"]
+        );
+        assert_eq!(explanation.reasons, ["Manually marked as not spam"]);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

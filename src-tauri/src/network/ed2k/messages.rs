@@ -517,6 +517,51 @@ pub fn build_hello_answer_with_buddy_opts(
 // now travels in a separate `OP_EMBER_HELLO` opcode that vanilla peers
 // ignore, so we look byte-identical to eMule on the public handshake.
 
+// `CT_EMULE_MISCOPTIONS1` / `CT_EMULE_MISCOPTIONS2` field positions, named
+// after eMule's own locals in `BaseClient.cpp` `SendHelloTypePacket` (see
+// `emulesource/BaseClient.cpp:963-1024`).
+//
+// These are named constants rather than inline comments because the fields are
+// packed adjacently and the labels have drifted before: a clippy `identity_op`
+// sweep removed the always-zero terms (`uPeerCache << 3`, `uSupportPreview << 0`
+// in MISCOPTIONS1, `uReserved << 6` in MISCOPTIONS2) and left every surviving
+// comment sitting one field away from the bit it described. Nothing changed on
+// the wire, so only a reader comparing against eMule could notice — and these
+// are the words that decide whether a peer offers us comments, multipacket or
+// obfuscation at all. A shift that cannot be separated from its name cannot
+// drift again.
+//
+// Bits deliberately left clear (and therefore unnamed): MISCOPTIONS1 bit 3
+// (`uPeerCache`) and bit 0 (`uSupportPreview`), MISCOPTIONS2 bit 6
+// (`uReserved`, the mod bit).
+const MO1_AICH_VER: u32 = 29;
+const MO1_UNICODE_SUPPORT: u32 = 28;
+const MO1_UDP_VER: u32 = 24;
+const MO1_DATA_COMP_VER: u32 = 20;
+const MO1_SUPPORT_SEC_IDENT: u32 = 16;
+const MO1_SOURCE_EXCHANGE_VER: u32 = 12;
+const MO1_EXTENDED_REQUESTS_VER: u32 = 8;
+const MO1_ACCEPT_COMMENT_VER: u32 = 4;
+const MO1_NO_VIEW_SHARED_FILES: u32 = 2;
+const MO1_MULTI_PACKET: u32 = 1;
+
+const MO2_FILE_IDENTIFIERS: u32 = 13;
+const MO2_DIRECT_UDP_CALLBACK: u32 = 12;
+const MO2_SUPPORTS_CAPTCHA: u32 = 11;
+const MO2_SUPPORTS_SOURCE_EX2: u32 = 10;
+const MO2_REQUIRES_CRYPT_LAYER: u32 = 9;
+const MO2_REQUESTS_CRYPT_LAYER: u32 = 8;
+const MO2_SUPPORTS_CRYPT_LAYER: u32 = 7;
+const MO2_EXT_MULTI_PACKET: u32 = 5;
+const MO2_SUPPORT_LARGE_FILES: u32 = 4;
+
+/// `ET_FEATURES` (0x27) layout: bits 0-1 SecureIdent level, bit 2 preview,
+/// bit 3 SupportsCryptLayer, bit 4 RequestsCryptLayer, bit 5 RequiresCryptLayer.
+/// The level is a value in bits 0-1, not a flag, hence no shift.
+const ET_FEATURES_SEC_IDENT_LEVEL: u8 = 3;
+const ET_FEATURES_SUPPORTS_CRYPT_LAYER: u32 = 3;
+const ET_FEATURES_REQUESTS_CRYPT_LAYER: u32 = 4;
+
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 ///
 /// Bit 2 is "no view shared files", so it is the *inverse* of the user's
@@ -528,17 +573,22 @@ pub fn build_hello_answer_with_buddy_opts(
 /// the polite `OP_ASKSHAREDDENIEDANS` refusal — was unreachable for the
 /// clients it was written for.
 pub fn build_misc_options1() -> u32 {
-    let no_view_shared_files = !share_browsing_allowed() as u32;
-    ((1u32 << 29)   // AICH ver 1
-    | (1u32 << 28)   // Unicode
-    | (4u32 << 24)   // UDP ver 4
-    | (1u32 << 20)   // Compression ver 1
-    | (3u32 << 16)   // Secure ident ver 3
-    | (4u32 << 12)   // Source exchange ver 4
-    | (2u32 << 8)    // Extended requests ver 2
-    | (1u32 << 4))    // No peer cache
-    | (no_view_shared_files << 2)
-    | (1u32 << 1) // Preview support
+    misc_options1_with(!share_browsing_allowed())
+}
+
+/// Split from [`build_misc_options1`] so the packing can be pinned by a test
+/// without reaching into the process-global share-browsing mirror.
+fn misc_options1_with(no_view_shared_files: bool) -> u32 {
+    (1u32 << MO1_AICH_VER)
+        | (1u32 << MO1_UNICODE_SUPPORT)
+        | (4u32 << MO1_UDP_VER)
+        | (1u32 << MO1_DATA_COMP_VER)
+        | (3u32 << MO1_SUPPORT_SEC_IDENT)
+        | (4u32 << MO1_SOURCE_EXCHANGE_VER)
+        | (2u32 << MO1_EXTENDED_REQUESTS_VER)
+        | (1u32 << MO1_ACCEPT_COMMENT_VER)
+        | ((no_view_shared_files as u32) << MO1_NO_VIEW_SHARED_FILES)
+        | (1u32 << MO1_MULTI_PACKET)
 }
 
 /// Compute CT_EMULE_MISCOPTIONS2 matching eMule BaseClient.cpp SendHelloTypePacket.
@@ -546,17 +596,18 @@ pub fn build_misc_options1() -> u32 {
 /// ET_MOD_VERSION tag in EmuleInfo instead to avoid triggering anti-leecher
 /// detection in eMule mods that reject unknown bits in reserved positions.
 pub fn build_misc_options2(options: &HelloOptions) -> u32 {
+    // `uKadVersion` occupies bits 0-3, so it contributes unshifted.
     let kad_version = options.kad_version as u32;
-    ((1u32 << 13)       // uFileIdentifiers
-    | ((options.supports_direct_udp_callback as u32) << 12)
-    | ((options.supports_captcha as u32) << 11)
-    | (1u32 << 10)       // uSupportsSourceEx2
-    | ((options.requires_crypt_layer as u32) << 9)
-    | ((options.requests_crypt_layer as u32) << 8)
-    | ((options.supports_crypt_layer as u32) << 7))        // reserved
-    | (1u32 << 5)        // uExtMultiPacket
-    | (1u32 << 4)        // uSupportLargeFiles
-    | kad_version // uKadVersion (bits 0-3)
+    (1u32 << MO2_FILE_IDENTIFIERS)
+        | ((options.supports_direct_udp_callback as u32) << MO2_DIRECT_UDP_CALLBACK)
+        | ((options.supports_captcha as u32) << MO2_SUPPORTS_CAPTCHA)
+        | (1u32 << MO2_SUPPORTS_SOURCE_EX2)
+        | ((options.requires_crypt_layer as u32) << MO2_REQUIRES_CRYPT_LAYER)
+        | ((options.requests_crypt_layer as u32) << MO2_REQUESTS_CRYPT_LAYER)
+        | ((options.supports_crypt_layer as u32) << MO2_SUPPORTS_CRYPT_LAYER)
+        | (1u32 << MO2_EXT_MULTI_PACKET)
+        | (1u32 << MO2_SUPPORT_LARGE_FILES)
+        | kad_version
 }
 
 fn build_hello_inner(
@@ -722,11 +773,13 @@ pub fn build_emule_info(
     write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint8(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint8(2));
-    // ET_FEATURES (0x27): bits 0-1 = SecureIdent level, bit 2 = preview,
-    // bit 3 = SupportsCryptLayer, bit 4 = RequestsCryptLayer, bit 5 = RequiresCryptLayer
-    let features: u8 = 3              // no preview
-        | ((obfuscation_enabled as u8) << 3)  // SupportsCryptLayer — must match Hello MISCOPTIONS2
-        | ((obfuscation_enabled as u8) << 4); // no RequiresCryptLayer
+    // ET_FEATURES (0x27). Named like the MISCOPTIONS shifts above and for the
+    // same reason: bit 2 (preview) and bit 5 (RequiresCryptLayer) are left
+    // clear, and the labels for those two once slid onto the neighbouring
+    // fields when the zero terms were removed.
+    let features: u8 = ET_FEATURES_SEC_IDENT_LEVEL
+        | ((obfuscation_enabled as u8) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
+        | ((obfuscation_enabled as u8) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint8(features));
 
     buf
@@ -2744,6 +2797,43 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the two Hello capability words to the exact `u32` eMule expects.
+    ///
+    /// Every field here is packed adjacent to its neighbours, so an off-by-one
+    /// shift stays a valid-looking word that silently claims a different
+    /// capability — no parse error, no wire-format mismatch, just peers that
+    /// stop offering us comments or obfuscation. Only a golden value catches it.
+    /// Cross-check against `emulesource/BaseClient.cpp:980-1024`.
+    #[test]
+    fn misc_options_match_emule_hello_layout() {
+        // AICH 1<<29 | Unicode 1<<28 | UDPv4 4<<24 | Comp 1<<20 | SecIdent 3<<16
+        // | SourceExch 4<<12 | ExtReq 2<<8 | AcceptComment 1<<4 | MultiPacket 1<<1
+        assert_eq!(misc_options1_with(false), 0x3413_4212);
+        // Same, plus NoViewSharedFiles at bit 2.
+        assert_eq!(misc_options1_with(true), 0x3413_4216);
+        assert_eq!(
+            build_misc_options1(),
+            misc_options1_with(!share_browsing_allowed())
+        );
+
+        // FileIdentifiers 1<<13 | SourceEx2 1<<10 | RequestsCrypt 1<<8
+        // | SupportsCrypt 1<<7 | ExtMultiPacket 1<<5 | LargeFiles 1<<4 | Kad 9
+        let options = HelloOptions::default_for_udp_port(4672);
+        assert_eq!(build_misc_options2(&options), 0x25B9);
+
+        // Each optional flag must land on its own bit and nothing else.
+        let all_on = HelloOptions {
+            supports_crypt_layer: true,
+            requests_crypt_layer: true,
+            requires_crypt_layer: true,
+            supports_direct_udp_callback: true,
+            supports_captcha: true,
+            kad_version: 0,
+            ..options
+        };
+        assert_eq!(build_misc_options2(&all_on), 0x3FB0);
+    }
 
     /// The envelope exists so future friend-session messages cost a sub-type
     /// byte instead of one of the two opcodes left in the private range, so
