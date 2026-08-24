@@ -34,11 +34,25 @@ const DYNAMIC_KEY_PREFIX = "error_";
 const MESSAGE_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Keys that are deliberately unreferenced. Empty on purpose: a string with no
- * call site is dead until someone writes down why it isn't, and the staleness
- * check below makes sure an entry cannot outlive its reason.
+ * Keys that are deliberately unreferenced. A string with no call site is dead
+ * until someone writes down why it isn't, and the staleness check below makes
+ * sure an entry cannot outlive its reason: once a key gains a call site, this
+ * test fails until it is removed from here.
  */
-const ALLOWED_ORPHANS = new Map();
+const ALLOWED_ORPHANS = new Map([
+  [
+    "channels_owner",
+    "Channel UI in progress on develop; the roster does not render an owner badge yet.",
+  ],
+  [
+    "channels_create_title",
+    "Channel UI in progress on develop; the create dialog is not wired up yet.",
+  ],
+  [
+    "channels_attach_too_large",
+    "Channel UI in progress on develop; attachment size refusal is not implemented yet.",
+  ],
+]);
 
 /** Compiled Paraglide output is generated from these same keys; skip it. */
 const SKIP_DIRS = new Set(["paraglide", "node_modules"]);
