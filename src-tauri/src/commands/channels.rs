@@ -13,7 +13,7 @@ use crate::network::ember::channel::{
 };
 use crate::network::ember::dht::messages::MAX_FIND_VALUE_KEYS;
 use crate::network::ember::dht::publish::{
-    SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
+    ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
     CHANNEL_WELCOME_MAX,
 };
 use crate::network::ember::crypto;
@@ -41,10 +41,25 @@ pub struct ChannelInfo {
     pub you_are_moderator: bool,
     pub successor_id: String,
     pub predecessor_id: String,
+    /// Owner-nominated successor (64-char hex), empty when unset.
+    pub successor_nominee: String,
+    /// Days of owner silence before that nomination may be claimed; 0 disables.
+    pub claim_after_days: i64,
+    /// When the owner last republished. The UI counts the claim window from it.
+    pub moderation_updated_at: i64,
+    /// Whether this device may claim the room right now: it is the nominee and
+    /// the owner has been silent past the window.
+    pub can_claim: bool,
+    /// A private room whose content key has rotated past what we hold, so we
+    /// cannot read new traffic until the epoch record sealed to us arrives. Also
+    /// what a stale invite looks like from the inside.
+    pub key_behind: bool,
 }
 
 impl ChannelInfo {
     fn from_stored(row: StoredChannel, you_are_banned: bool, you_are_moderator: bool) -> Self {
+        let key_behind =
+            row.visibility == CHANNEL_KIND_PRIVATE && row.key_epoch_wanted > row.key_epoch;
         Self {
             channel_id: row.channel_id,
             pubkey: row.pubkey,
@@ -59,9 +74,37 @@ impl ChannelInfo {
             unread: row.unread,
             you_are_banned,
             you_are_moderator,
+            key_behind,
+            can_claim: false,
+            moderation_updated_at: row.moderation_updated_at,
+            successor_nominee: row.successor_nominee,
+            claim_after_days: row.claim_after_days,
             successor_id: row.successor_id,
             predecessor_id: row.predecessor_id,
         }
+    }
+
+    /// Fill in the two facts that depend on who we are and what time it is.
+    ///
+    /// Mirrors the checks in `claim_channel_ownership`, including the confirmed
+    /// silence one, so the button is not offered for an action that would be
+    /// refused — or worse, accepted locally and refused by everyone else.
+    fn with_viewer(
+        mut self,
+        our_pubkey_hex: &str,
+        moderation_updated_at: i64,
+        moderation_checked_at: i64,
+    ) -> Self {
+        self.can_claim = !self.is_owner
+            && !self.you_are_banned
+            && self.successor_id.is_empty()
+            && self.claim_after_days > 0
+            && moderation_updated_at > 0
+            && channel::owner_silence_is_confirmed(moderation_checked_at)
+            && self.successor_nominee.eq_ignore_ascii_case(our_pubkey_hex)
+            && chrono::Utc::now().timestamp().saturating_sub(moderation_updated_at)
+                >= self.claim_after_days.saturating_mul(86_400);
+        self
     }
 }
 
@@ -247,11 +290,15 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
             let you_are_banned =
                 !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
             let you_are_moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
-            out.push(ChannelInfo::from_stored(
-                row,
-                you_are_banned,
-                you_are_moderator,
-            ));
+            let moderation_updated_at = row.moderation_updated_at;
+            let moderation_checked_at = row.moderation_checked_at;
+            out.push(
+                ChannelInfo::from_stored(row, you_are_banned, you_are_moderator).with_viewer(
+                    &our_pk,
+                    moderation_updated_at,
+                    moderation_checked_at,
+                ),
+            );
         }
         Ok::<_, anyhow::Error>(out)
     })
@@ -347,7 +394,11 @@ pub async fn create_channel(
         &[],
         // Names us as owner from the very first record, so a member who joins
         // before any moderation edit already knows who cannot be banned.
-        Some(&state.identity.ed25519_public_key),
+        &ModerationTail {
+            owner_pubkey: Some(state.identity.ed25519_public_key),
+            key_epoch: Some(0),
+            ..Default::default()
+        },
         ident.channel_id,
         ident.pubkey,
         private,
@@ -361,6 +412,8 @@ pub async fn create_channel(
         name: name.clone(),
         join_secret,
         private,
+        // A room that has just been created has never rotated.
+        key_epoch: 0,
     };
     Ok(ChannelInviteInfo {
         uri: invite.format(),
@@ -444,6 +497,26 @@ pub async fn join_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
 
+    // Record which epoch the invite's secret belongs to. Otherwise the room
+    // reports an epoch we hold no record of, and we would both warn the user
+    // their working invite is stale and poll forever for a key the owner never
+    // minted for us — we were not a member when it rotated.
+    if private && invite.key_epoch > 0 {
+        let db = db.clone();
+        let id = db_id.clone();
+        let epoch = invite.key_epoch.min(i64::MAX as u64) as i64;
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || db.insert_channel_key_epoch(&id, epoch, &join_secret))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .and_then(|r| r)
+        {
+            // Not fatal: the secret is already stored as the join secret, so the
+            // room is readable either way.
+            tracing::warn!(channel_id = %db_id, error = %e, "could not record the invite's epoch");
+        }
+    }
+
     let nickname = {
         let cfg = state.config.read().await;
         crate::security::sanitize_display_name(&cfg.settings.nickname)
@@ -523,6 +596,15 @@ pub async fn get_channel_invite(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_invite_failed", "Failed to load invite", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    // Same gate as sending and attaching. A banned member still holds retired
+    // epoch secrets, so without this they could keep handing out invites that
+    // read nothing and look to the recipient like a broken room.
+    if self_banned_from(&state, &row, "channels_invite_failed").await? {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
     let mut pubkey = [0u8; 32];
     let pk_bytes = hex::decode(&row.pubkey)
         .map_err(|_| coded("channels_invite_invalid", "Stored channel pubkey is invalid"))?;
@@ -544,28 +626,27 @@ pub async fn get_channel_invite(
     }
     cid.copy_from_slice(&id_bytes);
     let private = row.visibility == CHANNEL_KIND_PRIVATE;
-    let join_secret = if private {
-        let db = state.db.clone();
-        let id = channel_id.clone();
-        tokio::task::spawn_blocking(move || db.load_channel_join_secret(&id))
-            .await
-            .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-            .map_err(|e| coded_ctx("channels_invite_failed", "Failed to load invite", e))?
-            .ok_or_else(|| {
-                coded(
-                    "channels_invite_invalid",
-                    "This private channel has no join secret on this device",
-                )
-            })?
-    } else {
-        channel::public_join_secret(&pubkey)
-    };
+    // Minted from the *current* epoch, so every invite handed out before the
+    // last rotation is already dead. That is the point of rotating.
+    let join_secret = join_secret_for_channel(&state, &row).await.ok_or_else(|| {
+        if private {
+            coded(
+                "channels_invite_invalid",
+                "This private channel has no join secret on this device",
+            )
+        } else {
+            coded("channels_invite_invalid", "Stored channel pubkey is invalid")
+        }
+    })?;
     let invite = ChannelInvite {
         channel_id: cid,
         pubkey,
         name: row.name.clone(),
         join_secret,
         private,
+        // Names the epoch the secret above belongs to, so the joiner records it
+        // rather than looking behind and hunting a key never minted for them.
+        key_epoch: row.key_epoch.max(0) as u64,
     };
     Ok(ChannelInviteInfo {
         uri: invite.format(),
@@ -742,21 +823,11 @@ pub async fn send_channel_message(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
 
-    let join_secret = if row.visibility == CHANNEL_KIND_PRIVATE {
-        let db = state.db.clone();
-        let id = channel_id.clone();
-        tokio::task::spawn_blocking(move || db.load_channel_join_secret(&id))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-    } else {
-        hex::decode(&row.pubkey)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            .map(|pk| channel::public_join_secret(&pk))
-    };
-    if let Some(join_secret) = join_secret {
+    // Must be the current epoch, not the `join_secret` column. Chat is the bulk
+    // of what a room carries, so sealing it with the pre-rotation key left the
+    // member a ban had just evicted able to read every new message — the one
+    // thing rotating is for.
+    if let Some(join_secret) = join_secret_for_channel(&state, &row).await {
         let mut channel_id_bytes = [0u8; 16];
         if let Ok(id_bytes) = hex::decode(&channel_id) {
             if id_bytes.len() == 16 {
@@ -892,20 +963,52 @@ async fn commit_channel_moderation(
 ) -> Result<(), String> {
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     // We are the owner on this path, so our identity is what every member needs
-    // in order to refuse a moderator's ban aimed at us.
+    // in order to refuse a moderator's ban aimed at us, and our epoch is how
+    // they tell they are behind and go looking for the key sealed to them.
     let our_pk = state.identity.ed25519_public_key;
+    // Re-read rather than trusting `owned.row`: a ban rotates the key before
+    // committing, so the snapshot in hand is one epoch stale and members would
+    // never learn to go looking for the new one.
+    let live_epoch = {
+        let db = state.db.clone();
+        let id = owned.row.channel_id.clone();
+        tokio::task::spawn_blocking(move || db.get_channel(&id))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
+            .map(|row| row.key_epoch)
+            .unwrap_or(owned.row.key_epoch)
+    };
+    let tail = ModerationTail {
+        owner_pubkey: Some(our_pk),
+        key_epoch: Some(live_epoch.max(0) as u64),
+        // Always written, zeros when there is no nominee: that is what lets an
+        // owner withdraw one. Leaving it absent would truncate the field, which
+        // members read as "no opinion" and would go on honouring the old name.
+        successor_nominee: Some(
+            hex::decode(&owned.row.successor_nominee)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .unwrap_or([0u8; 32]),
+        ),
+        claim_after_days: Some(owned.row.claim_after_days.clamp(0, u16::MAX as i64) as u16),
+    };
     let record = SignedRecord::channel_moderation(
         topic,
         welcome,
         bans,
         mods,
-        Some(&our_pk),
+        &tail,
         owned.channel_id,
         owned.ident.pubkey,
         private,
         &owned.ident.signing_key,
     );
     let ts = record.timestamp;
+    let tail_nominee = tail.successor_nominee;
+    let tail_days = tail.claim_after_days;
+    let tail_epoch = tail.key_epoch;
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
     let topic_s = topic.to_string();
@@ -921,6 +1024,9 @@ async fn commit_channel_moderation(
             &bans_v,
             &mods_v,
             Some(&our_pk),
+            tail_nominee.as_ref(),
+            tail_days,
+            tail_epoch,
         )
     })
     .await
@@ -998,7 +1104,15 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
     let row = row.ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
-    Ok(ChannelInfo::from_stored(row, you_are_banned, you_are_moderator))
+    let moderation_updated_at = row.moderation_updated_at;
+    let moderation_checked_at = row.moderation_checked_at;
+    Ok(
+        ChannelInfo::from_stored(row, you_are_banned, you_are_moderator).with_viewer(
+            &our_pk,
+            moderation_updated_at,
+            moderation_checked_at,
+        ),
+    )
 }
 
 async fn load_joined_channel(
@@ -1094,24 +1208,142 @@ fn enqueue_channel_gossip(state: &AppState, channel_id: &str, join_secret: [u8; 
         });
 }
 
+/// Secrets this room can be read with, newest epoch first.
+///
+/// A private room rotates on a ban, so anything sealed before the rotation — an
+/// attachment already on disk, a message being replayed by history sync — is
+/// under an older epoch. Public rooms have exactly one, derived from a pubkey
+/// anyone can compute.
+async fn join_secrets_for_channel(state: &AppState, row: &StoredChannel) -> Vec<[u8; 32]> {
+    if row.visibility != CHANNEL_KIND_PRIVATE {
+        return hex::decode(&row.pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(|pk| vec![channel::public_join_secret(&pk)])
+            .unwrap_or_default();
+    }
+    let db = state.db.clone();
+    let id = row.channel_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut out: Vec<[u8; 32]> = db
+            .load_channel_key_epochs(&id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, secret)| secret)
+            .collect();
+        // Epoch 0 is the secret the invite was minted with, still in
+        // `join_secret` for a room that has never rotated.
+        if let Ok(Some(secret)) = db.load_channel_join_secret(&id) {
+            if !out.contains(&secret) {
+                out.push(secret);
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The secret this room seals *new* traffic with, and mints invites from.
 async fn join_secret_for_channel(
     state: &AppState,
     row: &StoredChannel,
 ) -> Option<[u8; 32]> {
-    if row.visibility == CHANNEL_KIND_PRIVATE {
-        let db = state.db.clone();
-        let id = row.channel_id.clone();
-        tokio::task::spawn_blocking(move || db.load_channel_join_secret(&id))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-    } else {
-        hex::decode(&row.pubkey)
+    join_secrets_for_channel(state, row).await.into_iter().next()
+}
+
+/// Mint the next content key for a private room and hand it to every member
+/// who is still in it.
+///
+/// This is what makes a ban an eviction. Until it runs, a removed member still
+/// holds a key that reads everything, and so does anyone they ever passed the
+/// invite to. Each remaining member gets the key sealed under a secret only
+/// they and the owner can derive, so the banned member can fetch the records
+/// and still learn nothing.
+///
+/// Public rooms are skipped: their key comes from the channel pubkey, which
+/// anyone can compute, so there is nothing to rotate away from.
+/// `excluded` is the ban list about to be committed, not what the database says.
+/// The `banned` flag is written by `commit_channel_moderation`, which runs
+/// *after* this — reading it from `channel_members` here would still show the
+/// member as present and seal the new key straight to the person being evicted.
+async fn rotate_channel_key(
+    state: &AppState,
+    owned: &OwnedChannel,
+    excluded: &[[u8; 32]],
+) -> Result<Option<i64>, String> {
+    if owned.row.visibility != CHANNEL_KIND_PRIVATE {
+        return Ok(None);
+    }
+    let next_epoch = owned.row.key_epoch.saturating_add(1);
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let stored_secret = secret;
+    tokio::task::spawn_blocking(move || {
+        db.insert_channel_key_epoch(&id, next_epoch, &stored_secret)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_moderation_failed", "Could not rotate the room key", e))?;
+
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
+
+    let our_seed = state.identity.ed25519_secret_key;
+    let our_hex = hex::encode(state.identity.ed25519_public_key);
+    for member in members {
+        // Banned members are the point of rotating, and we already hold the key
+        // we just minted.
+        if member.banned || member.member_pubkey.eq_ignore_ascii_case(&our_hex) {
+            continue;
+        }
+        let Some(member_pk) = hex::decode(&member.member_pubkey)
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            .map(|pk| channel::public_join_secret(&pk))
+        else {
+            continue;
+        };
+        if excluded.contains(&member_pk) {
+            continue;
+        }
+        let Some(wrap) = channel::derive_channel_epoch_secret(
+            &our_seed,
+            &member_pk,
+            &owned.channel_id,
+            next_epoch,
+        ) else {
+            continue;
+        };
+        let sealed =
+            channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
+        let record = SignedRecord::channel_key_epoch(
+            owned.channel_id,
+            owned.ident.pubkey,
+            &member_pk,
+            next_epoch,
+            &sealed,
+            &owned.ident.signing_key,
+        );
+        // Best effort per member, like every other channel publish: the owner
+        // republishes moderation on a timer, and a member who cannot find
+        // their record re-asks every minute until it lands.
+        if let Err(e) = publish_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                member = %member.member_pubkey,
+                error = %e,
+                "could not publish a rotated channel key to a member"
+            );
+        }
     }
+    Ok(Some(next_epoch))
 }
 
 async fn apply_local_mod_ban(
@@ -1210,7 +1442,30 @@ pub async fn ban_channel_member(
             }
             bans.push(pk);
         }
-        commit_channel_moderation(
+        // Banning the nominee withdraws the nomination. Leaving it standing
+        // would let the person we just evicted inherit the room once we went
+        // quiet, which is the opposite of what a ban means.
+        if owned
+            .row
+            .successor_nominee
+            .eq_ignore_ascii_case(&hex::encode(pk))
+        {
+            let db = state.db.clone();
+            let id = channel_id.clone();
+            tokio::task::spawn_blocking(move || db.set_channel_succession(&id, "", 0))
+                .await
+                .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+                .map_err(|e| {
+                    coded_ctx("channels_moderation_failed", "Could not clear the nominee", e)
+                })?;
+        }
+        // Rotate before committing: a ban that leaves the old key in place is
+        // not an eviction, since the removed member — and anyone they gave the
+        // invite to — can still read everything sent afterwards. Ordering
+        // matters twice over, because the snapshot below carries the new epoch
+        // number and that is how the remaining members learn to fetch it.
+        let rotated = rotate_channel_key(&state, &owned, &bans).await?;
+        if let Err(error) = commit_channel_moderation(
             &state,
             &owned,
             &owned.row.topic,
@@ -1218,7 +1473,29 @@ pub async fn ban_channel_member(
             &bans,
             &mods,
         )
-        .await?;
+        .await
+        {
+            // The snapshot is what tells members a new epoch exists. Without it
+            // we would seal everything under a key none of them will ever go
+            // looking for, so the rotation has to come back off.
+            if let Some(epoch) = rotated {
+                let db = state.db.clone();
+                let id = channel_id.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || db.rollback_channel_key_epoch(&id, epoch))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .and_then(|r| r)
+                {
+                    tracing::error!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "could not roll back epoch {epoch} after a failed moderation commit"
+                    );
+                }
+            }
+            return Err(error);
+        }
     } else {
         apply_local_mod_ban(&state, &row, pk, true).await?;
     }
@@ -1346,6 +1623,254 @@ pub async fn remove_channel_moderator(
     )
     .await?;
     Ok(())
+}
+
+/// Nominate who may take the room over if the owner stops republishing, and
+/// after how long. Both facts ride the owner-signed moderation record, so every
+/// member can check a later claim against them.
+#[tauri::command]
+pub async fn set_channel_successor_nominee(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    member_pubkey: Option<String>,
+    claim_after_days: Option<u16>,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let nominee = match member_pubkey.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let pk = parse_member_pubkey(raw)?;
+            if pk == state.identity.ed25519_public_key {
+                return Err(coded(
+                    "channels_mod_self",
+                    "You cannot nominate yourself as successor",
+                ));
+            }
+            Some(pk)
+        }
+    };
+    // No nominee means no succession, whatever window was asked for.
+    let days = if nominee.is_none() {
+        0
+    } else {
+        claim_after_days
+            .unwrap_or(channel::CLAIM_AFTER_DAYS_DEFAULT)
+            .clamp(channel::CLAIM_AFTER_DAYS_MIN, channel::CLAIM_AFTER_DAYS_MAX)
+    };
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    if nominee.is_some() {
+        // Nominating somebody who is not in the room, or is banned from it,
+        // would hand it to nobody.
+        let member_hex = nominee.map(hex::encode).unwrap_or_default();
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            let members = db.list_channel_members(&id)?;
+            Ok::<_, anyhow::Error>(members.into_iter().any(|m| {
+                m.member_pubkey.eq_ignore_ascii_case(&member_hex) && !m.banned
+            }))
+        })
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
+        if !ok {
+            return Err(coded(
+                "channels_member_invalid",
+                "That member is not in this room",
+            ));
+        }
+    }
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let nominee_hex = nominee.map(hex::encode).unwrap_or_default();
+    tokio::task::spawn_blocking(move || db.set_channel_succession(&id, &nominee_hex, days as i64))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not save the nominee", e))?;
+
+    // Republish so members learn the nomination; the tail is rebuilt from the
+    // row we just wrote.
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    let refreshed = load_owned_channel(&state, &channel_id).await?;
+    commit_channel_moderation(
+        &state,
+        &refreshed,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+        &mods,
+    )
+    .await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// Take over a room whose owner has gone silent, as the member they nominated.
+///
+/// Mints a fresh room key — the old owner's seed is never copied — and publishes
+/// a claim every member checks against the nomination in the owner's last signed
+/// record before following it.
+#[tauri::command]
+pub async fn claim_channel_ownership(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to claim this channel",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let _snapshot = moderation_lock().lock().await;
+    let row = load_joined_channel(&state, &channel_id).await?;
+    if row.is_owner || !row.successor_id.is_empty() {
+        return Err(coded(
+            "channels_handoff_failed",
+            "This room does not need claiming",
+        ));
+    }
+    let our_hex = hex::encode(state.identity.ed25519_public_key);
+    if !row.successor_nominee.eq_ignore_ascii_case(&our_hex) {
+        return Err(coded(
+            "channels_not_nominee",
+            "The owner nominated somebody else",
+        ));
+    }
+    // No point minting a room every other member will refuse to follow.
+    if self_banned_from(&state, &row, "channels_handoff_failed").await? {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
+    if row.claim_after_days <= 0 || row.moderation_updated_at <= 0 {
+        return Err(coded(
+            "channels_claim_too_early",
+            "This room has no succession window set",
+        ));
+    }
+    // Our snapshot only means the owner is gone if we have actually been asking.
+    // Otherwise a nominee who had been offline past the window would, on
+    // startup, claim a room whose owner never stopped publishing — and every
+    // other member would rightly refuse it, leaving the nominee alone on a
+    // successor room while the real one carried on without them.
+    if !channel::owner_silence_is_confirmed(row.moderation_checked_at) {
+        return Err(coded(
+            "channels_claim_unverified",
+            "Still checking whether the owner is active; try again shortly",
+        ));
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now.saturating_sub(row.moderation_updated_at)
+        < row.claim_after_days.saturating_mul(86_400)
+    {
+        return Err(coded(
+            "channels_claim_too_early",
+            "The owner has not been silent long enough yet",
+        ));
+    }
+
+    let successor = ChannelIdentity::generate();
+    let private = row.visibility == CHANNEL_KIND_PRIVATE;
+    let seed = successor.seed();
+    let old_pubkey = hex::decode(&row.pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    let mut old_id = [0u8; 16];
+    hex::decode_to_slice(&channel_id, &mut old_id)
+        .map_err(|_| coded("channels_not_found", "Channel not found"))?;
+
+    // Install locally first: if the publish fails we are still the owner of a
+    // successor room our own members can be pointed at on the next republish,
+    // rather than having announced a room we do not hold the key to.
+    let db = state.db.clone();
+    let old = channel_id.clone();
+    let successor_pk_hex = hex::encode(successor.pubkey);
+    let successor_id_hex = hex::encode(successor.channel_id);
+    let version = row.moderation_updated_at.max(1) as u64;
+    tokio::task::spawn_blocking(move || {
+        db.apply_channel_handoff(
+            &old,
+            &successor_pk_hex,
+            &successor_id_hex,
+            version,
+            private,
+            Some(&seed),
+        )
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_handoff_failed", "Could not claim the room", e))?;
+
+    let claim = SignedRecord::channel_succession_claim(
+        old_id,
+        old_pubkey,
+        &successor.pubkey,
+        row.moderation_updated_at,
+        private,
+        &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+    );
+    if let Err(e) = publish_signed_record(&state, claim).await {
+        tracing::warn!(
+            channel_id = %channel_id,
+            error = %e,
+            "claimed a room locally but could not publish the claim yet"
+        );
+    }
+
+    // Rotate the successor room straight away, and let that be what every
+    // member converges on.
+    //
+    // The room inherits the predecessor's *current* content key, and each member
+    // computes that from whichever epoch they had reached — so a member who
+    // never caught up would inherit a different secret and be unable to talk to
+    // anyone. Rotating fixes it for good, because the new key reaches each
+    // member sealed pairwise against our identity: that needs only our pubkey,
+    // which we sign into the moderation record below, and their own seed. No
+    // shared secret has to have survived the handoff for this to work.
+    let successor_id_hex = hex::encode(successor.channel_id);
+    match load_owned_channel(&state, &successor_id_hex).await {
+        Ok(owned) => {
+            if let Err(e) = rotate_channel_key(&state, &owned, &[]).await {
+                tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not rotate the claimed room");
+            }
+            let bans = load_banned_pubkeys(&state, &successor_id_hex)
+                .await
+                .unwrap_or_default();
+            let mods = load_moderator_pubkeys(&state, &successor_id_hex)
+                .await
+                .unwrap_or_default();
+            // Also the first record naming us as owner, which is what lets
+            // members derive the pairwise key at all.
+            if let Err(e) = commit_channel_moderation(
+                &state,
+                &owned,
+                &owned.row.topic,
+                &owned.row.welcome,
+                &bans,
+                &mods,
+            )
+            .await
+            {
+                tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(channel_id = %successor_id_hex, error = %e, "claimed room is not loadable as owned");
+        }
+    }
+    channel_info_from_id(&state, &successor_id_hex).await
 }
 
 /// Walk the 16 public-index shards and return unique channel listings.
@@ -1817,12 +2342,15 @@ async fn open_stored_channel_file(
             "File is not available yet",
         ));
     }
-    let Some(join_secret) = join_secret_for_channel(state, &row).await else {
+    // Candidates, not the current key: this file was sealed under whichever
+    // epoch was live when it arrived, which a later ban has since replaced.
+    let secrets = join_secrets_for_channel(state, &row).await;
+    if secrets.is_empty() {
         return Err(coded(
             "channels_file_failed",
             "Could not load the file",
         ));
-    };
+    }
     let mut channel_id_bytes = [0u8; 16];
     hex::decode_to_slice(&channel_id, &mut channel_id_bytes).map_err(|_| {
         coded("channels_not_found", "Channel not found")
@@ -1831,10 +2359,17 @@ async fn open_stored_channel_file(
     let sealed = tokio::fs::read(&path).await.map_err(|_| {
         coded("channels_file_failed", "File is not available yet")
     })?;
-    let key = channel::content_key(&join_secret);
-    let plain = channel::open_channel_file(&key, &channel_id_bytes, &digest, &sealed).ok_or_else(
-        || coded("channels_file_failed", "Could not decrypt the attachment"),
-    )?;
+    let plain = secrets
+        .iter()
+        .find_map(|secret| {
+            channel::open_channel_file(
+                &channel::content_key(secret),
+                &channel_id_bytes,
+                &digest,
+                &sealed,
+            )
+        })
+        .ok_or_else(|| coded("channels_file_failed", "Could not decrypt the attachment"))?;
     if *blake3::hash(&plain).as_bytes() != digest {
         return Err(coded(
             "channels_file_failed",

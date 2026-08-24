@@ -23,7 +23,9 @@
     leaveChannel,
     listChannelMembers,
     removeChannelModerator,
+    claimChannelOwnership,
     searchChannelMessages,
+    setChannelSuccessorNominee,
     transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
@@ -60,6 +62,10 @@
   let editingModeration = $state(false);
   let savingModeration = $state(false);
   let moderatingMember = $state<string | null>(null);
+  let claiming = $state(false);
+  /** Matches the backend default; the backend clamps to 7–365 either way. */
+  const DEFAULT_CLAIM_DAYS = 14;
+  const CLAIM_WINDOWS = [7, 14, 30, 90, 180, 365];
   let transferTarget = $state<ChannelMemberInfo | null>(null);
   let transferOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
@@ -115,6 +121,21 @@
    * the value really differs, which keeps that boundary stable no matter how
    * often the store churns.
    */
+  /**
+   * "Owner is away, X can take over" — but only worth saying once the owner has
+   * actually gone quiet. `presenceNow` ticks, so the countdown moves on its own.
+   */
+  let nomineeNotice = $derived.by(() => {
+    if (!selected?.successor_nominee || selected.claim_after_days <= 0) return '';
+    const who = memberNames[selected.successor_nominee] || shortId(selected.successor_nominee);
+    if (selected.can_claim) return m.channels_owner_inactive_now({ name: who });
+    if (selected.moderation_updated_at <= 0) return '';
+    const elapsedDays = (presenceNow / 1000 - selected.moderation_updated_at) / 86400;
+    const left = Math.ceil(selected.claim_after_days - elapsedDays);
+    // Only worth mentioning once the owner has actually started to go quiet.
+    if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
+    return m.channels_owner_inactive({ name: who, days: left });
+  });
   let selectedMuted = $derived(!!selected && $mutedChannels.includes(selected.channel_id));
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
@@ -568,9 +589,13 @@
     const id = selectedId;
     if (!id || moderationBusy) return;
     moderatingMember = memberPubkey;
+    const rotates = !!selected?.is_owner && selected.visibility === 'private';
     try {
       await banChannelMember(id, memberPubkey);
       await refreshMembers(id, true);
+      // Worth saying out loud: the removal also killed every invite link the
+      // owner has ever handed out for this room.
+      if (rotates) toastSuccess(m.channels_rotated_notice());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -638,6 +663,37 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       transferTarget = null;
+    }
+  }
+
+  async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS) {
+    const id = selectedId;
+    if (!id) return;
+    savingModeration = true;
+    try {
+      await setChannelSuccessorNominee(id, memberPubkey || null, memberPubkey ? days : null);
+      toastSuccess(m.channels_succession_saved());
+      await refreshChannels();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      savingModeration = false;
+    }
+  }
+
+  async function handleClaim() {
+    const id = selectedId;
+    if (!id || claiming) return;
+    claiming = true;
+    try {
+      const successor = await claimChannelOwnership(id);
+      toastSuccess(m.channels_claimed());
+      await refreshChannels();
+      await selectChannel(successor.channel_id);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      claiming = false;
     }
   }
 
@@ -1036,6 +1092,22 @@
                 <span>{m.channels_transfer_started()}</span>
               </div>
             {/if}
+            {#if selected.key_behind}
+              <div class="key-behind-banner" role="status">
+                <strong>{m.channels_key_behind()}</strong>
+                <span>{m.channels_key_behind_body()}</span>
+              </div>
+            {/if}
+            {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
+              <div class="successor-banner" role="status">
+                <span>{nomineeNotice}</span>
+                {#if selected.can_claim}
+                  <button class="ghost" disabled={claiming} onclick={handleClaim}>
+                    {claiming ? m.common_loading() : m.channels_claim_ownership()}
+                  </button>
+                {/if}
+              </div>
+            {/if}
             {#if selected.is_owner && roomInfoOpen}
               <form
                 class="moderation-form"
@@ -1062,6 +1134,37 @@
                 ></textarea>
                 <button type="submit" disabled={moderationBusy}>{m.channels_save_moderation()}</button>
               </form>
+              <div class="succession-form">
+                <p class="mod-label" id="succession-label">{m.channels_succession()}</p>
+                <select
+                  aria-labelledby="succession-label"
+                  disabled={moderationBusy}
+                  value={selected.successor_nominee}
+                  onchange={(e) => handleNominee(e.currentTarget.value)}
+                >
+                  <option value="">{m.channels_succession_none()}</option>
+                  {#each sortedMembers as mem (mem.member_pubkey)}
+                    {#if !mem.is_self && !mem.banned}
+                      <option value={mem.member_pubkey}>
+                        {mem.nickname || shortId(mem.member_pubkey)}
+                      </option>
+                    {/if}
+                  {/each}
+                </select>
+                {#if selected.successor_nominee}
+                  <select
+                    aria-label={m.channels_succession()}
+                    disabled={moderationBusy}
+                    value={String(selected.claim_after_days)}
+                    onchange={(e) =>
+                      handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+                  >
+                    {#each CLAIM_WINDOWS as days (days)}
+                      <option value={String(days)}>{m.channels_succession_days({ days })}</option>
+                    {/each}
+                  </select>
+                {/if}
+              </div>
             {/if}
             {#if searchOpen}
               <form
@@ -1806,6 +1909,32 @@
     font-size: 13px;
     color: var(--badge-warning-text);
     flex-shrink: 0;
+  }
+
+  .key-behind-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .key-behind-banner strong {
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .succession-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 14px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
   }
 
   .welcome-banner {

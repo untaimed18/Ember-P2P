@@ -6265,6 +6265,137 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// A succession claim hands a room to someone new, so the checks that gate
+    /// it are the most consequential in the feature. "The owner is silent" and
+    /// "we have not looked" are the same observation locally, and the claimant
+    /// picks the timestamp they cite — so neither our snapshot nor their word
+    /// can be trusted alone.
+    #[test]
+    fn a_succession_claim_is_refused_unless_both_we_and_it_show_real_silence() {
+        use crate::network::ember::channel::ChannelIdentity;
+        use crate::network::ember::dht::publish::SignedRecord;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng as RandOsRng;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-claim-gate-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let room = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let nominee = SigningKey::generate(&mut RandOsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let owner_pk = [0x11u8; 32];
+        let channel_id_hex = hex::encode(room.channel_id);
+
+        // A room we are a member of, with a 14-day succession window.
+        db.insert_channel(
+            &channel_id_hex,
+            &hex::encode(room.pubkey),
+            "Room",
+            "private",
+            false,
+            None,
+            Some(&[0xABu8; 32]),
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1)
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let day = 86_400i64;
+        // Stands in for the drain recording that a moderation search came back
+        // *and* that some peer answered it — the drain only writes this when
+        // `responded_count() > 0`, so an unanswered search leaves it untouched.
+        let confirm_silence_at = |ts: i64| {
+            db.touch_channel_moderation_checked(&channel_id_hex, ts).unwrap();
+        };
+        let claim_blob = |witnessed_ts: i64| -> Vec<u8> {
+            let rec = SignedRecord::channel_succession_claim(
+                room.channel_id,
+                room.pubkey,
+                &successor.pubkey,
+                witnessed_ts,
+                true,
+                &nominee,
+            );
+            let mut blob = rec.data.clone();
+            blob.extend_from_slice(&rec.signature);
+            blob
+        };
+        // Our own snapshot of the owner's last word, 30 days stale.
+        let stale_owner_ts = now - 30 * day;
+        let seed_moderation = |ts: i64| {
+            db.apply_channel_moderation(
+                &channel_id_hex,
+                "Topic",
+                "",
+                ts,
+                &[],
+                &[],
+                Some(&owner_pk),
+                Some(&nominee_pk),
+                Some(14),
+                None,
+            )
+            .unwrap();
+        };
+        seed_moderation(stale_owner_ts);
+
+        // Not having looked is not the same as the owner being quiet. A client
+        // that just started up with a month-old snapshot must not hand the room
+        // over before it has asked whether the owner is still publishing.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            None,
+            "a claim must not be honoured before we have polled at all"
+        );
+        confirm_silence_at(now - ember::channel::MODERATION_FETCH_SECS * 3 - 60);
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            None,
+            "nor on a stale poll"
+        );
+
+        // From here on we have confirmed the silence recently.
+        confirm_silence_at(now - 10);
+
+        // A claim whose own evidence shows the owner active an hour ago is
+        // refused however stale our snapshot is. This was the hole: the window
+        // was measured only against our own copy, so a claimant could prove the
+        // owner was alive and inherit the room anyway.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(now - 3_600)]),
+            None,
+            "a claim citing a live owner must be refused"
+        );
+
+        // A claimant cannot backdate below what we hold, either.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts - day)]),
+            None,
+            "a claim older than our own record must be refused"
+        );
+
+        // Both sides agreeing on real silence, and we have looked: honoured.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            Some(successor.channel_id),
+            "genuine silence, freshly confirmed, is what succession is for"
+        );
+        assert_eq!(
+            db.get_channel(&channel_id_hex).unwrap().unwrap().successor_id,
+            hex::encode(successor.channel_id)
+        );
+    }
     use crate::network::kad::messages::SearchResultEntry;
     use crate::network::kad::types::{
         KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING,
@@ -12078,8 +12209,11 @@ struct NetworkState {
     channel_presence_fetch_at: HashMap<[u8; 16], i64>,
     /// In-flight FIND_VALUE of channel moderation keys (`search_id` → channel).
     ember_channel_moderation_searches: HashMap<u32, [u8; 16]>,
-    /// Moderation blobs waiting for DB apply + UI emit (async drain).
-    ember_pending_channel_moderation: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// Moderation blobs waiting for DB apply + UI emit (async drain), with how
+    /// many peers answered the search that produced them. Zero means we learned
+    /// nothing either way, which succession has to tell apart from a room whose
+    /// owner really has stopped publishing.
+    ember_pending_channel_moderation: Vec<([u8; 16], Vec<Vec<u8>>, usize)>,
     /// Last moderation FIND_VALUE start per channel.
     channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
@@ -12098,6 +12232,22 @@ struct NetworkState {
     channel_handoff_fetch_at: HashMap<[u8; 16], i64>,
     /// Partial attachment reassembly (channel_id, blake3) → bytes.
     channel_file_assembly: HashMap<([u8; 16], [u8; 32]), ChannelFileAssembly>,
+    /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
+    /// channel + epoch).
+    ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
+    /// Epoch blobs waiting to be opened and stored (async drain).
+    ember_pending_channel_epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    /// Last epoch FIND_VALUE start per channel.
+    ///
+    /// Per channel rather than per (channel, epoch): we only ever chase the one
+    /// epoch the owner currently advertises, and keying on the epoch too meant
+    /// a long-lived client accumulated an entry for every rotation a room had
+    /// ever had, with nothing to remove them.
+    channel_epoch_fetch_at: HashMap<[u8; 16], i64>,
+    /// In-flight FIND_VALUE of a succession claim (`search_id` → channel).
+    ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
+    /// Claim blobs waiting to be verified against the owner's nomination.
+    ember_pending_channel_claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -12193,13 +12343,12 @@ async fn maybe_publish_channel_presence(
         let mut channel_pubkey = [0u8; 32];
         channel_pubkey.copy_from_slice(&pk_bytes);
         let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
-        let join_secret = if private {
-            match db.load_channel_join_secret(&channel_id_hex) {
-                Ok(Some(secret)) => secret,
-                _ => continue,
-            }
-        } else {
-            ember::channel::public_join_secret(&channel_pubkey)
+        // The current epoch, not the `join_secret` column: a private room's
+        // presence extra is sealed with the content key, and publishing it under
+        // a retired epoch would leave an evicted member able to enumerate the
+        // room's membership while the members who rotated could not read it.
+        let Some(join_secret) = current_channel_join_secret(db, &ch) else {
+            continue;
         };
         let record = ember::dht::publish::SignedRecord::channel_presence(
             &nickname,
@@ -12282,15 +12431,79 @@ fn channel_gossip_inbound_ok(state: &mut NetworkState, from_id: &ember::dht::Emb
     )
 }
 
-fn channel_content_key(db: &Database, ch: &crate::storage::database::StoredChannel) -> Option<[u8; 32]> {
-    let join_secret = if ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE {
-        db.load_channel_join_secret(&ch.channel_id).ok().flatten()?
-    } else {
-        let pk_bytes = hex::decode(&ch.pubkey).ok()?;
-        let pk = <[u8; 32]>::try_from(pk_bytes).ok()?;
-        ember::channel::public_join_secret(&pk)
-    };
-    Some(ember::channel::content_key(&join_secret))
+/// Content keys this room can be read with, newest epoch first.
+///
+/// Private rooms rotate on a ban, so anything already in flight — a relayed
+/// message, a history-sync reply, an attachment sealed on disk before the
+/// rotation — is still sealed under an older epoch. Readers try these in
+/// order; an AEAD failure is a clean signal, and the retained window is small.
+///
+/// Public rooms have exactly one key, derived from the channel pubkey that
+/// anyone can compute, so rotating one would evict nobody.
+fn channel_content_keys(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Vec<[u8; 32]> {
+    if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
+        let Some(pk) = hex::decode(&ch.pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            return Vec::new();
+        };
+        return vec![ember::channel::content_key(
+            &ember::channel::public_join_secret(&pk),
+        )];
+    }
+    let mut keys: Vec<[u8; 32]> = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, secret)| ember::channel::content_key(&secret))
+        .collect();
+    // Epoch 0 is the secret the invite was minted with, still in `join_secret`
+    // for any room that has never rotated.
+    if let Ok(Some(secret)) = db.load_channel_join_secret(&ch.channel_id) {
+        let legacy = ember::channel::content_key(&secret);
+        if !keys.contains(&legacy) {
+            keys.push(legacy);
+        }
+    }
+    keys
+}
+
+/// The join secret this room seals *new* traffic with: its newest epoch, or the
+/// original invite secret for a room that has never rotated.
+///
+/// Distinct from [`channel_content_keys`] because presence takes the secret
+/// itself rather than the derived content key.
+fn current_channel_join_secret(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Option<[u8; 32]> {
+    if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
+        return hex::decode(&ch.pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(|pk| ember::channel::public_join_secret(&pk));
+    }
+    if let Some((_, secret)) = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+    {
+        return Some(secret);
+    }
+    db.load_channel_join_secret(&ch.channel_id).ok().flatten()
+}
+
+/// The key this room seals *new* traffic with.
+fn channel_content_key(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Option<[u8; 32]> {
+    channel_content_keys(db, ch).into_iter().next()
 }
 
 fn channel_member_pubkeys(
@@ -12401,20 +12614,18 @@ async fn maybe_refresh_channel_members(
         if now.saturating_sub(last) < ember::channel::PRESENCE_FETCH_SECS {
             continue;
         }
-        let Ok(pk_bytes) = hex::decode(&ch.pubkey) else {
+        // Has to be the same secret the publisher used, because the presence
+        // slot's DHT key is derived from it. Reading the raw `join_secret` here
+        // while publishing under the current epoch would put the two sides on
+        // different keys and members would stop discovering each other outright
+        // the first time a room rotated.
+        //
+        // Members briefly on different epochs therefore cannot see each other's
+        // presence. That resolves as they pick up the new key, and it does not
+        // block recovery: an epoch record is fetched by a key derived from the
+        // channel and our own identity, never from presence.
+        let Some(join_secret) = current_channel_join_secret(db, &ch) else {
             continue;
-        };
-        let Ok(channel_pubkey) = <[u8; 32]>::try_from(pk_bytes) else {
-            continue;
-        };
-        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
-        let join_secret = if private {
-            match db.load_channel_join_secret(&ch.channel_id) {
-                Ok(Some(secret)) => secret,
-                _ => continue,
-            }
-        } else {
-            ember::channel::public_join_secret(&channel_pubkey)
         };
         let epoch = ember::channel::presence_epoch(now);
         let current_key = ember::channel::presence_key(&channel_id, &join_secret, epoch);
@@ -12550,7 +12761,10 @@ fn ingest_channel_moderation_records(
         moderation.timestamp,
         &moderation.banned_pubkeys,
         &moderation.moderator_pubkeys,
-        moderation.owner_pubkey.as_ref(),
+        moderation.tail.owner_pubkey.as_ref(),
+        moderation.tail.successor_nominee.as_ref(),
+        moderation.tail.claim_after_days,
+        moderation.tail.key_epoch,
     )
     .unwrap_or(false)
 }
@@ -12565,6 +12779,7 @@ async fn maybe_publish_owned_channel_records(
     state: &mut NetworkState,
     db: &Arc<Database>,
     settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
 ) {
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
@@ -12623,8 +12838,21 @@ async fn maybe_publish_owned_channel_records(
             &bans,
             &mods,
             // We own this room, so our own identity is the owner identity every
-            // member needs in order to refuse a ban aimed at us.
-            Some(&our_pk),
+            // member needs in order to refuse a ban aimed at us, and our epoch
+            // is how they tell they are behind.
+            &ember::dht::publish::ModerationTail {
+                owner_pubkey: Some(our_pk),
+                key_epoch: Some(ch.key_epoch.max(0) as u64),
+                // Zeros rather than absent when unset, so withdrawing a
+                // nomination actually reaches members.
+                successor_nominee: Some(
+                    hex::decode(&ch.successor_nominee)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .unwrap_or([0u8; 32]),
+                ),
+                claim_after_days: Some(ch.claim_after_days.clamp(0, u16::MAX as i64) as u16),
+            },
             channel_id,
             ident.pubkey,
             private,
@@ -12657,8 +12885,220 @@ async fn maybe_publish_owned_channel_records(
                     drive_ember_publish(socket, state, index_id).await;
                 }
             }
+            // Renew the current epoch alongside it. Rotation publishes these
+            // once, on the ban, and if that pass failed — app closed mid-way, no
+            // route to the storing nodes, records aged out — every remaining
+            // member is locked out of a room they are still entitled to read,
+            // with nothing to re-ask of. This is the recovery path, and it is
+            // cheap: republishing an epoch a member already holds is a no-op.
+            if private && ch.key_epoch > 0 {
+                republish_channel_key_epoch(socket, state, db, &ch, &ident, identity, our_pk).await;
+            }
         }
     }
+}
+
+/// Re-seal the room's current content key to every member still entitled to it.
+///
+/// Skips banned members and ourselves, exactly as the rotation did. Reads the
+/// `banned` flag from the database, which is safe here because any ban that
+/// triggered a rotation was committed long before this timer runs.
+async fn republish_channel_key_epoch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    ident: &ember::channel::ChannelIdentity,
+    identity: &crate::storage::identity::NodeIdentity,
+    our_pk: [u8; 32],
+) {
+    let epoch = ch.key_epoch;
+    let Some(secret) = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(e, _)| *e == epoch)
+        .map(|(_, secret)| secret)
+    else {
+        return;
+    };
+    let our_seed = identity.ed25519_secret_key;
+    for member in db.list_channel_members(&ch.channel_id).unwrap_or_default() {
+        if member.banned {
+            continue;
+        }
+        let Some(member_pk) = hex::decode(&member.member_pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        if member_pk == our_pk {
+            continue;
+        }
+        let Some(wrap) = ember::channel::derive_channel_epoch_secret(
+            &our_seed,
+            &member_pk,
+            &ident.channel_id,
+            epoch,
+        ) else {
+            continue;
+        };
+        let sealed =
+            ember::channel::seal_channel_key_epoch(&wrap, &ident.channel_id, epoch, &secret);
+        let record = ember::dht::publish::SignedRecord::channel_key_epoch(
+            ident.channel_id,
+            ident.pubkey,
+            &member_pk,
+            epoch,
+            &sealed,
+            &ident.signing_key,
+        );
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
+const CHANNEL_EPOCH_FETCH_PER_TICK: usize = 2;
+/// Re-ask for an epoch record we could not find yet. Short, because until it
+/// lands the member cannot read anything new in the room.
+const CHANNEL_EPOCH_FETCH_SECS: i64 = 60;
+
+/// FIND_VALUE our own copy of a rotated content key.
+///
+/// Only for private rooms we do not own: the owner mints epochs, and a public
+/// room's key is derivable by anyone so rotating one would evict nobody. Driven
+/// by `key_epoch_wanted` running ahead of `key_epoch`, both of which come from
+/// the owner's signed moderation record.
+async fn maybe_refresh_channel_key_epoch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let our_pk = identity.ed25519_public_key;
+    let mut started = 0usize;
+    for ch in channels {
+        if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
+            break;
+        }
+        if ch.is_owner
+            || ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE
+            || ch.key_epoch_wanted <= ch.key_epoch
+            || !ch.successor_id.is_empty()
+        {
+            continue;
+        }
+        let Ok(channel_id) = hex::decode(&ch.channel_id)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
+        else {
+            continue;
+        };
+        let target = ch.key_epoch_wanted;
+        if state
+            .ember_channel_epoch_searches
+            .values()
+            .any(|(id, epoch)| *id == channel_id && *epoch == target)
+        {
+            continue;
+        }
+        let last = state
+            .channel_epoch_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < CHANNEL_EPOCH_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::epoch_key(&channel_id, &our_pk, target);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_epoch_searches
+            .insert(search_id, (channel_id, target));
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_epoch_fetch_at.insert(channel_id, now);
+        started += 1;
+    }
+}
+
+/// Open an epoch record sealed to us and store the key it carries.
+///
+/// The wrapping key is pairwise with the owner, so a blob sealed to anyone else
+/// simply fails to open — which is exactly what makes a ban an eviction.
+fn ingest_channel_epoch_records(
+    db: &Database,
+    identity: &crate::storage::identity::NodeIdentity,
+    channel_id: [u8; 16],
+    epoch: i64,
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Some(owner_pk) = hex::decode(&ch.owner_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        // We have not learned who owns the room, so there is nobody to derive
+        // the wrapping key against yet. The moderation poll fixes that.
+        return false;
+    };
+    let Some(wrap) = ember::channel::derive_channel_epoch_secret(
+        &identity.ed25519_secret_key,
+        &owner_pk,
+        &channel_id,
+        epoch,
+    ) else {
+        return false;
+    };
+    for blob in records {
+        let Some((member, record_epoch, envelope)) =
+            ember::dht::publish::SignedRecord::parse_channel_key_epoch(blob, &channel_id)
+        else {
+            continue;
+        };
+        // Only our own slot, and only for the epoch we asked about: the record
+        // is self-validating about both, so a mismatch is somebody else's.
+        if member != identity.ed25519_public_key || record_epoch != epoch {
+            continue;
+        }
+        let Some(secret) =
+            ember::channel::open_channel_key_epoch(&wrap, &channel_id, epoch, &envelope)
+        else {
+            continue;
+        };
+        match db.insert_channel_key_epoch(&channel_id_hex, epoch, &secret) {
+            Ok(()) => return true,
+            Err(e) => {
+                debug!("Ember channel epoch {epoch} for {channel_id_hex} not stored: {e}");
+            }
+        }
+    }
+    false
 }
 
 const CHANNEL_HANDOFF_FETCH_PER_TICK: usize = 2;
@@ -12723,6 +13163,38 @@ async fn maybe_refresh_channel_handoff(
         drive_ember_search(socket, state, search_id).await;
         state.channel_handoff_fetch_at.insert(channel_id, now);
         started += 1;
+
+        // A succession claim lives under its own key, because it is signed by
+        // the nominee rather than the room. Only worth asking for once the
+        // owner has actually been silent long enough to honour one.
+        if ch.successor_nominee.is_empty()
+            || ch.claim_after_days <= 0
+            || ch.moderation_updated_at <= 0
+            || now.saturating_sub(ch.moderation_updated_at)
+                < ch.claim_after_days.saturating_mul(86_400)
+        {
+            continue;
+        }
+        if state
+            .ember_channel_claim_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let claim = ember::channel::claim_key(&channel_id);
+        let Some(claim_search) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(claim),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            continue;
+        };
+        seed_ember_local_records(state, claim_search, &claim, &[]);
+        state
+            .ember_channel_claim_searches
+            .insert(claim_search, channel_id);
+        drive_ember_search(socket, state, claim_search).await;
     }
 }
 
@@ -12784,6 +13256,117 @@ fn ingest_channel_handoff_records(
     }
 }
 
+/// Honour a nominee's claim on a room whose owner has gone silent.
+///
+/// The claim itself proves nothing — it is signed by the claimant, who has
+/// every reason to publish one. What makes it safe is that each member decides
+/// independently, against facts only the owner could have authored: the
+/// nomination in their last signed moderation record, and the timestamp of that
+/// record.
+///
+/// The awkward part is that "the owner is silent" and "we have not looked" are
+/// the same observation from here. So the window is measured from the *newest*
+/// evidence available — ours or the claim's own — and only once
+/// [`owner_silence_is_confirmed`] says we have actually been asking.
+fn ingest_channel_claim_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> Option<[u8; 16]> {
+    if db.chat_locked() {
+        return None;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return None;
+    };
+    if !ember::channel::owner_silence_is_confirmed(ch.moderation_checked_at) {
+        return None;
+    }
+    if !ch.successor_id.is_empty() || ch.is_owner {
+        return None;
+    }
+    // Succession is opt-in: no nomination, or no window, means the owner never
+    // set it up and the room stays as it is.
+    if ch.successor_nominee.is_empty() || ch.claim_after_days <= 0 {
+        return None;
+    }
+    if ch.moderation_updated_at <= 0 {
+        // We have never held an owner-signed record, so we have no idea how
+        // long they have been quiet and no nomination we can trust.
+        return None;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let silent_for = now.saturating_sub(ch.moderation_updated_at);
+    let required = ch.claim_after_days.saturating_mul(86_400);
+    if silent_for < required {
+        return None;
+    }
+    // Pick one claim by a rule every member applies identically, rather than
+    // whichever the DHT happened to return first. A nominee can publish two
+    // claims naming different successor rooms; first-wins would let members
+    // follow different ones and split the room, which is exactly what
+    // succession is supposed to avoid. Newest witness wins, ties broken on the
+    // successor id so the ordering is total.
+    let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
+        .iter()
+        .filter_map(|blob| {
+            ember::dht::publish::SignedRecord::parse_channel_succession_claim(blob, &channel_id)
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.2.cmp(&b.2)));
+    for (claimant, successor_pk, successor_id, witnessed_ts, keep) in candidates {
+        let claimant_hex = hex::encode(claimant);
+        if !ch.successor_nominee.eq_ignore_ascii_case(&claimant_hex) {
+            continue;
+        }
+        // A nominee who was banned before the owner went quiet does not inherit
+        // the room. The owner clears the nomination when they ban, but their
+        // final record may never have reached us, so this is checked again here
+        // against the ban we do hold.
+        if db
+            .channel_member_is_banned(&channel_id_hex, &claimant_hex)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        // A claimant cannot backdate the owner's last word: they may only cite
+        // a record at least as new as the one we hold.
+        if witnessed_ts < ch.moderation_updated_at {
+            continue;
+        }
+        // And their own evidence has to clear the window too. Checking only our
+        // local copy meant a claim that openly cited a record from an hour ago
+        // was still honoured by anyone whose snapshot happened to be older —
+        // the claimant proved the owner was alive and inherited the room anyway.
+        if now.saturating_sub(witnessed_ts) < required {
+            continue;
+        }
+        let successor_pk_hex = hex::encode(successor_pk);
+        let successor_id_hex = hex::encode(successor_id);
+        if db
+            .apply_channel_handoff(
+                &channel_id_hex,
+                &successor_pk_hex,
+                &successor_id_hex,
+                // Version is the claim's own witness timestamp: monotonic, and
+                // it cannot collide with the owner's own handoff versions.
+                witnessed_ts.max(1) as u64,
+                keep,
+                None,
+            )
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                channel_id = %channel_id_hex,
+                "followed a succession claim after {silent_for}s of owner silence"
+            );
+            return Some(successor_id);
+        }
+    }
+    None
+}
+
 fn ingest_channel_presence_records(
     state: &mut NetworkState,
     db: &Database,
@@ -12798,7 +13381,10 @@ fn ingest_channel_presence_records(
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return false;
     };
-    let content_key = channel_content_key(db, &ch);
+    // A private room's presence extra is sealed under the content key, so a
+    // member who has not yet picked up the newest epoch is still readable under
+    // the one they published with.
+    let content_keys = channel_content_keys(db, &ch);
     let existing: HashSet<String> = db
         .list_channel_members(&channel_id_hex)
         .unwrap_or_default()
@@ -12807,11 +13393,13 @@ fn ingest_channel_presence_records(
         .collect();
     let mut changed = false;
     for blob in records {
-        let Some(member) = ember::dht::publish::SignedRecord::parse_channel_presence_member(
-            blob,
-            &channel_id,
-            content_key.as_ref(),
-        ) else {
+        let Some(member) = content_keys.iter().find_map(|candidate| {
+            ember::dht::publish::SignedRecord::parse_channel_presence_member(
+                blob,
+                &channel_id,
+                Some(candidate),
+            )
+        }) else {
             continue;
         };
         let pk_hex = hex::encode(member.publisher_key);
@@ -13487,10 +14075,12 @@ async fn handle_inbound_channel_gossip(
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return;
     };
-    let Some(key) = channel_content_key(db, &ch) else {
-        return;
-    };
-    let Some(plain) = gossip.decrypt(&key) else {
+    // Whichever epoch opened it is also what we answer under, so a member who
+    // is an epoch behind can still read our reply.
+    let Some((key, plain)) = channel_content_keys(db, &ch)
+        .into_iter()
+        .find_map(|candidate| gossip.decrypt(&candidate).map(|plain| (candidate, plain)))
+    else {
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
         return;
     };
@@ -13832,14 +14422,14 @@ async fn apply_channel_file_want(
         .channel_attachment_complete(&ch.channel_id, &digest_hex)
         .unwrap_or(false)
     {
-        if let Some(join) = channel_content_key(db, ch) {
-            let path = channel_file_disk_path(&ch.channel_id, &digest_hex);
-            if let Ok(sealed) = std::fs::read(&path) {
-                if let Some(plain) =
-                    ember::channel::open_channel_file(&join, &gossip.channel_id, &digest, &sealed)
-                {
-                    send_channel_file_chunks(socket, state, db, ch, key, &digest, &plain).await;
-                }
+        let path = channel_file_disk_path(&ch.channel_id, &digest_hex);
+        if let Ok(sealed) = std::fs::read(&path) {
+            // Sealed on disk under whatever epoch was current when it landed,
+            // which may no longer be the current one.
+            if let Some(plain) = channel_content_keys(db, ch).into_iter().find_map(|candidate| {
+                ember::channel::open_channel_file(&candidate, &gossip.channel_id, &digest, &sealed)
+            }) {
+                send_channel_file_chunks(socket, state, db, ch, key, &digest, &plain).await;
             }
         }
     }
@@ -18556,6 +19146,11 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_channel_handoff.clear();
     state.channel_handoff_fetch_at.clear();
     state.channel_file_assembly.clear();
+    state.ember_channel_epoch_searches.clear();
+    state.ember_pending_channel_epoch.clear();
+    state.channel_epoch_fetch_at.clear();
+    state.ember_channel_claim_searches.clear();
+    state.ember_pending_channel_claim.clear();
     state.channel_gossip_from_times.clear();
     state.channel_gossip_author_times.clear();
     state.channel_history_sync_at.clear();
@@ -19553,6 +20148,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_handoff: Vec::new(),
         channel_handoff_fetch_at: HashMap::new(),
         channel_file_assembly: HashMap::new(),
+        ember_channel_epoch_searches: HashMap::new(),
+        ember_pending_channel_epoch: Vec::new(),
+        channel_epoch_fetch_at: HashMap::new(),
+        ember_channel_claim_searches: HashMap::new(),
+        ember_pending_channel_claim: Vec::new(),
     };
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
@@ -36975,6 +37575,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     && state.ember_pending_channel_presence.is_empty()
                     && state.ember_pending_channel_moderation.is_empty()
                     && state.ember_pending_channel_handoff.is_empty()
+                    && state.ember_pending_channel_epoch.is_empty()
+                    && state.ember_pending_channel_claim.is_empty()
                     // The batch publisher is on an entirely separate path from
                     // the maps above — `flush_ember_batch_publish` only ever
                     // writes `in_flight` — and `expire()` below is its only
@@ -37061,6 +37663,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     state.ember_channel_presence_searches.remove(&search_id);
                     state.ember_channel_moderation_searches.remove(&search_id);
                     state.ember_channel_handoff_searches.remove(&search_id);
+                    state.ember_channel_epoch_searches.remove(&search_id);
+                    state.ember_channel_claim_searches.remove(&search_id);
                     // A publish-target lookup can end here rather than through
                     // `maybe_finish_ember_search`: if every send in its first
                     // batch fails, the whole shortlist goes back to Pending, so
@@ -37690,8 +38294,50 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
                 if !state.ember_pending_channel_moderation.is_empty() {
                     let pending = std::mem::take(&mut state.ember_pending_channel_moderation);
-                    for (channel_id, records) in pending {
+                    let checked_at = chrono::Utc::now().timestamp();
+                    for (channel_id, records, answered) in pending {
+                        // Only a search some peer actually answered counts as
+                        // having looked. Finding no owner record because nobody
+                        // replied is not evidence the owner has gone, and
+                        // succession is the one feature that acts on absence.
+                        if answered > 0 {
+                            let _ = db.touch_channel_moderation_checked(
+                                &hex::encode(channel_id),
+                                checked_at,
+                            );
+                        }
                         if ingest_channel_moderation_records(&db, channel_id, &records) {
+                            let _ = app_handle.emit(
+                                "ember:channel-moderation",
+                                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+                            );
+                        }
+                    }
+                }
+                if !state.ember_pending_channel_claim.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_claim);
+                    for (channel_id, records) in pending {
+                        if let Some(successor_id) =
+                            ingest_channel_claim_records(&db, channel_id, &records)
+                        {
+                            let _ = app_handle.emit(
+                                "ember:channel-handoff",
+                                serde_json::json!({
+                                    "channel_id": hex::encode(channel_id),
+                                    "successor_id": hex::encode(successor_id),
+                                    "phase": "claimed",
+                                }),
+                            );
+                        }
+                    }
+                }
+                if !state.ember_pending_channel_epoch.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_epoch);
+                    for (channel_id, epoch, records) in pending {
+                        if ingest_channel_epoch_records(&db, &identity, channel_id, epoch, &records)
+                        {
+                            // The room is readable again, so the list's badges
+                            // and the composer state want refreshing.
                             let _ = app_handle.emit(
                                 "ember:channel-moderation",
                                 serde_json::json!({ "channel_id": hex::encode(channel_id) }),
@@ -37752,6 +38398,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &mut state,
                         &db,
                         &settings,
+                        &identity,
                     )
                     .await;
                 }
@@ -37771,6 +38418,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .await;
                     maybe_refresh_channel_handoff(&udp_socket, &mut state, &db, &settings)
                         .await;
+                    maybe_refresh_channel_key_epoch(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                    )
+                    .await;
                 }
 
                 // Nothing to bridge from means nobody has crossed our path yet.
@@ -40911,11 +41566,32 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                     .ember_pending_channel_presence
                     .push((channel_id, records));
             } else if let Some(channel_id) =
-                state.ember_channel_moderation_searches.remove(&search_id)
+                state.ember_channel_claim_searches.remove(&search_id)
             {
                 state
-                    .ember_pending_channel_moderation
+                    .ember_pending_channel_claim
                     .push((channel_id, records));
+            } else if let Some((channel_id, epoch)) =
+                state.ember_channel_epoch_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_epoch
+                    .push((channel_id, epoch, records));
+            } else if let Some(channel_id) =
+                state.ember_channel_moderation_searches.remove(&search_id)
+            {
+                // How many peers actually answered. An empty result from a
+                // search nobody answered says nothing about the owner — it says
+                // we could not reach the network — and succession must not read
+                // the two the same way.
+                let answered = state
+                    .ember_search
+                    .get(search_id)
+                    .map(|s| s.responded_count())
+                    .unwrap_or(0);
+                state
+                    .ember_pending_channel_moderation
+                    .push((channel_id, records, answered));
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {

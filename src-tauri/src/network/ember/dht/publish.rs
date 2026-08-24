@@ -55,6 +55,20 @@ pub const CHANNEL_KIND_INDEX: u8 = 1;
 pub const CHANNEL_KIND_PRESENCE: u8 = 2;
 pub const CHANNEL_KIND_MODERATION: u8 = 3;
 pub const CHANNEL_KIND_HANDOFF: u8 = 4;
+pub const CHANNEL_KIND_EPOCH: u8 = 5;
+pub const CHANNEL_KIND_CLAIM: u8 = 6;
+// Adding a kind here does *not* need an `EMBER_DHT_VERSION` bump, and must not
+// get one. That byte versions the frame *layout*, so that a peer handed a frame
+// it would misparse refuses it outright; bumping it partitions the transport for
+// everything — file search, friend presence — not just channels. A kind an older
+// build has never heard of is already a clean refusal: `channel_store_ok` falls
+// through to `false`, and every `parse_channel_*` gates on `kind`. The record
+// simply is not stored or read by that peer, which is the correct outcome.
+//
+// The same holds for appending to a record's `extra`: see [`ModerationTail`],
+// where a reader accepts any prefix and rejects a partial field.
+/// `member(32) || epoch(8) || sealed envelope`.
+const EPOCH_EXTRA_PREFIX_LEN: usize = 32 + 8;
 pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
 const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
@@ -492,11 +506,10 @@ pub struct ChannelModeration {
     pub welcome: String,
     pub banned_pubkeys: Vec<[u8; 32]>,
     pub moderator_pubkeys: Vec<[u8; 32]>,
-    /// The owner's own user identity, signed by the room key so every member
-    /// can tell who it is. Without it a moderator's ban gossip could name the
-    /// owner and no recipient had grounds to refuse. `None` for records
-    /// published before this field existed — unknown, not "nobody".
-    pub owner_pubkey: Option<[u8; 32]>,
+    /// Owner-signed facts appended after the original three fields. Each is
+    /// `None` for a record published before it existed — unknown, not a
+    /// definite negative.
+    pub tail: ModerationTail,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
 }
@@ -660,7 +673,7 @@ impl SignedRecord {
         welcome: &str,
         banned_pubkeys: &[[u8; 32]],
         moderator_pubkeys: &[[u8; 32]],
-        owner_pubkey: Option<&[u8; 32]>,
+        tail: &ModerationTail,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         private: bool,
@@ -668,8 +681,7 @@ impl SignedRecord {
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
-        let extra =
-            encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, owner_pubkey);
+        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
         Self::build(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
@@ -681,6 +693,117 @@ impl SignedRecord {
             Some(extra),
             signing_key,
         )
+    }
+
+    /// One member's copy of one rotated content key, signed by the channel key
+    /// so only the owner can mint it, and sealed so only that member can read
+    /// it. Published per member; the room key itself never appears in the clear.
+    pub fn channel_key_epoch(
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        member_pubkey: &[u8; 32],
+        epoch: i64,
+        sealed: &[u8],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let mut extra = Vec::with_capacity(EPOCH_EXTRA_PREFIX_LEN + sealed.len());
+        extra.extend_from_slice(member_pubkey);
+        extra.extend_from_slice(&epoch.to_le_bytes());
+        extra.extend_from_slice(sealed);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::epoch_key(&channel_id, member_pubkey, epoch),
+            channel_id,
+            channel_pubkey,
+            // Always private in effect: a public room's key is derivable by
+            // anyone, so rotating one would evict nobody.
+            pack_channel_file_size(CHANNEL_KIND_EPOCH, CHANNEL_FLAG_PRIVATE),
+            "",
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Parse an epoch record for `expected_channel_id`, returning the recipient
+    /// it was sealed for, the epoch, and the sealed envelope.
+    pub fn parse_channel_key_epoch(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<([u8; 32], i64, Vec<u8>)> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_EPOCH {
+            return None;
+        }
+        let (member, epoch, envelope) = decode_epoch_extra(&meta.extra)?;
+        Some((member, epoch, envelope.to_vec()))
+    }
+
+    /// A nominee claiming a room whose owner has gone silent, signed by the
+    /// nominee's own user key.
+    ///
+    /// `ember_file_hash` stays the old channel pubkey so the record still
+    /// belongs to that room; the publisher is the claimant. Members decide
+    /// whether to honour it by checking the claimant against the nomination in
+    /// the owner's last signed record, and the silence against their own copy
+    /// of its timestamp.
+    pub fn channel_succession_claim(
+        old_channel_id: [u8; 16],
+        old_channel_pubkey: [u8; 32],
+        successor_pubkey: &[u8; 32],
+        witnessed_moderation_ts: i64,
+        private: bool,
+        claimant_signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let extra = channel::encode_claim_extra(successor_pubkey, witnessed_moderation_ts);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::claim_key(&old_channel_id),
+            old_channel_id,
+            old_channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_CLAIM, flags),
+            "",
+            None,
+            Some(extra),
+            claimant_signing_key,
+        )
+    }
+
+    /// Parse a succession claim: `(claimant, successor_pubkey,
+    /// successor_channel_id, witnessed_moderation_ts, keep_join_secret)`.
+    pub fn parse_channel_succession_claim(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<([u8; 32], [u8; 32], [u8; 16], i64, bool)> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_CLAIM {
+            return None;
+        }
+        let (successor_pubkey, successor_channel_id, ts) =
+            channel::decode_claim_extra(&meta.extra)?;
+        let keep = meta.flags & CHANNEL_FLAG_PRIVATE != 0;
+        Some((
+            rec.publisher_key,
+            successor_pubkey,
+            successor_channel_id,
+            ts,
+            keep,
+        ))
     }
 
     /// Successor mapping signed by the **old** channel key. Does not copy
@@ -748,6 +871,29 @@ impl SignedRecord {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::handoff_key(&self.file_hash)
                     && channel::decode_handoff_extra(&meta.extra).is_some()
+            }
+            CHANNEL_KIND_EPOCH => {
+                // Fully self-validating: the recipient and epoch are in the
+                // extra, so a storer can recompute the key this record claims
+                // to live under and refuse one filed anywhere else. It cannot
+                // read the envelope, only check its shape.
+                let Some((member, epoch, envelope)) = decode_epoch_extra(&meta.extra) else {
+                    return false;
+                };
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::epoch_key(&self.file_hash, &member, epoch)
+                    && channel::epoch_envelope_store_ok(envelope)
+            }
+            CHANNEL_KIND_CLAIM => {
+                // Signed by the *nominee's* user key, not the room key — the
+                // whole point is that the owner is unreachable — so unlike a
+                // handoff this does not require publisher == channel pubkey.
+                // Whether the claim is legitimate is a question only a member
+                // holding the owner's nomination can answer; a storer just
+                // checks the shape and the slot.
+                crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
+                    && self.keyword_hash == channel::claim_key(&self.file_hash)
+                    && channel::decode_claim_extra(&meta.extra).is_some()
             }
             _ => false,
         }
@@ -902,14 +1048,14 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_MODERATION {
             return None;
         }
-        let (welcome, banned_pubkeys, moderator_pubkeys, owner_pubkey) =
+        let (welcome, banned_pubkeys, moderator_pubkeys, tail) =
             decode_moderation_extra(&meta.extra)?;
         Some(ChannelModeration {
             topic: rec.file_name,
             welcome,
             banned_pubkeys,
             moderator_pubkeys,
-            owner_pubkey,
+            tail,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
         })
@@ -1080,11 +1226,115 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// The owner-signed facts appended to a moderation record after its original
+/// three fields.
+///
+/// Encoded as an append-only run in declaration order, each field readable only
+/// if the whole of it is present. Any prefix is valid, so a reader accepts
+/// every version of the record ever published and a writer never has to
+/// coordinate with one; a *partial* field is malformed, not old.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModerationTail {
+    /// The owner's own user identity. Lets any member refuse a moderator's ban
+    /// aimed at the owner — nothing else on the wire identifies them.
+    pub owner_pubkey: Option<[u8; 32]>,
+    /// Current content-key epoch, so a member can tell they are behind and go
+    /// looking for the epoch record sealed to them.
+    pub key_epoch: Option<u64>,
+    /// Who may take the room over if the owner goes quiet.
+    ///
+    /// All zeros means "explicitly nobody", which is not the same as absent: a
+    /// current build always writes this field, so zeros are how an owner
+    /// *withdraws* a nomination. Without that distinction there is no way to
+    /// clear one — stopping at `None` would truncate the field away, and a
+    /// reader cannot tell a truncated tail from a withdrawal, so members would
+    /// honour a nominee the owner had already dropped.
+    pub successor_nominee: Option<[u8; 32]>,
+    /// How long the owner must be silent before that claim is honoured.
+    pub claim_after_days: Option<u16>,
+}
+
+impl ModerationTail {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Stops at the first absent field: a later field cannot be located
+        // without the earlier ones, so writing one alone would be unreadable.
+        let Some(owner) = self.owner_pubkey else {
+            return;
+        };
+        out.extend_from_slice(&owner);
+        let Some(epoch) = self.key_epoch else {
+            return;
+        };
+        out.extend_from_slice(&epoch.to_le_bytes());
+        let Some(nominee) = self.successor_nominee else {
+            return;
+        };
+        out.extend_from_slice(&nominee);
+        let Some(days) = self.claim_after_days else {
+            return;
+        };
+        out.extend_from_slice(&days.to_le_bytes());
+    }
+
+    fn decode(mut rest: &[u8]) -> Option<Self> {
+        let mut tail = Self::default();
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&rest[..32]);
+        tail.owner_pubkey = Some(owner);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 8 {
+            return None;
+        }
+        tail.key_epoch = Some(u64::from_le_bytes(rest[..8].try_into().ok()?));
+        rest = &rest[8..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        let mut nominee = [0u8; 32];
+        nominee.copy_from_slice(&rest[..32]);
+        tail.successor_nominee = Some(nominee);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() != 2 {
+            return None;
+        }
+        tail.claim_after_days = Some(u16::from_le_bytes(rest.try_into().ok()?));
+        Some(tail)
+    }
+}
+
+fn decode_epoch_extra(extra: &[u8]) -> Option<([u8; 32], i64, &[u8])> {
+    if extra.len() <= EPOCH_EXTRA_PREFIX_LEN {
+        return None;
+    }
+    let mut member = [0u8; 32];
+    member.copy_from_slice(&extra[..32]);
+    let epoch = i64::from_le_bytes(extra[32..EPOCH_EXTRA_PREFIX_LEN].try_into().ok()?);
+    if epoch < 0 {
+        return None;
+    }
+    Some((member, epoch, &extra[EPOCH_EXTRA_PREFIX_LEN..]))
+}
+
 fn encode_moderation_extra(
     welcome: &str,
     banned_pubkeys: &[[u8; 32]],
     moderator_pubkeys: &[[u8; 32]],
-    owner_pubkey: Option<&[u8; 32]>,
+    tail: &ModerationTail,
 ) -> Vec<u8> {
     let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
     let bans = banned_pubkeys
@@ -1107,21 +1357,18 @@ fn encode_moderation_extra(
     for pk in mods {
         extra.extend_from_slice(pk);
     }
-    if let Some(owner) = owner_pubkey {
-        extra.extend_from_slice(owner);
-    }
+    tail.encode(&mut extra);
     extra
 }
 
 /// Decode the extra blob from a moderation record.
 ///
-/// Two fields have been appended over time and both are optional on the way
-/// in, so a mixed network still applies whatever a record does carry: records
-/// from before moderator delegation omit the delegation list, and records from
-/// before owner identity omit the trailing owner key. A missing owner means
-/// "this record does not say", which readers must treat as unknown rather than
-/// as nobody.
-type ModerationExtra = (String, Vec<[u8; 32]>, Vec<[u8; 32]>, Option<[u8; 32]>);
+/// The format has grown twice and every addition is optional on the way in, so
+/// a reader accepts whatever a record carries: no delegation list (pre-
+/// delegation), and any prefix of [`ModerationTail`] after it. An absent field
+/// means "this record does not say", which readers must treat as unknown
+/// rather than as a definite negative.
+type ModerationExtra = (String, Vec<[u8; 32]>, Vec<[u8; 32]>, ModerationTail);
 
 pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
     if extra.len() < 4 {
@@ -1149,7 +1396,7 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
     }
     let rest = &extra[bans_end..];
     if rest.is_empty() {
-        return Some((welcome, bans, Vec::new(), None));
+        return Some((welcome, bans, Vec::new(), ModerationTail::default()));
     }
     if rest.len() < 2 {
         return None;
@@ -1168,19 +1415,8 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
         pk.copy_from_slice(chunk);
         mods.push(pk);
     }
-    // Trailing owner key: present or absent, never partial. A short or
-    // oversized tail is a malformed record rather than an older one.
-    let tail = &rest[mods_end..];
-    let owner = match tail.len() {
-        0 => None,
-        32 => {
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(tail);
-            Some(pk)
-        }
-        _ => return None,
-    };
-    Some((welcome, bans, mods, owner))
+    let tail = ModerationTail::decode(&rest[mods_end..])?;
+    Some((welcome, bans, mods, tail))
 }
 
 /// Tracks a single publish operation: store a record on the closest K nodes.
@@ -1831,12 +2067,16 @@ mod tests {
         let banned = [[0x11u8; 32], [0x22u8; 32]];
         let mods = [[0xAAu8; 32]];
         let owner = [0x77u8; 32];
+        let owner_tail = ModerationTail {
+            owner_pubkey: Some(owner),
+            ..Default::default()
+        };
         let record = SignedRecord::channel_moderation(
             "rules",
             "be kind",
             &banned,
             &mods,
-            Some(&owner),
+            &owner_tail,
             ident.channel_id,
             ident.pubkey,
             false,
@@ -1844,13 +2084,13 @@ mod tests {
         );
         assert!(record.channel_store_ok());
         let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
-        let (welcome, bans, parsed_mods, parsed_owner) =
+        let (welcome, bans, parsed_mods, parsed_tail) =
             decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
         assert_eq!(parsed.file_name, "rules");
         assert_eq!(welcome, "be kind");
         assert_eq!(bans, banned);
         assert_eq!(parsed_mods, mods);
-        assert_eq!(parsed_owner, Some(owner));
+        assert_eq!(parsed_tail.owner_pubkey, Some(owner));
 
         let mut blob = record.data.clone();
         blob.extend_from_slice(&record.signature);
@@ -1860,7 +2100,7 @@ mod tests {
         assert_eq!(mod_info.banned_pubkeys, banned);
         assert_eq!(mod_info.moderator_pubkeys, mods);
         assert_eq!(
-            mod_info.owner_pubkey,
+            mod_info.tail.owner_pubkey,
             Some(owner),
             "members can only refuse a ban on the owner if the record names them"
         );
@@ -1874,7 +2114,7 @@ mod tests {
             "be kind",
             &banned,
             &mods,
-            None,
+            &ModerationTail::default(),
             ident.channel_id,
             ident.pubkey,
             false,
@@ -1884,7 +2124,7 @@ mod tests {
         anon_blob.extend_from_slice(&anonymous.signature);
         let anon_info =
             SignedRecord::parse_channel_moderation(&anon_blob, &ident.channel_id).unwrap();
-        assert_eq!(anon_info.owner_pubkey, None);
+        assert_eq!(anon_info.tail.owner_pubkey, None);
         assert_eq!(anon_info.banned_pubkeys, banned);
 
         let successor = channel::ChannelIdentity::generate();
@@ -1907,19 +2147,98 @@ mod tests {
         assert!(SignedRecord::parse_channel_handoff(&hblob, &[0u8; 16]).is_none());
 
         // Pre-delegation extra: welcome + bans and nothing after.
-        let mut legacy = encode_moderation_extra("hi", &banned, &[], None);
+        let mut legacy = encode_moderation_extra("hi", &banned, &[], &ModerationTail::default());
         legacy.truncate(legacy.len() - 2);
-        let (w, b, m, o) = decode_moderation_extra(&legacy).unwrap();
+        let (w, b, m, legacy_tail) = decode_moderation_extra(&legacy).unwrap();
         assert_eq!(w, "hi");
         assert_eq!(b, banned);
         assert!(m.is_empty());
-        assert_eq!(o, None);
+        assert_eq!(legacy_tail, ModerationTail::default());
 
         // A partial owner key is malformed, not an older record: accepting a
         // short tail would let a truncated pubkey stand in for the owner.
-        let mut short_owner = encode_moderation_extra("hi", &banned, &[], Some(&[0x99u8; 32]));
+        let mut short_owner = encode_moderation_extra(
+            "hi",
+            &banned,
+            &[],
+            &ModerationTail { owner_pubkey: Some([0x99u8; 32]), ..Default::default() },
+        );
         short_owner.truncate(short_owner.len() - 1);
         assert!(decode_moderation_extra(&short_owner).is_none());
+    }
+
+    /// The moderation tail is how a member learns who owns a room, which epoch
+    /// it is on, and who may inherit it. Fields were appended over time, so
+    /// every prefix has to stay readable — a reader that rejected an older
+    /// record would lose all three facts, and one that accepted a partial field
+    /// would invent a truncated pubkey.
+    #[test]
+    fn every_prefix_of_the_moderation_tail_decodes_and_partials_do_not() {
+        let owner = [0x11u8; 32];
+        let nominee = [0x22u8; 32];
+        let full = ModerationTail {
+            owner_pubkey: Some(owner),
+            key_epoch: Some(9),
+            successor_nominee: Some(nominee),
+            claim_after_days: Some(14),
+        };
+
+        let round_trip = |tail: &ModerationTail| -> ModerationTail {
+            let extra = encode_moderation_extra("hi", &[[0x01u8; 32]], &[[0x02u8; 32]], tail);
+            let (_, _, _, decoded) = decode_moderation_extra(&extra).expect("decodes");
+            decoded
+        };
+
+        // Every prefix survives, and stopping early does not fabricate the rest.
+        assert_eq!(round_trip(&full), full);
+        let no_days = ModerationTail {
+            claim_after_days: None,
+            ..full
+        };
+        assert_eq!(round_trip(&no_days), no_days);
+        let owner_and_epoch = ModerationTail {
+            successor_nominee: None,
+            ..no_days
+        };
+        assert_eq!(round_trip(&owner_and_epoch), owner_and_epoch);
+        let owner_only = ModerationTail {
+            owner_pubkey: Some(owner),
+            ..Default::default()
+        };
+        assert_eq!(round_trip(&owner_only), owner_only);
+        assert_eq!(
+            round_trip(&ModerationTail::default()),
+            ModerationTail::default()
+        );
+
+        // A later field without its predecessor cannot be located, so it is
+        // dropped on the way out rather than written somewhere unreadable.
+        let orphan = ModerationTail {
+            owner_pubkey: None,
+            key_epoch: Some(4),
+            successor_nominee: Some(nominee),
+            claim_after_days: Some(7),
+        };
+        assert_eq!(round_trip(&orphan), ModerationTail::default());
+
+        // Every partial field is malformed, not old.
+        let base = encode_moderation_extra("hi", &[], &[], &full);
+        for cut in 1..=(32 + 8 + 32 + 2) {
+            if cut == 2 || cut == 2 + 32 || cut == 2 + 32 + 8 {
+                // 0, 32, 40 and 72-byte tails are the legitimate prefixes.
+                continue;
+            }
+            let mut truncated = base.clone();
+            truncated.truncate(base.len() - cut);
+            let tail_len = truncated.len() - (base.len() - (32 + 8 + 32 + 2));
+            if matches!(tail_len, 0 | 32 | 40 | 72) {
+                continue;
+            }
+            assert!(
+                decode_moderation_extra(&truncated).is_none(),
+                "a {tail_len}-byte tail is malformed"
+            );
+        }
     }
 
     #[test]
@@ -1947,9 +2266,9 @@ mod tests {
             "welcome ☕",
             &[[0x11u8; 32], [0x22u8; 32]],
             &[[0xAAu8; 32]],
-            Some(&[0x77u8; 32]),
+            &ModerationTail { owner_pubkey: Some([0x77u8; 32]), ..Default::default() },
         );
-        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[], None);
+        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[], &ModerationTail::default());
         legacy.truncate(legacy.len() - 2);
         let mut decoded_ok = 0usize;
         for i in 0..2_000 {
@@ -1972,11 +2291,11 @@ mod tests {
                 decoded_ok += 1;
             }
         }
-        let (welcome, bans, mods, owner) = decode_moderation_extra(&well_formed).unwrap();
+        let (welcome, bans, mods, fuzz_tail) = decode_moderation_extra(&well_formed).unwrap();
         assert_eq!(welcome, "welcome ☕");
         assert_eq!(bans.len(), 2);
         assert_eq!(mods.len(), 1);
-        assert_eq!(owner, Some([0x77u8; 32]));
+        assert_eq!(fuzz_tail.owner_pubkey, Some([0x77u8; 32]));
         assert!(
             decoded_ok > 0,
             "the fuzz never produced a buffer that reached decode_moderation_extra"
@@ -2005,7 +2324,7 @@ mod tests {
             "be kind",
             &[[0x11u8; 32]],
             &[[0xAAu8; 32]],
-            Some(&[0x77u8; 32]),
+            &ModerationTail { owner_pubkey: Some([0x77u8; 32]), ..Default::default() },
             ident.channel_id,
             ident.pubkey,
             false,

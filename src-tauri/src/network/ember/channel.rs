@@ -27,6 +27,12 @@ const INDEX_KEY_PREFIX: &[u8] = b"ember:channels:index:v1:";
 const PRESENCE_KEY_PREFIX: &[u8] = b"ember:channel:presence:v1";
 const MODERATION_KEY_PREFIX: &[u8] = b"ember:channel:mod:v1";
 const HANDOFF_KEY_PREFIX: &[u8] = b"ember:channel:handoff:v1";
+const EPOCH_KEY_PREFIX: &[u8] = b"ember:channel:epoch:v1";
+const CLAIM_KEY_PREFIX: &[u8] = b"ember:channel:claim:v1";
+const EPOCH_AAD_DOMAIN: &[u8] = b"ember-channel-key-epoch-v1\0";
+const EPOCH_ENVELOPE_VERSION: u8 = 1;
+/// `version(1) + nonce + key(32) + tag`.
+pub const EPOCH_ENVELOPE_LEN: usize = 1 + GOSSIP_NONCE_LEN + 32 + GOSSIP_TAG_LEN;
 const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
 const GOSSIP_AAD_DOMAIN: &[u8] = b"ember-channel-gossip-v1\0";
 const FILE_AAD_DOMAIN: &[u8] = b"ember-channel-file-v1\0";
@@ -233,6 +239,176 @@ pub fn handoff_key(channel_id: &[u8; 16]) -> [u8; 16] {
     key
 }
 
+/// DHT key holding one member's copy of one content-key epoch.
+///
+/// Per member rather than one record listing everybody: a room of 32 would not
+/// fit a single record, and this way each member fetches only their own slot.
+/// An evicted member can still fetch someone else's blob — they simply cannot
+/// open it, which is the whole point.
+pub fn epoch_key(channel_id: &[u8; 16], member_pubkey: &[u8; 32], epoch: i64) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EPOCH_KEY_PREFIX);
+    hasher.update(channel_id);
+    hasher.update(member_pubkey);
+    hasher.update(&epoch.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// Whether a room's owner-silence is something we have observed rather than
+/// assumed.
+///
+/// `moderation_checked_at` is when a search for the owner's record last came
+/// back. Without this, a client that had been offline past the claim window
+/// would treat its own stale snapshot as proof the owner had gone — the two are
+/// indistinguishable locally. Both the member honouring a claim and the nominee
+/// making one ask this, so neither can act on an unverified silence.
+///
+/// Three fetch intervals tolerates a couple of missed passes.
+pub fn owner_silence_is_confirmed(moderation_checked_at: i64) -> bool {
+    if moderation_checked_at <= 0 {
+        return false;
+    }
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(moderation_checked_at);
+    age <= MODERATION_FETCH_SECS * 3
+}
+
+/// Default silence before an owner's nomination may be claimed.
+pub const CLAIM_AFTER_DAYS_DEFAULT: u16 = 14;
+/// Bounds on that window. A room whose owner is merely on holiday must not
+/// change hands, and one nobody can ever inherit is the problem being solved.
+pub const CLAIM_AFTER_DAYS_MIN: u16 = 7;
+pub const CLAIM_AFTER_DAYS_MAX: u16 = 365;
+
+/// DHT key for a nominee's succession claim.
+///
+/// Separate from [`handoff_key`] because the two are signed by different keys:
+/// a handoff is the owner acting, a claim is a nominee acting in their absence.
+/// Sharing a slot would let one overwrite the other.
+pub fn claim_key(channel_id: &[u8; 16]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CLAIM_KEY_PREFIX);
+    hasher.update(channel_id);
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// `successor_pubkey(32) || witnessed_moderation_ts(8)`.
+///
+/// The timestamp is the newest owner-signed moderation record the claimant
+/// could find. Members check it against their own copy, so a claimant cannot
+/// pretend the owner has been quiet longer than they have.
+pub fn encode_claim_extra(successor_pubkey: &[u8; 32], witnessed_moderation_ts: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(successor_pubkey);
+    out.extend_from_slice(&witnessed_moderation_ts.to_le_bytes());
+    out
+}
+
+pub fn decode_claim_extra(extra: &[u8]) -> Option<([u8; 32], [u8; 16], i64)> {
+    if extra.len() != 40 {
+        return None;
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&extra[..32]);
+    // Must be a real point, or the successor id derived from it is meaningless.
+    crypto::verifying_key_from_bytes(&pk)?;
+    let ts = i64::from_le_bytes(extra[32..].try_into().ok()?);
+    Some((pk, channel_id_from_pubkey(&pk), ts))
+}
+
+/// Wrapping key for one member's copy of one epoch.
+///
+/// Symmetric static DH, so the owner computes it from their own seed plus the
+/// member's identity and the member computes the identical value from their
+/// seed plus the owner's — which they know because the owner signs it into the
+/// moderation record. Nobody else can derive it, so nobody else can read the
+/// room key out of the DHT.
+pub fn derive_channel_epoch_secret(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    epoch: i64,
+) -> Option<[u8; 32]> {
+    // Pairwise purpose is capped at 64 bytes; this is 26.
+    let mut purpose = Vec::with_capacity(10 + 16);
+    purpose.extend_from_slice(b"ch-epoch-v1");
+    purpose.extend_from_slice(channel_id);
+    crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, epoch)
+}
+
+/// Seal a rotated content key for one member.
+///
+/// The epoch and room are bound as AAD, so a blob lifted from one room or one
+/// epoch cannot be replayed into another even by a member who legitimately
+/// holds the wrapping key for both.
+pub fn seal_channel_key_epoch(
+    wrap_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    epoch: i64,
+    room_key: &[u8; 32],
+) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(wrap_key));
+    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: room_key,
+                aad: &epoch_aad(channel_id, epoch),
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail for a 32-byte key");
+    let mut out = Vec::with_capacity(1 + GOSSIP_NONCE_LEN + encrypted.len());
+    out.push(EPOCH_ENVELOPE_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    out
+}
+
+pub fn open_channel_key_epoch(
+    wrap_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    epoch: i64,
+    envelope: &[u8],
+) -> Option<[u8; 32]> {
+    if envelope.len() != EPOCH_ENVELOPE_LEN || envelope[0] != EPOCH_ENVELOPE_VERSION {
+        return None;
+    }
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(wrap_key));
+    let plain = cipher
+        .decrypt(
+            XNonce::from_slice(&envelope[1..1 + GOSSIP_NONCE_LEN]),
+            Payload {
+                msg: &envelope[1 + GOSSIP_NONCE_LEN..],
+                aad: &epoch_aad(channel_id, epoch),
+            },
+        )
+        .ok()?;
+    <[u8; 32]>::try_from(plain).ok()
+}
+
+fn epoch_aad(channel_id: &[u8; 16], epoch: i64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(EPOCH_AAD_DOMAIN.len() + 16 + 8);
+    aad.extend_from_slice(EPOCH_AAD_DOMAIN);
+    aad.extend_from_slice(channel_id);
+    aad.extend_from_slice(&epoch.to_le_bytes());
+    aad
+}
+
+/// Storers cannot open an epoch blob, so they check only that it is the right
+/// shape — a truncated or padded one is dropped rather than stored to mislead.
+pub fn epoch_envelope_store_ok(extra: &[u8]) -> bool {
+    extra.len() == EPOCH_ENVELOPE_LEN && extra[0] == EPOCH_ENVELOPE_VERSION
+}
+
 /// Rendezvous capability two channel members compute for each other.
 ///
 /// Distinct from friend presence: the purpose binds the channel and the
@@ -300,6 +476,15 @@ pub struct ChannelInvite {
     pub name: String,
     pub join_secret: [u8; 32],
     pub private: bool,
+    /// Which content-key epoch `join_secret` belongs to. 0 means the invite does
+    /// not say, which is true of a room that never rotated and of any invite
+    /// minted before this field existed.
+    ///
+    /// Without it a joiner cannot tell a working invite from a stale one: their
+    /// secret is current, but the room reports an epoch they have no record of,
+    /// so they would be told their invite was out of date and would chase a key
+    /// that was never minted for them.
+    pub key_epoch: u64,
 }
 
 impl ChannelInvite {
@@ -316,6 +501,11 @@ impl ChannelInvite {
         if self.private {
             uri.push_str("&k=");
             uri.push_str(&hex::encode(self.join_secret));
+            // Omitted at epoch 0 so an unrotated room's invite is unchanged.
+            if self.key_epoch > 0 {
+                uri.push_str("&e=");
+                uri.push_str(&self.key_epoch.to_string());
+            }
         }
         uri
     }
@@ -331,6 +521,7 @@ impl ChannelInvite {
         let mut pubkey = None;
         let mut name = String::new();
         let mut join_secret = None;
+        let mut key_epoch = 0u64;
         for pair in query.split('&') {
             if pair.is_empty() {
                 continue;
@@ -340,6 +531,10 @@ impl ChannelInvite {
                 "pk" => pubkey = hex_32(value),
                 "name" => name = percent_decode(value)?,
                 "k" => join_secret = hex_32(value),
+                // Unparseable is the same as absent: an invite is user-pasted,
+                // so a mangled epoch must not throw the whole thing away when
+                // the secret itself is intact.
+                "e" => key_epoch = value.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -349,12 +544,16 @@ impl ChannelInvite {
         }
         let private = join_secret.is_some();
         let join_secret = join_secret.unwrap_or_else(|| public_join_secret(&pubkey));
+        // A public room's key is derived, never rotated, so an epoch on one is
+        // meaningless and is dropped rather than recorded.
+        let key_epoch = if private { key_epoch } else { 0 };
         Some(Self {
             channel_id,
             pubkey,
             name,
             join_secret,
             private,
+            key_epoch,
         })
     }
 }
@@ -1302,6 +1501,7 @@ mod tests {
             name: "General chat".into(),
             join_secret: public_join_secret(&ident.pubkey),
             private: false,
+            key_epoch: 0,
         };
         let parsed = ChannelInvite::parse(&invite.format()).unwrap();
         assert_eq!(parsed, invite);
@@ -1318,11 +1518,40 @@ mod tests {
             name: "café ☕".into(),
             join_secret: secret,
             private: true,
+            key_epoch: 5,
         };
         let parsed = ChannelInvite::parse(&invite.format()).unwrap();
         assert_eq!(parsed.join_secret, secret);
         assert!(parsed.private);
         assert_eq!(parsed.name, "café ☕");
+        assert_eq!(parsed.key_epoch, 5, "the invite states which epoch it is for");
+
+        // An invite from before this field existed, or from a room that never
+        // rotated, reads as epoch 0 rather than failing to parse — the secret is
+        // what matters and it is still intact.
+        let older = invite.format().replace("&e=5", "");
+        let parsed = ChannelInvite::parse(&older).expect("older invites still parse");
+        assert_eq!(parsed.join_secret, secret);
+        assert_eq!(parsed.key_epoch, 0);
+
+        // A mangled epoch is treated the same way, for the same reason: these
+        // are pasted by hand.
+        let mangled = invite.format().replace("&e=5", "&e=notanumber");
+        let parsed = ChannelInvite::parse(&mangled).expect("a bad epoch is not fatal");
+        assert_eq!(parsed.join_secret, secret);
+        assert_eq!(parsed.key_epoch, 0);
+
+        // A public invite never carries one: its key is derived, not rotated.
+        let public = ChannelInvite {
+            channel_id: ident.channel_id,
+            pubkey: ident.pubkey,
+            name: String::new(),
+            join_secret: public_join_secret(&ident.pubkey),
+            private: false,
+            key_epoch: 9,
+        };
+        assert!(!public.format().contains("&e="));
+        assert_eq!(ChannelInvite::parse(&public.format()).unwrap().key_epoch, 0);
     }
 
     #[test]
@@ -1808,6 +2037,90 @@ mod tests {
             seen.len(),
             CHANNEL_GOSSIP_AUTHOR_CAP,
             "and refusing does not grow the map"
+        );
+    }
+
+    /// Rotation is only an eviction if the member who was removed cannot open
+    /// the new key. That rests entirely on the wrapping key being pairwise, so
+    /// this pins both directions: the two parties agree, and nobody else can
+    /// reach it.
+    #[test]
+    fn an_epoch_key_is_readable_by_its_recipient_and_nobody_else() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let member = SigningKey::generate(&mut OsRng);
+        let evicted = SigningKey::generate(&mut OsRng);
+        let owner_pub = owner.verifying_key().to_bytes();
+        let member_pub = member.verifying_key().to_bytes();
+        let channel_id = [0x31u8; 16];
+        let room_key = [0x5Eu8; 32];
+        let epoch = 7i64;
+
+        // Owner seals to the member; the member derives the same wrapping key
+        // from their own seed and the owner's identity.
+        let owner_side =
+            derive_channel_epoch_secret(&owner.to_bytes(), &member_pub, &channel_id, epoch)
+                .expect("owner derives");
+        let member_side =
+            derive_channel_epoch_secret(&member.to_bytes(), &owner_pub, &channel_id, epoch)
+                .expect("member derives");
+        assert_eq!(owner_side, member_side, "static DH has to be symmetric");
+
+        let sealed = seal_channel_key_epoch(&owner_side, &channel_id, epoch, &room_key);
+        assert!(epoch_envelope_store_ok(&sealed));
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, epoch, &sealed),
+            Some(room_key)
+        );
+
+        // The evicted member holds the room's old key and every pubkey in it,
+        // and still cannot derive this wrapping key.
+        let evicted_side =
+            derive_channel_epoch_secret(&evicted.to_bytes(), &owner_pub, &channel_id, epoch)
+                .expect("derives, just not the right one");
+        assert_ne!(evicted_side, owner_side);
+        assert_eq!(
+            open_channel_key_epoch(&evicted_side, &channel_id, epoch, &sealed),
+            None,
+            "an evicted member must not be able to open the epoch that removed them"
+        );
+
+        // Room and epoch are bound, so a blob cannot be replayed across either.
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &[0x32u8; 16], epoch, &sealed),
+            None
+        );
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, epoch + 1, &sealed),
+            None
+        );
+
+        // And the DHT slot is per member, per epoch, per room.
+        assert_ne!(
+            epoch_key(&channel_id, &member_pub, epoch),
+            epoch_key(&channel_id, &member_pub, epoch + 1)
+        );
+        assert_ne!(
+            epoch_key(&channel_id, &member_pub, epoch),
+            epoch_key(&channel_id, &owner_pub, epoch)
+        );
+        assert_ne!(
+            epoch_key(&channel_id, &member_pub, epoch),
+            epoch_key(&[0x32u8; 16], &member_pub, epoch)
+        );
+
+        // Malformed envelopes are refused rather than mistaken for a key.
+        let mut truncated = sealed.clone();
+        truncated.pop();
+        assert!(!epoch_envelope_store_ok(&truncated));
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, epoch, &truncated),
+            None
+        );
+        let mut tampered = sealed.clone();
+        tampered[EPOCH_ENVELOPE_LEN - 1] ^= 0xFF;
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, epoch, &tampered),
+            None
         );
     }
 

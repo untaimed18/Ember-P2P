@@ -16,6 +16,14 @@ export interface ChannelInfo {
   you_are_moderator: boolean;
   successor_id: string;
   predecessor_id: string;
+  successor_nominee: string;
+  claim_after_days: number;
+  /** When the owner last republished; the claim window counts from here. */
+  moderation_updated_at: number;
+  /** This device is the nominee and the owner has been silent past the window. */
+  can_claim: boolean;
+  /** The room's key has rotated past what we hold, so new messages are unreadable. */
+  key_behind: boolean;
 }
 
 export interface ChannelMemberInfo {
@@ -150,6 +158,18 @@ export async function transferChannelOwnership(
   memberPubkey: string,
 ): Promise<void> {
   return invoke('transfer_channel_ownership', { channelId, memberPubkey });
+}
+
+export async function setChannelSuccessorNominee(
+  channelId: string,
+  memberPubkey: string | null,
+  claimAfterDays: number | null,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_successor_nominee', { channelId, memberPubkey, claimAfterDays });
+}
+
+export async function claimChannelOwnership(channelId: string): Promise<ChannelInfo> {
+  return invoke('claim_channel_ownership', { channelId });
 }
 
 export async function offerChannelFile(channelId: string, path: string): Promise<ChannelMessageInfo> {

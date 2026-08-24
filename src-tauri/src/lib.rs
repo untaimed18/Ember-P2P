@@ -1841,6 +1841,8 @@ pub fn run() {
             commands::channels::add_channel_moderator,
             commands::channels::remove_channel_moderator,
             commands::channels::transfer_channel_ownership,
+            commands::channels::set_channel_successor_nominee,
+            commands::channels::claim_channel_ownership,
             commands::channels::offer_channel_file,
             commands::channels::request_channel_file,
             commands::channels::get_channel_file,
