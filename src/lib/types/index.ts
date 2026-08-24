@@ -91,7 +91,11 @@ export interface Transfer {
   completed_size: number;
   started_at: number;
   failure_reason?: string;
-  failure_kind?: 'transient' | 'permanent' | 'download_timeout';
+  /** Stable discriminator for `failure_reason`, from the
+   *  `transfer_failure_codes!` table in `src-tauri/src/network/ed2k/transfer.rs`.
+   *  Preferred over the English; absent on rows written before it existed. */
+  failure_code?: string;
+  failure_kind?: 'transient' | 'permanent' | 'download_timeout' | 'insufficient_disk';
   failure_stage?: string;
   priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto';
   sources: number;
@@ -102,6 +106,10 @@ export interface Transfer {
   last_received?: number;
   health: 'healthy' | 'degraded' | 'stalled';
   health_reason?: string;
+  /** Stable discriminator for `health_reason`, from the
+   *  `transfer_health_codes!` table in `src-tauri/src/sharing/manager.rs`.
+   *  `retrying_after` composes with `failure_code`. */
+  health_code?: string;
   stalled_since?: number;
   category: string;
   wait_time: number;
@@ -200,6 +208,9 @@ export interface SearchResult {
   origin_server_ip?: string | null;
   /** Reasons from the enrich pass; preferred over a one-off explain call. */
   spam_reasons?: string[];
+  /** The same reasons, coded and parameterised. Preferred over `spam_reasons`
+   *  because it renders in the active locale; see `spamReasonTexts`. */
+  spam_reason_details?: SpamReason[];
 }
 
 export interface StartDownloadResponse {
@@ -221,12 +232,34 @@ export interface DownloadHistoryStats {
   total: number;
 }
 
+/**
+ * One scored spam signal, as emitted by the `spam_reason_codes!` table in
+ * `src-tauri/src/search/spam.rs`.
+ *
+ * `code` picks the message; the numeric fields are that message's parameters,
+ * present only for the codes whose sentence interpolates them. `text` is the
+ * backend's own English rendering, used when this UI has no key for `code`.
+ */
+export interface SpamReason {
+  code: string;
+  /** Points this signal added to the spam score. */
+  weight?: number;
+  /** Similarity or share, 0-100. */
+  percent?: number;
+  /** How many colliding names or hashes were seen in the same search. */
+  count?: number;
+  votes?: number;
+  total?: number;
+  text: string;
+}
+
 export interface SpamExplanation {
   score: number;
   threshold: number;
   profile: 'relaxed' | 'balanced' | 'aggressive';
   is_spam: boolean;
   reasons: string[];
+  reason_details?: SpamReason[];
 }
 
 export type SpamFilterProfile = 'relaxed' | 'balanced' | 'aggressive';

@@ -2740,6 +2740,15 @@
                     ? m.updater_stalled_body({ version: $updater.version ?? '' })
                     : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
                 </span>
+                <!-- `restoreStaged(staged, true)` sets both flags at once, so
+                     the `signatureMissing` branch below can never be reached
+                     from a re-offered staged installer. Say it here instead:
+                     the reason we fell back to the staged copy is that the
+                     newer release could not be verified, and that is exactly
+                     the user who is about to run an installer. -->
+                {#if $updater.signatureMissing}
+                  <span class="feedback error about-update-note">{m.updater_signature_missing()}</span>
+                {/if}
               {:else if $updater.phase === 'error' || $updater.signatureMissing}
                 <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
               {:else}
@@ -3437,6 +3446,11 @@
   .about-update-status.busy {
     border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
     background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface));
+  }
+
+  .about-update-note {
+    display: block;
+    margin-top: 6px;
   }
 
   .about-progress {

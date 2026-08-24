@@ -29,6 +29,7 @@ import {
   type Locale,
 } from '$lib/paraglide/runtime';
 import * as m from '$lib/paraglide/messages';
+import type { SpamReason } from '$lib/types';
 
 export { baseLocale, locales, getLocale, setLocale };
 export type { Locale };
@@ -291,6 +292,268 @@ export function degradedReasonText(reason: string | undefined): string {
     default:
       return reason ?? '';
   }
+}
+
+/**
+ * Every `TransferFailureCode` the backend can put on a transfer row.
+ *
+ * The codes come from the `transfer_failure_codes!` table in
+ * `src-tauri/src/network/ed2k/transfer.rs`, which is the only place a failure
+ * sentence is minted: `classify_failure` reduces every download and upload
+ * failure to one of these before it leaves Rust — deliberately, so peer IPs and
+ * local paths from anyhow chains cannot leak into the UI — and the sites that
+ * assign the field directly (`commands/transfers.rs`,
+ * `commands/collections.rs`, `storage/database.rs`) pick from the same table.
+ *
+ * `scripts/backend-codes.test.mjs` requires this map to name exactly the codes
+ * that table declares, so a variant added in Rust without a row here fails
+ * `npm test` rather than quietly rendering English in the other eight locales.
+ */
+const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
+  ['cancelled', m.transfers_failure_reason_cancelled],
+  ['remote_missing_file', m.transfers_failure_reason_remote_missing],
+  // Same wording as the row badge, which the Ember page and docs also use.
+  ['ember_content_hash_mismatch', m.transfers_ember_mismatch_label],
+  ['aich_hash_mismatch', m.transfers_failure_reason_aich_mismatch],
+  ['hash_mismatch', m.transfers_failure_reason_hash_mismatch],
+  ['download_timed_out', m.transfers_failure_reason_download_timeout],
+  ['insufficient_disk_space', m.transfers_failure_reason_insufficient_disk],
+  ['connection_failed', m.transfers_failure_reason_connection_failed],
+  ['peer_handshake_failed', m.transfers_failure_reason_handshake_failed],
+  ['queue_wait_interrupted', m.transfers_failure_reason_queue_wait],
+  ['hashset_request_failed', m.transfers_failure_reason_hashset_failed],
+  ['connection_lost', m.transfers_failure_reason_connection_lost],
+  ['permanent_failure', m.transfers_failure_reason_permanent],
+  ['transient_failure', m.transfers_failure_reason_transient],
+  ['network_channel_unavailable', m.transfers_failure_reason_no_channel],
+  ['ember_pin_corrupt', m.transfers_failure_reason_ember_pin_corrupt],
+  ['aich_pin_corrupt', m.transfers_failure_reason_aich_pin_corrupt],
+]);
+
+/**
+ * Every `TransferHealthCode`, from the `transfer_health_codes!` table in
+ * `src-tauri/src/sharing/manager.rs`. Pinned to that table by
+ * `scripts/backend-codes.test.mjs` the same way the failure codes are.
+ *
+ * `retrying_after` is absent: its sentence names the failure being retried, so
+ * it is composed in {@link transferHealthReasonText} from the row's
+ * `failure_code` rather than rendered from a single message.
+ */
+const TRANSFER_HEALTH_CODES = new Map<string, () => string>([
+  ['queued_sources', m.transfers_health_reason_queued_sources],
+  ['waiting_sources', m.transfers_health_reason_waiting_sources],
+  ['no_data', m.transfers_health_reason_no_data],
+  ['idle', m.transfers_health_reason_idle],
+  ['retrying_sources', m.transfers_health_reason_retrying_sources],
+  ['still_searching', m.transfers_health_reason_still_searching],
+  ['no_sources', m.transfers_health_reason_no_sources],
+  ['waiting_slot', m.transfers_health_reason_waiting_slot],
+]);
+
+/**
+ * Every `SpamReasonCode`, from the `spam_reason_codes!` table in
+ * `src-tauri/src/search/spam.rs`.
+ *
+ * Unlike the transfer tables these take arguments: most reasons interpolate the
+ * weight they contributed, and some a percentage or a vote count. The numbers
+ * ride the wire as fields on the reason so each locale can put them where its
+ * own sentence needs them. `scripts/backend-codes.test.mjs` checks both that
+ * every code has a row and that the `{placeholders}` on the two sides agree.
+ */
+const SPAM_REASON_CODES = new Map<string, (reason: SpamReason) => string>([
+  // The whitelist verdict is the same sentence the Mark Not Spam action shows
+  // optimistically, so the two share a key rather than drifting apart.
+  ['not_spam_marked', () => m.search_spam_reason_manual_not_spam()],
+  ['known_hash', (r) => m.search_spam_reason_known_hash({ weight: r.weight ?? 0 })],
+  ['exact_filename', (r) => m.search_spam_reason_exact_filename({ weight: r.weight ?? 0 })],
+  [
+    'very_similar_name',
+    (r) => m.search_spam_reason_very_similar_name({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'similar_name',
+    (r) => m.search_spam_reason_similar_name({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'reordered_name',
+    (r) => m.search_spam_reason_reordered_name({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'loosely_similar_name',
+    (r) =>
+      m.search_spam_reason_loosely_similar_name({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  ['size_signature', (r) => m.search_spam_reason_size_signature({ weight: r.weight ?? 0 })],
+  ['fake_pattern', (r) => m.search_spam_reason_fake_pattern({ weight: r.weight ?? 0 })],
+  [
+    'community_fake_majority',
+    (r) =>
+      m.search_spam_reason_community_fake_majority({
+        votes: r.votes ?? 0,
+        total: r.total ?? 0,
+        weight: r.weight ?? 0,
+      }),
+  ],
+  [
+    'community_fake_some',
+    (r) =>
+      m.search_spam_reason_community_fake_some({
+        votes: r.votes ?? 0,
+        total: r.total ?? 0,
+        weight: r.weight ?? 0,
+      }),
+  ],
+  ['result_rated_fake', (r) => m.search_spam_reason_result_rated_fake({ weight: r.weight ?? 0 })],
+  [
+    'batch_name_many_hashes',
+    (r) =>
+      m.search_spam_reason_batch_name_many_hashes({ count: r.count ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'batch_hash_many_names',
+    (r) =>
+      m.search_spam_reason_batch_hash_many_names({ count: r.count ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'batch_source_concentration',
+    (r) => m.search_spam_reason_batch_source_concentration({ weight: r.weight ?? 0 }),
+  ],
+  ['spam_source_ip', (r) => m.search_spam_reason_spam_source_ip({ weight: r.weight ?? 0 })],
+  [
+    'spam_server_all_sources',
+    (r) => m.search_spam_reason_spam_server_all_sources({ weight: r.weight ?? 0 }),
+  ],
+  [
+    'spam_server_influence',
+    (r) => m.search_spam_reason_spam_server_influence({ weight: r.weight ?? 0 }),
+  ],
+  [
+    'server_ratio_high',
+    (r) => m.search_spam_reason_server_ratio_high({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  [
+    'server_ratio_elevated',
+    (r) =>
+      m.search_spam_reason_server_ratio_elevated({ percent: r.percent ?? 0, weight: r.weight ?? 0 }),
+  ],
+  ['aggressive_boost', (r) => m.search_spam_reason_aggressive_boost({ weight: r.weight ?? 0 })],
+  ['no_signals', () => m.search_spam_reason_no_signals()],
+]);
+
+/**
+ * Localize the coded spam reasons on a search hit, falling back to the English
+ * list when the row carries none.
+ *
+ * Two things can leave `details` empty: a backend older than the codes, and the
+ * optimistic patch behind Mark spam / Mark not spam, which writes an
+ * already-translated sentence straight into `spam_reasons`. Neither should be
+ * dropped, so the fallback list is rendered verbatim.
+ */
+export function spamReasonTexts(
+  details: SpamReason[] | undefined | null,
+  english: string[] | undefined | null,
+): string[] {
+  if (details?.length) {
+    return details.map((reason) => SPAM_REASON_CODES.get(reason.code)?.(reason) ?? reason.text);
+  }
+  return english ?? [];
+}
+
+/** Stages, from `infer_stage_from_error` plus the two literal call sites. */
+const TRANSFER_FAILURE_STAGES = new Map<string, () => string>([
+  ['tcp_connect', m.transfers_failure_stage_tcp_connect],
+  ['hello_wait', m.transfers_failure_stage_hello_wait],
+  ['emule_info_wait', m.transfers_failure_stage_emule_info_wait],
+  ['file_status_wait', m.transfers_failure_stage_file_status_wait],
+  ['queue_wait', m.transfers_failure_stage_queue_wait],
+  ['hashset_wait', m.transfers_failure_stage_hashset_wait],
+  ['data_wait', m.transfers_failure_stage_data_wait],
+  ['cancelled', m.transfers_failure_stage_cancelled],
+  ['disk_space', m.transfers_failure_stage_disk_space],
+  ['unknown', m.common_unknown],
+]);
+
+/** Kinds, from `failure_kind_name` in `src-tauri/src/network/ed2k/transfer.rs`. */
+const TRANSFER_FAILURE_KINDS = new Map<string, () => string>([
+  ['transient', m.transfers_failure_kind_transient],
+  ['permanent', m.transfers_failure_kind_permanent],
+  ['download_timeout', m.transfers_failure_kind_download_timeout],
+  ['insufficient_disk', m.transfers_failure_kind_insufficient_disk],
+]);
+
+/**
+ * Localize a transfer's failure from its `failure_code`.
+ *
+ * `reason` is the backend's own English, shown only when the row carries no
+ * code this UI knows — which no live producer does any more, so in practice
+ * this is the "a newer backend added a variant" path. Showing it beats
+ * blanking the row.
+ */
+export function transferFailureReasonText(
+  reason: string | undefined | null,
+  code?: string | undefined | null,
+): string {
+  if (code) {
+    const coded = TRANSFER_FAILURE_CODES.get(code);
+    if (coded) return coded();
+  }
+  return reason ?? '';
+}
+
+/**
+ * Localize a transfer's health state from its `health_code`.
+ *
+ * One health reason is composed rather than canned: `retrying_after` names the
+ * failure being retried, which the row carries alongside as `failure_code`.
+ * Recomposing it from two translated halves keeps that path localized without a
+ * key per failure, and the message carries a colon so languages that capitalize
+ * differently from English still read correctly.
+ */
+export function transferHealthReasonText(
+  reason: string | undefined | null,
+  code?: string | undefined | null,
+  failureCode?: string | undefined | null,
+): string {
+  if (code === 'retrying_after') {
+    const failure = failureCode ? TRANSFER_FAILURE_CODES.get(failureCode) : undefined;
+    if (failure) return m.transfers_health_reason_retrying_after({ reason: failure() });
+  } else if (code) {
+    const coded = TRANSFER_HEALTH_CODES.get(code);
+    if (coded) return coded();
+  }
+  return reason ?? '';
+}
+
+/** Localize a transfer's `failure_stage` (shown in the status tooltip). */
+export function transferFailureStageText(stage: string | undefined | null): string {
+  if (!stage) return '';
+  return TRANSFER_FAILURE_STAGES.get(stage)?.() ?? stage;
+}
+
+/** Localize a transfer's `failure_kind` (shown in the status tooltip). */
+export function transferFailureKindText(kind: string | undefined | null): string {
+  if (!kind) return '';
+  return TRANSFER_FAILURE_KINDS.get(kind)?.() ?? kind;
+}
+
+/**
+ * The active spam-filter profile, as a bare noun for the score tooltip.
+ *
+ * Deliberately not the `settings_spam_profile_*` strings: those carry a
+ * parenthetical ("Balanced (recommended)") that would nest a second set of
+ * brackets inside "Score 5/10 (…)". The backend value is a stable code from
+ * `SpamFilterProfile`, so an unrecognized one is shown verbatim rather than
+ * dropped.
+ */
+const SPAM_PROFILES = new Map<string, () => string>([
+  ['relaxed', () => m.search_spam_profile_relaxed()],
+  ['balanced', () => m.search_spam_profile_balanced()],
+  ['aggressive', () => m.search_spam_profile_aggressive()],
+]);
+
+export function spamProfileText(profile: string | undefined | null): string {
+  if (!profile) return '';
+  return SPAM_PROFILES.get(profile)?.() ?? profile;
 }
 
 /**

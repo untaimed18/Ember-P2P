@@ -1,0 +1,46 @@
+{
+  "rust": {
+    "file": "src-tauri/src/network/ed2k/transfer.rs",
+    "macro": "transfer_failure_codes",
+    "predicate": "is_ember_blake3_mismatch",
+    "classifier_fn": "classify_failure",
+    "variant": "EmberContentHashMismatch",
+    "code": "ember_content_hash_mismatch",
+    "summary": "Ember content hash mismatch",
+    "raw_message_const": "EMBER_BLAKE3_MISMATCH_MSG",
+    "raw_message": "ember blake3 mismatch: content did not match the expected Ember hash",
+    "match_substrings": ["ember blake3 mismatch", "ember content hash mismatch"]
+  },
+  "cases": [
+    {
+      "name": "the code the classifier emits for a pin failure",
+      "code": "ember_content_hash_mismatch",
+      "mismatch": true
+    },
+    {
+      "name": "an ed2k part-hash mismatch is a different failure",
+      "code": "hash_mismatch",
+      "mismatch": false
+    },
+    {
+      "name": "an AICH pin miss is a different failure",
+      "code": "aich_hash_mismatch",
+      "mismatch": false
+    },
+    {
+      "name": "a corrupt persisted Ember pin is not a content mismatch",
+      "code": "ember_pin_corrupt",
+      "mismatch": false
+    },
+    {
+      "name": "an ordinary connection failure",
+      "code": "connection_failed",
+      "mismatch": false
+    },
+    {
+      "name": "a row with no failure code at all",
+      "code": "",
+      "mismatch": false
+    }
+  ]
+}

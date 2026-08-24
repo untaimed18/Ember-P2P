@@ -24,7 +24,7 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { formatDurationSecs } from '$lib/utils';
-  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
+  import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -49,7 +49,7 @@
   let diagFailures = 0;
   let activeSince: number | null = null;
   let joinTimer: ReturnType<typeof setTimeout> | null = null;
-  const DIAG_FAILURE_THRESHOLD = 3;
+  const DIAG_FAILURE_THRESHOLD = EMBER_DIAG_FAILURE_THRESHOLD;
   // Long enough to span a couple of backend maintenance ticks (60s each),
   // which is what actually drives the bridge that finds our first contacts.
   // A shorter window used to be fine when joining kicked an immediate fetch

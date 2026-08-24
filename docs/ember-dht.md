@@ -227,6 +227,15 @@ The truncation counters (`ember_dht_found_value_truncated` /
 `ember_dht_found_value_withheld`, shipped 1.5.3) are still the way to read how
 far the datagram ceiling actually binds on real keys.
 
+Read `withheld` as *records past this page's window that it has not served* —
+`n - past_last_taken`. It previously counted from the rewound resume point, so
+it included records the same page had just put on the wire and over-reported
+accordingly; a page that rewound but still reached the end of its key now
+reports zero withheld and no longer increments `truncated`, because it truncated
+nothing. Both counters therefore read lower than they did before 1.5.9 on the
+same key. Re-sent records still cost bandwidth, but no longer consume the
+searcher's per-node offer allowance, which is charged per *distinct* blob.
+
 ### 2. Per-publisher keyword capacity — done
 
 `MAX_RECORDS_PER_PUBLISHER_PER_KEY` was 45 of `MAX_RECORDS_PER_KEY` 300 against
@@ -464,7 +473,7 @@ settled.
 | Network loop / publish / search drivers | `src-tauri/src/network/mod.rs` |
 | Adaptive abuse limits | `src-tauri/src/network/ember/dht/scale.rs` |
 | Dormant native transfer | `src-tauri/src/network/ember/transfer.rs` |
-| Settings toggle | Settings → Network (`ember_native_enabled`, always on; switch is visible but disabled) |
+| Overlay enable flag | `ember_native_enabled` — always on, with no UI control anywhere |
 | User-facing status | `/ember` (Ember Network page) |
 | Library publish badges | `shared_ember` on `FileInfo` → Library "Shared" column |
 
