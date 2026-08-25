@@ -12313,6 +12313,9 @@ struct NetworkState {
     /// the local copy is already stored and on screen, so dropping it shows
     /// them a message the room never received.
     channel_gossip_local_times: VecDeque<std::time::Instant>,
+    /// Originated gossip that had no neighbor (or hit the local send budget)
+    /// and is waiting to be tried again.
+    channel_origin_retry: VecDeque<(std::time::Instant, Vec<u8>)>,
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Inbound chat timestamps keyed by (room, signed author), so one member
@@ -12540,14 +12543,45 @@ fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
     );
 }
 
+fn queue_channel_origin_retry(
+    state: &mut NetworkState,
+    body: Vec<u8>,
+    queued_at: std::time::Instant,
+) {
+    while state.channel_origin_retry.len() >= ember::channel::CHANNEL_ORIGIN_RETRY_CAP {
+        state.channel_origin_retry.pop_front();
+    }
+    state
+        .channel_origin_retry
+        .push_back((queued_at, body));
+}
+
+async fn drain_channel_origin_retry(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+) {
+    if state.channel_origin_retry.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.channel_origin_retry);
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(ember::channel::CHANNEL_ORIGIN_RETRY_SECS);
+    for (queued_at, body) in pending {
+        if now.saturating_duration_since(queued_at) >= ttl {
+            continue;
+        }
+        fanout_channel_gossip_retry(socket, state, db, body, None, Some(queued_at)).await;
+    }
+}
+
 /// Admit one outbound fanout, against the bucket that fits where it came from.
 ///
 /// A relay is charged the shared allowance, which is what stops this node
 /// amplifying a flood. Something the user typed is charged its own, so a room
-/// busy enough to spend the relay budget cannot silently swallow their message
-/// — it is already stored and on screen locally, and nothing retries it.
-/// Separate rather than exempt, because an unbounded local path would turn any
-/// send loop into an outbound flood with no ceiling at all.
+/// busy enough to spend the relay budget cannot silently swallow their message.
+/// Failed origination is queued and retried; unbounded sending would still
+/// turn a send loop into an outbound flood with no ceiling at all.
 fn channel_gossip_rate_ok(state: &mut NetworkState, local_origin: bool) -> bool {
     let (times, limit) = if local_origin {
         (
@@ -14106,9 +14140,25 @@ async fn fanout_channel_gossip_body(
     body: Vec<u8>,
     exclude: Option<ember::dht::EmberNodeId>,
 ) {
+    fanout_channel_gossip_retry(socket, state, db, body, exclude, None).await;
+}
+
+async fn fanout_channel_gossip_retry(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    body: Vec<u8>,
+    exclude: Option<ember::dht::EmberNodeId>,
+    origin_queued_at: Option<std::time::Instant>,
+) {
     // `exclude` names the hop a frame arrived from, so its absence is what
     // marks this as something we originated rather than are passing on.
-    if !channel_gossip_rate_ok(state, exclude.is_none()) {
+    let local_origin = exclude.is_none();
+    let retry_at = origin_queued_at.unwrap_or_else(std::time::Instant::now);
+    if !channel_gossip_rate_ok(state, local_origin) {
+        if local_origin {
+            queue_channel_origin_retry(state, body, retry_at);
+        }
         return;
     }
     let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
@@ -14116,7 +14166,15 @@ async fn fanout_channel_gossip_body(
     };
     let channel_id_hex = hex::encode(gossip.channel_id);
     let members = channel_member_pubkeys(db, &channel_id_hex);
-    if members.is_empty() {
+    let others: Vec<[u8; 32]> = members
+        .iter()
+        .copied()
+        .filter(|pk| pk != &state.local_ed25519_pubkey)
+        .collect();
+    if local_origin && others.is_empty() {
+        // Alone in the roster: keep the frame until presence names someone.
+        // Relays of other people's frames do not wait.
+        queue_channel_origin_retry(state, body, retry_at);
         return;
     }
     let neighbors = ember::channel::xor_closest_neighbors(
@@ -14265,20 +14323,31 @@ async fn handle_inbound_channel_gossip(
     if !remember_channel_gossip(state, gossip.msg_id) {
         return;
     }
+    if !ember::channel::gossip_timestamp_ok(
+        gossip.timestamp,
+        chrono::Utc::now().timestamp(),
+    ) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
     if db.chat_locked() {
+        forget_channel_gossip(state, &gossip.msg_id);
         return;
     }
     let channel_id_hex = hex::encode(gossip.channel_id);
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        forget_channel_gossip(state, &gossip.msg_id);
         return;
     };
-    // Whichever epoch opened it is also what we answer under, so a member who
-    // is an epoch behind can still read our reply.
-    let Some((key, plain)) = channel_content_keys(db, &ch)
+    // Decrypt may succeed under an older epoch; that key is only used to
+    // *read*. Replies (history sync) are sealed under the current epoch so a
+    // banned member who still holds a retired key cannot be handed new chat.
+    let Some((_opened_key, plain)) = channel_content_keys(db, &ch)
         .into_iter()
         .find_map(|candidate| gossip.decrypt(&candidate).map(|plain| (candidate, plain)))
     else {
         debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
+        forget_channel_gossip(state, &gossip.msg_id);
         return;
     };
     // Ember Transfer frames are addressed to one member and never relayed on,
@@ -14340,7 +14409,6 @@ async fn handle_inbound_channel_gossip(
             db,
             app_handle,
             &ch,
-            &key,
             &gossip,
             from_id,
             sender_pk,
@@ -14351,7 +14419,7 @@ async fn handle_inbound_channel_gossip(
         return;
     }
     if let Some((sender_pk, successor_pk, version)) =
-        ember::channel::decode_channel_handoff_ready(&plain)
+        ember::channel::decode_channel_handoff_ready(&plain, &gossip.channel_id)
     {
         apply_channel_handoff_ready(
             socket,
@@ -14368,7 +14436,12 @@ async fn handle_inbound_channel_gossip(
         .await;
         return;
     }
-    if let Some((sender_pk, since_ts)) = ember::channel::decode_channel_sync_request(&plain) {
+    if let Some((sender_pk, since_ts)) = ember::channel::decode_channel_sync_request(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
         let sender_hex = hex::encode(sender_pk);
         if db
             .channel_member_is_banned(&channel_id_hex, &sender_hex)
@@ -14381,16 +14454,18 @@ async fn handle_inbound_channel_gossip(
             state,
             db,
             &ch,
-            &key,
             &from_id,
             since_ts,
         )
         .await;
         return;
     }
-    if let Some((sender_pk, target_pk, banned)) =
-        ember::channel::decode_channel_mod_action(&plain)
-    {
+    if let Some((sender_pk, target_pk, banned)) = ember::channel::decode_channel_mod_action(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
         let sender_hex = hex::encode(sender_pk);
         if db
             .channel_member_is_banned(&channel_id_hex, &sender_hex)
@@ -14504,6 +14579,7 @@ async fn handle_inbound_channel_gossip(
         &msg_id_hex,
         now,
         &stored_sig,
+        false,
     ) {
         Ok(row_id) => {
             let _ = db.upsert_channel_member(&channel_id_hex, &sender_hex, "", now);
@@ -14534,7 +14610,6 @@ async fn apply_channel_handoff_offer(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     ch: &crate::storage::database::StoredChannel,
-    key: &[u8; 32],
     gossip: &ember::channel::ChannelGossip,
     from_id: ember::dht::EmberNodeId,
     _sender_pk: [u8; 32],
@@ -14557,27 +14632,32 @@ async fn apply_channel_handoff_offer(
                 ident
             }
         };
-        let plain = ember::channel::encode_channel_handoff_ready(
-            &state.local_ed25519_pubkey,
-            &ident.pubkey,
-            version,
-        );
-        let reply = ember::channel::ChannelGossip::new_plaintext(
-            gossip.channel_id,
-            key,
-            version,
-            &plain,
-            ember::channel::CHANNEL_MSG_TTL_DEFAULT,
-        );
-        let _ = remember_channel_gossip(state, reply.msg_id);
-        fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
-        let _ = app_handle.emit(
-            "ember:channel-handoff",
-            serde_json::json!({
-                "channel_id": ch.channel_id,
-                "phase": "ready",
-            }),
-        );
+        if let Some(key) = channel_content_key(db, ch) {
+            let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
+            let plain = ember::channel::encode_channel_handoff_ready(
+                &signing,
+                &gossip.channel_id,
+                &state.local_ed25519_pubkey,
+                &ident.pubkey,
+                version,
+            );
+            let reply = ember::channel::ChannelGossip::new_plaintext(
+                gossip.channel_id,
+                &key,
+                version,
+                &plain,
+                ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+            );
+            let _ = remember_channel_gossip(state, reply.msg_id);
+            fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
+            let _ = app_handle.emit(
+                "ember:channel-handoff",
+                serde_json::json!({
+                    "channel_id": ch.channel_id,
+                    "phase": "ready",
+                }),
+            );
+        }
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
@@ -15399,10 +15479,12 @@ async fn reply_channel_history_sync(
     state: &mut NetworkState,
     db: &Arc<Database>,
     ch: &crate::storage::database::StoredChannel,
-    key: &[u8; 32],
     to: &ember::dht::EmberNodeId,
     since_ts: i64,
 ) {
+    let Some(key) = channel_content_key(db, ch) else {
+        return;
+    };
     let Ok(rows) = db.list_channel_messages_for_sync(
         &ch.channel_id,
         since_ts.max(0),
@@ -15443,7 +15525,7 @@ async fn reply_channel_history_sync(
         let gossip = ember::channel::ChannelGossip::sealed(
             channel_id,
             msg_id,
-            key,
+            &key,
             timestamp.max(0) as u64,
             &plain,
             1,
@@ -15456,7 +15538,7 @@ async fn reply_channel_history_sync(
 async fn maybe_sync_channel_history(
     socket: &UdpSocket,
     state: &mut NetworkState,
-    db: &Database,
+    db: &Arc<Database>,
     settings: &AppSettings,
 ) {
     if !settings.ember_native_enabled || db.chat_locked() {
@@ -15488,9 +15570,19 @@ async fn maybe_sync_channel_history(
             &members,
             ember::channel::CHANNEL_NEIGHBOR_COUNT,
         );
-        let since = db
+        let wall = chrono::Utc::now().timestamp();
+        let latest = db
             .latest_channel_message_timestamp(&ch.channel_id)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(wall);
+        let since = if latest <= 0 {
+            0
+        } else {
+            latest
+                .saturating_sub(ember::channel::CHANNEL_HISTORY_SYNC_LOOKBACK_SECS)
+                .max(0)
+        };
+        let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
         for pk in neighbors {
             if sent >= 4 {
                 break;
@@ -15508,13 +15600,25 @@ async fn maybe_sync_channel_history(
                 continue;
             }
             state.channel_history_sync_at.insert(stamp_key, now);
-            let plain = ember::channel::encode_channel_sync_request(&our_pk, since);
-            let gossip = ember::channel::ChannelGossip::new_plaintext(
+            let ts = chrono::Utc::now().timestamp();
+            let mut msg_id = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+            let plain = ember::channel::encode_channel_sync_request(
+                &signing,
+                &our_pk,
+                &channel_id,
+                &msg_id,
+                ts,
+                since,
+            );
+            let gossip = ember::channel::ChannelGossip::sealed(
                 channel_id,
+                msg_id,
                 &key,
-                chrono::Utc::now().timestamp().max(0) as u64,
+                ts.max(0) as u64,
                 &plain,
                 1,
+                ts,
             );
             send_channel_gossip_unicast(socket, state, &node_id, gossip.encode()).await;
             sent += 1;
@@ -19821,6 +19925,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.channel_gossip_from_times.clear();
     state.channel_gossip_author_times.clear();
     state.channel_history_sync_at.clear();
+    state.channel_origin_retry.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -20798,6 +20903,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
         channel_gossip_local_times: VecDeque::new(),
+        channel_origin_retry: VecDeque::new(),
         channel_gossip_from_times: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
@@ -37523,6 +37629,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // whatever the constant says.
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
+                    drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
@@ -38975,6 +39082,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // New XOR neighbors: re-register channel capabilities
                         // without waiting out the friend heartbeat.
                         state.rendezvous_last_register = None;
+                        drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
                     }
                     for channel_id in updated_ids {
                         let _ = app_handle.emit(

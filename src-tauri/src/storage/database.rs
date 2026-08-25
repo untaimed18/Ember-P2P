@@ -4520,7 +4520,7 @@ impl Database {
         // What happens next is decided inside the transaction but acted on after
         // the lock is released — `clear_handoff_pending` and the replay both
         // take the lock themselves, and this mutex is not reentrant.
-        let replay_history = {
+        let _replayed = {
             let conn = self.conn.lock();
             let tx = conn.unchecked_transaction()?;
             let old = match Self::get_channel_locked(&tx, old_channel_id)? {
@@ -4553,7 +4553,7 @@ impl Database {
                     }
                 }
                 tx.commit()?;
-                false
+                true
             } else {
                 let successor_exists =
                     Self::get_channel_locked(&tx, successor_channel_id)?.is_some();
@@ -4613,15 +4613,11 @@ impl Database {
                     params![old_channel_id, successor_channel_id],
                 )?;
                 tx.commit()?;
-                !successor_exists
+                true
             }
         };
-        if !replay_history {
-            let _ = self.clear_handoff_pending(old_channel_id);
-            return Ok(true);
-        }
         let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
-        for (id, sender, direction, message, timestamp, _read) in history.into_iter().rev() {
+        for (id, sender, direction, message, timestamp, read) in history.into_iter().rev() {
             let msg_id = format!("handoff-{old_channel_id}-{id}");
             // No signature travels with a handoff copy. The author signed the
             // line against the *old* room's id, so the original does not verify
@@ -4636,6 +4632,7 @@ impl Database {
                 &msg_id,
                 timestamp,
                 "",
+                read,
             );
         }
         let _ = self.clear_handoff_pending(old_channel_id);
@@ -4773,6 +4770,11 @@ impl Database {
         banned: bool,
         timestamp: i64,
     ) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        if !crate::network::ember::channel::gossip_timestamp_ok(timestamp, now) {
+            return Ok(false);
+        }
+        let timestamp = timestamp.min(now);
         let conn = self.conn.lock();
         let snapshot: i64 = conn
             .query_row(
@@ -4977,6 +4979,7 @@ impl Database {
         msg_id: &str,
         timestamp: i64,
         author_sig: &str,
+        read: bool,
     ) -> anyhow::Result<i64> {
         const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
         const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
@@ -4997,7 +5000,7 @@ impl Database {
             chrono::Utc::now().timestamp()
         };
         tx.execute(
-            "INSERT INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig)
+            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 channel_id,
@@ -5005,11 +5008,20 @@ impl Database {
                 direction,
                 CHAT_CIPHERTEXT_PREFIX,
                 now,
-                if direction == "sent" { 1 } else { 0 },
+                if read { 1 } else { 0 },
                 msg_id,
                 author_sig
             ],
         )?;
+        if tx.changes() == 0 {
+            let existing: i64 = tx.query_row(
+                "SELECT id FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+                params![channel_id, msg_id],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(existing);
+        }
         let new_id = tx.last_insert_rowid();
         let encrypted = Self::encrypt_channel_message_body(
             self.require_chat_key()?,
@@ -5210,7 +5222,7 @@ impl Database {
     }
 
     /// Recent decrypted messages for neighbor history catch-up.
-    /// Returns `(msg_id, sender_pubkey, body, timestamp, author_sig)` oldest-first.
+    /// Returns `(msg_id, sender_pubkey, body, timestamp, author_sig)` newest-first.
     ///
     /// Rows with no stored signature are skipped: a re-serve has to replay the
     /// author's own signature, and this node cannot produce one on their behalf.
@@ -5229,7 +5241,7 @@ impl Database {
                 "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig
                  FROM channel_messages
                  WHERE channel_id = ?1 AND timestamp >= ?2 AND author_sig <> ''
-                 ORDER BY timestamp ASC, id ASC
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT ?3",
             )?;
             let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
@@ -6314,6 +6326,11 @@ mod tests {
         assert!(db
             .apply_channel_ban_action(&channel_id, &banned_hex, true, 80)
             .unwrap());
+        assert!(
+            !db.apply_channel_ban_action(&channel_id, &banned_hex, true, i64::MAX)
+                .unwrap(),
+            "a far-future gossip timestamp must not stick a ban past every owner snapshot"
+        );
         assert!(db
             .channel_member_is_banned(&channel_id, &banned_hex)
             .unwrap());
@@ -6336,6 +6353,7 @@ mod tests {
                 &msg_id,
                 1_700_000_000,
                 &"cd".repeat(64),
+                true,
             )
             .unwrap();
         let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
@@ -6343,11 +6361,26 @@ mod tests {
         assert_eq!(msgs[0].0, id);
         assert_eq!(msgs[0].3, "hello room");
         assert_eq!(msgs[0].4, 1_700_000_000);
+        let newer_id = "bb".repeat(16);
+        db.insert_channel_message(
+            &channel_id,
+            &pubkey,
+            "sent",
+            "later line",
+            &newer_id,
+            1_700_000_100,
+            &"ce".repeat(64),
+            true,
+        )
+        .unwrap();
         let sync = db
             .list_channel_messages_for_sync(&channel_id, 0, 32)
             .unwrap();
-        assert_eq!(sync.len(), 1);
-        assert_eq!(sync[0].0, msg_id);
+        assert_eq!(sync.len(), 2);
+        assert_eq!(
+            sync[0].0, newer_id,
+            "catch-up with since=0 must offer newest first, not oldest"
+        );
 
         let listed = db.list_channels().unwrap();
         assert_eq!(listed.len(), 1);
@@ -6505,7 +6538,7 @@ mod tests {
             .expect("insert channel");
         db.upsert_channel_member(&old_id, &"b2".repeat(32), "Them", 100)
             .unwrap();
-        db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "")
+        db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
 
         let seed = [0x44u8; 32];
@@ -6535,6 +6568,36 @@ mod tests {
             db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
             1
         );
+        let copied = db.get_channel_messages(&successor_id, 10, None).unwrap();
+        assert!(
+            copied[0].5,
+            "a read received line must stay read on the successor"
+        );
+        assert_eq!(
+            db.get_channel(&successor_id).unwrap().unwrap().unread,
+            0,
+            "handoff must not turn copied history into unread"
+        );
+
+        db.insert_channel_message(
+            &old_id,
+            &"b2".repeat(32),
+            "received",
+            "after crash",
+            "m2",
+            101,
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(db
+            .apply_channel_handoff(&old_id, &successor_pk, &successor_id, 1, true, Some(&seed))
+            .expect("resume handoff"));
+        assert_eq!(
+            db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
+            2,
+            "a second apply must copy lines missed by a crash mid-replay"
+        );
 
         // Replaying is idempotent: same successor, no duplicated history.
         assert!(db
@@ -6542,7 +6605,7 @@ mod tests {
             .expect("replay handoff"));
         assert_eq!(
             db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
-            1,
+            2,
             "a replay must not duplicate history"
         );
 
@@ -7040,7 +7103,7 @@ mod tests {
         db.insert_channel(&old_id, &old_pk, "Lobby", "private", true, Some(&old_seed), Some(&join))
             .unwrap();
         let keep_id = "aa".repeat(16);
-        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10, "")
+        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10, "", true)
             .unwrap();
 
         assert!(db

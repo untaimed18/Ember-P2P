@@ -72,12 +72,10 @@ pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// `CHANNEL_MSG` frames this user may originate per second.
 ///
 /// Held apart from the relay allowance above. Sharing one budget meant a room
-/// busy enough to fill it dropped the sender's own next line, and a dropped
-/// origination is unrecoverable in a way a dropped relay is not: the local copy
-/// is already written and drawn, no peer will ever ask for it again, and the
-/// only thing that would eventually carry it is a history sync minutes later.
-/// Well above any human typing rate, and still a ceiling, so a send loop cannot
-/// become an unbounded flood.
+/// busy enough to fill it dropped the sender's own next line. Origination is
+/// retried for a few minutes, but a shared budget would still starve the
+/// queue whenever the mesh was busy. Well above any human typing rate, and
+/// still a ceiling, so a send loop cannot become an unbounded flood.
 pub const CHANNEL_GOSSIP_LOCAL_PER_SEC: usize = 32;
 /// Inbound `CHANNEL_MSG` frames accepted from one DHT hop per second.
 pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
@@ -108,6 +106,23 @@ pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
+/// Catch-up asks for messages in this window behind our newest timestamp so a
+/// hole behind the frontier can still be filled. Combined with
+/// `ORDER BY timestamp DESC`, a new joiner (watermark 0) receives the newest
+/// [`CHANNEL_HISTORY_SYNC_MAX`] lines rather than the oldest.
+pub const CHANNEL_HISTORY_SYNC_LOOKBACK_SECS: i64 = 6 * 60 * 60;
+/// Gossip timestamps further ahead of local time than this are refused.
+///
+/// The envelope timestamp is authenticated under the room key, so a member
+/// (or anyone who can compute a public room's key) can still *choose* it.
+/// Without a ceiling, `i64::MAX` poisons `last_active`, the history-sync
+/// watermark, and `ban_revised_at` — an owner snapshot can never catch up.
+pub const CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
+/// Originated frames waiting for a neighbor to appear, or for the local
+/// send budget to roll over. Sized to a couple of bursts, not a send loop.
+pub const CHANNEL_ORIGIN_RETRY_CAP: usize = 64;
+/// Give up retrying an origination that has sat this long.
+pub const CHANNEL_ORIGIN_RETRY_SECS: u64 = 10 * 60;
 /// Retry rendezvous lookup sooner when a neighbor still has no UDP session.
 pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
 /// How often members walk the owner-signed handoff key.
@@ -700,13 +715,24 @@ pub struct ChannelGossip {
 // it still read, an impersonator would just send the old frame and the
 // signature would buy nothing.
 const CHAT_PLAIN_VERSION: u8 = 15;
-const MOD_ACTION_PLAIN_VERSION: u8 = 2;
-const SYNC_REQUEST_PLAIN_VERSION: u8 = 3;
+// 2 was unsigned moderator gossip. Same hole chat closed: the content key
+// proves membership, not who sent the frame. Retired rather than accepted
+// alongside, or an impersonator would just send the old frame.
+const MOD_ACTION_PLAIN_VERSION: u8 = 16;
+// 3 was an unsigned sync request. Retired for the same reason: a banned
+// member could name someone else and be answered under an old epoch key.
+const SYNC_REQUEST_PLAIN_VERSION: u8 = 18;
 // 4, 5, and 8 belonged to the withdrawn broadcast-attachment path. Builds
 // still running it are on the network, so the numbers stay retired rather
 // than being recycled into something a stale peer would misread.
 const HANDOFF_OFFER_PLAIN_VERSION: u8 = 6;
-const HANDOFF_READY_PLAIN_VERSION: u8 = 7;
+// 7 was unsigned handoff-ready. The offer is signed by the channel key; Ready
+// was not, so any content-key holder who saw the flooded offer could race the
+// nominee and point the DHT handoff at a successor they own.
+const HANDOFF_READY_PLAIN_VERSION: u8 = 17;
+const MOD_SIG_DOMAIN: &[u8] = b"ember-channel-mod-author-v1\0";
+const SYNC_SIG_DOMAIN: &[u8] = b"ember-channel-sync-author-v1\0";
+const HANDOFF_READY_DOMAIN: &[u8] = b"ember-channel-handoff-ready-v1\0";
 const XFER_OFFER_PLAIN_VERSION: u8 = 9;
 const XFER_REPLY_PLAIN_VERSION: u8 = 10;
 const XFER_BLOCK_REQUEST_PLAIN_VERSION: u8 = 11;
@@ -826,14 +852,28 @@ pub fn decode_channel_chat_plain(
     Some((pk, text, sig))
 }
 
-/// Moderator gossip: `version(1) || sender(32) || action(1) || target(32)`.
-pub fn encode_channel_mod_action(
+/// Whether a gossip envelope timestamp is usable as wall-clock state.
+///
+/// Old timestamps are allowed: history catch-up replays them, and a delayed
+/// flood can be minutes behind. Far-future values are not — they are how a
+/// member used to stick a ban or freeze catch-up for everyone who stored it.
+pub fn gossip_timestamp_ok(timestamp: i64, now: i64) -> bool {
+    timestamp > 0 && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+}
+
+fn mod_action_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
     sender_pubkey: &[u8; 32],
     target_pubkey: &[u8; 32],
     banned: bool,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + 1 + 32);
-    out.push(MOD_ACTION_PLAIN_VERSION);
+    let mut out = Vec::with_capacity(MOD_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 1 + 32);
+    out.extend_from_slice(MOD_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(sender_pubkey);
     out.push(if banned {
         MOD_ACTION_BAN
@@ -844,8 +884,50 @@ pub fn encode_channel_mod_action(
     out
 }
 
-pub fn decode_channel_mod_action(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], bool)> {
-    if bytes.len() != 66 || bytes[0] != MOD_ACTION_PLAIN_VERSION {
+/// Moderator gossip: `version || sender || action || target || signature`.
+///
+/// Signed by the sender's user key and bound to the room, id, and time, for
+/// the same reason chat is: every member holds the content key.
+pub fn encode_channel_mod_action(
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    target_pubkey: &[u8; 32],
+    banned: bool,
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 1 + 32 + 64);
+    out.push(MOD_ACTION_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.push(if banned {
+        MOD_ACTION_BAN
+    } else {
+        MOD_ACTION_UNBAN
+    });
+    out.extend_from_slice(target_pubkey);
+    let sig = crypto::sign(
+        signing_key,
+        &mod_action_preimage(
+            channel_id,
+            msg_id,
+            timestamp,
+            sender_pubkey,
+            target_pubkey,
+            banned,
+        ),
+    );
+    out.extend_from_slice(&sig);
+    out
+}
+
+pub fn decode_channel_mod_action(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], [u8; 32], bool)> {
+    if bytes.len() != 130 || bytes[0] != MOD_ACTION_PLAIN_VERSION {
         return None;
     }
     let mut sender = [0u8; 32];
@@ -857,24 +939,76 @@ pub fn decode_channel_mod_action(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], bo
     };
     let mut target = [0u8; 32];
     target.copy_from_slice(&bytes[34..66]);
+    let sig: [u8; 64] = bytes[66..130].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &mod_action_preimage(channel_id, msg_id, timestamp, &sender, &target, banned),
+        &sig,
+    ) {
+        return None;
+    }
     Some((sender, target, banned))
 }
 
-pub fn encode_channel_sync_request(sender_pubkey: &[u8; 32], since_ts: i64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + 8);
-    out.push(SYNC_REQUEST_PLAIN_VERSION);
+fn sync_request_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    sender_pubkey: &[u8; 32],
+    since_ts: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SYNC_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 8);
+    out.extend_from_slice(SYNC_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(sender_pubkey);
     out.extend_from_slice(&since_ts.to_le_bytes());
     out
 }
 
-pub fn decode_channel_sync_request(bytes: &[u8]) -> Option<([u8; 32], i64)> {
-    if bytes.len() != 41 || bytes[0] != SYNC_REQUEST_PLAIN_VERSION {
+pub fn encode_channel_sync_request(
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    since_ts: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 8 + 64);
+    out.push(SYNC_REQUEST_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(&since_ts.to_le_bytes());
+    let sig = crypto::sign(
+        signing_key,
+        &sync_request_preimage(channel_id, msg_id, timestamp, sender_pubkey, since_ts),
+    );
+    out.extend_from_slice(&sig);
+    out
+}
+
+pub fn decode_channel_sync_request(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], i64)> {
+    if bytes.len() != 105 || bytes[0] != SYNC_REQUEST_PLAIN_VERSION {
         return None;
     }
     let mut sender = [0u8; 32];
     sender.copy_from_slice(&bytes[1..33]);
     let since_ts = i64::from_le_bytes(bytes[33..41].try_into().ok()?);
+    let sig: [u8; 64] = bytes[41..105].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &sync_request_preimage(channel_id, msg_id, timestamp, &sender, since_ts),
+        &sig,
+    ) {
+        return None;
+    }
     Some((sender, since_ts))
 }
 
@@ -1392,21 +1526,52 @@ fn handoff_offer_preimage(
     pre
 }
 
-pub fn encode_channel_handoff_ready(
+fn handoff_ready_preimage(
+    channel_id: &[u8; 16],
     sender_pubkey: &[u8; 32],
     successor_pubkey: &[u8; 32],
     version: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + 32 + 8);
+    let mut pre = Vec::with_capacity(HANDOFF_READY_DOMAIN.len() + 16 + 32 + 32 + 8);
+    pre.extend_from_slice(HANDOFF_READY_DOMAIN);
+    pre.extend_from_slice(channel_id);
+    pre.extend_from_slice(sender_pubkey);
+    pre.extend_from_slice(successor_pubkey);
+    pre.extend_from_slice(&version.to_le_bytes());
+    pre
+}
+
+/// Ready signed by the **nominee's user key**, bound to this room and version.
+///
+/// The matching offer is signed by the channel key. Ready was unsigned, so
+/// anyone who saw the flooded offer could impersonate the nominee and name
+/// their own successor. The owner checks this signature against the pending
+/// target before publishing a DHT handoff.
+pub fn encode_channel_handoff_ready(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    sender_pubkey: &[u8; 32],
+    successor_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 32 + 8 + 64);
     out.push(HANDOFF_READY_PLAIN_VERSION);
     out.extend_from_slice(sender_pubkey);
     out.extend_from_slice(successor_pubkey);
     out.extend_from_slice(&version.to_le_bytes());
+    let sig = crypto::sign(
+        signing_key,
+        &handoff_ready_preimage(channel_id, sender_pubkey, successor_pubkey, version),
+    );
+    out.extend_from_slice(&sig);
     out
 }
 
-pub fn decode_channel_handoff_ready(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], u64)> {
-    if bytes.len() != 73 || bytes[0] != HANDOFF_READY_PLAIN_VERSION {
+pub fn decode_channel_handoff_ready(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+) -> Option<([u8; 32], [u8; 32], u64)> {
+    if bytes.len() != 137 || bytes[0] != HANDOFF_READY_PLAIN_VERSION {
         return None;
     }
     let mut sender = [0u8; 32];
@@ -1414,6 +1579,15 @@ pub fn decode_channel_handoff_ready(bytes: &[u8]) -> Option<([u8; 32], [u8; 32],
     let mut successor = [0u8; 32];
     successor.copy_from_slice(&bytes[33..65]);
     let version = u64::from_le_bytes(bytes[65..73].try_into().ok()?);
+    let sig: [u8; 64] = bytes[73..137].try_into().ok()?;
+    let vk = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &vk,
+        &handoff_ready_preimage(channel_id, &sender, &successor, version),
+        &sig,
+    ) {
+        return None;
+    }
     Some((sender, successor, version))
 }
 
@@ -2065,13 +2239,34 @@ mod tests {
         assert!(ChannelGossip { ttl: 1, ..decoded }
             .decremented_ttl()
             .is_none());
-        let (sender, target, banned) =
-            decode_channel_mod_action(&encode_channel_mod_action(&[1u8; 32], &[2u8; 32], true))
-                .unwrap();
-        assert_eq!(sender, [1u8; 32]);
-        assert_eq!(target, [2u8; 32]);
+        let author = SigningKey::generate(&mut OsRng);
+        let author_pk = author.verifying_key().to_bytes();
+        let target = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let (sender, decoded_target, banned) = decode_channel_mod_action(
+            &encode_channel_mod_action(
+                &author,
+                &author_pk,
+                &target,
+                true,
+                &CHAT_CHANNEL,
+                &CHAT_MSG_ID,
+                CHAT_TS,
+            ),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+        )
+        .unwrap();
+        assert_eq!(sender, author_pk);
+        assert_eq!(decoded_target, target);
         assert!(banned);
-        assert!(decode_channel_mod_action(&chat_frame(&author, "x")).is_none());
+        assert!(decode_channel_mod_action(
+            &chat_frame(&author, "x"),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS
+        )
+        .is_none());
     }
 
     /// The forgery the signature exists to stop, and the three replays that
@@ -2270,8 +2465,18 @@ mod tests {
         let well_chat =
             ChannelGossip::sealed(channel_id, CHAT_MSG_ID, &key, 1, &chat_plain, 4, CHAT_TS)
                 .encode();
-        let mod_plain = encode_channel_mod_action(&[1u8; 32], &[2u8; 32], true);
-        let well_mod = ChannelGossip::new_plaintext(channel_id, &key, 2, &mod_plain, 4).encode();
+        let mod_plain = encode_channel_mod_action(
+            &author,
+            &author.verifying_key().to_bytes(),
+            &SigningKey::generate(&mut OsRng).verifying_key().to_bytes(),
+            true,
+            &channel_id,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+        );
+        let well_mod =
+            ChannelGossip::sealed(channel_id, CHAT_MSG_ID, &key, 2, &mod_plain, 4, CHAT_TS)
+                .encode();
         let mut decoded_ok = 0usize;
         for i in 0..2_000 {
             let buf = match i {
@@ -2299,12 +2504,17 @@ mod tests {
                         &decoded.msg_id,
                         decoded.timestamp,
                     );
-                    let _ = decode_channel_mod_action(&plain);
+                    let _ = decode_channel_mod_action(
+                        &plain,
+                        &decoded.channel_id,
+                        &decoded.msg_id,
+                        decoded.timestamp,
+                    );
                 }
             }
             let _ = decode_channel_chat_plain(&buf, &channel_id, &CHAT_MSG_ID, CHAT_TS);
-            let _ = decode_channel_mod_action(&buf);
-            let _ = decode_channel_sync_request(&buf);
+            let _ = decode_channel_mod_action(&buf, &channel_id, &CHAT_MSG_ID, CHAT_TS);
+            let _ = decode_channel_sync_request(&buf, &channel_id, &CHAT_MSG_ID, CHAT_TS);
             let _ = decode_presence_extra(Some(&key), &channel_id, &buf, "");
         }
         let chat = ChannelGossip::decode(&well_chat).unwrap();
@@ -2318,10 +2528,15 @@ mod tests {
         assert_eq!(pk, author.verifying_key().to_bytes());
         assert_eq!(text, "fuzz");
         let mod_g = ChannelGossip::decode(&well_mod).unwrap();
-        let (sender, target, banned) =
-            decode_channel_mod_action(&mod_g.decrypt(&key).unwrap()).unwrap();
-        assert_eq!(sender, [1u8; 32]);
-        assert_eq!(target, [2u8; 32]);
+        let (sender, target, banned) = decode_channel_mod_action(
+            &mod_g.decrypt(&key).unwrap(),
+            &mod_g.channel_id,
+            &mod_g.msg_id,
+            mod_g.timestamp,
+        )
+        .unwrap();
+        assert_eq!(sender, author.verifying_key().to_bytes());
+        assert_eq!(target.len(), 32);
         assert!(banned);
         assert!(
             decoded_ok > 0,
@@ -2457,12 +2672,27 @@ mod tests {
 
     #[test]
     fn sync_request_round_trip_and_rate_window() {
-        let plain = encode_channel_sync_request(&[9u8; 32], 1_700_000_000);
-        let (pk, since) = decode_channel_sync_request(&plain).unwrap();
-        assert_eq!(pk, [9u8; 32]);
-        assert_eq!(since, 1_700_000_000);
         let author = SigningKey::generate(&mut OsRng);
-        assert!(decode_channel_sync_request(&chat_frame(&author, "x")).is_none());
+        let pk = author.verifying_key().to_bytes();
+        let plain = encode_channel_sync_request(
+            &author,
+            &pk,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            1_700_000_000,
+        );
+        let (decoded_pk, since) =
+            decode_channel_sync_request(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).unwrap();
+        assert_eq!(decoded_pk, pk);
+        assert_eq!(since, 1_700_000_000);
+        assert!(decode_channel_sync_request(
+            &chat_frame(&author, "x"),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS
+        )
+        .is_none());
 
         let mut times = VecDeque::new();
         let t0 = Instant::now();
@@ -2701,6 +2931,99 @@ mod tests {
     }
 
     #[test]
+    fn handoff_ready_requires_the_nominees_user_key() {
+        let nominee = SigningKey::generate(&mut OsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let successor = ChannelIdentity::generate();
+        let room = [0x11u8; 16];
+        let bytes = encode_channel_handoff_ready(
+            &nominee,
+            &room,
+            &nominee_pk,
+            &successor.pubkey,
+            9,
+        );
+        assert_eq!(
+            decode_channel_handoff_ready(&bytes, &room),
+            Some((nominee_pk, successor.pubkey, 9))
+        );
+        let mallory = SigningKey::generate(&mut OsRng);
+        let forged = encode_channel_handoff_ready(
+            &mallory,
+            &room,
+            &nominee_pk,
+            &successor.pubkey,
+            9,
+        );
+        assert!(
+            decode_channel_handoff_ready(&forged, &room).is_none(),
+            "a Ready naming the nominee must be signed by the nominee"
+        );
+        assert!(decode_channel_handoff_ready(&bytes, &[0u8; 16]).is_none());
+        let mut legacy = bytes[..73].to_vec();
+        legacy[0] = 7;
+        assert!(
+            decode_channel_handoff_ready(&legacy, &room).is_none(),
+            "unsigned Ready frames are refused"
+        );
+    }
+
+    #[test]
+    fn a_member_cannot_put_a_moderators_name_on_a_ban() {
+        let moderator = SigningKey::generate(&mut OsRng);
+        let mallory = SigningKey::generate(&mut OsRng);
+        let moderator_pk = moderator.verifying_key().to_bytes();
+        let target = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let mallory_frame = encode_channel_mod_action(
+            &mallory,
+            &moderator_pk,
+            &target,
+            true,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+        );
+        assert!(
+            decode_channel_mod_action(&mallory_frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+                .is_none()
+        );
+        let genuine = encode_channel_mod_action(
+            &moderator,
+            &moderator_pk,
+            &target,
+            true,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+        );
+        assert!(
+            decode_channel_mod_action(&genuine, &[9u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none()
+        );
+        let mut unsigned = vec![2u8];
+        unsigned.extend_from_slice(&moderator_pk);
+        unsigned.push(1);
+        unsigned.extend_from_slice(&target);
+        assert!(
+            decode_channel_mod_action(&unsigned, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+            "unsigned mod frames are refused"
+        );
+    }
+
+    #[test]
+    fn gossip_timestamp_rejects_the_far_future() {
+        let now = 1_700_000_000;
+        assert!(gossip_timestamp_ok(now, now));
+        assert!(gossip_timestamp_ok(now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS, now));
+        assert!(!gossip_timestamp_ok(
+            now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1,
+            now
+        ));
+        assert!(!gossip_timestamp_ok(0, now));
+        assert!(!gossip_timestamp_ok(i64::MAX, now));
+        assert!(gossip_timestamp_ok(1, now), "old timestamps stay admissible for catch-up");
+    }
+
+    #[test]
     fn handoff_extra_round_trip_binds_successor_id() {
         let successor = ChannelIdentity::generate();
         let extra = encode_handoff_extra(7, &successor.pubkey, HANDOFF_FLAG_KEEP_JOIN_SECRET);
@@ -2921,7 +3244,15 @@ mod tests {
         // Chat and handoff frames are not mistaken for transfer frames either.
         let author = SigningKey::generate(&mut OsRng);
         assert!(xfer_frame_peek(&chat_frame(&author, "hello there")).is_none());
-        assert!(xfer_frame_peek(&encode_channel_sync_request(&s, 1)).is_none());
+        let sync = encode_channel_sync_request(
+            &author,
+            &author.verifying_key().to_bytes(),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            1,
+        );
+        assert!(xfer_frame_peek(&sync).is_none());
     }
 
     #[test]

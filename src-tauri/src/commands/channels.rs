@@ -54,6 +54,10 @@ pub struct ChannelInfo {
     /// cannot read new traffic until the epoch record sealed to us arrives. Also
     /// what a stale invite looks like from the inside.
     pub key_behind: bool,
+    /// Owner's user pubkey (64-char hex), empty until a signed moderation
+    /// record naming them has been applied. Used so the roster can hide Ban
+    /// on the owner rather than only refusing it on the wire.
+    pub owner_pubkey: String,
 }
 
 impl ChannelInfo {
@@ -81,6 +85,7 @@ impl ChannelInfo {
             claim_after_days: row.claim_after_days,
             successor_id: row.successor_id,
             predecessor_id: row.predecessor_id,
+            owner_pubkey: row.owner_pubkey,
         }
     }
 
@@ -415,6 +420,27 @@ pub async fn create_channel(
         &ident.signing_key,
     );
     let _ = publish_signed_record(&state, moderation).await;
+    // Remember it locally too, so this device's roster can hide Ban on us
+    // without waiting for our own DHT record to be fetched back.
+    let db_owner = state.db.clone();
+    let id_owner = channel_id_hex.clone();
+    let owner_pk = state.identity.ed25519_public_key;
+    let _ = tokio::task::spawn_blocking(move || {
+        db_owner.apply_channel_moderation(
+            &id_owner,
+            "",
+            "",
+            // Older than any real DHT record so the first fetch still applies.
+            1,
+            &[],
+            &[],
+            Some(&owner_pk),
+            None,
+            None,
+            Some(0),
+        )
+    })
+    .await;
 
     let invite = ChannelInvite {
         channel_id: ident.channel_id,
@@ -831,18 +857,22 @@ pub async fn send_channel_message(
             "You are banned from this channel",
         ));
     }
+    if row.visibility == CHANNEL_KIND_PRIVATE && row.key_epoch_wanted > row.key_epoch {
+        return Err(coded(
+            "channels_key_behind",
+            "New messages are locked until this device has the current room key",
+        ));
+    }
+    let join_secret = join_secret_for_channel(&state, &row).await.ok_or_else(|| {
+        coded(
+            "channels_send_failed",
+            "This device has no key for this channel",
+        )
+    })?;
     let mut msg_id = [0u8; 16];
     OsRng.fill_bytes(&mut msg_id);
     let sender_pk = state.identity.ed25519_public_key;
-    let db = state.db.clone();
-    let id = channel_id.clone();
-    let sender2 = sender.clone();
-    let text = cleaned.clone();
-    let msg_id_hex = hex::encode(msg_id);
     let sent_at = chrono::Utc::now().timestamp();
-    // Signed before the row is written so the stored copy carries the same
-    // authenticator the room will see, and can be re-served on a catch-up
-    // without this node ever signing on somebody's behalf.
     let author_sig = channel::chat_author_signature(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
         &sender_pk,
@@ -851,6 +881,29 @@ pub async fn send_channel_message(
         sent_at,
         &cleaned,
     );
+    let key = channel::content_key(&join_secret);
+    let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &cleaned);
+    let gossip = channel::ChannelGossip::sealed(
+        channel_id_bytes,
+        msg_id,
+        &key,
+        sent_at.max(0) as u64,
+        &plain,
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        sent_at,
+    );
+    state
+        .network_tx
+        .try_send(NetworkCommand::FanoutChannelGossip {
+            body: gossip.encode(),
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let sender2 = sender.clone();
+    let text = cleaned.clone();
+    let msg_id_hex = hex::encode(msg_id);
     let author_sig_hex = hex::encode(author_sig);
     let row_id = tokio::task::spawn_blocking(move || {
         db.insert_channel_message(
@@ -861,36 +914,12 @@ pub async fn send_channel_message(
             &msg_id_hex,
             sent_at,
             &author_sig_hex,
+            true,
         )
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
-
-    // Must be the current epoch, not the `join_secret` column. Chat is the bulk
-    // of what a room carries, so sealing it with the pre-rotation key left the
-    // member a ban had just evicted able to read every new message — the one
-    // thing rotating is for.
-    if let Some(join_secret) = join_secret_for_channel(&state, &row).await {
-        let key = channel::content_key(&join_secret);
-        // The same signature the row kept, so what the room verifies and what a
-        // later catch-up replays are byte-identical.
-        let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &cleaned);
-        let gossip = channel::ChannelGossip::sealed(
-            channel_id_bytes,
-            msg_id,
-            &key,
-            sent_at.max(0) as u64,
-            &plain,
-            channel::CHANNEL_MSG_TTL_DEFAULT,
-            sent_at,
-        );
-        let _ = state
-            .network_tx
-            .try_send(NetworkCommand::FanoutChannelGossip {
-                body: gossip.encode(),
-            });
-    }
 
     Ok(ChannelMessageInfo {
         id: row_id,
@@ -1403,12 +1432,40 @@ async fn apply_local_mod_ban(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_ban_failed", "Failed to update the ban list", e))?;
     if let Some(join_secret) = join_secret_for_channel(state, row).await {
+        let mut channel_id_bytes = [0u8; 16];
+        let Ok(id_bytes) = hex::decode(&row.channel_id) else {
+            return Ok(());
+        };
+        if id_bytes.len() != 16 {
+            return Ok(());
+        }
+        channel_id_bytes.copy_from_slice(&id_bytes);
+        let mut msg_id = [0u8; 16];
+        OsRng.fill_bytes(&mut msg_id);
         let plain = channel::encode_channel_mod_action(
+            &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
             &state.identity.ed25519_public_key,
             &target,
             banned,
+            &channel_id_bytes,
+            &msg_id,
+            ts,
         );
-        enqueue_channel_gossip(state, &row.channel_id, join_secret, plain);
+        let key = channel::content_key(&join_secret);
+        let gossip = channel::ChannelGossip::sealed(
+            channel_id_bytes,
+            msg_id,
+            &key,
+            ts.max(0) as u64,
+            &plain,
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            ts,
+        );
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::FanoutChannelGossip {
+                body: gossip.encode(),
+            });
     }
     Ok(())
 }
@@ -1465,6 +1522,15 @@ pub async fn ban_channel_member(
         return Err(coded(
             "channels_not_moderator",
             "Only the owner or a moderator can do that",
+        ));
+    }
+    if !is_owner
+        && !row.owner_pubkey.is_empty()
+        && row.owner_pubkey.eq_ignore_ascii_case(&hex::encode(pk))
+    {
+        return Err(coded(
+            "channels_ban_owner",
+            "You cannot ban the channel owner",
         ));
     }
     if is_owner {

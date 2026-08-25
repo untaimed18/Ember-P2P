@@ -8,6 +8,19 @@ import * as m from '$lib/paraglide/messages';
 export const channels = writable<ChannelInfo[]>([]);
 export const activeChannelId = writable<string | null>(null);
 
+let lastOpenedChannelId: string | null = null;
+
+export function stashActiveChannelOnLeave(): void {
+  lastOpenedChannelId = get(activeChannelId);
+  activeChannelId.set(null);
+}
+
+export function restoreActiveChannelOnEnter(): void {
+  if (get(activeChannelId) == null && lastOpenedChannelId) {
+    activeChannelId.set(lastOpenedChannelId);
+  }
+}
+
 const CHANNEL_ID_RE = /^[0-9a-f]{32}$/i;
 const MEMBER_PUBKEY_RE = /^[0-9a-f]{64}$/i;
 const TOAST_GAP_MS = 15_000;
@@ -269,6 +282,7 @@ export function cleanupChannelsStore() {
   unlisteners = [];
   initialized = false;
   lastToastAt.clear();
+  lastOpenedChannelId = null;
   channels.set([]);
   activeChannelId.set(null);
 }

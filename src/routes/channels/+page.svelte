@@ -50,6 +50,8 @@
     mutedChannels,
     refreshChannels,
     replaceChannel,
+    restoreActiveChannelOnEnter,
+    stashActiveChannelOnLeave,
     toggleChannelMute,
     toggleMemberIgnore,
   } from '$lib/stores/channels';
@@ -160,6 +162,7 @@
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
+  let selectedKeyBehind = $derived(selected?.key_behind ?? false);
   let memberNames = $derived(
     Object.fromEntries(
       members.map((mem) => [
@@ -271,6 +274,7 @@
   }
 
   onMount(() => {
+    restoreActiveChannelOnEnter();
     if (typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
       membersOpen = false;
     }
@@ -433,6 +437,7 @@
       unlistenXferUpdate?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
       document.removeEventListener('keydown', onPageKeydown);
+      stashActiveChannelOnLeave();
     };
   });
 
@@ -848,6 +853,13 @@
    *  member, where the moderation items below are not. */
   function memberHasMenu(mem: ChannelMemberInfo): boolean {
     return !!selected && !mem.is_self;
+  }
+
+  function isChannelOwner(mem: ChannelMemberInfo): boolean {
+    if (!selected) return false;
+    if (mem.is_self && selected.is_owner) return true;
+    const owner = selected.owner_pubkey;
+    return !!owner && mem.member_pubkey.toLowerCase() === owner.toLowerCase();
   }
 
   /** Right-click opens the same menu the button does, rather than a second one
@@ -1559,6 +1571,7 @@
                 channelId={selectedChannelId}
                 hideHeader
                 youAreBanned={selectedBanned}
+                youAreKeyBehind={selectedKeyBehind}
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMembers}
                 mentionName={$appSettings?.nickname ?? ''}
@@ -1610,7 +1623,7 @@
                         <bdi dir="auto">{mem.is_self ? m.channels_you() : mem.nickname || shortId(mem.member_pubkey)}</bdi>
                       </span>
                       <span class="member-badges">
-                        {#if mem.is_self && selected.is_owner}
+                        {#if isChannelOwner(mem)}
                           <span class="badge owner">{m.channels_owner()}</span>
                         {:else if mem.moderator}
                           <span class="badge">{m.channels_moderator_badge()}</span>
@@ -1672,7 +1685,7 @@
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
                               >{m.channels_unban()}</button>
-                            {:else}
+                            {:else if !isChannelOwner(mem)}
                               <button
                                 type="button"
                                 role="menuitem"

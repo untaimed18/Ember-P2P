@@ -2615,6 +2615,8 @@
   "error_channels_not_owner": "Only the channel owner can do that",
   "error_channels_banned": "You are banned from this channel",
   "error_channels_ban_self": "You cannot ban yourself",
+  "error_channels_ban_owner": "You cannot ban the channel owner",
+  "error_channels_key_behind": "New messages are locked until this device has the current room key",
   "error_channels_ban_list_full": "Ban list is full (max 32)",
   "error_channels_member_invalid": "Invalid member key",
   "error_channels_moderation_failed": "Could not update room info: {detail}",

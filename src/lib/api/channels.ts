@@ -24,6 +24,8 @@ export interface ChannelInfo {
   can_claim: boolean;
   /** The room's key has rotated past what we hold, so new messages are unreadable. */
   key_behind: boolean;
+  /** Owner's user pubkey, empty until a signed moderation record naming them arrives. */
+  owner_pubkey: string;
 }
 
 export interface ChannelMemberInfo {

@@ -2615,6 +2615,8 @@
   "error_channels_not_owner": "Nur der Kanalbesitzer kann das tun",
   "error_channels_banned": "Sie sind in diesem Kanal gesperrt",
   "error_channels_ban_self": "Sie können sich nicht selbst sperren",
+  "error_channels_ban_owner": "Sie können den Kanalbesitzer nicht sperren",
+  "error_channels_key_behind": "Neue Nachrichten sind gesperrt, bis dieses Gerät den aktuellen Raumschlüssel hat",
   "error_channels_ban_list_full": "Sperrliste ist voll (max. 32)",
   "error_channels_member_invalid": "Ungültiger Mitgliedsschlüssel",
   "error_channels_moderation_failed": "Rauminfo konnte nicht aktualisiert werden: {detail}",

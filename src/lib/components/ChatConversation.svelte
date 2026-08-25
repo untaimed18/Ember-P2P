@@ -34,6 +34,8 @@
     channelId?: string;
     hideHeader?: boolean;
     youAreBanned?: boolean;
+    /** Private room whose content key has rotated past what this device holds. */
+    youAreKeyBehind?: boolean;
     memberNames?: Record<string, string>;
     /** Senders hidden on this device. Presentational only — their messages are
      *  still received and stored, they just aren't drawn. */
@@ -51,6 +53,7 @@
     channelId = '',
     hideHeader = false,
     youAreBanned = false,
+    youAreKeyBehind = false,
     memberNames = {},
     ignoredSenders = [],
     mentionName = '',
@@ -144,7 +147,7 @@
   }
 
   $effect(() => {
-    if (!chatInputEl || youAreBanned) return;
+    if (!chatInputEl || youAreBanned || youAreKeyBehind) return;
     const raf = requestAnimationFrame(() => chatInputEl?.focus());
     return () => cancelAnimationFrame(raf);
   });
@@ -511,7 +514,7 @@
 
   async function handleSend() {
     const text = inputText.trim();
-    if (!text || sending || youAreBanned) return;
+    if (!text || sending || youAreBanned || youAreKeyBehind) return;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
     // can be under 4096 chars yet over 4096 bytes and be rejected server-side
@@ -861,6 +864,8 @@
 
   {#if youAreBanned}
     <div class="conv-disabled" role="status">{m.channels_you_are_banned()}</div>
+  {:else if youAreKeyBehind}
+    <div class="conv-disabled" role="status">{m.channels_key_behind()}</div>
   {:else if chatDisabled}
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
