@@ -8089,6 +8089,75 @@ mod tests {
     /// these cases exercise the TTL arithmetic rather than the flush budget.
     const ROOMY_TABLE: usize = K_EMBER_REPLICAS * 64;
 
+    /// A room busy enough to spend the relay allowance must still be able to
+    /// carry what this user typed.
+    ///
+    /// The two buckets are what make that true, so this exhausts the relay one
+    /// and checks the local one is untouched. Sharing a bucket was the bug: the
+    /// local copy of a line is written and drawn before fanout is even
+    /// attempted, so a send refused here leaves the user looking at a message
+    /// no peer will ever be offered again.
+    #[test]
+    fn a_saturated_relay_budget_cannot_swallow_what_the_user_typed() {
+        let mut relayed = VecDeque::new();
+        let mut local = VecDeque::new();
+        let now = std::time::Instant::now();
+
+        for _ in 0..ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC {
+            assert!(ember::channel::rate_window_allow(
+                &mut relayed,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+            ));
+        }
+        assert!(
+            !ember::channel::rate_window_allow(
+                &mut relayed,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+            ),
+            "the relay allowance is meant to run out, that is what stops a flood"
+        );
+
+        assert!(
+            ember::channel::rate_window_allow(
+                &mut local,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_LOCAL_PER_SEC,
+            ),
+            "originating must not be charged the allowance relaying just spent"
+        );
+    }
+
+    /// A room nobody else is in yet must be re-asked on a cadence a waiting
+    /// user would accept, and the driver that applies it has to tick at least
+    /// that often or the constant is decoration. `maybe_refresh_channel_members`
+    /// moved off the sixty-second maintenance tick onto the one-second one for
+    /// exactly this reason; putting it back would silently round the empty-room
+    /// interval up to a minute while every value here still read as intended.
+    #[test]
+    fn an_empty_room_asks_for_its_roster_far_sooner_than_a_settled_one() {
+        let empty = channel_presence_interval(1);
+        let settled = channel_presence_interval(4);
+
+        assert_eq!(empty, ember::channel::PRESENCE_FETCH_EMPTY_SECS);
+        assert_eq!(settled, ember::channel::PRESENCE_FETCH_SECS);
+        assert!(
+            empty < settled,
+            "an empty room is the case somebody is waiting on"
+        );
+        // Zero should not be reachable — we write our own member row on join —
+        // but it is the same "nobody else" situation if it ever is.
+        assert_eq!(channel_presence_interval(0), empty);
+        assert!(
+            empty < ember::channel::PRESENCE_REPUBLISH_SECS,
+            "asking less often than members announce would miss arrivals"
+        );
+    }
+
     #[test]
     fn keyword_publish_budget_covers_the_library_within_its_ttl() {
         let ticks_per_cycle =
@@ -10342,6 +10411,14 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
+    /// Walk this room's presence keys now rather than at the next maintenance
+    /// tick. Sent on join and create: publishing our own presence tells the
+    /// room we exist, but nothing pulls the roster the other way, so without
+    /// this a joiner sat with an empty member list — and therefore no one to
+    /// gossip to and no working chat — until a tick came round.
+    RefreshChannelMembers {
+        channel_id: [u8; 16],
+    },
     /// Ember Transfer: offer one file to one channel member. The file is
     /// already hashed by the caller, so the network task never blocks on a
     /// 100 MB read.
@@ -12225,8 +12302,17 @@ struct NetworkState {
     /// Channel gossip ids already persisted or flooded this session.
     channel_gossip_seen: HashMap<[u8; 16], std::time::Instant>,
     channel_gossip_seen_order: VecDeque<[u8; 16]>,
-    /// Timestamps of recent outbound `CHANNEL_MSG` frames (token bucket).
+    /// Timestamps of recent relayed `CHANNEL_MSG` frames (token bucket).
     channel_gossip_sent_times: VecDeque<std::time::Instant>,
+    /// The same, for frames this user originated.
+    ///
+    /// Separate from the relay bucket because the two deserve opposite
+    /// treatment when the room is busy. Relaying is work done on the mesh's
+    /// behalf and shedding it is how a flood stops spreading; a line the user
+    /// typed is the one frame in the system that has no second chance, since
+    /// the local copy is already stored and on screen, so dropping it shows
+    /// them a message the room never received.
+    channel_gossip_local_times: VecDeque<std::time::Instant>,
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Inbound chat timestamps keyed by (room, signed author), so one member
@@ -12454,12 +12540,31 @@ fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
     );
 }
 
-fn channel_gossip_rate_ok(state: &mut NetworkState) -> bool {
+/// Admit one outbound fanout, against the bucket that fits where it came from.
+///
+/// A relay is charged the shared allowance, which is what stops this node
+/// amplifying a flood. Something the user typed is charged its own, so a room
+/// busy enough to spend the relay budget cannot silently swallow their message
+/// — it is already stored and on screen locally, and nothing retries it.
+/// Separate rather than exempt, because an unbounded local path would turn any
+/// send loop into an outbound flood with no ceiling at all.
+fn channel_gossip_rate_ok(state: &mut NetworkState, local_origin: bool) -> bool {
+    let (times, limit) = if local_origin {
+        (
+            &mut state.channel_gossip_local_times,
+            ember::channel::CHANNEL_GOSSIP_LOCAL_PER_SEC,
+        )
+    } else {
+        (
+            &mut state.channel_gossip_sent_times,
+            ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+        )
+    };
     ember::channel::rate_window_allow(
-        &mut state.channel_gossip_sent_times,
+        times,
         std::time::Instant::now(),
         CHANNEL_GOSSIP_RATE_WINDOW,
-        ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+        limit,
     )
 }
 
@@ -12622,10 +12727,89 @@ const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
 const CHANNEL_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
 
-/// FIND_VALUE the current (and previous) presence keys so members are
-/// learned without prior gossip. Extra FIND_VALUE keys intersect by
-/// `file_hash`, which would drop members who only appear in one epoch,
-/// so the two keys are walked as independent searches.
+/// How long to leave a room's presence keys alone before walking them again.
+///
+/// A room we are alone in is asked about far more often than a settled one. The
+/// five-minute cadence is sized for keeping a roster we already have fresh, and
+/// applying it to an empty room made the one case where somebody is actually
+/// waiting the slowest case there is — they have just joined, or they are first
+/// in and somebody else is arriving. Until presence names a second member there
+/// is nobody to gossip to either, so chat cannot move until this resolves.
+///
+/// `member_count` includes us, so 1 means nobody else yet.
+fn channel_presence_interval(member_count: i64) -> i64 {
+    if member_count > 1 {
+        ember::channel::PRESENCE_FETCH_SECS
+    } else {
+        ember::channel::PRESENCE_FETCH_EMPTY_SECS
+    }
+}
+
+/// FIND_VALUE the current (and previous) presence keys for one room.
+///
+/// Extra FIND_VALUE keys intersect by `file_hash`, which would drop members who
+/// only appear in one epoch, so the two keys are walked as independent
+/// searches. Returns whether a walk actually started, so the caller can charge
+/// it against a per-tick budget.
+async fn start_channel_presence_fetch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    now: i64,
+) -> bool {
+    if state
+        .ember_channel_presence_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return false;
+    }
+    // Has to be the same secret the publisher used, because the presence
+    // slot's DHT key is derived from it. Reading the raw `join_secret` here
+    // while publishing under the current epoch would put the two sides on
+    // different keys and members would stop discovering each other outright
+    // the first time a room rotated.
+    //
+    // Members briefly on different epochs therefore cannot see each other's
+    // presence. That resolves as they pick up the new key, and it does not
+    // block recovery: an epoch record is fetched by a key derived from the
+    // channel and our own identity, never from presence.
+    let Some(join_secret) = current_channel_join_secret(db, ch) else {
+        return false;
+    };
+    let epoch = ember::channel::presence_epoch(now);
+    let current_key = ember::channel::presence_key(&channel_id, &join_secret, epoch);
+    let prev_key = ember::channel::presence_key(&channel_id, &join_secret, epoch - 1);
+    let mut keys = vec![current_key];
+    if prev_key != current_key {
+        keys.push(prev_key);
+    }
+    let mut any = false;
+    for key in keys {
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_presence_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        any = true;
+    }
+    if any {
+        state.channel_presence_fetch_at.insert(channel_id, now);
+    }
+    any
+}
+
+/// Walk presence for the rooms that are due, so members are learned without
+/// prior gossip.
 async fn maybe_refresh_channel_members(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -12650,59 +12834,15 @@ async fn maybe_refresh_channel_members(
         let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
             continue;
         };
-        if state
-            .ember_channel_presence_searches
-            .values()
-            .any(|id| *id == channel_id)
-        {
-            continue;
-        }
         let last = state
             .channel_presence_fetch_at
             .get(&channel_id)
             .copied()
             .unwrap_or(0);
-        if now.saturating_sub(last) < ember::channel::PRESENCE_FETCH_SECS {
+        if now.saturating_sub(last) < channel_presence_interval(ch.member_count) {
             continue;
         }
-        // Has to be the same secret the publisher used, because the presence
-        // slot's DHT key is derived from it. Reading the raw `join_secret` here
-        // while publishing under the current epoch would put the two sides on
-        // different keys and members would stop discovering each other outright
-        // the first time a room rotated.
-        //
-        // Members briefly on different epochs therefore cannot see each other's
-        // presence. That resolves as they pick up the new key, and it does not
-        // block recovery: an epoch record is fetched by a key derived from the
-        // channel and our own identity, never from presence.
-        let Some(join_secret) = current_channel_join_secret(db, &ch) else {
-            continue;
-        };
-        let epoch = ember::channel::presence_epoch(now);
-        let current_key = ember::channel::presence_key(&channel_id, &join_secret, epoch);
-        let prev_key = ember::channel::presence_key(&channel_id, &join_secret, epoch - 1);
-        let mut keys = vec![current_key];
-        if prev_key != current_key {
-            keys.push(prev_key);
-        }
-        let mut any = false;
-        for key in keys {
-            let Some(search_id) = state.ember_search.start_find_value(
-                ember::dht::EmberNodeId(key),
-                Vec::new(),
-                state.ember_dht.routing(),
-            ) else {
-                break;
-            };
-            seed_ember_local_records(state, search_id, &key, &[]);
-            state
-                .ember_channel_presence_searches
-                .insert(search_id, channel_id);
-            drive_ember_search(socket, state, search_id).await;
-            any = true;
-        }
-        if any {
-            state.channel_presence_fetch_at.insert(channel_id, now);
+        if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
             started += 1;
         }
     }
@@ -13966,7 +14106,9 @@ async fn fanout_channel_gossip_body(
     body: Vec<u8>,
     exclude: Option<ember::dht::EmberNodeId>,
 ) {
-    if !channel_gossip_rate_ok(state) {
+    // `exclude` names the hop a frame arrived from, so its absence is what
+    // marks this as something we originated rather than are passing on.
+    if !channel_gossip_rate_ok(state, exclude.is_none()) {
         return;
     }
     let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
@@ -14510,7 +14652,11 @@ async fn send_channel_gossip_unicast(
     let Some(contact) = state.ember_dht.routing().get_contact(node_id).cloned() else {
         return;
     };
-    if !channel_gossip_rate_ok(state) {
+    // History catch-up, in both directions: automated mesh traffic rather than
+    // anything the user typed, and it retries on its own timer, so it belongs
+    // on the shared allowance and not the one reserved for a line that gets no
+    // second attempt.
+    if !channel_gossip_rate_ok(state, false) {
         return;
     }
     let (_rid, frame) = state.ember_dht.build_channel_msg(body);
@@ -20651,6 +20797,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
         channel_gossip_sent_times: VecDeque::new(),
+        channel_gossip_local_times: VecDeque::new(),
         channel_gossip_from_times: HashMap::new(),
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
@@ -37367,6 +37514,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &channel_neighbor_lookup_tx,
                     )
                     .await;
+                    // Driven from the one-second tick rather than the minute
+                    // one it used to share with DHT maintenance. Its own
+                    // per-room gates decide when a walk actually happens, and
+                    // on the slow tick the shorter of those gates could not
+                    // mean anything: a room we are alone in asks every twenty
+                    // seconds, which a sixty-second caller rounds up to sixty
+                    // whatever the constant says.
+                    maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
@@ -38948,8 +39103,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         std::time::Instant::now(),
                         std::time::Duration::from_secs(60),
                     );
-                    maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings)
-                        .await;
                     maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)
                         .await;
                     maybe_refresh_channel_handoff(&udp_socket, &mut state, &db, &settings)

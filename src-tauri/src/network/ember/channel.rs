@@ -46,6 +46,15 @@ pub const PRESENCE_EPOCH_SECS: i64 = 15 * 60;
 pub const PRESENCE_REPUBLISH_SECS: i64 = 10 * 60;
 /// How often a member walks the presence DHT keys for rooms they have joined.
 pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
+/// The same walk for a room we are alone in.
+///
+/// Five minutes keeps a roster we already have fresh, but it is the wrong
+/// number for the case the user is actually watching: a room with nobody else
+/// in it yet is either one they have just joined or one somebody is about to
+/// arrive in, and until presence names a second member there is no one to
+/// gossip to, so chat cannot move either. Costs one extra walk every twenty
+/// seconds per empty room, and stops as soon as the room has anyone in it.
+pub const PRESENCE_FETCH_EMPTY_SECS: i64 = 20;
 /// How often members re-fetch the owner-signed moderation record.
 pub const MODERATION_FETCH_SECS: i64 = 5 * 60;
 /// Owners re-publish moderation so the 24h record TTL cannot age out.
@@ -58,8 +67,18 @@ pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
 /// In-session cap on distinct gossip ids remembered for flood dedup.
 pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
-/// Outbound `CHANNEL_MSG` frames we will originate or relay per second.
+/// `CHANNEL_MSG` frames we will relay for the mesh per second.
 pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
+/// `CHANNEL_MSG` frames this user may originate per second.
+///
+/// Held apart from the relay allowance above. Sharing one budget meant a room
+/// busy enough to fill it dropped the sender's own next line, and a dropped
+/// origination is unrecoverable in a way a dropped relay is not: the local copy
+/// is already written and drawn, no peer will ever ask for it again, and the
+/// only thing that would eventually carry it is a history sync minutes later.
+/// Well above any human typing rate, and still a ceiling, so a send loop cannot
+/// become an unbounded flood.
+pub const CHANNEL_GOSSIP_LOCAL_PER_SEC: usize = 32;
 /// Inbound `CHANNEL_MSG` frames accepted from one DHT hop per second.
 pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
 /// Cap on distinct hops tracked in the inbound gossip rate map.
@@ -73,6 +92,16 @@ pub const CHANNEL_GOSSIP_IN_PEER_CAP: usize = 512;
 /// each would dutifully relay. Four a second is far above human typing and far
 /// below what makes a room unreadable.
 pub const CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC: usize = 4;
+
+// Refusing to send what the far end would have accepted is the one way these
+// two can be wrong together: our own ceiling has to sit above what a receiving
+// peer allows one author, or a burst is lost here rather than there, where at
+// least it is a deliberate flood defence.
+const _: () = assert!(
+    CHANNEL_GOSSIP_LOCAL_PER_SEC > CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
+    "originating must not be capped below what a peer accepts from one author"
+);
+
 /// Cap on distinct (room, author) pairs tracked for the limit above.
 pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 /// Recent local messages offered to a neighbor that asks for catch-up.

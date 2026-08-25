@@ -547,6 +547,16 @@ pub async fn join_channel(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
     let _ = publish_signed_record(&state, presence).await;
+    // Publishing tells the room we are here; it does not tell us who else is.
+    // Only the roster walk does that, and until it lands there is nobody to
+    // gossip to, so chat cannot leave this node either. Asking for it now
+    // rather than at the next maintenance tick is the difference between a
+    // room that works on arrival and one that looks empty for a minute.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::RefreshChannelMembers {
+            channel_id: invite.channel_id,
+        });
 
     let db = state.db.clone();
     let row = tokio::task::spawn_blocking(move || db.get_channel(&db_id))

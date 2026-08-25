@@ -2738,6 +2738,18 @@ async fn handle_command_inner(
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
 
+        NetworkCommand::RefreshChannelMembers { channel_id } => {
+            if !settings.ember_native_enabled || db.chat_locked() {
+                return;
+            }
+            let channel_id_hex = hex::encode(channel_id);
+            let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+                return;
+            };
+            let now = chrono::Utc::now().timestamp();
+            start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
+        }
+
         NetworkCommand::OfferChannelTransfer {
             channel_id,
             peer,
