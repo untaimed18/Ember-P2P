@@ -6,7 +6,8 @@ use tracing::debug;
 use crate::network::ember::crypto;
 
 use super::publish::{
-    channel_kind_from_data, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
+    channel_kind_from_data, CHANNEL_KIND_INDEX, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -134,13 +135,39 @@ const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 /// listed for a full day.
 const CHANNEL_PRESENCE_TTL: Duration = Duration::from_secs(45 * 60);
 
+/// A room's public-index listing, which is what Discover walks.
+///
+/// Only the owner can refresh one: the record is signed by the *channel* key,
+/// so no member can republish on the room's behalf, and a storer replicating it
+/// re-sends the identical bytes that every node derives the same expiry from.
+/// Under the 24-hour keyword default an established room therefore fell out of
+/// Discover one day after its owner closed the app, while the members still
+/// inside it carried on talking — the room had not died, it had only become
+/// impossible to find. A week survives an ordinary absence.
+///
+/// The cost is the other direction: a room genuinely abandoned keeps its
+/// listing for up to a week, so Discover can offer a room with nobody in it.
+/// Presence records expire in 45 minutes and would show that room as empty, so
+/// a stale listing is recoverable in the UI whereas a vanished one is not.
+const CHANNEL_INDEX_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+// The whole point of the constant is that it outlasts the default it used to
+// inherit. Equal values would compile, pass every test below, and quietly put
+// rooms back to expiring a day after their owner leaves.
+const _: () = assert!(
+    CHANNEL_INDEX_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "a room listing must outlive the generic keyword TTL"
+);
+
 /// How long a record of this type lives, from its leading type byte.
 fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
         Some(&RECORD_TYPE_SOURCE) => SOURCE_RECORD_TTL,
-        Some(&RECORD_TYPE_CHANNEL) if channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE) => {
-            CHANNEL_PRESENCE_TTL
-        }
+        Some(&RECORD_TYPE_CHANNEL) => match channel_kind_from_data(data) {
+            Some(CHANNEL_KIND_PRESENCE) => CHANNEL_PRESENCE_TTL,
+            Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
+            _ => KEYWORD_RECORD_TTL,
+        },
         _ => KEYWORD_RECORD_TTL,
     }
 }
@@ -3031,14 +3058,49 @@ mod tests {
         );
     }
 
-    /// A room's public-index record is published once, when the room is created
-    /// (`commands::channels::create_channel`), and nothing republishes it.
-    /// Replication cannot make up the difference, which is the point of this
-    /// test: remaining life is derived from the publisher's signed creation
-    /// time, so a storer offered the identical bytes past the TTL refuses them
-    /// rather than granting a fresh 24 hours. Discover (`gather_channels`)
-    /// walks exactly these keys, so a public room stops being discoverable one
-    /// TTL after creation whether or not its owner is online.
+    /// [`record_ttl`] singles out the index kind from inside the channel record
+    /// type, so the arm has to be narrow enough to leave the room's other records
+    /// on the default. Moderation standing in for all of them: it shares the type
+    /// byte and differs only in the packed kind.
+    #[test]
+    fn only_the_index_kind_of_a_channel_record_gets_the_long_ttl() {
+        use super::super::publish::{ModerationTail, SignedRecord};
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let ident = ChannelIdentity::generate();
+
+        let index = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert_eq!(record_ttl(&index.data), CHANNEL_INDEX_TTL);
+
+        let moderation = SignedRecord::channel_moderation(
+            "",
+            "",
+            &[],
+            &[],
+            &ModerationTail::default(),
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert_eq!(record_ttl(&moderation.data), KEYWORD_RECORD_TTL);
+    }
+
+    /// Only the room's owner can renew its listing — the record is signed by the
+    /// channel key, and the owner maintenance loop in `network::mod` re-signs one
+    /// every 6 hours while the app is open. Replication cannot stand in for that,
+    /// which is the point of this test: remaining life comes from the publisher's
+    /// signed creation time, so a storer offered the identical bytes past the TTL
+    /// refuses them instead of granting a fresh term. Discover
+    /// (`commands::channels::gather_channels`) walks exactly these keys, so
+    /// [`CHANNEL_INDEX_TTL`] is how long a room stays findable after its owner
+    /// goes offline.
     #[test]
     fn a_channel_index_record_cannot_outlive_its_signed_creation_time() {
         use super::super::publish::SignedRecord;
@@ -3052,7 +3114,7 @@ mod tests {
             false,
             &ident.signing_key,
         );
-        let ttl = KEYWORD_RECORD_TTL.as_secs() as i64;
+        let ttl = CHANNEL_INDEX_TTL.as_secs() as i64;
 
         let mut inside = DhtStore::new();
         assert!(

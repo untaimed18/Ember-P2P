@@ -16,6 +16,7 @@
   import {
     addChannelModerator,
     banChannelMember,
+    cachedChannels,
     cancelChannelTransfer,
     channelMemberFriendCode,
     createChannel,
@@ -320,6 +321,22 @@
       if (cancelled) fn();
       else unlistenHandoff = fn;
     });
+    // One index shard answered. Sixteen of these arrive per browse, in whatever
+    // order the DHT returns them, so the list grows as the walk proceeds instead
+    // of appearing all at once when the slowest shard gives up. Ignored unless a
+    // browse is actually running, so a dismissed list stays dismissed.
+    let unlistenFound: UnlistenFn | undefined;
+    listen<GatheredChannelInfo[]>('ember:channels-found', (event) => {
+      if (!discovering) return;
+      const batch = event.payload ?? [];
+      if (batch.length === 0) return;
+      const byId = new Map(discovered.map((item) => [item.channel_id, item]));
+      for (const item of batch) byId.set(item.channel_id, item);
+      discovered = [...byId.values()];
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenFound = fn;
+    });
     // Ember Transfer. `xfer-offer` is an offer waiting on the user;
     // `xfer-update` carries every state change including progress.
     let unlistenXferOffer: UnlistenFn | undefined;
@@ -411,6 +428,7 @@
       unlistenMembers?.();
       unlistenModeration?.();
       unlistenHandoff?.();
+      unlistenFound?.();
       unlistenXferOffer?.();
       unlistenXferUpdate?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
@@ -652,8 +670,23 @@
   async function handleDiscover() {
     discovering = true;
     try {
-      discovered = await gatherChannels();
+      // Draw the last walk's rooms straight away so the browse is not blank
+      // while sixteen shards are being asked. `ember:channels-found` fills in
+      // each shard as it answers, and the walk's own result replaces the lot
+      // below, so a room that has since disappeared does not outlive the
+      // refresh that failed to find it.
       if (discovered.length === 0) {
+        try {
+          discovered = await cachedChannels();
+        } catch {
+          // A cold cache is the normal first run, not a failure to report.
+        }
+      }
+      const found = await gatherChannels();
+      discovered = found;
+      // Counted from the walk, not the merged list: a cache hit must not make
+      // an empty network look like a populated one.
+      if (found.length === 0) {
         toastSuccess(m.channels_none_found());
       }
     } catch (e) {

@@ -5,13 +5,13 @@
 
 use rand::rngs::OsRng;
 use rand::RngCore;
+use tauri::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::ember::channel::{
     self, ChannelIdentity, ChannelInvite, CHANNEL_KIND_PRIVATE, CHANNEL_KIND_PUBLIC,
 };
-use crate::network::ember::dht::messages::MAX_FIND_VALUE_KEYS;
 use crate::network::ember::dht::publish::{
     ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
     CHANNEL_WELCOME_MAX,
@@ -374,7 +374,17 @@ pub async fn create_channel(
             false,
             &ident.signing_key,
         );
-        let _ = publish_signed_record(&state, record).await;
+        // Not fatal — the room exists locally and the owner maintenance loop
+        // republishes the listing within the hour. Until it does the room is
+        // undiscoverable, and a discarded error made that indistinguishable
+        // from a room nobody happened to browse for.
+        if let Err(e) = publish_signed_record(&state, record).await {
+            tracing::warn!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "public room created but its index record did not publish"
+            );
+        }
     }
     let presence = SignedRecord::channel_presence(
         &nickname,
@@ -791,6 +801,12 @@ pub async fn send_channel_message(
         ));
     }
     let channel_id = parse_channel_id(&channel_id)?;
+    // `parse_channel_id` has already established this is 16 hex-decodable
+    // bytes; the signature below binds the room, so it needs them as bytes.
+    let channel_id_bytes: [u8; 16] = hex::decode(&channel_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .ok_or_else(|| coded("channels_invite_invalid", "Invalid channel id"))?;
     let db = state.db.clone();
     let id_check = channel_id.clone();
     let row = tokio::task::spawn_blocking(move || db.get_channel(&id_check))
@@ -814,8 +830,28 @@ pub async fn send_channel_message(
     let text = cleaned.clone();
     let msg_id_hex = hex::encode(msg_id);
     let sent_at = chrono::Utc::now().timestamp();
+    // Signed before the row is written so the stored copy carries the same
+    // authenticator the room will see, and can be re-served on a catch-up
+    // without this node ever signing on somebody's behalf.
+    let author_sig = channel::chat_author_signature(
+        &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+        &sender_pk,
+        &channel_id_bytes,
+        &msg_id,
+        sent_at,
+        &cleaned,
+    );
+    let author_sig_hex = hex::encode(author_sig);
     let row_id = tokio::task::spawn_blocking(move || {
-        db.insert_channel_message(&id, &sender2, "sent", &text, &msg_id_hex, sent_at)
+        db.insert_channel_message(
+            &id,
+            &sender2,
+            "sent",
+            &text,
+            &msg_id_hex,
+            sent_at,
+            &author_sig_hex,
+        )
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -826,28 +862,24 @@ pub async fn send_channel_message(
     // member a ban had just evicted able to read every new message — the one
     // thing rotating is for.
     if let Some(join_secret) = join_secret_for_channel(&state, &row).await {
-        let mut channel_id_bytes = [0u8; 16];
-        if let Ok(id_bytes) = hex::decode(&channel_id) {
-            if id_bytes.len() == 16 {
-                channel_id_bytes.copy_from_slice(&id_bytes);
-                let key = channel::content_key(&join_secret);
-                let plain = channel::encode_channel_chat_plain(&sender_pk, &cleaned);
-                let gossip = channel::ChannelGossip::sealed(
-                    channel_id_bytes,
-                    msg_id,
-                    &key,
-                    sent_at.max(0) as u64,
-                    &plain,
-                    channel::CHANNEL_MSG_TTL_DEFAULT,
-                    sent_at,
-                );
-                let _ = state
-                    .network_tx
-                    .try_send(NetworkCommand::FanoutChannelGossip {
-                        body: gossip.encode(),
-                    });
-            }
-        }
+        let key = channel::content_key(&join_secret);
+        // The same signature the row kept, so what the room verifies and what a
+        // later catch-up replays are byte-identical.
+        let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &cleaned);
+        let gossip = channel::ChannelGossip::sealed(
+            channel_id_bytes,
+            msg_id,
+            &key,
+            sent_at.max(0) as u64,
+            &plain,
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            sent_at,
+        );
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::FanoutChannelGossip {
+                body: gossip.encode(),
+            });
     }
 
     Ok(ChannelMessageInfo {
@@ -1871,31 +1903,19 @@ pub async fn claim_channel_ownership(
     channel_info_from_id(&state, &successor_id_hex).await
 }
 
-/// Walk the 16 public-index shards and return unique channel listings.
-#[tauri::command]
-pub async fn gather_channels(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<GatheredChannelInfo>, String> {
-    require_ember(&state).await?;
-    let keys = channel::all_index_keys();
-    let mut records = Vec::new();
-    for chunk in keys.chunks(MAX_FIND_VALUE_KEYS) {
-        match find_raw_keys(&state, chunk.to_vec()).await {
-            Ok(blobs) => records.extend(blobs),
-            Err(_) => continue,
-        }
-    }
-    let db = state.db.clone();
-    let joined = tokio::task::spawn_blocking(move || db.list_channels())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
-    let joined_ids: std::collections::HashSet<_> =
-        joined.into_iter().map(|c| c.channel_id).collect();
-    let mut seen = std::collections::HashSet::new();
+/// Turn one shard's raw `FOUND_VALUE` blobs into public room listings.
+///
+/// `seen` is threaded across shards so a record several storers hold is listed
+/// once. Private rooms publish an index record too and are dropped here: theirs
+/// exists so a holder of the invite can confirm the room, not so a browse can
+/// find it.
+fn listings_from_blobs(
+    blobs: Vec<Vec<u8>>,
+    joined_ids: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Vec<GatheredChannelInfo> {
     let mut out = Vec::new();
-    for blob in records {
+    for blob in blobs {
         let Some(rec) = SignedRecord::from_value_blob(&blob) else {
             continue;
         };
@@ -1925,7 +1945,102 @@ pub async fn gather_channels(
             joined: joined_ids.contains(&id_hex),
         });
     }
+    out
+}
+
+/// Walk the 16 public-index shards and return unique channel listings.
+///
+/// Each shard is emitted on `ember:channels-found` the moment it lands, so a
+/// browse fills in as answers arrive instead of showing nothing until the
+/// slowest walk gives up, and the merged result is cached for the next open.
+/// The return value is still the complete set: a caller that ignores the
+/// events behaves exactly as before.
+#[tauri::command]
+pub async fn gather_channels(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<GatheredChannelInfo>, String> {
+    use futures::StreamExt;
+
+    require_ember(&state).await?;
+    let db = state.db.clone();
+    let joined = tokio::task::spawn_blocking(move || db.list_channels())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    let joined_ids: std::collections::HashSet<_> =
+        joined.into_iter().map(|c| c.channel_id).collect();
+
+    // One walk per shard, and never a batch. A `FIND_VALUE` converges on the
+    // single point in the ID space named by its first key; the rest are an AND
+    // filter for multi-word search, and the searcher drops any record whose
+    // embedded key is not the primary. Batching the shards into requests of
+    // `MAX_FIND_VALUE_KEYS` therefore walked toward shard 0 and shard 8 and
+    // discarded the other fourteen, so most public rooms could never be found.
+    // The walks run together because they are independent and a browse that
+    // ran them in series would cost sixteen timeouts.
+    let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
+        .into_iter()
+        .map(|key| find_raw_keys(&state, vec![key]))
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<GatheredChannelInfo> = Vec::new();
+    // A shard that errors or times out is skipped rather than failing the
+    // browse: fifteen shards of listings beat none.
+    while let Some(shard) = walks.next().await {
+        let found = listings_from_blobs(shard.unwrap_or_default(), &joined_ids, &mut seen);
+        if found.is_empty() {
+            continue;
+        }
+        let _ = app.emit("ember:channels-found", &found);
+        out.extend(found);
+    }
+
+    let listings: Vec<(String, String, String)> = out
+        .iter()
+        .map(|c| (c.channel_id.clone(), c.pubkey.clone(), c.name.clone()))
+        .collect();
+    if !listings.is_empty() {
+        let db = state.db.clone();
+        let _ = tokio::task::spawn_blocking(move || db.cache_channel_listings(&listings)).await;
+    }
+
     Ok(out)
+}
+
+/// Rooms the last Discover walk found, straight from the local cache.
+///
+/// Answers without touching the network so the browse has something on screen
+/// while [`gather_channels`] is still walking. These are hints and may name a
+/// room that has since gone; the walk that follows is what confirms them.
+#[tauri::command]
+pub async fn cached_channels(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<GatheredChannelInfo>, String> {
+    let db = state.db.clone();
+    let (cached, joined) = tokio::task::spawn_blocking(move || {
+        (
+            db.list_cached_channels().unwrap_or_default(),
+            db.list_channels().unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+
+    let joined_ids: std::collections::HashSet<_> =
+        joined.into_iter().map(|c| c.channel_id).collect();
+    Ok(cached
+        .into_iter()
+        .map(|c| GatheredChannelInfo {
+            joined: joined_ids.contains(&c.channel_id),
+            channel_id: c.channel_id,
+            pubkey: c.pubkey,
+            name: c.name,
+            private: false,
+        })
+        .collect())
 }
 
 async fn publish_signed_record(

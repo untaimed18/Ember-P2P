@@ -14017,18 +14017,24 @@ async fn fanout_channel_gossip_body(
         let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         send_ember_dht_frame(socket, state, &contact, &frame).await;
     }
+    // Every unreachable neighbor is tried over the overlay, which is UDP
+    // between members, before the rendezvous tunnel, which is a TCP WebSocket
+    // through a server. The tunnel is not skipped for the peers that hold one:
+    // an overlay hop only forwards to a target it already has a contact for and
+    // says nothing when it cannot, so overlay delivery is best-effort and
+    // indistinguishable from silence. Dropping a working tunnel on the strength
+    // of an attempt that reports nothing would trade a delivery for a hope.
+    //
+    // Sending both is close to free. Receivers deduplicate on `msg_id`, so a
+    // line that arrives twice is stored and forwarded once, and only neighbors
+    // we could not reach directly cost anything at all.
+    if !missing.is_empty() {
+        overlay_forward_channel_gossip(socket, state, &gossip.channel_id, &body, &missing).await;
+    }
     for pk in &missing {
         if let Some(tx) = state.channel_relay_outboxes.get(pk) {
             let _ = tx.try_send(body.clone());
         }
-    }
-    let still_missing: Vec<[u8; 32]> = missing
-        .into_iter()
-        .filter(|pk| !state.channel_relay_outboxes.contains_key(pk))
-        .collect();
-    if !still_missing.is_empty() {
-        overlay_forward_channel_gossip(socket, state, &gossip.channel_id, &body, &still_missing)
-            .await;
     }
 }
 
@@ -14295,7 +14301,16 @@ async fn handle_inbound_channel_gossip(
         }
         return;
     }
-    let Some((sender_pk, text)) = ember::channel::decode_channel_chat_plain(&plain) else {
+    let Some((sender_pk, text, author_sig)) = ember::channel::decode_channel_chat_plain(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) else {
+        debug!(
+            "Ember channel gossip: dropped a chat line in {channel_id_hex} that did not carry a \
+             signature from the member it named"
+        );
         return;
     };
     // Ahead of any DB work, and ahead of the relay below: a member flooding a
@@ -14329,6 +14344,16 @@ async fn handle_inbound_channel_gossip(
         return;
     }
     let now = gossip.timestamp;
+    // Keep the author's signature only when sanitising left the text alone.
+    // The signature covers what they wrote; if we had to change it, the two no
+    // longer agree, and storing the signature anyway would produce a re-serve
+    // that every recipient rejects. Such a line stays readable here and simply
+    // is not passed on.
+    let stored_sig = if cleaned == text {
+        hex::encode(author_sig)
+    } else {
+        String::new()
+    };
     match db.insert_channel_message(
         &channel_id_hex,
         &sender_hex,
@@ -14336,6 +14361,7 @@ async fn handle_inbound_channel_gossip(
         &cleaned,
         &msg_id_hex,
         now,
+        &stored_sig,
     ) {
         Ok(row_id) => {
             let _ = db.upsert_channel_member(&channel_id_hex, &sender_hex, "", now);
@@ -15244,7 +15270,7 @@ async fn reply_channel_history_sync(
     let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
         return;
     };
-    for (msg_id_hex, sender_hex, text, timestamp) in rows {
+    for (msg_id_hex, sender_hex, text, timestamp, author_sig_hex) in rows {
         let Ok(msg_id_bytes) = hex::decode(&msg_id_hex) else {
             continue;
         };
@@ -15257,7 +15283,17 @@ async fn reply_channel_history_sync(
         let Ok(sender_pk) = <[u8; 32]>::try_from(sender_bytes) else {
             continue;
         };
-        let plain = ember::channel::encode_channel_chat_plain(&sender_pk, &text);
+        // Replaying the author's own signature, never one of ours. This loop
+        // re-serves lines other members wrote, so signing here would let any
+        // node answer a catch-up with a conversation that never happened.
+        let Ok(sig_bytes) = hex::decode(&author_sig_hex) else {
+            continue;
+        };
+        let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
+            continue;
+        };
+        let plain =
+            ember::channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &text);
         let gossip = ember::channel::ChannelGossip::sealed(
             channel_id,
             msg_id,

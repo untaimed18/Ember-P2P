@@ -2358,6 +2358,47 @@ mod tests {
         );
     }
 
+    /// The extra keys on a `FIND_VALUE` are an AND filter for multi-word
+    /// search, never a union. The walk converges on the primary alone, and a
+    /// record filed under a secondary is dropped the moment it arrives — so
+    /// batching independent keys into one search returns a fraction of them
+    /// and reports success. That is how the public-channel index came to serve
+    /// two of its sixteen shards; `commands::channels::gather_channels` runs
+    /// one search per shard, and this is the property that says it must.
+    #[test]
+    fn a_multi_key_find_value_returns_nothing_for_its_secondary_keys() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        rt.add_contact(make_contact(0x80));
+
+        let primary = keyword_target("ubuntu");
+        let secondary = keyword_target("debian");
+        let mut sm = SearchManager::new();
+        let search_id = sm
+            .start_find_value(primary, vec![secondary.0], &rt)
+            .expect("search slot");
+
+        let search = sm.get_mut(search_id).unwrap();
+        let batch = search.query_pairs();
+        let (_, req_id) = &batch[0];
+
+        search.process_unpaged(
+            *req_id,
+            &make_id(0x80),
+            vec![],
+            vec![
+                signed_value_blob("ubuntu", 0x01),
+                signed_value_blob("debian", 0x02),
+            ],
+        );
+
+        assert_eq!(
+            search.results.len(),
+            1,
+            "a record filed under a secondary key must not reach the caller"
+        );
+    }
+
     #[test]
     fn seed_extra_contacts_are_queried_first_and_survive_the_k_trim() {
         let local = make_id(0);

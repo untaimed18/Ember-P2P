@@ -14,11 +14,18 @@ use crate::types::*;
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+/// Rooms kept in the Discover cache. Far more than a browse can usefully show,
+/// and small enough that the table stays a rounding error on disk.
+const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
+/// A cached listing this old has been absent from the DHT for many times the
+/// index record's own lifetime, so offering it would only send the user at a
+/// room that no longer answers.
+const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// Highest `schema_version` this build knows how to open. Opening a newer
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 34;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 36;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -46,6 +53,18 @@ pub type CreditRowRef<'a> = (
     Option<&'a [u8; 16]>,
     bool,
 );
+
+/// One public room remembered from an earlier Discover walk.
+///
+/// A hint for what to draw while the DHT is being asked again, never an
+/// assertion that the room is still there. The `last_seen` column behind this
+/// orders and expires the cache in SQL; nothing in Rust needs to read it.
+#[derive(Debug, Clone)]
+pub struct CachedChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+}
 
 /// One joined channel, as listed in the Channels page.
 #[derive(Debug, Clone)]
@@ -1650,6 +1669,52 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch("DROP TABLE IF EXISTS channel_attachments;")?;
             set_version(&tx, 34)?;
+            tx.commit()?;
+        }
+
+        if version < 35 {
+            // Discover began from nothing on every open: a cold DHT walk across
+            // sixteen index shards with an empty list on screen until the
+            // slowest of them answered, which on a table that had just started
+            // warming meant the better part of a minute showing nothing. This
+            // remembers what the last walk turned up so the browse can open on
+            // it and replace the rows as fresh records land. Cache only — the
+            // DHT stays the authority, and a listing here is never treated as
+            // proof the room is still alive.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_index_cache (
+                    channel_id TEXT PRIMARY KEY,
+                    pubkey TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 35)?;
+            tx.commit()?;
+        }
+
+        if version < 36 {
+            // The author's own signature over a chat line, hex, empty when we
+            // do not have one.
+            //
+            // History sync used to re-encode a stored message under whatever
+            // `sender_pubkey` the row carried, which meant any member answering
+            // a catch-up request could invent a conversation and attribute it to
+            // anyone. Chat lines now carry an Ed25519 signature from their
+            // author, and a re-serve has to replay that original rather than
+            // mint a new one, so the signature has to survive in the row.
+            //
+            // Rows written before this are left empty and simply are not
+            // re-served; their text is still readable locally.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "author_sig",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 36)?;
             tx.commit()?;
         }
 
@@ -3865,6 +3930,66 @@ impl Database {
         Ok(rows)
     }
 
+    /// Remember what a Discover walk turned up.
+    ///
+    /// Upsert rather than replace-all, because a walk that lost a shard to a
+    /// timeout still knows everything the previous one did about the other
+    /// fifteen. Clearing the table each time would empty the cache precisely
+    /// when the network is least able to refill it.
+    pub fn cache_channel_listings(&self, rows: &[(String, String, String)]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO channel_index_cache (channel_id, pubkey, name, last_seen)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    pubkey = excluded.pubkey,
+                    name = excluded.name,
+                    last_seen = excluded.last_seen",
+            )?;
+            for (channel_id, pubkey, name) in rows {
+                stmt.execute(params![channel_id, pubkey, name, now])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM channel_index_cache WHERE last_seen < ?1",
+            params![now - CHANNEL_CACHE_MAX_AGE_SECS],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_index_cache WHERE channel_id NOT IN (
+                 SELECT channel_id FROM channel_index_cache
+                 ORDER BY last_seen DESC LIMIT ?1
+             )",
+            params![MAX_CHANNEL_CACHE_ROWS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rooms an earlier Discover walk found, most recently seen first.
+    pub fn list_cached_channels(&self) -> anyhow::Result<Vec<CachedChannel>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, pubkey, name FROM channel_index_cache
+             ORDER BY last_seen DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CachedChannel {
+                    channel_id: row.get(0)?,
+                    pubkey: row.get(1)?,
+                    name: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_channel(&self, channel_id: &str) -> anyhow::Result<Option<StoredChannel>> {
         let conn = self.conn.lock();
         Self::get_channel_locked(&conn, channel_id)
@@ -4498,6 +4623,11 @@ impl Database {
         let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
         for (id, sender, direction, message, timestamp, _read) in history.into_iter().rev() {
             let msg_id = format!("handoff-{old_channel_id}-{id}");
+            // No signature travels with a handoff copy. The author signed the
+            // line against the *old* room's id, so the original does not verify
+            // under the successor's, and re-signing here is the forgery the
+            // signature exists to prevent. The copy stays readable locally and
+            // is not re-served to anyone else.
             let _ = self.insert_channel_message(
                 successor_channel_id,
                 &sender,
@@ -4505,6 +4635,7 @@ impl Database {
                 &message,
                 &msg_id,
                 timestamp,
+                "",
             );
         }
         let _ = self.clear_handoff_pending(old_channel_id);
@@ -4832,6 +4963,11 @@ impl Database {
         Ok(rows)
     }
 
+    /// `author_sig` is the author's hex Ed25519 signature over the line, or
+    /// empty when we hold none — a locally copied handoff, or a row written
+    /// before signatures existed. Only a row that has one can be re-served to
+    /// another member, since a re-serve replays the original rather than
+    /// signing afresh.
     pub fn insert_channel_message(
         &self,
         channel_id: &str,
@@ -4840,6 +4976,7 @@ impl Database {
         message: &str,
         msg_id: &str,
         timestamp: i64,
+        author_sig: &str,
     ) -> anyhow::Result<i64> {
         const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
         const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
@@ -4860,8 +4997,8 @@ impl Database {
             chrono::Utc::now().timestamp()
         };
         tx.execute(
-            "INSERT INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 channel_id,
                 sender_pubkey,
@@ -4869,7 +5006,8 @@ impl Database {
                 CHAT_CIPHERTEXT_PREFIX,
                 now,
                 if direction == "sent" { 1 } else { 0 },
-                msg_id
+                msg_id,
+                author_sig
             ],
         )?;
         let new_id = tx.last_insert_rowid();
@@ -5072,20 +5210,25 @@ impl Database {
     }
 
     /// Recent decrypted messages for neighbor history catch-up.
-    /// Returns `(msg_id, sender_pubkey, body, timestamp)` oldest-first.
+    /// Returns `(msg_id, sender_pubkey, body, timestamp, author_sig)` oldest-first.
+    ///
+    /// Rows with no stored signature are skipped: a re-serve has to replay the
+    /// author's own signature, and this node cannot produce one on their behalf.
+    /// That is the point rather than a shortcoming — it is what stops a member
+    /// answering a catch-up with a conversation nobody had.
     pub fn list_channel_messages_for_sync(
         &self,
         channel_id: &str,
         since_ts: i64,
         limit: i64,
-    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, i64, String)>> {
         let limit = limit.clamp(1, 64);
-        let rows: Vec<(i64, String, String, String, String, i64)> = {
+        let rows: Vec<(i64, String, String, String, String, i64, String)> = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp
+                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig
                  FROM channel_messages
-                 WHERE channel_id = ?1 AND timestamp >= ?2
+                 WHERE channel_id = ?1 AND timestamp >= ?2 AND author_sig <> ''
                  ORDER BY timestamp ASC, id ASC
                  LIMIT ?3",
             )?;
@@ -5097,6 +5240,7 @@ impl Database {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
@@ -5105,11 +5249,11 @@ impl Database {
             return Ok(Vec::new());
         };
         let mut out = Vec::with_capacity(rows.len());
-        for (id, msg_id, sender, direction, stored, timestamp) in rows {
+        for (id, msg_id, sender, direction, stored, timestamp, author_sig) in rows {
             if let Ok(message) = Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
-                out.push((msg_id, sender, message, timestamp));
+                out.push((msg_id, sender, message, timestamp, author_sig));
             }
         }
         Ok(out)
@@ -6191,6 +6335,7 @@ mod tests {
                 "hello room",
                 &msg_id,
                 1_700_000_000,
+                &"cd".repeat(64),
             )
             .unwrap();
         let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
@@ -6360,7 +6505,7 @@ mod tests {
             .expect("insert channel");
         db.upsert_channel_member(&old_id, &"b2".repeat(32), "Them", 100)
             .unwrap();
-        db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100)
+        db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "")
             .unwrap();
 
         let seed = [0x44u8; 32];
@@ -6895,7 +7040,7 @@ mod tests {
         db.insert_channel(&old_id, &old_pk, "Lobby", "private", true, Some(&old_seed), Some(&join))
             .unwrap();
         let keep_id = "aa".repeat(16);
-        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10)
+        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10, "")
             .unwrap();
 
         assert!(db

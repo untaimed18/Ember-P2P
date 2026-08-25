@@ -125,8 +125,17 @@ export async function deleteChannelMessage(
   return invoke('delete_channel_message', { channelId, messageId });
 }
 
+/** Walk the public index. Each shard is also emitted on `ember:channels-found`
+ *  as it lands, so a caller can fill the list in rather than wait for the
+ *  slowest walk; the resolved value is still the complete set. */
 export async function gatherChannels(): Promise<GatheredChannelInfo[]> {
   return invoke('gather_channels');
+}
+
+/** What the last walk found, from the local cache and without touching the
+ *  network. Hints only — the walk that follows is what confirms them. */
+export async function cachedChannels(): Promise<GatheredChannelInfo[]> {
+  return invoke('cached_channels');
 }
 
 export async function updateChannelModeration(

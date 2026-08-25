@@ -35,6 +35,7 @@ const EPOCH_ENVELOPE_VERSION: u8 = 1;
 pub const EPOCH_ENVELOPE_LEN: usize = 1 + GOSSIP_NONCE_LEN + 32 + GOSSIP_TAG_LEN;
 const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
 const GOSSIP_AAD_DOMAIN: &[u8] = b"ember-channel-gossip-v1\0";
+const CHAT_SIG_DOMAIN: &[u8] = b"ember-channel-chat-author-v1\0";
 
 /// How many public-index shards Gather walks. Sized so each shard stays under
 /// the 300-records-per-key FIND_VALUE cap for longer.
@@ -664,7 +665,12 @@ pub struct ChannelGossip {
     pub ciphertext: Vec<u8>,
 }
 
-const CHAT_PLAIN_VERSION: u8 = 1;
+// 1 was chat before it carried the author's signature. A peer still sending it
+// cannot prove who wrote the line, which is exactly what the new frame exists
+// to establish, so the number is retired rather than accepted alongside: were
+// it still read, an impersonator would just send the old frame and the
+// signature would buy nothing.
+const CHAT_PLAIN_VERSION: u8 = 15;
 const MOD_ACTION_PLAIN_VERSION: u8 = 2;
 const SYNC_REQUEST_PLAIN_VERSION: u8 = 3;
 // 4, 5, and 8 belonged to the withdrawn broadcast-attachment path. Builds
@@ -687,23 +693,108 @@ const PRESENCE_EXTRA_AAD: &[u8] = b"ember-channel-presence-extra-v1\0";
 pub const PRESENCE_EXTRA_ENC_LEN: usize =
     1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN + 32 + 1 + PRESENCE_NICK_PAD;
 
-/// `version(1) || sender_pubkey(32) || utf8 text` inside a gossip body.
-pub fn encode_channel_chat_plain(sender_pubkey: &[u8; 32], text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + text.len());
-    out.push(CHAT_PLAIN_VERSION);
+/// What the author's signature covers.
+///
+/// The room binding is the point. Every member holds the content key, so the
+/// AEAD proves only that a line came from *somebody* in the room, and the
+/// `sender` beside it was until now an unauthenticated claim any member could
+/// fill in with another member's key. Signing the text alone would fix the
+/// author and leave the context forgeable: the same signed line could be
+/// replayed into a different room, or re-dated, or re-wrapped under a fresh
+/// `msg_id` to slip past the duplicate filter and repeat somebody's words back
+/// at the room. All four are therefore inside the preimage.
+fn chat_sig_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    sender_pubkey: &[u8; 32],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CHAT_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + text.len());
+    out.extend_from_slice(CHAT_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(sender_pubkey);
     out.extend_from_slice(text.as_bytes());
     out
 }
 
-pub fn decode_channel_chat_plain(bytes: &[u8]) -> Option<([u8; 32], String)> {
-    if bytes.len() < 33 || bytes[0] != CHAT_PLAIN_VERSION {
+/// The author's signature over a chat line.
+///
+/// A signature rather than the pairwise MAC transfers use, because chat is
+/// one-to-many and every member has to verify the same bytes. The 64 bytes are
+/// affordable here for the reason they were not on a transfer block: a chat
+/// line is nowhere near the unfragmented datagram budget.
+///
+/// Produced separately from the frame so a sender can keep it with its stored
+/// copy of the message and put byte-identical bytes on the wire, which is what
+/// lets the row be re-served on a catch-up later.
+pub fn chat_author_signature(
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    text: &str,
+) -> [u8; 64] {
+    crypto::sign(
+        signing_key,
+        &chat_sig_preimage(channel_id, msg_id, timestamp, sender_pubkey, text),
+    )
+}
+
+/// Rebuild a chat frame around a signature its author already made.
+///
+/// History catch-up re-serves lines somebody else wrote, and only they could
+/// have signed one. Replaying the original is what makes a re-serve worth
+/// trusting; minting a fresh signature here would be precisely the
+/// impersonation the frame exists to rule out.
+pub fn encode_channel_chat_plain_presigned(
+    sender_pubkey: &[u8; 32],
+    signature: &[u8; 64],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 64 + text.len());
+    out.push(CHAT_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(signature);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// Recover the author of a chat line, or nothing if it cannot be proved.
+///
+/// Returns `None` for an unsigned line as well as a badly signed one. Accepting
+/// unsigned chat would leave the forgery it exists to close wide open, since an
+/// impersonator would simply send the older frame; the version byte moved for
+/// the same reason, so a build that cannot sign is not silently trusted.
+///
+/// The signature comes back with the text so a receiver can keep it and re-serve
+/// the line later without being able to author one.
+pub fn decode_channel_chat_plain(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], String, [u8; 64])> {
+    if bytes.len() < 1 + 32 + 64 || bytes[0] != CHAT_PLAIN_VERSION {
         return None;
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&bytes[1..33]);
-    let text = std::str::from_utf8(&bytes[33..]).ok()?.to_string();
-    Some((pk, text))
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&bytes[33..97]);
+    let text = std::str::from_utf8(&bytes[97..]).ok()?.to_string();
+    let author = crypto::verifying_key_from_bytes(&pk)?;
+    if !crypto::verify(
+        &author,
+        &chat_sig_preimage(channel_id, msg_id, timestamp, &pk, &text),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((pk, text, sig))
 }
 
 /// Moderator gossip: `version(1) || sender(32) || action(1) || target(32)`.
@@ -1766,6 +1857,20 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    // One fixed room / message / time for the chat frames below. A signature
+    // only verifies against the context it was made for, so both ends of a
+    // test have to name the same one.
+    const CHAT_CHANNEL: [u8; 16] = [3u8; 16];
+    const CHAT_MSG_ID: [u8; 16] = [4u8; 16];
+    const CHAT_TS: i64 = 1_700_000_000;
+
+    /// A chat line signed by `sk` and bound to the fixed context above.
+    fn chat_frame(sk: &SigningKey, text: &str) -> Vec<u8> {
+        let pk = sk.verifying_key().to_bytes();
+        let sig = chat_author_signature(sk, &pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, text);
+        encode_channel_chat_plain_presigned(&pk, &sig, text)
+    }
+
     #[test]
     fn channel_id_matches_ember_node_id_derivation() {
         let ident = ChannelIdentity::generate();
@@ -1913,9 +2018,15 @@ mod tests {
             decoded.decrypt(&key).as_deref(),
             Some(b"hello room".as_slice())
         );
-        let (pk, text) =
-            decode_channel_chat_plain(&encode_channel_chat_plain(&[9u8; 32], "hi")).unwrap();
-        assert_eq!(pk, [9u8; 32]);
+        let author = SigningKey::generate(&mut OsRng);
+        let (pk, text, _sig) = decode_channel_chat_plain(
+            &chat_frame(&author, "hi"),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+        )
+        .unwrap();
+        assert_eq!(pk, author.verifying_key().to_bytes());
         assert_eq!(text, "hi");
         assert!(decoded.decrypt(&[8u8; 32]).is_none());
         let mut tampered = decoded.clone();
@@ -1931,7 +2042,78 @@ mod tests {
         assert_eq!(sender, [1u8; 32]);
         assert_eq!(target, [2u8; 32]);
         assert!(banned);
-        assert!(decode_channel_mod_action(&encode_channel_chat_plain(&[1u8; 32], "x")).is_none());
+        assert!(decode_channel_mod_action(&chat_frame(&author, "x")).is_none());
+    }
+
+    /// The forgery the signature exists to stop, and the three replays that
+    /// signing the text alone would have left open.
+    ///
+    /// Every member holds the room's content key, so Mallory can seal a line
+    /// that names Alice in its sender field and it will decrypt for everyone.
+    /// What she cannot do is produce Alice's signature over it.
+    #[test]
+    fn a_member_cannot_put_another_members_name_on_a_chat_line() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let mallory = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+
+        // Mallory signs with her own key and writes Alice's into the sender
+        // field — everything an impersonating member can actually do.
+        let mallory_sig = chat_author_signature(
+            &mallory,
+            &alice_pk,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            "I vouch for this download",
+        );
+        let forged = encode_channel_chat_plain_presigned(
+            &alice_pk,
+            &mallory_sig,
+            "I vouch for this download",
+        );
+        assert!(
+            decode_channel_chat_plain(&forged, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+            "a line signed by one member but naming another must not be attributed"
+        );
+
+        let genuine = chat_frame(&alice, "I vouch for this download");
+        let (pk, text, sig) =
+            decode_channel_chat_plain(&genuine, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).unwrap();
+        assert_eq!(pk, alice_pk);
+        assert_eq!(text, "I vouch for this download");
+
+        // The signature comes back out so a receiver can re-serve the line on a
+        // catch-up. Rebuilt from those parts alone it still verifies, which is
+        // what makes history sync possible without anyone signing for Alice.
+        let reserved = encode_channel_chat_plain_presigned(&pk, &sig, &text);
+        assert_eq!(reserved, genuine);
+
+        // The context is inside the preimage, so a genuine line cannot be
+        // lifted into another room, re-wrapped under a fresh id to get past the
+        // duplicate filter, or re-dated.
+        assert!(decode_channel_chat_plain(&genuine, &[9u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_chat_plain(&genuine, &CHAT_CHANNEL, &[9u8; 16], CHAT_TS).is_none());
+        assert!(
+            decode_channel_chat_plain(&genuine, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none()
+        );
+
+        let mut tampered = genuine.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        assert!(
+            decode_channel_chat_plain(&tampered, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none()
+        );
+
+        // The unsigned frame this replaced is refused outright. Reading it would
+        // hand an impersonator the whole forgery back for the cost of one byte.
+        let mut legacy = vec![1u8];
+        legacy.extend_from_slice(&alice_pk);
+        legacy.extend_from_slice(b"I vouch for this download");
+        assert!(
+            decode_channel_chat_plain(&legacy, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+            "the retired unsigned chat frame must not be trusted"
+        );
     }
 
     #[test]
@@ -2051,9 +2233,14 @@ mod tests {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_7E11);
         let key = content_key(&[7u8; 32]);
-        let channel_id = [3u8; 16];
-        let chat_plain = encode_channel_chat_plain(&[9u8; 32], "fuzz");
-        let well_chat = ChannelGossip::new_plaintext(channel_id, &key, 1, &chat_plain, 4).encode();
+        let channel_id = CHAT_CHANNEL;
+        let author = SigningKey::generate(&mut OsRng);
+        let chat_plain = chat_frame(&author, "fuzz");
+        // Sealed rather than `new_plaintext` so the envelope carries the same
+        // room, id and time the signature inside it was made over.
+        let well_chat =
+            ChannelGossip::sealed(channel_id, CHAT_MSG_ID, &key, 1, &chat_plain, 4, CHAT_TS)
+                .encode();
         let mod_plain = encode_channel_mod_action(&[1u8; 32], &[2u8; 32], true);
         let well_mod = ChannelGossip::new_plaintext(channel_id, &key, 2, &mod_plain, 4).encode();
         let mut decoded_ok = 0usize;
@@ -2077,18 +2264,29 @@ mod tests {
                 decoded_ok += 1;
                 let _ = decoded.decremented_ttl();
                 if let Some(plain) = decoded.decrypt(&key) {
-                    let _ = decode_channel_chat_plain(&plain);
+                    let _ = decode_channel_chat_plain(
+                        &plain,
+                        &decoded.channel_id,
+                        &decoded.msg_id,
+                        decoded.timestamp,
+                    );
                     let _ = decode_channel_mod_action(&plain);
                 }
             }
-            let _ = decode_channel_chat_plain(&buf);
+            let _ = decode_channel_chat_plain(&buf, &channel_id, &CHAT_MSG_ID, CHAT_TS);
             let _ = decode_channel_mod_action(&buf);
             let _ = decode_channel_sync_request(&buf);
             let _ = decode_presence_extra(Some(&key), &channel_id, &buf, "");
         }
         let chat = ChannelGossip::decode(&well_chat).unwrap();
-        let (pk, text) = decode_channel_chat_plain(&chat.decrypt(&key).unwrap()).unwrap();
-        assert_eq!(pk, [9u8; 32]);
+        let (pk, text, _sig) = decode_channel_chat_plain(
+            &chat.decrypt(&key).unwrap(),
+            &chat.channel_id,
+            &chat.msg_id,
+            chat.timestamp,
+        )
+        .unwrap();
+        assert_eq!(pk, author.verifying_key().to_bytes());
         assert_eq!(text, "fuzz");
         let mod_g = ChannelGossip::decode(&well_mod).unwrap();
         let (sender, target, banned) =
@@ -2234,7 +2432,8 @@ mod tests {
         let (pk, since) = decode_channel_sync_request(&plain).unwrap();
         assert_eq!(pk, [9u8; 32]);
         assert_eq!(since, 1_700_000_000);
-        assert!(decode_channel_sync_request(&encode_channel_chat_plain(&[9u8; 32], "x")).is_none());
+        let author = SigningKey::generate(&mut OsRng);
+        assert!(decode_channel_sync_request(&chat_frame(&author, "x")).is_none());
 
         let mut times = VecDeque::new();
         let t0 = Instant::now();
@@ -2691,7 +2890,8 @@ mod tests {
             assert!(xfer_frame_peek(&bytes).is_none());
         }
         // Chat and handoff frames are not mistaken for transfer frames either.
-        assert!(xfer_frame_peek(&encode_channel_chat_plain(&s, "hello there")).is_none());
+        let author = SigningKey::generate(&mut OsRng);
+        assert!(xfer_frame_peek(&chat_frame(&author, "hello there")).is_none());
         assert!(xfer_frame_peek(&encode_channel_sync_request(&s, 1)).is_none());
     }
 
