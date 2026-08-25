@@ -4557,7 +4557,7 @@ mod friend_transfer_tests {
             relay_offer_digest(&offer, now),
             relay_offer_digest(&offer, now + RELAY_OFFER_REFRESH_SECS)
         );
-        assert!(
+        const _: () = assert!(
             RELAY_OFFER_REFRESH_SECS < ember::RELAY_ATTESTATION_MAX_TTL_SECS,
             "a refresh must land before the friend's copy expires"
         );
@@ -7909,7 +7909,7 @@ mod tests {
             ember_maint_ping_budget(starved, starved),
             EMBER_MAINT_MAX_PINGS
         );
-        assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
+        const _: () = assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
     }
 
     /// The budget used to be one absolute rate for every table size, so a full
@@ -22046,14 +22046,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
 
-        if part_progress_task.is_none()
-            && part_progress_map.is_none()
-            && pending_incomplete_downloads.is_some()
+        if let Some(pending) = pending_incomplete_downloads
+            .as_ref()
+            .filter(|_| part_progress_task.is_none() && part_progress_map.is_none())
         {
             let dl_folder = settings.download_folder.clone();
-            let jobs: Vec<(String, u64, String)> = pending_incomplete_downloads
-                .as_ref()
-                .unwrap()
+            let jobs: Vec<(String, u64, String)> = pending
                 .iter()
                 .map(|t| (t.id.clone(), t.total_size, t.file_name.clone()))
                 .collect();

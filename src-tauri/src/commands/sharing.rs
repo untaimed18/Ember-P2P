@@ -909,7 +909,7 @@ async fn delete_file_with_retry(
     ))
 }
 
-fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<FileInfo> {
+fn resolve_from_known(files: &mut [FileInfo], known: &KnownFileList) -> Vec<FileInfo> {
     let mut needs_hashing = Vec::new();
     for file in files.iter_mut() {
         if let Some(record) = known.find_by_path_and_meta(&file.path, file.size, file.modified_at) {

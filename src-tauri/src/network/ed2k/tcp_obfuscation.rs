@@ -51,6 +51,11 @@ fn semi_random_not_protocol_marker() -> u8 {
     0x01
 }
 
+/// Returned once per handshake. The obfuscated arm is larger because it
+/// carries both RC4 states inline, which is exactly where the caller wants
+/// them — boxing would allocate per connection to save a move that happens
+/// once.
+#[allow(clippy::large_enum_variant)]
 pub enum NegotiationResult {
     Plain {
         first_byte: u8,

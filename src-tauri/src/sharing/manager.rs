@@ -450,9 +450,10 @@ impl TransferManager {
     fn queued_wait_status(transfer: &Transfer) -> TransferStatus {
         if transfer.direction == TransferDirection::Upload {
             TransferStatus::Active
-        } else if transfer.sources == 0 && transfer.queued_sources == 0 {
-            TransferStatus::Searching
-        } else if transfer.peer_id.is_empty() && transfer.sources == 0 {
+        // Nothing found at all, or nothing found and nobody to ask.
+        } else if (transfer.sources == 0 && transfer.queued_sources == 0)
+            || (transfer.peer_id.is_empty() && transfer.sources == 0)
+        {
             TransferStatus::Searching
         } else {
             TransferStatus::Queued

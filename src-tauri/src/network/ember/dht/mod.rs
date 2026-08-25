@@ -80,7 +80,7 @@ impl EmberNodeId {
         self.distance(other).leading_bit_index()
     }
 
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
 }

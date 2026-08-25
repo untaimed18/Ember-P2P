@@ -1773,8 +1773,8 @@ mod tests {
 
         // Our own frames still decode, and the range is coherent.
         assert!(decode_message(&encoded, true).is_ok());
-        assert!(EMBER_DHT_MIN_VERSION >= 1);
-        assert!(EMBER_DHT_MIN_VERSION <= EMBER_DHT_VERSION);
+        const _: () = assert!(EMBER_DHT_MIN_VERSION >= 1);
+        const _: () = assert!(EMBER_DHT_MIN_VERSION <= EMBER_DHT_VERSION);
         assert_eq!(unsupported_dht_version(&encoded), None);
         let mut newer = encoded.clone();
         newer[0] = EMBER_DHT_VERSION + 1;

@@ -1927,7 +1927,7 @@ mod tests {
             search.mark_failed_with(first, QueryFailure::NotSent),
             Some(peer.node_id)
         );
-        assert!(
+        const _: () = assert!(
             MAX_QUERY_ATTEMPTS > 1,
             "the point is that the node still had an attempt to spare"
         );

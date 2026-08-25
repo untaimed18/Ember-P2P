@@ -180,7 +180,7 @@ fn compute_all_part_hashes(
     let part_is_left = compute_part_is_left(num_parts);
     let mut part_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_parts);
     let mut offset = 0;
-    for p in 0..num_parts {
+    for (p, &is_left) in part_is_left.iter().enumerate() {
         let part_data_size = if p < num_parts - 1 {
             PARTSIZE
         } else {
@@ -197,7 +197,7 @@ fn compute_all_part_hashes(
         if part_leaves.len() == 1 {
             part_hashes.push(part_leaves[0]);
         } else {
-            part_hashes.push(build_tree_recursive(part_leaves, part_is_left[p]));
+            part_hashes.push(build_tree_recursive(part_leaves, is_left));
         }
         offset = end;
     }

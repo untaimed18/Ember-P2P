@@ -4148,7 +4148,9 @@ mod tests {
             accepted, MAX_PROXY_FORWARDS_IN_FLIGHT,
             "proxied work must never be able to take the whole publish driver"
         );
-        assert!(
+        // Const-evaluated so a change to either bound fails the build rather
+        // than waiting for this test to run.
+        const _: () = assert!(
             MAX_PROXY_FORWARDS_IN_FLIGHT * 2 < 128,
             "and the bound has to sit well under MAX_ACTIVE_PUBLISHES to mean anything"
         );

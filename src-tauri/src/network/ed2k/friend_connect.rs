@@ -924,6 +924,10 @@ pub async fn connect_friend_with_fallback(
     }
 }
 
+/// One per friend connection that had to fall back, chosen at setup and then
+/// held for the session. Boxing the larger arm to even the variants out would
+/// buy nothing: the value is moved once and read through thereafter.
+#[allow(clippy::large_enum_variant)]
 enum FallbackTransport {
     Punch(quinn::SendStream, quinn::RecvStream),
     Relay(crate::network::ember::relay::WsStream),

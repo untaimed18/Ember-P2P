@@ -2747,7 +2747,7 @@ mod tests {
             QUIC_ACCEPT_ORDINARY_CAP + QUIC_ACCEPT_RESERVED_FRIENDS,
             QUIC_ACCEPT_INFLIGHT_CAP
         );
-        assert!(QUIC_HANDSHAKE_OVERFLOW_CAP > 0);
+        const _: () = assert!(QUIC_HANDSHAKE_OVERFLOW_CAP > 0);
         assert_eq!(QUIC_PENDING_PER_IP, 4);
     }
 
