@@ -86,7 +86,9 @@ export const totalChannelUnread = derived(
   ([list, muted]) =>
     list.reduce(
       (sum, channel) =>
-        muted.includes(channel.channel_id) ? sum : sum + Math.max(0, channel.unread),
+        !channel.in_room || channel.deleted || muted.includes(channel.channel_id)
+          ? sum
+          : sum + Math.max(0, channel.unread),
       0,
     ),
 );
@@ -183,7 +185,7 @@ export function clearChannelUnread(channelId: string): void {
 export function bumpChannelUnread(channelId: string): void {
   if (get(activeChannelId) === channelId) return;
   channels.update((list) => {
-    if (!list.some((channel) => channel.channel_id === channelId)) {
+    if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
       return list;
     }
     return list.map((channel) =>
@@ -211,9 +213,9 @@ function maybeToastChannelMessage(channelId: string, message: string) {
   const prev = lastToastAt.get(channelId) ?? 0;
   if (now - prev < TOAST_GAP_MS) return;
   lastToastAt.set(channelId, now);
-  const name =
-    get(channels).find((channel) => channel.channel_id === channelId)?.name ??
-    m.nav_channels();
+  const row = get(channels).find((channel) => channel.channel_id === channelId);
+  if (row && (!row.in_room || row.deleted)) return;
+  const name = row?.name ?? m.nav_channels();
   const preview = previewText(message);
   if (!preview) return;
   toast(m.channels_message_toast({ name, preview }));

@@ -602,6 +602,16 @@
     if (new TextEncoder().encode(s.nickname).length > 128) {
       return { error: m.error_settings_nickname_too_long(), adjusted: false };
     }
+    if (s.channel_username.trim()) {
+      const trimmed = s.channel_username.trim();
+      if (trimmed.toLowerCase() === 'anonymous') {
+        return { error: m.error_channels_username_invalid(), adjusted: false };
+      }
+      const userBytes = new TextEncoder().encode(trimmed);
+      if (userBytes.length < 2 || userBytes.length > 32) {
+        return { error: m.error_channels_username_invalid(), adjusted: false };
+      }
+    }
     if (!s.download_folder.trim()) {
       return { error: m.settings_validation_folder_empty(), adjusted: false };
     }
@@ -1746,6 +1756,11 @@
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
             <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
+          </div>
+          <div class="field">
+            <label for="channel_username">{m.settings_channel_username_label()}</label>
+            <input id="channel_username" bind:value={settings.channel_username} maxlength="32" placeholder={m.settings_channel_username_placeholder()} />
+            <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
           <div class="divider"></div>
           <div class="field toggle-row">

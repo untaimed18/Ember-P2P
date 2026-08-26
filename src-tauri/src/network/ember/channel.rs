@@ -2,7 +2,8 @@
 //!
 //! A channel is an Ed25519 keypair minted at creation. Its stable address is
 //! `channel_id = BLAKE3(channel_pubkey)[..16]`, the same derivation used for
-//! Ember node IDs. Display names are not unique and cannot be squatted.
+//! Ember node IDs. Display names are a Rendezvous directory property
+//! (unique handles); the DHT identity remains the channel keypair.
 //!
 //! Index / presence / moderation records are published as
 //! [`super::dht::publish::RECORD_TYPE_CHANNEL`] signed records. Member IPs

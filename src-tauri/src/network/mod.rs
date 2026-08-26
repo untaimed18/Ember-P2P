@@ -12463,7 +12463,13 @@ async fn maybe_publish_channel_presence(
             return;
         }
     };
-    let nickname = crate::security::sanitize_display_name(&settings.nickname);
+    let nickname = {
+        let name = settings.channel_username.trim();
+        if name.is_empty() {
+            return;
+        }
+        name.to_string()
+    };
     let signing = ed25519_dalek::SigningKey::from_bytes(&identity.ed25519_secret_key);
     for channel_id_hex in due.into_iter().take(4) {
         let Some(ch) = db.get_channel(&channel_id_hex).ok().flatten() else {
@@ -12720,6 +12726,9 @@ fn collect_channel_neighbor_caps(
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
     let mut members_by_channel = Vec::new();
     for ch in db.list_channels()? {
+        if !ch.in_room_now() {
+            continue;
+        }
         let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
             continue;
         };
@@ -12859,6 +12868,9 @@ async fn maybe_refresh_channel_members(
     };
     let mut started = 0usize;
     for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
         if started >= CHANNEL_PRESENCE_FETCH_PER_TICK {
             break;
         }
@@ -12902,6 +12914,9 @@ async fn maybe_refresh_channel_moderation(
     };
     let mut started = 0usize;
     for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
         if started >= CHANNEL_MODERATION_FETCH_PER_TICK {
             break;
         }
@@ -13015,6 +13030,9 @@ async fn maybe_publish_owned_channel_records(
     };
     let mut started = 0usize;
     for ch in channels {
+        if ch.deleted {
+            continue;
+        }
         if started >= CHANNEL_MODERATION_PUBLISH_PER_TICK {
             break;
         }
@@ -13216,6 +13234,9 @@ async fn maybe_refresh_channel_key_epoch(
     let our_pk = identity.ed25519_public_key;
     let mut started = 0usize;
     for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
         if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
             break;
         }
@@ -13346,6 +13367,9 @@ async fn maybe_refresh_channel_handoff(
     };
     let mut started = 0usize;
     for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
         if started >= CHANNEL_HANDOFF_FETCH_PER_TICK {
             break;
         }
@@ -13602,6 +13626,9 @@ fn ingest_channel_presence_records(
     }
     let channel_id_hex = hex::encode(channel_id);
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    if !ch.in_room_now() {
         return false;
     };
     // A private room's presence extra is sealed under the content key, so a
@@ -14165,6 +14192,14 @@ async fn fanout_channel_gossip_retry(
         return;
     };
     let channel_id_hex = hex::encode(gossip.channel_id);
+    let in_room = db
+        .get_channel(&channel_id_hex)
+        .ok()
+        .flatten()
+        .is_some_and(|ch| ch.in_room_now());
+    if !in_room {
+        return;
+    }
     let members = channel_member_pubkeys(db, &channel_id_hex);
     let others: Vec<[u8; 32]> = members
         .iter()
@@ -14339,6 +14374,10 @@ async fn handle_inbound_channel_gossip(
         forget_channel_gossip(state, &gossip.msg_id);
         return;
     };
+    if !ch.in_room_now() {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
     // Decrypt may succeed under an older epoch; that key is only used to
     // *read*. Replies (history sync) are sealed under the current epoch so a
     // banned member who still holds a retired key cannot be handed new chat.
@@ -15552,6 +15591,9 @@ async fn maybe_sync_channel_history(
     let our_pk = state.local_ed25519_pubkey;
     let mut sent = 0usize;
     for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
         if sent >= 4 {
             break;
         }

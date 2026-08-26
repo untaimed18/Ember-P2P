@@ -31,6 +31,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+mod registry;
+
 const MAX_HTTP_CONNECTIONS: usize = 256;
 const RESERVED_HEALTH_CONNECTIONS: usize = 16;
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -158,6 +160,9 @@ const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
 const OP_PUNCH_REGISTER_V4: u8 = 0x23;
 const OP_PUNCH_POLL_V4: u8 = 0x24;
 const OP_PUNCH_ACK_V4: u8 = 0x25;
+const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
+const OP_CHANNEL_NAME_V4: u8 = 0x27;
+const OP_CHANNEL_DELETE_V4: u8 = 0x28;
 
 /// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
 const SIGNED_IP_V4: u8 = 4;
@@ -603,6 +608,83 @@ fn build_punch_ack_v4_msg(
     message.extend_from_slice(nonce);
     message.extend_from_slice(&ts.to_le_bytes());
     message
+}
+
+fn build_channel_username_v4_msg(pubkey: &[u8; 32], name: &str, ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + name.len() + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_USERNAME_V4);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_name_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    name: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + name.len() + 1 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_DELETE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn decode_hex_channel_id(s: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    if hex::decode_to_slice(s, &mut out).is_ok() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn channel_id_matches_pubkey(pubkey: &[u8; 32], channel_id: &[u8; 16]) -> bool {
+    let hash = blake3::hash(pubkey);
+    &hash.as_bytes()[..16] == channel_id.as_slice()
+}
+
+fn registry_error_status(err: registry::RegistryError) -> StatusCode {
+    match err {
+        registry::RegistryError::InvalidName => StatusCode::BAD_REQUEST,
+        registry::RegistryError::Taken => StatusCode::CONFLICT,
+        registry::RegistryError::Forbidden => StatusCode::FORBIDDEN,
+    }
+}
+
+fn load_channels_registry() -> Arc<RwLock<registry::ChannelRegistry>> {
+    match std::env::var("CHANNELS_REGISTRY_PATH") {
+        Ok(path) if !path.trim().is_empty() => {
+            info!("channels registry at {path}");
+            Arc::new(RwLock::new(registry::ChannelRegistry::load(
+                std::path::PathBuf::from(path),
+            )))
+        }
+        _ => {
+            warn!(
+                "CHANNELS_REGISTRY_PATH unset; channel usernames and names are in-memory only"
+            );
+            Arc::new(RwLock::new(registry::ChannelRegistry::in_memory()))
+        }
+    }
 }
 
 fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
@@ -1543,6 +1625,10 @@ struct AppState {
     /// one-time mutation cache used by offer/accept.
     status_read_nonces: Arc<RwLock<ScopedNonceCache<([u8; 32], [u8; 32])>>>,
     started_at: Instant,
+    /// Unique Channel usernames and room names. Persistence is a JSON file
+    /// when `CHANNELS_REGISTRY_PATH` is set; otherwise names live only in
+    /// this process and vanish on restart.
+    channels_registry: Arc<RwLock<registry::ChannelRegistry>>,
 }
 
 #[derive(Deserialize)]
@@ -2518,6 +2604,186 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         "domain": "ember-rdv-v4",
         "legacy_v3_rollout": true,
     }))
+}
+
+#[derive(Deserialize)]
+struct ChannelUsernameRequest {
+    pubkey: String,
+    name: String,
+    ts: i64,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct ChannelNameRequest {
+    channel_id: String,
+    pubkey: String,
+    name: String,
+    private: bool,
+    ts: i64,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct ChannelDeleteRequest {
+    channel_id: String,
+    pubkey: String,
+    ts: i64,
+    sig: String,
+}
+
+async fn claim_channel_username_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelUsernameRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Some(normalized) = registry::normalize_username(&body.name) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let (Some(pubkey), Some(sig)) = (
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_channel_username_v4_msg(&pubkey, &normalized, body.ts);
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) =
+        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    {
+        return status;
+    }
+    let mut registry = state.channels_registry.write().await;
+    match registry.claim_username(&hex::encode(pubkey), &normalized) {
+        Ok(()) => StatusCode::OK,
+        Err(err) => registry_error_status(err),
+    }
+}
+
+async fn claim_channel_name_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelNameRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Some(normalized) = registry::normalize_channel_name(&body.name) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let (Some(channel_id), Some(pubkey), Some(sig)) = (
+        decode_hex_channel_id(&body.channel_id),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !channel_id_matches_pubkey(&pubkey, &channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_channel_name_v4_msg(&channel_id, &pubkey, &normalized, body.private, body.ts);
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) =
+        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    {
+        return status;
+    }
+    let mut registry = state.channels_registry.write().await;
+    match registry.claim_channel_name(
+        &hex::encode(channel_id),
+        &hex::encode(pubkey),
+        &body.name,
+        body.private,
+    ) {
+        Ok(()) => StatusCode::OK,
+        Err(err) => registry_error_status(err),
+    }
+}
+
+async fn delete_channel_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelDeleteRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (Some(channel_id), Some(pubkey), Some(sig)) = (
+        decode_hex_channel_id(&body.channel_id),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !channel_id_matches_pubkey(&pubkey, &channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_channel_delete_v4_msg(&channel_id, &pubkey, body.ts);
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) =
+        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    {
+        return status;
+    }
+    let mut registry = state.channels_registry.write().await;
+    match registry.delete_channel(&hex::encode(channel_id), &hex::encode(pubkey)) {
+        Ok(()) => StatusCode::OK,
+        Err(err) => registry_error_status(err),
+    }
+}
+
+async fn channel_directory_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let registry = state.channels_registry.read().await;
+    Ok(Json(serde_json::json!({
+        "channels": registry.public_directory(),
+    })))
+}
+
+async fn channel_deleted_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let registry = state.channels_registry.read().await;
+    Ok(Json(serde_json::json!({
+        "ids": registry.deleted_ids(),
+    })))
 }
 
 async fn legacy_identity_lookup(
@@ -4443,6 +4709,7 @@ async fn main() {
         poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
         status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
         started_at: Instant::now(),
+        channels_registry: load_channels_registry(),
     };
 
     tokio::spawn(sweep_expired(state.clone()));
@@ -4469,6 +4736,11 @@ async fn main() {
         .route("/v4/punch/register", post(punch_register_v4))
         .route("/v4/punch/poll", post(punch_poll_v4))
         .route("/v4/punch/ack", post(punch_ack_v4))
+        .route("/v4/channels/username", post(claim_channel_username_v4))
+        .route("/v4/channels/name", post(claim_channel_name_v4))
+        .route("/v4/channels/delete", post(delete_channel_v4))
+        .route("/v4/channels/directory", get(channel_directory_v4))
+        .route("/v4/channels/deleted", get(channel_deleted_v4))
         .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
         .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
         .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
@@ -4669,6 +4941,7 @@ mod relay_ticket_tests {
             poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             started_at: Instant::now(),
+            channels_registry: Arc::new(RwLock::new(registry::ChannelRegistry::in_memory())),
         }
     }
 
@@ -5411,6 +5684,9 @@ mod relay_ticket_tests {
         assert_eq!(OP_PUNCH_REGISTER_V4, 0x23);
         assert_eq!(OP_PUNCH_POLL_V4, 0x24);
         assert_eq!(OP_PUNCH_ACK_V4, 0x25);
+        assert_eq!(OP_CHANNEL_USERNAME_V4, 0x26);
+        assert_eq!(OP_CHANNEL_NAME_V4, 0x27);
+        assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
     }
 
     #[test]
@@ -6508,5 +6784,244 @@ mod relay_ticket_tests {
         let error = timed.read_u8().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         client.await.unwrap();
+    }
+
+    fn test_channel_id(pubkey: &[u8; 32]) -> [u8; 16] {
+        let hash = blake3::hash(pubkey);
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash.as_bytes()[..16]);
+        id
+    }
+
+    #[tokio::test]
+    async fn channel_username_first_write_wins_over_http() {
+        let state = test_state();
+        let alice = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
+        let bob = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let bob_pk = bob.verifying_key().to_bytes();
+        let ts = now_unix_secs();
+        let signed = build_channel_username_v4_msg(&alice_pk, "ada", ts);
+        assert_eq!(
+            claim_channel_username_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(alice_pk),
+                    name: "Ada".to_string(),
+                    ts,
+                    sig: hex::encode(alice.sign(&signed).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let bob_signed = build_channel_username_v4_msg(&bob_pk, "ada", ts);
+        assert_eq!(
+            claim_channel_username_v4(
+                State(state.clone()),
+                ConnectInfo("2.2.2.2:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(bob_pk),
+                    name: "ada".to_string(),
+                    ts,
+                    sig: hex::encode(bob.sign(&bob_signed).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        let rename_ts = ts + 1;
+        let renamed = build_channel_username_v4_msg(&alice_pk, "ada lovelace", rename_ts);
+        assert_eq!(
+            claim_channel_username_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:1001".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(alice_pk),
+                    name: "Ada Lovelace".to_string(),
+                    ts: rename_ts,
+                    sig: hex::encode(alice.sign(&renamed).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let bob_retry = build_channel_username_v4_msg(&bob_pk, "ada", rename_ts);
+        assert_eq!(
+            claim_channel_username_v4(
+                State(state),
+                ConnectInfo("2.2.2.2:1001".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(bob_pk),
+                    name: "Ada".to_string(),
+                    ts: rename_ts,
+                    sig: hex::encode(bob.sign(&bob_retry).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_name_claim_delete_and_directory() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0xD4; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let other_pk = other.verifying_key().to_bytes();
+        let channel_id = test_channel_id(&owner_pk);
+        let other_id = test_channel_id(&other_pk);
+        let ts = now_unix_secs();
+        let addr = "8.8.8.8:1000".parse().unwrap();
+
+        let private_msg = build_channel_name_v4_msg(&channel_id, &owner_pk, "secret", true, ts);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Secret".to_string(),
+                    private: true,
+                    ts,
+                    sig: hex::encode(owner.sign(&private_msg).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let dir = channel_directory_v4(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("directory");
+        assert_eq!(dir.0["channels"].as_array().unwrap().len(), 0);
+
+        let taken = build_channel_name_v4_msg(&other_id, &other_pk, "secret", false, ts);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(other_id),
+                    pubkey: hex::encode(other_pk),
+                    name: "secret".to_string(),
+                    private: false,
+                    ts,
+                    sig: hex::encode(other.sign(&taken).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a taken name must not reveal that the room is private"
+        );
+
+        let public_id_key = ed25519_dalek::SigningKey::from_bytes(&[0xE5; 32]);
+        let public_pk = public_id_key.verifying_key().to_bytes();
+        let public_id = test_channel_id(&public_pk);
+        let public_msg = build_channel_name_v4_msg(&public_id, &public_pk, "lobby", false, ts);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(public_id),
+                    pubkey: hex::encode(public_pk),
+                    name: "Lobby".to_string(),
+                    private: false,
+                    ts,
+                    sig: hex::encode(public_id_key.sign(&public_msg).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let dir = channel_directory_v4(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("directory");
+        assert_eq!(dir.0["channels"].as_array().unwrap().len(), 1);
+
+        let forged = build_channel_delete_v4_msg(&public_id, &other_pk, ts);
+        assert_eq!(
+            delete_channel_v4(
+                State(state.clone()),
+                ConnectInfo("9.9.9.9:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelDeleteRequest {
+                    channel_id: hex::encode(public_id),
+                    pubkey: hex::encode(other_pk),
+                    ts,
+                    sig: hex::encode(other.sign(&forged).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        let delete_msg = build_channel_delete_v4_msg(&public_id, &public_pk, ts);
+        assert_eq!(
+            delete_channel_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelDeleteRequest {
+                    channel_id: hex::encode(public_id),
+                    pubkey: hex::encode(public_pk),
+                    ts,
+                    sig: hex::encode(public_id_key.sign(&delete_msg).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let gone = channel_deleted_v4(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("deleted");
+        let ids = gone.0["ids"].as_array().unwrap();
+        assert!(ids.iter().any(|v| v.as_str() == Some(&hex::encode(public_id))));
+
+        let reuse_key = ed25519_dalek::SigningKey::from_bytes(&[0xF6; 32]);
+        let reuse_pk = reuse_key.verifying_key().to_bytes();
+        let reuse_id = test_channel_id(&reuse_pk);
+        let reuse = build_channel_name_v4_msg(&reuse_id, &reuse_pk, "lobby", false, ts + 1);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(reuse_id),
+                    pubkey: hex::encode(reuse_pk),
+                    name: "Lobby".to_string(),
+                    private: false,
+                    ts: ts + 1,
+                    sig: hex::encode(reuse_key.sign(&reuse).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a deleted name must not be reclaimable"
+        );
     }
 }

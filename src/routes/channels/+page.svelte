@@ -8,7 +8,7 @@
   import ChatConversation from '$lib/components/ChatConversation.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
-  import { appSettings } from '$lib/stores/settings';
+  import { appSettings, loadAppSettings } from '$lib/stores/settings';
   import { copyToClipboard, formatRelativeTime } from '$lib/utils';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -20,6 +20,8 @@
     cancelChannelTransfer,
     channelMemberFriendCode,
     createChannel,
+    deleteOwnedChannel,
+    enterChannel,
     gatherChannels,
     getChannelInvite,
     joinChannel,
@@ -30,11 +32,13 @@
     removeChannelModerator,
     respondChannelTransfer,
     claimChannelOwnership,
+    claimChannelUsername,
     searchChannelMessages,
     setChannelSuccessorNominee,
     transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
+    type ChannelInfo,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
     type ChannelTransferInfo,
@@ -45,7 +49,6 @@
     activeChannelId,
     channels as channelsStore,
     clearChannelUnread,
-    forgetChannelMute,
     ignoredMembers,
     mutedChannels,
     refreshChannels,
@@ -56,7 +59,7 @@
     toggleMemberIgnore,
   } from '$lib/stores/channels';
 
-  let channelList = $derived($channelsStore);
+  let channelList = $derived($channelsStore.filter((c) => !c.deleted));
   let selectedId = $derived($activeChannelId);
   let members: ChannelMemberInfo[] = $state([]);
   let loading = $state(true);
@@ -67,6 +70,10 @@
   let joinUri = $state('');
   let error: string | null = $state(null);
   let leaveOpen = $state(false);
+  let deleteOpen = $state(false);
+  let leaveTargetId = $state<string | null>(null);
+  let usernameDraft = $state('');
+  let claimingUsername = $state(false);
   let editTopic = $state('');
   let editWelcome = $state('');
   let editingModeration = $state(false);
@@ -120,7 +127,10 @@
   let addingFriend = $state<string[]>([]);
 
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
-  let selected = $derived(channelList.find((c) => c.channel_id === selectedId) ?? null);
+  let selected = $derived(
+    channelList.find((c) => c.channel_id === selectedId && c.in_room) ?? null,
+  );
+  let needsUsername = $derived(!($appSettings?.channel_username ?? '').trim());
   let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
   /**
    * The one gate that has to serialise. Every owner moderation command —
@@ -171,10 +181,54 @@
       ]),
     ),
   );
+  let directoryList = $derived.by(() => {
+    const hidden = new Set(
+      $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
+    );
+    const byId = new Map<string, ChannelInfo>();
+    for (const ch of channelList) {
+      byId.set(ch.channel_id, ch);
+    }
+    for (const item of discovered) {
+      if (hidden.has(item.channel_id) || byId.has(item.channel_id)) continue;
+      byId.set(item.channel_id, {
+        channel_id: item.channel_id,
+        pubkey: item.pubkey,
+        name: item.name,
+        visibility: 'public',
+        is_owner: false,
+        topic: '',
+        welcome: '',
+        joined_at: 0,
+        last_active: 0,
+        member_count: 0,
+        unread: 0,
+        you_are_banned: false,
+        you_are_moderator: false,
+        successor_id: '',
+        predecessor_id: '',
+        successor_nominee: '',
+        claim_after_days: 0,
+        moderation_updated_at: 0,
+        can_claim: false,
+        key_behind: false,
+        owner_pubkey: '',
+        in_room: item.joined,
+        deleted: false,
+      });
+    }
+    return [...byId.values()];
+  });
+  let leaveTargetName = $derived(
+    directoryList.find((c) => c.channel_id === leaveTargetId)?.name
+      ?? channelList.find((c) => c.channel_id === leaveTargetId)?.name
+      ?? '',
+  );
   let visibleChannels = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
-    if (!q) return channelList;
-    return channelList.filter(
+    const list = directoryList;
+    if (!q) return list;
+    return list.filter(
       (ch) =>
         ch.name.toLowerCase().includes(q) ||
         ch.topic.toLowerCase().includes(q),
@@ -279,6 +333,10 @@
       membersOpen = false;
     }
     loadChannels();
+    void refreshDirectory(false);
+    const gatherTimer = setInterval(() => {
+      void refreshDirectory(false);
+    }, 60_000);
     let cancelled = false;
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
@@ -331,7 +389,6 @@
     // browse is actually running, so a dismissed list stays dismissed.
     let unlistenFound: UnlistenFn | undefined;
     listen<GatheredChannelInfo[]>('ember:channels-found', (event) => {
-      if (!discovering) return;
       const batch = event.payload ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
@@ -427,6 +484,7 @@
     return () => {
       cancelled = true;
       clearInterval(presenceTimer);
+      clearInterval(gatherTimer);
       for (const timer of xferClearTimers.values()) clearTimeout(timer);
       xferClearTimers.clear();
       unlistenMembers?.();
@@ -471,7 +529,7 @@
     try {
       await refreshChannels();
       const current = selectedId;
-      if (current && !$channelsStore.some((c) => c.channel_id === current)) {
+      if (current && !$channelsStore.some((c) => c.channel_id === current && c.in_room)) {
         activeChannelId.set(null);
         members = [];
       } else if (current) {
@@ -487,8 +545,11 @@
           editWelcome = ch?.welcome ?? '';
         }
         if (members.length === 0) await refreshMembers(current, true);
-      } else if ($channelsStore.length > 0 && !deepLinkJoin) {
-        const newest = $channelsStore.slice().sort((a, b) => b.last_active - a.last_active)[0];
+      } else if ($channelsStore.some((c) => c.in_room && !c.deleted) && !deepLinkJoin) {
+        const newest = $channelsStore
+          .filter((c) => c.in_room && !c.deleted)
+          .slice()
+          .sort((a, b) => b.last_active - a.last_active)[0];
         if (newest) await selectChannel(newest.channel_id);
       }
     } catch (e) {
@@ -512,11 +573,12 @@
   }
 
   async function selectChannel(id: string) {
+    const ch = $channelsStore.find((c) => c.channel_id === id);
+    if (!ch?.in_room) return;
     activeChannelId.set(id);
     members = [];
-    const ch = $channelsStore.find((c) => c.channel_id === id);
-    editTopic = ch?.topic ?? '';
-    editWelcome = ch?.welcome ?? '';
+    editTopic = ch.topic ?? '';
+    editWelcome = ch.welcome ?? '';
     editingModeration = false;
     roomInfoOpen = false;
     resetSearch();
@@ -570,6 +632,10 @@
 
   async function handleCreate() {
     if (creating) return;
+    if (needsUsername) {
+      composeMode = 'create';
+      return;
+    }
     error = null;
     creating = true;
     try {
@@ -603,6 +669,10 @@
    *  touch the invite box or close a form the user is still filling in, and
    *  each row gets its own in-flight slot so several can run at once. */
   async function handleJoin(uri = joinUri, discoveredId?: string) {
+    if (needsUsername) {
+      composeMode = composeMode ?? 'join';
+      return;
+    }
     if (discoveredId) {
       if (joiningIds.includes(discoveredId)) return;
       joiningIds = [...joiningIds, discoveredId];
@@ -619,7 +689,7 @@
         deepLinkJoin = false;
       }
       discovered = discovered.map((item) =>
-        item.channel_id === joined.channel_id ? { ...item, joined: true } : item,
+        item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       await refreshChannels();
       await selectChannel(joined.channel_id);
@@ -635,26 +705,26 @@
   }
 
   async function handleLeave() {
-    const id = selectedId;
+    const id = leaveTargetId;
     if (!id) return;
     try {
       await leaveChannel(id);
-      activeChannelId.set(null);
-      members = [];
+      if (selectedId === id) {
+        activeChannelId.set(null);
+        members = [];
+        resetSearch();
+      }
       transferSent = Object.fromEntries(
         Object.entries(transferSent).filter(([key]) => key !== id),
       );
-      forgetChannelMute(id);
       discovered = discovered.map((item) =>
         item.channel_id === id ? { ...item, joined: false } : item,
       );
-      resetSearch();
-      // `refreshChannels` rather than `loadChannels`: the latter would treat
-      // the now-empty selection as "nothing open yet" and drop the user
-      // straight into another room, which is not what leaving one means.
       await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      leaveTargetId = null;
     }
   }
 
@@ -672,14 +742,9 @@
     }
   }
 
-  async function handleDiscover() {
+  async function refreshDirectory(notifyEmpty: boolean) {
     discovering = true;
     try {
-      // Draw the last walk's rooms straight away so the browse is not blank
-      // while sixteen shards are being asked. `ember:channels-found` fills in
-      // each shard as it answers, and the walk's own result replaces the lot
-      // below, so a room that has since disappeared does not outlive the
-      // refresh that failed to find it.
       if (discovered.length === 0) {
         try {
           discovered = await cachedChannels();
@@ -689,21 +754,83 @@
       }
       const found = await gatherChannels();
       discovered = found;
-      // Counted from the walk, not the merged list: a cache hit must not make
-      // an empty network look like a populated one.
-      if (found.length === 0) {
+      await refreshChannels();
+      if (notifyEmpty && found.length === 0) {
         toastSuccess(m.channels_none_found());
       }
     } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      if (notifyEmpty) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       discovering = false;
     }
   }
 
-  async function joinDiscovered(item: GatheredChannelInfo) {
-    const uri = `ember-channel:${item.channel_id}?pk=${item.pubkey}&name=${encodeURIComponent(item.name)}`;
-    await handleJoin(uri, item.channel_id);
+  async function handleDiscover() {
+    await refreshDirectory(true);
+  }
+
+  async function joinCard(ch: ChannelInfo) {
+    if (needsUsername) {
+      composeMode = 'join';
+      return;
+    }
+    if (joiningIds.includes(ch.channel_id)) return;
+    joiningIds = [...joiningIds, ch.channel_id];
+    error = null;
+    try {
+      const local = $channelsStore.find(
+        (row) => row.channel_id === ch.channel_id && !row.deleted,
+      );
+      const joined = local
+        ? await enterChannel(ch.channel_id)
+        : await joinChannel(
+            `ember-channel:${ch.channel_id}?pk=${ch.pubkey}&name=${encodeURIComponent(ch.name)}`,
+          );
+      discovered = discovered.map((item) =>
+        item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
+      );
+      await refreshChannels();
+      await selectChannel(joined.channel_id);
+    } catch (e) {
+      error = translateError(e, m.error_operation_failed());
+    } finally {
+      joiningIds = joiningIds.filter((id) => id !== ch.channel_id);
+    }
+  }
+
+  function requestLeave(channelId: string) {
+    leaveTargetId = channelId;
+    leaveOpen = true;
+  }
+
+  async function handleDeleteOwned() {
+    const id = selectedId;
+    if (!id) return;
+    try {
+      await deleteOwnedChannel(id);
+      activeChannelId.set(null);
+      members = [];
+      discovered = discovered.filter((item) => item.channel_id !== id);
+      resetSearch();
+      await refreshChannels();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
+  async function handleClaimUsername() {
+    if (claimingUsername) return;
+    claimingUsername = true;
+    error = null;
+    try {
+      await claimChannelUsername(usernameDraft.trim());
+      usernameDraft = '';
+      await loadAppSettings();
+    } catch (e) {
+      error = translateError(e, m.error_operation_failed());
+    } finally {
+      claimingUsername = false;
+    }
   }
 
   async function handleSaveModeration() {
@@ -1019,11 +1146,11 @@
 <div class="page-header">
   <div class="header-title">
     <h2>{m.nav_channels()}</h2>
-    {#if channelList.length > 0}
+    {#if channelList.length > 0 || directoryList.length > 0}
       <span class="header-count">
-        {channelList.length === 1
+        {directoryList.length === 1
           ? m.channels_count_one()
-          : m.channels_count_other({ count: channelList.length })}
+          : m.channels_count_other({ count: directoryList.length })}
       </span>
     {/if}
   </div>
@@ -1070,7 +1197,30 @@
       {m.channels_disabled_body()}
     </div>
   {:else}
-    {#if composeMode === 'create'}
+    {#if needsUsername}
+      <form
+        class="add-form"
+        onsubmit={(e) => {
+          e.preventDefault();
+          handleClaimUsername();
+        }}
+      >
+        <p class="form-title">{m.channels_username_title()}</p>
+        <p class="form-hint">{m.channels_username_hint()}</p>
+        <div class="add-form-inner">
+          <input
+            bind:value={usernameDraft}
+            placeholder={m.channels_username_placeholder()}
+            maxlength="32"
+            aria-label={m.channels_username_placeholder()}
+            use:autoFocus
+          />
+          <button type="submit" disabled={usernameDraft.trim().length < 2 || claimingUsername}>
+            {m.channels_username_save()}
+          </button>
+        </div>
+      </form>
+    {:else if composeMode === 'create'}
       <form
         class="add-form"
         onsubmit={(e) => {
@@ -1115,48 +1265,12 @@
       </form>
     {/if}
 
-    {#if discovered.length > 0}
-      <div class="requests-section">
-        <div class="requests-header">
-          <span class="requests-title">{m.channels_discover()}</span>
-          <span class="requests-badge">{discovered.length}</span>
-          <button class="ghost requests-dismiss" onclick={() => (discovered = [])}>{m.common_dismiss()}</button>
-        </div>
-        <div class="requests-list">
-          {#each discovered as item (item.channel_id)}
-            <div class="request-card">
-              <div
-                class="chan-avatar"
-                style="--chan-hue: {channelHue(item.channel_id)}"
-                aria-hidden="true"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h16M4 12h10M4 17h16"/>
-                </svg>
-              </div>
-              <div class="request-info">
-                <span class="request-name"><bdi dir="auto">{item.name || shortId(item.channel_id)}</bdi></span>
-                <span class="request-hash">{item.joined ? m.channels_joined() : m.channels_public_badge()}</span>
-              </div>
-              <button
-                class="req-accept"
-                disabled={item.joined || joiningIds.includes(item.channel_id)}
-                onclick={() => joinDiscovered(item)}
-              >
-                {item.joined ? m.channels_joined() : m.channels_join()}
-              </button>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-
-    {#if loading && channelList.length === 0}
+    {#if loading && directoryList.length === 0}
       <div class="empty-state">
         <div class="spinner lg"></div>
         <p>{m.common_loading()}</p>
       </div>
-    {:else if channelList.length === 0}
+    {:else if directoryList.length === 0}
       <div class="empty-state">
         <div class="empty-icon">
           <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1187,7 +1301,7 @@
     {:else}
       <div class="workspace" class:members-open={membersOpen && !!selected}>
         <aside class="list-pane" class:hidden-when-chat={!!selected}>
-          {#if channelList.length > 5}
+          {#if directoryList.length > 5}
             <div class="search-wrap">
               <span class="search-icon">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
@@ -1217,49 +1331,69 @@
               <p class="muted list-empty">{m.channels_no_matches()}</p>
             {:else}
               {#each visibleChannels as ch (ch.channel_id)}
-                <button
+                <div
                   class="chan-row"
-                  class:active={ch.channel_id === selectedId}
-                  aria-current={ch.channel_id === selectedId ? 'true' : undefined}
-                  onclick={() => selectChannel(ch.channel_id)}
+                  class:active={ch.in_room && ch.channel_id === selectedId}
                 >
-                  <div
-                    class="chan-avatar"
-                    class:private={ch.visibility === 'private'}
-                    style="--chan-hue: {channelHue(ch.channel_id)}"
-                    aria-hidden="true"
+                  <button
+                    type="button"
+                    class="chan-row-main"
+                    aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
+                    onclick={() => selectChannel(ch.channel_id)}
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M4 7h16M4 12h10M4 17h16"/>
-                    </svg>
-                    {#if ch.visibility === 'private'}
-                      <span class="lock-dot">
-                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                          <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
-                          <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
-                        </svg>
-                      </span>
-                    {/if}
-                  </div>
-                  <span class="chan-identity">
-                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
-                    <span class="chan-sub">
-                      {#if ch.successor_id}
-                        {m.channels_transferred_badge()}
-                      {:else if ch.topic}
-                        <bdi dir="auto">{ch.topic}</bdi>
-                      {:else}
-                        {ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}
+                    <div
+                      class="chan-avatar"
+                      class:private={ch.visibility === 'private'}
+                      style="--chan-hue: {channelHue(ch.channel_id)}"
+                      aria-hidden="true"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 7h16M4 12h10M4 17h16"/>
+                      </svg>
+                      {#if ch.visibility === 'private'}
+                        <span class="lock-dot">
+                          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
+                            <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
+                          </svg>
+                        </span>
                       {/if}
+                    </div>
+                    <span class="chan-identity">
+                      <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                      <span class="chan-sub">
+                        {#if ch.successor_id}
+                          {m.channels_transferred_badge()}
+                        {:else if ch.topic}
+                          <bdi dir="auto">{ch.topic}</bdi>
+                        {:else}
+                          {ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}
+                        {/if}
+                      </span>
                     </span>
-                  </span>
-                  {#if ch.member_count > 0 && ch.unread === 0}
-                    <span class="chan-count" title={m.channels_members()}>{ch.member_count}</span>
+                    {#if ch.in_room && ch.member_count > 0 && ch.unread === 0}
+                      <span class="chan-count" title={m.channels_members()}>{ch.member_count}</span>
+                    {/if}
+                    {#if ch.in_room && ch.unread > 0}
+                      <span class="unread" class:silenced={$mutedChannels.includes(ch.channel_id)}>{ch.unread}</span>
+                    {/if}
+                  </button>
+                  {#if ch.in_room}
+                    <button
+                      type="button"
+                      class="ghost chan-door"
+                      disabled={joiningIds.includes(ch.channel_id)}
+                      onclick={() => requestLeave(ch.channel_id)}
+                    >{m.channels_leave()}</button>
+                  {:else}
+                    <button
+                      type="button"
+                      class="req-accept chan-door"
+                      disabled={joiningIds.includes(ch.channel_id) || needsUsername}
+                      onclick={() => joinCard(ch)}
+                    >{m.channels_join()}</button>
                   {/if}
-                  {#if ch.unread > 0}
-                    <span class="unread" class:silenced={$mutedChannels.includes(ch.channel_id)}>{ch.unread}</span>
-                  {/if}
-                </button>
+                </div>
               {/each}
             {/if}
           </div>
@@ -1371,7 +1505,10 @@
                   </svg>
                 </button>
                 <button class="ghost" onclick={handleCopyInvite}>{m.channels_invite()}</button>
-                <button class="ghost danger" onclick={() => (leaveOpen = true)}>{m.channels_leave()}</button>
+                <button class="ghost danger" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
+                {#if selected.is_owner}
+                  <button class="ghost danger" onclick={() => (deleteOpen = true)}>{m.channels_delete()}</button>
+                {/if}
               </div>
             </header>
             {#if selected.welcome.trim()}
@@ -1574,7 +1711,7 @@
                 youAreKeyBehind={selectedKeyBehind}
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMembers}
-                mentionName={$appSettings?.nickname ?? ''}
+                mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
               />
             </div>
           {/if}
@@ -1738,7 +1875,7 @@
 <ConfirmDialog
   bind:open={leaveOpen}
   title={m.channels_leave_confirm()}
-  message={m.channels_leave_confirm_body({ name: selected?.name ?? '' })}
+  message={m.channels_leave_confirm_body({ name: leaveTargetName })}
   confirmLabel={m.channels_leave()}
   danger
   onconfirm={handleLeave}
@@ -1753,6 +1890,15 @@
   confirmLabel={m.channels_transfer_ownership()}
   danger
   onconfirm={handleTransfer}
+/>
+
+<ConfirmDialog
+  bind:open={deleteOpen}
+  title={m.channels_delete_confirm()}
+  message={m.channels_delete_confirm_body({ name: selected?.name ?? '' })}
+  confirmLabel={m.channels_delete()}
+  danger
+  onconfirm={handleDeleteOwned}
 />
 
 <style>
@@ -2091,18 +2237,42 @@
 
   .list-empty { padding: 16px 10px; text-align: center; font-size: 12px; }
 
+  .form-hint {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
   .chan-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     width: 100%;
     text-align: left;
-    padding: 8px 10px;
+    padding: 4px 6px 4px 4px;
     border: 0;
     background: transparent;
     color: inherit;
     border-radius: var(--radius-md);
+  }
+
+  .chan-row-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    padding: 6px 4px;
+    border: 0;
+    background: transparent;
+    color: inherit;
     cursor: pointer;
+  }
+
+  .chan-door {
+    flex-shrink: 0;
+    font-size: 12px;
   }
 
   .chan-row:hover { background: var(--bg-hover); }

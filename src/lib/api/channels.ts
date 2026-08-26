@@ -26,6 +26,10 @@ export interface ChannelInfo {
   key_behind: boolean;
   /** Owner's user pubkey, empty until a signed moderation record naming them arrives. */
   owner_pubkey: string;
+  /** This device is currently inside the room. */
+  in_room: boolean;
+  /** Owner has permanently deleted this room. */
+  deleted: boolean;
 }
 
 export interface ChannelMemberInfo {
@@ -73,8 +77,20 @@ export async function joinChannel(uri: string): Promise<ChannelInfo> {
   return invoke('join_channel', { uri });
 }
 
+export async function enterChannel(channelId: string): Promise<ChannelInfo> {
+  return invoke('enter_channel', { channelId });
+}
+
 export async function leaveChannel(channelId: string): Promise<void> {
   return invoke('leave_channel', { channelId });
+}
+
+export async function claimChannelUsername(name: string): Promise<string> {
+  return invoke('claim_channel_username', { name });
+}
+
+export async function deleteOwnedChannel(channelId: string): Promise<void> {
+  return invoke('delete_owned_channel', { channelId });
 }
 
 export async function getChannelInvite(channelId: string): Promise<ChannelInviteInfo> {

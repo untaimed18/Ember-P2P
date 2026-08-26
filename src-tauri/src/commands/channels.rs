@@ -58,6 +58,10 @@ pub struct ChannelInfo {
     /// record naming them has been applied. Used so the roster can hide Ban
     /// on the owner rather than only refusing it on the wire.
     pub owner_pubkey: String,
+    /// This device is currently inside the room.
+    pub in_room: bool,
+    /// Owner has permanently deleted this room.
+    pub deleted: bool,
 }
 
 impl ChannelInfo {
@@ -86,6 +90,8 @@ impl ChannelInfo {
             successor_id: row.successor_id,
             predecessor_id: row.predecessor_id,
             owner_pubkey: row.owner_pubkey,
+            in_room: row.in_room,
+            deleted: row.deleted,
         }
     }
 
@@ -189,6 +195,122 @@ fn sanitize_channel_name(name: &str) -> Result<String, String> {
         ));
     }
     Ok(cleaned)
+}
+
+const CHANNEL_USERNAME_MIN: usize = 2;
+const CHANNEL_USERNAME_MAX: usize = 32;
+
+/// Strip controls, reject empty/Anonymous, cap at 32 bytes. Returns the
+/// display form (original case) and the lowercase claim key.
+pub(crate) fn sanitize_channel_username(name: &str) -> Result<String, String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| {
+            !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c)
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.len() < CHANNEL_USERNAME_MIN
+        || cleaned.eq_ignore_ascii_case("anonymous")
+    {
+        return Err(coded(
+            "channels_username_invalid",
+            "Channel username must be between 2 and 32 bytes",
+        ));
+    }
+    if cleaned.len() > CHANNEL_USERNAME_MAX {
+        return Err(coded(
+            "channels_username_invalid",
+            "Channel username must be between 2 and 32 bytes",
+        ));
+    }
+    Ok(cleaned)
+}
+
+fn username_claim_key(display: &str) -> String {
+    display.to_lowercase()
+}
+
+fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, taken: &'static str) -> String {
+    match err {
+        crate::network::rendezvous::ChannelRegistryError::Taken => coded(
+            taken,
+            "That name is already taken",
+        ),
+        crate::network::rendezvous::ChannelRegistryError::Forbidden => coded(
+            "channels_delete_forbidden",
+            "Only the channel owner can delete this room",
+        ),
+        crate::network::rendezvous::ChannelRegistryError::Invalid => coded(
+            "channels_name_invalid",
+            "Channel name must not be empty",
+        ),
+        crate::network::rendezvous::ChannelRegistryError::Unavailable => coded(
+            "channels_registry_unavailable",
+            "The name registry is unreachable; try again when online",
+        ),
+    }
+}
+
+async fn rendezvous_url(state: &AppState) -> String {
+    state.config.read().await.settings.rendezvous_url.clone()
+}
+
+async fn require_channel_username(state: &AppState) -> Result<String, String> {
+    let name = state.config.read().await.settings.channel_username.clone();
+    if name.trim().is_empty() {
+        return Err(coded(
+            "channels_username_required",
+            "Choose a Channel username before creating or joining a room",
+        ));
+    }
+    sanitize_channel_username(&name)
+}
+
+async fn persist_channel_username(state: &AppState, username: &str) -> Result<(), String> {
+    let _guard = state.settings_save_lock.lock().await;
+    let (new_settings, save_data) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        new_settings.channel_username = username.to_string();
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?;
+        (new_settings, data)
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+    .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    state.config.write().await.settings = new_settings;
+    Ok(())
+}
+
+/// Claim `username` on Rendezvous and return the stored display form.
+pub(crate) async fn claim_username_on_registry(
+    state: &AppState,
+    username: &str,
+) -> Result<String, String> {
+    let display = sanitize_channel_username(username)?;
+    let key = username_claim_key(&display);
+    let url = rendezvous_url(state).await;
+    crate::network::rendezvous::claim_channel_username(
+        &url,
+        &state.identity.ed25519_public_key,
+        &state.identity.ed25519_secret_key,
+        &key,
+    )
+    .await
+    .map_err(|e| registry_fail(e, "channels_username_taken"))?;
+    Ok(display)
 }
 
 fn sanitize_topic(topic: &str) -> Result<String, String> {
@@ -327,6 +449,8 @@ pub async fn create_channel(
         ));
     }
     let name = sanitize_channel_name(&name)?;
+    let username = require_channel_username(&state).await?;
+    let username = claim_username_on_registry(&state, &username).await?;
     let ident = ChannelIdentity::generate();
     let join_secret = if private {
         channel::generate_private_join_secret()
@@ -340,7 +464,9 @@ pub async fn create_channel(
     };
     let channel_id_hex = hex::encode(ident.channel_id);
     let pubkey_hex = hex::encode(ident.pubkey);
-    let seed = ident.seed();
+    let url = rendezvous_url(&state).await;
+    let channel_seed = ident.seed();
+    let seed = channel_seed;
     let db = state.db.clone();
     let db_id = channel_id_hex.clone();
     let db_pk = pubkey_hex.clone();
@@ -360,13 +486,31 @@ pub async fn create_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_create_failed", "Failed to create channel", e))?;
 
-    let nickname = {
-        let cfg = state.config.read().await;
-        crate::security::sanitize_display_name(&cfg.settings.nickname)
-    };
+    if let Err(e) = crate::network::rendezvous::claim_channel_name(
+        &url,
+        &ident.channel_id,
+        &ident.pubkey,
+        &channel_seed,
+        &name,
+        private,
+    )
+    .await
+    {
+        discard_partial_channel(&state, &channel_id_hex).await;
+        return Err(registry_fail(e, "channels_name_taken"));
+    }
+
+    let nickname = username;
     if let Err(e) =
         record_self_member(&state, &channel_id_hex, &nickname, "channels_create_failed").await
     {
+        let _ = crate::network::rendezvous::delete_channel_registry(
+            &url,
+            &ident.channel_id,
+            &ident.pubkey,
+            &channel_seed,
+        )
+        .await;
         discard_partial_channel(&state, &channel_id_hex).await;
         return Err(e);
     }
@@ -471,6 +615,7 @@ pub async fn join_channel(
             "Chat history is locked; restore the key file to join a channel",
         ));
     }
+    let username = require_channel_username(&state).await?;
     let invite = ChannelInvite::parse(&uri).ok_or_else(|| {
         coded(
             "channels_invite_invalid",
@@ -486,32 +631,38 @@ pub async fn join_channel(
         })
     };
     let channel_id_hex = hex::encode(invite.channel_id);
+    refuse_deleted_channel(&state, &channel_id_hex).await?;
+
+    let db = state.db.clone();
+    let existing = tokio::task::spawn_blocking({
+        let db = db.clone();
+        let id = channel_id_hex.clone();
+        move || db.get_channel(&id)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
+    if let Some(row) = existing {
+        if row.deleted {
+            return Err(coded(
+                "channels_deleted",
+                "This channel has been deleted",
+            ));
+        }
+        return enter_stored_channel(&state, &channel_id_hex, &username).await;
+    }
+
+    let username = claim_username_on_registry(&state, &username).await?;
+
     let pubkey_hex = hex::encode(invite.pubkey);
     let visibility = if invite.private {
         CHANNEL_KIND_PRIVATE
     } else {
         CHANNEL_KIND_PUBLIC
     };
-    let db = state.db.clone();
-    let db_id = channel_id_hex.clone();
-    if tokio::task::spawn_blocking({
-        let db = db.clone();
-        let id = db_id.clone();
-        move || db.get_channel(&id)
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?
-    .is_some()
-    {
-        return Err(coded(
-            "channels_already_joined",
-            "You have already joined this channel",
-        ));
-    }
-
     let join_secret = invite.join_secret;
     let private = invite.private;
+    let db_id = channel_id_hex.clone();
     tokio::task::spawn_blocking({
         let db = db.clone();
         let id = db_id.clone();
@@ -533,10 +684,6 @@ pub async fn join_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
 
-    // Record which epoch the invite's secret belongs to. Otherwise the room
-    // reports an epoch we hold no record of, and we would both warn the user
-    // their working invite is stale and poll forever for a key the owner never
-    // minted for us — we were not a member when it rotated.
     if private && invite.key_epoch > 0 {
         let db = db.clone();
         let id = db_id.clone();
@@ -547,23 +694,154 @@ pub async fn join_channel(
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .and_then(|r| r)
         {
-            // Not fatal: the secret is already stored as the join secret, so the
-            // room is readable either way.
             tracing::warn!(channel_id = %db_id, error = %e, "could not record the invite's epoch");
         }
     }
 
-    let nickname = {
-        let cfg = state.config.read().await;
-        crate::security::sanitize_display_name(&cfg.settings.nickname)
-    };
-    if let Err(e) = record_self_member(&state, &db_id, &nickname, "channels_join_failed").await {
+    if let Err(e) = record_self_member(&state, &db_id, &username, "channels_join_failed").await {
         discard_partial_channel(&state, &db_id).await;
         return Err(e);
     }
 
+    publish_join_presence(&state, &invite, &username).await;
+    let db = state.db.clone();
+    let row = tokio::task::spawn_blocking(move || db.get_channel(&db_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?
+        .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    Ok(ChannelInfo::from_stored(row, false, false))
+}
+
+/// Re-enter a room this device already has a row for, without an invite URI.
+#[tauri::command]
+pub async fn enter_channel(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to join a channel",
+        ));
+    }
+    let username = require_channel_username(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    refuse_deleted_channel(&state, &channel_id).await?;
+    enter_stored_channel(&state, &channel_id, &username).await
+}
+
+async fn refuse_deleted_channel(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(), String> {
+    let url = rendezvous_url(state).await;
+    match crate::network::rendezvous::fetch_deleted_channel_ids(&url).await {
+        Ok(ids) if ids.iter().any(|id| id.eq_ignore_ascii_case(channel_id)) => {
+            Err(coded(
+                "channels_deleted",
+                "This channel has been deleted",
+            ))
+        }
+        Ok(_) => Ok(()),
+        // Tombstones are a directory hint, not uniqueness. A private invite
+        // must still work when Rendezvous is unreachable.
+        Err(_) => Ok(()),
+    }
+}
+
+async fn enter_stored_channel(
+    state: &AppState,
+    channel_id: &str,
+    username: &str,
+) -> Result<ChannelInfo, String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let row = tokio::task::spawn_blocking({
+        let db = db.clone();
+        let id = id.clone();
+        move || {
+            let row = db.get_channel(&id)?;
+            if let Some(ref row) = row {
+                if row.deleted {
+                    return Err(anyhow::anyhow!("deleted"));
+                }
+                db.set_channel_in_room(&id, true)?;
+            }
+            Ok::<_, anyhow::Error>(row)
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| {
+        if e.to_string().contains("deleted") {
+            coded("channels_deleted", "This channel has been deleted")
+        } else {
+            coded_ctx("channels_join_failed", "Failed to join channel", e)
+        }
+    })?
+    .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+
+    if let Err(e) = record_self_member(state, channel_id, username, "channels_join_failed").await {
+        let db = state.db.clone();
+        let id = channel_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || db.set_channel_in_room(&id, false)).await;
+        return Err(e);
+    }
+    let Ok(id_bytes) = hex::decode(&row.channel_id) else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    let Ok(channel_id_bytes) = <[u8; 16]>::try_from(id_bytes) else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    let Ok(pk_bytes) = hex::decode(&row.pubkey) else {
+        return Err(coded("channels_invite_invalid", "Stored channel pubkey is invalid"));
+    };
+    let Ok(pubkey) = <[u8; 32]>::try_from(pk_bytes) else {
+        return Err(coded("channels_invite_invalid", "Stored channel pubkey is invalid"));
+    };
+    let private = row.visibility == CHANNEL_KIND_PRIVATE;
+    let join_secret = join_secret_for_channel(state, &row).await.unwrap_or_else(|| {
+        if private {
+            [0u8; 32]
+        } else {
+            channel::public_join_secret(&pubkey)
+        }
+    });
+    if private && join_secret == [0u8; 32] {
+        return Err(coded(
+            "channels_join_failed",
+            "This private channel has no join secret on this device",
+        ));
+    }
+    let invite = ChannelInvite {
+        channel_id: channel_id_bytes,
+        pubkey,
+        name: row.name.clone(),
+        join_secret,
+        private,
+        key_epoch: row.key_epoch.max(0) as u64,
+    };
+    publish_join_presence(state, &invite, username).await;
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    let refreshed = tokio::task::spawn_blocking(move || {
+        let row = db.get_channel(&id)?.ok_or_else(|| anyhow::anyhow!("missing"))?;
+        let banned = !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
+        let moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
+        Ok::<_, anyhow::Error>(ChannelInfo::from_stored(row, banned, moderator))
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
+    Ok(refreshed)
+}
+
+async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, username: &str) {
     let presence = SignedRecord::channel_presence(
-        &nickname,
+        username,
         invite.channel_id,
         invite.pubkey,
         &invite.join_secret,
@@ -572,25 +850,12 @@ pub async fn join_channel(
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
-    let _ = publish_signed_record(&state, presence).await;
-    // Publishing tells the room we are here; it does not tell us who else is.
-    // Only the roster walk does that, and until it lands there is nobody to
-    // gossip to, so chat cannot leave this node either. Asking for it now
-    // rather than at the next maintenance tick is the difference between a
-    // room that works on arrival and one that looks empty for a minute.
+    let _ = publish_signed_record(state, presence).await;
     let _ = state
         .network_tx
         .try_send(NetworkCommand::RefreshChannelMembers {
             channel_id: invite.channel_id,
         });
-
-    let db = state.db.clone();
-    let row = tokio::task::spawn_blocking(move || db.get_channel(&db_id))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?
-        .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
-    Ok(ChannelInfo::from_stored(row, false, false))
 }
 
 #[tauri::command]
@@ -601,21 +866,60 @@ pub async fn leave_channel(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let db = state.db.clone();
-    let our_pk = hex::encode(state.identity.ed25519_public_key);
-    let delete_id = channel_id.clone();
-    let removed = tokio::task::spawn_blocking(move || {
-        db.delete_channel(&delete_id, Some(&our_pk))
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
-    if !removed {
+    let leave_id = channel_id.clone();
+    let left = tokio::task::spawn_blocking(move || db.set_channel_in_room(&leave_id, false))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
+    if !left {
         return Err(coded("channels_not_found", "Channel not found"));
     }
-    // Transfers belong to the room. Leaving takes the content key with it, so
-    // anything still in flight can neither continue nor be cancelled on the
-    // wire — drop it now rather than leaving the UI a row that only clears
-    // when it eventually times out.
+    if let Ok(bytes) = hex::decode(&channel_id) {
+        if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::DropChannelTransfers { channel_id: id });
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn claim_channel_username(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<String, String> {
+    let display = claim_username_on_registry(&state, &name).await?;
+    persist_channel_username(&state, &display).await?;
+    Ok(display)
+}
+
+/// Owner-only permanent delete: tombstone the name on Rendezvous and walk
+/// this device out. Moderators cannot call this.
+#[tauri::command]
+pub async fn delete_owned_channel(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    let url = rendezvous_url(&state).await;
+    let channel_seed = owned.ident.seed();
+    crate::network::rendezvous::delete_channel_registry(
+        &url,
+        &owned.ident.channel_id,
+        &owned.ident.pubkey,
+        &channel_seed,
+    )
+    .await
+    .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    tokio::task::spawn_blocking(move || db.tombstone_channel(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
             let _ = state
@@ -850,6 +1154,12 @@ pub async fn send_channel_message(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    if !row.in_room_now() {
+        return Err(coded(
+            "channels_not_in_room",
+            "Join this channel before sending",
+        ));
+    }
     let sender = hex::encode(state.identity.ed25519_public_key);
     if self_banned_from(&state, &row, "channels_send_failed").await? {
         return Err(coded(
@@ -1190,11 +1500,18 @@ async fn load_joined_channel(
 ) -> Result<StoredChannel, String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
-    tokio::task::spawn_blocking(move || db.get_channel(&id))
+    let row = tokio::task::spawn_blocking(move || db.get_channel(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?
-        .ok_or_else(|| coded("channels_not_found", "Channel not found"))
+        .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    if !row.in_room_now() {
+        return Err(coded(
+            "channels_not_in_room",
+            "Join this channel first",
+        ));
+    }
+    Ok(row)
 }
 
 /// Whether *we* are barred from taking part in this room.
@@ -2024,6 +2341,13 @@ fn listings_from_blobs(
     out
 }
 
+fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
+    rows.iter()
+        .filter(|c| c.in_room_now())
+        .map(|c| c.channel_id.clone())
+        .collect()
+}
+
 /// Walk the 16 public-index shards and return unique channel listings.
 ///
 /// Each shard is emitted on `ember:channels-found` the moment it lands, so a
@@ -2040,22 +2364,29 @@ pub async fn gather_channels(
 
     require_ember(&state).await?;
     let db = state.db.clone();
-    let joined = tokio::task::spawn_blocking(move || db.list_channels())
+    let local = tokio::task::spawn_blocking(move || db.list_channels())
         .await
         .ok()
         .and_then(|r| r.ok())
         .unwrap_or_default();
-    let joined_ids: std::collections::HashSet<_> =
-        joined.into_iter().map(|c| c.channel_id).collect();
+    let joined_ids = inside_ids(&local);
 
-    // One walk per shard, and never a batch. A `FIND_VALUE` converges on the
-    // single point in the ID space named by its first key; the rest are an AND
-    // filter for multi-word search, and the searcher drops any record whose
-    // embedded key is not the primary. Batching the shards into requests of
-    // `MAX_FIND_VALUE_KEYS` therefore walked toward shard 0 and shard 8 and
-    // discarded the other fourteen, so most public rooms could never be found.
-    // The walks run together because they are independent and a browse that
-    // ran them in series would cost sixteen timeouts.
+    let url = rendezvous_url(&state).await;
+    let (directory, deleted) = tokio::join!(
+        crate::network::rendezvous::fetch_channel_directory(&url),
+        crate::network::rendezvous::fetch_deleted_channel_ids(&url),
+    );
+    let deleted: std::collections::HashSet<String> = deleted
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    if !deleted.is_empty() {
+        let db = state.db.clone();
+        let ids: Vec<String> = deleted.iter().cloned().collect();
+        let _ = tokio::task::spawn_blocking(move || db.walk_out_deleted_channels(&ids)).await;
+    }
+
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
         .into_iter()
         .map(|key| find_raw_keys(&state, vec![key]))
@@ -2063,10 +2394,30 @@ pub async fn gather_channels(
 
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<GatheredChannelInfo> = Vec::new();
-    // A shard that errors or times out is skipped rather than failing the
-    // browse: fifteen shards of listings beat none.
+    for listing in directory.unwrap_or_default() {
+        let id = listing.channel_id.to_ascii_lowercase();
+        if deleted.contains(&id) || listing.pubkey.len() != 64 {
+            continue;
+        }
+        seen.insert(id.clone());
+        out.push(GatheredChannelInfo {
+            joined: joined_ids.contains(&id),
+            channel_id: id,
+            pubkey: listing.pubkey.to_ascii_lowercase(),
+            name: listing.name,
+            private: false,
+        });
+    }
+    if !out.is_empty() {
+        let _ = app.emit("ember:channels-found", &out);
+    }
+
     while let Some(shard) = walks.next().await {
         let found = listings_from_blobs(shard.unwrap_or_default(), &joined_ids, &mut seen);
+        let found: Vec<_> = found
+            .into_iter()
+            .filter(|c| !deleted.contains(&c.channel_id))
+            .collect();
         if found.is_empty() {
             continue;
         }
@@ -2105,10 +2456,15 @@ pub async fn cached_channels(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
 
-    let joined_ids: std::collections::HashSet<_> =
-        joined.into_iter().map(|c| c.channel_id).collect();
+    let joined_ids = inside_ids(&joined);
+    let hidden: std::collections::HashSet<String> = joined
+        .iter()
+        .filter(|c| c.deleted)
+        .map(|c| c.channel_id.clone())
+        .collect();
     Ok(cached
         .into_iter()
+        .filter(|c| !hidden.contains(&c.channel_id))
         .map(|c| GatheredChannelInfo {
             joined: joined_ids.contains(&c.channel_id),
             channel_id: c.channel_id,
@@ -2476,5 +2832,19 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
         .map_err(|_| coded("channels_xfer_not_found", "Invalid transfer id"))?;
     <[u8; 16]>::try_from(bytes.as_slice())
         .map_err(|_| coded("channels_xfer_not_found", "Invalid transfer id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_username_rejects_anonymous_and_out_of_range() {
+        assert!(sanitize_channel_username("A").is_err());
+        assert!(sanitize_channel_username("Anonymous").is_err());
+        assert!(sanitize_channel_username(&"x".repeat(33)).is_err());
+        assert_eq!(sanitize_channel_username("Ada").unwrap(), "Ada");
+        assert_eq!(username_claim_key("Ada"), "ada");
+    }
 }
 

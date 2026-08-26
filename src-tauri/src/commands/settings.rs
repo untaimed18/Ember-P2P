@@ -774,6 +774,20 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Nickname must be 128 bytes or fewer",
         ));
     }
+    if !settings.channel_username.is_empty() {
+        if settings.channel_username.len() < 2 || settings.channel_username.len() > 32 {
+            return Err(coded(
+                "channels_username_invalid",
+                "Channel username must be between 2 and 32 bytes",
+            ));
+        }
+        if settings.channel_username.eq_ignore_ascii_case("anonymous") {
+            return Err(coded(
+                "channels_username_invalid",
+                "Channel username must not be empty",
+            ));
+        }
+    }
     let is_filesystem_root = |path: &std::path::Path| {
         path.has_root()
             && !path
@@ -990,6 +1004,15 @@ pub async fn update_settings(
         .collect::<String>()
         .trim()
         .to_string();
+    settings.channel_username = settings
+        .channel_username
+        .chars()
+        .filter(|c| {
+            !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c)
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
     let shared_folders = std::mem::take(&mut settings.shared_folders);
     settings.shared_folders =
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
@@ -1000,6 +1023,23 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    }
+
+    if settings.channel_username != old_settings.channel_username {
+        if settings.channel_username.is_empty() {
+            if !old_settings.channel_username.is_empty() {
+                return Err(coded(
+                    "channels_username_required",
+                    "Choose a Channel username before creating or joining a room",
+                ));
+            }
+        } else {
+            settings.channel_username = crate::commands::channels::claim_username_on_registry(
+                &state,
+                &settings.channel_username,
+            )
+            .await?;
+        }
     }
 
     if settings.settings_revision != old_settings.settings_revision {

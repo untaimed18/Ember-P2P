@@ -1053,6 +1053,11 @@ pub enum NetworkStatus {
 // Completely unreadable JSON still falls back to defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
+    /// Unique handle used in Channels, claimed on Rendezvous. Empty until
+    /// the user chooses one. Distinct from [`Self::nickname`], which is the
+    /// friend display name and is not unique.
+    #[serde(default)]
+    pub channel_username: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     pub max_upload_speed: u64,
@@ -1663,6 +1668,7 @@ impl Default for AppSettings {
 
         Self {
             nickname: format!("Ember-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            channel_username: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             max_upload_speed: 0,

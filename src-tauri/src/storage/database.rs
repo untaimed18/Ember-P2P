@@ -25,7 +25,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 36;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 37;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -107,6 +107,20 @@ pub struct StoredChannel {
     /// When we last got an answer back from a search for that record. Silence is
     /// only evidence of an absent owner if we have been asking.
     pub moderation_checked_at: i64,
+    /// Whether this device is currently inside the room. Leave walks out
+    /// without deleting the local row, so Join can reopen the same door.
+    pub in_room: bool,
+    /// Owner has permanently deleted this room. The row stays so the owner
+    /// cannot recreate the same name by accident on this device.
+    pub deleted: bool,
+}
+
+impl StoredChannel {
+    /// Presence, send, and gossip: only while we are actually in the room
+    /// and it has not been tombstoned.
+    pub fn in_room_now(&self) -> bool {
+        self.in_room && !self.deleted
+    }
 }
 
 /// One member of a joined channel. `member_pubkey` is 64-char hex.
@@ -1715,6 +1729,27 @@ impl Database {
                 "TEXT NOT NULL DEFAULT ''",
             )?;
             set_version(&tx, 36)?;
+            tx.commit()?;
+        }
+
+        if version < 37 {
+            // Membership is presence: Leave walks out without wiping the row,
+            // so Join can reopen the same door. Existing rows are rooms this
+            // device already joined, so they start inside.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "in_room",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "deleted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 37)?;
             tx.commit()?;
         }
 
@@ -3890,42 +3925,20 @@ impl Database {
     pub fn list_channels(&self) -> anyhow::Result<Vec<StoredChannel>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
                     c.joined_at, c.last_active,
                     (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
                     (SELECT COUNT(*) FROM channel_messages msg
                      WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
-                    c.moderation_updated_at, c.moderation_checked_at
+                    c.moderation_updated_at, c.moderation_checked_at,
+                    c.in_room, c.deleted
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredChannel {
-                    channel_id: row.get(0)?,
-                    pubkey: row.get(1)?,
-                    name: row.get(2)?,
-                    visibility: row.get(3)?,
-                    is_owner: row.get::<_, i64>(4)? != 0,
-                    topic: row.get(5)?,
-                    welcome: row.get(6)?,
-                    joined_at: row.get(7)?,
-                    last_active: row.get(8)?,
-                    member_count: row.get(9)?,
-                    unread: row.get(10)?,
-                    successor_id: row.get::<_, String>(11).unwrap_or_default(),
-                    predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
-                    owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
-                    key_epoch: row.get::<_, i64>(14).unwrap_or(0),
-                    successor_nominee: row.get::<_, String>(15).unwrap_or_default(),
-                    claim_after_days: row.get::<_, i64>(16).unwrap_or(0),
-                    key_epoch_wanted: row.get::<_, i64>(17).unwrap_or(0),
-                    moderation_updated_at: row.get::<_, i64>(18).unwrap_or(0),
-                    moderation_checked_at: row.get::<_, i64>(19).unwrap_or(0),
-                })
-            })?
+            .query_map([], |row| Self::stored_channel_from_row(row))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -4008,36 +4021,41 @@ impl Database {
                          WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
-                        c.moderation_updated_at, c.moderation_checked_at
+                        c.moderation_updated_at, c.moderation_checked_at,
+                        c.in_room, c.deleted
                  FROM channels c WHERE c.channel_id = ?1",
                 params![channel_id],
-                |row| {
-                    Ok(StoredChannel {
-                        channel_id: row.get(0)?,
-                        pubkey: row.get(1)?,
-                        name: row.get(2)?,
-                        visibility: row.get(3)?,
-                        is_owner: row.get::<_, i64>(4)? != 0,
-                        topic: row.get(5)?,
-                        welcome: row.get(6)?,
-                        joined_at: row.get(7)?,
-                        last_active: row.get(8)?,
-                        member_count: row.get(9)?,
-                        unread: row.get(10)?,
-                        successor_id: row.get::<_, String>(11).unwrap_or_default(),
-                        predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
-                        owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
-                        key_epoch: row.get::<_, i64>(14).unwrap_or(0),
-                        successor_nominee: row.get::<_, String>(15).unwrap_or_default(),
-                        claim_after_days: row.get::<_, i64>(16).unwrap_or(0),
-                        key_epoch_wanted: row.get::<_, i64>(17).unwrap_or(0),
-                        moderation_updated_at: row.get::<_, i64>(18).unwrap_or(0),
-                        moderation_checked_at: row.get::<_, i64>(19).unwrap_or(0),
-                    })
-                },
+                |row| Self::stored_channel_from_row(row),
             )
             .optional()?;
         Ok(row)
+    }
+
+    fn stored_channel_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
+        Ok(StoredChannel {
+            channel_id: row.get(0)?,
+            pubkey: row.get(1)?,
+            name: row.get(2)?,
+            visibility: row.get(3)?,
+            is_owner: row.get::<_, i64>(4)? != 0,
+            topic: row.get(5)?,
+            welcome: row.get(6)?,
+            joined_at: row.get(7)?,
+            last_active: row.get(8)?,
+            member_count: row.get(9)?,
+            unread: row.get(10)?,
+            successor_id: row.get::<_, String>(11).unwrap_or_default(),
+            predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
+            owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
+            key_epoch: row.get::<_, i64>(14).unwrap_or(0),
+            successor_nominee: row.get::<_, String>(15).unwrap_or_default(),
+            claim_after_days: row.get::<_, i64>(16).unwrap_or(0),
+            key_epoch_wanted: row.get::<_, i64>(17).unwrap_or(0),
+            moderation_updated_at: row.get::<_, i64>(18).unwrap_or(0),
+            moderation_checked_at: row.get::<_, i64>(19).unwrap_or(0),
+            in_room: row.get::<_, i64>(20).unwrap_or(1) != 0,
+            deleted: row.get::<_, i64>(21).unwrap_or(0) != 0,
+        })
     }
 
     pub fn insert_channel(
@@ -4110,6 +4128,46 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Walk in or out without dropping secrets or history.
+    pub fn set_channel_in_room(&self, channel_id: &str, in_room: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET in_room = ?2 WHERE channel_id = ?1 AND deleted = 0",
+            params![channel_id, if in_room { 1 } else { 0 }],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Owner-only permanent delete on this device: leave the door and keep the
+    /// row so the same name is not minted again locally.
+    pub fn tombstone_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Walk this device out of rooms the directory has tombstoned.
+    pub fn walk_out_deleted_channels(&self, deleted_ids: &[String]) -> anyhow::Result<Vec<String>> {
+        if deleted_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut walked = Vec::new();
+        for id in deleted_ids {
+            let n = conn.execute(
+                "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1 AND deleted = 0",
+                params![id],
+            )?;
+            if n > 0 {
+                walked.push(id.clone());
+            }
+        }
+        Ok(walked)
     }
 
     /// Forget a channel. A ban recorded against `keep_banned_member` survives,
@@ -4956,6 +5014,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT channel_id FROM channels
              WHERE presence_published_at <= ?1 AND successor_id = ''
+               AND in_room = 1 AND deleted = 0
              ORDER BY presence_published_at ASC",
         )?;
         let cutoff = now.saturating_sub(interval_secs);
@@ -6393,6 +6452,81 @@ mod tests {
             db.list_channel_members(&channel_id).unwrap().is_empty(),
             "no member is preserved when the caller keeps nobody"
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn leave_keeps_the_row_and_skips_presence() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-in-room-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            Some(&[0x11u8; 32]),
+            None,
+        )
+        .expect("insert");
+        let listed = db.list_channels().unwrap();
+        assert!(listed[0].in_room);
+        assert!(!listed[0].deleted);
+        let due = db.channels_due_for_presence(i64::MAX, 1).unwrap();
+        assert_eq!(due, vec![channel_id.clone()]);
+
+        assert!(db.set_channel_in_room(&channel_id, false).unwrap());
+        let left = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!left.in_room);
+        assert!(db.load_channel_owner_seed(&channel_id).unwrap().is_some());
+        assert!(
+            db.channels_due_for_presence(i64::MAX, 1)
+                .unwrap()
+                .is_empty(),
+            "a device that walked out must not republish presence"
+        );
+
+        assert!(db.set_channel_in_room(&channel_id, true).unwrap());
+        assert!(db.get_channel(&channel_id).unwrap().unwrap().in_room);
+
+        assert!(db.tombstone_channel(&channel_id).unwrap());
+        let gone = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!gone.in_room);
+        assert!(gone.deleted);
+        assert!(
+            !db.set_channel_in_room(&channel_id, true).unwrap(),
+            "a tombstoned room cannot be re-entered on this device"
+        );
+
+        let other_id = "ef".repeat(16);
+        db.insert_channel(
+            &other_id,
+            &"12".repeat(32),
+            "Elsewhere",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert other");
+        let walked = db.walk_out_deleted_channels(&[other_id.clone()]).unwrap();
+        assert_eq!(walked, vec![other_id.clone()]);
+        let hidden = db.get_channel(&other_id).unwrap().unwrap();
+        assert!(!hidden.in_room);
+        assert!(hidden.deleted, "a directory tombstone must hide the card");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

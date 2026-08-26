@@ -32,6 +32,9 @@ const RDV_V4_DOMAIN: &[u8] = b"ember-rdv-v4";
 const OP_IDENTITY_LOOKUP_V4: u8 = 0x20;
 const OP_CAPABILITY_REGISTER_V4: u8 = 0x21;
 const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
+const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
+const OP_CHANNEL_NAME_V4: u8 = 0x27;
+const OP_CHANNEL_DELETE_V4: u8 = 0x28;
 const SIGNED_IP_V4: u8 = 4;
 const SIGNED_IP_V6: u8 = 6;
 
@@ -420,6 +423,9 @@ pub(crate) fn current_timestamp() -> i64 {
 /// "future-proof" reasons but no current code path needs that much
 /// — the smaller cap matches main and shrinks the DoS surface.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024;
+/// Public directory listings are larger than a single signed lookup. 256 KiB
+/// still bounds a malicious dump while covering a few thousand rooms.
+const MAX_DIRECTORY_RESPONSE_BYTES: usize = 256 * 1024;
 
 pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     let mut hasher = Sha256::new();
@@ -2149,6 +2155,235 @@ pub async fn friend_relay_ticket_accepted(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChannelRegistryError {
+    Unavailable,
+    Taken,
+    Forbidden,
+    Invalid,
+}
+
+fn map_registry_status(status: reqwest::StatusCode) -> ChannelRegistryError {
+    if status == reqwest::StatusCode::CONFLICT {
+        ChannelRegistryError::Taken
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        ChannelRegistryError::Forbidden
+    } else if status == reqwest::StatusCode::BAD_REQUEST {
+        ChannelRegistryError::Invalid
+    } else {
+        ChannelRegistryError::Unavailable
+    }
+}
+
+fn build_channel_username_v4_msg(pubkey: &[u8; 32], name: &str, ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + name.len() + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_USERNAME_V4);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_name_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    name: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + name.len() + 1 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_DELETE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// Claim or rename this device's Channel username. `name` must already be the
+/// normalised lowercase form the server stores.
+pub(crate) async fn claim_channel_username(
+    base_url: &str,
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    name: &str,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_username_v4_msg(pubkey, name, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/username",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "pubkey": hex::encode(pubkey),
+            "name": name,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Claim a unique channel name with the **channel** key.
+pub(crate) async fn claim_channel_name(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    name: &str,
+    private: bool,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed_name = name.to_lowercase();
+    let signed = build_channel_name_v4_msg(channel_id, pubkey, &signed_name, private, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/name",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "name": name,
+            "private": private,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Tombstone a room. Signed with the **channel** key so the server cannot
+/// invent deletes.
+pub(crate) async fn delete_channel_registry(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_delete_v4_msg(channel_id, pubkey, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/delete",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct DirectoryChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+}
+
+pub(crate) async fn fetch_channel_directory(
+    base_url: &str,
+) -> Result<Vec<DirectoryChannel>, ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .get(format!(
+            "{}/v4/channels/directory",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if !resp.status().is_success() {
+        return Err(map_registry_status(resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let Some(list) = body.get("channels") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+}
+
+pub(crate) async fn fetch_deleted_channel_ids(
+    base_url: &str,
+) -> Result<Vec<String>, ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .get(format!(
+            "{}/v4/channels/deleted",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if !resp.status().is_success() {
+        return Err(map_registry_status(resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let Some(list) = body.get("ids") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+}
+
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
@@ -2164,6 +2399,9 @@ mod relay_ticket_tests {
         assert_eq!(OP_IDENTITY_LOOKUP_V4, 0x20);
         assert_eq!(OP_CAPABILITY_REGISTER_V4, 0x21);
         assert_eq!(OP_CAPABILITY_LOOKUP_V4, 0x22);
+        assert_eq!(OP_CHANNEL_USERNAME_V4, 0x26);
+        assert_eq!(OP_CHANNEL_NAME_V4, 0x27);
+        assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
     }
 
     #[test]
