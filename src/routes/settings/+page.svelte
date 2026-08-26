@@ -10,6 +10,11 @@
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
+  import {
+    CHANNEL_USERNAME_MAX,
+    isValidChannelUsername,
+    sanitizeChannelUsernameInput,
+  } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
@@ -602,15 +607,8 @@
     if (new TextEncoder().encode(s.nickname).length > 128) {
       return { error: m.error_settings_nickname_too_long(), adjusted: false };
     }
-    if (s.channel_username.trim()) {
-      const trimmed = s.channel_username.trim();
-      if (trimmed.toLowerCase() === 'anonymous') {
-        return { error: m.error_channels_username_invalid(), adjusted: false };
-      }
-      const userBytes = new TextEncoder().encode(trimmed);
-      if (userBytes.length < 2 || userBytes.length > 32) {
-        return { error: m.error_channels_username_invalid(), adjusted: false };
-      }
+    if (s.channel_username.trim() && !isValidChannelUsername(s.channel_username)) {
+      return { error: m.error_channels_username_invalid(), adjusted: false };
     }
     if (!s.download_folder.trim()) {
       return { error: m.settings_validation_folder_empty(), adjusted: false };
@@ -1418,6 +1416,14 @@
     settings.close_to_tray_behavior = behavior;
   }
 
+  /** Strips as you type, so the field can only ever hold a legal handle. A
+   *  named function rather than an inline handler: inside the template the
+   *  callback outlives the `{#if settings}` narrowing around it. */
+  function setChannelUsername(raw: string) {
+    if (!settings) return;
+    settings.channel_username = sanitizeChannelUsernameInput(raw);
+  }
+
   function handleRadioGroupKey(
     event: KeyboardEvent,
     values: string[],
@@ -1759,7 +1765,16 @@
           </div>
           <div class="field">
             <label for="channel_username">{m.settings_channel_username_label()}</label>
-            <input id="channel_username" bind:value={settings.channel_username} maxlength="32" placeholder={m.settings_channel_username_placeholder()} />
+            <input
+              id="channel_username"
+              value={settings.channel_username}
+              maxlength={CHANNEL_USERNAME_MAX}
+              spellcheck="false"
+              autocomplete="username"
+              autocapitalize="off"
+              placeholder={m.settings_channel_username_placeholder()}
+              oninput={(e) => setChannelUsername(e.currentTarget.value)}
+            />
             <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
           <div class="divider"></div>

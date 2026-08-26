@@ -60,6 +60,9 @@ pub const PRESENCE_FETCH_EMPTY_SECS: i64 = 20;
 pub const MODERATION_FETCH_SECS: i64 = 5 * 60;
 /// Owners re-publish moderation so the 24h record TTL cannot age out.
 pub const MODERATION_REPUBLISH_SECS: i64 = 6 * 60 * 60;
+/// How often an in-room member re-claims their username so Rendezvous
+/// does not free it after a year of silence.
+pub const USERNAME_REFRESH_SECS: i64 = 24 * 60 * 60;
 /// Cap on rooms whose XOR-neighbors we register at rendezvous per heartbeat.
 pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
 /// Deterministic gossip degree: XOR-closest members to self.

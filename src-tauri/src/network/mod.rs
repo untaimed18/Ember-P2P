@@ -12341,6 +12341,13 @@ struct NetworkState {
     channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// Last Channel-username refresh against Rendezvous.
+    channel_username_refresh_at: i64,
+    /// Rendezvous base URL, refreshed from settings on the channel heartbeat.
+    /// Cached because the gossip handlers need it to hand a room's registry
+    /// name to its successor, and they are several layers below the loop that
+    /// holds `AppSettings`.
+    rendezvous_url: String,
     /// Member Ed25519 → Noise static key from presence extra (no IP).
     ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
@@ -12470,6 +12477,10 @@ async fn maybe_publish_channel_presence(
         }
         name.to_string()
     };
+    let refresh_username = !due.is_empty()
+        && now.saturating_sub(state.channel_username_refresh_at)
+            >= ember::channel::USERNAME_REFRESH_SECS
+        && !settings.rendezvous_url.is_empty();
     let signing = ed25519_dalek::SigningKey::from_bytes(&identity.ed25519_secret_key);
     for channel_id_hex in due.into_iter().take(4) {
         let Some(ch) = db.get_channel(&channel_id_hex).ok().flatten() else {
@@ -12513,6 +12524,20 @@ async fn maybe_publish_channel_presence(
             let _ = db.touch_channel_presence(&channel_id_hex, now);
             drive_ember_publish(socket, state, publish_id).await;
         }
+    }
+    if refresh_username {
+        let url = settings.rendezvous_url.clone();
+        let pk = identity.ed25519_public_key;
+        let sk = identity.ed25519_secret_key;
+        let name = nickname.to_lowercase();
+        state.channel_username_refresh_at = now;
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::network::rendezvous::claim_channel_username(&url, &pk, &sk, &name).await
+            {
+                tracing::debug!(?error, "could not refresh the channel username claim");
+            }
+        });
     }
 }
 
@@ -13021,6 +13046,11 @@ async fn maybe_publish_owned_channel_records(
     settings: &AppSettings,
     identity: &crate::storage::identity::NodeIdentity,
 ) {
+    // The gossip handlers cannot reach `AppSettings`, so keep their copy of the
+    // Rendezvous URL current from the loop that can.
+    if settings.rendezvous_url != state.rendezvous_url {
+        state.rendezvous_url = settings.rendezvous_url.clone();
+    }
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
     }
@@ -13108,6 +13138,77 @@ async fn maybe_publish_owned_channel_records(
             state.channel_moderation_publish_at.insert(channel_id, now);
             drive_ember_publish(socket, state, publish_id).await;
             started += 1;
+            // Everything a room's survival depends on is renewed from here, so
+            // this loop running *is* the owner's liveness signal: the directory
+            // entry, the name claim, and the succession clock all age from the
+            // last pass. Walking out of a room you own is not abandonment and
+            // must not start that clock — closing Ember for good is, and that
+            // stops this loop on its own.
+            if !settings.rendezvous_url.is_empty() {
+                let url = settings.rendezvous_url.clone();
+                let cid = ident.channel_id;
+                let cpk = ident.pubkey;
+                let seed = ident.seed();
+                let cname = ch.name.clone();
+                // A room we inherited still has its name bound to the room it
+                // came from, and the handover at claim time is one shot — it
+                // fails whenever Rendezvous happens to be unreachable. Retrying
+                // it here is what makes that recoverable rather than a wait for
+                // the abandoned name to lapse.
+                let predecessor = hex::decode(&ch.predecessor_id)
+                    .ok()
+                    .and_then(|b| <[u8; 16]>::try_from(b).ok());
+                // Whoever we nominated has to be on record with the registry or
+                // they cannot take the name when they take the room. Sent from
+                // here as well as at nomination time, because that one-shot is
+                // lost if the registry was unreachable — or if the room had no
+                // name claim yet for the nomination to attach to.
+                let nominee = hex::decode(&ch.successor_nominee)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .filter(|_| ch.claim_after_days > 0);
+                let claim_after_days = ch.claim_after_days.clamp(0, u32::MAX as i64) as u32;
+                let our_pk = identity.ed25519_public_key;
+                let our_sk = identity.ed25519_secret_key;
+                tokio::spawn(async move {
+                    let claimed = crate::network::rendezvous::claim_channel_name(
+                        &url, &cid, &cpk, &seed, &cname, private,
+                    )
+                    .await;
+                    if claimed.is_ok() {
+                        if let Some(nominee) = nominee {
+                            if let Err(error) =
+                                crate::network::rendezvous::register_channel_nominee(
+                                    &url,
+                                    &cid,
+                                    &cpk,
+                                    &seed,
+                                    Some(&nominee),
+                                    claim_after_days,
+                                )
+                                .await
+                            {
+                                tracing::debug!(?error, "could not re-register the room's nominee");
+                            }
+                        }
+                        return;
+                    }
+                    let taken = matches!(
+                        claimed,
+                        Err(crate::network::rendezvous::ChannelRegistryError::Taken)
+                    );
+                    let Some(old_id) = predecessor.filter(|_| taken) else {
+                        return;
+                    };
+                    if let Err(error) = crate::network::rendezvous::handover_channel_name(
+                        &url, &old_id, &cid, &cpk, &our_pk, &our_sk,
+                    )
+                    .await
+                    {
+                        tracing::debug!(?error, "could not move the inherited channel name");
+                    }
+                });
+            }
             // The listing Discover walks was published once, at creation, so an
             // established room aged out of the index after a day while its
             // members carried on none the wiser. Renewed on the same cadence
@@ -14737,6 +14838,61 @@ async fn apply_channel_handoff_ready(
                     }
                     let keep = private;
                     let successor_id = ember::channel::channel_id_from_pubkey(&successor_pk);
+                    // We are about to stop being this room's owner, and the
+                    // successor's key has never held our registry name. Hand it
+                    // over while we can still sign for it — after
+                    // `apply_channel_handoff` the seed is gone, and the new
+                    // owner cannot sign for a name that is still ours.
+                    //
+                    // This is the only chance, so a blip does not get to cost
+                    // the room its name for a year: retry while the registry is
+                    // merely unreachable, and give up at once on a refusal,
+                    // which retrying cannot change. The old seed lives in this
+                    // task for a few seconds longer than the request as a
+                    // result, and nowhere else.
+                    if !state.rendezvous_url.is_empty() {
+                        let url = state.rendezvous_url.clone();
+                        let old_id = gossip.channel_id;
+                        let old_pk = ident.pubkey;
+                        let old_seed = seed;
+                        tokio::spawn(async move {
+                            for backoff_secs in [0u64, 3, 12, 45] {
+                                if backoff_secs > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        backoff_secs,
+                                    ))
+                                    .await;
+                                }
+                                match crate::network::rendezvous::handover_channel_name(
+                                    &url,
+                                    &old_id,
+                                    &successor_id,
+                                    &successor_pk,
+                                    &old_pk,
+                                    &old_seed,
+                                )
+                                .await
+                                {
+                                    Ok(()) => return,
+                                    Err(
+                                        error @ crate::network::rendezvous::ChannelRegistryError::Unavailable,
+                                    ) => {
+                                        tracing::debug!(
+                                            ?error,
+                                            "name handover to the successor did not land; retrying"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            ?error,
+                                            "the registry refused to hand the channel name over"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
                     let _ = db.apply_channel_handoff(
                         &ch.channel_id,
                         &hex::encode(successor_pk),
@@ -19947,6 +20103,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_channel_moderation.clear();
     state.channel_moderation_fetch_at.clear();
     state.channel_moderation_publish_at.clear();
+    state.channel_username_refresh_at = 0;
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
     state.channel_neighbor_lookup_inflight.clear();
@@ -20956,6 +21113,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        channel_username_refresh_at: 0,
+        rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),

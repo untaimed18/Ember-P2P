@@ -166,6 +166,17 @@ export function replaceChannel(updated: ChannelInfo): void {
   );
 }
 
+export function setChannelMemberCount(channelId: string, count: number): void {
+  channels.update((list) => {
+    if (!list.some((channel) => channel.channel_id === channelId && channel.member_count !== count)) {
+      return list;
+    }
+    return list.map((channel) =>
+      channel.channel_id === channelId ? { ...channel, member_count: count } : channel,
+    );
+  });
+}
+
 export function clearChannelUnread(channelId: string): void {
   channels.update((list) => {
     // Hand back the same array when there is nothing to clear. Allocating a

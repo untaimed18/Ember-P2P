@@ -163,6 +163,8 @@ const OP_PUNCH_ACK_V4: u8 = 0x25;
 const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
 const OP_CHANNEL_NAME_V4: u8 = 0x27;
 const OP_CHANNEL_DELETE_V4: u8 = 0x28;
+const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
+const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 
 /// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
 const SIGNED_IP_V4: u8 = 4;
@@ -644,6 +646,45 @@ fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64
     message.push(OP_CHANNEL_DELETE_V4);
     message.extend_from_slice(channel_id);
     message.extend_from_slice(pubkey);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_nominee_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    nominee: &[u8; 32],
+    claim_after_days: u32,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 32 + 4 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NOMINEE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(nominee);
+    message.extend_from_slice(&claim_after_days.to_le_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// The signer is bound into the message so one signature cannot be replayed as
+/// the other authorization path: the server decides *which* rule to apply from
+/// the key that signed, and that key has to be what the owner actually signed.
+fn build_channel_handover_v4_msg(
+    old_channel_id: &[u8; 16],
+    new_channel_id: &[u8; 16],
+    new_pubkey: &[u8; 32],
+    signer: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 16 + 32 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_HANDOVER_V4);
+    message.extend_from_slice(old_channel_id);
+    message.extend_from_slice(new_channel_id);
+    message.extend_from_slice(new_pubkey);
+    message.extend_from_slice(signer);
     message.extend_from_slice(&ts.to_le_bytes());
     message
 }
@@ -2632,6 +2673,31 @@ struct ChannelDeleteRequest {
     sig: String,
 }
 
+#[derive(Deserialize)]
+struct ChannelNomineeRequest {
+    channel_id: String,
+    pubkey: String,
+    /// User pubkey to nominate, or empty to withdraw.
+    #[serde(default)]
+    nominee: String,
+    #[serde(default)]
+    claim_after_days: u32,
+    ts: i64,
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct ChannelHandoverRequest {
+    old_channel_id: String,
+    new_channel_id: String,
+    new_pubkey: String,
+    /// Old channel key for an explicit transfer, or the nominee's user key for
+    /// a takeover. The server picks the rule from this.
+    signer: String,
+    ts: i64,
+    sig: String,
+}
+
 async fn claim_channel_username_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2756,6 +2822,126 @@ async fn delete_channel_v4(
     }
 }
 
+async fn set_channel_nominee_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelNomineeRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (Some(channel_id), Some(pubkey), Some(sig)) = (
+        decode_hex_channel_id(&body.channel_id),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    // Withdrawing is signed over all-zeros, so an empty nominee cannot be
+    // swapped in for a real one without invalidating the signature.
+    let nominee = if body.nominee.trim().is_empty() {
+        [0u8; 32]
+    } else {
+        match decode_hex_pubkey(&body.nominee) {
+            Some(pk) => pk,
+            None => return StatusCode::BAD_REQUEST,
+        }
+    };
+    if !channel_id_matches_pubkey(&pubkey, &channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_channel_nominee_v4_msg(
+        &channel_id,
+        &pubkey,
+        &nominee,
+        body.claim_after_days,
+        body.ts,
+    );
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) =
+        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    {
+        return status;
+    }
+    let nominee_hex = if nominee == [0u8; 32] {
+        String::new()
+    } else {
+        hex::encode(nominee)
+    };
+    let mut registry = state.channels_registry.write().await;
+    match registry.set_channel_nominee(
+        &hex::encode(channel_id),
+        &hex::encode(pubkey),
+        &nominee_hex,
+        body.claim_after_days,
+    ) {
+        Ok(()) => StatusCode::OK,
+        Err(err) => registry_error_status(err),
+    }
+}
+
+async fn handover_channel_name_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelHandoverRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (Some(old_channel_id), Some(new_channel_id), Some(new_pubkey), Some(signer), Some(sig)) = (
+        decode_hex_channel_id(&body.old_channel_id),
+        decode_hex_channel_id(&body.new_channel_id),
+        decode_hex_pubkey(&body.new_pubkey),
+        decode_hex_pubkey(&body.signer),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    // The successor has to be a real room, or a name could be parked on an id
+    // nobody holds the key to.
+    if !channel_id_matches_pubkey(&new_pubkey, &new_channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let signed = build_channel_handover_v4_msg(
+        &old_channel_id,
+        &new_channel_id,
+        &new_pubkey,
+        &signer,
+        body.ts,
+    );
+    if !ed25519_verify(&signer, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    if let Err(status) =
+        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    {
+        return status;
+    }
+    let mut registry = state.channels_registry.write().await;
+    match registry.handover_channel_name(
+        &hex::encode(old_channel_id),
+        &hex::encode(new_channel_id),
+        &hex::encode(new_pubkey),
+        &hex::encode(signer),
+        now_unix_secs(),
+    ) {
+        Ok(()) => StatusCode::OK,
+        Err(err) => registry_error_status(err),
+    }
+}
+
 async fn channel_directory_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2765,6 +2951,9 @@ async fn channel_directory_v4(
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
+    // Read-only: `public_directory` already hides listings the owner has
+    // stopped refreshing, so serving Discover never needs the write lock that
+    // reaping takes.
     let registry = state.channels_registry.read().await;
     Ok(Json(serde_json::json!({
         "channels": registry.public_directory(),
@@ -4739,6 +4928,8 @@ async fn main() {
         .route("/v4/channels/username", post(claim_channel_username_v4))
         .route("/v4/channels/name", post(claim_channel_name_v4))
         .route("/v4/channels/delete", post(delete_channel_v4))
+        .route("/v4/channels/nominee", post(set_channel_nominee_v4))
+        .route("/v4/channels/handover", post(handover_channel_name_v4))
         .route("/v4/channels/directory", get(channel_directory_v4))
         .route("/v4/channels/deleted", get(channel_deleted_v4))
         .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
@@ -5687,6 +5878,8 @@ mod relay_ticket_tests {
         assert_eq!(OP_CHANNEL_USERNAME_V4, 0x26);
         assert_eq!(OP_CHANNEL_NAME_V4, 0x27);
         assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
+        assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
+        assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
     }
 
     #[test]
@@ -6834,7 +7027,7 @@ mod relay_ticket_tests {
             StatusCode::CONFLICT
         );
         let rename_ts = ts + 1;
-        let renamed = build_channel_username_v4_msg(&alice_pk, "ada lovelace", rename_ts);
+        let renamed = build_channel_username_v4_msg(&alice_pk, "adalovelace", rename_ts);
         assert_eq!(
             claim_channel_username_v4(
                 State(state.clone()),
@@ -6842,7 +7035,7 @@ mod relay_ticket_tests {
                 HeaderMap::new(),
                 Json(ChannelUsernameRequest {
                     pubkey: hex::encode(alice_pk),
-                    name: "Ada Lovelace".to_string(),
+                    name: "AdaLovelace".to_string(),
                     ts: rename_ts,
                     sig: hex::encode(alice.sign(&renamed).to_bytes()),
                 }),
@@ -6865,6 +7058,116 @@ mod relay_ticket_tests {
             )
             .await,
             StatusCode::OK
+        );
+    }
+
+    /// End to end over HTTP: a nominated successor takes the name once the
+    /// owner has gone quiet, and nobody else can.
+    #[tokio::test]
+    async fn channel_name_handover_follows_the_room() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let successor = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let nominee = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        let thief = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let successor_pk = successor.verifying_key().to_bytes();
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let old_id = test_channel_id(&owner_pk);
+        let new_id = test_channel_id(&successor_pk);
+        let ts = now_unix_secs();
+        let addr = "8.8.8.8:1000".parse().unwrap();
+
+        let claim = build_channel_name_v4_msg(&old_id, &owner_pk, "lobby", false, ts);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(old_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Lobby".to_string(),
+                    private: false,
+                    ts,
+                    sig: hex::encode(owner.sign(&claim).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let nom = build_channel_nominee_v4_msg(&old_id, &owner_pk, &nominee_pk, 7, ts);
+        assert_eq!(
+            set_channel_nominee_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNomineeRequest {
+                    channel_id: hex::encode(old_id),
+                    pubkey: hex::encode(owner_pk),
+                    nominee: hex::encode(nominee_pk),
+                    claim_after_days: 7,
+                    ts,
+                    sig: hex::encode(owner.sign(&nom).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // Signed correctly, but by a key the owner never nominated.
+        let thief_pk = thief.verifying_key().to_bytes();
+        let stolen =
+            build_channel_handover_v4_msg(&old_id, &new_id, &successor_pk, &thief_pk, ts);
+        assert_eq!(
+            handover_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelHandoverRequest {
+                    old_channel_id: hex::encode(old_id),
+                    new_channel_id: hex::encode(new_id),
+                    new_pubkey: hex::encode(successor_pk),
+                    signer: hex::encode(thief_pk),
+                    ts,
+                    sig: hex::encode(thief.sign(&stolen).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        // The outgoing owner's own key needs no waiting period.
+        let handover =
+            build_channel_handover_v4_msg(&old_id, &new_id, &successor_pk, &owner_pk, ts);
+        assert_eq!(
+            handover_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelHandoverRequest {
+                    old_channel_id: hex::encode(old_id),
+                    new_channel_id: hex::encode(new_id),
+                    new_pubkey: hex::encode(successor_pk),
+                    signer: hex::encode(owner_pk),
+                    ts,
+                    sig: hex::encode(owner.sign(&handover).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let dir = channel_directory_v4(State(state.clone()), ConnectInfo(addr), HeaderMap::new())
+            .await
+            .expect("directory");
+        let channels = dir.0["channels"].as_array().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0]["channel_id"], hex::encode(new_id));
+        assert_eq!(
+            channels[0]["name"], "Lobby",
+            "the successor inherits the display name"
         );
     }
 

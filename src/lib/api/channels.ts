@@ -63,6 +63,9 @@ export interface GatheredChannelInfo {
   name: string;
   private: boolean;
   joined: boolean;
+  /** Members announcing themselves right now, or null when we could not find
+   *  out. A confirmed 0 is not the same as an unanswered probe. */
+  member_count: number | null;
 }
 
 export async function listChannels(): Promise<ChannelInfo[]> {
@@ -83,6 +86,24 @@ export async function enterChannel(channelId: string): Promise<ChannelInfo> {
 
 export async function leaveChannel(channelId: string): Promise<void> {
   return invoke('leave_channel', { channelId });
+}
+
+export const CHANNEL_USERNAME_MIN = 2;
+export const CHANNEL_USERNAME_MAX = 12;
+
+/** Letters and numbers only; keeps the typed casing. */
+export function sanitizeChannelUsernameInput(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9]/g, '').slice(0, CHANNEL_USERNAME_MAX);
+}
+
+export function isValidChannelUsername(raw: string): boolean {
+  const trimmed = raw.trim();
+  return (
+    trimmed.length >= CHANNEL_USERNAME_MIN &&
+    trimmed.length <= CHANNEL_USERNAME_MAX &&
+    /^[A-Za-z0-9]+$/.test(trimmed) &&
+    trimmed.toLowerCase() !== 'anonymous'
+  );
 }
 
 export async function claimChannelUsername(name: string): Promise<string> {

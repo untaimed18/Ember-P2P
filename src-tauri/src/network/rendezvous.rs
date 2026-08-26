@@ -35,6 +35,8 @@ const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
 const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
 const OP_CHANNEL_NAME_V4: u8 = 0x27;
 const OP_CHANNEL_DELETE_V4: u8 = 0x28;
+const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
+const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 const SIGNED_IP_V4: u8 = 4;
 const SIGNED_IP_V6: u8 = 6;
 
@@ -2213,6 +2215,134 @@ fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64
     message
 }
 
+fn build_channel_nominee_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    nominee: &[u8; 32],
+    claim_after_days: u32,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 32 + 4 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NOMINEE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(nominee);
+    message.extend_from_slice(&claim_after_days.to_le_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_handover_v4_msg(
+    old_channel_id: &[u8; 16],
+    new_channel_id: &[u8; 16],
+    new_pubkey: &[u8; 32],
+    signer: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 16 + 32 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_HANDOVER_V4);
+    message.extend_from_slice(old_channel_id);
+    message.extend_from_slice(new_channel_id);
+    message.extend_from_slice(new_pubkey);
+    message.extend_from_slice(signer);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// Tell the registry who may inherit this room's name if we stop refreshing it.
+/// Signed with the **channel** key. `nominee` of `None` withdraws.
+pub(crate) async fn register_channel_nominee(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    nominee: Option<&[u8; 32]>,
+    claim_after_days: u32,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let nominee_bytes = nominee.copied().unwrap_or([0u8; 32]);
+    let days = if nominee.is_some() { claim_after_days } else { 0 };
+    let signed =
+        build_channel_nominee_v4_msg(channel_id, pubkey, &nominee_bytes, days, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/nominee",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "nominee": nominee.map(hex::encode).unwrap_or_default(),
+            "claim_after_days": days,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Move a room's registry name onto its successor room.
+///
+/// `signer_secret` is the **old channel** key for an explicit transfer, or the
+/// nominee's **user** key for a takeover — the server applies the matching rule
+/// and only lets the nominee through once the owner's claim has gone stale.
+pub(crate) async fn handover_channel_name(
+    base_url: &str,
+    old_channel_id: &[u8; 16],
+    new_channel_id: &[u8; 16],
+    new_pubkey: &[u8; 32],
+    signer_pubkey: &[u8; 32],
+    signer_secret: &[u8; 32],
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_handover_v4_msg(
+        old_channel_id,
+        new_channel_id,
+        new_pubkey,
+        signer_pubkey,
+        ts,
+    );
+    let sig = signing_key_from_secret(signer_secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/handover",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "old_channel_id": hex::encode(old_channel_id),
+            "new_channel_id": hex::encode(new_channel_id),
+            "new_pubkey": hex::encode(new_pubkey),
+            "signer": hex::encode(signer_pubkey),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
 /// Claim or rename this device's Channel username. `name` must already be the
 /// normalised lowercase form the server stores.
 pub(crate) async fn claim_channel_username(
@@ -2402,6 +2532,8 @@ mod relay_ticket_tests {
         assert_eq!(OP_CHANNEL_USERNAME_V4, 0x26);
         assert_eq!(OP_CHANNEL_NAME_V4, 0x27);
         assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
+        assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
+        assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
     }
 
     #[test]

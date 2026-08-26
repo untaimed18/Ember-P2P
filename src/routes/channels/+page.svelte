@@ -18,8 +18,10 @@
     banChannelMember,
     cachedChannels,
     cancelChannelTransfer,
+    CHANNEL_USERNAME_MAX,
     channelMemberFriendCode,
     createChannel,
+    isValidChannelUsername,
     deleteOwnedChannel,
     enterChannel,
     gatherChannels,
@@ -33,6 +35,7 @@
     respondChannelTransfer,
     claimChannelOwnership,
     claimChannelUsername,
+    sanitizeChannelUsernameInput,
     searchChannelMessages,
     setChannelSuccessorNominee,
     transferChannelOwnership,
@@ -53,6 +56,7 @@
     mutedChannels,
     refreshChannels,
     replaceChannel,
+    setChannelMemberCount,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
     toggleChannelMute,
@@ -87,6 +91,9 @@
   let transferOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
   let membersOpen = $state(true);
+  /** Walking into a room hands the whole workspace to the conversation; the
+   *  header toggle brings the directory back without leaving the room. */
+  let listCollapsed = $state(false);
   let roomInfoOpen = $state(false);
   let listQuery = $state('');
   /** Separate in-flight flags per operation. One shared "form busy" gate meant
@@ -201,7 +208,7 @@
         welcome: '',
         joined_at: 0,
         last_active: 0,
-        member_count: 0,
+        member_count: item.member_count ?? 0,
         unread: 0,
         you_are_banned: false,
         you_are_moderator: false,
@@ -392,7 +399,9 @@
       const batch = event.payload ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
-      for (const item of batch) byId.set(item.channel_id, item);
+      for (const item of batch) {
+        byId.set(item.channel_id, withKnownMemberCount(item, byId.get(item.channel_id)));
+      }
       discovered = [...byId.values()];
     }).then((fn) => {
       if (cancelled) fn();
@@ -505,6 +514,16 @@
     }
   });
 
+  /** Walking into a room gives it the whole workspace; stepping back out
+   *  returns the directory. Driven off the selection rather than set inside
+   *  `selectChannel`, so a room restored on mount collapses the list too. */
+  $effect(() => {
+    const open = !!selectedId;
+    untrack(() => {
+      listCollapsed = open;
+    });
+  });
+
   $effect(() => {
     const joinParam = $page.url.searchParams.get('join');
     if (!joinParam) return;
@@ -565,11 +584,31 @@
     try {
       const mems = await listChannelMembers(id);
       if (id === selectedId) members = mems;
+      if (mems.length > 0) setChannelMemberCount(id, mems.length);
     } catch (e) {
       if (notify && id === selectedId) {
         toastError(translateError(e, m.error_operation_failed()));
       }
     }
+  }
+
+  function roomMemberCount(ch: ChannelInfo): number {
+    if (ch.in_room && ch.channel_id === selectedId && members.length > 0) {
+      return members.length;
+    }
+    return Math.max(0, ch.member_count);
+  }
+
+  /** Only a browse that reached the network reports a size, so `null` means the
+   *  question went unanswered and the last real answer should stand rather than
+   *  blink out of the card. A number — including 0 — replaces it, which is how
+   *  a room that has emptied stops claiming members it no longer has. */
+  function withKnownMemberCount(
+    next: GatheredChannelInfo,
+    prev: GatheredChannelInfo | undefined,
+  ): GatheredChannelInfo {
+    if (next.member_count !== null || !prev || prev.member_count === null) return next;
+    return { ...next, member_count: prev.member_count };
   }
 
   async function selectChannel(id: string) {
@@ -743,6 +782,10 @@
   }
 
   async function refreshDirectory(notifyEmpty: boolean) {
+    // A browse walks sixteen index shards and then sizes what it found, which
+    // on a slow network can outlast the interval that started it. Without this
+    // those runs stack up and each one re-issues the whole set of lookups.
+    if (discovering) return;
     discovering = true;
     try {
       if (discovered.length === 0) {
@@ -753,7 +796,10 @@
         }
       }
       const found = await gatherChannels();
-      discovered = found;
+      const prior = new Map(discovered.map((item) => [item.channel_id, item]));
+      discovered = found.map((item) =>
+        withKnownMemberCount(item, prior.get(item.channel_id)),
+      );
       await refreshChannels();
       if (notifyEmpty && found.length === 0) {
         toastSuccess(m.channels_none_found());
@@ -1209,13 +1255,19 @@
         <p class="form-hint">{m.channels_username_hint()}</p>
         <div class="add-form-inner">
           <input
-            bind:value={usernameDraft}
+            value={usernameDraft}
             placeholder={m.channels_username_placeholder()}
-            maxlength="32"
+            maxlength={CHANNEL_USERNAME_MAX}
+            spellcheck="false"
+            autocomplete="username"
+            autocapitalize="off"
             aria-label={m.channels_username_placeholder()}
             use:autoFocus
+            oninput={(e) => {
+              usernameDraft = sanitizeChannelUsernameInput(e.currentTarget.value);
+            }}
           />
-          <button type="submit" disabled={usernameDraft.trim().length < 2 || claimingUsername}>
+          <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
             {m.channels_username_save()}
           </button>
         </div>
@@ -1299,8 +1351,16 @@
         </div>
       </div>
     {:else}
-      <div class="workspace" class:members-open={membersOpen && !!selected}>
-        <aside class="list-pane" class:hidden-when-chat={!!selected}>
+      <div
+        class="workspace"
+        class:members-open={membersOpen && !!selected}
+        class:list-collapsed={listCollapsed && !!selected}
+      >
+        <aside
+          class="list-pane"
+          class:hidden-when-chat={!!selected}
+          inert={listCollapsed && !!selected}
+        >
           {#if directoryList.length > 5}
             <div class="search-wrap">
               <span class="search-icon">
@@ -1371,28 +1431,41 @@
                         {/if}
                       </span>
                     </span>
-                    {#if ch.in_room && ch.member_count > 0 && ch.unread === 0}
-                      <span class="chan-count" title={m.channels_members()}>{ch.member_count}</span>
-                    {/if}
                     {#if ch.in_room && ch.unread > 0}
                       <span class="unread" class:silenced={$mutedChannels.includes(ch.channel_id)}>{ch.unread}</span>
                     {/if}
                   </button>
-                  {#if ch.in_room}
-                    <button
-                      type="button"
-                      class="ghost chan-door"
-                      disabled={joiningIds.includes(ch.channel_id)}
-                      onclick={() => requestLeave(ch.channel_id)}
-                    >{m.channels_leave()}</button>
-                  {:else}
-                    <button
-                      type="button"
-                      class="req-accept chan-door"
-                      disabled={joiningIds.includes(ch.channel_id) || needsUsername}
-                      onclick={() => joinCard(ch)}
-                    >{m.channels_join()}</button>
-                  {/if}
+                  <div class="chan-door-col">
+                    {#if roomMemberCount(ch) > 0}
+                      {@const count = roomMemberCount(ch)}
+                      <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <circle cx="6" cy="6" r="2.2"/>
+                          <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
+                          <circle cx="11.5" cy="6.5" r="1.7"/>
+                          <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
+                        </svg>
+                        {count}
+                      </span>
+                    {/if}
+                    {#if ch.in_room}
+                      <button
+                        type="button"
+                        class="ghost chan-door"
+                        disabled={joiningIds.includes(ch.channel_id)}
+                        onclick={() => requestLeave(ch.channel_id)}
+                      >{m.channels_leave()}</button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="chan-door chan-join"
+                        disabled={joiningIds.includes(ch.channel_id) || needsUsername}
+                        onclick={() => joinCard(ch)}
+                      >{joiningIds.includes(ch.channel_id)
+                        ? m.channels_joining()
+                        : m.channels_join()}</button>
+                    {/if}
+                  </div>
                 </div>
               {/each}
             {/if}
@@ -1416,6 +1489,19 @@
               <button class="back-btn" onclick={clearSelection} aria-label={m.common_back()}>
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M10 3L5 8l5 5"/>
+                </svg>
+              </button>
+              <button
+                class="icon-btn list-toggle"
+                class:on={!listCollapsed}
+                onclick={() => (listCollapsed = !listCollapsed)}
+                title={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
+                aria-pressed={!listCollapsed}
+                aria-label={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="3" width="12" height="10" rx="1.5"/>
+                  <path d="M6.5 3v10"/>
                 </svg>
               </button>
               <div
@@ -1569,34 +1655,40 @@
                 <button type="submit" disabled={moderationBusy}>{m.channels_save_moderation()}</button>
               </form>
               <div class="succession-form">
-                <p class="mod-label" id="succession-label">{m.channels_succession()}</p>
-                <select
-                  aria-labelledby="succession-label"
-                  disabled={moderationBusy}
-                  value={selected.successor_nominee}
-                  onchange={(e) => handleNominee(e.currentTarget.value)}
-                >
-                  <option value="">{m.channels_succession_none()}</option>
-                  {#each sortedMembers as mem (mem.member_pubkey)}
-                    {#if !mem.is_self && !mem.banned}
-                      <option value={mem.member_pubkey}>
-                        {mem.nickname || shortId(mem.member_pubkey)}
-                      </option>
-                    {/if}
-                  {/each}
-                </select>
-                {#if selected.successor_nominee}
+                <p class="succession-title">{m.channels_succession()}</p>
+                <p class="succession-hint">{m.channels_succession_hint()}</p>
+                <label class="succession-field">
+                  <span>{m.channels_succession_who()}</span>
                   <select
-                    aria-label={m.channels_succession()}
                     disabled={moderationBusy}
-                    value={String(selected.claim_after_days)}
-                    onchange={(e) =>
-                      handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+                    value={selected.successor_nominee}
+                    onchange={(e) => handleNominee(e.currentTarget.value)}
                   >
-                    {#each CLAIM_WINDOWS as days (days)}
-                      <option value={String(days)}>{m.channels_succession_days({ days })}</option>
+                    <option value="">{m.channels_succession_none()}</option>
+                    {#each sortedMembers as mem (mem.member_pubkey)}
+                      {#if !mem.is_self && !mem.banned}
+                        <option value={mem.member_pubkey}>
+                          {mem.nickname || shortId(mem.member_pubkey)}
+                        </option>
+                      {/if}
                     {/each}
                   </select>
+                </label>
+                {#if selected.successor_nominee}
+                  <label class="succession-field">
+                    <span>{m.channels_succession_wait()}</span>
+                    <select
+                      aria-label={m.channels_succession_wait()}
+                      disabled={moderationBusy}
+                      value={String(selected.claim_after_days)}
+                      onchange={(e) =>
+                        handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+                    >
+                      {#each CLAIM_WINDOWS as days (days)}
+                        <option value={String(days)}>{m.channels_succession_days({ days })}</option>
+                      {/each}
+                    </select>
+                  </label>
                 {/if}
               </div>
             {/if}
@@ -2148,22 +2240,47 @@
     color: var(--text-muted);
   }
 
-  .req-accept {
-    font-size: 12px;
-    font-weight: 600;
-  }
-
+  /* Fixed track widths rather than minmax(): collapsing the list animates
+     `grid-template-columns`, and browsers only interpolate that when the track
+     values are plain lengths. With minmax() the sidebar would jump. */
   .workspace {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+    grid-template-columns: 264px minmax(0, 1fr);
     gap: 10px;
     position: relative;
+    transition: grid-template-columns var(--transition-slow) ease;
   }
 
   .workspace.members-open {
-    grid-template-columns: minmax(200px, 260px) minmax(0, 1fr) minmax(200px, 240px);
+    grid-template-columns: 240px minmax(0, 1fr) 228px;
+  }
+
+  .workspace.list-collapsed {
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .workspace.list-collapsed.members-open {
+    grid-template-columns: 0 minmax(0, 1fr) 228px;
+  }
+
+  /* The column goes to zero but the grid gap does not, so pull the conversation
+     back over it — otherwise the chat sits 10px right of everything above it. */
+  .workspace.list-collapsed > .conversation-pane {
+    margin-left: -10px;
+  }
+
+  .list-pane {
+    transition:
+      opacity var(--transition-normal) ease,
+      border-color var(--transition-normal) ease;
+  }
+
+  .workspace.list-collapsed > .list-pane {
+    opacity: 0;
+    border-color: transparent;
+    pointer-events: none;
   }
 
   .list-pane,
@@ -2270,9 +2387,54 @@
     cursor: pointer;
   }
 
-  .chan-door {
+  .chan-door-col {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 5px;
     flex-shrink: 0;
+    min-width: 62px;
+  }
+
+  .chan-door {
     font-size: 12px;
+    padding: 4px 10px;
+    border-radius: var(--radius-pill);
+  }
+
+  .chan-join {
+    background: var(--accent);
+    color: var(--on-accent);
+    font-weight: 600;
+    transition: background-color var(--transition-fast) ease;
+  }
+
+  .chan-join:hover:not(:disabled) { background: var(--accent-hover); }
+
+  .chan-members {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    height: 18px;
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    line-height: 1;
+  }
+
+  .chan-members svg {
+    width: 11px;
+    height: 11px;
+    flex-shrink: 0;
+    opacity: 0.9;
   }
 
   .chan-row:hover { background: var(--bg-hover); }
@@ -2352,13 +2514,6 @@
     place-items: center;
     padding: 0 5px;
     flex-shrink: 0;
-  }
-
-  .chan-count {
-    font-size: 11px;
-    color: var(--text-muted);
-    flex-shrink: 0;
-    font-variant-numeric: tabular-nums;
   }
 
   /* A silenced room still counts its unread, it just stops shouting about it. */
@@ -2545,10 +2700,38 @@
   .succession-form {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 0 14px 10px;
+    gap: 10px;
+    padding: 12px 14px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
+  }
+
+  .succession-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .succession-hint {
+    margin: -4px 0 0;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .succession-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .succession-field select {
+    font-weight: 400;
+    color: var(--text-primary);
   }
 
   .welcome-banner {
@@ -2882,7 +3065,13 @@
 
   @media (max-width: 1200px) {
     .workspace.members-open {
-      grid-template-columns: minmax(200px, 240px) minmax(0, 1fr);
+      grid-template-columns: 240px minmax(0, 1fr);
+    }
+
+    /* The members pane floats over the chat at this width, so a collapsed list
+       leaves just the conversation. */
+    .workspace.list-collapsed.members-open {
+      grid-template-columns: 0 minmax(0, 1fr);
     }
 
     .members-backdrop {
@@ -2909,9 +3098,16 @@
 
   @media (max-width: 980px) {
     .workspace,
-    .workspace.members-open {
+    .workspace.members-open,
+    .workspace.list-collapsed,
+    .workspace.list-collapsed.members-open {
       grid-template-columns: 1fr;
     }
+
+    /* One pane at a time here, swapped by `hidden-when-chat`, so the collapse
+       has nothing to do and its offset would only misalign the chat. */
+    .workspace.list-collapsed > .conversation-pane { margin-left: 0; }
+    .list-toggle { display: none; }
 
     .back-btn {
       display: inline-flex;

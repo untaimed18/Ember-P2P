@@ -461,6 +461,29 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A username stored under the older, looser rule (spaces, punctuation, up
+    // to 32 bytes) is not a corrupt config — but `validate_settings` now
+    // refuses it, and on load that answer means backup-and-reset of every
+    // other setting. Repair it to the closest legal handle instead, and clear
+    // it when nothing legal is left: empty is a valid state that makes the
+    // Channels page ask for a new one.
+    if !settings.channel_username.is_empty()
+        && crate::commands::channels::sanitize_channel_username(&settings.channel_username).is_err()
+    {
+        let repaired: String = settings
+            .channel_username
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(crate::commands::channels::CHANNEL_USERNAME_MAX)
+            .collect();
+        settings.channel_username =
+            match crate::commands::channels::sanitize_channel_username(&repaired) {
+                Ok(name) => name,
+                Err(_) => String::new(),
+            };
+        changed = true;
+    }
+
     let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
     if freq != "daily" && freq != "weekly" && freq != "monthly" {
         settings.update_check_frequency = "daily".to_string();
@@ -775,18 +798,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         ));
     }
     if !settings.channel_username.is_empty() {
-        if settings.channel_username.len() < 2 || settings.channel_username.len() > 32 {
-            return Err(coded(
-                "channels_username_invalid",
-                "Channel username must be between 2 and 32 bytes",
-            ));
-        }
-        if settings.channel_username.eq_ignore_ascii_case("anonymous") {
-            return Err(coded(
-                "channels_username_invalid",
-                "Channel username must not be empty",
-            ));
-        }
+        crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
     }
     let is_filesystem_root = |path: &std::path::Path| {
         path.has_root()
@@ -1790,6 +1802,45 @@ mod tests {
         if let Err(e) = validate_settings(&AppSettings::default()) {
             panic!("AppSettings::default() must satisfy validate_settings, got: {e}");
         }
+    }
+
+    /// Tightening the Channel username to 2–12 alphanumerics made every
+    /// handle stored under the old 32-byte rule fail `validate_settings` — and
+    /// on load that answer backs up `config.json` and resets *every* setting.
+    /// Soft repair has to salvage those instead.
+    #[test]
+    fn a_legacy_channel_username_is_repaired_not_treated_as_corrupt() {
+        for (stored, expected) in [
+            ("Ada Lovelace", "AdaLovelace"),
+            ("ada_lovelace_the_first", "adalovelacet"),
+            ("Ada!", "Ada"),
+            ("!!", ""),
+            ("日本語", ""),
+        ] {
+            let mut settings = AppSettings {
+                channel_username: stored.to_string(),
+                ..AppSettings::default()
+            };
+            assert!(
+                soft_repair_settings(&mut settings),
+                "{stored:?} needs repairing"
+            );
+            assert_eq!(settings.channel_username, expected, "repairing {stored:?}");
+            validate_settings(&settings)
+                .unwrap_or_else(|e| panic!("repaired {stored:?} must load: {e}"));
+        }
+    }
+
+    /// A handle that already obeys the rule must survive untouched, or a save
+    /// would silently rename the user in every room.
+    #[test]
+    fn a_valid_channel_username_is_left_alone() {
+        let mut settings = AppSettings {
+            channel_username: "Ada1".to_string(),
+            ..AppSettings::default()
+        };
+        soft_repair_settings(&mut settings);
+        assert_eq!(settings.channel_username, "Ada1");
     }
 
     /// An empty download folder used to skip the path-safety block instead of

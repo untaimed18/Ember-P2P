@@ -167,6 +167,10 @@ pub struct GatheredChannelInfo {
     pub name: String,
     pub private: bool,
     pub joined: bool,
+    /// Members announcing themselves in the room right now, or `None` when we
+    /// could not find out. A confirmed 0 and an unanswered probe have to stay
+    /// distinguishable, or a card can never drop a count it has outlived.
+    pub member_count: Option<i64>,
 }
 
 async fn require_ember(state: &AppState) -> Result<(), String> {
@@ -198,10 +202,10 @@ fn sanitize_channel_name(name: &str) -> Result<String, String> {
 }
 
 const CHANNEL_USERNAME_MIN: usize = 2;
-const CHANNEL_USERNAME_MAX: usize = 32;
+pub(crate) const CHANNEL_USERNAME_MAX: usize = 12;
 
-/// Strip controls, reject empty/Anonymous, cap at 32 bytes. Returns the
-/// display form (original case) and the lowercase claim key.
+/// Letters and numbers only, 2–12 characters, never Anonymous. Returns the
+/// display form (original case); the claim key is the lowercase of that.
 pub(crate) fn sanitize_channel_username(name: &str) -> Result<String, String> {
     let cleaned: String = name
         .chars()
@@ -211,18 +215,14 @@ pub(crate) fn sanitize_channel_username(name: &str) -> Result<String, String> {
         .collect::<String>()
         .trim()
         .to_string();
-    if cleaned.len() < CHANNEL_USERNAME_MIN
-        || cleaned.eq_ignore_ascii_case("anonymous")
-    {
+    let valid = cleaned.len() >= CHANNEL_USERNAME_MIN
+        && cleaned.len() <= CHANNEL_USERNAME_MAX
+        && cleaned.chars().all(|c| c.is_ascii_alphanumeric())
+        && !cleaned.eq_ignore_ascii_case("anonymous");
+    if !valid {
         return Err(coded(
             "channels_username_invalid",
-            "Channel username must be between 2 and 32 bytes",
-        ));
-    }
-    if cleaned.len() > CHANNEL_USERNAME_MAX {
-        return Err(coded(
-            "channels_username_invalid",
-            "Channel username must be between 2 and 32 bytes",
+            "Channel username must be 2–12 letters or numbers",
         ));
     }
     Ok(cleaned)
@@ -2119,6 +2119,32 @@ pub async fn set_channel_successor_nominee(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_moderation_failed", "Could not save the nominee", e))?;
 
+    // The members learn the nomination from the moderation record below, but
+    // the name registry cannot read that — so tell it separately. Without this
+    // the nominee could take the room and still not be able to move its name,
+    // because the record would stay bound to the abandoned room's key.
+    let url = rendezvous_url(&state).await;
+    if !url.is_empty() {
+        if let Err(e) = crate::network::rendezvous::register_channel_nominee(
+            &url,
+            &owned.ident.channel_id,
+            &owned.ident.pubkey,
+            &owned.ident.seed(),
+            nominee.as_ref(),
+            days as u32,
+        )
+        .await
+        {
+            // Not fatal: the nomination itself lives in the signed record, and
+            // an unreachable registry only delays the name following the room.
+            tracing::warn!(
+                channel_id = %channel_id,
+                error = ?e,
+                "saved the nominee but could not register it with the name registry"
+            );
+        }
+    }
+
     // Republish so members learn the nomination; the tail is rebuilt from the
     // row we just wrote.
     let bans = load_banned_pubkeys(&state, &channel_id).await?;
@@ -2252,6 +2278,32 @@ pub async fn claim_channel_ownership(
         );
     }
 
+    // Take the name with us. Signed with our *user* key: the owner registered
+    // us as their nominee, and the registry checks their claim has been stale
+    // for the window they published — the same silence we just proved against
+    // their moderation record.
+    let url = rendezvous_url(&state).await;
+    if !url.is_empty() {
+        if let Err(e) = crate::network::rendezvous::handover_channel_name(
+            &url,
+            &old_id,
+            &successor.channel_id,
+            &successor.pubkey,
+            &state.identity.ed25519_public_key,
+            &state.identity.ed25519_secret_key,
+        )
+        .await
+        {
+            // The room is ours either way; only its directory name is behind,
+            // and the periodic refresh retries the claim.
+            tracing::warn!(
+                channel_id = %channel_id,
+                error = ?e,
+                "claimed the room but could not move its registry name yet"
+            );
+        }
+    }
+
     // Rotate the successor room straight away, and let that be what every
     // member converges on.
     //
@@ -2296,6 +2348,112 @@ pub async fn claim_channel_ownership(
     channel_info_from_id(&state, &successor_id_hex).await
 }
 
+/// How many rooms one Discover pass will ask the network to size. Each costs a
+/// FIND_VALUE, so this is the ceiling on what browsing adds to a walk.
+const MAX_PRESENCE_PROBE_ROOMS: usize = 24;
+
+/// How long to wait for those counts. Far shorter than a shard walk's budget:
+/// the size is a decoration on a listing the browse has already produced, so a
+/// slow answer should be dropped rather than hold the whole result back.
+const PRESENCE_PROBE_TIMEOUT_MS: u64 = 6_000;
+
+/// How recently a member must have announced themselves to be counted. Two
+/// republish intervals, so one missed announcement does not drop somebody, and
+/// the same rule the roster's presence dot uses.
+const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_REPUBLISH_SECS * 2;
+
+/// Count who is announcing themselves in public rooms we have not joined.
+///
+/// A public room's presence key folds in `public_join_secret`, which *is* the
+/// channel pubkey, and its presence extra is unsealed — so a directory listing
+/// alone is enough to read the room's size. Private rooms fold in a real secret
+/// and stay uncountable on purpose, which is why they never reach here.
+///
+/// Only the current epoch is asked for. A member who last announced under the
+/// previous key is missed for up to one republish interval, which is why the
+/// caller treats 0 as "unknown" rather than "empty".
+async fn probe_public_member_counts(
+    state: &AppState,
+    rooms: &[(String, String)],
+) -> Option<std::collections::HashMap<String, i64>> {
+    use std::collections::{HashMap, HashSet};
+
+    let now = chrono::Utc::now().timestamp();
+    let epoch = channel::presence_epoch(now);
+    let mut keys = Vec::new();
+    let mut wanted: HashMap<String, [u8; 16]> = HashMap::new();
+    for (id_hex, pk_hex) in rooms.iter().take(MAX_PRESENCE_PROBE_ROOMS) {
+        let Some(id) = hex::decode(id_hex)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        let Some(pk) = hex::decode(pk_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        keys.push(channel::presence_key(
+            &id,
+            &channel::public_join_secret(&pk),
+            epoch,
+        ));
+        wanted.insert(id_hex.clone(), id);
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let blobs = find_raw_keys_within(state, keys, PRESENCE_PROBE_TIMEOUT_MS)
+        .await
+        .unwrap_or_default();
+    // Hearing nothing at all cannot be told apart from not being able to ask,
+    // so the whole pass is inconclusive rather than a claim that every room is
+    // empty. One answer is enough to trust the silence of the others.
+    if blobs.is_empty() {
+        return None;
+    }
+    let mut members: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
+    for blob in blobs {
+        // Read the room out of the record header first so each blob is only
+        // signature-checked against the room it claims to be for.
+        let Some(rec) = SignedRecord::from_value_blob(&blob) else {
+            continue;
+        };
+        let id_hex = hex::encode(rec.file_hash);
+        let Some(channel_id) = wanted.get(&id_hex) else {
+            continue;
+        };
+        if let Some(member) =
+            SignedRecord::parse_channel_presence_member(&blob, channel_id, None)
+        {
+            // A record outlives its publisher's last announcement by design, so
+            // counting every one that is still stored would keep people in the
+            // room for half an hour after they left. Same window the roster uses
+            // to decide who is present.
+            if now.saturating_sub(member.timestamp) > PRESENCE_FRESH_SECS {
+                continue;
+            }
+            members
+                .entry(id_hex)
+                .or_default()
+                .insert(member.publisher_key);
+        }
+    }
+    // Rooms we asked about and heard nothing from are empty, not unknown —
+    // that is what lets a directory card drop a count that has gone away.
+    Some(
+        wanted
+            .into_keys()
+            .map(|id| {
+                let count = members.get(&id).map(|seen| seen.len() as i64).unwrap_or(0);
+                (id, count)
+            })
+            .collect(),
+    )
+}
+
 /// Turn one shard's raw `FOUND_VALUE` blobs into public room listings.
 ///
 /// `seen` is threaded across shards so a record several storers hold is listed
@@ -2336,6 +2494,7 @@ fn listings_from_blobs(
             name: rec.file_name,
             private,
             joined: joined_ids.contains(&id_hex),
+            member_count: None,
         });
     }
     out
@@ -2406,6 +2565,7 @@ pub async fn gather_channels(
             pubkey: listing.pubkey.to_ascii_lowercase(),
             name: listing.name,
             private: false,
+            member_count: None,
         });
     }
     if !out.is_empty() {
@@ -2423,6 +2583,25 @@ pub async fn gather_channels(
         }
         let _ = app.emit("ember:channels-found", &found);
         out.extend(found);
+    }
+
+    // A room the user has not joined shows no roster, so the directory is the
+    // only place its size can come from. Rooms we are already in are skipped:
+    // their own member table is both cheaper and more accurate.
+    let probe: Vec<(String, String)> = out
+        .iter()
+        .filter(|c| !c.private && !c.joined)
+        .map(|c| (c.channel_id.clone(), c.pubkey.clone()))
+        .collect();
+    if !probe.is_empty() {
+        if let Some(counts) = probe_public_member_counts(&state, &probe).await {
+            for item in out.iter_mut() {
+                if let Some(count) = counts.get(&item.channel_id) {
+                    item.member_count = Some(*count);
+                }
+            }
+            let _ = app.emit("ember:channels-found", &out);
+        }
     }
 
     let listings: Vec<(String, String, String)> = out
@@ -2471,6 +2650,9 @@ pub async fn cached_channels(
             pubkey: c.pubkey,
             name: c.name,
             private: false,
+            // Nobody's presence is cached, so the size stays unknown until the
+            // walk this cache is standing in for comes back.
+            member_count: None,
         })
         .collect())
 }
@@ -2509,6 +2691,14 @@ async fn publish_signed_record(
 }
 
 async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<u8>>, String> {
+    find_raw_keys_within(state, keys, DEFAULT_FIND_TIMEOUT_MS).await
+}
+
+async fn find_raw_keys_within(
+    state: &AppState,
+    keys: Vec<[u8; 16]>,
+    timeout_ms: u64,
+) -> Result<Vec<Vec<u8>>, String> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -2519,7 +2709,7 @@ async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     let pending = await_reply(rx, "channels_gather_failed", "No response from network").await??;
     match tokio::time::timeout(
-        std::time::Duration::from_millis(DEFAULT_FIND_TIMEOUT_MS),
+        std::time::Duration::from_millis(timeout_ms),
         pending.records_rx,
     )
     .await
@@ -2842,8 +3032,11 @@ mod tests {
     fn channel_username_rejects_anonymous_and_out_of_range() {
         assert!(sanitize_channel_username("A").is_err());
         assert!(sanitize_channel_username("Anonymous").is_err());
-        assert!(sanitize_channel_username(&"x".repeat(33)).is_err());
+        assert!(sanitize_channel_username("Ada Lovelace").is_err());
+        assert!(sanitize_channel_username("Ada_1").is_err());
+        assert!(sanitize_channel_username(&"x".repeat(13)).is_err());
         assert_eq!(sanitize_channel_username("Ada").unwrap(), "Ada");
+        assert_eq!(sanitize_channel_username("Ada1").unwrap(), "Ada1");
         assert_eq!(username_claim_key("Ada"), "ada");
     }
 }
