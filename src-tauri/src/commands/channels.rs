@@ -563,7 +563,13 @@ pub async fn create_channel(
         private,
         &ident.signing_key,
     );
-    let _ = publish_signed_record(&state, moderation).await;
+    // An empty topic, welcome and lists cannot overrun the record budget, so
+    // this only fires if those limits are ever changed out from under it.
+    if let Some(moderation) = moderation {
+        let _ = publish_signed_record(&state, moderation).await;
+    } else {
+        tracing::error!("Ember: the opening channel moderation record does not fit a STORE");
+    }
     // Remember it locally too, so this device's roster can hide Ban on us
     // without waiting for our own DHT record to be fetched back.
     let db_owner = state.db.clone();
@@ -1384,6 +1390,32 @@ async fn commit_channel_moderation(
         private,
         &owned.ident.signing_key,
     );
+    // Refuse before touching the database. A moderation record is a full
+    // snapshot, so one the network will not accept does not leave the previous
+    // state standing — the last good copy simply expires, taking the topic,
+    // welcome, both lists, the owner key, the key epoch and any successor
+    // nomination with it. Reporting the edit as applied while that happens is
+    // the worst of both.
+    //
+    // The `fits` check catches the commoner case, where the record would
+    // publish but the encoder would quietly drop entries past the cap, so the
+    // room would go on believing it had banned someone it had not.
+    if !crate::network::ember::dht::publish::moderation_snapshot_fits(
+        topic, welcome, bans, mods, &tail,
+    ) {
+        return Err(format!(
+            "This change does not fit in one published record. A room can carry up to \
+             {CHANNEL_BAN_LIST_MAX} bans, {CHANNEL_MOD_LIST_MAX} moderators and a \
+             {CHANNEL_WELCOME_MAX}-character welcome message. Remove something and try again."
+        ));
+    }
+    let Some(record) = record else {
+        return Err(
+            "This change does not fit in one published record. Shorten the welcome message \
+             or remove some bans or moderators, then try again."
+                .to_string(),
+        );
+    };
     let ts = record.timestamp;
     let tail_nominee = tail.successor_nominee;
     let tail_days = tail.claim_after_days;

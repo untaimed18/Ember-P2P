@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod engine;
 pub mod messages;
 pub mod observed;
+pub mod peer_cache;
 pub mod protection;
 pub mod publish;
 pub mod routing;
@@ -32,7 +33,28 @@ use serde::{Deserialize, Serialize};
 /// v2 read the contact list at a fixed stride and the `FOUND_VALUE` header at a
 /// fixed offset, so a v2 peer handed a v3 frame does not fail cleanly on its
 /// own — the version byte is what makes it a refusal instead of a misparse.
-pub const EMBER_DHT_VERSION: u8 = 3;
+///
+/// Bumped to 4 to bind a frame's signature to the Noise session it travels in.
+/// The signed bytes now end with the sender's own Noise static public key,
+/// which is *not* transmitted — the receiver already learned it from the
+/// handshake, so the frame is the same size on the wire and only the signature
+/// changes.
+///
+/// Without that binding a signed frame was a bearer token: it proved only that
+/// its sender_id had once signed those bytes, not that whoever delivered them
+/// was that sender. Anyone who had ever received a frame from Alice could
+/// replay it verbatim inside their own Noise session, and the receiver — which
+/// learns a *verified* contact from the session's address and static key on
+/// every frame that decodes — would record Alice as living at the replayer's
+/// address with the replayer's key. The `noise_pub` pin then held that entry
+/// against the real Alice, and replaying kept it fresh so it never aged out.
+/// Signing over our own static key makes the signature verify only against the
+/// session whose handshake proved ownership of that key.
+///
+/// A v3 peer's signature cannot verify here and ours cannot verify there, so
+/// the version byte has to move with it: this is a refusal at the version
+/// check rather than a stream of "signature verification failed".
+pub const EMBER_DHT_VERSION: u8 = 4;
 
 /// Oldest wire version this build can still parse.
 ///
@@ -40,7 +62,7 @@ pub const EMBER_DHT_VERSION: u8 = 3;
 /// another. A future change that only *adds* to the format can lower this
 /// instead of raising both, which is the whole point of keeping them separate:
 /// the decoder then accepts the range rather than a single value.
-pub const EMBER_DHT_MIN_VERSION: u8 = 3;
+pub const EMBER_DHT_MIN_VERSION: u8 = 4;
 pub const K_BUCKET_SIZE: usize = 20;
 pub const ALPHA: usize = 5;
 pub const ID_BITS: usize = 128;
@@ -127,8 +149,25 @@ impl EmberContact {
     }
 
     /// Whether we can send Ember UDP to this contact on the shared IPv4 socket.
+    ///
+    /// Unroutable space is excluded because a contact there is never something
+    /// we should dial on the strength of a peer having named it: loopback,
+    /// multicast, broadcast, `0.0.0.0/8` and the reserved blocks are either us
+    /// or nobody. The search shortlist — filled straight from `FOUND_NODE`, and
+    /// not the routing table — used to take this as its only admission test.
+    /// The user's own range filter is a separate, per-dial question the routing
+    /// table's gate answers; this is the part that holds regardless of policy.
+    ///
+    /// LAN, CGNAT and link-local are deliberately *not* excluded: `is_bogus_v4`
+    /// is `is_special_use_v4` minus [`crate::security::is_lan_or_cgnat_v4`],
+    /// which covers all three. Whether to talk to them is the
+    /// `block_private_ips` setting's call, and a LAN island is a supported
+    /// topology.
     pub fn is_dialable(&self) -> bool {
-        self.addr.port() != 0 && self.addr.ip().is_ipv4()
+        let std::net::IpAddr::V4(v4) = self.addr.ip() else {
+            return false;
+        };
+        self.addr.port() != 0 && !crate::security::is_bogus_v4(v4)
     }
 
     /// Subnet key (first 3 octets for IPv4, first 48 bits for IPv6).

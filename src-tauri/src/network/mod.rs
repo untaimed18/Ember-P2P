@@ -1547,6 +1547,41 @@ fn ember_publishable_peer_count(state: &NetworkState) -> usize {
     state.ember_dht.routing().verified_held() + ember_session_overlay_extras(state, true)
 }
 
+/// Everything worth writing to `nodes_ember.dat`, from all three places a
+/// contact can live.
+///
+/// [`ember_dht_ui_contact_counts`] counts bucket contacts, replacement-cache
+/// entries and session peers alike, but only the first of those was ever
+/// persisted — so the overlay figure on screen could be several times what the
+/// file held, and the peers a LAN or CGNAT node was actually talking to were
+/// never remembered at all.
+///
+/// The bucket set comes through [`ember::dht::engine::EmberDht::bootstrap_contacts`],
+/// which keeps its existing rule: proven contacts first, then untried leads to
+/// fill the remaining slots. Elsewhere only *verified* contacts qualify. That
+/// preserves the reason the replacement cache was excluded in the first place —
+/// it is where unproven gossip accumulates, and a file full of hearsay is worse
+/// than a short one — while no longer throwing away a peer we have genuinely
+/// spoken to merely because a full bucket or the IP filter put it there.
+fn ember_persistable_contacts(state: &NetworkState) -> Vec<ember::dht::EmberContact> {
+    let mut out = state
+        .ember_dht
+        .bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+    out.extend(
+        state
+            .ember_dht
+            .cached_contacts()
+            .into_iter()
+            .chain(state.ember_session_dht_contacts.values().cloned())
+            .filter(|c| {
+                c.is_verified()
+                    && c.is_dialable()
+                    && c.failed_queries < ember::dht::MAX_FAILED_QUERIES
+            }),
+    );
+    out
+}
+
 fn ember_session_overlay_extras(state: &NetworkState, verified_only: bool) -> usize {
     state
         .ember_session_dht_contacts
@@ -11853,6 +11888,22 @@ struct NetworkState {
     /// keeps sending signed frames renews its entry without needing a fresh
     /// eD2K introduction.
     ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+    /// Every Ember peer we remember, across restarts — the thing
+    /// `nodes_ember.dat` actually holds.
+    ///
+    /// Deliberately not the routing table. The table is live state: a lead that
+    /// will not answer three pings has to lose its bucket slot, and a peer the
+    /// public table refuses outright (LAN or CGNAT under `block_private_ips`)
+    /// never gets one at all. Writing the file straight from the table made
+    /// those two facts mean "forget this address", which cost a node most of
+    /// its peers on every restart and could only ever shrink the file. See
+    /// [`ember::dht::peer_cache`].
+    ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache,
+    /// Whether this session actually read `nodes_ember.dat`. Lets the save path
+    /// tell "the book is genuinely empty" from "we never got to look at it" —
+    /// see [`ember::dht::bootstrap::save_nodes`]. `true` when the file is simply
+    /// absent, which is a new profile rather than a failure.
+    ember_nodes_loaded: bool,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
     ember_rendezvous_published_at: i64,
@@ -13131,6 +13182,17 @@ async fn maybe_publish_owned_channel_records(
             private,
             &ident.signing_key,
         );
+        // A snapshot too large for one record cannot be republished at all, and
+        // the copy the network holds expires within the day. Say so once per
+        // refresh rather than letting the room quietly lose its governance.
+        let Some(record) = record else {
+            warn!(
+                "Ember: channel {} moderation snapshot does not fit one record; its published \
+                 state will lapse until the welcome or the ban/moderator lists are shortened",
+                hex::encode(channel_id)
+            );
+            continue;
+        };
         if let Some(publish_id) = state
             .ember_publish
             .start_publish(record, state.ember_dht.routing())
@@ -17108,6 +17170,26 @@ const EMBER_BRIDGE_FAST_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// table (which also meant persisting gossip we had never reached).
 const EMBER_PERSIST_MAX_CONTACTS: usize = 200;
 
+/// Remembered peers handed to the routing table at once, at launch and on each
+/// top-up.
+///
+/// Equal to the starved liveness budget, so a batch is fully probed in the tick
+/// it arrives and resolves — answered or three-struck — before the next one is
+/// needed. Larger batches do not join faster: the table cannot preserve the
+/// cache's ranking (see [`ember::dht::peer_cache::BootstrapCache::seed_batch`]),
+/// so anything past what one tick can dial just queues in XOR order and delays
+/// the peers most likely to answer.
+const EMBER_SEED_BATCH: usize = EMBER_MAINT_MAX_PINGS_STARVED;
+
+/// Batches `drive_ember_search` will pull in one call while none of them reach
+/// the wire.
+///
+/// Each barren round retires its whole batch, so the shortlist shrinks by at
+/// least ALPHA every pass and this is a safety net rather than a working limit
+/// — a shortlist is bounded by k plus its pins plus what is in flight, so eight
+/// passes at ALPHA covers any real one several times over.
+const EMBER_SEARCH_MAX_BARREN_ROUNDS: usize = 8;
+
 // ── Self-lookup and disconnect detection ──
 
 /// How long after start the join-time self-lookup runs on a cold table.
@@ -20659,7 +20741,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // share the same policy: a blocked address is refused whichever table
     // learned it, and `evict_filtered_contacts` runs once ranges are ready.
     let ember_dht =
-        ember::dht::engine::EmberDht::new(identity.ed25519_secret_key, settings.block_private_ips);
+        ember::dht::engine::EmberDht::new(
+            identity.ed25519_secret_key,
+            identity.noise_public_key,
+            settings.block_private_ips,
+        );
     // Shared with StatsManager below so send_kad_packet / Ember UDP
     // send-recv can record wire bytes without holding the manager.
     let kad_upload_overhead = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -20837,6 +20923,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache::new(),
+        ember_nodes_loaded: false,
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
@@ -21152,23 +21240,86 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     if nodes_ember_path.exists() {
         // Read + parse on the blocking pool: this is a synchronous whole-file
         // `std::fs` read inside an async fn that shares its runtime with the UI.
+        let load_path = nodes_ember_path.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_nodes(&nodes_ember_path)
+            ember::dht::bootstrap::load_nodes(&load_path)
         })
         .await;
         match loaded {
-            Ok(Ok(contacts)) => {
-                let n = contacts.len();
-                state.ember_dht.load_contacts(contacts);
+            Ok(Ok(entries)) => {
+                let n = entries.len();
+                state.ember_nodes_loaded = true;
+                state.ember_bootstrap_cache.load(entries);
+                // Through `seed_batch`, never straight from the file: the table
+                // has to receive every remembered peer as unproven, while the
+                // cache keeps the timestamps that say when we last reached one.
+                // Only the first batch goes in now — `run_ember_maintenance`
+                // tops the table up as leads fail, so the peers most likely to
+                // answer are dialled in the first tick instead of queuing behind
+                // an address book the ping budget would take many minutes to
+                // work through.
+                let local_id = state.ember_dht.local_id();
+                let seed = state.ember_bootstrap_cache.seed_batch(
+                    &local_id,
+                    &HashSet::new(),
+                    EMBER_SEED_BATCH,
+                );
+                let seeded: Vec<ember::dht::EmberNodeId> =
+                    seed.iter().map(|c| c.node_id).collect();
+                state.ember_dht.load_contacts(seed);
+                // Whatever the table took is genuinely being tried this session,
+                // so its silence counts at shutdown. The bulk loader reports no
+                // per-contact result, hence asking the table afterwards.
+                let admitted: Vec<ember::dht::EmberNodeId> = seeded
+                    .into_iter()
+                    .filter(|id| state.ember_dht.contact_for(id).is_some())
+                    .collect();
+                state
+                    .ember_bootstrap_cache
+                    .note_offered(admitted.into_iter());
                 info!(
-                    "Loaded {n} Ember DHT contacts from nodes_ember.dat ({} seeded into routing table)",
+                    "Loaded {n} remembered Ember peers from nodes_ember.dat ({} seeded into routing table)",
                     state.ember_dht.contact_count()
                 );
             }
-            Ok(Err(e)) => warn!("Failed to load nodes_ember.dat: {e}"),
+            Ok(Err(e)) => {
+                // A file we cannot parse would otherwise wedge saving forever:
+                // `ember_nodes_loaded` stays false on every launch, so the
+                // shrink guard refuses every write and the node can never
+                // persist a contact again. Quarantine it once — a version
+                // downgrade, a corrupt header or an over-large file are all
+                // permanent for this build — and carry on as if the file had
+                // been absent. The truncation path already keeps a dated copy
+                // this way.
+                warn!("Failed to load nodes_ember.dat: {e}");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let quarantine = nodes_ember_path.with_extension(format!("dat.unreadable.{ts}"));
+                match std::fs::rename(&nodes_ember_path, &quarantine) {
+                    Ok(()) => {
+                        state.ember_nodes_loaded = true;
+                        warn!(
+                            "Moved the unreadable nodes_ember.dat aside to {} so this node can \
+                             remember peers again",
+                            quarantine.display()
+                        );
+                    }
+                    Err(e) => warn!(
+                        "Could not move the unreadable nodes_ember.dat aside ({e}); peer \
+                         persistence stays disabled until it is removed"
+                    ),
+                }
+            }
+            // A panicked or cancelled task says nothing about the file, so the
+            // guard stays armed and the next launch tries again.
             Err(e) => warn!("nodes_ember.dat load task failed: {e}"),
         }
     } else {
+        // Absent is not unreadable: there is nothing to preserve, so the save
+        // path is free to write whatever this session learns.
+        state.ember_nodes_loaded = true;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
     state
@@ -37249,10 +37400,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         });
                     });
                 }
-                // Persist the Ember DHT routing table too (slice 7). Skip
-                // when empty so we don't churn a zero-contact file over a
-                // previously-populated one.
-                let ember_contacts = state.ember_dht.bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+                // Fold the live overlay into the remembered set and persist that
+                // (slice 7). Additive by construction: a peer that has just been
+                // evicted as an unresponsive lead stays in the cache, so this
+                // write can grow the file or refresh it but never cuts it down
+                // to whatever the table happens to hold five minutes into a
+                // session. Retiring an address is a once-per-session decision
+                // and belongs to the shutdown path. Still skipped when empty, so
+                // a brand-new profile doesn't churn a zero-contact file.
+                let live = ember_persistable_contacts(&state);
+                state.ember_bootstrap_cache.observe(live.iter());
+                let local_id = state.ember_dht.local_id();
+                // Bound the in-memory set here too, not only on the way out. It
+                // takes the whole replacement cache and every session peer every
+                // five minutes, and a peer answering FIND_NODE with invented
+                // contacts can inject fresh ids at will, so over a long session
+                // it would grow into the tens of thousands — and each save sorts
+                // the lot. Trimming to the same ceiling the file is written under
+                // discards only entries that could never have been saved anyway,
+                // and is a no-op below it.
+                state
+                    .ember_bootstrap_cache
+                    .trim_to(&local_id, EMBER_PERSIST_MAX_CONTACTS);
+                let ember_contacts = state
+                    .ember_bootstrap_cache
+                    .snapshot(&local_id, EMBER_PERSIST_MAX_CONTACTS);
                 if !ember_contacts.is_empty() {
                     let ember_path = state.data_dir.join("nodes_ember.dat");
                     // Off the loop, like the nodes.dat write above and for the
@@ -37273,11 +37445,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
                         return;
                     };
+                    let nodes_were_loaded = state.ember_nodes_loaded;
                     tokio::task::spawn_blocking(move || {
                         let _ownership = ownership;
-                        if let Err(e) =
-                            ember::dht::bootstrap::save_nodes(&ember_path, &ember_contacts)
-                        {
+                        if let Err(e) = ember::dht::bootstrap::save_nodes(
+                            &ember_path,
+                            &ember_contacts,
+                            nodes_were_loaded,
+                        ) {
                             error!("Failed periodic nodes_ember.dat save: {e}");
                         }
                     });
@@ -40441,11 +40616,33 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         }
     }
 
-    // Persist the Ember DHT routing table (slice 7) so the next session
-    // can rejoin the DHT immediately.
+    // Persist the remembered peer set (slice 7) so the next session can rejoin
+    // the DHT immediately.
+    //
+    // The only place an address is ever forgotten, and only ever for want of
+    // room. A session long enough to have pinged the peers it offered the table
+    // sinks each silent one in the ranking; the trim then keeps the best
+    // `EMBER_PERSIST_MAX_CONTACTS` of them, proven addresses ahead of gossip. A peer that is merely offline
+    // tonight is still here tomorrow — which matters most on a small overlay,
+    // where the addresses of a handful of peers who happen to be asleep are the
+    // only way back in. Charging misses per save instead would turn a session
+    // into five minutes and put the old ratchet back.
+    let live = ember_persistable_contacts(&state);
+    state.ember_bootstrap_cache.observe(live.iter());
+    let now_secs = chrono::Utc::now().timestamp();
+    let sunk = state.ember_bootstrap_cache.charge_silent_session(now_secs);
+    let local_id = state.ember_dht.local_id();
+    let dropped = state
+        .ember_bootstrap_cache
+        .trim_to(&local_id, EMBER_PERSIST_MAX_CONTACTS);
     let ember_contacts = state
-        .ember_dht
-        .bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+        .ember_bootstrap_cache
+        .snapshot(&local_id, EMBER_PERSIST_MAX_CONTACTS);
+    info!(
+        "Ember bootstrap cache: remembering {} peer(s) ({sunk} silent this session, \
+         {dropped} dropped for room)",
+        ember_contacts.len(),
+    );
     if !ember_contacts.is_empty() {
         let ember_nodes_path = state.data_dir.join("nodes_ember.dat");
         // Wait out a periodic save that is still in flight, bounded by the shared
@@ -40460,9 +40657,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .await
         {
             Ok(_ownership) => {
-                if let Err(e) =
-                    ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts)
-                {
+                if let Err(e) = ember::dht::bootstrap::save_nodes(
+                    &ember_nodes_path,
+                    &ember_contacts,
+                    state.ember_nodes_loaded,
+                ) {
                     error!("Failed to save nodes_ember.dat on shutdown: {e}");
                 }
             }
@@ -42255,18 +42454,62 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
         None => return,
     };
 
-    let batch = match state.ember_search.get_mut(search_id) {
-        Some(s) => s.next_to_query(),
-        None => return,
-    };
-
     let mut batch_sent = 0u32;
-    for query in batch {
+    // Keep pulling batches until one of them actually reaches the wire.
+    //
+    // Nothing re-drives a search except a response or a query deadline, and a
+    // query that was never sent has neither — so a call that retires its whole
+    // batch without transmitting leaves the walk idle until `cleanup_expired`
+    // reaps it two minutes later, holding a search slot and resolving its
+    // waiter empty. A scattered send failure rarely takes a whole batch, but an
+    // address the IP policy refuses is *systematically* correlated: an attacker
+    // can choose node ids near the target (the id is theirs to pick, which is
+    // the premise of the gate below) with addresses in a blocked range and
+    // occupy the head of the shortlist deliberately.
+    let mut barren_rounds = 0usize;
+    loop {
+        let batch = match state.ember_search.get_mut(search_id) {
+            Some(s) => s.next_to_query(),
+            None => return,
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for query in batch {
         let ember::dht::search::QueryTarget {
             contact,
             request_id: per_search_req_id,
             start_position,
         } = query;
+        // The shortlist is not the routing table, and its contents arrive
+        // straight out of a peer's `FOUND_NODE`. The table refuses an address
+        // the user blocked, but a search dialled its own shortlist directly, so
+        // a peer could name any IPv4 address it liked — a blocked range,
+        // special-use space, or a third party — and have us open unsolicited
+        // Noise handshakes to it. Getting into the top of the shortlist is
+        // cheap, since the node id is the attacker's to choose. Every other
+        // Ember dial path already consults this gate.
+        //
+        // `definitely_blocked`, not `!admits_addr`: the latter is fail-*closed*
+        // while `ipfilter.dat` is still parsing, and Ember addresses are never
+        // Kad seeds, so during that window it refuses every peer — which would
+        // have made a search on any node with the filter enabled retire its
+        // whole shortlist without dialling anyone. "Known bad" is the right
+        // question for whether to dial; the routing table draws the same
+        // distinction for admission versus eviction.
+        if state.ember_dht.routing().definitely_blocked(&contact.addr) {
+            debug!(
+                "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
+                contact.addr
+            );
+            if let Some(search) = state.ember_search.get_mut(search_id) {
+                let _ = search.mark_failed_with(
+                    per_search_req_id,
+                    ember::dht::search::QueryFailure::NotSent,
+                );
+            }
+            continue;
+        }
         let (wire_req_id, frame) = match search_type {
             ember::dht::search::SearchType::FindNode => state.ember_dht.build_find_node(target),
             ember::dht::search::SearchType::FindValue => {
@@ -42390,6 +42633,22 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 sent_unix: chrono::Utc::now().timestamp(),
             },
         );
+        }
+        if batch_sent > 0 {
+            break;
+        }
+        // Nothing left this call. Bounded so a shortlist of entries we cannot
+        // dial costs one pass, not a spin: every barren round retires its
+        // whole batch, so the shortlist strictly shrinks and this terminates
+        // well before the cap on any real search.
+        barren_rounds += 1;
+        if barren_rounds >= EMBER_SEARCH_MAX_BARREN_ROUNDS {
+            debug!(
+                "Ember search {search_id}: gave up after {barren_rounds} batches that could \
+                 not be dialled"
+            );
+            break;
+        }
     }
 
     if batch_sent > 0 {
@@ -44815,6 +45074,90 @@ async fn start_ember_source_search(
 /// a measured cold start. Re-running it is close to free once the candidates
 /// are spent, because `bridge_retry_due` holds every attempted peer until its
 /// backoff expires and the extra passes just build an empty candidate list.
+/// Probe the oldest contact of each bucket a newcomer could not enter.
+///
+/// Kademlia bucket pressure: `add_contact` answers `PingOldest` when the bucket
+/// is full. The newcomer is already parked in that bucket's replacement cache,
+/// and whether it ever gets a slot depends entirely on this probe. If the
+/// incumbent answers it keeps its slot (proven-live contacts win, and the
+/// newcomer ages out of the cache); if it stays silent past
+/// `EMBER_MAINT_PING_TIMEOUT` the 1-second sweep faults and evicts it,
+/// promoting the newcomer. Registering the probe in the same
+/// `ember_dht_maint_pings` map the liveness sweep drains is what makes that
+/// fault/evict/promote path fire for free.
+///
+/// Shared by the inbound path and the bootstrap-cache top-up so the two cannot
+/// drift — the top-up originally discarded `PingOldest` entirely, which left
+/// the peers it parked waiting on an eviction nothing would ever trigger.
+async fn probe_bucket_oldest(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    targets: &[(SocketAddr, ember::dht::EmberNodeId, [u8; 32])],
+    now: i64,
+) {
+    for (oldest_addr, oldest_id, oldest_noise) in targets {
+        // One probe per contact: if a liveness or earlier bucket-pressure
+        // ping to it is already outstanding, that one already decides its
+        // fate — piling on would over-count failures and waste packets.
+        if state
+            .ember_dht_maint_pings
+            .values()
+            .any(|p| p.node_id == *oldest_id)
+        {
+            continue;
+        }
+        let (wire_req_id, frame) = state.ember_dht.build_ping();
+        let mut behind_handshake = false;
+        let sent =
+            match state
+                .ember_transport
+                .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
+            {
+                ember::transport::OutgoingResult::Ready { packet } => {
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    behind_handshake = true;
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {
+                    behind_handshake = true;
+                    true
+                }
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
+                    false
+                }
+            };
+        if sent {
+            state.ember_dht_maint_pings.insert(
+                wire_req_id,
+                new_ember_maint_ping(*oldest_id, behind_handshake, now),
+            );
+            state.ember_diagnostics.ember_dht_liveness_pings_sent = state
+                .ember_diagnostics
+                .ember_dht_liveness_pings_sent
+                .saturating_add(1);
+        }
+    }
+}
+
 async fn run_ember_kad_bridge(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -44913,17 +45256,39 @@ async fn run_ember_maintenance(
         }
 
         let contacts = ember_overlay_contact_count(state);
+        // Whether the "overlay just emptied" edge was acted on. It used to be
+        // consumed either way, so a transition suppressed by the rate limiter
+        // was lost for good: empty at t=100 re-arms, the fresh batch is
+        // admitted, all of it is three-struck by t=160, the count returns to
+        // zero — but 60s is inside `EMBER_EMPTY_REARM_SECS`, so nothing fires,
+        // and with the edge already spent it can never recur. The node then
+        // holds a fully-consumed `offered` set and cannot re-dial a single
+        // remembered peer for the rest of the session, however reachable they
+        // become. This is the cache's only recovery path, so it must survive
+        // being rate-limited.
+        let mut rearmed = false;
         if contacts == 0
             && state.ember_last_overlay_contacts > 0
             && now_secs.saturating_sub(state.ember_empty_rearmed_at) >= EMBER_EMPTY_REARM_SECS
         {
+            rearmed = true;
             info!("Ember DHT: overlay emptied, re-arming bootstrap");
             state.ember_kad_bridge_attempted.clear();
             state.ember_bridge_fast_at = None;
             state.ember_rendezvous_looked_up_at = 0;
+            // Let the remembered peers be offered again. Each is handed to the
+            // table once per session, which is right while the table still
+            // holds them and wrong the moment it does not — a suspend/resume,
+            // an interface change or an `ipfilter.dat` reload can empty it, and
+            // without this the address book is unusable until a restart.
+            state.ember_bootstrap_cache.rearm_offers();
             state.ember_empty_rearmed_at = now_secs;
         }
-        state.ember_last_overlay_contacts = contacts;
+        // Hold the edge open while it is still pending, so a suppressed
+        // transition is retried once the floor passes.
+        if contacts > 0 || rearmed {
+            state.ember_last_overlay_contacts = contacts;
+        }
     }
 
     // 0a) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
@@ -44953,6 +45318,94 @@ async fn run_ember_maintenance(
     let admitted = state.ember_dht.promote_cached_contacts();
     if admitted > 0 {
         debug!("Ember DHT: promoted {admitted} cached contact(s) into free bucket slots");
+    }
+
+    // 0b2) Top the table up from the remembered set. Runs after the purge and
+    //      the eviction sweep it follows, so the slots the last batch just
+    //      vacated are refilled in time for this tick's liveness pings.
+    //
+    //      Only while the table is still short of a working set: once we hold a
+    //      bucket's worth of proven contacts, gossip and lookups keep it fed and
+    //      dialling an address book is pointless traffic. Each peer is offered
+    //      once per session, so this walks steadily through the book instead of
+    //      re-dialling whatever died most recently, and stops on its own when
+    //      there is nothing left to offer.
+    //
+    //      Held back while a batch of *ours* is still outstanding, or the
+    //      timer's immediate first tick would stack a second batch on the one
+    //      seeded at launch and put back the queueing this is here to avoid.
+    //      Counted as seeds still sitting unproven in the table, not as bucket
+    //      leads at large: gossip is also unverified and arrives far faster, so
+    //      measuring all leads let two answered FIND_NODEs pin the gate shut
+    //      while the verified count was still nearly zero and leave the rest of
+    //      the address book — the entries with real history — undialled.
+    let held: HashSet<ember::dht::EmberNodeId> = state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .chain(state.ember_dht.cached_contacts())
+        .map(|c| c.node_id)
+        .chain(state.ember_session_dht_contacts.values().map(|c| c.node_id))
+        .collect();
+    // Cache entries count too, or a seed the table parked there is neither
+    // re-offered (it is in `held`, which includes the cache) nor counted as
+    // outstanding — so it would silently open the gate for another batch.
+    let held_leads: HashSet<ember::dht::EmberNodeId> = state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .chain(state.ember_dht.cached_contacts())
+        .filter(|c| !c.is_verified())
+        .map(|c| c.node_id)
+        .collect();
+    let outstanding = state.ember_bootstrap_cache.offers_outstanding(&held_leads);
+    if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+        && outstanding < EMBER_SEED_BATCH
+    {
+        let local_id = state.ember_dht.local_id();
+        let batch = state
+            .ember_bootstrap_cache
+            .seed_batch(&local_id, &held, EMBER_SEED_BATCH);
+        if !batch.is_empty() {
+            let offered_count = batch.len();
+            // One at a time through the admission gate, not `load_contacts`:
+            // that detaches the range filter, which is right only at startup,
+            // where it is fail-closed because `ipfilter.dat` has not parsed yet.
+            // By now it has, and bypassing it here would dial addresses the user
+            // blocked.
+            let mut admitted = Vec::with_capacity(batch.len());
+            let mut pressure = Vec::new();
+            for contact in batch {
+                match state.ember_dht.offer_contact(contact.clone()) {
+                    ember::dht::routing::AddResult::Added => admitted.push(contact.node_id),
+                    // The bucket is full; the newcomer is parked in its
+                    // replacement cache and gets a slot only if the incumbent
+                    // fails the probe the table just asked for. Dropping this
+                    // would leave it waiting on an eviction nothing triggers.
+                    ember::dht::routing::AddResult::PingOldest {
+                        addr,
+                        node_id,
+                        noise_pub,
+                    } => pressure.push((addr, node_id, noise_pub)),
+                    ember::dht::routing::AddResult::Rejected => {}
+                }
+            }
+            // Only what the table actually took counts as tried. Marking the
+            // whole batch would let a book be consumed without a single peer
+            // being dialled — a contact the IP policy or a diversity cap
+            // refuses never enters the table, so it would never appear in
+            // `held_leads` either, and the gate would reopen immediately.
+            state
+                .ember_bootstrap_cache
+                .note_offered(admitted.iter().copied());
+            debug!(
+                "Ember DHT: offered {offered_count} remembered peer(s) to the routing table, \
+                 {} admitted, {} behind a full bucket",
+                admitted.len(),
+                pressure.len()
+            );
+            probe_bucket_oldest(socket, state, &pressure, now_secs).await;
+        }
     }
 
     // Announce bookkeeping only means anything for contacts we still hold,
@@ -45743,77 +46196,7 @@ async fn handle_ember_dht_message(
         }
     }
 
-    // Kademlia bucket pressure: learning the sender (or a FOUND_NODE
-    // contact) hit a full bucket, so the engine asks us to ping the
-    // *oldest* contact there. The newcomer is already parked in that
-    // bucket's replacement cache. If the oldest answers it keeps its
-    // slot (proven-live contacts win — the newcomer ages out of the
-    // cache); if it stays silent past EMBER_MAINT_PING_TIMEOUT the
-    // 1-second sweep faults and evicts it, promoting the newcomer. We
-    // register these probes in the same `ember_dht_maint_pings` map the
-    // liveness sweep already drains, so that fault/evict/promote path
-    // fires for free.
-    for (oldest_addr, oldest_id, oldest_noise) in &inbound.ping_oldest {
-        // One probe per contact: if a liveness or earlier bucket-pressure
-        // ping to it is already outstanding, that one already decides its
-        // fate — piling on would over-count failures and waste packets.
-        if state
-            .ember_dht_maint_pings
-            .values()
-            .any(|p| p.node_id == *oldest_id)
-        {
-            continue;
-        }
-        let (wire_req_id, frame) = state.ember_dht.build_ping();
-        let mut behind_handshake = false;
-        let sent =
-            match state
-                .ember_transport
-                .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
-            {
-                ember::transport::OutgoingResult::Ready { packet } => {
-                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    behind_handshake = true;
-                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::Queued => {
-                    behind_handshake = true;
-                    true
-                }
-                ember::transport::OutgoingResult::Error(e) => {
-                    debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
-                    false
-                }
-            };
-        if sent {
-            state.ember_dht_maint_pings.insert(
-                wire_req_id,
-                new_ember_maint_ping(*oldest_id, behind_handshake, now),
-            );
-            state.ember_diagnostics.ember_dht_liveness_pings_sent = state
-                .ember_diagnostics
-                .ember_dht_liveness_pings_sent
-                .saturating_add(1);
-        }
-    }
+    probe_bucket_oldest(socket, state, &inbound.ping_oldest, now).await;
 
     // While the public table is still too thin to run lookups, ask this
     // peer for their contact list now instead of waiting for the 60s tick.

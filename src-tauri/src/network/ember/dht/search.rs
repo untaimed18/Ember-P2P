@@ -59,6 +59,18 @@ const MAX_RESULTS_PER_NODE: usize = MAX_SEARCH_RESULTS / 4;
 /// work at one repeat query per node so a search still converges.
 const MAX_QUERY_ATTEMPTS: u8 = 2;
 
+/// Firsthand session peers [`IterativeSearch::seed_extra_contacts`] may pin
+/// onto one shortlist.
+///
+/// Pins are exempt from the k-trim, so they are additive to the Kademlia
+/// shortlist rather than competing with it, and `FIND_VALUE` exhausts the
+/// shortlist rather than converging early. Half a bucket keeps the LAN/island
+/// publishers this exists to reach without letting them dominate the walk —
+/// the session table can hold 64, more than three times `K_BUCKET_SIZE`, and
+/// querying all of them at `MAX_QUERY_ATTEMPTS` does not fit inside
+/// `SEARCH_TIMEOUT_SECS` at ALPHA concurrency.
+const MAX_PINNED_EXTRA_CONTACTS: usize = super::K_BUCKET_SIZE / 2;
+
 /// Consecutive responses that bring nothing closer before a `FIND_NODE` walk
 /// calls itself converged.
 ///
@@ -496,9 +508,31 @@ impl IterativeSearch {
     ///
     /// Keyword records on a LAN or island publisher never reach the public
     /// walk unless that peer is asked directly.
-    pub fn seed_extra_contacts(&mut self, contacts: Vec<EmberContact>) -> usize {
+    ///
+    /// Capped, because a pin is exempt from the k-trim and `FIND_VALUE`
+    /// deliberately never converges early — it exhausts the shortlist. The
+    /// session table holds up to `MAX_EMBER_SESSION_DHT_CONTACTS` (64) against
+    /// a `K_BUCKET_SIZE` of 20, so pinning all of them could outnumber the
+    /// entire Kademlia shortlist three to one; with those peers slow or gone,
+    /// which is the LAN/CGNAT case this mechanism exists for, 84 entries at
+    /// `MAX_QUERY_ATTEMPTS` is well past what `SEARCH_TIMEOUT_SECS` allows at
+    /// ALPHA concurrency, and the search expired having never descended toward
+    /// the target. Most-recently-seen first, so the cap keeps the peers most
+    /// likely to answer.
+    pub fn seed_extra_contacts(&mut self, mut contacts: Vec<EmberContact>) -> usize {
+        // Ranked, then capped on what is actually *pinned* — not on candidates.
+        // Truncating the input first spent slots on peers the filters below
+        // discard, and the commonest discard is "already on the shortlist",
+        // which adds nothing. Session peers are exactly the peers most likely
+        // to be routing-table contacts already seeding it, so on the small
+        // overlay this exists for, the LAN publisher that is *not* in the table
+        // — the one the pin is for — was the one ordered out.
+        contacts.sort_by_key(|c| std::cmp::Reverse(c.last_seen));
         let mut added = 0;
         for contact in contacts {
+            if added >= MAX_PINNED_EXTRA_CONTACTS {
+                break;
+            }
             if !contact.is_dialable() {
                 continue;
             }
@@ -539,8 +573,8 @@ impl IterativeSearch {
         request_id: u32,
         from_id: &EmberNodeId,
         closer_nodes: Vec<EmberContact>,
-        value_records: Vec<Vec<u8>>,
-        page: Option<ValuePage>,
+        mut value_records: Vec<Vec<u8>>,
+        mut page: Option<ValuePage>,
     ) -> ResponseOutcome {
         // Reject responses we didn't ask for: an attacker (or a buggy
         // peer) sending arbitrary `(request_id, from_id)` pairs must
@@ -579,6 +613,33 @@ impl IterativeSearch {
         // DHT key: blobs are `record_data || 64-byte sig` with keyword_hash
         // at bytes [1..17]. Without this check a malicious LOOKUP peer can
         // return any publisher-signed keyword records as hits for the query.
+        // A `FIND_NODE` asked for contacts, so a value answer to it is unasked
+        // for and nothing downstream reads it: `maybe_finish_ember_search`'s
+        // `FindNode` arm never looks at `results`. Taking it anyway meant a peer
+        // we sent `FIND_NODE` could reply `FOUND_VALUE` under that request id
+        // and buy up to 300 Ed25519 verifications and a few hundred KB of dead
+        // buffer per search, aimed at the task that also drives eD2K, KAD and
+        // the UI. The key binding below is scoped to value searches too, so
+        // these were the blobs entering unchecked.
+        //
+        // The paging half has to go with it. `queue_next_page` has no search
+        // type of its own, and `next_to_query` reserves half the α budget for
+        // pages — so a single peer could take half a `FIND_NODE` walk's
+        // concurrency for repeat queries to itself, which cannot even make
+        // progress: the driver builds a plain `FIND_NODE` for a page follow-up
+        // and ignores `start_position`.
+        let value_answer_expected = self.search_type == SearchType::FindValue;
+        if !value_answer_expected {
+            if !value_records.is_empty() {
+                debug!(
+                    "Search {}: ignoring {} record(s) offered to a FIND_NODE",
+                    self.id,
+                    value_records.len()
+                );
+                value_records = Vec::new();
+            }
+            page = None;
+        }
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -1046,10 +1107,10 @@ impl SearchManager {
                 break;
             }
             // The same key binding the wire path applies to FOUND_VALUE
-            // blobs. The store already refuses a record whose embedded key
-            // differs from the key it is filed under, so this should never
-            // reject anything; keeping the two paths identical means the
-            // invariant holds here even if that gate ever moves.
+            // blobs. `DhtStore::store_attributed` re-derives the key from the
+            // signed body and refuses a mismatch, so this should never reject
+            // anything; keeping the two paths identical means the invariant
+            // holds here even if that gate ever moves.
             if data.len() < 17 + 64 || data[1..17] != search.target.0 {
                 continue;
             }

@@ -5,10 +5,15 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
 
+use super::peer_cache::CachedContact;
 use super::{EmberContact, EmberNodeId};
 
 const NODES_EMBER_MAGIC: u32 = 0x454D_4233; // "EMB3" in LE
-const NODES_EMBER_VERSION: u8 = 1;
+/// v2 appends a per-entry miss count, so how many consecutive sessions have
+/// failed to reach an address survives the restart it is counting. v1 files
+/// still load — every entry simply starts with a clean slate.
+const NODES_EMBER_VERSION: u8 = 2;
+const NODES_EMBER_VERSION_WITHOUT_MISSES: u8 = 1;
 /// Contacts `load_nodes` will parse from one file, whatever its header claims.
 ///
 /// Same reasoning as [`MAX_PERSISTED_RECORDS`], and taken from the same place —
@@ -55,14 +60,18 @@ fn backup_before_overwrite(path: &Path) {
     }
 }
 
-/// Persist the routing table to `nodes_ember.dat`.
+/// Persist the bootstrap cache to `nodes_ember.dat`.
 ///
 /// Format:
 ///   magic(4) + version(1) + count(u16 LE) +
 ///   for each contact:
 ///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
-///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE)
-pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> {
+///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE) + misses(1)
+pub fn save_nodes(
+    path: &Path,
+    contacts: &[CachedContact],
+    nodes_were_loaded: bool,
+) -> anyhow::Result<()> {
     // Never trade a usable bootstrap file for an empty one. A table can be
     // momentarily empty (startup, the transport toggled off, a network drop),
     // and overwriting the file at that moment leaves the next launch with no
@@ -70,6 +79,22 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
     if contacts.is_empty() && path.exists() {
         info!(
             "Skipping Ember nodes save: routing table empty but {} already exists",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    // A file we could not read is not a file with nothing in it. `load_nodes`
+    // fails with the contents perfectly intact on a version downgrade, a bad
+    // magic, an oversized file, or — routinely on Windows — a sharing violation
+    // from antivirus, the indexer or backup software. The cache then starts
+    // empty, nothing re-reads the file, and the next save would overwrite two
+    // hundred remembered peers with whatever this one session managed to find.
+    // `save_store` has taken the same flag for the same reason all along.
+    if !nodes_were_loaded && path.exists() {
+        info!(
+            "Skipping Ember nodes save: this session never loaded {}, so what it \
+             holds cannot be compared with what is there",
             path.display()
         );
         return Ok(());
@@ -88,7 +113,8 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
     let count = contacts.len().min(u16::MAX as usize);
     buf.write_u16::<LittleEndian>(count as u16)?;
 
-    for contact in contacts.iter().take(count) {
+    for entry in contacts.iter().take(count) {
+        let contact = &entry.contact;
         buf.write_all(&contact.node_id.0)?;
 
         match contact.addr.ip() {
@@ -105,6 +131,7 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
         buf.write_all(&contact.noise_pub)?;
         buf.write_all(&contact.ed25519_pub)?;
         buf.write_i64::<LittleEndian>(contact.last_seen)?;
+        buf.write_u8(entry.misses)?;
     }
 
     backup_before_overwrite(path);
@@ -113,8 +140,15 @@ pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Load contacts from `nodes_ember.dat`.
-pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
+/// Load remembered contacts from `nodes_ember.dat`.
+///
+/// The persisted `last_seen` is returned as written, because the bootstrap
+/// cache ranks by it and decides on it whether a session reached the peer. It
+/// must not reach the routing table, which needs every restored entry to look
+/// unproven — [`super::peer_cache::BootstrapCache::seed_batch`] is what
+/// enforces that, and is the only supported way to get contacts from here into
+/// a table.
+pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<CachedContact>> {
     crate::security::recover_interrupted_replace(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_NODES_EMBER_BYTES {
@@ -198,16 +232,30 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
             break;
         }
 
-        // The persisted timestamp records when the *previous* session last
-        // heard from this contact. It is deliberately not carried forward:
-        // `last_seen` is what marks a contact as proven, and a contact we
-        // have not spoken to since launch has proven nothing. Restoring it
-        // would make every entry look verified the moment it loads, so the
-        // staleness purge would delete the whole bootstrap set — before a
-        // single ping went out — for any restart after the stale threshold.
-        // Zero also sorts them first for liveness probing, which is exactly
-        // the order we want.
-        let _persisted_last_seen = cursor.read_i64::<LittleEndian>().unwrap_or(0);
+        // When the *previous* session last heard from this contact. Kept for
+        // the cache, which needs it to tell a session that reached the peer
+        // from one that only remembered it, and stripped on the way into the
+        // routing table, which needs every restored entry to look unproven.
+        //
+        // Kept raw here; the clamp belongs to the cache, which is the only
+        // thing that knows what "before this session" means. Clamping to
+        // wall-clock now would not have worked: `load_nodes` runs *after*
+        // `BootstrapCache::new` stamps the session start, so "now" is at or
+        // past it, and a future-dated entry would still satisfy "did we reach
+        // anybody this run" — the exact guard the clamp was meant to protect.
+        // After an NTP correction on a machine whose clock was fast, that is
+        // every entry in the file at once.
+        let persisted_last_seen = cursor.read_i64::<LittleEndian>().unwrap_or(0);
+
+        // Absent in v1, where every entry starts even.
+        let misses = if version > NODES_EMBER_VERSION_WITHOUT_MISSES {
+            match cursor.read_u8() {
+                Ok(m) => m,
+                Err(_) => break,
+            }
+        } else {
+            0
+        };
 
         // Re-derive the node id from the persisted Ed25519 key rather than
         // trusting the on-disk `node_id`. If the file was tampered with (or
@@ -222,13 +270,16 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
         };
         let _ = node_id; // persisted id is advisory; derived id is authoritative
 
-        contacts.push(EmberContact {
-            node_id: EmberNodeId(derived),
-            addr: SocketAddr::new(ip, port),
-            noise_pub,
-            ed25519_pub,
-            last_seen: 0,
-            failed_queries: 0,
+        contacts.push(CachedContact {
+            contact: EmberContact {
+                node_id: EmberNodeId(derived),
+                addr: SocketAddr::new(ip, port),
+                noise_pub,
+                ed25519_pub,
+                last_seen: persisted_last_seen,
+                failed_queries: 0,
+            },
+            misses,
         });
     }
 
@@ -491,19 +542,22 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    fn make_contact(id: u8) -> EmberContact {
+    fn make_contact(id: u8) -> CachedContact {
         // `load_nodes` re-derives the node id from the Ed25519 key and drops
         // contacts whose key isn't a valid curve point, so use a real keypair
         // (any 32 bytes is a valid Ed25519 seed).
         let sk = ed25519_dalek::SigningKey::from_bytes(&[id; 32]);
         let vk = sk.verifying_key();
-        EmberContact {
-            node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk)),
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 2, id)), 4662),
-            noise_pub: [id; 32],
-            ed25519_pub: vk.to_bytes(),
-            last_seen: 1000 + id as i64,
-            failed_queries: 0,
+        CachedContact {
+            contact: EmberContact {
+                node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk)),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 2, id)), 4662),
+                noise_pub: [id; 32],
+                ed25519_pub: vk.to_bytes(),
+                last_seen: 1000 + id as i64,
+                failed_queries: 0,
+            },
+            misses: id % 3,
         }
     }
 
@@ -514,25 +568,133 @@ mod tests {
         let path = dir.join("nodes_ember.dat");
 
         let contacts = vec![make_contact(1), make_contact(2), make_contact(3)];
-        save_nodes(&path, &contacts).unwrap();
+        save_nodes(&path, &contacts, true).unwrap();
         let loaded = load_nodes(&path).unwrap();
 
         assert_eq!(loaded.len(), 3);
-        assert_eq!(loaded[0].node_id, contacts[0].node_id);
-        assert_eq!(loaded[0].addr, contacts[0].addr);
-        assert_eq!(loaded[0].noise_pub, contacts[0].noise_pub);
-        assert_eq!(loaded[2].node_id, contacts[2].node_id);
-        // A loaded contact has proven nothing yet this session, so it comes
-        // back unverified regardless of how recently the previous session
-        // heard from it. Carrying the timestamp forward would make the
-        // staleness purge delete the entire bootstrap set on any restart
-        // after the stale threshold, before a single ping was sent.
-        assert!(
-            contacts[0].last_seen > 0,
-            "the fixture must have a real timestamp for this to mean anything"
+        assert_eq!(loaded[0].contact.node_id, contacts[0].contact.node_id);
+        assert_eq!(loaded[0].contact.addr, contacts[0].contact.addr);
+        assert_eq!(loaded[0].contact.noise_pub, contacts[0].contact.noise_pub);
+        assert_eq!(loaded[2].contact.node_id, contacts[2].contact.node_id);
+        // The cache keeps the real timestamp — it is what tells a session that
+        // reached the peer from one that only remembered it. Stripping it is
+        // `BootstrapCache::seed_batch`'s job, on the way into the table.
+        assert!(loaded
+            .iter()
+            .zip(&contacts)
+            .all(|(l, c)| l.contact.last_seen == c.contact.last_seen));
+        // Miss counts have to survive the restart they are counting, or an
+        // address can never be retired.
+        assert!(loaded
+            .iter()
+            .zip(&contacts)
+            .all(|(l, c)| l.misses == c.misses));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file we could not read is not a file with nothing in it. `load_nodes`
+    /// fails with the contents intact on a version downgrade, a bad magic, an
+    /// oversized file, or a Windows sharing violation from antivirus or backup
+    /// software — and the next save would then bury two hundred remembered
+    /// peers under whatever one session happened to find.
+    #[test]
+    fn a_session_that_could_not_read_the_file_must_not_overwrite_it() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_unread");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        let book: Vec<CachedContact> = (1..=8).map(make_contact).collect();
+        save_nodes(&path, &book, true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // This session never loaded it and found one peer of its own.
+        save_nodes(&path, &[make_contact(9)], false).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the unread book must survive untouched"
         );
-        assert!(loaded.iter().all(|c| c.last_seen == 0));
-        assert!(loaded.iter().all(|c| !c.is_verified()));
+        assert_eq!(load_nodes(&path).unwrap().len(), 8);
+
+        // A session that did read it is free to rewrite it.
+        save_nodes(&path, &[make_contact(9)], true).unwrap();
+        assert_eq!(load_nodes(&path).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same flag must not stop a brand-new profile from ever saving: with
+    /// no file to protect there is nothing to lose.
+    #[test]
+    fn a_missing_file_is_still_written_even_if_nothing_was_loaded() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+        let _ = std::fs::remove_file(&path);
+
+        save_nodes(&path, &[make_contact(3)], false).unwrap();
+        assert_eq!(load_nodes(&path).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The loader reports what the file says, including a nonsensical
+    /// timestamp. Deciding what counts as "before this session" needs the
+    /// session start, which only the cache knows, so the clamp lives there —
+    /// see `BootstrapCache::load` and its
+    /// `a_future_dated_entry_cannot_fake_having_been_reached` test.
+    #[test]
+    fn the_loader_reports_the_timestamp_the_file_carries() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_future");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        let mut ahead = make_contact(5);
+        let far_future = chrono::Utc::now().timestamp() + 86_400;
+        ahead.contact.last_seen = far_future;
+        save_nodes(&path, &[ahead], true).unwrap();
+
+        let loaded = load_nodes(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].contact.last_seen, far_future);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1 files predate the miss count. They must still load, with every entry
+    /// starting even rather than being refused or misparsed.
+    #[test]
+    fn a_v1_file_loads_with_a_clean_slate() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        let contacts = [make_contact(7), make_contact(8)];
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_u32::<LittleEndian>(NODES_EMBER_MAGIC).unwrap();
+        buf.write_u8(NODES_EMBER_VERSION_WITHOUT_MISSES).unwrap();
+        buf.write_u16::<LittleEndian>(contacts.len() as u16).unwrap();
+        for entry in &contacts {
+            let c = &entry.contact;
+            buf.write_all(&c.node_id.0).unwrap();
+            buf.write_u8(4).unwrap();
+            let std::net::IpAddr::V4(ip) = c.addr.ip() else {
+                unreachable!()
+            };
+            buf.write_all(&ip.octets()).unwrap();
+            buf.write_u16::<byteorder::BigEndian>(c.addr.port()).unwrap();
+            buf.write_all(&c.noise_pub).unwrap();
+            buf.write_all(&c.ed25519_pub).unwrap();
+            buf.write_i64::<LittleEndian>(c.last_seen).unwrap();
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let loaded = load_nodes(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].contact.node_id, contacts[0].contact.node_id);
+        assert_eq!(loaded[1].contact.addr, contacts[1].contact.addr);
+        assert!(loaded.iter().all(|c| c.misses == 0));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -549,12 +711,12 @@ mod tests {
 
         // Distinct real keypairs: the loader re-derives each id from its key,
         // and duplicates would be indistinguishable from a shorter file.
-        let overlong: Vec<EmberContact> = (0..(MAX_PERSISTED_CONTACTS as u16 + 5))
+        let overlong: Vec<CachedContact> = (0..(MAX_PERSISTED_CONTACTS as u16 + 5))
             .map(|i| {
                 let mut seed = [0u8; 32];
                 seed[..2].copy_from_slice(&i.to_le_bytes());
                 let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-                EmberContact {
+                CachedContact::new(EmberContact {
                     node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(
                         &vk,
                     )),
@@ -563,10 +725,10 @@ mod tests {
                     ed25519_pub: vk.to_bytes(),
                     last_seen: 1000,
                     failed_queries: 0,
-                }
+                })
             })
             .collect();
-        save_nodes(&path, &overlong).unwrap();
+        save_nodes(&path, &overlong, true).unwrap();
 
         let loaded = load_nodes(&path).unwrap();
         assert_eq!(
@@ -586,7 +748,7 @@ mod tests {
 
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
         let vk = sk.verifying_key();
-        let contacts = vec![EmberContact {
+        let contacts = vec![CachedContact::new(EmberContact {
             node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk)),
             addr: SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
@@ -596,14 +758,14 @@ mod tests {
             ed25519_pub: vk.to_bytes(),
             last_seen: 42,
             failed_queries: 0,
-        }];
-        save_nodes(&path, &contacts).unwrap();
+        })];
+        save_nodes(&path, &contacts, true).unwrap();
         let loaded = load_nodes(&path).unwrap();
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].node_id, contacts[0].node_id);
+        assert_eq!(loaded[0].contact.node_id, contacts[0].contact.node_id);
         assert_eq!(
-            loaded[0].addr,
+            loaded[0].contact.addr,
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
                 9999

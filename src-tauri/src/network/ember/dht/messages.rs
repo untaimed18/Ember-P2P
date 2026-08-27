@@ -423,10 +423,19 @@ pub enum DhtPayload {
 ///
 /// If `include_pub_key` is true, the sender's 32-byte Ed25519 public key is
 /// included in the header (used for initial messages before encryption is established).
+///
+/// `sender_noise_pub` is our own Noise static public key. It is appended to the
+/// signed bytes but never written to the wire: the peer learned it from the
+/// handshake, so restating it would waste 32 bytes per frame. Signing over it is
+/// what stops the frame being a bearer token — see [`EMBER_DHT_VERSION`]. Our
+/// *own* key rather than the recipient's, deliberately: we always know it (an
+/// XX handshake has not yet revealed the responder's), and one frame can still
+/// be addressed to many peers.
 pub fn encode_message(
     msg: &DhtMessage,
     signing_key: &ed25519_dalek::SigningKey,
     include_pub_key: bool,
+    sender_noise_pub: &[u8; 32],
 ) -> Vec<u8> {
     let mut payload_bytes = encode_payload(&msg.payload);
     // The length prefix is a u16 and the peer drops anything over the
@@ -468,11 +477,48 @@ pub fn encode_message(
     buf.write_u16::<LittleEndian>(payload_len as u16).unwrap();
     buf.write_all(&payload_bytes).unwrap();
 
-    // Sign everything so far
+    // Sign everything so far, plus the domain tag and our Noise static key.
+    // Appended and then cut back rather than signed over a copy, so binding the
+    // session costs no allocation on a path that runs per outbound frame.
+    let suffix_len = frame_signing_suffix(&mut buf, sender_noise_pub);
     let sig = crypto::sign(signing_key, &buf);
+    buf.truncate(buf.len() - suffix_len);
     buf.write_all(&sig).unwrap();
 
     buf
+}
+
+/// Domain tag mixed into every DHT frame signature.
+///
+/// The identity key also signs stored records (`SignedRecord`), and neither
+/// preimage carried a context string — the only thing keeping a signature over
+/// one from being read as the other was that both formats happen to require the
+/// signer's own key at a fixed offset, which is an accident that any future
+/// field addition would quietly spend. Everything else in the tree that signs
+/// with this key is already separated (`BUDDY_ENDORSE_DOMAIN`, `RDV_DOMAIN`,
+/// `ember_auth`), so this brings frames in line.
+///
+/// Appended rather than prepended, unlike those. They build a preimage from
+/// scratch; this one signs a buffer that is already the frame, and appending is
+/// what lets the suffix be cut back off without copying it. Separation does not
+/// care which end it sits at, only that no other context can produce the same
+/// bytes — and no record body ends with this tag followed by a static key.
+///
+/// The version is inside the tag deliberately: changing the wire format changes
+/// the domain, so a v4 signature can never be replayed as a v5 one. It has to
+/// be edited by hand alongside [`EMBER_DHT_VERSION`], which the test below
+/// pins.
+const DHT_FRAME_DOMAIN: &[u8] = b"ember-dht-frame-v4";
+
+/// Append the bytes a frame signature covers beyond the frame itself, returning
+/// how many were added so the caller can cut them back off.
+///
+/// Kept in one place because the encoder and the verifier have to agree byte
+/// for byte, and they are three hundred lines apart.
+fn frame_signing_suffix(buf: &mut Vec<u8>, noise_pub: &[u8; 32]) -> usize {
+    buf.extend_from_slice(DHT_FRAME_DOMAIN);
+    buf.extend_from_slice(noise_pub);
+    DHT_FRAME_DOMAIN.len() + 32
 }
 
 /// The version byte of a DHT frame, if it is outside the range this build
@@ -498,7 +544,17 @@ pub fn unsupported_dht_version(data: &[u8]) -> Option<u8> {
 ///
 /// `has_pub_key`: whether the sender's public key is present in the header
 /// (should be true for messages received outside encrypted sessions).
-pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessage> {
+///
+/// `session_noise_pub` is the peer static key the Noise handshake proved for
+/// the session this frame arrived on. The signature is checked over the frame
+/// *plus* that key, so a frame signed for one session cannot verify on another
+/// — which is what makes a captured frame useless to a replayer. See
+/// [`EMBER_DHT_VERSION`].
+pub fn decode_message(
+    data: &[u8],
+    has_pub_key: bool,
+    session_noise_pub: &[u8; 32],
+) -> anyhow::Result<DhtMessage> {
     let pub_key_size = if has_pub_key { 32 } else { 0 };
     let min_size = HEADER_MIN_SIZE + pub_key_size + 2 + 64; // header + payload_len + signature
     if data.len() < min_size {
@@ -575,8 +631,14 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
     let Some(pk) = crypto::verifying_key_from_bytes(pk_bytes) else {
         anyhow::bail!("Invalid Ed25519 public key in DHT message");
     };
-    let signed_data = &data[..sig_offset];
-    if !crypto::verify(&pk, signed_data, &signature) {
+    // The sender signed the frame with its own Noise static key appended. We
+    // check against the key the handshake proved for *this* session, so a frame
+    // captured from another session fails here rather than being accepted as
+    // proof that its sender_id lives at the address that delivered it.
+    let mut signed_data = Vec::with_capacity(sig_offset + DHT_FRAME_DOMAIN.len() + 32);
+    signed_data.extend_from_slice(&data[..sig_offset]);
+    frame_signing_suffix(&mut signed_data, session_noise_pub);
+    if !crypto::verify(&pk, &signed_data, &signature) {
         anyhow::bail!("DHT message signature verification failed");
     }
     // Bind sender_id to the public key. The signature only proves the
@@ -1651,6 +1713,11 @@ mod tests {
     use super::*;
     use crate::network::ember::crypto;
     use ed25519_dalek::SigningKey;
+    /// Stand-in for a node's own Noise static key, which v4 binds every frame
+    /// signature to. Encode and decode must agree on it; a test that needs them
+    /// to disagree passes a different key explicitly.
+    const TEST_NOISE_PUB: [u8; 32] = [0xAB; 32];
+
 
     /// A signing key paired with the node ID it actually binds to
     /// (`node_id == BLAKE3(pubkey)[..16]`). `decode_message` enforces
@@ -1684,8 +1751,8 @@ mod tests {
         let (sk, id) = test_keypair();
 
         let ping = build_ping(id, 42);
-        let encoded = encode_message(&ping, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
 
         assert_eq!(decoded.version, EMBER_DHT_VERSION);
         assert_eq!(decoded.msg_type, MSG_PING);
@@ -1694,8 +1761,8 @@ mod tests {
         assert!(matches!(decoded.payload, DhtPayload::Ping));
 
         let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
-        let encoded = encode_message(&pong, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::Pong { observed } => {
                 assert_eq!(observed, Some("203.0.113.50:4672".parse().unwrap()));
@@ -1709,8 +1776,8 @@ mod tests {
         let (sk, id) = test_keypair();
         let body = b"gossip-body".to_vec();
         let msg = build_channel_msg(id, 7, body.clone());
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         assert_eq!(decoded.msg_type, MSG_CHANNEL_MSG);
         match decoded.payload {
             DhtPayload::ChannelMsg { body: got } => assert_eq!(got, body),
@@ -1723,8 +1790,8 @@ mod tests {
         let (sk, id) = test_keypair();
         let body = b"relay-envelope".to_vec();
         let msg = build_channel_relay(id, 8, body.clone());
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         assert_eq!(decoded.msg_type, MSG_CHANNEL_RELAY);
         match decoded.payload {
             DhtPayload::ChannelRelay { body: got } => assert_eq!(got, body),
@@ -1742,8 +1809,8 @@ mod tests {
     fn a_frame_without_a_public_key_cannot_be_authenticated_and_is_refused() {
         let (sk, id) = test_keypair();
         let pong = build_pong(id, 42, "203.0.113.50:4672".parse().unwrap());
-        let encoded = encode_message(&pong, &sk, false);
-        let err = decode_message(&encoded, false).expect_err("must not decode unauthenticated");
+        let encoded = encode_message(&pong, &sk, false, &TEST_NOISE_PUB);
+        let err = decode_message(&encoded, false, &TEST_NOISE_PUB).expect_err("must not decode unauthenticated");
         assert!(
             err.to_string().contains("cannot be authenticated"),
             "unexpected reason: {err}"
@@ -1758,7 +1825,7 @@ mod tests {
     #[test]
     fn decode_refuses_versions_outside_the_supported_range() {
         let (sk, id) = test_keypair();
-        let encoded = encode_message(&build_ping(id, 1), &sk, true);
+        let encoded = encode_message(&build_ping(id, 1), &sk, true, &TEST_NOISE_PUB);
 
         // The version byte leads the frame, so the range check runs before the
         // signature is even looked at.
@@ -1766,13 +1833,13 @@ mod tests {
             let mut framed = encoded.clone();
             framed[0] = bogus;
             assert!(
-                decode_message(&framed, true).is_err(),
+                decode_message(&framed, true, &TEST_NOISE_PUB).is_err(),
                 "version {bogus} must be refused"
             );
         }
 
         // Our own frames still decode, and the range is coherent.
-        assert!(decode_message(&encoded, true).is_ok());
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_ok());
         const _: () = assert!(EMBER_DHT_MIN_VERSION >= 1);
         const _: () = assert!(EMBER_DHT_MIN_VERSION <= EMBER_DHT_VERSION);
         assert_eq!(unsupported_dht_version(&encoded), None);
@@ -1792,18 +1859,18 @@ mod tests {
     fn version_zero_rejected() {
         let (sk, id) = test_keypair();
         let ping = build_ping(id, 1);
-        let mut encoded = encode_message(&ping, &sk, true);
+        let mut encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
         encoded[0] = 0;
-        assert!(decode_message(&encoded, true).is_err());
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
     }
 
     #[test]
     fn trailing_bytes_rejected() {
         let (sk, id) = test_keypair();
         let ping = build_ping(id, 1);
-        let mut encoded = encode_message(&ping, &sk, true);
+        let mut encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
         encoded.push(0xAB);
-        assert!(decode_message(&encoded, true).is_err());
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
     }
 
     /// A reply that fragments is a reply many peers never receive, so the
@@ -1836,7 +1903,7 @@ mod tests {
                 .collect();
 
             let msg = build_found_node(id, 1, contacts);
-            let frame = encode_message(&msg, &sk, true);
+            let frame = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
             let datagram = frame.len() + TRANSPORT_OVERHEAD;
             assert!(
                 datagram <= MAX_UNFRAGMENTED_DATAGRAM,
@@ -1844,7 +1911,7 @@ mod tests {
             );
 
             // Trimming must still leave a useful answer, and it must decode.
-            let decoded = decode_message(&frame, true).expect("frame decodes");
+            let decoded = decode_message(&frame, true, &TEST_NOISE_PUB).expect("frame decodes");
             match decoded.payload {
                 DhtPayload::FoundNode { contacts } => {
                     assert!(!contacts.is_empty(), "{label} reply must carry contacts");
@@ -1858,14 +1925,14 @@ mod tests {
     fn oversized_payload_rejected() {
         let (sk, id) = test_keypair();
         let ping = build_ping(id, 1);
-        let mut encoded = encode_message(&ping, &sk, true);
+        let mut encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
         // payload_len is a u16 LE right after the pub key (header min + 32).
         let payload_len_off = HEADER_MIN_SIZE + 32;
         let oversized = (MAX_DHT_PAYLOAD as u16).saturating_add(1);
         encoded[payload_len_off..payload_len_off + 2].copy_from_slice(&oversized.to_le_bytes());
         // Truncate/extend so length checks past payload_len still run;
         // we only care that the max-payload gate fires first.
-        assert!(decode_message(&encoded, true).is_err());
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
     }
 
     #[test]
@@ -1873,14 +1940,27 @@ mod tests {
         let (sk, id) = test_keypair();
         let observed: SocketAddr = "198.51.100.7:4662".parse().unwrap();
         let pong = build_pong(id, 7, observed);
-        let encoded = encode_message(&pong, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::Pong {
                 observed: Some(addr),
             } => assert_eq!(addr, observed),
             _ => panic!("expected Pong with observed"),
         }
+    }
+
+    /// The domain tag carries the wire version, so a signature made under one
+    /// format can never verify under another. That only holds while the two are
+    /// edited together, and nothing but this test makes them.
+    #[test]
+    fn the_frame_domain_names_the_wire_version() {
+        let tag = std::str::from_utf8(DHT_FRAME_DOMAIN).expect("the tag is ASCII");
+        assert!(
+            tag.ends_with(&format!("-v{EMBER_DHT_VERSION}")),
+            "DHT_FRAME_DOMAIN is {tag:?} but the wire version is {EMBER_DHT_VERSION}; \
+             bump the tag with it or a v{EMBER_DHT_VERSION} signature inherits the old domain"
+        );
     }
 
     #[test]
@@ -1895,8 +1975,8 @@ mod tests {
             let len = rng.gen_range(0..=2_048);
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf[..]);
-            let _ = decode_message(&buf, true);
-            let _ = decode_message(&buf, false);
+            let _ = decode_message(&buf, true, &TEST_NOISE_PUB);
+            let _ = decode_message(&buf, false, &TEST_NOISE_PUB);
         }
     }
 
@@ -1933,24 +2013,28 @@ mod tests {
             MSG_CALLBACK,
             MSG_CHANNEL_MSG,
             MSG_CHANNEL_RELAY,
+            // The two newest types, and the ones this list silently omitted.
+            MSG_BUDDY_ENDORSE_REQ,
+            MSG_BUDDY_ENDORSE,
             0x00,
             0xFF,
         ];
 
-        let mut decoded_ok = 0usize;
-        for i in 0..2_000 {
-            // One deterministic well-formed frame so a future change that
-            // stops the fuzz reaching the decoders fails loudly instead of
-            // passing vacuously again.
-            let (msg_type, payload) = if i == 0 {
-                (MSG_PING, Vec::new())
-            } else {
-                let msg_type = types[rng.gen_range(0..types.len())];
-                let len = rng.gen_range(0..=600usize);
-                let mut payload = vec![0u8; len];
-                rng.fill(&mut payload[..]);
-                (msg_type, payload)
-            };
+        // Only the randomised iterations count. A deterministic well-formed
+        // frame used to be mixed in "so a future change that stops the fuzz
+        // reaching the decoders fails loudly" — but it was an empty `PING`, so
+        // it satisfied the assertion by itself and the guard could only ever
+        // prove that `PING` decodes. Counting the random ones separately is
+        // what makes the claim real.
+        let mut random_decoded_ok = 0usize;
+        for _ in 0..2_000 {
+            let msg_type = types[rng.gen_range(0..types.len())];
+            // Up to the wire ceiling, not 600: every length prefix above that
+            // — `FOUND_VALUE` pages, `STORE_BATCH` bodies, the source-contact
+            // trailer — was outside the range the fuzz could ever produce.
+            let len = rng.gen_range(0..=MAX_DELIVERABLE_PAYLOAD);
+            let mut payload = vec![0u8; len];
+            rng.fill(&mut payload[..]);
 
             let mut buf = Vec::with_capacity(payload.len() + 120);
             buf.push(EMBER_DHT_VERSION);
@@ -1960,15 +2044,20 @@ mod tests {
             buf.extend_from_slice(&sk.verifying_key().to_bytes());
             buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
             buf.extend_from_slice(&payload);
+            // Same domain tag and session binding `encode_message` applies.
+            // Without them nothing here clears signature verification and the
+            // fuzz never reaches the payload decoders it exists to exercise.
+            let suffix = frame_signing_suffix(&mut buf, &TEST_NOISE_PUB);
             let sig = crypto::sign(&sk, &buf);
+            buf.truncate(buf.len() - suffix);
             buf.extend_from_slice(&sig);
 
-            if decode_message(&buf, true).is_ok() {
-                decoded_ok += 1;
+            if decode_message(&buf, true, &TEST_NOISE_PUB).is_ok() {
+                random_decoded_ok += 1;
             }
         }
         assert!(
-            decoded_ok > 0,
+            random_decoded_ok > 0,
             "the fuzz never produced a frame that reached the payload decoders"
         );
     }
@@ -1981,8 +2070,8 @@ mod tests {
             test_contact(22, "203.0.113.2:4663", 0x22),
         ];
         let announce = build_announce_peer(id, 55, contacts.clone());
-        let encoded = encode_message(&announce, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&announce, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::AnnouncePeer { contacts: got } => {
                 assert_eq!(got.len(), 2);
@@ -1993,8 +2082,8 @@ mod tests {
         }
 
         let list = build_peer_list(id, 55, contacts.clone());
-        let encoded = encode_message(&list, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&list, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::PeerList { contacts: got } => {
                 assert_eq!(got.len(), 2);
@@ -2010,8 +2099,8 @@ mod tests {
         let target = EmberNodeId([0xAA; 16]);
 
         let msg = build_find_node(id, 99, target);
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
 
         match decoded.payload {
             DhtPayload::FindNode { target: t } => {
@@ -2031,8 +2120,8 @@ mod tests {
         ];
 
         let msg = build_found_node(id, 100, contacts.clone());
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
 
         match decoded.payload {
             DhtPayload::FoundNode {
@@ -2134,12 +2223,12 @@ mod tests {
     fn signature_verification_fails_on_tamper() {
         let (sk, id) = test_keypair();
         let msg = build_ping(id, 1);
-        let mut encoded = encode_message(&msg, &sk, true);
+        let mut encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
 
         // Tamper with the request_id
         encoded[3] ^= 0xFF;
 
-        let result = decode_message(&encoded, true);
+        let result = decode_message(&encoded, true, &TEST_NOISE_PUB);
         assert!(result.is_err());
     }
 
@@ -2173,13 +2262,13 @@ mod tests {
         let (sk, id) = test_keypair();
         let too_big = vec![0u8; MAX_STORE_RECORD_BYTES + 1];
         let msg = build_store_record(id, 1, [0xAB; 16], too_big, [0u8; 64]);
-        let encoded = encode_message(&msg, &sk, true);
-        assert!(decode_message(&encoded, true).is_err());
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
 
         let fits = vec![0u8; MAX_STORE_RECORD_BYTES];
         let msg = build_store_record(id, 2, [0xAB; 16], fits, [0u8; 64]);
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).expect("max-size body still decodes");
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).expect("max-size body still decodes");
         match decoded.payload {
             DhtPayload::StoreRecord { record, .. } => {
                 assert_eq!(record.len(), MAX_STORE_RECORD_BYTES);
@@ -2209,8 +2298,8 @@ mod tests {
             },
             signature: [0u8; 64],
         };
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).expect("max blob decodes");
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).expect("max blob decodes");
         match decoded.payload {
             DhtPayload::FoundValue { records, .. } => {
                 assert_eq!(records[0].len(), MAX_FOUND_VALUE_BLOB_BYTES);
@@ -2233,8 +2322,8 @@ mod tests {
             },
             signature: [0u8; 64],
         };
-        let encoded = encode_message(&msg, &sk, true);
-        assert!(decode_message(&encoded, true).is_err());
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
     }
 
     /// Both paging positions have to survive the wire, and the `start_position`
@@ -2244,7 +2333,7 @@ mod tests {
         let (sk, id) = test_keypair();
 
         let ask = build_find_value(id, 1, vec![[0xA1; 16], [0xA2; 16]], 4321);
-        let decoded = decode_message(&encode_message(&ask, &sk, true), true).unwrap();
+        let decoded = decode_message(&encode_message(&ask, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::FindValue {
                 keys,
@@ -2257,7 +2346,7 @@ mod tests {
         }
 
         let answer = build_found_value(id, 2, [0xB0; 16], vec![vec![7u8; 40]], 9, 900);
-        let decoded = decode_message(&encode_message(&answer, &sk, true), true).unwrap();
+        let decoded = decode_message(&encode_message(&answer, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::FoundValue {
                 key,
@@ -2302,8 +2391,8 @@ mod tests {
         let user_hash = [0x33u8; 16];
         let token = [0x44u8; 16];
         let req = build_callback_req(id, 7, publisher, file_hash, 4662, 0x03, user_hash, token);
-        let encoded = encode_message(&req, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&req, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::CallbackReq {
                 publisher_id,
@@ -2325,8 +2414,8 @@ mod tests {
 
         let ip = Ipv4Addr::new(8, 8, 4, 4);
         let cb = build_callback(id, 8, file_hash, ip, 4662, 0x03, user_hash, token);
-        let encoded = encode_message(&cb, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&cb, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::Callback {
                 file_hash: fh,
@@ -2351,8 +2440,8 @@ mod tests {
     fn buddy_endorse_round_trip() {
         let (sk, id) = test_keypair();
         let req = build_buddy_endorse_req(id, 9);
-        let encoded = encode_message(&req, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&req, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         assert!(matches!(decoded.payload, DhtPayload::BuddyEndorseReq));
         assert_eq!(decoded.request_id, 9, "the answer has to match the ask");
 
@@ -2360,8 +2449,8 @@ mod tests {
         let noise = [0x5Au8; 32];
         let sig = [0x6Bu8; 64];
         let msg = build_buddy_endorse(id, 9, ip, 4672, noise, 1_700_000_000, sig);
-        let encoded = encode_message(&msg, &sk, true);
-        let decoded = decode_message(&encoded, true).unwrap();
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
             DhtPayload::BuddyEndorse {
                 ip: got_ip,
@@ -2386,7 +2475,7 @@ mod tests {
         // A short or long body is a framing error, not a partial endorsement.
         let mut truncated = build_buddy_endorse(id, 9, ip, 4672, noise, 1, sig);
         truncated.payload = DhtPayload::Unknown(vec![0u8; BUDDY_ENDORSE_WIRE_LEN - 1]);
-        let encoded = encode_message(&truncated, &sk, true);
-        assert!(decode_message(&encoded, true).is_err());
+        let encoded = encode_message(&truncated, &sk, true, &TEST_NOISE_PUB);
+        assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
     }
 }

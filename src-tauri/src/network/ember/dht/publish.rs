@@ -74,9 +74,44 @@ const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
 const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
 pub const CHANNEL_NAME_MAX: usize = 64;
-pub const CHANNEL_WELCOME_MAX: usize = 512;
-pub const CHANNEL_BAN_LIST_MAX: usize = 32;
-pub const CHANNEL_MOD_LIST_MAX: usize = 16;
+pub const CHANNEL_WELCOME_MAX: usize = 256;
+pub const CHANNEL_BAN_LIST_MAX: usize = 12;
+pub const CHANNEL_MOD_LIST_MAX: usize = 6;
+
+/// Largest [`ModerationTail::encode`] output: `owner_pubkey(32) +
+/// key_epoch(8) + successor_nominee(32) + claim_after_days(2)`.
+const MODERATION_TAIL_MAX_LEN: usize = 32 + 8 + 32 + 2;
+
+/// Fixed cost of a moderation `extra` blob: the three length prefixes plus a
+/// fully-populated tail.
+const MODERATION_EXTRA_FIXED_LEN: usize = 2 + 2 + 2 + MODERATION_TAIL_MAX_LEN;
+
+/// A moderation record is a *full snapshot* of a room's governance, so one that
+/// does not fit is not a partial update — it is the loss of the topic, the
+/// welcome, the ban and moderator lists, the owner key that lets members refuse
+/// a moderator's ban aimed at the owner, the key epoch that tells them to fetch
+/// a rotated key, and the successor nomination, all at once.
+///
+/// The four maxima above used to be stated independently of the byte budget and
+/// were jointly unreachable by more than a factor of two: `CHANNEL_BAN_LIST_MAX`
+/// alone at 32 needed 1024 bytes of a ~967-byte allowance. Past the real limit
+/// the record was refused by our own store and by every recipient's decoder, so
+/// no `STORE_ACK` ever came back, the last good copy expired a day later, and
+/// the UI reported success throughout.
+///
+/// This pins them together. Anything that widens the welcome, lengthens the
+/// tail or grows either list now fails to compile instead of silently
+/// un-publishing rooms.
+const _: () = assert!(
+    RECORD_HEADER_LEN
+        + CHANNEL_NAME_MAX
+        + CHANNEL_TRAILER_MIN_LEN
+        + MODERATION_EXTRA_FIXED_LEN
+        + CHANNEL_WELCOME_MAX
+        + 32 * (CHANNEL_BAN_LIST_MAX + CHANNEL_MOD_LIST_MAX)
+        <= messages::MAX_STORE_RECORD_BYTES,
+    "the advertised channel moderation limits must fit one STORE record"
+);
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
@@ -678,11 +713,22 @@ impl SignedRecord {
         channel_pubkey: [u8; 32],
         private: bool,
         signing_key: &SigningKey,
-    ) -> Self {
+    ) -> Option<Self> {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
         let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
-        Self::build(
+        // `None` rather than an oversized record: this is a full snapshot of a
+        // room's governance, so publishing one the network refuses does not
+        // leave the previous state standing — it lets the last good copy expire
+        // and takes the topic, welcome, ban and moderator lists, owner key, key
+        // epoch and successor nomination with it. The caller has to be able to
+        // tell the user their edit did not go out.
+        if RECORD_HEADER_LEN + topic.len() + CHANNEL_TRAILER_MIN_LEN + extra.len()
+            > messages::MAX_STORE_RECORD_BYTES
+        {
+            return None;
+        }
+        Some(Self::build(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
             channel_id,
@@ -692,7 +738,7 @@ impl SignedRecord {
             None,
             Some(extra),
             signing_key,
-        )
+        ))
     }
 
     /// One member's copy of one rotated content key, signed by the channel key
@@ -913,7 +959,14 @@ impl SignedRecord {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
         let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
-        let file_name = clamp_name_to_record_budget(file_name, contact_bytes);
+        // The channel trailer is written below but was left out of the name
+        // budget, so a record could be clamped to "fit" and then have up to two
+        // kilobytes appended past the cap. Both trailing blocks have to be
+        // charged here, since the name is the only part this can shorten.
+        let trailer_bytes = channel_extra
+            .as_ref()
+            .map_or(0, |extra| CHANNEL_TRAILER_MIN_LEN + extra.len());
+        let file_name = clamp_name_to_record_budget(file_name, contact_bytes + trailer_bytes);
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len();
 
@@ -950,6 +1003,28 @@ impl SignedRecord {
         } else {
             None
         };
+
+        // Last line of defence. Trimming the name cannot save a record whose
+        // trailer alone overruns the cap, and one that does is not merely
+        // large: our own store refuses it, every recipient's decoder refuses
+        // it, so no `STORE_ACK` ever returns and the caller cannot tell a
+        // record nobody would take from one nobody happened to answer. Callers
+        // that can produce a variable trailer check the budget up front and
+        // report it; this catches anything that does not.
+        debug_assert!(
+            data.len() <= messages::MAX_STORE_RECORD_BYTES,
+            "record body of {} bytes exceeds the {} the network accepts",
+            data.len(),
+            messages::MAX_STORE_RECORD_BYTES
+        );
+        if data.len() > messages::MAX_STORE_RECORD_BYTES {
+            tracing::error!(
+                "Ember: built a {}-byte record body of type {record_type}, over the \
+                 {}-byte store limit; it will be refused by every peer",
+                data.len(),
+                messages::MAX_STORE_RECORD_BYTES
+            );
+        }
 
         let signature = crypto::sign(signing_key, &data);
 
@@ -1130,6 +1205,24 @@ impl SignedRecord {
 
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
+        let parsed = Self::parse_unverified(data, signature)?;
+        let pk = crypto::verifying_key_from_bytes(&parsed.publisher_key)?;
+        if !crypto::verify(&pk, data, &signature) {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// Parse a record body's structure **without checking its signature**.
+    ///
+    /// Everything returned is derived from `data` alone, so it says nothing
+    /// about who wrote it: a caller that does not verify must not act on the
+    /// identity fields. It exists for callers that verify separately — and
+    /// would otherwise pay twice. `DhtStore::restore` is the one that matters:
+    /// it runs synchronously at startup against a 20,000-record ceiling sized
+    /// on one Ed25519 check each, so a second one per record is a real launch
+    /// cost rather than a micro-optimisation.
+    pub fn parse_unverified(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
         //          size(8) + pub_key(32) + timestamp(8) + name_len(2) = 115
         if data.len() < 115 {
@@ -1182,12 +1275,6 @@ impl SignedRecord {
         } else {
             None
         };
-
-        // Verify signature
-        let pk = crypto::verifying_key_from_bytes(&publisher_key)?;
-        if !crypto::verify(&pk, data, &signature) {
-            return None;
-        }
 
         Some(Self {
             record_type,
@@ -1330,6 +1417,159 @@ fn decode_epoch_extra(extra: &[u8]) -> Option<([u8; 32], i64, &[u8])> {
     Some((member, epoch, &extra[EPOCH_EXTRA_PREFIX_LEN..]))
 }
 
+#[cfg(test)]
+mod moderation_budget_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn tail() -> ModerationTail {
+        ModerationTail {
+            owner_pubkey: Some([0x11; 32]),
+            key_epoch: Some(7),
+            successor_nominee: Some([0x22; 32]),
+            claim_after_days: Some(30),
+        }
+    }
+
+    /// The constant the compile-time budget assert is written against.
+    #[test]
+    fn a_full_tail_encodes_to_the_length_the_budget_assumes() {
+        let mut out = Vec::new();
+        tail().encode(&mut out);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN);
+    }
+
+    /// Everything the advertised maxima allow, at once, has to fit — that is
+    /// what the `const _: () = assert!` beside them pins, and this is the
+    /// runtime half showing the encoder really produces what it predicts.
+    #[test]
+    fn the_advertised_maxima_fit_one_record() {
+        let topic = "t".repeat(CHANNEL_NAME_MAX);
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX];
+        let mods = vec![[0xBB; 32]; CHANNEL_MOD_LIST_MAX];
+        assert!(moderation_snapshot_fits(
+            &topic, &welcome, &bans, &mods, &tail()
+        ));
+
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let record = SignedRecord::channel_moderation(
+            &topic,
+            &welcome,
+            &bans,
+            &mods,
+            &tail(),
+            [0x33; 16],
+            [0x44; 32],
+            false,
+            &sk,
+        )
+        .expect("the advertised maxima must be publishable");
+        assert!(record.data.len() <= messages::MAX_STORE_RECORD_BYTES);
+    }
+
+    /// More bans than the cap is reported as not fitting, because the encoder
+    /// would drop the surplus and the room would go on believing it had banned
+    /// them. The record itself still publishes — a governance snapshot that
+    /// lapses entirely is far worse than one missing its newest entries — so
+    /// the caller has to be the one to refuse.
+    #[test]
+    fn a_snapshot_that_would_be_truncated_does_not_count_as_fitting() {
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX + 1];
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        assert!(!moderation_snapshot_fits(
+            "topic",
+            &welcome,
+            &bans,
+            &[],
+            &tail()
+        ));
+
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let record = SignedRecord::channel_moderation(
+            "topic",
+            &welcome,
+            &bans,
+            &[],
+            &tail(),
+            [0x33; 16],
+            [0x44; 32],
+            false,
+            &sk,
+        )
+        .expect("a truncated snapshot still publishes rather than lapsing");
+        assert!(record.data.len() <= messages::MAX_STORE_RECORD_BYTES);
+
+        // An over-long welcome is caught the same way.
+        assert!(!moderation_snapshot_fits(
+            "topic",
+            &"w".repeat(CHANNEL_WELCOME_MAX + 1),
+            &[],
+            &[],
+            &tail()
+        ));
+    }
+
+    /// The channel trailer used to be written after the name was clamped, so a
+    /// record could be trimmed to "fit" and then overrun anyway.
+    #[test]
+    fn the_name_clamp_accounts_for_the_channel_trailer() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX];
+        let record = SignedRecord::channel_moderation(
+            &"n".repeat(CHANNEL_NAME_MAX),
+            &welcome,
+            &bans,
+            &[],
+            &tail(),
+            [0x55; 16],
+            [0x66; 32],
+            false,
+            &sk,
+        )
+        .expect("fits");
+        assert!(
+            record.data.len() <= messages::MAX_STORE_RECORD_BYTES,
+            "body of {} bytes overran the {}-byte store cap",
+            record.data.len(),
+            messages::MAX_STORE_RECORD_BYTES
+        );
+    }
+}
+
+/// Whether a moderation snapshot would be published *whole*.
+///
+/// `false` means something would be silently dropped on the way out —
+/// [`encode_moderation_extra`] truncates the welcome and both lists to the
+/// advertised maxima, which keeps a room publishable but quietly stops
+/// enforcing the entries past the cut. Callers use this to refuse the edit and
+/// say so, instead of reporting success for a ban that will never take effect.
+///
+/// Both halves are checked because they fail differently. Exceeding a list
+/// maximum is silent truncation; exceeding the byte budget is a record the
+/// network refuses outright. The maxima are pinned to fit the budget by the
+/// assert beside them, so the second half only bites if those constants are
+/// ever changed apart — which is exactly when a caller would want to know.
+pub fn moderation_snapshot_fits(
+    topic: &str,
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> bool {
+    if banned_pubkeys.len() > CHANNEL_BAN_LIST_MAX
+        || moderator_pubkeys.len() > CHANNEL_MOD_LIST_MAX
+        || welcome.len() > CHANNEL_WELCOME_MAX
+    {
+        return false;
+    }
+    let topic_len = truncate_utf8(topic, CHANNEL_NAME_MAX).len();
+    let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
+    RECORD_HEADER_LEN + topic_len + CHANNEL_TRAILER_MIN_LEN + extra.len()
+        <= messages::MAX_STORE_RECORD_BYTES
+}
+
 fn encode_moderation_extra(
     welcome: &str,
     banned_pubkeys: &[[u8; 32]],
@@ -1345,6 +1585,22 @@ fn encode_moderation_extra(
         .iter()
         .take(CHANNEL_MOD_LIST_MAX)
         .collect::<Vec<_>>();
+    // Truncation keeps the room publishable, which is the right trade against
+    // letting its whole governance snapshot lapse — but the entries past the
+    // cut stop being enforced, and a room that has carried more than this
+    // (these limits were once set well above what one record could hold) has no
+    // other way to find out. `moderation_snapshot_fits` is what stops a *new*
+    // edit reaching this point silently.
+    if banned_pubkeys.len() > bans.len() || moderator_pubkeys.len() > mods.len() {
+        tracing::warn!(
+            "Ember: channel moderation snapshot trimmed to {} ban(s) of {} and {} moderator(s) \
+             of {} to fit one record; the rest are no longer published",
+            bans.len(),
+            banned_pubkeys.len(),
+            mods.len(),
+            moderator_pubkeys.len()
+        );
+    }
     let mut extra =
         Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32 + 32);
     extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
@@ -2081,7 +2337,8 @@ mod tests {
             ident.pubkey,
             false,
             &ident.signing_key,
-        );
+        )
+        .expect("the fixture fits one record");
         assert!(record.channel_store_ok());
         let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
         let (welcome, bans, parsed_mods, parsed_tail) =
@@ -2119,7 +2376,8 @@ mod tests {
             ident.pubkey,
             false,
             &ident.signing_key,
-        );
+        )
+        .expect("the fixture fits one record");
         let mut anon_blob = anonymous.data.clone();
         anon_blob.extend_from_slice(&anonymous.signature);
         let anon_info =
@@ -2258,6 +2516,140 @@ mod tests {
         assert!(!SignedRecord::value_blob_is_authentic(&blob));
     }
 
+    /// `decode_source_contact` carries the most length arithmetic in this file
+    /// — the 41-byte contact block plus a 174-byte buddy/endorsement trailer —
+    /// and the record-level fuzz essentially never reached it: a random buffer
+    /// gets there only if byte 0 happens to be `RECORD_TYPE_SOURCE` *and* the
+    /// random `u16` name length is small enough for the body to hold it, which
+    /// is a fraction of a percent per iteration. Fuzzing the decoder directly is
+    /// what the moderation test already does, and is the model here.
+    #[test]
+    fn decode_source_contact_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x50C0_17AC);
+
+        let plain = SourceContact {
+            ip: std::net::Ipv4Addr::new(203, 0, 113, 7),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [0x33; 32],
+            user_hash: None,
+            buddy: None,
+            callback_token: None,
+        };
+        let with_buddy = SourceContact {
+            flags: crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE,
+            user_hash: Some([0x44; 16]),
+            callback_token: Some([0x55; 16]),
+            buddy: Some(SourceBuddy {
+                ip: std::net::Ipv4Addr::new(198, 51, 100, 9),
+                udp_port: 4672,
+                noise_pub: [0x66; 32],
+                ed25519_pub: [0x77; 32],
+                endorsed_until: 1_900_000_000,
+                endorsement: [0x88; 64],
+            }),
+            ..plain
+        };
+        let mut seeds = Vec::new();
+        for sc in [plain, with_buddy] {
+            let mut buf = Vec::new();
+            encode_source_contact(&mut buf, &sc);
+            seeds.push(buf);
+        }
+
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            // Mostly random, with well-formed encodings and bit-flipped copies
+            // mixed in so the trailer's own length checks are actually reached.
+            let buf = match i % 7 {
+                0 => seeds[i % seeds.len()].clone(),
+                1 => {
+                    let mut b = seeds[i % seeds.len()].clone();
+                    if !b.is_empty() {
+                        let at = rng.gen_range(0..b.len());
+                        b[at] ^= 1 << rng.gen_range(0..8);
+                    }
+                    b
+                }
+                2 => {
+                    let mut b = seeds[i % seeds.len()].clone();
+                    let keep = rng.gen_range(0..=b.len());
+                    b.truncate(keep);
+                    b
+                }
+                _ => {
+                    let len = rng.gen_range(0..=400usize);
+                    let mut b = vec![0u8; len];
+                    rng.fill(&mut b[..]);
+                    b
+                }
+            };
+            // Offsets past the end included deliberately: the decoder has to
+            // refuse them rather than index into nothing.
+            let off = if i % 3 == 0 {
+                0
+            } else {
+                rng.gen_range(0..=buf.len().saturating_add(8))
+            };
+            if decode_source_contact(&buf, off).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a contact the decoder accepted"
+        );
+    }
+
+    /// The channel sub-decoders sit behind `channel_store_ok`, which is only
+    /// reached after an Ed25519 signature verifies — so random and bit-flipped
+    /// buffers cannot get to them, and the record-level fuzz's two deterministic
+    /// seeds are fixed at kinds 2 and 3. That left EPOCH, CLAIM and HANDOFF with
+    /// no fuzz input at all.
+    #[test]
+    fn decode_epoch_extra_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE70C_4EA5);
+
+        let mut well_formed = Vec::new();
+        well_formed.extend_from_slice(&[0x21u8; 32]);
+        well_formed.extend_from_slice(&1_900_000_000i64.to_le_bytes());
+        well_formed.extend_from_slice(&[0xEE; 48]);
+
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            let buf = match i % 5 {
+                0 => well_formed.clone(),
+                1 => {
+                    let mut b = well_formed.clone();
+                    let at = rng.gen_range(0..b.len());
+                    b[at] ^= 1 << rng.gen_range(0..8);
+                    b
+                }
+                2 => {
+                    let mut b = well_formed.clone();
+                    b.truncate(rng.gen_range(0..=b.len()));
+                    b
+                }
+                _ => {
+                    let len = rng.gen_range(0..=300usize);
+                    let mut b = vec![0u8; len];
+                    rng.fill(&mut b[..]);
+                    b
+                }
+            };
+            if decode_epoch_extra(&buf).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced an epoch blob the decoder accepted"
+        );
+    }
+
     #[test]
     fn decode_moderation_extra_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
@@ -2329,7 +2721,8 @@ mod tests {
             ident.pubkey,
             false,
             &ident.signing_key,
-        );
+        )
+        .expect("the fixture fits one record");
         let mut presence_blob = presence.data.clone();
         presence_blob.extend_from_slice(&presence.signature);
         let mut moderation_blob = moderation.data.clone();
