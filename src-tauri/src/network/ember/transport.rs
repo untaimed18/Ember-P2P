@@ -1044,6 +1044,17 @@ impl EmberTransport {
             .any(|(session_addr, _)| session_addr == addr)
     }
 
+    /// Whether a completed Noise session exists for this identity at `addr`.
+    ///
+    /// Distinct from [`Self::has_session`]: sessions are keyed by
+    /// `(addr, static key)`, so an XX squatter at the same address must not
+    /// count as a live path to `remote_noise_pub`. Channel relay and transfer
+    /// delivery use this so they never call `prepare_outgoing` in a way that
+    /// starts a handshake and then claim the frame was sent.
+    pub fn has_live_session(&self, addr: &SocketAddr, remote_noise_pub: &[u8; 32]) -> bool {
+        self.sessions.contains_key(&(*addr, *remote_noise_pub))
+    }
+
     /// Whether the one session identified by `remote_noise_pub` completed
     /// Noise_IK.
     ///

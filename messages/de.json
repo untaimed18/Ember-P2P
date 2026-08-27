@@ -2646,10 +2646,12 @@
   "error_channels_member_invalid": "Ungültiger Mitgliedsschlüssel",
   "error_channels_moderation_failed": "Rauminfo konnte nicht aktualisiert werden: {detail}",
   "error_channels_ban_failed": "Sperrliste konnte nicht aktualisiert werden: {detail}",
+  "error_channels_ban_stuck": "Die Sperre oder Aufhebung wurde auf diesem Gerät gespeichert, aber der Raum wurde nicht benachrichtigt und das Rückgängigmachen ist fehlgeschlagen. Die Änderung kann hier noch gelten.",
   "error_channels_not_moderator": "Nur der Eigentümer oder ein Moderator darf das",
   "error_channels_mod_self": "Sie können sich nicht selbst zum Moderator machen",
   "error_channels_mod_list_full": "Die Moderatorenliste ist voll (max. 16)",
   "error_channels_handoff_failed": "Eigentum konnte nicht übertragen werden: {detail}",
   "error_channels_handoff_pending": "Eine Übertragung an ein anderes Mitglied wartet bereits auf Annahme",
+  "error_channels_handoff_stuck": "Dieser Raum ist noch als wartend auf eine Eigentumsübertragung markiert. Versuchen Sie es erneut mit demselben Mitglied, oder warten Sie, bevor Sie sie jemand anderem anbieten.",
   "error_settings_channel_file_offers_invalid": "Kanal-Dateiangebote müssen 'everyone', 'friends' oder 'nobody' sein"
 }

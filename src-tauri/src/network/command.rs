@@ -2652,7 +2652,10 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
-            let _ = tx.send(Ok(EmberValueLookupPending { records_rx }));
+            let _ = tx.send(Ok(EmberValueLookupPending {
+                search_id,
+                records_rx,
+            }));
 
             // Kick off the first round (and resolve immediately if the
             // routing table had nothing to seed the shortlist with).
@@ -2724,8 +2727,27 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
-            let _ = tx.send(Ok(EmberValueLookupPending { records_rx }));
+            let _ = tx.send(Ok(EmberValueLookupPending {
+                search_id,
+                records_rx,
+            }));
             drive_ember_search(socket, state, search_id).await;
+        }
+
+        NetworkCommand::CancelEmberSearch { search_id } => {
+            // The Tauri waiter has already given up. Drop the slot rather
+            // than let FIND_VALUE run to SEARCH_TIMEOUT_SECS (60s) after a
+            // 6s Discover probe. Completing would only send to a dropped
+            // oneshot; the slot is what matters.
+            state.ember_dht_pending_value_lookups.remove(&search_id);
+            state.ember_search.remove(search_id);
+            state
+                .ember_dht_search_requests
+                .retain(|_, r| r.search_id != search_id);
+            if let Some(channel_id) = state.ember_channel_presence_searches.remove(&search_id)
+            {
+                flush_channel_presence_if_idle(state, channel_id);
+            }
         }
 
         NetworkCommand::FanoutChannelGossip { body } => {

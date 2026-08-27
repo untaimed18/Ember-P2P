@@ -6,8 +6,8 @@ use tracing::debug;
 use crate::network::ember::crypto;
 
 use super::publish::{
-    channel_kind_from_data, CHANNEL_KIND_INDEX, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
-    RECORD_TYPE_SOURCE,
+    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_INDEX,
+    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -134,6 +134,11 @@ const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 /// TTL survives a few missed republishes without keeping a departed member
 /// listed for a full day.
 const CHANNEL_PRESENCE_TTL: Duration = Duration::from_secs(45 * 60);
+/// Leave tombstones replace the live record under the same store key; they
+/// only need to outlive a republish interval so stragglers still see the
+/// departure. Storers that do not know `CHANNEL_FLAG_DEPARTED` keep applying
+/// the live TTL, which is why ingest also drops the member.
+const CHANNEL_PRESENCE_DEPARTED_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// A room's public-index listing, which is what Discover walks.
 ///
@@ -164,7 +169,15 @@ fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
         Some(&RECORD_TYPE_SOURCE) => SOURCE_RECORD_TTL,
         Some(&RECORD_TYPE_CHANNEL) => match channel_kind_from_data(data) {
-            Some(CHANNEL_KIND_PRESENCE) => CHANNEL_PRESENCE_TTL,
+            Some(CHANNEL_KIND_PRESENCE) => {
+                if channel_flags_from_data(data)
+                    .is_some_and(|f| f & CHANNEL_FLAG_DEPARTED != 0)
+                {
+                    CHANNEL_PRESENCE_DEPARTED_TTL
+                } else {
+                    CHANNEL_PRESENCE_TTL
+                }
+            }
             Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
             _ => KEYWORD_RECORD_TTL,
         },

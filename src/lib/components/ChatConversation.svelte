@@ -15,7 +15,7 @@
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { isAppVisible } from '$lib/utils';
+  import { isAppVisible, shortPubkey } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
 
   // The backend rejects chat messages whose UTF-8 encoding exceeds this many
@@ -141,9 +141,7 @@
 
   function senderLabel(pubkey?: string): string {
     if (!pubkey) return '';
-    const name = memberNames[pubkey];
-    if (name) return name;
-    return pubkey.slice(0, 8) + '\u2026';
+    return memberNames[pubkey] || shortPubkey(pubkey);
   }
 
   $effect(() => {

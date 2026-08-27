@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::network::ed2k::transfer::TransferFailureCode;
+use crate::network::ember::channel::{CHANNEL_MEMBERS_MAX, PRESENCE_FRESH_SECS};
 use crate::storage::paths;
 use crate::types::*;
 
@@ -3924,12 +3925,37 @@ impl Database {
 
     pub fn list_channels(&self) -> anyhow::Result<Vec<StoredChannel>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-                "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+        let sql = format!(
+            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
                     c.joined_at, c.last_active,
-                    (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
+                    (SELECT COUNT(*) FROM channel_members m
+                     WHERE m.channel_id = c.channel_id
+                       AND m.banned = 0
+                       AND m.last_seen >= unixepoch() - {PRESENCE_FRESH_SECS}),
                     (SELECT COUNT(*) FROM channel_messages msg
                      WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
+                    c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
+                    c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
+                    c.moderation_updated_at, c.moderation_checked_at,
+                    c.in_room, c.deleted
+             FROM channels c
+             ORDER BY c.last_active DESC, c.joined_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| Self::stored_channel_from_row(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Joined-room rows without the two COUNT(*) subqueries. The network loop
+    /// ticks this once a second; unread and historical member totals are UI
+    /// figures it does not read.
+    pub fn list_channels_lite(&self) -> anyhow::Result<Vec<StoredChannel>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                    c.joined_at, c.last_active, 0, 0,
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
@@ -3941,6 +3967,25 @@ impl Database {
             .query_map([], |row| Self::stored_channel_from_row(row))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Presence-fresh members, including us if we are not banned. `1`
+    /// means nobody else has announced recently — the empty-room poll case.
+    pub fn count_fresh_channel_members(
+        &self,
+        channel_id: &str,
+        now: i64,
+        fresh_secs: i64,
+    ) -> anyhow::Result<i64> {
+        let cutoff = now.saturating_sub(fresh_secs);
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_members
+             WHERE channel_id = ?1 AND banned = 0 AND last_seen >= ?2",
+            params![channel_id, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(n)
     }
 
     /// Remember what a Discover walk turned up.
@@ -4014,16 +4059,21 @@ impl Database {
     ) -> anyhow::Result<Option<StoredChannel>> {
         let row = conn
             .query_row(
-                "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                &format!(
+                    "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
                         c.joined_at, c.last_active,
-                        (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id = c.channel_id),
+                        (SELECT COUNT(*) FROM channel_members m
+                         WHERE m.channel_id = c.channel_id
+                           AND m.banned = 0
+                           AND m.last_seen >= unixepoch() - {PRESENCE_FRESH_SECS}),
                         (SELECT COUNT(*) FROM channel_messages msg
                          WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
                         c.in_room, c.deleted
-                 FROM channels c WHERE c.channel_id = ?1",
+                 FROM channels c WHERE c.channel_id = ?1"
+                ),
                 params![channel_id],
                 |row| Self::stored_channel_from_row(row),
             )
@@ -4703,17 +4753,112 @@ impl Database {
         member_pubkey: &str,
         nickname: &str,
         last_seen: i64,
+        local_pubkey: Option<&str>,
     ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        // Signed records can claim a last_seen up to an hour ahead of us
+        // (DHT store CLOCK_SKEW). Eviction sorts by last_seen, so an
+        // unclamped future value would sit at the end of the list while
+        // honest (and our own) rows are dropped first.
+        let last_seen = last_seen.min(now);
         let conn = self.conn.lock();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let existed: bool = tx
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        tx.execute(
             "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
              VALUES (?1, ?2, ?3, ?4, 0, 0)
              ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
-                nickname = excluded.nickname,
-                last_seen = excluded.last_seen",
+                nickname = CASE WHEN excluded.nickname = '' THEN channel_members.nickname ELSE excluded.nickname END,
+                last_seen = MAX(channel_members.last_seen, excluded.last_seen)",
             params![channel_id, member_pubkey, nickname, last_seen],
         )?;
+        // Presence ingest and private-room chat can still grow the table.
+        // Banned rows stay: a ban has to survive eviction or it can be
+        // laundered by flooding new identities. Past the cap we only drop
+        // stale non-banned rows, never the local user, and never a still-
+        // fresh honest peer — a flood of newcomers is refused instead.
+        let live: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM channel_members
+             WHERE channel_id = ?1 AND banned = 0",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        if live > CHANNEL_MEMBERS_MAX as i64 {
+            let extra = live - CHANNEL_MEMBERS_MAX as i64;
+            let cutoff = now.saturating_sub(PRESENCE_FRESH_SECS);
+            tx.execute(
+                "DELETE FROM channel_members WHERE rowid IN (
+                    SELECT rowid FROM channel_members
+                     WHERE channel_id = ?1 AND banned = 0
+                       AND member_pubkey != ?2
+                       AND (?3 IS NULL OR member_pubkey != ?3)
+                       AND last_seen < ?4
+                     ORDER BY last_seen ASC, member_pubkey ASC
+                     LIMIT ?5
+                 )",
+                params![channel_id, member_pubkey, local_pubkey, cutoff, extra],
+            )?;
+            let live: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM channel_members
+                 WHERE channel_id = ?1 AND banned = 0",
+                params![channel_id],
+                |row| row.get(0),
+            )?;
+            if live > CHANNEL_MEMBERS_MAX as i64
+                && !existed
+                && local_pubkey != Some(member_pubkey)
+            {
+                tx.execute(
+                    "DELETE FROM channel_members
+                     WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0",
+                    params![channel_id, member_pubkey],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Refresh `last_seen` for a pubkey that already has a row. No INSERT:
+    /// public-room chat must not admit strangers onto the gossip roster.
+    pub fn touch_channel_member_last_seen(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        last_seen: i64,
+    ) -> anyhow::Result<bool> {
+        let last_seen = last_seen.min(chrono::Utc::now().timestamp());
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channel_members
+             SET last_seen = MAX(channel_members.last_seen, ?3)
+             WHERE channel_id = ?1 AND member_pubkey = ?2",
+            params![channel_id, member_pubkey, last_seen],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn remove_channel_member(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        last_seen: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM channel_members
+             WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0
+               AND last_seen <= ?3",
+            params![channel_id, member_pubkey, last_seen],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn list_channel_members(
@@ -6341,7 +6486,7 @@ mod tests {
             Some(join)
         );
 
-        db.upsert_channel_member(&channel_id, &pubkey, "Ada", 100)
+        db.upsert_channel_member(&channel_id, &pubkey, "Ada", 100, None)
             .unwrap();
         let members = db.list_channel_members(&channel_id).unwrap();
         assert_eq!(members.len(), 1);
@@ -6453,6 +6598,228 @@ mod tests {
             "no member is preserved when the caller keeps nobody"
         );
 
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channel_member_upsert_keeps_nickname_and_last_seen_monotonic() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-upsert-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let pk = "ee".repeat(32);
+        db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &pk, "", 50, None)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members[0].nickname, "Ada");
+        assert_eq!(
+            members[0].last_seen, 200,
+            "an older chat timestamp must not rewind presence last_seen"
+        );
+        db.upsert_channel_member(&channel_id, &pk, "Ada2", 250, None)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members[0].nickname, "Ada2");
+        assert_eq!(members[0].last_seen, 250);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn list_channels_member_count_counts_only_presence_fresh_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-fresh-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.upsert_channel_member(&channel_id, &"11".repeat(32), "Us", now, None)
+            .unwrap();
+        db.upsert_channel_member(
+            &channel_id,
+            &"22".repeat(32),
+            "Gone",
+            now - PRESENCE_FRESH_SECS - 30,
+            None,
+        )
+        .unwrap();
+        let listed = db.list_channels().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].member_count, 1,
+            "a stale last_seen must not keep the empty-room poll from firing"
+        );
+        assert_eq!(
+            db.count_fresh_channel_members(&channel_id, now, PRESENCE_FRESH_SECS)
+                .unwrap(),
+            1
+        );
+        let banned_pk = "33".repeat(32);
+        db.upsert_channel_member(&channel_id, &banned_pk, "Banned", now, None)
+            .unwrap();
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &banned_pk, true, now)
+            .unwrap());
+        assert_eq!(
+            db.list_channels().unwrap()[0].member_count,
+            1,
+            "a banned member must not keep the empty-room poll from firing"
+        );
+        assert_eq!(
+            db.count_fresh_channel_members(&channel_id, now, PRESENCE_FRESH_SECS)
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn an_older_tombstone_does_not_delete_a_newer_live_row() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-presence-tombstone-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let pk = "ee".repeat(32);
+        db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
+            .unwrap();
+        assert!(
+            !db.remove_channel_member(&channel_id, &pk, 100).unwrap(),
+            "an older tombstone must not delete a newer live last_seen"
+        );
+        assert_eq!(db.list_channel_members(&channel_id).unwrap().len(), 1);
+        assert!(
+            db.remove_channel_member(&channel_id, &pk, 200).unwrap(),
+            "equal timestamps prefer the tombstone"
+        );
+        assert!(db.list_channel_members(&channel_id).unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_flood_of_newcomers_does_not_evict_a_still_fresh_local_or_honest_row() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-cap-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let local = "11".repeat(32);
+        let honest = "22".repeat(32);
+        db.upsert_channel_member(&channel_id, &local, "Us", now, Some(&local))
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &honest, "Ada", now, Some(&local))
+            .unwrap();
+        for i in 0..CHANNEL_MEMBERS_MAX.saturating_sub(2) {
+            let pk = format!("{i:064x}");
+            db.upsert_channel_member(&channel_id, &pk, "Flood", now, Some(&local))
+                .unwrap();
+        }
+        assert_eq!(
+            db.list_channel_members(&channel_id)
+                .unwrap()
+                .iter()
+                .filter(|m| !m.banned)
+                .count(),
+            CHANNEL_MEMBERS_MAX
+        );
+        for i in 0..16 {
+            let pk = format!("{:064x}", 10_000 + i);
+            db.upsert_channel_member(&channel_id, &pk, "New", now, Some(&local))
+                .unwrap();
+        }
+        let members = db.list_channel_members(&channel_id).unwrap();
+        let live: Vec<_> = members.iter().filter(|m| !m.banned).collect();
+        assert!(
+            live.iter().any(|m| m.member_pubkey == local),
+            "the local user's row must survive a newcomer flood"
+        );
+        assert!(
+            live.iter().any(|m| m.member_pubkey == honest),
+            "a still-fresh honest peer must not be dropped to admit identity 257"
+        );
+        assert!(
+            live.len() <= CHANNEL_MEMBERS_MAX,
+            "refusing newcomers must not grow the table past the cap"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -6670,7 +7037,7 @@ mod tests {
         let successor_pk = "9c".repeat(32);
         db.insert_channel(&old_id, &"a1".repeat(32), "Room", "private", true, None, None)
             .expect("insert channel");
-        db.upsert_channel_member(&old_id, &"b2".repeat(32), "Them", 100)
+        db.upsert_channel_member(&old_id, &"b2".repeat(32), "Them", 100, None)
             .unwrap();
         db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
@@ -7159,9 +7526,9 @@ mod tests {
             None,
         )
         .expect("insert channel");
-        db.upsert_channel_member(&channel_id, &us_hex, "Us", 100)
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 100, None)
             .unwrap();
-        db.upsert_channel_member(&channel_id, &other_hex, "Them", 100)
+        db.upsert_channel_member(&channel_id, &other_hex, "Them", 100, None)
             .unwrap();
         assert!(db
             .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None)
@@ -7190,7 +7557,7 @@ mod tests {
             None,
         )
         .expect("rejoin channel");
-        db.upsert_channel_member(&channel_id, &us_hex, "Us", 200)
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 200, None)
             .unwrap();
         assert!(
             db.channel_member_is_banned(&channel_id, &us_hex).unwrap(),

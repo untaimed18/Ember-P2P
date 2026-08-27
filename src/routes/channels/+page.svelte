@@ -9,7 +9,7 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { copyToClipboard, formatRelativeTime } from '$lib/utils';
+  import { copyToClipboard, disambiguatedMemberName, formatRelativeTime, shortPubkey } from '$lib/utils';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -182,10 +182,7 @@
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
   let memberNames = $derived(
     Object.fromEntries(
-      members.map((mem) => [
-        mem.member_pubkey,
-        mem.is_self ? m.channels_you() : mem.nickname,
-      ]),
+      members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
     ),
   );
   let directoryList = $derived.by(() => {
@@ -302,10 +299,13 @@
    * Whether a member has been heard from recently enough to call them present.
    *
    * `last_seen` advances on their presence record (republished every
-   * `PRESENCE_REPUBLISH_SECS`, ten minutes) and on any message of theirs we
-   * ingest. Two intervals of slack means one missed republish does not blink
-   * somebody offline; the DHT drops the record entirely at 45 minutes, so
-   * anything beyond that would be claiming more than we know.
+   * `PRESENCE_REPUBLISH_SECS`, ten minutes). In a public room a chat line
+   * from someone already on the roster also refreshes it, so they do not
+   * age out while talking; it does not insert strangers. Private rooms
+   * still upsert from chat. Two intervals of slack means one missed
+   * republish does not blink somebody offline; the DHT drops the record
+   * entirely at 45 minutes, so anything beyond that would be claiming
+   * more than we know.
    */
   const PRESENCE_FRESH_SECS = 20 * 60;
 
@@ -1019,7 +1019,16 @@
   }
 
   function shortId(id: string): string {
-    return id.slice(0, 8) + '\u2026';
+    return shortPubkey(id);
+  }
+
+  function roomMemberLabel(mem: { nickname: string; member_pubkey: string; is_self: boolean }): string {
+    if (mem.is_self) return m.channels_you();
+    return disambiguatedMemberName(
+      mem.nickname,
+      mem.member_pubkey,
+      members.map((other) => other.nickname),
+    );
   }
 
   /** Anyone other than yourself has a menu now: ignoring is available to every
@@ -1059,7 +1068,7 @@
     try {
       const code = await channelMemberFriendCode(pk);
       await addFriend(code, mem.nickname || undefined);
-      toastSuccess(m.channels_friend_added({ name: mem.nickname || shortId(pk) }));
+      toastSuccess(m.channels_friend_added({ name: roomMemberLabel(mem) }));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1088,7 +1097,7 @@
       const picked = await open({ multiple: false, title: m.channels_send_file() });
       if (!picked || Array.isArray(picked)) return;
       await offerChannelTransfer(id, pk, picked);
-      toastSuccess(m.channels_xfer_offer_sent({ name: mem.nickname || shortId(pk) }));
+      toastSuccess(m.channels_xfer_offer_sent({ name: roomMemberLabel(mem) }));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1668,7 +1677,7 @@
                     {#each sortedMembers as mem (mem.member_pubkey)}
                       {#if !mem.is_self && !mem.banned}
                         <option value={mem.member_pubkey}>
-                          {mem.nickname || shortId(mem.member_pubkey)}
+                          {roomMemberLabel(mem)}
                         </option>
                       {/if}
                     {/each}
@@ -1849,7 +1858,7 @@
                     </div>
                     <div class="member-identity">
                       <span class="member-name">
-                        <bdi dir="auto">{mem.is_self ? m.channels_you() : mem.nickname || shortId(mem.member_pubkey)}</bdi>
+                        <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
                       </span>
                       <span class="member-badges">
                         {#if isChannelOwner(mem)}
@@ -1977,7 +1986,7 @@
   bind:open={transferOpen}
   title={m.channels_transfer_confirm()}
   message={m.channels_transfer_confirm_body({
-    name: transferTarget?.nickname || shortId(transferTarget?.member_pubkey ?? ''),
+    name: transferTarget ? roomMemberLabel(transferTarget) : '',
   })}
   confirmLabel={m.channels_transfer_ownership()}
   danger

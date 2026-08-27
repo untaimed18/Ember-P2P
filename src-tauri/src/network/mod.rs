@@ -6320,7 +6320,7 @@ mod tests {
             Some(&[0xABu8; 32]),
         )
         .expect("insert channel");
-        db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1)
+        db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1, None)
             .unwrap();
 
         let now = chrono::Utc::now().timestamp();
@@ -8173,6 +8173,10 @@ mod tests {
     /// moved off the sixty-second maintenance tick onto the one-second one for
     /// exactly this reason; putting it back would silently round the empty-room
     /// interval up to a minute while every value here still read as intended.
+    ///
+    /// `member_count` is presence-fresh (including us). Historical roster rows
+    /// do not keep the slow interval — 1 means nobody else has announced
+    /// recently, which is the empty-room poll case.
     #[test]
     fn an_empty_room_asks_for_its_roster_far_sooner_than_a_settled_one() {
         let empty = channel_presence_interval(1);
@@ -10446,6 +10450,12 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
+    /// Drop an in-flight Ember `FIND_VALUE` the caller has already given
+    /// up on, so the search slot is not held until [`ember::dht::search`]
+    /// times out on its own (60s). Discover presence probes wait 6s.
+    CancelEmberSearch {
+        search_id: u32,
+    },
     /// Walk this room's presence keys now rather than at the next maintenance
     /// tick. Sent on join and create: publishing our own presence tells the
     /// room we exist, but nothing pulls the roster the other way, so without
@@ -10613,6 +10623,7 @@ struct EmberVerifiedHighwater {
 /// waiter resolves with the verified records collected by the search.
 #[derive(Debug)]
 pub struct EmberValueLookupPending {
+    pub search_id: u32,
     pub records_rx: oneshot::Receiver<Vec<Vec<u8>>>,
 }
 
@@ -12377,6 +12388,11 @@ struct NetworkState {
     channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
     ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
+    /// Presence blobs accumulated for a channel while any FIND_VALUE for it
+    /// is still in flight. Applied only when the last search completes, so
+    /// current and previous epoch are newest-wins together rather than two
+    /// independent races.
+    ember_channel_presence_buffer: HashMap<[u8; 16], Vec<Vec<u8>>>,
     /// Presence blobs waiting for DB upsert + UI emit (async drain).
     ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
     /// Last presence FIND_VALUE start per channel.
@@ -12785,9 +12801,14 @@ fn channel_member_pubkeys(
     let Ok(rows) = db.list_channel_members(channel_id_hex) else {
         return Vec::new();
     };
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now.saturating_sub(ember::channel::PRESENCE_FRESH_SECS);
     rows.into_iter()
         .filter_map(|row| {
             if row.banned {
+                return None;
+            }
+            if row.last_seen < cutoff {
                 return None;
             }
             let bytes = hex::decode(row.member_pubkey).ok()?;
@@ -12801,7 +12822,7 @@ fn collect_channel_neighbor_caps(
     our_pubkey: &[u8; 32],
 ) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
     let mut members_by_channel = Vec::new();
-    for ch in db.list_channels()? {
+    for ch in db.list_channels_lite()? {
         if !ch.in_room_now() {
             continue;
         }
@@ -12939,7 +12960,7 @@ async fn maybe_refresh_channel_members(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let mut started = 0usize;
@@ -12961,7 +12982,20 @@ async fn maybe_refresh_channel_members(
             .get(&channel_id)
             .copied()
             .unwrap_or(0);
-        if now.saturating_sub(last) < channel_presence_interval(ch.member_count) {
+        // Even an empty room is not walked more often than this. Count the
+        // roster only when that gate is open — the 1 Hz tick used to run
+        // COUNT(*) for every joined room on every pass.
+        if now.saturating_sub(last) < ember::channel::PRESENCE_FETCH_EMPTY_SECS {
+            continue;
+        }
+        let fresh = db
+            .count_fresh_channel_members(
+                &ch.channel_id,
+                now,
+                ember::channel::PRESENCE_FRESH_SECS,
+            )
+            .unwrap_or(0);
+        if now.saturating_sub(last) < channel_presence_interval(fresh) {
             continue;
         }
         if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
@@ -13804,7 +13838,13 @@ fn ingest_channel_presence_records(
         .into_iter()
         .map(|m| m.member_pubkey)
         .collect();
-    let mut changed = false;
+    // Current and previous epoch are two FIND_VALUE walks. Newest-wins has
+    // to see both before any row is written, or a prev-epoch live announce
+    // re-inserts after the current tombstone and a prev-epoch tombstone
+    // deletes a rejoiner. Equal timestamps prefer the leave.
+    let now = chrono::Utc::now().timestamp();
+    let mut latest: HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember> =
+        HashMap::new();
     for blob in records {
         let Some(member) = content_keys.iter().find_map(|candidate| {
             ember::dht::publish::SignedRecord::parse_channel_presence_member(
@@ -13815,10 +13855,51 @@ fn ingest_channel_presence_records(
         }) else {
             continue;
         };
+        let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {
+            continue;
+        };
+        let mut member = member;
+        member.timestamp = ts;
+        ember::dht::publish::keep_latest_presence_member(&mut latest, member);
+    }
+    let our_hex = hex::encode(our_pubkey);
+    let mut changed = false;
+    for member in latest.into_values() {
         let pk_hex = hex::encode(member.publisher_key);
+        if member.departed {
+            if !ember::channel::presence_departure_applies(
+                &member.publisher_key,
+                our_pubkey,
+                ch.in_room_now(),
+            ) {
+                continue;
+            }
+            match db.remove_channel_member(&channel_id_hex, &pk_hex, member.timestamp) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        channel_id = %channel_id_hex,
+                        member = %pk_hex,
+                        error = %e,
+                        "could not apply a presence leave tombstone"
+                    );
+                }
+            }
+            state.ember_channel_noise_keys.remove(&member.publisher_key);
+            if existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
+                changed = true;
+            }
+            continue;
+        }
         let nick = crate::security::sanitize_display_name(&member.nickname);
         if db
-            .upsert_channel_member(&channel_id_hex, &pk_hex, &nick, member.timestamp)
+            .upsert_channel_member(
+                &channel_id_hex,
+                &pk_hex,
+                &nick,
+                member.timestamp,
+                Some(&our_hex),
+            )
             .is_ok()
         {
             state
@@ -13830,6 +13911,38 @@ fn ingest_channel_presence_records(
         }
     }
     changed
+}
+
+/// Hold presence blobs until every FIND_VALUE for this room (current and
+/// previous epoch) has finished, then queue one newest-wins ingest.
+fn buffer_channel_presence_records(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    records: Vec<Vec<u8>>,
+) {
+    if !records.is_empty() {
+        state
+            .ember_channel_presence_buffer
+            .entry(channel_id)
+            .or_default()
+            .extend(records);
+    }
+    flush_channel_presence_if_idle(state, channel_id);
+}
+
+fn flush_channel_presence_if_idle(state: &mut NetworkState, channel_id: [u8; 16]) {
+    if state
+        .ember_channel_presence_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return;
+    }
+    if let Some(records) = state.ember_channel_presence_buffer.remove(&channel_id) {
+        state
+            .ember_pending_channel_presence
+            .push((channel_id, records));
+    }
 }
 
 async fn maybe_dial_channel_neighbors(
@@ -14297,12 +14410,26 @@ async fn apply_channel_relay_event(
     }
 }
 
+fn ember_has_live_session(
+    state: &NetworkState,
+    contact: &ember::dht::EmberContact,
+) -> bool {
+    state
+        .ember_transport
+        .has_live_session(&contact.addr, &contact.noise_pub)
+}
+
+/// Handshake-capable send. Channel gossip, transfer, and CHANNEL_RELAY
+/// must not use this: `HandshakeStarted` used to count as delivered and
+/// skip overlay + the WebSocket outbox. DHT lookups still start sessions
+/// through their own `prepare_outgoing` paths.
+#[allow(dead_code)]
 async fn send_ember_dht_frame(
     socket: &UdpSocket,
     state: &mut NetworkState,
     contact: &ember::dht::EmberContact,
     frame: &[u8],
-) {
+) -> bool {
     match state
         .ember_transport
         .prepare_outgoing(contact.addr, Some(&contact.noise_pub), frame)
@@ -14311,15 +14438,43 @@ async fn send_ember_dht_frame(
         | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
             if let Err(e) = socket.send_to(&packet, contact.addr).await {
                 debug!("Ember channel gossip: send to {} failed: {e}", contact.addr);
+                false
+            } else {
+                true
             }
         }
-        ember::transport::OutgoingResult::Queued => {}
+        ember::transport::OutgoingResult::Queued => true,
         ember::transport::OutgoingResult::Error(e) => {
             debug!(
                 "Ember channel gossip: transport error for {}: {e}",
                 contact.addr
             );
+            false
         }
+    }
+}
+
+/// Seal and send only if a Noise session for this identity already exists.
+/// Does not start a handshake — `prepare_outgoing` is not called unless
+/// [`ember_has_live_session`] is true, so CHANNEL_RELAY cannot re-seal an
+/// attacker body under our identity.
+async fn send_ember_dht_frame_established(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    contact: &ember::dht::EmberContact,
+    frame: &[u8],
+) -> bool {
+    if !ember_has_live_session(state, contact) {
+        return false;
+    }
+    match state
+        .ember_transport
+        .prepare_outgoing(contact.addr, Some(&contact.noise_pub), frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet } => {
+            socket.send_to(&packet, contact.addr).await.is_ok()
+        }
+        _ => false,
     }
 }
 
@@ -14380,7 +14535,7 @@ async fn fanout_channel_gossip_retry(
         &members,
         ember::channel::CHANNEL_NEIGHBOR_COUNT,
     );
-    let mut targets = Vec::new();
+    let mut direct = Vec::new();
     let mut missing = Vec::new();
     for pk in &neighbors {
         let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
@@ -14388,32 +14543,44 @@ async fn fanout_channel_gossip_retry(
             continue;
         }
         if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
-            targets.push(contact);
-        } else {
-            missing.push(*pk);
+            if ember::channel::channel_fanout_uses_direct_session(ember_has_live_session(
+                state, &contact,
+            )) {
+                direct.push((*pk, contact));
+                continue;
+            }
         }
+        missing.push(*pk);
     }
-    if targets.len() < ember::channel::CHANNEL_NEIGHBOR_COUNT {
+    if direct.len() + missing.len() < ember::channel::CHANNEL_NEIGHBOR_COUNT {
         for pk in &members {
-            if targets.len() >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
+            if direct.len() + missing.len() >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
                 break;
             }
             let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
             if exclude == Some(node_id)
-                || targets.iter().any(|c| c.node_id == node_id)
+                || *pk == state.local_ed25519_pubkey
+                || direct.iter().any(|(p, _)| p == pk)
+                || missing.contains(pk)
             {
                 continue;
             }
             if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
-                targets.push(contact);
-            } else if !missing.contains(pk) {
-                missing.push(*pk);
+                if ember::channel::channel_fanout_uses_direct_session(ember_has_live_session(
+                    state, &contact,
+                )) {
+                    direct.push((*pk, contact));
+                    continue;
+                }
             }
+            missing.push(*pk);
         }
     }
-    for contact in targets {
+    for (pk, contact) in direct {
         let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
-        send_ember_dht_frame(socket, state, &contact, &frame).await;
+        if !send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+            missing.push(pk);
+        }
     }
     // Every unreachable neighbor is tried over the overlay, which is UDP
     // between members, before the rendezvous tunnel, which is a TCP WebSocket
@@ -14427,7 +14594,15 @@ async fn fanout_channel_gossip_retry(
     // line that arrives twice is stored and forwarded once, and only neighbors
     // we could not reach directly cost anything at all.
     if !missing.is_empty() {
-        overlay_forward_channel_gossip(socket, state, &gossip.channel_id, &body, &missing).await;
+        overlay_forward_channel_gossip(
+            socket,
+            state,
+            &gossip.channel_id,
+            &body,
+            &missing,
+            &members,
+        )
+        .await;
     }
     for pk in &missing {
         if let Some(tx) = state.channel_relay_outboxes.get(pk) {
@@ -14442,26 +14617,51 @@ async fn overlay_forward_channel_gossip(
     channel_id: &[u8; 16],
     body: &[u8],
     missing: &[[u8; 32]],
-) {
-    let hops: Vec<ember::dht::EmberContact> = state
-        .ember_dht
-        .contacts()
-        .into_iter()
-        .filter(|c| {
-            !missing
-                .iter()
-                .any(|pk| ember::channel::channel_id_from_pubkey(pk) == c.node_id.0)
+    roster: &[[u8; 32]],
+) -> bool {
+    // After inbound CHANNEL_RELAY refuses hops that are not in this room,
+    // random routing-table contacts drop the envelope. Prefer other members
+    // we already have a live session with.
+    let local = state.local_ed25519_pubkey;
+    let mut hops: Vec<ember::dht::EmberContact> = roster
+        .iter()
+        .filter(|pk| **pk != local && !missing.iter().any(|m| m == *pk))
+        .filter_map(|pk| {
+            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+            state.ember_dht.routing().get_contact(&node_id).cloned()
         })
+        .filter(|c| ember_has_live_session(state, c))
         .take(3)
         .collect();
+    if hops.is_empty() {
+        hops = state
+            .ember_dht
+            .contacts()
+            .into_iter()
+            .filter(|c| {
+                ember_has_live_session(state, c)
+                    && !missing
+                        .iter()
+                        .any(|pk| ember::channel::channel_id_from_pubkey(pk) == c.node_id.0)
+            })
+            .take(3)
+            .collect();
+    }
+    if hops.is_empty() {
+        return false;
+    }
+    let mut sent = false;
     for pk in missing {
         let target = ember::channel::channel_id_from_pubkey(pk);
         let envelope = ember::channel::encode_channel_relay_envelope(channel_id, &target, body);
         let (_rid, frame) = state.ember_dht.build_channel_relay(envelope);
         for hop in &hops {
-            send_ember_dht_frame(socket, state, hop, &frame).await;
+            if send_ember_dht_frame_established(socket, state, hop, &frame).await {
+                sent = true;
+            }
         }
     }
+    sent
 }
 
 async fn handle_inbound_channel_relay(
@@ -14488,17 +14688,40 @@ async fn handle_inbound_channel_relay(
             .await;
         return;
     }
-    if let Some(contact) = state
+    let channel_id_hex = hex::encode(channel_id);
+    let in_room = db
+        .get_channel(&channel_id_hex)
+        .ok()
+        .flatten()
+        .is_some_and(|ch| ch.in_room_now());
+    let roster = if in_room {
+        channel_member_pubkeys(db, &channel_id_hex)
+    } else {
+        Vec::new()
+    };
+    let target_on_roster = if roster.is_empty() {
+        None
+    } else {
+        Some(
+            roster
+                .iter()
+                .any(|pk| ember::channel::channel_id_from_pubkey(pk) == target_id),
+        )
+    };
+    let Some(contact) = state
         .ember_dht
         .routing()
         .get_contact(&ember::dht::EmberNodeId(target_id))
         .cloned()
-    {
-        let (_rid, frame) = state.ember_dht.build_channel_msg(inner.to_vec());
-        send_ember_dht_frame(socket, state, &contact, &frame).await;
+    else {
+        return;
+    };
+    let live = ember_has_live_session(state, &contact);
+    if !ember::channel::inbound_channel_relay_may_forward(in_room, target_on_roster, live) {
         return;
     }
-    let _ = channel_id;
+    let (_rid, frame) = state.ember_dht.build_channel_msg(inner.to_vec());
+    send_ember_dht_frame_established(socket, state, &contact, &frame).await;
 }
 
 async fn handle_inbound_channel_gossip(
@@ -14656,7 +14879,7 @@ async fn handle_inbound_channel_gossip(
             state,
             db,
             &ch,
-            &from_id,
+            sender_pk,
             since_ts,
         )
         .await;
@@ -14784,7 +15007,22 @@ async fn handle_inbound_channel_gossip(
         false,
     ) {
         Ok(row_id) => {
-            let _ = db.upsert_channel_member(&channel_id_hex, &sender_hex, "", now);
+            if ember::channel::chat_author_joins_gossip_roster(
+                ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+            ) {
+                let _ = db.upsert_channel_member(
+                    &channel_id_hex,
+                    &sender_hex,
+                    "",
+                    now,
+                    Some(&hex::encode(state.local_ed25519_pubkey)),
+                );
+            } else {
+                // Public rooms do not INSERT strangers from chat (anti-eclipse).
+                // A line from someone already on the roster still refreshes
+                // last_seen so they do not age out while visibly talking.
+                let _ = db.touch_channel_member_last_seen(&channel_id_hex, &sender_hex, now);
+            }
             let _ = app_handle.emit(
                 "ember:channel-message",
                 serde_json::json!({
@@ -14983,21 +15221,38 @@ async fn apply_channel_handoff_ready(
 async fn send_channel_gossip_unicast(
     socket: &UdpSocket,
     state: &mut NetworkState,
-    node_id: &ember::dht::EmberNodeId,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
     body: Vec<u8>,
-) {
-    let Some(contact) = state.ember_dht.routing().get_contact(node_id).cloned() else {
-        return;
-    };
+) -> bool {
     // History catch-up, in both directions: automated mesh traffic rather than
     // anything the user typed, and it retries on its own timer, so it belongs
     // on the shared allowance and not the one reserved for a line that gets no
     // second attempt.
     if !channel_gossip_rate_ok(state, false) {
-        return;
+        return false;
     }
-    let (_rid, frame) = state.ember_dht.build_channel_msg(body);
-    send_ember_dht_frame(socket, state, &contact, &frame).await;
+    // Same ladder as `send_xfer_frame`: a routing-table hit (including the
+    // unverified replacement cache) is not a live path. History catch-up used
+    // to return here after `get_contact`, which skipped overlay and the
+    // WebSocket relay for every peer we merely had a lead for.
+    let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
+    if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+        if ember_has_live_session(state, &contact) {
+            let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+            if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+                return true;
+            }
+        }
+    }
+    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+        if tx.try_send(body.clone()).is_ok() {
+            return true;
+        }
+    }
+    let roster = channel_member_pubkeys(db, &hex::encode(channel_id));
+    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
 }
 
 // --- Ember Transfer -------------------------------------------------------
@@ -15054,15 +15309,20 @@ async fn send_xfer_frame(
     let _ = remember_channel_gossip(state, gossip.msg_id);
     let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
     if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
-        let (_rid, frame) = state.ember_dht.build_channel_msg(body);
-        send_ember_dht_frame(socket, state, &contact, &frame).await;
-        return true;
+        if ember_has_live_session(state, &contact) {
+            let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+            if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+                return true;
+            }
+        }
     }
     if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
-        return tx.try_send(body).is_ok();
+        if tx.try_send(body.clone()).is_ok() {
+            return true;
+        }
     }
-    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer]).await;
-    true
+    let roster = channel_member_pubkeys(db, &channel_id_hex);
+    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
 }
 
 fn emit_xfer_update(
@@ -15736,7 +15996,7 @@ async fn reply_channel_history_sync(
     state: &mut NetworkState,
     db: &Arc<Database>,
     ch: &crate::storage::database::StoredChannel,
-    to: &ember::dht::EmberNodeId,
+    to: [u8; 32],
     since_ts: i64,
 ) {
     let Some(key) = channel_content_key(db, ch) else {
@@ -15788,7 +16048,7 @@ async fn reply_channel_history_sync(
             1,
             timestamp,
         );
-        send_channel_gossip_unicast(socket, state, to, gossip.encode()).await;
+        send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
     }
 }
 
@@ -15801,7 +16061,7 @@ async fn maybe_sync_channel_history(
     if !settings.ember_native_enabled || db.chat_locked() {
         return;
     }
-    let Ok(channels) = db.list_channels() else {
+    let Ok(channels) = db.list_channels_lite() else {
         return;
     };
     let now = std::time::Instant::now();
@@ -15821,15 +16081,41 @@ async fn maybe_sync_channel_history(
         let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
             continue;
         };
-        let Some(key) = channel_content_key(db, &ch) else {
+        // Cheap per-room gate: if every neighbor slot was asked recently,
+        // skip loading the roster. A room with fewer stamps may have grown
+        // new XOR-neighbors and still needs the member list.
+        let recent_stamps = state
+            .channel_history_sync_at
+            .iter()
+            .filter(|((cid, _), at)| {
+                *cid == channel_id && now.saturating_duration_since(**at) < interval
+            })
+            .count();
+        if recent_stamps >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
             continue;
-        };
+        }
         let members = channel_member_pubkeys(db, &ch.channel_id);
         let neighbors = ember::channel::xor_closest_neighbors(
             &our_pk,
             &members,
             ember::channel::CHANNEL_NEIGHBOR_COUNT,
         );
+        let due: Vec<[u8; 32]> = neighbors
+            .into_iter()
+            .filter(|pk| {
+                let stamp_key = (channel_id, *pk);
+                !state
+                    .channel_history_sync_at
+                    .get(&stamp_key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < interval)
+            })
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let Some(key) = channel_content_key(db, &ch) else {
+            continue;
+        };
         let wall = chrono::Utc::now().timestamp();
         let latest = db
             .latest_channel_message_timestamp(&ch.channel_id)
@@ -15843,23 +16129,11 @@ async fn maybe_sync_channel_history(
                 .max(0)
         };
         let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
-        for pk in neighbors {
+        for pk in due {
             if sent >= 4 {
                 break;
             }
-            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&pk));
-            if state.ember_dht.routing().get_contact(&node_id).is_none() {
-                continue;
-            }
             let stamp_key = (channel_id, pk);
-            if state
-                .channel_history_sync_at
-                .get(&stamp_key)
-                .is_some_and(|at| now.saturating_duration_since(*at) < interval)
-            {
-                continue;
-            }
-            state.channel_history_sync_at.insert(stamp_key, now);
             let ts = chrono::Utc::now().timestamp();
             let mut msg_id = [0u8; 16];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
@@ -15880,8 +16154,12 @@ async fn maybe_sync_channel_history(
                 1,
                 ts,
             );
-            send_channel_gossip_unicast(socket, state, &node_id, gossip.encode()).await;
-            sent += 1;
+            if send_channel_gossip_unicast(socket, state, db, channel_id, pk, gossip.encode())
+                .await
+            {
+                state.channel_history_sync_at.insert(stamp_key, now);
+                sent += 1;
+            }
         }
     }
 }
@@ -20179,6 +20457,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_keyword_searches.clear();
     state.ember_pending_keyword_results.clear();
     state.ember_channel_presence_searches.clear();
+    state.ember_channel_presence_buffer.clear();
     state.ember_pending_channel_presence.clear();
     state.channel_presence_fetch_at.clear();
     state.ember_channel_moderation_searches.clear();
@@ -21195,6 +21474,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_gossip_author_times: HashMap::new(),
         channel_history_sync_at: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
+        ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         channel_presence_fetch_at: HashMap::new(),
         ember_channel_moderation_searches: HashMap::new(),
@@ -38747,6 +39027,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     && state.ember_pending_proxy_overlay.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
                     && state.ember_pending_channel_presence.is_empty()
+                    && state.ember_channel_presence_buffer.is_empty()
                     && state.ember_pending_channel_moderation.is_empty()
                     && state.ember_pending_channel_handoff.is_empty()
                     && state.ember_pending_channel_epoch.is_empty()
@@ -38834,7 +39115,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                         maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
                     }
-                    state.ember_channel_presence_searches.remove(&search_id);
+                    if let Some(channel_id) =
+                        state.ember_channel_presence_searches.remove(&search_id)
+                    {
+                        flush_channel_presence_if_idle(&mut state, channel_id);
+                    }
                     state.ember_channel_moderation_searches.remove(&search_id);
                     state.ember_channel_handoff_searches.remove(&search_id);
                     state.ember_channel_epoch_searches.remove(&search_id);
@@ -42819,9 +43104,7 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
             } else if let Some(channel_id) =
                 state.ember_channel_presence_searches.remove(&search_id)
             {
-                state
-                    .ember_pending_channel_presence
-                    .push((channel_id, records));
+                buffer_channel_presence_records(state, channel_id, records);
             } else if let Some(channel_id) =
                 state.ember_channel_claim_searches.remove(&search_id)
             {

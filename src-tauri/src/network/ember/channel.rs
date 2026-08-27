@@ -56,6 +56,17 @@ pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
 /// gossip to, so chat cannot move either. Costs one extra walk every twenty
 /// seconds per empty room, and stops as soon as the room has anyone in it.
 pub const PRESENCE_FETCH_EMPTY_SECS: i64 = 20;
+/// A member is treated as present — and eligible as a gossip neighbor —
+/// if their last announcement is this recent. Two republish intervals so one
+/// missed announce does not drop them, matching the roster presence dot.
+pub const PRESENCE_FRESH_SECS: i64 = PRESENCE_REPUBLISH_SECS * 2;
+/// Hard cap on `channel_members` rows per room. Public rooms used to grow
+/// without bound from chat ingest; gossip neighbors are the XOR-closest of
+/// that table, so an unbounded roster is an eclipse. Past this we only drop
+/// stale rows (`last_seen` older than [`PRESENCE_FRESH_SECS`]), never the
+/// local user, and never a still-fresh peer — a flood of newcomers is
+/// refused rather than admitted as identity 257.
+pub const CHANNEL_MEMBERS_MAX: usize = 256;
 /// How often members re-fetch the owner-signed moderation record.
 pub const MODERATION_FETCH_SECS: i64 = 5 * 60;
 /// Owners re-publish moderation so the 24h record TTL cannot age out.
@@ -513,6 +524,73 @@ pub fn derive_channel_presence_capability(
     purpose.extend_from_slice(channel_id);
     purpose.extend_from_slice(&owner_id);
     crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, epoch)
+}
+
+/// Whether a signature-valid chat line may insert its author into the
+/// gossip roster.
+///
+/// Presence is the voucher for a public room: anyone who can compute the
+/// public content key can mint a chat line, so treating every author as a
+/// mesh neighbor is how a public room gets eclipsed. Private rooms fold a
+/// secret into the content key, so a chat line is already evidence of
+/// membership. Chat display can still show the author either way.
+pub fn chat_author_joins_gossip_roster(private: bool) -> bool {
+    private
+}
+
+/// Presence timestamps more than this far ahead of wall clock are dropped.
+/// Same bound DHT store uses for `created_at` (`CLOCK_SKEW_TOLERANCE_SECS`
+/// = 3600): a record that sat in the store can still carry a lying
+/// `last_seen`, and that is what roster eviction sorts on.
+pub const PRESENCE_MAX_FUTURE_SKEW_SECS: i64 = 3600;
+
+/// Drop a signed presence timestamp that is unusable as `last_seen`, and
+/// clamp a slightly-ahead clock so it cannot sort past honest peers.
+pub fn clamp_presence_timestamp(timestamp: i64, now: i64) -> Option<i64> {
+    if timestamp <= 0 || timestamp > now.saturating_add(PRESENCE_MAX_FUTURE_SKEW_SECS) {
+        return None;
+    }
+    Some(timestamp.min(now))
+}
+
+/// A leave tombstone for our own key is ignored while we are still in
+/// the room: the previous epoch's departure would otherwise delete us
+/// after we re-announced under the current one.
+pub fn presence_departure_applies(
+    publisher: &[u8; 32],
+    our_pubkey: &[u8; 32],
+    in_room: bool,
+) -> bool {
+    !(publisher == our_pubkey && in_room)
+}
+
+/// Direct DHT unicast only with a live Noise session. A routing-table
+/// contact (including HandshakeStarted / replacement cache) is not
+/// delivery; those neighbors still go through overlay and the WebSocket
+/// outbox.
+pub fn channel_fanout_uses_direct_session(has_live_session: bool) -> bool {
+    has_live_session
+}
+
+/// Inbound `CHANNEL_RELAY` may be forwarded only when this node is in the
+/// named room, a live Noise session already exists for the target (never a
+/// replacement-cache lead we would handshake to), and — when we have a
+/// roster — the target is on it.
+///
+/// The previous hop is a DHT overlay contact, not necessarily a member, so
+/// it is not roster-checked. Relays stay off the handshake-initiating path:
+/// `has_live_session` is what makes `prepare_outgoing` take the established
+/// fast path instead of starting Noise_IK and re-sealing the attacker's body
+/// under our identity.
+pub fn inbound_channel_relay_may_forward(
+    in_room: bool,
+    target_on_roster: Option<bool>,
+    has_live_session: bool,
+) -> bool {
+    if !in_room || !has_live_session {
+        return false;
+    }
+    target_on_roster.unwrap_or(true)
 }
 
 /// XOR-closest `k` member pubkeys to `self_pub`, excluding self.
@@ -2213,6 +2291,80 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), CHANNEL_NEIGHBOR_COUNT);
         assert!(!a.contains(&self_pk));
+    }
+
+    #[test]
+    fn presence_departure_is_skipped_for_us_while_in_the_room() {
+        let us = [1u8; 32];
+        let them = [2u8; 32];
+        assert!(
+            !presence_departure_applies(&us, &us, true),
+            "our own leave tombstone must not drop us while we are still in the room"
+        );
+        assert!(presence_departure_applies(&them, &us, true));
+        assert!(
+            presence_departure_applies(&us, &us, false),
+            "after we walk out, a tombstone for us is still applied"
+        );
+    }
+
+    #[test]
+    fn clamp_presence_timestamp_rejects_far_future_and_pins_to_now() {
+        let now = 1_700_000_000;
+        assert_eq!(clamp_presence_timestamp(now, now), Some(now));
+        assert_eq!(clamp_presence_timestamp(now - 60, now), Some(now - 60));
+        assert_eq!(
+            clamp_presence_timestamp(now + 30, now),
+            Some(now),
+            "a slightly-ahead clock must not sort past honest last_seen"
+        );
+        assert!(clamp_presence_timestamp(now + PRESENCE_MAX_FUTURE_SKEW_SECS + 1, now).is_none());
+        assert!(clamp_presence_timestamp(0, now).is_none());
+    }
+
+    #[test]
+    fn chat_fanout_direct_rung_requires_a_live_session() {
+        assert!(channel_fanout_uses_direct_session(true));
+        assert!(
+            !channel_fanout_uses_direct_session(false),
+            "a routing-table hit is not delivery — overlay and WS must still run"
+        );
+    }
+
+    #[test]
+    fn a_public_chat_line_does_not_insert_a_stranger_into_the_neighbor_set() {
+        assert!(
+            !chat_author_joins_gossip_roster(false),
+            "public rooms take neighbors from presence, not from chat authors"
+        );
+        assert!(
+            chat_author_joins_gossip_roster(true),
+            "a private chat line is already evidence of membership"
+        );
+
+        let self_pk = [1u8; 32];
+        let stranger = [9u8; 32];
+        // The gossip roster is presence-vouched members. A chat line must not
+        // have added `stranger`, so XOR-closest of the real roster does not
+        // include them.
+        let neighbors = xor_closest_neighbors(&self_pk, &[self_pk], CHANNEL_NEIGHBOR_COUNT);
+        assert!(
+            !neighbors.contains(&stranger),
+            "a stranger who only spoke must not become a mesh neighbor"
+        );
+        assert!(neighbors.is_empty());
+    }
+
+    #[test]
+    fn inbound_relay_forwards_only_with_a_live_session_in_a_room_we_are_in() {
+        assert!(inbound_channel_relay_may_forward(true, Some(true), true));
+        assert!(
+            inbound_channel_relay_may_forward(true, None, true),
+            "no roster yet is not a hard refuse"
+        );
+        assert!(!inbound_channel_relay_may_forward(false, Some(true), true));
+        assert!(!inbound_channel_relay_may_forward(true, Some(true), false));
+        assert!(!inbound_channel_relay_may_forward(true, Some(false), true));
     }
 
     #[test]

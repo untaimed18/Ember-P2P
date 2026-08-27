@@ -70,6 +70,14 @@ pub const CHANNEL_KIND_CLAIM: u8 = 6;
 /// `member(32) || epoch(8) || sealed envelope`.
 const EPOCH_EXTRA_PREFIX_LEN: usize = 32 + 8;
 pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
+/// Presence record that means the publisher has left the room.
+///
+/// Same key and extra shape as a live announcement so storers that do not
+/// know the flag still accept it; ingest on this build drops the member.
+/// Not a wire-format break: `flags` already lives in `file_size`'s second
+/// byte, and unknown bits were ignored. A newer timestamp replaces the live
+/// record under the same `(publisher, channel_id)` store key.
+pub const CHANNEL_FLAG_DEPARTED: u8 = 0x02;
 const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
 const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
@@ -523,6 +531,10 @@ impl ChannelRecordMeta {
     pub fn is_private(&self) -> bool {
         self.flags & CHANNEL_FLAG_PRIVATE != 0
     }
+
+    pub fn is_departed(&self) -> bool {
+        self.flags & CHANNEL_FLAG_DEPARTED != 0
+    }
 }
 
 /// A member announced under a channel presence key. No address.
@@ -532,6 +544,28 @@ pub struct ChannelPresenceMember {
     pub nickname: String,
     pub timestamp: i64,
     pub noise_pub: [u8; 32],
+    /// True when this is a leave tombstone (`CHANNEL_FLAG_DEPARTED`).
+    pub departed: bool,
+}
+
+/// Newest-wins across presence records for one publisher.
+///
+/// Current and previous epoch are two FIND_VALUE walks; without merging
+/// first, a prev-epoch live announce ingested after a current-epoch
+/// tombstone re-inserts a departed member, and a prev-epoch tombstone
+/// deletes a rejoiner. Equal timestamps prefer the tombstone so a
+/// same-second leave cannot be revived by parse order.
+pub fn keep_latest_presence_member(
+    latest: &mut HashMap<[u8; 32], ChannelPresenceMember>,
+    member: ChannelPresenceMember,
+) {
+    match latest.get(&member.publisher_key) {
+        Some(prev) if prev.timestamp > member.timestamp => {}
+        Some(prev) if prev.timestamp == member.timestamp && prev.departed && !member.departed => {}
+        _ => {
+            latest.insert(member.publisher_key, member);
+        }
+    }
 }
 
 /// Owner-signed topic, welcome, ban list, and delegated moderators. No addresses.
@@ -569,6 +603,15 @@ pub fn channel_kind_from_data(data: &[u8]) -> Option<u8> {
     // so the low byte — the kind — is `data[65]`.
     if data.first() == Some(&RECORD_TYPE_CHANNEL) {
         data.get(65).copied()
+    } else {
+        None
+    }
+}
+
+/// Second byte of packed `file_size` (kind at `[65]`, flags at `[66]`).
+pub fn channel_flags_from_data(data: &[u8]) -> Option<u8> {
+    if data.first() == Some(&RECORD_TYPE_CHANNEL) {
+        data.get(66).copied()
     } else {
         None
     }
@@ -682,6 +725,44 @@ impl SignedRecord {
         signing_key: &SigningKey,
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let (nickname, extra) = channel::encode_presence_extra(
+            private,
+            &channel::content_key(join_secret),
+            &channel_id,
+            noise_pub,
+            nickname,
+        );
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::presence_key(&channel_id, join_secret, epoch),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            &nickname,
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Leave tombstone under the same presence key as a live announcement.
+    ///
+    /// Extra is still well-formed so storers accept it; `CHANNEL_FLAG_DEPARTED`
+    /// is what ingest uses to drop the member. A newer timestamp replaces the
+    /// live record. Older builds ignore the unknown flag and treat this as a
+    /// last announce until TTL elapses — the least-breaking option without a
+    /// new record kind.
+    pub fn channel_presence_departure(
+        nickname: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        epoch: i64,
+        noise_pub: &[u8; 32],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = (if private { CHANNEL_FLAG_PRIVATE } else { 0 }) | CHANNEL_FLAG_DEPARTED;
         let (nickname, extra) = channel::encode_presence_extra(
             private,
             &channel::content_key(join_secret),
@@ -1103,6 +1184,7 @@ impl SignedRecord {
             nickname,
             timestamp: rec.timestamp,
             noise_pub,
+            departed: meta.is_departed(),
         })
     }
 
@@ -2280,9 +2362,84 @@ mod tests {
         assert_eq!(member_info.publisher_key, member.verifying_key().to_bytes());
         assert_eq!(member_info.nickname, "Ada");
         assert_eq!(member_info.noise_pub, noise_pub);
+        assert!(!member_info.departed);
         assert!(SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16], None).is_none());
         record.channel.as_mut().unwrap().extra.clear();
         assert!(!record.channel_store_ok());
+    }
+
+    #[test]
+    fn a_presence_departure_is_the_same_key_with_the_departed_flag() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&channel.pubkey);
+        let noise_pub = [0x42u8; 32];
+        let live = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &noise_pub,
+            &member,
+        );
+        let left = SignedRecord::channel_presence_departure(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &noise_pub,
+            &member,
+        );
+        assert_eq!(live.keyword_hash, left.keyword_hash);
+        assert_eq!(live.file_hash, left.file_hash);
+        assert!(left.channel.as_ref().unwrap().is_departed());
+        let mut blob = left.data.clone();
+        blob.extend_from_slice(&left.signature);
+        let parsed =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).unwrap();
+        assert!(parsed.departed);
+        assert_eq!(parsed.publisher_key, member.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn newest_presence_wins_and_equal_timestamp_prefers_the_tombstone() {
+        fn member(pk: [u8; 32], timestamp: i64, departed: bool) -> ChannelPresenceMember {
+            ChannelPresenceMember {
+                publisher_key: pk,
+                nickname: String::new(),
+                timestamp,
+                noise_pub: [0u8; 32],
+                departed,
+            }
+        }
+        let pk = [0xAAu8; 32];
+        let mut latest = HashMap::new();
+        keep_latest_presence_member(&mut latest, member(pk, 200, false));
+        keep_latest_presence_member(&mut latest, member(pk, 50, true));
+        assert!(
+            !latest[&pk].departed && latest[&pk].timestamp == 200,
+            "an older tombstone must not drop a newer live announce"
+        );
+
+        latest.clear();
+        keep_latest_presence_member(&mut latest, member(pk, 100, false));
+        keep_latest_presence_member(&mut latest, member(pk, 100, true));
+        assert!(
+            latest[&pk].departed,
+            "equal timestamps prefer the leave tombstone"
+        );
+
+        latest.clear();
+        keep_latest_presence_member(&mut latest, member(pk, 100, true));
+        keep_latest_presence_member(&mut latest, member(pk, 100, false));
+        assert!(
+            latest[&pk].departed,
+            "a same-second live record must not revive a tombstone that arrived first"
+        );
     }
 
     #[test]

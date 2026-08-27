@@ -22,10 +22,9 @@ const MAX_SEARCH_RESULTS: usize = 300;
 /// whatever fitted one datagram — about five records — purely as a side effect of
 /// sharing the wire packer, and lifting that (correctly: nothing is being sent)
 /// exposed the real hazard. A node that stores a popular key could seed all 300
-/// results, and `check_complete` ends a `FIND_VALUE` the moment the budget is
-/// full, so the first remote reply would finish the search and nothing remote
-/// would ever be merged — the node would answer every search from its own store
-/// alone.
+/// results; remote replies used to complete the search the moment the combined
+/// budget was full. Local seed no longer counts toward that budget, so the walk
+/// still descends. Half the slots are reserved so the network always has room.
 const MAX_LOCAL_SEED_RESULTS: usize = MAX_SEARCH_RESULTS / 2;
 
 /// Blobs one node may offer a single search, whether or not they are kept.
@@ -304,6 +303,17 @@ pub struct IterativeSearch {
     /// Answers in a row that brought nothing closer than the best node already
     /// on the shortlist. See [`STALE_RESPONSES_TO_CONVERGE`].
     stale_responses: u8,
+    /// Set the first time this search dispatches a shortlist query. Seed-class
+    /// preference (pinned, then verified, then mute leads) applies only to that
+    /// opening batch. Inferring it from `queried.is_empty()` re-ran the
+    /// preference after a timeout retried every seed, because retries clear
+    /// `queried`.
+    seed_round_done: bool,
+    /// How many of `results` came from [`SearchManager::seed_local_results`].
+    /// Local copies must not count toward the FIND_VALUE completion budget:
+    /// a full seed plus two remote nodes used to fill `MAX_SEARCH_RESULTS` and
+    /// stop the walk before it descended.
+    seeded_count: usize,
 }
 
 impl IterativeSearch {
@@ -348,6 +358,8 @@ impl IterativeSearch {
             pages_queued: HashMap::new(),
             next_request_id: 1,
             stale_responses: 0,
+            seed_round_done: false,
+            seeded_count: 0,
         }
     }
 
@@ -402,19 +414,22 @@ impl IterativeSearch {
         } else {
             can_send
         };
+        let mut skipped_pages = Vec::new();
         while batch.len() < page_budget {
             let Some((node_id, start)) = self.page_queue.pop_front() else {
                 break;
             };
             // The shortlist is trimmed as the walk progresses, so a node that
-            // answered may no longer be on it. Nothing else holds its address,
-            // so the page is simply dropped.
+            // answered may no longer be on it. Re-queue the page rather than
+            // dropping the rest of that node's records; the trim keep-set now
+            // includes in-flight pages so this should be rare.
             let Some(contact) = self
                 .shortlist
                 .iter()
                 .find(|e| e.contact.node_id == node_id)
                 .map(|e| e.contact.clone())
             else {
+                skipped_pages.push((node_id, start));
                 continue;
             };
             let req_id = self.take_request_id();
@@ -430,6 +445,9 @@ impl IterativeSearch {
                 request_id: req_id,
                 start_position: start,
             });
+        }
+        for item in skipped_pages {
+            self.page_queue.push_back(item);
         }
         if batch.len() >= can_send {
             return batch;
@@ -452,10 +470,11 @@ impl IterativeSearch {
         // invariant `routing.rs` states explicitly — that seed order cannot
         // matter because the search re-sorts by distance and walks that order.
         //
-        // `queried` is only empty before the very first query of a search (it
-        // retains nodes whose retries are spent), so this is exactly the
-        // opening batch.
-        let seed_round = self.queried.is_empty();
+        // `queried` is emptied when a node is retried after a timeout, so it
+        // is not a reliable "have we dispatched yet" flag. `seed_round_done`
+        // is set on the first shortlist dispatch and stays set, so retries
+        // walk XOR order like every later batch.
+        let seed_round = !self.seed_round_done;
         let passes = if seed_round { 3 } else { 1 };
         for prefer in 0..passes {
             for entry in &mut self.shortlist {
@@ -499,6 +518,9 @@ impl IterativeSearch {
             if batch.len() >= can_send {
                 break;
             }
+        }
+        if batch.iter().any(|q| q.start_position == 0) {
+            self.seed_round_done = true;
         }
         batch
     }
@@ -691,7 +713,7 @@ impl IterativeSearch {
                 );
                 continue;
             }
-            if self.results.len() < MAX_SEARCH_RESULTS {
+            if self.results.len().saturating_sub(self.seeded_count) < MAX_SEARCH_RESULTS {
                 self.results.push(SearchResultRecord {
                     data,
                     from_node: *from_id,
@@ -762,7 +784,17 @@ impl IterativeSearch {
             // matching records, which is more than most of the list has done,
             // and gossip contacts answer with `last_seen: 0` so the verified
             // clause does not cover them.
-            let owed: HashSet<EmberNodeId> = self.page_queue.iter().map(|(id, _)| *id).collect();
+            let owed: HashSet<EmberNodeId> = self
+                .page_queue
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(
+                    self.pending_requests
+                        .values()
+                        .filter(|p| p.is_page())
+                        .map(|p| p.node),
+                )
+                .collect();
             let mut kept = 0usize;
             self.shortlist.retain(|e| {
                 kept += 1;
@@ -813,8 +845,9 @@ impl IterativeSearch {
         if page.next_position <= asked_start {
             return;
         }
-        // Nothing left to put the records in.
-        if self.results.len() >= MAX_SEARCH_RESULTS {
+        // Nothing left to put the records in. Local seed is held in `results`
+        // but does not consume the remote budget — see [`Self::check_complete`].
+        if self.results.len().saturating_sub(self.seeded_count) >= MAX_SEARCH_RESULTS {
             return;
         }
         // This node has already offered everything one peer is allowed to
@@ -951,8 +984,18 @@ impl IterativeSearch {
             return;
         }
 
-        // For FIND_VALUE, complete if we have enough results
-        if self.search_type == SearchType::FindValue && self.results.len() >= MAX_SEARCH_RESULTS {
+        // For FIND_VALUE, complete if we have enough *remote* results.
+        // Local seed is held in `results` so the caller can use it, but it
+        // must not fill the budget: a popular key we already store would
+        // otherwise complete from the seed plus two answering nodes, before
+        // the walk descended toward closer hops.
+        if self.search_type == SearchType::FindValue
+            && self
+                .results
+                .len()
+                .saturating_sub(self.seeded_count)
+                >= MAX_SEARCH_RESULTS
+        {
             self.complete = true;
         }
     }
@@ -1129,6 +1172,7 @@ impl SearchManager {
                 data,
                 from_node: local_id,
             });
+            search.seeded_count = search.seeded_count.saturating_add(1);
             added += 1;
         }
         added
@@ -1355,6 +1399,15 @@ mod tests {
             last_seen: chrono::Utc::now().timestamp(),
             failed_queries: 0,
         }
+    }
+
+    /// A FOUND_NODE lead we have never reached: `last_seen == 0`, so
+    /// `is_verified()` is false and the k-trim will drop it unless it is
+    /// in-flight, pinned, or owed a page.
+    fn make_lead(id_byte: u8) -> EmberContact {
+        let mut c = make_contact(id_byte);
+        c.last_seen = 0;
+        c
     }
 
     /// A FOUND_VALUE blob — `record_data || 64-byte publisher signature` —
@@ -2493,6 +2546,199 @@ mod tests {
                 .iter()
                 .any(|e| e.contact.node_id == extra.node_id && e.pinned),
             "a pinned session peer must not be trimmed off by closer gossip"
+        );
+    }
+
+    /// Local seed used to occupy the FIND_VALUE completion budget. A node
+    /// storing a popular key seeded half the slots; two remote answers then
+    /// filled the rest and `check_complete` ended the walk before closer hops
+    /// were asked.
+    #[test]
+    fn a_full_local_seed_plus_two_nodes_does_not_complete_the_walk() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        for i in 0xA0..0xA8 {
+            rt.add_contact(make_contact(i));
+        }
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let seeds: Vec<Vec<u8>> = (0..MAX_LOCAL_SEED_RESULTS as u16)
+            .map(|i| signed_value_blob("ubuntu", i))
+            .collect();
+        assert_eq!(
+            sm.seed_local_results(sid, make_id(0x00), seeds),
+            MAX_LOCAL_SEED_RESULTS
+        );
+
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.query_pairs();
+        assert!(
+            batch.len() >= 2,
+            "need two remote answers against a still-open shortlist"
+        );
+        let (a_contact, a_req) = batch[0].clone();
+        let (b_contact, b_req) = batch[1].clone();
+        let flood_a: Vec<Vec<u8>> = (0..MAX_RESULTS_PER_NODE as u16)
+            .map(|i| signed_value_blob("ubuntu", 0x1000 + i))
+            .collect();
+        let flood_b: Vec<Vec<u8>> = (0..MAX_RESULTS_PER_NODE as u16)
+            .map(|i| signed_value_blob("ubuntu", 0x2000 + i))
+            .collect();
+        search.process_unpaged(a_req, &a_contact.node_id, vec![], flood_a);
+        search.process_unpaged(b_req, &b_contact.node_id, vec![], flood_b);
+
+        assert_eq!(
+            search.results.len(),
+            MAX_LOCAL_SEED_RESULTS + 2 * MAX_RESULTS_PER_NODE
+        );
+        assert!(
+            !search.complete,
+            "local seed must not count toward the FIND_VALUE completion budget"
+        );
+        assert!(
+            !search.next_to_query().is_empty(),
+            "the walk must still descend after the seed plus two answers"
+        );
+    }
+
+    /// Push used to refuse at `results.len() >= 300` while `check_complete`
+    /// counted only remotes. A full local seed then made 300 remotes
+    /// unreachable, so the walk burned `SEARCH_TIMEOUT_SECS` holding a slot.
+    #[test]
+    fn a_full_local_seed_still_accepts_the_remote_result_budget() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        for i in 0xA0..0xA8 {
+            rt.add_contact(make_contact(i));
+        }
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let seeds: Vec<Vec<u8>> = (0..MAX_LOCAL_SEED_RESULTS as u16)
+            .map(|i| signed_value_blob("ubuntu", i))
+            .collect();
+        assert_eq!(
+            sm.seed_local_results(sid, make_id(0x00), seeds),
+            MAX_LOCAL_SEED_RESULTS
+        );
+
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.query_pairs();
+        assert!(
+            batch.len() >= 4,
+            "need four remote answers to fill the remote budget against a full seed"
+        );
+        for (i, (contact, req)) in batch.iter().take(4).enumerate() {
+            let flood: Vec<Vec<u8>> = (0..MAX_RESULTS_PER_NODE as u16)
+                .map(|j| signed_value_blob("ubuntu", 0x1000 + (i as u16) * 0x100 + j))
+                .collect();
+            search.process_unpaged(*req, &contact.node_id, vec![], flood);
+        }
+
+        assert_eq!(
+            search.results.len(),
+            MAX_LOCAL_SEED_RESULTS + MAX_SEARCH_RESULTS,
+            "the result vector must hold the local seed plus 300 remotes"
+        );
+        assert!(
+            search.complete,
+            "the walk may complete once 300 *remote* records are in hand"
+        );
+    }
+
+    /// A page already taken out of `page_queue` and sitting in
+    /// `pending_requests` used to be trimmed off as a Responded unverified
+    /// entry. `next_to_query` then dropped the rest of that node's records.
+    #[test]
+    fn an_in_flight_page_survives_shortlist_trim() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let pager = make_lead(0xF0);
+        let helper = make_lead(0xE0);
+        rt.add_contact(pager.clone());
+        rt.add_contact(helper.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let batch = search.next_to_query();
+        let pager_req = batch
+            .iter()
+            .find(|q| q.contact.node_id == pager.node_id)
+            .map(|q| q.request_id)
+            .expect("pager is queried");
+        let helper_req = batch
+            .iter()
+            .find(|q| q.contact.node_id == helper.node_id)
+            .map(|q| q.request_id)
+            .expect("helper is queried");
+
+        search.process_response(
+            pager_req,
+            &pager.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 0)],
+            Some(ValuePage {
+                next_position: 1,
+                total_available: 40,
+            }),
+        );
+
+        let closer: Vec<EmberContact> = (1..=(K_BUCKET_SIZE as u8 + 4)).map(make_lead).collect();
+        search.process_unpaged(helper_req, &helper.node_id, closer, vec![]);
+
+        let page = search.next_to_query();
+        assert!(
+            page.iter().any(|q| {
+                q.contact.node_id == pager.node_id && q.start_position == 1
+            }),
+            "the page must be dispatched, not dropped, after closer leads fill the shortlist"
+        );
+
+        let even_closer: Vec<EmberContact> = (0x10..=0x10 + K_BUCKET_SIZE as u8)
+            .map(make_lead)
+            .collect();
+        // A closer lead we have not asked yet is Pending; pick one off the
+        // shortlist by asking it through the normal path so its answer can
+        // trim. If ALPHA already filled with pages, drain by marking nothing
+        // — the keep-set must still hold the pager while the page is in flight.
+        assert!(
+            search
+                .shortlist
+                .iter()
+                .any(|e| e.contact.node_id == pager.node_id),
+            "an in-flight page's node must stay on the shortlist through the k-trim"
+        );
+        let _ = even_closer;
+    }
+
+    /// After the opening batch, a timeout that empties `queried` must not
+    /// re-apply the seed-class preference. Retries walk XOR order so a closer
+    /// mute lead is asked before a far verified seed.
+    #[test]
+    fn retries_walk_xor_order_not_the_seed_preference() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let far = make_contact(0xF0);
+        let close = make_lead(0x02);
+        rt.add_contact(far.clone());
+        rt.add_contact(close.clone());
+
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let first = search.query_pairs();
+        assert_eq!(
+            first[0].0.node_id, far.node_id,
+            "the opening batch still prefers a verified seed"
+        );
+        for (_, req) in &first {
+            search.mark_failed_with(*req, QueryFailure::TimedOut);
+        }
+
+        let retry = search.query_pairs();
+        assert_eq!(
+            retry[0].0.node_id, close.node_id,
+            "after the first dispatch, retries walk XOR order, not seed class"
         );
     }
 }

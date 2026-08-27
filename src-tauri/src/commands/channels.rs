@@ -376,7 +376,7 @@ async fn record_self_member(
     let pk = hex::encode(state.identity.ed25519_public_key);
     let nick = nickname.to_string();
     tokio::task::spawn_blocking(move || {
-        db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp())
+        db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp(), Some(&pk))
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -545,7 +545,13 @@ pub async fn create_channel(
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
-    let _ = publish_signed_record(&state, presence).await;
+    if let Err(e) = publish_signed_record(&state, presence).await {
+        tracing::warn!(
+            channel_id = %channel_id_hex,
+            error = %e,
+            "room created but its presence record did not publish"
+        );
+    }
     let moderation = SignedRecord::channel_moderation(
         "",
         "",
@@ -566,7 +572,13 @@ pub async fn create_channel(
     // An empty topic, welcome and lists cannot overrun the record budget, so
     // this only fires if those limits are ever changed out from under it.
     if let Some(moderation) = moderation {
-        let _ = publish_signed_record(&state, moderation).await;
+        if let Err(e) = publish_signed_record(&state, moderation).await {
+            tracing::warn!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "room created but its moderation record did not publish"
+            );
+        }
     } else {
         tracing::error!("Ember: the opening channel moderation record does not fit a STORE");
     }
@@ -575,7 +587,7 @@ pub async fn create_channel(
     let db_owner = state.db.clone();
     let id_owner = channel_id_hex.clone();
     let owner_pk = state.identity.ed25519_public_key;
-    let _ = tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         db_owner.apply_channel_moderation(
             &id_owner,
             "",
@@ -590,7 +602,24 @@ pub async fn create_channel(
             Some(0),
         )
     })
-    .await;
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::error!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "could not apply the opening moderation snapshot locally"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "opening moderation snapshot task failed"
+            );
+        }
+    }
 
     let invite = ChannelInvite {
         channel_id: ident.channel_id,
@@ -856,7 +885,13 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
-    let _ = publish_signed_record(state, presence).await;
+    if let Err(e) = publish_signed_record(state, presence).await {
+        tracing::warn!(
+            channel_id = %hex::encode(invite.channel_id),
+            error = %e,
+            "join presence did not publish"
+        );
+    }
     let _ = state
         .network_tx
         .try_send(NetworkCommand::RefreshChannelMembers {
@@ -872,6 +907,17 @@ pub async fn leave_channel(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let db = state.db.clone();
+    let row_id = channel_id.clone();
+    let row = tokio::task::spawn_blocking(move || db.get_channel(&row_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
+    let Some(row) = row else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    let join_secret = join_secret_for_channel(&state, &row).await;
+    let username = state.config.read().await.settings.channel_username.clone();
+    let db = state.db.clone();
     let leave_id = channel_id.clone();
     let left = tokio::task::spawn_blocking(move || db.set_channel_in_room(&leave_id, false))
         .await
@@ -885,6 +931,38 @@ pub async fn leave_channel(
             let _ = state
                 .network_tx
                 .try_send(NetworkCommand::DropChannelTransfers { channel_id: id });
+        }
+    }
+    // Same presence key, newer timestamp, CHANNEL_FLAG_DEPARTED. Ingest on
+    // this build drops the member; the store TTL is short. Not a new wire
+    // type — flags already lived in file_size — so older peers treat this as
+    // a last announce until it expires.
+    if let Some(join_secret) = join_secret {
+        if let (Ok(id_bytes), Ok(pk_bytes)) = (hex::decode(&row.channel_id), hex::decode(&row.pubkey))
+        {
+            if let (Ok(cid), Ok(cpk)) = (
+                <[u8; 16]>::try_from(id_bytes.as_slice()),
+                <[u8; 32]>::try_from(pk_bytes.as_slice()),
+            ) {
+                let nick = username.trim();
+                let record = SignedRecord::channel_presence_departure(
+                    nick,
+                    cid,
+                    cpk,
+                    &join_secret,
+                    row.visibility == CHANNEL_KIND_PRIVATE,
+                    channel::presence_epoch(chrono::Utc::now().timestamp()),
+                    &state.identity.noise_public_key,
+                    &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+                );
+                if let Err(e) = publish_signed_record(&state, record).await {
+                    tracing::warn!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "left the room but the presence tombstone did not publish"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1597,13 +1675,18 @@ async fn moderation_power(
     Ok((row, is_owner, moderator))
 }
 
-fn enqueue_channel_gossip(state: &AppState, channel_id: &str, join_secret: [u8; 32], plain: Vec<u8>) {
+fn enqueue_channel_gossip(
+    state: &AppState,
+    channel_id: &str,
+    join_secret: [u8; 32],
+    plain: Vec<u8>,
+) -> Result<(), String> {
     let mut channel_id_bytes = [0u8; 16];
     let Ok(id_bytes) = hex::decode(channel_id) else {
-        return;
+        return Err(coded("channels_not_found", "Channel not found"));
     };
     if id_bytes.len() != 16 {
-        return;
+        return Err(coded("channels_not_found", "Channel not found"));
     }
     channel_id_bytes.copy_from_slice(&id_bytes);
     let mut msg_id = [0u8; 16];
@@ -1619,11 +1702,13 @@ fn enqueue_channel_gossip(state: &AppState, channel_id: &str, join_secret: [u8; 
         channel::CHANNEL_MSG_TTL_DEFAULT,
         ts,
     );
-    let _ = state
+    state
         .network_tx
         .try_send(NetworkCommand::FanoutChannelGossip {
             body: gossip.encode(),
-        });
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    Ok(())
 }
 
 /// Secrets this room can be read with, newest epoch first.
@@ -1774,47 +1859,131 @@ async fn apply_local_mod_ban(
     let db = state.db.clone();
     let id = row.channel_id.clone();
     let target_hex = hex::encode(target);
-    tokio::task::spawn_blocking(move || {
+    let applied = tokio::task::spawn_blocking(move || {
         db.apply_channel_ban_action(&id, &target_hex, banned, ts)
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_ban_failed", "Failed to update the ban list", e))?;
-    if let Some(join_secret) = join_secret_for_channel(state, row).await {
-        let mut channel_id_bytes = [0u8; 16];
-        let Ok(id_bytes) = hex::decode(&row.channel_id) else {
-            return Ok(());
-        };
-        if id_bytes.len() != 16 {
-            return Ok(());
+    if !applied {
+        return Err(coded(
+            "channels_ban_failed",
+            "The ban list was not updated",
+        ));
+    }
+
+    async fn rollback(
+        state: &AppState,
+        row: &StoredChannel,
+        target: [u8; 32],
+        banned: bool,
+        ts: i64,
+    ) -> Result<(), String> {
+        let db = state.db.clone();
+        let id = row.channel_id.clone();
+        let target_hex = hex::encode(target);
+        let rollback_banned = !banned;
+        let rollback_ts = ts.saturating_add(1);
+        let outcome = tokio::task::spawn_blocking(move || {
+            db.apply_channel_ban_action(&id, &target_hex, rollback_banned, rollback_ts)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => {
+                tracing::error!(
+                    channel_id = %row.channel_id,
+                    member = %hex::encode(target),
+                    "ban was saved locally but rolling it back did not take"
+                );
+                Err(coded(
+                    "channels_ban_stuck",
+                    "The ban was saved but could not be announced, and rolling it back failed",
+                ))
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    channel_id = %row.channel_id,
+                    member = %hex::encode(target),
+                    error = %e,
+                    "ban was saved locally but rolling it back failed"
+                );
+                Err(coded_ctx(
+                    "channels_ban_stuck",
+                    "The ban was saved but could not be announced, and rolling it back failed",
+                    e,
+                ))
+            }
+            Err(e) => {
+                tracing::error!(
+                    channel_id = %row.channel_id,
+                    member = %hex::encode(target),
+                    error = %e,
+                    "ban was saved locally but rolling it back failed"
+                );
+                Err(coded_ctx(
+                    "channels_ban_stuck",
+                    "The ban was saved but could not be announced, and rolling it back failed",
+                    e,
+                ))
+            }
         }
-        channel_id_bytes.copy_from_slice(&id_bytes);
-        let mut msg_id = [0u8; 16];
-        OsRng.fill_bytes(&mut msg_id);
-        let plain = channel::encode_channel_mod_action(
-            &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-            &state.identity.ed25519_public_key,
-            &target,
-            banned,
-            &channel_id_bytes,
-            &msg_id,
-            ts,
-        );
-        let key = channel::content_key(&join_secret);
-        let gossip = channel::ChannelGossip::sealed(
-            channel_id_bytes,
-            msg_id,
-            &key,
-            ts.max(0) as u64,
-            &plain,
-            channel::CHANNEL_MSG_TTL_DEFAULT,
-            ts,
-        );
-        let _ = state
-            .network_tx
-            .try_send(NetworkCommand::FanoutChannelGossip {
-                body: gossip.encode(),
-            });
+    }
+
+    let Some(join_secret) = join_secret_for_channel(state, row).await else {
+        rollback(state, row, target, banned, ts).await?;
+        return Err(coded(
+            "channels_ban_failed",
+            "Could not announce the ban",
+        ));
+    };
+    let mut channel_id_bytes = [0u8; 16];
+    let Ok(id_bytes) = hex::decode(&row.channel_id) else {
+        rollback(state, row, target, banned, ts).await?;
+        return Err(coded(
+            "channels_ban_failed",
+            "Could not announce the ban",
+        ));
+    };
+    if id_bytes.len() != 16 {
+        rollback(state, row, target, banned, ts).await?;
+        return Err(coded(
+            "channels_ban_failed",
+            "Could not announce the ban",
+        ));
+    }
+    channel_id_bytes.copy_from_slice(&id_bytes);
+    let mut msg_id = [0u8; 16];
+    OsRng.fill_bytes(&mut msg_id);
+    let plain = channel::encode_channel_mod_action(
+        &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+        &state.identity.ed25519_public_key,
+        &target,
+        banned,
+        &channel_id_bytes,
+        &msg_id,
+        ts,
+    );
+    let key = channel::content_key(&join_secret);
+    let gossip = channel::ChannelGossip::sealed(
+        channel_id_bytes,
+        msg_id,
+        &key,
+        ts.max(0) as u64,
+        &plain,
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        ts,
+    );
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::FanoutChannelGossip {
+            body: gossip.encode(),
+        })
+    {
+        if let Err(stuck) = rollback(state, row, target, banned, ts).await {
+            return Err(stuck);
+        }
+        return Err(coded_ctx("network_busy", "Network busy", e));
     }
     Ok(())
 }
@@ -2384,6 +2553,11 @@ pub async fn claim_channel_ownership(
 /// FIND_VALUE, so this is the ceiling on what browsing adds to a walk.
 const MAX_PRESENCE_PROBE_ROOMS: usize = 24;
 
+/// Probe FIND_VALUEs started at once. The search manager holds 64 slots and
+/// a walk lasts 60s unless cancelled; 24 in parallel plus shard walks used
+/// to fill the table so new searches were silently rejected.
+const PRESENCE_PROBE_CONCURRENCY: usize = 6;
+
 /// How long to wait for those counts. Far shorter than a shard walk's budget:
 /// the size is a decoration on a listing the browse has already produced, so a
 /// slow answer should be dropped rather than hold the whole result back.
@@ -2392,7 +2566,7 @@ const PRESENCE_PROBE_TIMEOUT_MS: u64 = 6_000;
 /// How recently a member must have announced themselves to be counted. Two
 /// republish intervals, so one missed announcement does not drop somebody, and
 /// the same rule the roster's presence dot uses.
-const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_REPUBLISH_SECS * 2;
+const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_FRESH_SECS;
 
 /// Count who is announcing themselves in public rooms we have not joined.
 ///
@@ -2402,8 +2576,9 @@ const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_REPUBLISH_SECS * 2;
 /// and stay uncountable on purpose, which is why they never reach here.
 ///
 /// Only the current epoch is asked for. A member who last announced under the
-/// previous key is missed for up to one republish interval, which is why the
-/// caller treats 0 as "unknown" rather than "empty".
+/// previous key is missed for up to one republish interval. Rooms that time
+/// out or never answer stay `None`; a completed walk with no fresh live
+/// records is stamped 0.
 async fn probe_public_member_counts(
     state: &AppState,
     rooms: &[(String, String)],
@@ -2412,8 +2587,7 @@ async fn probe_public_member_counts(
 
     let now = chrono::Utc::now().timestamp();
     let epoch = channel::presence_epoch(now);
-    let mut keys = Vec::new();
-    let mut wanted: HashMap<String, [u8; 16]> = HashMap::new();
+    let mut wanted: HashMap<[u8; 16], String> = HashMap::new();
     for (id_hex, pk_hex) in rooms.iter().take(MAX_PRESENCE_PROBE_ROOMS) {
         let Some(id) = hex::decode(id_hex)
             .ok()
@@ -2427,63 +2601,84 @@ async fn probe_public_member_counts(
         else {
             continue;
         };
-        keys.push(channel::presence_key(
-            &id,
-            &channel::public_join_secret(&pk),
-            epoch,
-        ));
-        wanted.insert(id_hex.clone(), id);
+        let key = channel::presence_key(&id, &channel::public_join_secret(&pk), epoch);
+        wanted.insert(key, id_hex.clone());
     }
-    if keys.is_empty() {
+    if wanted.is_empty() {
         return None;
     }
-    let blobs = find_raw_keys_within(state, keys, PRESENCE_PROBE_TIMEOUT_MS)
-        .await
-        .unwrap_or_default();
-    // Hearing nothing at all cannot be told apart from not being able to ask,
-    // so the whole pass is inconclusive rather than a claim that every room is
-    // empty. One answer is enough to trust the silence of the others.
-    if blobs.is_empty() {
-        return None;
+    // One FIND_VALUE per presence key, the same pattern as the public-index
+    // shard walks. Batching independent rooms into extras AND-filters by
+    // file_hash, and MAX_FIND_VALUE_KEYS would truncate the rest to a
+    // confirmed 0 the UI treated as authoritative. Run in small batches so
+    // the 64-slot search table is not filled by one Discover pass.
+    let keys: Vec<[u8; 16]> = wanted.keys().copied().collect();
+    let mut walks = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(PRESENCE_PROBE_CONCURRENCY) {
+        let batch = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|key| find_raw_keys_within(state, vec![*key], PRESENCE_PROBE_TIMEOUT_MS)),
+        )
+        .await;
+        walks.extend(batch);
     }
-    let mut members: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
-    for blob in blobs {
-        // Read the room out of the record header first so each blob is only
-        // signature-checked against the room it claims to be for.
-        let Some(rec) = SignedRecord::from_value_blob(&blob) else {
+    let mut members: HashMap<String, HashMap<[u8; 32], (i64, bool)>> = HashMap::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    let mut any_answer = false;
+    for (key, walk) in keys.into_iter().zip(walks) {
+        let Some(blobs) = walk.unwrap_or(None) else {
             continue;
         };
-        let id_hex = hex::encode(rec.file_hash);
-        let Some(channel_id) = wanted.get(&id_hex) else {
+        any_answer = true;
+        let Some(id_hex) = wanted.get(&key) else {
             continue;
         };
-        if let Some(member) =
-            SignedRecord::parse_channel_presence_member(&blob, channel_id, None)
-        {
-            // A record outlives its publisher's last announcement by design, so
-            // counting every one that is still stored would keep people in the
-            // room for half an hour after they left. Same window the roster uses
-            // to decide who is present.
-            if now.saturating_sub(member.timestamp) > PRESENCE_FRESH_SECS {
-                continue;
+        answered.insert(id_hex.clone());
+        let Some(channel_id) = hex::decode(id_hex)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        let per_room = members.entry(id_hex.clone()).or_default();
+        for blob in blobs {
+            if let Some(member) =
+                SignedRecord::parse_channel_presence_member(&blob, &channel_id, None)
+            {
+                match per_room.get(&member.publisher_key) {
+                    Some((ts, departed))
+                        if *ts > member.timestamp
+                            || (*ts == member.timestamp && *departed && !member.departed) => {}
+                    _ => {
+                        per_room.insert(
+                            member.publisher_key,
+                            (member.timestamp, member.departed),
+                        );
+                    }
+                }
             }
-            members
-                .entry(id_hex)
-                .or_default()
-                .insert(member.publisher_key);
         }
     }
-    // Rooms we asked about and heard nothing from are empty, not unknown —
-    // that is what lets a directory card drop a count that has gone away.
-    Some(
-        wanted
-            .into_keys()
-            .map(|id| {
-                let count = members.get(&id).map(|seen| seen.len() as i64).unwrap_or(0);
-                (id, count)
-            })
-            .collect(),
-    )
+    // Hearing nothing at all cannot be told apart from not being able to ask.
+    if !any_answer {
+        return None;
+    }
+    // A walked key that completed — including tombstone-only or empty —
+    // reports 0 rather than leaving the previous count on screen forever.
+    // Timeouts stay absent so the UI does not treat 0 as authoritative.
+    let mut out = HashMap::new();
+    for id in answered {
+        let count = members.get(&id).map(|seen| {
+            seen.values()
+                .filter(|(ts, departed)| {
+                    !*departed && now.saturating_sub(*ts) <= PRESENCE_FRESH_SECS
+                })
+                .count() as i64
+        }).unwrap_or(0);
+        out.insert(id, count);
+    }
+    Some(out)
 }
 
 /// Turn one shard's raw `FOUND_VALUE` blobs into public room listings.
@@ -2723,16 +2918,20 @@ async fn publish_signed_record(
 }
 
 async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<u8>>, String> {
-    find_raw_keys_within(state, keys, DEFAULT_FIND_TIMEOUT_MS).await
+    Ok(find_raw_keys_within(state, keys, DEFAULT_FIND_TIMEOUT_MS)
+        .await?
+        .unwrap_or_default())
 }
 
+/// `None` means the caller timed out (or the waiter was dropped) before the
+/// search completed. `Some(blobs)` — including empty — means the walk finished.
 async fn find_raw_keys_within(
     state: &AppState,
     keys: Vec<[u8; 16]>,
     timeout_ms: u64,
-) -> Result<Vec<Vec<u8>>, String> {
+) -> Result<Option<Vec<Vec<u8>>>, String> {
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2746,9 +2945,16 @@ async fn find_raw_keys_within(
     )
     .await
     {
-        Ok(Ok(records)) => Ok(records),
-        Ok(Err(_)) => Ok(Vec::new()),
-        Err(_) => Ok(Vec::new()),
+        Ok(Ok(records)) => Ok(Some(records)),
+        Ok(Err(_)) => Ok(None),
+        Err(_) => {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::CancelEmberSearch {
+                    search_id: pending.search_id,
+                });
+            Ok(None)
+        }
     }
 }
 
@@ -2829,6 +3035,7 @@ pub async fn transfer_channel_ownership(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
     let Some(join_secret) = join_secret_for_channel(&state, &owned.row).await else {
+        clear_channel_pending_handoff(&state, &channel_id).await?;
         return Err(coded(
             "channels_handoff_failed",
             "Could not start transfer",
@@ -2841,7 +3048,31 @@ pub async fn transfer_channel_ownership(
         &pk,
         version,
     );
-    enqueue_channel_gossip(&state, &channel_id, join_secret, plain);
+    if let Err(e) = enqueue_channel_gossip(&state, &channel_id, join_secret, plain) {
+        if let Err(stuck) = clear_channel_pending_handoff(&state, &channel_id).await {
+            return Err(stuck);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn clear_channel_pending_handoff(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    tokio::task::spawn_blocking(move || db.set_channel_pending_handoff(&id, "", 0))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "channels_handoff_stuck",
+                "A transfer is still marked pending on this room",
+                e,
+            )
+        })?;
     Ok(())
 }
 
@@ -2913,53 +3144,52 @@ pub async fn offer_channel_transfer(
         ));
     }
 
-    let canonical = std::path::PathBuf::from(&path)
-        .canonicalize()
-        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
-    if !canonical.is_file() {
-        return Err(coded("channels_xfer_failed", "That is not a file"));
-    }
-    crate::security::filesystem::ensure_not_reparse(&canonical)
-        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
-    let meta = std::fs::metadata(&canonical)
-        .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
-    if meta.len() == 0 || meta.len() > channel::XFER_MAX_BYTES {
-        return Err(coded_ctx(
-            "channels_xfer_too_large",
-            "Files must be between 1 byte and 100 MB",
-            channel::XFER_MAX_BYTES,
-        ));
-    }
-    let name = crate::security::sanitize_filename(
-        canonical
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file"),
-    );
-    if name.is_empty() {
-        return Err(coded(
-            "channels_xfer_failed",
-            "That file name is not allowed",
-        ));
-    }
-
-    // The same hash tree the dormant Ember transfer module defines, so the
-    // identifier here is the Ember file hash rather than a one-off digest.
-    let hash_path = canonical.clone();
-    let tree = tokio::task::spawn_blocking(move || {
-        std::fs::File::open(&hash_path).and_then(|f| {
+    let path_for_hash = path.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let canonical = std::path::PathBuf::from(&path_for_hash)
+            .canonicalize()
+            .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+        if !canonical.is_file() {
+            return Err(coded("channels_xfer_failed", "That is not a file"));
+        }
+        crate::security::filesystem::ensure_not_reparse(&canonical)
+            .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+        let meta = std::fs::metadata(&canonical)
+            .map_err(|e| coded_ctx("channels_xfer_failed", "Cannot open that file", e))?;
+        if meta.len() == 0 || meta.len() > channel::XFER_MAX_BYTES {
+            return Err(coded_ctx(
+                "channels_xfer_too_large",
+                "Files must be between 1 byte and 100 MB",
+                channel::XFER_MAX_BYTES,
+            ));
+        }
+        let name = crate::security::sanitize_filename(
+            canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"),
+        );
+        if name.is_empty() {
+            return Err(coded(
+                "channels_xfer_failed",
+                "That file name is not allowed",
+            ));
+        }
+        let tree = std::fs::File::open(&canonical).and_then(|f| {
             crate::network::ember::transfer::HashTree::from_reader(std::io::BufReader::new(f))
         })
+        .map_err(|e| coded_ctx("channels_xfer_failed", "Could not read that file", e))?;
+        if tree.file_size != meta.len() {
+            return Err(coded(
+                "channels_xfer_failed",
+                "That file changed while it was being prepared",
+            ));
+        }
+        Ok((canonical, name, meta.len(), tree))
     })
     .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_xfer_failed", "Could not read that file", e))?;
-    if tree.file_size != meta.len() {
-        return Err(coded(
-            "channels_xfer_failed",
-            "That file changed while it was being prepared",
-        ));
-    }
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
+    let (canonical, name, size, tree) = prepared;
 
     let mut channel_id_bytes = [0u8; 16];
     hex::decode_to_slice(&channel_id, &mut channel_id_bytes)
@@ -2976,7 +3206,7 @@ pub async fn offer_channel_transfer(
             xfer_id,
             path: canonical,
             name,
-            size: meta.len(),
+            size,
             root: tree.root_hash,
             tx,
         })
