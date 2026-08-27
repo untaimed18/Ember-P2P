@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
+  import ShareEmberDialog from '$lib/components/ShareEmberDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
@@ -16,6 +17,7 @@
 
   let aboutOpen = $state(false);
   let shortcutsOpen = $state(false);
+  let shareOpen = $state(false);
   let visibleNav = $derived(
     $appSettings?.ember_native_enabled === false
       ? navItems.filter((item) => item.id !== 'channels')
@@ -437,6 +439,18 @@
       </span>
       <span>{m.sidebar_about()}</span>
     </button>
+    <button type="button" class="about-btn" onclick={() => (shareOpen = true)} title={m.sidebar_share_ember_title()} aria-label={m.sidebar_share_ember_title()}>
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="5" cy="10" r="2.2"/>
+          <circle cx="14.5" cy="5" r="2.2"/>
+          <circle cx="14.5" cy="15" r="2.2"/>
+          <line x1="7" y1="9.2" x2="12.4" y2="6"/>
+          <line x1="7" y1="10.8" x2="12.4" y2="14"/>
+        </svg>
+      </span>
+      <span>{m.sidebar_share_ember()}</span>
+    </button>
     <button
       type="button"
       class="about-btn collapse-btn"
@@ -461,6 +475,7 @@
   </div>
 
   <AboutDialog bind:open={aboutOpen} />
+  <ShareEmberDialog bind:open={shareOpen} />
   <KeyboardShortcutsDialog bind:open={shortcutsOpen} />
 </nav>
 
@@ -558,6 +573,7 @@
     padding: 4px 0 8px;
     flex: 1;
     min-height: 0;
+    overflow-y: auto;
   }
 
   .sidebar-footer {

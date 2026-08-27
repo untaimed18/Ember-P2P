@@ -56,7 +56,9 @@
     mutedChannels,
     refreshChannels,
     replaceChannel,
+    setChannelInRoom,
     setChannelMemberCount,
+    upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
     toggleChannelMute,
@@ -624,7 +626,7 @@
     // Ahead of the fetch: a roster that fails to load must not leave an unread
     // badge on the room the user is now reading.
     clearChannelUnread(id);
-    await refreshMembers(id, true);
+    void refreshMembers(id, true);
   }
 
   function resetSearch() {
@@ -730,7 +732,8 @@
       discovered = discovered.map((item) =>
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
-      await refreshChannels();
+      upsertChannel(joined);
+      void refreshChannels();
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -746,22 +749,24 @@
   async function handleLeave() {
     const id = leaveTargetId;
     if (!id) return;
+    if (selectedId === id) {
+      activeChannelId.set(null);
+      members = [];
+      resetSearch();
+    }
+    setChannelInRoom(id, false);
+    transferSent = Object.fromEntries(
+      Object.entries(transferSent).filter(([key]) => key !== id),
+    );
+    discovered = discovered.map((item) =>
+      item.channel_id === id ? { ...item, joined: false } : item,
+    );
     try {
       await leaveChannel(id);
-      if (selectedId === id) {
-        activeChannelId.set(null);
-        members = [];
-        resetSearch();
-      }
-      transferSent = Object.fromEntries(
-        Object.entries(transferSent).filter(([key]) => key !== id),
-      );
-      discovered = discovered.map((item) =>
-        item.channel_id === id ? { ...item, joined: false } : item,
-      );
-      await refreshChannels();
+      void refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      await refreshChannels();
     } finally {
       leaveTargetId = null;
     }
@@ -835,7 +840,8 @@
       discovered = discovered.map((item) =>
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
-      await refreshChannels();
+      upsertChannel(joined);
+      void refreshChannels();
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());

@@ -23,6 +23,9 @@ use crate::storage::database::{StoredChannel, StoredChannelMember};
 const MAX_CHANNEL_NAME: usize = 64;
 const MAX_CHANNEL_MESSAGE: usize = 4096;
 const DEFAULT_FIND_TIMEOUT_MS: u64 = 30_000;
+/// Tombstone directory is a hint, not membership. The HTTP client can sit
+/// on a 60s request timeout; join must not.
+const DELETED_DIRECTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(serde::Serialize)]
 pub struct ChannelInfo {
@@ -527,7 +530,7 @@ pub async fn create_channel(
         // republishes the listing within the hour. Until it does the room is
         // undiscoverable, and a discarded error made that indistinguishable
         // from a room nobody happened to browse for.
-        if let Err(e) = publish_signed_record(&state, record).await {
+        if let Err(e) = queue_signed_record(&state, record).await {
             tracing::warn!(
                 channel_id = %channel_id_hex,
                 error = %e,
@@ -545,7 +548,7 @@ pub async fn create_channel(
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
-    if let Err(e) = publish_signed_record(&state, presence).await {
+    if let Err(e) = queue_signed_record(&state, presence).await {
         tracing::warn!(
             channel_id = %channel_id_hex,
             error = %e,
@@ -572,7 +575,7 @@ pub async fn create_channel(
     // An empty topic, welcome and lists cannot overrun the record budget, so
     // this only fires if those limits are ever changed out from under it.
     if let Some(moderation) = moderation {
-        if let Err(e) = publish_signed_record(&state, moderation).await {
+        if let Err(e) = queue_signed_record(&state, moderation).await {
             tracing::warn!(
                 channel_id = %channel_id_hex,
                 error = %e,
@@ -666,7 +669,6 @@ pub async fn join_channel(
         })
     };
     let channel_id_hex = hex::encode(invite.channel_id);
-    refuse_deleted_channel(&state, &channel_id_hex).await?;
 
     let db = state.db.clone();
     let existing = tokio::task::spawn_blocking({
@@ -684,10 +686,16 @@ pub async fn join_channel(
                 "This channel has been deleted",
             ));
         }
+        // Local rows already know `deleted`. A directory round-trip here made
+        // re-entry wait on Rendezvous even though membership is local.
         return enter_stored_channel(&state, &channel_id_hex, &username).await;
     }
 
-    let username = claim_username_on_registry(&state, &username).await?;
+    refuse_deleted_channel(&state, &channel_id_hex).await?;
+
+    // Username was claimed when the user chose it. Re-hitting Rendezvous here
+    // made first joins wait on a directory round-trip that does not decide
+    // membership.
 
     let pubkey_hex = hex::encode(invite.pubkey);
     let visibility = if invite.private {
@@ -763,7 +771,6 @@ pub async fn enter_channel(
     }
     let username = require_channel_username(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
-    refuse_deleted_channel(&state, &channel_id).await?;
     enter_stored_channel(&state, &channel_id, &username).await
 }
 
@@ -772,17 +779,18 @@ async fn refuse_deleted_channel(
     channel_id: &str,
 ) -> Result<(), String> {
     let url = rendezvous_url(state).await;
-    match crate::network::rendezvous::fetch_deleted_channel_ids(&url).await {
-        Ok(ids) if ids.iter().any(|id| id.eq_ignore_ascii_case(channel_id)) => {
+    let fetch = crate::network::rendezvous::fetch_deleted_channel_ids(&url);
+    match tokio::time::timeout(DELETED_DIRECTORY_TIMEOUT, fetch).await {
+        Ok(Ok(ids)) if ids.iter().any(|id| id.eq_ignore_ascii_case(channel_id)) => {
             Err(coded(
                 "channels_deleted",
                 "This channel has been deleted",
             ))
         }
-        Ok(_) => Ok(()),
+        Ok(Ok(_)) => Ok(()),
         // Tombstones are a directory hint, not uniqueness. A private invite
-        // must still work when Rendezvous is unreachable.
-        Err(_) => Ok(()),
+        // must still work when Rendezvous is unreachable or slow.
+        Ok(Err(_)) | Err(_) => Ok(()),
     }
 }
 
@@ -885,7 +893,7 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
     );
-    if let Err(e) = publish_signed_record(state, presence).await {
+    if let Err(e) = queue_signed_record(state, presence).await {
         tracing::warn!(
             channel_id = %hex::encode(invite.channel_id),
             error = %e,
@@ -955,7 +963,7 @@ pub async fn leave_channel(
                     &state.identity.noise_public_key,
                     &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
                 );
-                if let Err(e) = publish_signed_record(&state, record).await {
+                if let Err(e) = queue_signed_record(&state, record).await {
                     tracing::warn!(
                         channel_id = %channel_id,
                         error = %e,
@@ -2884,21 +2892,37 @@ pub async fn cached_channels(
         .collect())
 }
 
-async fn publish_signed_record(
+/// Queue a signed record on the Ember DHT without waiting for STORE (or even
+/// for the network task to pick the command up). Presence join/leave must not
+/// hold the UI for that lookup (up to [`DEFAULT_FIND_TIMEOUT_MS`]). The
+/// oneshot is dropped: `PublishEmberRecord` still starts the walk, and
+/// `maybe_finish_ember_publish` ignores a gone waiter.
+async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(), String> {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::PublishEmberRecord { record, tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    Ok(())
+}
+
+async fn start_signed_record(
     state: &AppState,
     record: SignedRecord,
-) -> Result<EmberPublishResult, String> {
+) -> Result<EmberPublishPending, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
         .try_send(NetworkCommand::PublishEmberRecord { record, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    let pending: EmberPublishPending = await_reply(
-        rx,
-        "channels_publish_failed",
-        "No response from network",
-    )
-    .await??;
+    await_reply(rx, "channels_publish_failed", "No response from network").await?
+}
+
+async fn publish_signed_record(
+    state: &AppState,
+    record: SignedRecord,
+) -> Result<EmberPublishResult, String> {
+    let pending = start_signed_record(state, record).await?;
     match tokio::time::timeout(
         std::time::Duration::from_millis(DEFAULT_FIND_TIMEOUT_MS),
         pending.result_rx,

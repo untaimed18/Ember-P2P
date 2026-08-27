@@ -25,6 +25,7 @@
   } from '$lib/types';
   import { formatDurationSecs } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
+  import { checkForUpdates, updater } from '$lib/stores/updater';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -173,6 +174,17 @@
   }
 
   let isActive = $derived(!!diag?.ember_native_enabled);
+  let versionPeerNewer = $derived(diag?.ember_dht_version_peer_newer ?? 0);
+  let versionPeerOlder = $derived(diag?.ember_dht_version_peer_older ?? 0);
+  let versionMismatch = $derived(diag?.ember_dht_version_mismatch ?? 0);
+  // Split counters are new; an older diagnostics payload only has the total.
+  // Treat a positive total with no split as the previous "they should update" banner.
+  let showNewerVersionBanner = $derived(isActive && versionPeerNewer > 0);
+  let showOlderVersionBanner = $derived(
+    isActive &&
+      (versionPeerOlder > 0 ||
+        (versionMismatch > 0 && versionPeerNewer === 0 && versionPeerOlder === 0)),
+  );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
   let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
@@ -360,6 +372,8 @@
     { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: String(diag?.ember_dht_callback_connects ?? 0) },
     { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
     { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: String(diag?.ember_dht_version_mismatch ?? 0) },
+    { id: 'version-peer-older', k: m.ember_stat_version_peer_older(), v: String(diag?.ember_dht_version_peer_older ?? 0) },
+    { id: 'version-peer-newer', k: m.ember_stat_version_peer_newer(), v: String(diag?.ember_dht_version_peer_newer ?? 0) },
     { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
     { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
     { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
@@ -420,6 +434,8 @@
 
 <div class="page-content">
   <div class="ember-inner">
+  <div class="banner banner-info" role="note">{m.ember_network_growing()}</div>
+
   <section class="hero" class:state-off={heroState === 'off' || heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
     <div class="hero-main">
@@ -443,7 +459,21 @@
     <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
   {/if}
 
-  {#if isActive && (diag?.ember_dht_version_mismatch ?? 0) > 0}
+  {#if showNewerVersionBanner}
+    <div class="banner banner-warn banner-with-action" role="status">
+      <span>{m.ember_version_newer_banner()}</span>
+      <button
+        type="button"
+        class="banner-action"
+        onclick={() => void checkForUpdates()}
+        disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+      >
+        {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+      </button>
+    </div>
+  {/if}
+
+  {#if showOlderVersionBanner}
     <div class="banner banner-warn" role="status">{m.ember_version_mismatch_banner()}</div>
   {/if}
 
@@ -1222,6 +1252,40 @@
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
     color: var(--warning);
+  }
+
+  .banner-info {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+    color: var(--text-secondary);
+  }
+
+  .banner-with-action {
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px 12px;
+  }
+
+  .banner-action {
+    flex-shrink: 0;
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+    background: color-mix(in srgb, var(--warning) 16%, var(--bg-secondary));
+    color: inherit;
+    border-radius: var(--radius-sm, 6px);
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .banner-action:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--warning) 24%, var(--bg-secondary));
+  }
+
+  .banner-action:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   .spinner {

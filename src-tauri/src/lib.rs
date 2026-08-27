@@ -1878,6 +1878,8 @@ pub fn run() {
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
             commands::settings::open_ember_website,
+            commands::settings::get_ember_website_url,
+            commands::settings::open_ember_share,
             commands::security::get_security_policy_state,
             commands::security::acknowledge_security_policy_reset,
             commands::security::get_ip_filter_stats,

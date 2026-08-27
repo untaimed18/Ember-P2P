@@ -1734,9 +1734,164 @@ pub async fn open_ember_website() -> Result<(), String> {
     })
 }
 
+/// The official site, for copying. Same constant [`open_ember_website`] opens
+/// so the clipboard and the browser cannot drift.
+#[tauri::command]
+pub fn get_ember_website_url() -> String {
+    EMBER_WEBSITE_URL.to_string()
+}
+
+/// Longest share caption the frontend may send. Tweet-sized; anything larger
+/// is not a caption, it is a way to stuff a query string.
+const EMBER_SHARE_TEXT_MAX: usize = 280;
+
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Intent URL for a named share target. The site is always
+/// [`EMBER_WEBSITE_URL`]; `target` is an allowlist, not a URL.
+fn ember_share_intent_url(target: &str, text: &str) -> Result<String, String> {
+    if text.len() > EMBER_SHARE_TEXT_MAX {
+        return Err(coded(
+            "settings_share_text_too_long",
+            "Share text is too long",
+        ));
+    }
+    if text.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        return Err(coded(
+            "settings_share_text_invalid",
+            "Share text contains invalid characters",
+        ));
+    }
+    let url_q = percent_encode_query(EMBER_WEBSITE_URL);
+    let text_q = percent_encode_query(text);
+    let intent = match target {
+        "x" => format!("https://x.com/intent/tweet?url={url_q}&text={text_q}"),
+        "facebook" => format!("https://www.facebook.com/sharer/sharer.php?u={url_q}"),
+        "reddit" => format!("https://www.reddit.com/submit?url={url_q}&title={text_q}"),
+        "bluesky" => format!("https://bsky.app/intent/compose?text={text_q}%20{url_q}"),
+        "linkedin" => format!("https://www.linkedin.com/sharing/share-offsite/?url={url_q}"),
+        "telegram" => format!("https://t.me/share/url?url={url_q}&text={text_q}"),
+        "whatsapp" => format!("https://api.whatsapp.com/send?text={text_q}%20{url_q}"),
+        "email" => {
+            let body_q = percent_encode_query(&format!("{text}\n\n{EMBER_WEBSITE_URL}"));
+            format!("mailto:?subject={text_q}&body={body_q}")
+        }
+        _ => {
+            return Err(coded(
+                "settings_unknown_share_target",
+                "Unknown share target",
+            ))
+        }
+    };
+    Ok(intent)
+}
+
+/// Open a share sheet for the official Ember website in the default browser
+/// (or the mail client, for email).
+///
+/// `target` is a name (`x`, `facebook`, …), never a URL. The site itself is
+/// the same hardcoded constant [`open_ember_website`] uses, so a compromised
+/// renderer cannot point this at an arbitrary host.
+#[tauri::command]
+pub async fn open_ember_share(target: String, text: String) -> Result<(), String> {
+    let intent = ember_share_intent_url(&target, &text)?;
+    opener::open(&intent).map_err(|e| {
+        coded_ctx(
+            "settings_open_share_failed",
+            "Failed to open the share link",
+            e,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ember_share_intents_stay_on_allowlisted_hosts_and_the_official_site() {
+        let text = "Ember P2P";
+        let encoded_site = percent_encode_query(EMBER_WEBSITE_URL);
+
+        let x = ember_share_intent_url("x", text).unwrap();
+        assert!(x.starts_with("https://x.com/intent/tweet?"));
+        assert!(x.contains(&encoded_site));
+
+        let facebook = ember_share_intent_url("facebook", text).unwrap();
+        assert!(facebook.starts_with("https://www.facebook.com/sharer/sharer.php?"));
+        assert!(facebook.contains(&encoded_site));
+
+        let reddit = ember_share_intent_url("reddit", text).unwrap();
+        assert!(reddit.starts_with("https://www.reddit.com/submit?"));
+        assert!(reddit.contains(&encoded_site));
+
+        let bluesky = ember_share_intent_url("bluesky", text).unwrap();
+        assert!(bluesky.starts_with("https://bsky.app/intent/compose?"));
+        assert!(bluesky.contains(&encoded_site));
+
+        let linkedin = ember_share_intent_url("linkedin", text).unwrap();
+        assert!(linkedin.starts_with("https://www.linkedin.com/sharing/share-offsite/?"));
+        assert!(linkedin.contains(&encoded_site));
+
+        let telegram = ember_share_intent_url("telegram", text).unwrap();
+        assert!(telegram.starts_with("https://t.me/share/url?"));
+        assert!(telegram.contains(&encoded_site));
+
+        let whatsapp = ember_share_intent_url("whatsapp", text).unwrap();
+        assert!(whatsapp.starts_with("https://api.whatsapp.com/send?"));
+        assert!(whatsapp.contains(&encoded_site));
+
+        let email = ember_share_intent_url("email", text).unwrap();
+        assert!(email.starts_with("mailto:?"));
+        assert!(email.contains(&encoded_site));
+
+        let encoded_text = percent_encode_query(text);
+        assert!(x.contains(&encoded_text), "X caption must be encoded into the intent");
+        assert!(reddit.contains(&encoded_text));
+        assert!(bluesky.contains(&encoded_text));
+        assert!(telegram.contains(&encoded_text));
+        assert!(whatsapp.contains(&encoded_text));
+        assert!(email.contains(&encoded_text));
+    }
+
+    #[test]
+    fn ember_share_encodes_text_so_it_cannot_inject_query_params() {
+        let hijack = "hi&url=https://evil.example/";
+        let x = ember_share_intent_url("x", hijack).unwrap();
+        assert!(
+            !x.contains("&url=https://evil.example/"),
+            "raw ampersands in caption must not add query parameters"
+        );
+        assert!(x.contains(&percent_encode_query(hijack)));
+        assert!(x.contains(&percent_encode_query(EMBER_WEBSITE_URL)));
+    }
+
+    #[test]
+    fn ember_share_rejects_unknown_targets_and_overlong_text() {
+        assert!(ember_share_intent_url("https://evil.example/", "hi").is_err());
+        assert!(ember_share_intent_url("javascript", "hi").is_err());
+        assert!(ember_share_intent_url("X", "hi").is_err(), "allowlist is lowercase");
+        let too_long = "n".repeat(EMBER_SHARE_TEXT_MAX + 1);
+        assert!(ember_share_intent_url("x", &too_long).is_err());
+        assert!(ember_share_intent_url("x", "ok\0no").is_err());
+    }
+
+    #[test]
+    fn get_ember_website_url_is_the_hardcoded_site() {
+        assert_eq!(get_ember_website_url(), EMBER_WEBSITE_URL);
+        assert!(EMBER_WEBSITE_URL.starts_with("https://"));
+    }
 
     #[test]
     fn config_write_failure_restores_exact_approved_root_snapshot() {

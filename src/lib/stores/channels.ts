@@ -166,6 +166,28 @@ export function replaceChannel(updated: ChannelInfo): void {
   );
 }
 
+/** Insert or replace so join can open the room before `list_channels` returns. */
+export function upsertChannel(updated: ChannelInfo): void {
+  channels.update((list) => {
+    const index = list.findIndex((channel) => channel.channel_id === updated.channel_id);
+    if (index === -1) return [...list, updated];
+    const next = list.slice();
+    next[index] = updated;
+    return next;
+  });
+}
+
+export function setChannelInRoom(channelId: string, inRoom: boolean): void {
+  channels.update((list) => {
+    if (!list.some((channel) => channel.channel_id === channelId && channel.in_room !== inRoom)) {
+      return list;
+    }
+    return list.map((channel) =>
+      channel.channel_id === channelId ? { ...channel, in_room: inRoom } : channel,
+    );
+  });
+}
+
 export function setChannelMemberCount(channelId: string, count: number): void {
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.member_count !== count)) {

@@ -871,8 +871,20 @@ pub struct EmberDiagnostics {
     /// Inbound Ember DHT frames refused because the version byte is outside
     /// this build's supported range. Counted separately from `ember_dht_malformed`
     /// so a peer we cannot speak to does not look like packet loss.
+    /// Sum of [`Self::ember_dht_version_peer_older`] and
+    /// [`Self::ember_dht_version_peer_newer`].
     #[serde(default)]
     pub ember_dht_version_mismatch: u32,
+    /// Of those mismatches, frames whose version byte is *below* this build —
+    /// the sender should update. Drives the "older peers" Ember-page banner.
+    #[serde(default)]
+    pub ember_dht_version_peer_older: u32,
+    /// Of those mismatches, frames whose version byte is *above* this build —
+    /// we should update. Drives the "check for an update" Ember-page banner.
+    /// A single Noise session can mint a high byte, so this is a hint to run
+    /// the signed updater, not proof of a release and not an install URL.
+    #[serde(default)]
+    pub ember_dht_version_peer_newer: u32,
     /// Completed KAD lookups of the Ember rendezvous key this session.
     #[serde(default)]
     pub ember_dht_rendezvous_lookups: u32,

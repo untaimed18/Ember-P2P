@@ -120,3 +120,21 @@ export async function takePendingRestoreFailedNotice(): Promise<boolean> {
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');
 }
+
+export async function getEmberWebsiteUrl(): Promise<string> {
+  return invoke('get_ember_website_url');
+}
+
+export type EmberShareTarget =
+  | 'x'
+  | 'facebook'
+  | 'reddit'
+  | 'bluesky'
+  | 'linkedin'
+  | 'telegram'
+  | 'whatsapp'
+  | 'email';
+
+export async function openEmberShare(target: EmberShareTarget, text: string): Promise<void> {
+  return invoke('open_ember_share', { target, text });
+}

@@ -46275,6 +46275,17 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_version_mismatch
             .saturating_add(1);
+        if ember::dht::messages::dht_version_is_newer_than_us(version) {
+            state.ember_diagnostics.ember_dht_version_peer_newer = state
+                .ember_diagnostics
+                .ember_dht_version_peer_newer
+                .saturating_add(1);
+        } else {
+            state.ember_diagnostics.ember_dht_version_peer_older = state
+                .ember_diagnostics
+                .ember_dht_version_peer_older
+                .saturating_add(1);
+        }
         debug!(
             "Ember DHT: dropping frame from {from}: unsupported version {version} \
              (this build speaks {}..={})",

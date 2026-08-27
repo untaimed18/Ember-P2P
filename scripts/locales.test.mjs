@@ -107,3 +107,17 @@ test("accented and CJK text is stored literally, not as \\u escapes", () => {
     );
   }
 });
+
+test("share_ember_text fits the backend caption cap", () => {
+  // Must match EMBER_SHARE_TEXT_MAX in src-tauri/src/commands/settings.rs.
+  // A longer translation makes every Share Ember button fail at runtime.
+  const maxBytes = 280;
+  for (const locale of locales) {
+    const text = files.get(locale).data.share_ember_text;
+    assert.equal(typeof text, "string", `${locale}.json share_ember_text`);
+    assert.ok(
+      Buffer.byteLength(text) <= maxBytes,
+      `${locale}.json share_ember_text is ${Buffer.byteLength(text)} bytes (max ${maxBytes})`,
+    );
+  }
+});

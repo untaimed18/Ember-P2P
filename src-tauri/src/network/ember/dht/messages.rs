@@ -540,6 +540,19 @@ pub fn unsupported_dht_version(data: &[u8]) -> Option<u8> {
     }
 }
 
+/// Whether an unsupported version byte means the sender is ahead of this build.
+///
+/// [`unsupported_dht_version`] only returns `Some` for a non-zero byte outside
+/// [`EMBER_DHT_MIN_VERSION`]..=[`EMBER_DHT_VERSION`]. Above that range we are
+/// the one who cannot speak the overlay; below it, they are. The Ember page
+/// uses this split so "check for an update" is not shown when the far end is
+/// the one that needs to upgrade. A high byte is only a hint: anyone who
+/// completed a Noise handshake can send one, so the install path is still the
+/// signed updater, never a URL from the peer.
+pub fn dht_version_is_newer_than_us(version: u8) -> bool {
+    version > EMBER_DHT_VERSION
+}
+
 /// Decode a DHT message from wire format.
 ///
 /// `has_pub_key`: whether the sender's public key is present in the header
@@ -1852,6 +1865,14 @@ mod tests {
             unsupported_dht_version(&zero),
             None,
             "version 0 is garbage, not a peer we could upgrade"
+        );
+        assert!(
+            dht_version_is_newer_than_us(EMBER_DHT_VERSION + 1),
+            "a byte above this build is a peer we should update to meet"
+        );
+        assert!(
+            !dht_version_is_newer_than_us(EMBER_DHT_MIN_VERSION.saturating_sub(1)),
+            "a byte below this build is a peer that should update to meet us"
         );
     }
 

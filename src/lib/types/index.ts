@@ -463,6 +463,10 @@ export interface EmberDiagnostics {
   ember_dht_malformed: number;
   /** Frames refused at the version byte rather than misparsed. */
   ember_dht_version_mismatch?: number;
+  /** Mismatch frames whose version is below this build (they should update). */
+  ember_dht_version_peer_older?: number;
+  /** Mismatch frames whose version is above this build (we should update). */
+  ember_dht_version_peer_newer?: number;
   /** Completed lookups of the Ember rendezvous key this session. */
   ember_dht_rendezvous_lookups?: number;
   /** Those lookups that returned no other Ember node after dropping self. */

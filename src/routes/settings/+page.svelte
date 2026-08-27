@@ -242,11 +242,19 @@
     }
   }
 
-  function clearRestoreState() {
+  function resetLocalRestoreFields() {
     restoreSource = null;
     restorePreview = null;
     restorePassphrase = '';
-    void clearPickedBackup();
+  }
+
+  async function clearRestoreState() {
+    resetLocalRestoreFields();
+    try {
+      await clearPickedBackup();
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    }
   }
 
   async function handleExportBackup() {
@@ -319,8 +327,11 @@
     showBackupMsg(m.settings_backup_restoring(), false);
     try {
       restoreStaged = await importBackup(restorePassphrase);
-      clearRestoreState();
+      resetLocalRestoreFields();
       backupMessage = null;
+      // Import already succeeded. Clearing the picker mutex must not reuse
+      // the restore-failed toast — a stuck mutex is not a failed restore.
+      await clearPickedBackup().catch(() => {});
       await refreshPendingRestore();
       showRestoreRestartPrompt = true;
     } catch (e) {
