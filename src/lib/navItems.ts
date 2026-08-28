@@ -42,8 +42,9 @@ export const navItems: NavItem[] = [
 
 /**
  * How many entries get an Alt+N shortcut. Alt+1..9 map to the first nine
- * items; Alt+0 maps to the tenth (Settings, today). Anything past that is
- * click-only — worth remembering when reordering.
+ * items; Alt+0 maps to the tenth (Security, today). Anything past that is
+ * click-only — worth remembering when reordering, and the reason this says
+ * "today": inserting Channels moved which page the tenth slot lands on.
  */
 export const NAV_SHORTCUT_LIMIT = 10;
 

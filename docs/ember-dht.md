@@ -2,11 +2,12 @@
 
 The protocol specification is
 [ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
-version 2 as implemented in Ember 1.5.6. **The wire is now version 3 and the PDF
+version 2 as implemented in Ember 1.5.6. **The wire is now version 4 and the PDF
 is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
 [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
-two frame changes. This file is the standing work log: what is left, what was
-compared against KAD, and what is explicitly not planned.
+two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)
+for what moved it to v4. This file is the standing work log: what is left, what
+was compared against KAD, and what is explicitly not planned.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
@@ -102,13 +103,17 @@ does not need the eMule wire at all:
 
 ### 2. Wire versioning rejects cleanly but cannot negotiate
 
-`EMBER_DHT_VERSION` is now **3**, with `EMBER_DHT_MIN_VERSION` 3 alongside it:
+`EMBER_DHT_VERSION` is now **4**, with `EMBER_DHT_MIN_VERSION` 4 alongside it:
 the decoder accepts a *range*, and a frame outside it is refused at the version
 byte instead of becoming a malformed-frame counter that reads like packet loss. A
 change that only adds to the format can lower the minimum rather than raising
-both — v3 could not, because it changed the shape of two existing frames
-(contact lists lost `node_id`, `FOUND_VALUE` gained two positions), and a v2
-peer reads both at fixed offsets.
+both — neither of the last two could. v3 changed the shape of two existing frames
+(contact lists lost `node_id`, `FOUND_VALUE` gained two positions), which a v2
+peer reads at fixed offsets. v4 appends the sender's own Noise static key to the
+*signed* bytes without transmitting it, binding a frame to the session it
+arrives on so a signed frame stops being a bearer token any prior recipient can
+replay; a v3 signature cannot verify here and ours cannot verify there, so the
+version byte has to move with it.
 
 **This is the breaking change the section used to warn about**, and it has now
 landed on an overlay that ships **on**. Two peers on incompatible versions fail
@@ -511,7 +516,7 @@ settled.
 
 Protocol constants live in
 [`dht/mod.rs`](../src-tauri/src/network/ember/dht/mod.rs): 128-bit node IDs
-(BLAKE3 of the Ed25519 public key), k = 20, α = 5, wire version 3.
+(BLAKE3 of the Ed25519 public key), k = 20, α = 5, wire version 4.
 
 `MAX_CONTACTS_PER_RESPONSE` is 20 but is still not reachable: `encode_contact_list`
 trims by bytes, and at 71 bytes per IPv4 contact (7 address + 32 Noise key + 32

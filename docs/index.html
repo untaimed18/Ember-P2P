@@ -422,6 +422,22 @@
       color: var(--text-primary);
       margin: 0 0 6px;
     }
+    /* Matches the badge the app puts beside Channels, so the site does not
+       promise something more settled than what ships. */
+    .beta-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border: 1px solid rgba(225, 29, 72, 0.35);
+      border-radius: 999px;
+      background: rgba(225, 29, 72, 0.08);
+      color: #e11d48;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      vertical-align: middle;
+    }
     .hl-card p {
       font-size: 13.5px;
       color: var(--text-secondary);
@@ -930,6 +946,16 @@
   </div>
 
   <div class="toc-section">
+    <span class="toc-heading">Channels</span>
+    <a href="#channels" class="toc-link">Rooms on Ember</a>
+    <a href="#channels-start" class="toc-link toc-child">Getting Started</a>
+    <a href="#channels-public" class="toc-link toc-child">Public vs Private</a>
+    <a href="#channels-owner" class="toc-link toc-child">Running a Room</a>
+    <a href="#channels-files" class="toc-link toc-child">Sending Files</a>
+    <a href="#channels-limits" class="toc-link toc-child">What to Expect</a>
+  </div>
+
+  <div class="toc-section">
     <span class="toc-heading">Network</span>
     <a href="#network" class="toc-link">Network Compatibility</a>
     <a href="#ports" class="toc-link">Port Forwarding</a>
@@ -1050,6 +1076,11 @@
         <h4>Ember Friends</h4>
         <p>Share a Friend Code, connect through the rendezvous server, then chat end-to-end encrypted over Noise-secured sessions. Mutual friends also get remote browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID.</p>
       </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F4AC;</div>
+        <h4>Channels <span class="beta-badge">Beta</span></h4>
+        <p>Group rooms carried over the Ember Network itself &mdash; no server hosts them and nobody publishes their IP to the room. Create a public room anyone can find, or a private one that needs an invite, with moderation tools and member-to-member file sending.</p>
+      </div>
     </div>
   </section>
 
@@ -1061,7 +1092,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.5.9</h3>
+      <h3>Get Ember 1.6.0</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11.</p>
       <span class="download-meta">Windows installer &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1113,6 +1144,10 @@
         <strong>Add Friends (optional)</strong><br>
         <span style="color: var(--text-secondary)">Open the Friends page, share your <strong>Friend Code</strong>, and add theirs. Once mutual and online, you get end-to-end encrypted chat, remote file browsing, and priority upload slots. See <a href="#friends">Friends</a>.</span>
       </li>
+      <li>
+        <strong>Join a Channel (optional)</strong><br>
+        <span style="color: var(--text-secondary)">Open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published. See <a href="#channels">Channels</a>.</span>
+      </li>
     </ol>
 
     <div class="callout">
@@ -1162,6 +1197,7 @@
       <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>v2 Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
       <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. The chat UI shows an <strong>Encrypted</strong> badge; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
+      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, and send a file to one member at a time. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
       <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
     </ul>
 
@@ -1182,7 +1218,7 @@
       <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, optional KAD auto-connect, and theme.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
       <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there.</li>
-      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, and Alt+1&ndash;9 to jump straight to the first nine sidebar pages.</li>
+      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, and Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages.</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
       <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on launch and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
@@ -1262,7 +1298,7 @@
         </tr>
         <tr>
           <td><strong>Node identity</strong></td>
-          <td>A 128-bit node ID derived from BLAKE3 of the node&rsquo;s Ed25519 public key. DHT frames are Ed25519-signed, and a contact is only trusted once it has answered directly.</td>
+          <td>A 128-bit node ID derived from BLAKE3 of the node&rsquo;s Ed25519 public key. DHT frames are Ed25519-signed and bound to the encrypted session they arrive on, and a contact is only trusted once it has answered directly.</td>
         </tr>
         <tr>
           <td><strong>Routing</strong></td>
@@ -1270,7 +1306,7 @@
         </tr>
         <tr>
           <td><strong>Wire versioning</strong></td>
-          <td>Version 3. The decoder accepts a version range and refuses anything outside it at the version byte, so an incompatible peer is a clean rejection rather than a stream of malformed-packet counters that read like packet loss.</td>
+          <td>Version 4. The decoder accepts a version range and refuses anything outside it at the version byte, so an incompatible peer is a clean rejection rather than a stream of malformed-packet counters that read like packet loss.</td>
         </tr>
         <tr>
           <td><strong>Abuse resistance</strong></td>
@@ -1414,6 +1450,76 @@ peer_count    (u16 LE)
 
     <h3 id="friends-privacy">Privacy</h3>
     <p>The rendezvous server stores presence as hashed capabilities derived from your Friend identity (never the raw Friend ID in the clear), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
+  </section>
+
+  <hr>
+
+  <!-- Channels -->
+  <section id="channels">
+    <h2>Channels <span class="beta-badge">Beta</span></h2>
+
+    <p>Channels are group chat rooms carried over the <a href="#ember">Ember Network</a> itself. No server hosts a room and no company runs one: messages travel encrypted between the members over the same overlay that carries search and source lookup. Members never publish their IP address to the room.</p>
+
+    <p>Friends are for people you know one-to-one. Channels are for a group &mdash; a room you can hand an invite to, hand off to someone else, or leave running after you have gone.</p>
+
+    <div class="callout-warn callout">
+      <p><strong>Channels are in beta.</strong> The app marks them so too. The format is still settling, so expect rough edges, and read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
+    </div>
+
+    <h3 id="channels-start">Getting started</h3>
+    <ol class="steps-list">
+      <li>
+        <strong>Pick a Channel username</strong><br>
+        <span style="color: var(--text-secondary)">Two to twelve letters or numbers, and it has to be free &mdash; the name is claimed across Ember so two people in a room are never the same &ldquo;Ada&rdquo;. This is separate from your friend nickname, and you need one before you can create or join anything.</span>
+      </li>
+      <li>
+        <strong>Create a room, or join one</strong><br>
+        <span style="color: var(--text-secondary)">A room name is up to 20 characters and is claimed once, first come first served. To join someone else&rsquo;s, paste the <code>ember-channel:</code> invite they sent you.</span>
+      </li>
+      <li>
+        <strong>Or find one with Discover</strong><br>
+        <span style="color: var(--text-secondary)">Discover lists public rooms that other people have published. Private rooms never appear there.</span>
+      </li>
+    </ol>
+
+    <h3 id="channels-public">Public and private rooms</h3>
+    <p>The choice you make when you create a room is the one that matters most, and it cannot be changed afterwards.</p>
+    <ul>
+      <li><strong>Public</strong> &mdash; listed in Discover so anyone can find and join it. Anyone who finds it can also <em>read</em> it: the key that unlocks the conversation is derived from the address in its public listing. A public room is a public conversation.</li>
+      <li><strong>Private</strong> &mdash; never listed. Joining needs an invite link, which carries the key. If the conversation should stay with the people you invite, this is the one to use.</li>
+    </ul>
+    <p>A private room&rsquo;s owner can rotate its key, which cuts off anyone holding an older invite &mdash; the remedy when a link has been shared further than you meant.</p>
+
+    <h3 id="channels-owner">Running a room</h3>
+    <p>Whoever creates a room owns it. Owner tools live in the room&rsquo;s info panel.</p>
+    <ul>
+      <li><strong>Topic and welcome</strong> &mdash; a line at the top of the room and a greeting new members see.</li>
+      <li><strong>Moderators</strong> &mdash; up to 6 members who can ban and unban on your behalf. They cannot ban you, and they cannot delete the room.</li>
+      <li><strong>Bans</strong> &mdash; up to 12 at a time.</li>
+      <li><strong>Owner-only invites</strong> &mdash; stops a member re-sharing the room without thinking. Every member holds the key either way, so treat this as a guard against carelessness rather than against someone determined.</li>
+      <li><strong>Slow mode</strong> &mdash; sets how long members wait between messages, from 5 seconds to 5 minutes. Off unless you turn it on. You and your moderators are exempt, and everyone in the room can see it is on.</li>
+      <li><strong>Rotate the key</strong> &mdash; private rooms only, for when an invite has leaked.</li>
+      <li><strong>Hand the room over</strong> &mdash; transfer ownership to a member, or nominate a successor who can claim the room if you go quiet for a window you choose. Better than sharing your key.</li>
+      <li><strong>Delete</strong> &mdash; permanent, and it releases the room name.</li>
+    </ul>
+    <p>One device can own up to 10 rooms at once. Deleting a room gives the slot back. Joining rooms is not limited.</p>
+
+    <p>Every member, owner or not, can <strong>mute</strong> a room so it stops raising notifications, and <strong>ignore</strong> a member so their messages are hidden. Both are private to your device and are listed under Settings &gt; Channels, where you can undo them.</p>
+
+    <h3 id="channels-files">Sending files</h3>
+    <p>You can send a file to one member of a room at a time, up to <strong>100 MB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room. If both of you are firewalled the transfer needs a relay, and may not start at all.</p>
+
+    <h3 id="channels-limits">What to expect</h3>
+    <div class="callout-warn callout">
+      <p><strong>Rooms have no forward secrecy.</strong> Everyone in a room shares one key. Someone who captures the traffic today and later obtains that key can read what was said. Rotating a private room&rsquo;s key protects future messages, not past ones.</p>
+    </div>
+    <ul>
+      <li><strong>Moderation is local.</strong> A ban stops honest clients from showing that member and stops them being served. It is not a network-level eviction, and someone running a modified client can ignore it.</li>
+      <li><strong>Public listings can be spammed.</strong> Discover shows what people published, and nobody vets it.</li>
+      <li><strong>A room holds up to 256 members</strong> and a message up to 4096 bytes.</li>
+      <li><strong>History is what your device kept.</strong> Rooms are not archived anywhere central. When you join, members near you share recent messages; older conversation you were not present for is gone.</li>
+      <li><strong>Search inside a room</strong> looks only through the history your device has.</li>
+    </ul>
   </section>
 
   <hr>
@@ -1719,6 +1825,73 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.0" target="_blank" rel="noopener">Ember v1.6.0</a></h3>
+        <time class="release-date" datetime="2026-08-28">August 28, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.0" target="_blank" rel="noopener"><code>v1.6.0</code></a></p>
+      <div class="release-notes">
+        <p>Channels: group rooms carried over the Ember Network itself. No server hosts them, and nobody publishes their IP address to the room.</p>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Channels (beta)</h5>
+        <ul>
+          <li><strong>Public and private rooms.</strong> A public room is listed in Discover and anyone who finds it can read it, because its key comes from the address in that listing. A private room is never listed and needs an invite. Pick private if the conversation should stay with the people you invite &mdash; the choice cannot be changed later</li>
+          <li><strong>A Channel username.</strong> Two to twelve letters or numbers, claimed across Ember, so two people in a room are never the same name. Separate from your friend nickname, and needed before you create or join</li>
+          <li><strong>Room tools for the owner.</strong> Topic and welcome, up to 6 moderators, up to 12 bans, and owner-only invites for when a link should not be re-shared. A private room&rsquo;s key can be rotated, which cuts off anyone holding an older invite</li>
+          <li><strong>Slow mode.</strong> Set how long members wait between messages, from 5 seconds to 5 minutes, when a room needs calming down. Off unless you turn it on, you and your moderators are exempt, and everyone in the room can see it is on</li>
+          <li><strong>Hand a room over instead of sharing your key.</strong> Transfer ownership to a member, or nominate a successor who can claim the room if you go quiet for a window you choose</li>
+          <li><strong>Send a file to one member,</strong> up to 100 MB and only after they accept. An unanswered offer lapses after five minutes. An offer that arrives while you are on another page now says which room it came from</li>
+          <li><strong>Mute a room or ignore a member,</strong> both private to your device and both undoable from Settings &gt; Channels, which now lists who you have ignored by name</li>
+        </ul>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>Ember DHT moves to wire version 4, and it is not backward compatible.</strong> A 1.6.0 client and a 1.5.9 or earlier client will not see each other on the overlay at all. The version byte makes that a clean refusal rather than a stream of errors, but neither side is told why, so a client left behind just watches the network shrink as everyone else updates. eD2K servers, KAD, search, and downloads are unaffected. Upgrade together if you share with a fixed group &mdash; and because Channels ride the same overlay, a room only reaches members who are also on 1.6.0</li>
+          <li><strong>A mismatch now tells you to update.</strong> When this install meets a newer overlay it says so and points at the update, instead of reporting the other peers as the problem</li>
+          <li><strong>One device can own 10 rooms at once.</strong> Deleting a room gives the slot back. Joining rooms is not limited. New room names are also rate-limited per connection, so creating many in a burst will be refused</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Security</h5>
+        <ul>
+          <li><strong>A signed Ember frame is no longer a bearer token.</strong> It proved that its sender had once signed those bytes, not that whoever handed them over was that sender &mdash; so anyone who had ever received a frame from you could replay it inside their own connection and have the receiver record you as living at <em>their</em> address, then keep replaying to hold the entry there. Every frame is now bound to the encrypted session it arrives on. This is the change that moves the wire version</li>
+          <li><strong>A stranger can no longer make every member of a public room do their work for them.</strong> Asking a room for missed history was answered with up to thirty-two messages, and nothing limited how often it could be asked &mdash; one small request from anyone who found the room turned into thirty-two replies from each member who heard it. Catch-up requests now have their own budget, well above what normal use needs</li>
+          <li><strong>A single message can no longer be pushed across the whole network.</strong> The hop limit that keeps a message in its own neighbourhood was taken on trust from whoever sent it, and is now capped on arrival</li>
+          <li><strong>Moderators stop disappearing from busy rooms.</strong> In a room near its 256-member limit, the people holding the moderation tools were first in line to be dropped from the local member list, so their bans stopped being honoured until the room&rsquo;s settings arrived again</li>
+        </ul>
+
+        <h5>Channels and chat</h5>
+        <ul>
+          <li><strong>The composer is disabled when chat history is locked,</strong> instead of letting you type a message that could never send</li>
+          <li><strong>Create and Join are disabled until you have a Channel username,</strong> rather than accepting the click and then refusing the action</li>
+          <li><strong>A failed send no longer costs you a turn.</strong> A run of network errors could use up a room&rsquo;s send allowance and lock you out of a room you had said nothing in</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>The collapsed sidebar shows the unread-chats dot again</strong> instead of hiding it along with the labels</li>
+          <li><strong>A slow first load of a large library no longer spins forever.</strong> The result it was waiting for was thrown away at five seconds; it is now kept, and a retry is offered rather than an endless spinner</li>
+          <li><strong>Settings only offers Save when something has changed,</strong> matching Discard beside it</li>
+          <li><strong>Destructive confirmations start on Cancel,</strong> so Enter no longer completes the dangerous action</li>
+          <li><strong>A failed speed test in the setup wizard reads as a failure</strong> rather than being coloured like a success, and the download-folder box opens the picker it looks like it opens</li>
+          <li><strong>Connect on the Ember Network page shows that it is working</strong> while a connection is being made, instead of looking idle</li>
+          <li><strong>Transfers offers Clear filter</strong> when a filter has hidden every download, matching the known-peers list</li>
+          <li><strong>The peers Ember remembers survive a restart.</strong> They shared a store with short-lived entries, so each launch started with a smaller address book than the one it saved</li>
+          <li><strong>Share Ember</strong> copies the official site and opens only known social destinations, rather than handing a link to whatever is registered to open it</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.5.9...v1.6.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.5.9...v1.6.0</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-5-9">
       <div class="release-header">
