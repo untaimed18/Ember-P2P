@@ -94,6 +94,60 @@ export const totalChannelUnread = derived(
 );
 
 /**
+ * Public rooms this device has taken off its list.
+ *
+ * Discover re-gathers every minute and re-adds anything still listed, so
+ * dropping the local row does not remove a public room from the list — it
+ * came straight back on the next sweep. This is the record of "not
+ * interested" that makes the removal stick.
+ *
+ * A device preference rather than room state, and deliberately *not* the
+ * `deleted` flag on the row: that flag is the tombstone `refuse_deleted_channel`
+ * reads, and wanting a room off the list is not the same as never wanting back
+ * in. Joining clears the entry, and Settings can clear the whole list.
+ */
+const HIDDEN_KEY = 'ember.channels.hidden.v1';
+
+function loadHidden(): string[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(HIDDEN_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((id): id is string => typeof id === 'string' && CHANNEL_ID_RE.test(id))
+      .map((id) => id.toLowerCase());
+  } catch {
+    return [];
+  }
+}
+
+export const hiddenChannels = writable<string[]>(loadHidden());
+
+hiddenChannels.subscribe((ids) => {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify(ids));
+  } catch {
+    // Quota exceeded / private mode. Holds for this session.
+  }
+});
+
+export function hideChannel(channelId: string): void {
+  const id = channelId.toLowerCase();
+  hiddenChannels.update((ids) => (ids.includes(id) ? ids : [...ids, id]));
+}
+
+/** Walking back into a room is the clearest possible statement of interest. */
+export function unhideChannel(channelId: string): void {
+  const id = channelId.toLowerCase();
+  hiddenChannels.update((ids) =>
+    ids.includes(id) ? ids.filter((existing) => existing !== id) : ids,
+  );
+}
+
+/**
  * Members this device hides, by Ed25519 pubkey.
  *
  * The only remedy a non-owner has: banning is owner-and-moderator work, so
@@ -140,8 +194,9 @@ export function toggleMemberIgnore(memberPubkey: string): void {
   );
 }
 
-/** Drop a room's mute when it is left, so the list cannot accumulate ids for
- *  rooms the user will never see again. */
+/** Drop a room's mute. Used when the owner deletes it, so the preference
+ *  list cannot accumulate ids for rooms the user will never see again.
+ *  Leave keeps the row (and the mute) because the user can walk back in. */
 export function forgetChannelMute(channelId: string): void {
   const id = channelId.toLowerCase();
   mutedChannels.update((ids) =>
@@ -156,6 +211,11 @@ let unlisteners: UnlistenFn[] = [];
 export async function refreshChannels(): Promise<void> {
   const list = await listChannels();
   channels.set(list);
+  const keep = new Set(list.filter((channel) => !channel.deleted).map((channel) => channel.channel_id));
+  mutedChannels.update((ids) => {
+    const next = ids.filter((id) => keep.has(id));
+    return next.length === ids.length ? ids : next;
+  });
 }
 
 export function replaceChannel(updated: ChannelInfo): void {

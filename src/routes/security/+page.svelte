@@ -387,7 +387,10 @@
     return parts.every(p => { const n = Number(p); return Number.isInteger(n) && n >= 0 && n <= 255 && p === String(n); });
   }
 
+  let addingRange = $state(false);
+
   async function handleAddRange() {
+    if (addingRange) return;
     const startIp = newStartIp.trim();
     const endIp = newEndIp.trim();
     const desc = newDescription.trim();
@@ -400,6 +403,7 @@
       return;
     }
     error = null;
+    addingRange = true;
     try {
       await addIpFilterRange(startIp, endIp, desc);
       if (unmounted) return;
@@ -412,6 +416,8 @@
     } catch (e: unknown) {
       if (unmounted) return;
       error = toErrorMsg(e);
+    } finally {
+      if (!unmounted) addingRange = false;
     }
   }
 
@@ -489,7 +495,7 @@
     >
       {showUrlForm ? m.security_cancel_url() : m.security_from_url()}
     </button>
-    <button class="ghost" onclick={() => void loadStats({ offset: listOffset })}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => void loadStats({ offset: listOffset })} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>
 
@@ -579,7 +585,7 @@
             <span class="add-field-label">{m.security_description_optional()}</span>
             <input bind:value={newDescription} placeholder={m.security_description_placeholder()} class="desc-input" aria-label={m.security_description_optional()} />
           </label>
-          <button class="add-form-submit" onclick={handleAddRange}>{m.common_add()}</button>
+          <button class="add-form-submit" onclick={handleAddRange} disabled={addingRange}>{m.common_add()}</button>
         </div>
       </div>
     {/if}
@@ -719,6 +725,16 @@
         </table>
       </div>
     {/if}
+  {:else}
+    <!-- Not loading and still no stats: every retry in `loadStats` ran out.
+         Without this the page is an error banner over an empty body, and the
+         only way back was to restart the app. -->
+    <div class="empty-state">
+      <p>{m.security_load_failed()}</p>
+      <button onclick={() => void loadStats()} disabled={loading}>
+        {loading ? m.common_loading() : m.common_retry()}
+      </button>
+    </div>
   {/if}
 </div>
 

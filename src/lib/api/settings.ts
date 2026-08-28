@@ -125,6 +125,15 @@ export async function getEmberWebsiteUrl(): Promise<string> {
   return invoke('get_ember_website_url');
 }
 
+/** Absolute path to the folder holding `ember.log`, for a bug report. */
+export async function getLogFolderPath(): Promise<string> {
+  return invoke('get_log_folder_path');
+}
+
+export async function openLogFolder(): Promise<void> {
+  return invoke('open_log_folder');
+}
+
 export type EmberShareTarget =
   | 'x'
   | 'facebook'

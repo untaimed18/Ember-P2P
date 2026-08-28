@@ -1421,6 +1421,13 @@ pub struct ModerationTail {
     pub successor_nominee: Option<[u8; 32]>,
     /// How long the owner must be silent before that claim is honoured.
     pub claim_after_days: Option<u16>,
+    /// Whether only the owner may hand out invites.
+    ///
+    /// A guardrail against a careless member re-sharing the key, not a control
+    /// against a hostile one: every member necessarily holds the key already,
+    /// so a patched client could still mint. Absent means the room predates
+    /// the field, which reads as "anyone", the behaviour it had then.
+    pub invites_owner_only: Option<bool>,
 }
 
 impl ModerationTail {
@@ -1443,6 +1450,10 @@ impl ModerationTail {
             return;
         };
         out.extend_from_slice(&days.to_le_bytes());
+        let Some(owner_only) = self.invites_owner_only else {
+            return;
+        };
+        out.push(u8::from(owner_only));
     }
 
     fn decode(mut rest: &[u8]) -> Option<Self> {
@@ -1478,10 +1489,18 @@ impl ModerationTail {
         if rest.is_empty() {
             return Some(tail);
         }
-        if rest.len() != 2 {
+        if rest.len() < 2 {
             return None;
         }
-        tail.claim_after_days = Some(u16::from_le_bytes(rest.try_into().ok()?));
+        tail.claim_after_days = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        rest = &rest[2..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() != 1 {
+            return None;
+        }
+        tail.invites_owner_only = Some(rest[0] != 0);
         Some(tail)
     }
 }
@@ -1510,6 +1529,7 @@ mod moderation_budget_tests {
             key_epoch: Some(7),
             successor_nominee: Some([0x22; 32]),
             claim_after_days: Some(30),
+            invites_owner_only: None,
         }
     }
 
@@ -2596,6 +2616,7 @@ mod tests {
             key_epoch: Some(9),
             successor_nominee: Some(nominee),
             claim_after_days: Some(14),
+            invites_owner_only: None,
         };
 
         let round_trip = |tail: &ModerationTail| -> ModerationTail {
@@ -2633,6 +2654,7 @@ mod tests {
             key_epoch: Some(4),
             successor_nominee: Some(nominee),
             claim_after_days: Some(7),
+            invites_owner_only: None,
         };
         assert_eq!(round_trip(&orphan), ModerationTail::default());
 

@@ -47,7 +47,13 @@
   let upnpEnabled = $state(_init.upnp_enabled);
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
-  let autoConnectKad = $state(_init.auto_connect_kad);
+  // Deliberately not `_init.auto_connect_kad`. The stored default is off so a
+  // fresh launch reaches for no network before the user asks — but this wizard
+  // *is* that ask, and the copy beside the switch recommends KAD. Starting it
+  // off meant most people finished setup disconnected from the very thing the
+  // page told them to turn on, then found search slow with no clue why. Anyone
+  // who does not want it can see the switch and turn it off before it runs.
+  let autoConnectKad = $state(true);
   let selectedTheme: Theme = $state(getInitialTheme());
 
   let speedTestRunning = $state(false);
@@ -591,6 +597,9 @@
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
           </div>
+          <!-- Said before the button rather than discovered after it: the
+               finish step restarts the app, which is alarming if unannounced. -->
+          <p class="step-hint">{m.wizard_ready_restart_note()}</p>
           {#if saveError}
             <p class="save-error">{saveError}</p>
           {/if}

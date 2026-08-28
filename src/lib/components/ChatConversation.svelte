@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
   import {
@@ -43,6 +43,11 @@
     /** Own display name, so a message naming us can be picked out. Empty
      *  disables the check rather than matching everything. */
     mentionName?: string;
+    /** Stored message to scroll to and mark. A fresh object each time, so
+     *  asking twice for the same message still moves the transcript. */
+    focusRequest?: { id: number } | null;
+    /** The message could not be reached — too far back, or no longer stored. */
+    onfocusmissing?: () => void;
   }
 
   type ConvMessage = ChatMessage & { sender_pubkey?: string };
@@ -57,6 +62,8 @@
     memberNames = {},
     ignoredSenders = [],
     mentionName = '',
+    focusRequest = null,
+    onfocusmissing,
   }: Props = $props();
 
   let isChannel = $derived(channelId.length > 0);
@@ -510,6 +517,87 @@
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
   }
 
+  /** The message a search hit pointed at, marked briefly so the eye can find
+   *  it after the jump. */
+  let focusedId = $state<number | null>(null);
+  let focusing = false;
+  /** A hit picked while an earlier jump is still paging. Held rather than
+   *  dropped, and run after: two jumps interleaved would each see the other's
+   *  `loadOlderMessages` as "no progress" and wrongly report the message gone. */
+  let queuedFocus: number | null = null;
+  let focusTimer: ReturnType<typeof setTimeout> | null = null;
+  const FOCUS_MARK_MS = 2600;
+
+  /**
+   * Bring a stored message into view, paging history back until it is loaded.
+   *
+   * History only pages backwards, so the way to reach an old message is to walk
+   * the same cursor "Load older" uses until it comes into range. That keeps the
+   * transcript one continuous run rather than stranding the user in a window
+   * with no path back to the live tail. Local SQLite, so the round trips are
+   * cheap; the in-memory cap still bounds how far back it can go.
+   */
+  async function focusMessage(id: number) {
+    if (id <= 0) return;
+    if (focusing) {
+      queuedFocus = id;
+      return;
+    }
+    const gen = loadGen;
+    focusing = true;
+    try {
+      while (!messages.some((message) => message.id === id)) {
+        const before = oldestDbId;
+        // Already paged past it: the row is not in this conversation's stored
+        // history any more (removed locally, or trimmed by the live cap).
+        if (before === null || before <= id) break;
+        if (!hasMoreHistory || messages.length >= MAX_LOADED_MESSAGES) break;
+        await loadOlderMessages();
+        if (gen !== loadGen) return;
+        // No progress means the page came back empty or the cap kicked in;
+        // without this the loop would spin on an unreachable id.
+        if (oldestDbId === before) break;
+      }
+      // Loaded is not the same as drawn: an ignored sender's message stays in
+      // `messages` but never reaches the DOM, and scrolling to it would do
+      // nothing at all. Report it rather than appear to ignore the click.
+      if (!visibleMessages.some((message) => message.id === id)) {
+        onfocusmissing?.();
+        return;
+      }
+      focusedId = id;
+      await tick();
+      // After the render, and after the scroll anchoring `loadOlderMessages`
+      // queues for itself — otherwise that restore lands on top of this jump.
+      requestAnimationFrame(() => {
+        messagesContainerEl
+          ?.querySelector(`[data-msg-id="${id}"]`)
+          ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      });
+      if (focusTimer) clearTimeout(focusTimer);
+      focusTimer = setTimeout(() => {
+        focusedId = null;
+        focusTimer = null;
+      }, FOCUS_MARK_MS);
+    } finally {
+      focusing = false;
+      const next = queuedFocus;
+      queuedFocus = null;
+      if (next !== null && next !== id) void focusMessage(next);
+    }
+  }
+
+  $effect(() => {
+    const request = focusRequest;
+    if (!request) return;
+    // Untracked: the jump reads and writes the message array it would
+    // otherwise re-subscribe to, and would re-fire on its own output.
+    untrack(() => {
+      void focusMessage(request.id);
+    });
+  });
+
+
   async function handleSend() {
     const text = inputText.trim();
     if (!text || sending || youAreBanned || youAreKeyBehind) return;
@@ -714,6 +802,7 @@
   onDestroy(() => {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
+    if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
   });
 </script>
 
@@ -777,7 +866,7 @@
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0}
-      <div class="conv-empty">{chatDisabled ? m.chat_empty_disabled() : m.chat_say_hello()}</div>
+      <div class="conv-empty">{chatDisabled ? m.chat_empty_disabled() : isChannel ? m.channels_empty_chat() : m.chat_say_hello()}</div>
     {:else}
       {#if hasMoreHistory}
         <div class="conv-load-older">
@@ -803,10 +892,12 @@
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
         <div
           class="conv-bubble"
+          data-msg-id={row.msg.id}
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
           class:starts-run={row.startsRun}
           class:ends-run={row.endsRun}
+          class:focused={row.msg.id === focusedId}
           class:mentions-me={row.msg.direction === 'received' && mentionsMe(row.msg.message)}
         >
           <!--
@@ -1188,6 +1279,13 @@
 
   .conv-bubble.received.ends-run {
     border-bottom-left-radius: 4px;
+  }
+
+  /* Marks the message a search hit jumped to. A ring rather than a background
+     swap, so it reads the same on a sent bubble as on a received one. */
+  .conv-bubble.focused {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .bubble-text {

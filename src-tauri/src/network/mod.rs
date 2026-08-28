@@ -6358,6 +6358,7 @@ mod tests {
                 Some(&nominee_pk),
                 Some(14),
                 None,
+                None,
             )
             .unwrap();
         };
@@ -13115,6 +13116,7 @@ fn ingest_channel_moderation_records(
         moderation.tail.successor_nominee.as_ref(),
         moderation.tail.claim_after_days,
         moderation.tail.key_epoch,
+        moderation.tail.invites_owner_only,
     )
     .unwrap_or(false)
 }
@@ -13210,6 +13212,7 @@ async fn maybe_publish_owned_channel_records(
                         .unwrap_or([0u8; 32]),
                 ),
                 claim_after_days: Some(ch.claim_after_days.clamp(0, u16::MAX as i64) as u16),
+                invites_owner_only: Some(ch.invites_owner_only),
             },
             channel_id,
             ident.pubkey,

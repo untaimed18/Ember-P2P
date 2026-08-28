@@ -1741,6 +1741,48 @@ pub fn get_ember_website_url() -> String {
     EMBER_WEBSITE_URL.to_string()
 }
 
+/// Where `ember.log` and its rotated copies live.
+///
+/// Resolved here rather than taken from the renderer, so neither this nor
+/// [`open_log_folder`] can be pointed somewhere else. Shown as text as well as
+/// opened: a bug report needs the path even when the file manager will not
+/// launch, and a tester on a locked-down machine can still get there by hand.
+#[tauri::command]
+pub fn get_log_folder_path() -> String {
+    crate::storage::paths::resolve_data_dir()
+        .join("logs")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Reveal the log folder in the system file manager.
+///
+/// Logs are pseudonymised — IPs, paths, hashes and search text are replaced
+/// with tokens — unless `EMBER_VERBOSE_DIAGNOSTICS` was set for the session,
+/// which stays env-only precisely so this button cannot produce a file that is
+/// unsafe to send anyone.
+#[tauri::command]
+pub async fn open_log_folder() -> Result<(), String> {
+    let dir = crate::storage::paths::resolve_data_dir().join("logs");
+    // Created rather than reported missing: file logging makes this on startup,
+    // but if that failed then an empty folder still answers "where do the logs
+    // go" better than an error the user cannot act on.
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        coded_ctx(
+            "settings_open_logs_failed",
+            "Failed to open the log folder",
+            e,
+        )
+    })?;
+    opener::open(&dir).map_err(|e| {
+        coded_ctx(
+            "settings_open_logs_failed",
+            "Failed to open the log folder",
+            e,
+        )
+    })
+}
+
 /// Longest share caption the frontend may send. Tweet-sized; anything larger
 /// is not a caption, it is a way to stuff a query string.
 const EMBER_SHARE_TEXT_MAX: usize = 280;

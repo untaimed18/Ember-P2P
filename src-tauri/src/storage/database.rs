@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 37;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 38;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -114,6 +114,9 @@ pub struct StoredChannel {
     /// Owner has permanently deleted this room. The row stays so the owner
     /// cannot recreate the same name by accident on this device.
     pub deleted: bool,
+    /// The owner has asked that only they hand out invites. Carried on their
+    /// signed moderation record; false for rooms whose owner never set it.
+    pub invites_owner_only: bool,
 }
 
 impl StoredChannel {
@@ -1751,6 +1754,21 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 37)?;
+            tx.commit()?;
+        }
+
+        if version < 38 {
+            // Owner-only invites. Defaults off, which is the behaviour every
+            // room had before the flag existed, so an upgraded database keeps
+            // letting members invite until an owner says otherwise.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "invites_owner_only",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 38)?;
             tx.commit()?;
         }
 
@@ -3937,7 +3955,7 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted
+                    c.in_room, c.deleted, c.invites_owner_only
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC"
         );
@@ -3959,7 +3977,7 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted
+                    c.in_room, c.deleted, c.invites_owner_only
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -4071,7 +4089,7 @@ impl Database {
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
-                        c.in_room, c.deleted
+                        c.in_room, c.deleted, c.invites_owner_only
                  FROM channels c WHERE c.channel_id = ?1"
                 ),
                 params![channel_id],
@@ -4105,6 +4123,7 @@ impl Database {
             moderation_checked_at: row.get::<_, i64>(19).unwrap_or(0),
             in_room: row.get::<_, i64>(20).unwrap_or(1) != 0,
             deleted: row.get::<_, i64>(21).unwrap_or(0) != 0,
+            invites_owner_only: row.get::<_, i64>(22).unwrap_or(0) != 0,
         })
     }
 
@@ -4201,7 +4220,21 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Walk this device out of rooms the directory has tombstoned.
+    /// Walk this device out of rooms the directory lists as deleted.
+    ///
+    /// Deliberately *not* a tombstone. The directory is an unsigned hint —
+    /// nothing in the response proves the room's owner asked for this — and
+    /// `deleted` is one-way: it hides the room, refuses re-entry, and there is
+    /// no way back from the UI. A directory bug or a compromised server could
+    /// therefore erase every room a user belongs to, private ones included,
+    /// whose ids the server has no authority over in the first place.
+    ///
+    /// Walking out is the recoverable half of the same action: the row, its
+    /// history and its join secret stay, the room reappears as a Join, and
+    /// re-entry is local so it works even while the directory still lies.
+    /// Owners are skipped — an owner's own delete goes through
+    /// [`Self::tombstone_channel`], so a row saying we own it and a directory
+    /// saying it is gone means the directory is the one that is wrong.
     pub fn walk_out_deleted_channels(&self, deleted_ids: &[String]) -> anyhow::Result<Vec<String>> {
         if deleted_ids.is_empty() {
             return Ok(Vec::new());
@@ -4210,7 +4243,8 @@ impl Database {
         let mut walked = Vec::new();
         for id in deleted_ids {
             let n = conn.execute(
-                "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1 AND deleted = 0",
+                "UPDATE channels SET in_room = 0 \
+                 WHERE channel_id = ?1 AND deleted = 0 AND is_owner = 0 AND in_room = 1",
                 params![id],
             )?;
             if n > 0 {
@@ -5030,6 +5064,7 @@ impl Database {
         successor_nominee: Option<&[u8; 32]>,
         claim_after_days: Option<u16>,
         key_epoch: Option<u64>,
+        invites_owner_only: Option<bool>,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let current: i64 = conn
@@ -5137,8 +5172,30 @@ impl Database {
                 params![channel_id, epoch as i64],
             )?;
         }
+        // Absent means the record predates the field, which must leave the
+        // stored policy alone rather than reading as "anyone may invite".
+        if let Some(owner_only) = invites_owner_only {
+            tx.execute(
+                "UPDATE channels SET invites_owner_only = ?2 WHERE channel_id = ?1",
+                params![channel_id, i64::from(owner_only)],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Owner-set: may members other than the owner mint invites?
+    pub fn set_channel_invite_policy(
+        &self,
+        channel_id: &str,
+        owner_only: bool,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET invites_owner_only = ?2 WHERE channel_id = ?1 AND is_owner = 1",
+            params![channel_id, i64::from(owner_only)],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn touch_channel_presence(&self, channel_id: &str, when: i64) -> anyhow::Result<()> {
@@ -6495,7 +6552,7 @@ mod tests {
         let banned = [0x33u8; 32];
         let banned_hex = hex::encode(banned);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None, None, None, None, None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
@@ -6505,12 +6562,12 @@ mod tests {
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
         assert!(!db
-            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None, None, None, None, None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None, None, None, None, None)
             .unwrap());
         assert!(!db
             .channel_member_is_banned(&channel_id, &banned_hex)
@@ -6519,7 +6576,7 @@ mod tests {
         let moderator = [0x44u8; 32];
         let mod_hex = hex::encode(moderator);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None, None, None, None, None)
             .unwrap());
         assert!(db
             .channel_member_is_moderator(&channel_id, &mod_hex)
@@ -6539,7 +6596,7 @@ mod tests {
             .channel_member_is_banned(&channel_id, &banned_hex)
             .unwrap());
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None, None, None, None, None)
             .unwrap());
         assert!(
             db.channel_member_is_banned(&channel_id, &banned_hex)
@@ -6889,11 +6946,33 @@ mod tests {
             None,
         )
         .expect("insert other");
-        let walked = db.walk_out_deleted_channels(&[other_id.clone()]).unwrap();
+        let walked = db
+            .walk_out_deleted_channels(std::slice::from_ref(&other_id))
+            .unwrap();
         assert_eq!(walked, vec![other_id.clone()]);
         let hidden = db.get_channel(&other_id).unwrap().unwrap();
         assert!(!hidden.in_room);
-        assert!(hidden.deleted, "a directory tombstone must hide the card");
+        assert!(
+            !hidden.deleted,
+            "the directory is an unsigned hint: it walks a device out, it does \
+             not tombstone a room beyond recovery"
+        );
+        assert!(
+            db.set_channel_in_room(&other_id, true).unwrap(),
+            "a room the directory was wrong about must be re-enterable"
+        );
+
+        let owned_id = "ab".repeat(16);
+        db.insert_channel(&owned_id, &"34".repeat(32), "Mine", "public", true, None, None)
+            .expect("insert owned");
+        let owned_walk = db
+            .walk_out_deleted_channels(std::slice::from_ref(&owned_id))
+            .unwrap();
+        assert!(
+            owned_walk.is_empty(),
+            "a room we own is not walked out on the directory's say-so"
+        );
+        assert!(db.get_channel(&owned_id).unwrap().unwrap().in_room);
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -6961,6 +7040,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap());
         assert!(
@@ -6990,6 +7070,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap());
         assert!(
@@ -7000,7 +7081,7 @@ mod tests {
 
         // A later record that predates the field must not erase what we know.
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None, None, None, None, None)
             .unwrap());
         assert_eq!(
             db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
@@ -7292,6 +7373,7 @@ mod tests {
                 Some(&nominee),
                 Some(30),
                 Some(4),
+                None,
             )
             .unwrap());
         let row = db.get_channel(&channel_id).unwrap().unwrap();
@@ -7304,7 +7386,7 @@ mod tests {
         // say — leaves what we already learned intact rather than wiping it.
         assert!(db
             .apply_channel_moderation(
-                &channel_id, "Topic 2", "Welcome", 2_000, &[], &[], None, None, None, None,
+                &channel_id, "Topic 2", "Welcome", 2_000, &[], &[], None, None, None, None, None,
             )
             .unwrap());
         let row = db.get_channel(&channel_id).unwrap().unwrap();
@@ -7325,6 +7407,7 @@ mod tests {
                 None,
                 None,
                 Some(2),
+                None,
             )
             .unwrap());
         assert_eq!(
@@ -7354,6 +7437,7 @@ mod tests {
                 Some(&nominee),
                 Some(21),
                 None,
+                None,
             )
             .unwrap());
         assert_eq!(
@@ -7371,6 +7455,7 @@ mod tests {
                 Some(&owner),
                 Some(&[0u8; 32]),
                 Some(0),
+                None,
                 None,
             )
             .unwrap());
@@ -7531,7 +7616,7 @@ mod tests {
         db.upsert_channel_member(&channel_id, &other_hex, "Them", 100, None)
             .unwrap();
         assert!(db
-            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None, None)
             .unwrap());
 
         assert!(db.delete_channel(&channel_id, Some(&us_hex)).unwrap());
@@ -7566,7 +7651,7 @@ mod tests {
 
         // The owner lifting it still does, on the next moderation snapshot.
         assert!(db
-            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None, None, None, None)
+            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None, None, None, None, None)
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &us_hex).unwrap());
 

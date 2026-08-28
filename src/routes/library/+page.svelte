@@ -596,6 +596,11 @@
 
   let mounted = false;
   let busy = false;
+  /** Cleared by the first load that actually succeeds, not the first attempt.
+   *  A watchdog timeout or a backend error leaves it set so the table keeps
+   *  showing a spinner while the 3s scan poll retries, rather than announcing
+   *  an empty library the user may not have. */
+  let initialLoadDone = $state(false);
   let pendingRefresh = false;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -643,6 +648,7 @@
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
+      initialLoadDone = true;
       // Successful load: clear a previously-surfaced load error (but leave
       // any error a user action raised in the meantime untouched).
       if (lastLoadError !== null) {
@@ -900,6 +906,8 @@
   }
 
   async function handleReload() {
+    if (reloading) return;
+    reloading = true;
     error = null;
     // An explicit reload is a fresh user-initiated rescan, so clear any
     // prior "stopped by user" state. Otherwise the progress listener and
@@ -919,8 +927,15 @@
         scanning = false;
         error = toErr(e);
       }
+    } finally {
+      if (mounted) reloading = false;
     }
   }
+
+  /** Guards the Reload button only. The rescan itself runs on in the backend
+   *  and reports through `scanning`; this just stops a second click stacking
+   *  another one on top of it. */
+  let reloading = $state(false);
 
   let stopConfirmVisible = $state(false);
   let stoppingHashing = $state(false);
@@ -2583,7 +2598,7 @@
       {/if}
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
-    <button class="ghost" onclick={handleReload}>{m.library_reload()}</button>
+    <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
     <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>
@@ -3189,6 +3204,15 @@
         </svg>
         <p>{m.library_empty_no_matches()}</p>
         <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button></p>
+      </div>
+    {:else if sortedFiles.length === 0 && !initialLoadDone}
+      <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
+           succeeded, an empty table means unknown, not empty. Offering Add
+           Folder to someone whose library is merely still loading tells them
+           their shares are gone. -->
+      <div class="empty-state">
+        <div class="spinner lg"></div>
+        <p>{m.common_loading()}</p>
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">

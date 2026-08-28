@@ -30,6 +30,9 @@ export interface ChannelInfo {
   in_room: boolean;
   /** Owner has permanently deleted this room. */
   deleted: boolean;
+  /** Only the owner may hand out invites. A guard against a careless re-share,
+   *  not against a member who patches their client — they hold the key too. */
+  invites_owner_only: boolean;
 }
 
 export interface ChannelMemberInfo {
@@ -86,6 +89,11 @@ export async function enterChannel(channelId: string): Promise<ChannelInfo> {
 
 export async function leaveChannel(channelId: string): Promise<void> {
   return invoke('leave_channel', { channelId });
+}
+
+/** Drop a room we have left off this device, along with its saved messages. */
+export async function forgetChannel(channelId: string): Promise<void> {
+  return invoke('forget_channel', { channelId });
 }
 
 export const CHANNEL_USERNAME_MIN = 2;
@@ -218,6 +226,22 @@ export async function setChannelSuccessorNominee(
 
 export async function claimChannelOwnership(channelId: string): Promise<ChannelInfo> {
   return invoke('claim_channel_ownership', { channelId });
+}
+
+/** Mint a fresh content key for a private room. Every invite handed out before
+ *  this stops working, which is the point — it is the remedy for a leaked
+ *  link. Owner only, and meaningless on a public room. */
+export async function rotateChannelRoomKey(channelId: string): Promise<ChannelInfo> {
+  return invoke('rotate_channel_room_key', { channelId });
+}
+
+/** Owner only. Rides the signed moderation snapshot, so members learn it the
+ *  same way they learn bans. */
+export async function setChannelInvitePolicy(
+  channelId: string,
+  ownerOnly: boolean,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_invite_policy', { channelId, ownerOnly });
 }
 
 /** `ember2:<hash>:<pubkey>` for a room member, ready to hand to `addFriend`.

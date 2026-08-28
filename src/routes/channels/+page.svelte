@@ -24,6 +24,7 @@
     isValidChannelUsername,
     deleteOwnedChannel,
     enterChannel,
+    forgetChannel,
     gatherChannels,
     getChannelInvite,
     joinChannel,
@@ -33,6 +34,8 @@
     offerChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
+    rotateChannelRoomKey,
+    setChannelInvitePolicy,
     claimChannelOwnership,
     claimChannelUsername,
     sanitizeChannelUsernameInput,
@@ -52,9 +55,13 @@
     activeChannelId,
     channels as channelsStore,
     clearChannelUnread,
+    forgetChannelMute,
+    hiddenChannels,
+    hideChannel,
     ignoredMembers,
     mutedChannels,
     refreshChannels,
+    unhideChannel,
     replaceChannel,
     setChannelInRoom,
     setChannelMemberCount,
@@ -66,11 +73,26 @@
   } from '$lib/stores/channels';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
+  let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
   let selectedId = $derived($activeChannelId);
   let members: ChannelMemberInfo[] = $state([]);
+  let membersLoading = $state(false);
+  let membersError: string | null = $state(null);
   let loading = $state(true);
+  /** Set by the first `list_channels` that succeeds, not the first attempt.
+   *  Discover fills the same list from the cache within milliseconds, so
+   *  gating the spinner on "any rows yet" hid the fact that the rooms you have
+   *  actually joined were still loading — or had failed to load at all. */
+  let channelsLoaded = $state(false);
   let discovering = $state(false);
+  /** True for any Discover walk, including the 60s refresh. The Find button
+   *  uses `discovering` so a background walk does not lock the control. */
+  let gatherInFlight = $state(false);
+  let pendingNotifyEmpty = $state(false);
   let discovered: GatheredChannelInfo[] = $state([]);
+  let copyingInvite = $state(false);
+  let deletingOwned = $state(false);
+  let transferring = $state(false);
   let createName = $state('');
   let createPrivate = $state(false);
   let joinUri = $state('');
@@ -78,6 +100,9 @@
   let leaveOpen = $state(false);
   let deleteOpen = $state(false);
   let leaveTargetId = $state<string | null>(null);
+  let forgetOpen = $state(false);
+  let forgetTargetId = $state<string | null>(null);
+  let forgettingIds = $state<string[]>([]);
   let usernameDraft = $state('');
   let claimingUsername = $state(false);
   let editTopic = $state('');
@@ -86,6 +111,9 @@
   let savingModeration = $state(false);
   let moderatingMember = $state<string | null>(null);
   let claiming = $state(false);
+  /** Matches MAX_CHANNEL_NAME_CHARS in src-tauri/src/commands/channels.rs, and
+   *  the width the list column is sized to hold. */
+  const CHANNEL_NAME_MAX = 20;
   /** Matches the backend default; the backend clamps to 7–365 either way. */
   const DEFAULT_CLAIM_DAYS = 14;
   const CLAIM_WINDOWS = [7, 14, 30, 90, 180, 365];
@@ -119,6 +147,10 @@
   let searchHits: ChannelMessageInfo[] = $state([]);
   let searching = $state(false);
   let searchRan = $state(false);
+  let searchError: string | null = $state(null);
+  /** A search hit the transcript should scroll to. A fresh object per click so
+   *  picking the same hit twice still moves it. */
+  let transcriptFocus = $state<{ id: number } | null>(null);
   /** Guards against a superseded query's reply landing last and showing hits
    *  for text the box no longer contains. */
   let searchGen = 0;
@@ -191,8 +223,16 @@
     const hidden = new Set(
       $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
     );
+    // Removing a room has to outlast the next Discover sweep, which re-adds
+    // anything still listed a minute later.
+    for (const id of $hiddenChannels) hidden.add(id);
     const byId = new Map<string, ChannelInfo>();
     for (const ch of channelList) {
+      // Never hide a room we are standing in. Removal is only offered once
+      // you are out, but the conversation pane reads membership straight from
+      // the store, so a joined room missing from the list would be a room you
+      // are in with no way back to it.
+      if (hidden.has(ch.channel_id) && !ch.in_room) continue;
       byId.set(ch.channel_id, ch);
     }
     for (const item of discovered) {
@@ -221,6 +261,9 @@
         owner_pubkey: '',
         in_room: item.joined,
         deleted: false,
+        // A room we have not joined tells us nothing about its invite policy,
+        // and the control that reads this is owner-only anyway.
+        invites_owner_only: false,
       });
     }
     return [...byId.values()];
@@ -230,6 +273,17 @@
       ?? channelList.find((c) => c.channel_id === leaveTargetId)?.name
       ?? '',
   );
+  /** Falls through to the raw sources: confirming the removal hides the room,
+   *  which takes it out of `directoryList` while the dialog is still closing. */
+  let forgetTargetName = $derived(
+    directoryList.find((c) => c.channel_id === forgetTargetId)?.name
+      ?? channelList.find((c) => c.channel_id === forgetTargetId)?.name
+      ?? discovered.find((c) => c.channel_id === forgetTargetId)?.name
+      ?? '',
+  );
+  /** Rooms with a row on this device. A Discover-only listing has no row to
+   *  delete, so removing one is a hide and nothing more. */
+  let storedChannelIds = $derived(new Set(channelList.map((c) => c.channel_id)));
   let visibleChannels = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
     const list = directoryList;
@@ -240,6 +294,16 @@
         ch.topic.toLowerCase().includes(q),
     );
   });
+  /** Hits the transcript can actually show. An ignored sender's messages are
+   *  drawn nowhere, so offering them here would be a dead click. */
+  let visibleSearchHits = $derived(
+    $ignoredMembers.length === 0
+      ? searchHits
+      : searchHits.filter(
+          (hit) =>
+            !hit.sender_pubkey || !$ignoredMembers.includes(hit.sender_pubkey.toLowerCase()),
+        ),
+  );
   let sortedMembers = $derived(
     members.slice().sort((a, b) => {
       if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
@@ -394,10 +458,10 @@
     });
     // One index shard answered. Sixteen of these arrive per browse, in whatever
     // order the DHT returns them, so the list grows as the walk proceeds instead
-    // of appearing all at once when the slowest shard gives up. Ignored unless a
-    // browse is actually running, so a dismissed list stays dismissed.
+    // of appearing all at once when the slowest shard gives up.
     let unlistenFound: UnlistenFn | undefined;
     listen<GatheredChannelInfo[]>('ember:channels-found', (event) => {
+      if (!gatherInFlight) return;
       const batch = event.payload ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
@@ -534,6 +598,10 @@
     deepLinkJoin = true;
     error = null;
     untrack(() => {
+      activeChannelId.set(null);
+      members = [];
+      membersLoading = false;
+      membersError = null;
       const next = new URL($page.url);
       next.searchParams.delete('join');
       void goto(`${next.pathname}${next.search}${next.hash}`, {
@@ -549,10 +617,13 @@
     error = null;
     try {
       await refreshChannels();
+      channelsLoaded = true;
       const current = selectedId;
       if (current && !$channelsStore.some((c) => c.channel_id === current && c.in_room)) {
         activeChannelId.set(null);
         members = [];
+        membersLoading = false;
+        membersError = null;
       } else if (current) {
         // `activeChannelId` is a module-level store, but the roster and the
         // moderation drafts are component state and the layout keys this page
@@ -583,22 +654,42 @@
   /** Apply only while `id` is still the open room, so a slow reply from a
    *  previous selection cannot replace the current roster. */
   async function refreshMembers(id: string, notify = false) {
+    if (id === selectedId && members.length === 0) {
+      membersLoading = true;
+      membersError = null;
+    }
     try {
       const mems = await listChannelMembers(id);
-      if (id === selectedId) members = mems;
-      if (mems.length > 0) setChannelMemberCount(id, mems.length);
+      if (id === selectedId) {
+        members = mems;
+        membersLoading = false;
+        membersError = null;
+      }
+      // Written even when empty: gating on a non-empty roster meant a room
+      // that had emptied kept whatever count it last reported.
+      setChannelMemberCount(id, mems.length);
     } catch (e) {
-      if (notify && id === selectedId) {
-        toastError(translateError(e, m.error_operation_failed()));
+      if (id === selectedId) {
+        membersLoading = false;
+        membersError = translateError(e, m.error_operation_failed());
+        if (notify) toastError(membersError);
       }
     }
   }
 
-  function roomMemberCount(ch: ChannelInfo): number {
+  /** Confirmed size for the directory chip. `null` means the probe did not
+   *  answer, which must not look like an empty room. */
+  function directoryMemberCount(ch: ChannelInfo): number | null {
     if (ch.in_room && ch.channel_id === selectedId && members.length > 0) {
       return members.length;
     }
-    return Math.max(0, ch.member_count);
+    if (!ch.in_room) {
+      const gathered = discovered.find((item) => item.channel_id === ch.channel_id);
+      if (gathered) return gathered.member_count;
+    }
+    // Joined rooms include this device, so a 0 from the table is "not
+    // loaded yet" rather than an empty room — hide it instead of flashing 0.
+    return ch.member_count > 0 ? ch.member_count : null;
   }
 
   /** Only a browse that reached the network reports a size, so `null` means the
@@ -618,6 +709,8 @@
     if (!ch?.in_room) return;
     activeChannelId.set(id);
     members = [];
+    membersLoading = true;
+    membersError = null;
     editTopic = ch.topic ?? '';
     editWelcome = ch.welcome ?? '';
     editingModeration = false;
@@ -636,6 +729,12 @@
     searchHits = [];
     searchRan = false;
     searching = false;
+    searchError = null;
+    transcriptFocus = null;
+  }
+
+  function focusHit(messageId: number) {
+    transcriptFocus = { id: messageId };
   }
 
   async function runSearch() {
@@ -648,6 +747,7 @@
     }
     const gen = ++searchGen;
     searching = true;
+    searchError = null;
     try {
       const hits = await searchChannelMessages(id, query);
       // Apply only if this is still the newest query for the still-open room:
@@ -658,7 +758,11 @@
       }
     } catch (e) {
       if (gen === searchGen && id === selectedId) {
-        toastError(translateError(e, m.error_operation_failed()));
+        // Drop the previous query's hits with it. Leaving them under the new
+        // term, with only a toast to say otherwise, reads as results.
+        searchHits = [];
+        searchRan = true;
+        searchError = translateError(e, m.error_operation_failed());
       }
     } finally {
       if (gen === searchGen) searching = false;
@@ -668,6 +772,8 @@
   function clearSelection() {
     activeChannelId.set(null);
     members = [];
+    membersLoading = false;
+    membersError = null;
     roomInfoOpen = false;
   }
 
@@ -724,6 +830,7 @@
     error = null;
     try {
       const joined = await joinChannel(uri.trim());
+      unhideChannel(joined.channel_id);
       if (!discoveredId) {
         joinUri = '';
         composeMode = null;
@@ -749,9 +856,12 @@
   async function handleLeave() {
     const id = leaveTargetId;
     if (!id) return;
-    if (selectedId === id) {
+    const wasOpen = selectedId === id;
+    if (wasOpen) {
       activeChannelId.set(null);
       members = [];
+      membersLoading = false;
+      membersError = null;
       resetSearch();
     }
     setChannelInRoom(id, false);
@@ -766,14 +876,22 @@
       void refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      // The optimistic walk-out has to come back too, not just the row.
+      // Refreshing alone restored membership in the list while leaving the
+      // user out on the directory, still a member and with no way to tell.
       await refreshChannels();
+      discovered = discovered.map((item) =>
+        item.channel_id === id ? { ...item, joined: true } : item,
+      );
+      if (wasOpen) await selectChannel(id);
     } finally {
       leaveTargetId = null;
     }
   }
 
   async function handleCopyInvite() {
-    if (!selectedId) return;
+    if (!selectedId || copyingInvite) return;
+    copyingInvite = true;
     try {
       const invite = await getChannelInvite(selectedId);
       if (await copyToClipboard(invite.uri)) {
@@ -783,6 +901,8 @@
       }
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      copyingInvite = false;
     }
   }
 
@@ -790,8 +910,19 @@
     // A browse walks sixteen index shards and then sizes what it found, which
     // on a slow network can outlast the interval that started it. Without this
     // those runs stack up and each one re-issues the whole set of lookups.
-    if (discovering) return;
-    discovering = true;
+    // The Find button is a separate flag: a background walk must not lock it,
+    // and a click during one should still report emptiness when that walk ends.
+    if (gatherInFlight) {
+      if (notifyEmpty) {
+        pendingNotifyEmpty = true;
+        discovering = true;
+      }
+      return;
+    }
+    gatherInFlight = true;
+    if (notifyEmpty || pendingNotifyEmpty) discovering = true;
+    let found: GatheredChannelInfo[] | null = null;
+    let err: unknown = null;
     try {
       if (discovered.length === 0) {
         try {
@@ -800,19 +931,30 @@
           // A cold cache is the normal first run, not a failure to report.
         }
       }
-      const found = await gatherChannels();
+      const result = await gatherChannels();
       const prior = new Map(discovered.map((item) => [item.channel_id, item]));
-      discovered = found.map((item) =>
+      discovered = result.map((item) =>
         withKnownMemberCount(item, prior.get(item.channel_id)),
       );
       await refreshChannels();
-      if (notifyEmpty && found.length === 0) {
-        toastSuccess(m.channels_none_found());
-      }
+      found = result;
     } catch (e) {
-      if (notifyEmpty) toastError(translateError(e, m.error_operation_failed()));
+      err = e;
     } finally {
-      discovering = false;
+      // Drop the lock before sampling pendingNotifyEmpty so a Find that
+      // arrived as we finished starts a real walk instead of setting a flag
+      // this invocation then forgets. Clearing `discovering` only if no
+      // walk started under us avoids wiping that Find's Searching label.
+      gatherInFlight = false;
+      const shouldNotify = notifyEmpty || pendingNotifyEmpty;
+      pendingNotifyEmpty = false;
+      if (shouldNotify) {
+        if (err) toastError(translateError(err, m.error_operation_failed()));
+        else if (found && found.length === 0) toast(m.channels_none_found());
+      }
+      if (!gatherInFlight) {
+        discovering = false;
+      }
     }
   }
 
@@ -837,6 +979,7 @@
         : await joinChannel(
             `ember-channel:${ch.channel_id}?pk=${ch.pubkey}&name=${encodeURIComponent(ch.name)}`,
           );
+      unhideChannel(joined.channel_id);
       discovered = discovered.map((item) =>
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
@@ -855,18 +998,49 @@
     leaveOpen = true;
   }
 
+  function requestForget(channelId: string) {
+    forgetTargetId = channelId;
+    forgetOpen = true;
+  }
+
+  async function handleForget() {
+    const id = forgetTargetId;
+    if (!id || forgettingIds.includes(id)) return;
+    forgettingIds = [...forgettingIds, id];
+    // Hide first and keep it hidden even if the row will not delete. A public
+    // room is still listed after we drop our copy of it, so this is the half
+    // that actually takes it off the list; the delete below is what clears the
+    // saved messages.
+    hideChannel(id);
+    forgetChannelMute(id);
+    try {
+      if (storedChannelIds.has(id)) await forgetChannel(id);
+      await refreshChannels();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      forgettingIds = forgettingIds.filter((each) => each !== id);
+    }
+  }
+
   async function handleDeleteOwned() {
     const id = selectedId;
-    if (!id) return;
+    if (!id || deletingOwned) return;
+    deletingOwned = true;
     try {
       await deleteOwnedChannel(id);
+      forgetChannelMute(id);
       activeChannelId.set(null);
       members = [];
+      membersLoading = false;
+      membersError = null;
       discovered = discovered.filter((item) => item.channel_id !== id);
       resetSearch();
       await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      deletingOwned = false;
     }
   }
 
@@ -961,6 +1135,39 @@
     }
   }
 
+  let rotateOpen = $state(false);
+  let rotatingKey = $state(false);
+  let savingInvitePolicy = $state(false);
+
+  async function handleInvitePolicy(ownerOnly: boolean) {
+    const id = selectedId;
+    if (!id || savingInvitePolicy) return;
+    savingInvitePolicy = true;
+    try {
+      replaceChannel(await setChannelInvitePolicy(id, ownerOnly));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+      // The switch is bound to the row, so a refresh is what puts it back.
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingInvitePolicy = false;
+    }
+  }
+
+  async function handleRotateKey() {
+    const id = selectedId;
+    if (!id || rotatingKey) return;
+    rotatingKey = true;
+    try {
+      replaceChannel(await rotateChannelRoomKey(id));
+      toastSuccess(m.channels_rotated_notice());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      rotatingKey = false;
+    }
+  }
+
   function requestTransfer(member: ChannelMemberInfo) {
     transferTarget = member;
     transferOpen = true;
@@ -969,7 +1176,8 @@
   async function handleTransfer() {
     const id = selectedId;
     const target = transferTarget;
-    if (!id || !target) return;
+    if (!id || !target || transferring) return;
+    transferring = true;
     try {
       await transferChannelOwnership(id, target.member_pubkey);
       transferSent = { ...transferSent, [id]: target.member_pubkey };
@@ -978,6 +1186,7 @@
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
+      transferring = false;
       transferTarget = null;
     }
   }
@@ -1013,14 +1222,21 @@
     }
   }
 
+  let openingSuccessor = $state(false);
+
   async function openSuccessor() {
     const id = selected?.successor_id;
-    if (!id) return;
-    await refreshChannels().catch(() => {});
-    if ($channelsStore.some((c) => c.channel_id === id)) {
-      await selectChannel(id);
-    } else {
-      toastError(m.error_channels_not_found());
+    if (!id || openingSuccessor) return;
+    openingSuccessor = true;
+    try {
+      await refreshChannels().catch(() => {});
+      if ($channelsStore.some((c) => c.channel_id === id)) {
+        await selectChannel(id);
+      } else {
+        toastError(m.error_channels_not_found());
+      }
+    } finally {
+      openingSuccessor = false;
     }
   }
 
@@ -1082,7 +1298,19 @@
     }
   }
 
+  let copyingMemberId = $state(false);
+
   async function handleCopyMemberId(mem: ChannelMemberInfo) {
+    if (copyingMemberId) return;
+    copyingMemberId = true;
+    try {
+      await copyMemberIdInner(mem);
+    } finally {
+      copyingMemberId = false;
+    }
+  }
+
+  async function copyMemberIdInner(mem: ChannelMemberInfo) {
     if (await copyToClipboard(mem.member_pubkey)) {
       toastSuccess(m.channels_member_id_copied());
     } else {
@@ -1207,11 +1435,14 @@
 <div class="page-header">
   <div class="header-title">
     <h2>{m.nav_channels()}</h2>
-    {#if channelList.length > 0 || directoryList.length > 0}
+    <!-- Rooms you are in, not rows in the list. The list also carries every
+         public room Discover turned up, so counting it read "14 rooms" to
+         someone who had joined two. -->
+    {#if joinedCount > 0}
       <span class="header-count">
-        {directoryList.length === 1
+        {joinedCount === 1
           ? m.channels_count_one()
-          : m.channels_count_other({ count: directoryList.length })}
+          : m.channels_count_other({ count: joinedCount })}
       </span>
     {/if}
   </div>
@@ -1242,6 +1473,7 @@
   <details class="how-panel">
     <summary class="how-title">{m.channels_how_title()}</summary>
     <p class="how-lede">{m.channels_page_subtitle()}</p>
+    <p class="how-limits">{m.channels_public_readable()}</p>
     <p class="how-limits">{m.channels_limits_note()}</p>
   </details>
 
@@ -1283,7 +1515,7 @@
             }}
           />
           <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
-            {m.channels_username_save()}
+            {claimingUsername ? m.common_loading() : m.channels_username_save()}
           </button>
         </div>
       </form>
@@ -1300,13 +1532,24 @@
           <input
             bind:value={createName}
             placeholder={m.channels_name_placeholder()}
-            maxlength="64"
+            maxlength={CHANNEL_NAME_MAX}
             aria-label={m.channels_name_placeholder()}
             use:autoFocus
           />
+          <!-- The field simply stops accepting input at the cap, which reads as
+               a broken key without a count next to it. `maxlength` already
+               tells a screen reader the limit, so this is for the eye only. -->
+          <span class="name-count" aria-hidden="true">{createName.length}/{CHANNEL_NAME_MAX}</span>
           <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
-          <button type="submit" disabled={!createName.trim() || creating}>{m.channels_create()}</button>
+          <button type="submit" disabled={!createName.trim() || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
         </div>
+        <!-- Said at the moment the choice is made, not buried in a panel. A
+             public room's content key is derived from the address in its
+             public listing, so discovering the room is the same as being able
+             to read it — which changes what people put in one. -->
+        {#if !createPrivate}
+          <p class="form-hint public-readable">{m.channels_public_readable()}</p>
+        {/if}
       </form>
     {:else if composeMode === 'join'}
       <form
@@ -1327,15 +1570,26 @@
             autocomplete="off"
             use:autoFocus
           />
-          <button type="submit" disabled={!joinUri.trim() || joiningForm}>{m.channels_join()}</button>
+          <button type="submit" disabled={!joinUri.trim() || joiningForm}>{joiningForm ? m.channels_joining() : m.channels_join()}</button>
         </div>
       </form>
     {/if}
 
-    {#if loading && directoryList.length === 0}
+    {#if directoryList.length === 0 && !channelsLoaded}
+      <!-- Nothing on screen and no successful load yet: still working, or it
+           failed. Either way this is not an empty directory, and offering the
+           "create your first room" pitch to someone whose rooms simply have
+           not arrived tells them their rooms are gone. -->
       <div class="empty-state">
-        <div class="spinner lg"></div>
-        <p>{m.common_loading()}</p>
+        {#if error}
+          <p class="empty-title">{m.channels_load_failed()}</p>
+          <button class="empty-action" onclick={() => void loadChannels()} disabled={loading}>
+            {loading ? m.common_loading() : m.common_retry()}
+          </button>
+        {:else}
+          <div class="spinner lg"></div>
+          <p>{m.common_loading()}</p>
+        {/if}
       </div>
     {:else if directoryList.length === 0}
       <div class="empty-state">
@@ -1406,15 +1660,28 @@
               <p class="muted list-empty">{m.channels_no_matches()}</p>
             {:else}
               {#each visibleChannels as ch (ch.channel_id)}
+                {@const memberCount = directoryMemberCount(ch)}
+                <!-- A room whose ownership moved is dimmed rather than
+                     labelled: the card carries no prose now, and opening it
+                     shows the successor banner that actually explains it. -->
                 <div
                   class="chan-row"
                   class:active={ch.in_room && ch.channel_id === selectedId}
+                  class:joining={joiningIds.includes(ch.channel_id)}
+                  class:moved={!!ch.successor_id}
+                  title={ch.successor_id ? m.channels_transferred_badge() : undefined}
                 >
                   <button
                     type="button"
                     class="chan-row-main"
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
-                    onclick={() => selectChannel(ch.channel_id)}
+                    aria-label={ch.in_room ? undefined : `${ch.name}. ${m.channels_join()}`}
+                    aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
+                    disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
+                    onclick={() => {
+                      if (ch.in_room) void selectChannel(ch.channel_id);
+                      else void joinCard(ch);
+                    }}
                   >
                     <div
                       class="chan-avatar"
@@ -1434,25 +1701,13 @@
                         </span>
                       {/if}
                     </div>
-                    <span class="chan-identity">
-                      <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
-                      <span class="chan-sub">
-                        {#if ch.successor_id}
-                          {m.channels_transferred_badge()}
-                        {:else if ch.topic}
-                          <bdi dir="auto">{ch.topic}</bdi>
-                        {:else}
-                          {ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}
-                        {/if}
-                      </span>
-                    </span>
-                    {#if ch.in_room && ch.unread > 0}
-                      <span class="unread" class:silenced={$mutedChannels.includes(ch.channel_id)}>{ch.unread}</span>
-                    {/if}
-                  </button>
-                  <div class="chan-door-col">
-                    {#if roomMemberCount(ch) > 0}
-                      {@const count = roomMemberCount(ch)}
+                    <!-- Name, member count, action. Topic and the
+                         Public/Private badge are gone: the room is identified
+                         by its name, and everything else about it is one click
+                         away inside. -->
+                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                    {#if memberCount !== null}
+                      {@const count = memberCount}
                       <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <circle cx="6" cy="6" r="2.2"/>
@@ -1463,10 +1718,23 @@
                         {count}
                       </span>
                     {/if}
+                    {#if ch.in_room && ch.unread > 0}
+                      <!-- A bare number beside a room name says nothing on its
+                           own to a screen reader. -->
+                      <span
+                        class="unread"
+                        class:silenced={$mutedChannels.includes(ch.channel_id)}
+                        aria-label={ch.unread === 1
+                          ? m.channels_unread_title_one()
+                          : m.channels_unread_title_other({ count: ch.unread })}
+                      >{ch.unread}</span>
+                    {/if}
+                  </button>
+                  <div class="chan-door-col">
                     {#if ch.in_room}
                       <button
                         type="button"
-                        class="ghost chan-door"
+                        class="chan-door chan-leave"
                         disabled={joiningIds.includes(ch.channel_id)}
                         onclick={() => requestLeave(ch.channel_id)}
                       >{m.channels_leave()}</button>
@@ -1479,6 +1747,23 @@
                       >{joiningIds.includes(ch.channel_id)
                         ? m.channels_joining()
                         : m.channels_join()}</button>
+                      {#if !ch.is_owner}
+                        <button
+                          type="button"
+                          class="chan-forget"
+                          title={m.channels_forget()}
+                          aria-label={m.channels_forget_aria({ name: ch.name })}
+                          disabled={forgettingIds.includes(ch.channel_id)
+                            || joiningIds.includes(ch.channel_id)}
+                          onclick={() => requestForget(ch.channel_id)}
+                        >
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2.5 4.5h11"/>
+                            <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                            <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                          </svg>
+                        </button>
+                      {/if}
                     {/if}
                   </div>
                 </div>
@@ -1553,9 +1838,13 @@
                     aria-pressed={roomInfoOpen}
                     aria-label={m.channels_edit_moderation()}
                   >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                      <circle cx="8" cy="8" r="2.2"/>
-                      <path d="M8 2.5v1.5M8 12v1.5M2.5 8h1.5M12 8h1.5M4.1 4.1l1.1 1.1M10.8 10.8l1.1 1.1M4.1 11.9l1.1-1.1M10.8 5.2l1.1-1.1"/>
+                    <!-- Drawn on a 24 grid rather than 16: the hand-fitted
+                         path this replaces was a few hundredths out of true on
+                         each tooth, which at icon size reads as a lopsided
+                         circle. -->
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="3"/>
+                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
                     </svg>
                   </button>
                 {/if}
@@ -1605,11 +1894,14 @@
                     {/if}
                   </svg>
                 </button>
-                <button class="ghost" onclick={handleCopyInvite}>{m.channels_invite()}</button>
-                <button class="ghost danger" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
-                {#if selected.is_owner}
-                  <button class="ghost danger" onclick={() => (deleteOpen = true)}>{m.channels_delete()}</button>
-                {/if}
+                <!-- Splits the four view toggles from the two actions that
+                     actually change something. -->
+                <span class="conv-actions-sep" aria-hidden="true"></span>
+                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.common_loading() : m.channels_invite()}</button>
+                <!-- Delete room used to sit here, identical red text one gap
+                     away from Leave. Only one of the two can be undone, so it
+                     moved in beside the owner's other room settings. -->
+                <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
               </div>
             </header>
             {#if selected.welcome.trim()}
@@ -1620,7 +1912,7 @@
             {#if selected.successor_id}
               <div class="successor-banner" role="status">
                 <span>{m.channels_successor_banner()}</span>
-                <button class="ghost" onclick={openSuccessor}>{m.channels_open_successor()}</button>
+                <button class="ghost" onclick={openSuccessor} disabled={openingSuccessor}>{m.channels_open_successor()}</button>
               </div>
             {:else if transferPendingTo}
               <div class="successor-banner" role="status">
@@ -1659,16 +1951,49 @@
                   aria-label={m.channels_topic_placeholder()}
                   oninput={() => (editingModeration = true)}
                 />
+                <!-- Matches CHANNEL_WELCOME_MAX. The backend truncates past it
+                     rather than refusing, so a larger box silently ate half a
+                     long welcome. Bytes there, characters here, so non-ASCII
+                     can still be trimmed — but not by 2x. -->
                 <textarea
                   bind:value={editWelcome}
-                  maxlength="512"
+                  maxlength="256"
                   rows="2"
                   placeholder={m.channels_welcome_placeholder()}
                   aria-label={m.channels_welcome_placeholder()}
                   oninput={() => (editingModeration = true)}
                 ></textarea>
-                <button type="submit" disabled={moderationBusy}>{m.channels_save_moderation()}</button>
+                <button type="submit" disabled={moderationBusy}>
+                  {savingModeration ? m.common_loading() : m.channels_save_moderation()}
+                </button>
               </form>
+              <div class="succession-form">
+                <p class="succession-title">{m.channels_invite_policy_title()}</p>
+                <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
+                <ToggleSwitch
+                  checked={selected.invites_owner_only}
+                  label={m.channels_invite_policy_label()}
+                  disabled={savingInvitePolicy}
+                  onchange={(v) => void handleInvitePolicy(v)}
+                />
+              </div>
+              <!-- Only private rooms have a key worth rotating: a public
+                   room's comes from its address, so there is nothing to
+                   change it to. -->
+              {#if selected.visibility === 'private'}
+                <div class="succession-form">
+                  <p class="succession-title">{m.channels_rotate_title()}</p>
+                  <p class="succession-hint">{m.channels_rotate_hint()}</p>
+                  <button
+                    type="button"
+                    class="ghost danger"
+                    disabled={rotatingKey || moderationBusy}
+                    onclick={() => (rotateOpen = true)}
+                  >
+                    {rotatingKey ? m.common_loading() : m.channels_rotate_btn()}
+                  </button>
+                </div>
+              {/if}
               <div class="succession-form">
                 <p class="succession-title">{m.channels_succession()}</p>
                 <p class="succession-hint">{m.channels_succession_hint()}</p>
@@ -1705,6 +2030,20 @@
                     </select>
                   </label>
                 {/if}
+              </div>
+              <!-- Last, and the only irreversible control on the page. In the
+                   header it was one gap from Leave in the same red text. -->
+              <div class="succession-form danger-zone">
+                <p class="succession-title">{m.channels_delete()}</p>
+                <p class="succession-hint">{m.channels_delete_confirm_body({ name: selected.name })}</p>
+                <button
+                  type="button"
+                  class="conv-action conv-delete"
+                  disabled={deletingOwned}
+                  onclick={() => (deleteOpen = true)}
+                >
+                  {deletingOwned ? m.common_loading() : m.channels_delete()}
+                </button>
               </div>
             {/if}
             {#if roomTransfers.length > 0}
@@ -1791,18 +2130,25 @@
                 </button>
               </form>
               {#if searchRan}
-                <div class="search-results">
-                  {#if searchHits.length === 0}
+                <div class="search-results" aria-live="polite">
+                  {#if searchError}
+                    <p class="muted list-empty">{searchError}</p>
+                  {:else if visibleSearchHits.length === 0}
                     <p class="muted list-empty">{m.channels_search_none()}</p>
                   {:else}
-                    {#each searchHits as hit (hit.id)}
-                      <div class="search-hit">
+                    {#each visibleSearchHits as hit (hit.id)}
+                      <button
+                        type="button"
+                        class="search-hit"
+                        title={m.channels_search_open_hit()}
+                        onclick={() => focusHit(hit.id)}
+                      >
                         <span class="search-hit-who">
                           <bdi dir="auto">{memberNames[hit.sender_pubkey] || shortId(hit.sender_pubkey)}</bdi>
                         </span>
                         <span class="search-hit-text"><bdi dir="auto">{hit.message}</bdi></span>
                         <span class="search-hit-when">{formatRelativeTime(hit.timestamp, presenceNow)}</span>
-                      </div>
+                      </button>
                     {/each}
                   {/if}
                 </div>
@@ -1819,6 +2165,8 @@
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMembers}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
+                focusRequest={transcriptFocus}
+                onfocusmissing={() => toast(m.channels_search_too_far())}
               />
             </div>
           {/if}
@@ -1834,7 +2182,11 @@
           <aside class="members-pane">
             <div class="members-header">
               <span class="members-label">{m.channels_members()}</span>
-              <span class="members-count">{members.length || selected.member_count}</span>
+              <!-- Only once the roster is in hand. Falling back to the stored
+                   count put a stale number beside a body that said Loading. -->
+              {#if members.length > 0}
+                <span class="members-count">{members.length}</span>
+              {/if}
               <button
                 class="icon-btn members-close"
                 onclick={() => (membersOpen = false)}
@@ -1843,8 +2195,17 @@
                 <IconX size={14} />
               </button>
             </div>
-            {#if members.length === 0}
+            {#if membersLoading && members.length === 0}
               <p class="muted list-empty">{m.common_loading()}</p>
+            {:else if membersError && members.length === 0}
+              <div class="members-empty">
+                <p class="muted list-empty">{m.channels_members_failed()}</p>
+                <button type="button" class="ghost" onclick={() => void refreshMembers(selected.channel_id)}>
+                  {m.common_retry()}
+                </button>
+              </div>
+            {:else if members.length === 0}
+              <p class="muted list-empty">{m.channels_members_empty()}</p>
             {:else}
               <ul class="member-list">
                 {#each sortedMembers as mem (mem.member_pubkey)}
@@ -1997,6 +2358,24 @@
   confirmLabel={m.channels_transfer_ownership()}
   danger
   onconfirm={handleTransfer}
+/>
+
+<ConfirmDialog
+  bind:open={rotateOpen}
+  title={m.channels_rotate_confirm()}
+  message={m.channels_rotate_confirm_body()}
+  confirmLabel={m.channels_rotate_btn()}
+  danger
+  onconfirm={handleRotateKey}
+/>
+
+<ConfirmDialog
+  bind:open={forgetOpen}
+  title={m.channels_forget_confirm()}
+  message={m.channels_forget_confirm_body({ name: forgetTargetName })}
+  confirmLabel={m.channels_forget()}
+  danger
+  onconfirm={handleForget}
 />
 
 <ConfirmDialog
@@ -2184,92 +2563,42 @@
     letter-spacing: 0.2px;
   }
 
-  .requests-section {
-    flex-shrink: 0;
-    background: var(--bg-surface);
-    border: 1px solid var(--accent-dim);
-    border-radius: var(--radius-lg);
-    overflow: hidden;
+  .public-readable {
+    margin: 10px 0 0;
+    color: var(--warning);
   }
 
-  .requests-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .requests-title {
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-  }
-
-  .requests-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    border-radius: var(--radius-pill);
-    background: var(--accent);
-    color: var(--on-accent);
-    font-size: 10px;
-    font-weight: 700;
-    padding: 0 5px;
-  }
-
-  .requests-dismiss { margin-left: auto; }
-
-  .request-card {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 16px;
-  }
-
-  .request-card + .request-card {
-    border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-  }
-
-  .request-info {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .request-name {
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .request-hash {
+  .name-count {
     font-size: 11px;
     color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
   }
 
   /* Fixed track widths rather than minmax(): collapsing the list animates
      `grid-template-columns`, and browsers only interpolate that when the track
-     values are plain lengths. With minmax() the sidebar would jump. */
+     values are plain lengths. With minmax() the sidebar would jump.
+
+     Sized to hold a full-length room name. Names cap at 20 characters, which
+     leaves the name about 162px here once the avatar, member count and door
+     button have taken theirs — enough that a name at the limit reads whole
+     instead of trailing off. Held at one width rather than measured per room:
+     the cap already bounds the worst case to a few dozen pixels, and a column
+     that resized itself would do so repeatedly while Discover streams rooms
+     in. The narrower members-open track is gone for the same reason — a name
+     should not shorten because a roster opened beside it. */
   .workspace {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 264px minmax(0, 1fr);
+    grid-template-columns: 312px minmax(0, 1fr);
     gap: 10px;
     position: relative;
     transition: grid-template-columns var(--transition-slow) ease;
   }
 
   .workspace.members-open {
-    grid-template-columns: 240px minmax(0, 1fr) 228px;
+    grid-template-columns: 312px minmax(0, 1fr) 228px;
   }
 
   .workspace.list-collapsed {
@@ -2386,6 +2715,8 @@
     background: transparent;
     color: inherit;
     border-radius: var(--radius-md);
+    /* Anchors the joining sweep below. */
+    position: relative;
   }
 
   .chan-row-main {
@@ -2400,48 +2731,163 @@
     background: transparent;
     color: inherit;
     cursor: pointer;
+    transition: transform var(--transition-fast) ease;
   }
 
+  /* Presses register before the network answers, so the row gives way under
+     the pointer rather than looking inert until the join comes back. */
+  .chan-row-main:active:not(:disabled) {
+    transform: scale(0.985);
+  }
+
+  .chan-row-main:disabled {
+    cursor: wait;
+    /* Light: the sweep already says the row is busy, and dimming it further
+       only makes the name harder to read while waiting. */
+    opacity: 0.9;
+  }
+
+  /* A join waits on the network, so the row itself carries the wait. A sweep
+     rather than a spinner, because a spinner needs room and would resize the
+     button under the pointer that just clicked it. */
+  .chan-row.joining {
+    overflow: hidden;
+  }
+
+  .chan-row.joining::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--accent) 20%, transparent),
+      transparent
+    );
+    animation: chan-joining-sweep 1.1s ease-in-out infinite;
+  }
+
+  @keyframes chan-joining-sweep {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(100%); }
+  }
+
+  /* Left as a still tint rather than nothing at all, so the row still reads
+     as busy without moving. */
+  @media (prefers-reduced-motion: reduce) {
+    .chan-row.joining::after { animation: none; }
+  }
+
+  /* One control, centred. The member count used to sit stacked above it, which
+     made the column two pills tall and left the row taller than its content. */
   .chan-door-col {
     display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: center;
-    gap: 5px;
+    align-items: center;
+    gap: 4px;
     flex-shrink: 0;
-    min-width: 62px;
+  }
+
+  /* Kept out of the way until the row is reached. Tidying the list is a rare
+     errand next to joining, and a second permanent button in every row undoes
+     the point of trimming the card down to a name and one action. It stays
+     focusable so the keyboard can reach it, which is also what reveals it. */
+  .chan-forget {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border-radius: var(--radius-pill);
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    opacity: 0;
+    transition:
+      opacity var(--transition-fast) ease,
+      background-color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease,
+      color var(--transition-fast) ease;
+  }
+
+  .chan-row:hover .chan-forget,
+  .chan-row:focus-within .chan-forget {
+    opacity: 1;
+  }
+
+  .chan-forget:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
+  }
+
+  .chan-forget:focus-visible { opacity: 1; }
+
+  .chan-forget svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .chan-forget:active:not(:disabled) { transform: scale(0.92); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chan-forget { transition: none; }
   }
 
   .chan-door {
     font-size: 12px;
-    padding: 4px 10px;
+    padding: 5px 12px;
+    min-width: 62px;
+    text-align: center;
     border-radius: var(--radius-pill);
+    transition: transform var(--transition-fast) ease;
   }
 
   .chan-join {
     background: var(--accent);
     color: var(--on-accent);
     font-weight: 600;
-    transition: background-color var(--transition-fast) ease;
+    transition:
+      background-color var(--transition-fast) ease,
+      transform var(--transition-fast) ease;
   }
 
   .chan-join:hover:not(:disabled) { background: var(--accent-hover); }
 
+  /* Tinted rather than solid red: walking out of a room is reversible, so it
+     should read as the deliberate opposite of Join, not as a delete. Hover
+     commits to solid, which is where the click actually happens. */
+  .chan-leave {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
+    font-weight: 600;
+    transition:
+      background-color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease,
+      color var(--transition-fast) ease,
+      transform var(--transition-fast) ease;
+  }
+
+  .chan-leave:hover:not(:disabled) {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--on-danger);
+  }
+
+  .chan-door:active:not(:disabled) { transform: scale(0.94); }
+
+  /* Plain text, not a chip. Bordered and filled it competed with the action
+     button for the eye; the room's name should win that. */
   .chan-members {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    gap: 4px;
-    height: 18px;
-    padding: 0 7px;
-    border-radius: var(--radius-pill);
-    border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
-    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
-    color: var(--text-secondary);
+    gap: 3px;
+    flex-shrink: 0;
     font-size: 11px;
-    font-weight: 650;
+    color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
-    letter-spacing: 0.01em;
     line-height: 1;
   }
 
@@ -2449,8 +2895,11 @@
     width: 11px;
     height: 11px;
     flex-shrink: 0;
-    opacity: 0.9;
+    opacity: 0.85;
   }
+
+  .chan-row.moved .chan-name,
+  .chan-row.moved .chan-avatar { opacity: 0.55; }
 
   .chan-row:hover { background: var(--bg-hover); }
 
@@ -2458,9 +2907,11 @@
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
   }
 
+  /* Sized to a one-line row. At 34px it was set by a two-line card and now
+     towers over the single line of text it sits beside. */
   .chan-avatar {
-    width: 34px;
-    height: 34px;
+    width: 30px;
+    height: 30px;
     flex-shrink: 0;
     border-radius: 50%;
     background: hsl(var(--chan-hue, 210) 38% 42%);
@@ -2471,19 +2922,21 @@
     position: relative;
   }
 
-  .chan-avatar svg { width: 16px; height: 16px; }
+  .chan-avatar svg { width: 15px; height: 15px; }
   .chan-avatar.sm { width: 28px; height: 28px; }
   .chan-avatar.sm svg { width: 13px; height: 13px; }
   .chan-avatar.private {
     box-shadow: inset 0 0 0 1px color-mix(in srgb, #000 20%, transparent);
   }
 
+  /* The only thing on the row that says a room is private, now that the badge
+     under the name is gone. */
   .lock-dot {
     position: absolute;
     bottom: -1px;
     right: -1px;
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
     border-radius: 50%;
     background: var(--bg-secondary);
     color: var(--text-secondary);
@@ -2494,24 +2947,12 @@
 
   .lock-dot svg { width: 8px; height: 8px; }
 
-  .chan-identity {
+  /* The name is the only thing that gives way when the row is tight. The
+     count is two glyphs, and hiding it would make a busy room look empty. */
+  .chan-name {
     flex: 1;
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .chan-name {
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .chan-sub {
-    font-size: 11px;
-    color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2538,6 +2979,25 @@
   }
 
   .conversation-pane { background: var(--bg-primary); }
+
+  /* Walking into a room hands it the whole workspace: the list collapses to
+     nothing and the conversation takes its place. Without this the room lands
+     in a single frame while the columns are still sliding, which reads as a
+     flash rather than a move. Timed to the column transition so the two
+     settle together.
+
+     On the children, not the pane: the pane itself never unmounts, so an
+     animation there would only ever run once. Everything a room draws mounts
+     together, so the set arrives as one movement — and the same rule carries
+     the way back out, plus any banner or panel that turns up mid-session. */
+  @keyframes room-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .conversation-pane > * {
+    animation: room-in var(--transition-slow) ease both;
+  }
 
   .conv-header {
     display: flex;
@@ -2577,19 +3037,64 @@
     margin-left: auto;
   }
 
+  /* A status light, not a control. The tinted box made it read as a pressed
+     toggle sitting at the head of four real ones. */
   .enc-lock {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    width: 22px;
+    height: 30px;
     color: var(--accent);
     flex-shrink: 0;
   }
 
-  .enc-lock svg { width: 12px; height: 12px; }
+  .enc-lock svg { width: 13px; height: 13px; }
+
+  .conv-actions-sep {
+    width: 1px;
+    align-self: center;
+    height: 18px;
+    margin: 0 3px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+
+  .conv-action {
+    padding: 5px 12px;
+    font-size: 12px;
+    border-radius: var(--radius-pill);
+  }
+
+  /* Same treatment as Leave on the room card, so the two agree. Tinted at
+     rest because walking out is reversible; solid on hover, where the click
+     lands. */
+  .conv-leave {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
+    font-weight: 600;
+  }
+
+  .conv-leave:hover:not(:disabled) {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--on-danger);
+  }
+
+  .conv-delete {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--on-danger);
+    font-weight: 600;
+    align-self: flex-start;
+  }
+
+  .conv-delete:hover:not(:disabled) { background: var(--danger-hover); }
+
+  .danger-zone {
+    border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  }
 
   .back-btn { display: none; }
 
@@ -2802,6 +3307,18 @@
     gap: 8px;
     padding: 7px 14px;
     font-size: 12px;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .search-hit:hover,
+  .search-hit:focus-visible {
+    background: var(--bg-hover);
   }
 
   .search-hit + .search-hit {
@@ -2864,6 +3381,14 @@
   .members-count {
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .members-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px 16px;
   }
 
   .members-close { margin-left: auto; }
@@ -3080,7 +3605,7 @@
 
   @media (max-width: 1200px) {
     .workspace.members-open {
-      grid-template-columns: 240px minmax(0, 1fr);
+      grid-template-columns: 312px minmax(0, 1fr);
     }
 
     /* The members pane floats over the chat at this width, so a collapsed list
@@ -3145,7 +3670,8 @@
     .list-pane.hidden-when-chat { display: none; }
     .conversation-pane.hidden-when-list { display: none; }
 
-    .conv-actions .ghost { padding: 5px 8px; font-size: 12px; }
+    .conv-actions .ghost,
+    .conv-actions .conv-action { padding: 5px 9px; font-size: 12px; }
   }
 
   @media (max-width: 760px) {
