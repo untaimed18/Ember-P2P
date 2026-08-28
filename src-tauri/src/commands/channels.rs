@@ -3,6 +3,8 @@
 //! DHT publish/search is forwarded to the network task. Channel peers are
 //! never added to `friend_hashes`.
 
+use std::time::{Duration, Instant};
+
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tauri::Emitter;
@@ -26,8 +28,44 @@ use crate::storage::database::{StoredChannel, StoredChannelMember};
 /// Counted in characters, not bytes — a byte cap of this size would leave a
 /// CJK name six characters to work with.
 const MAX_CHANNEL_NAME_CHARS: usize = 20;
-/// Byte ceiling the published record imposes whatever the count above says.
-/// Twenty astral emoji satisfy the character cap and still overrun this.
+
+/// Rooms one device may own at once, counting every room it has created and
+/// not deleted.
+///
+/// Aimed at scripted name-grabbing rather than at people: a room reserves its
+/// name on Rendezvous, so hundreds of throwaway rooms squat hundreds of words
+/// and crowd Discover. Ten is well past what anyone runs by hand, and deleting
+/// a room gives the slot straight back. Joining rooms is not capped — that
+/// costs the namespace nothing, and the gossip layer already tapers off past a
+/// handful (`CHANNEL_RENDEZVOUS_MAX_CHANNELS`).
+///
+/// A local count, so a patched build can ignore it. That is the right split:
+/// this stops the accident and the casual script, and the per-IP ceiling on
+/// name claims at Rendezvous is what answers a determined one.
+const MAX_OWNED_CHANNELS: i64 = 10;
+
+/// Slow-mode delays an owner may choose, in seconds. 0 is off.
+///
+/// A closed set rather than a free number so every member reads the same
+/// wait off the same record, and so the UI cannot offer something the
+/// backend would clamp to a different value behind the user's back.
+pub(crate) const SLOW_MODE_CHOICES: [u16; 6] = [0, 5, 10, 30, 60, 300];
+
+/// Messages this device will originate into one room per minute.
+///
+/// Sits above [`channel::CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC`], which bounds a
+/// burst, and below any rate a person sustains: twenty a minute is a fast
+/// conversation, and a hundred is a script. Per room, because being talkative
+/// in two rooms is not spam in either.
+///
+/// Deliberately enforced when *sending* rather than when receiving. A receiver
+/// that dropped what it judged excessive would leave members holding different
+/// halves of the same conversation with no way to tell; refusing our own send
+/// tells the one person who can do something about it.
+const LOCAL_SEND_PER_MINUTE: usize = 20;
+
+/// Byte ceiling the published record imposes whatever the character count
+/// says. Twenty astral emoji satisfy the character cap and still overrun this.
 const MAX_CHANNEL_NAME: usize = 64;
 const MAX_CHANNEL_MESSAGE: usize = 4096;
 const DEFAULT_FIND_TIMEOUT_MS: u64 = 30_000;
@@ -83,6 +121,8 @@ pub struct ChannelInfo {
     pub deleted: bool,
     /// Only the owner may hand out invites for this room.
     pub invites_owner_only: bool,
+    /// Seconds a member must wait between messages; 0 when slow mode is off.
+    pub slow_mode_secs: i64,
 }
 
 impl ChannelInfo {
@@ -114,6 +154,7 @@ impl ChannelInfo {
             in_room: row.in_room,
             deleted: row.deleted,
             invites_owner_only: row.invites_owner_only,
+            slow_mode_secs: row.slow_mode_secs,
         }
     }
 
@@ -524,6 +565,19 @@ pub async fn create_channel(
         ));
     }
     let name = sanitize_channel_name(&name)?;
+    // Counted before the name is claimed, so a refusal costs the namespace
+    // nothing and the user is not told a room exists that does not.
+    let db_count = state.db.clone();
+    let owned_now = tokio::task::spawn_blocking(move || db_count.count_owned_channels())
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_create_failed", "Failed to create channel", e))?;
+    if owned_now >= MAX_OWNED_CHANNELS {
+        return Err(coded(
+            "channels_owned_limit",
+            "You already own the most rooms one device can hold. Delete a room to make space.",
+        ));
+    }
     let username = require_channel_username(&state).await?;
     let username = reassert_channel_username(&state, &username).await?;
     let ident = ChannelIdentity::generate();
@@ -681,6 +735,8 @@ pub async fn create_channel(
             Some(0),
             // A new room starts open; the owner can close it afterwards.
             Some(false),
+            // And unthrottled, for the same reason.
+            None,
         )
     })
     .await
@@ -1430,7 +1486,47 @@ pub async fn send_channel_message(
             "New messages are locked until this device has the current room key",
         ));
     }
+    // The room's own rule, set by its owner and carried on the signed
+    // moderation record. Whoever runs the room is exempt: they are the ones
+    // answering questions and posting the notice that made it necessary.
+    let slow_secs = row.slow_mode_secs.clamp(0, u16::MAX as i64);
+    if slow_secs > 0 && !row.is_owner && !you_are_moderator(&state, &row.channel_id).await {
+        let db_last = state.db.clone();
+        let id_last = channel_id.clone();
+        let last_sent =
+            tokio::task::spawn_blocking(move || db_last.last_sent_channel_message_at(&id_last))
+                .await
+                .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+                .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
+        // Floored at zero so a clock that jumped backwards since the last send
+        // cannot report a wait longer than the room's own setting.
+        let waited = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(last_sent)
+            .max(0);
+        if last_sent > 0 && waited < slow_secs {
+            // The remaining wait rather than the room's setting, carried as
+            // context so the translated framing can interpolate it: what the
+            // sender needs is how long until they can post, and a bare "30
+            // seconds" one second after a send reads as a full reset.
+            let remaining = slow_secs - waited;
+            return Err(coded_ctx(
+                "channels_slow_mode",
+                format!("Slow mode is on in this room. Try again in {remaining}s."),
+                remaining,
+            ));
+        }
+    }
+    // Our own ceiling, which no room turns off. Checked last so a message
+    // refused for any reason above does not spend budget.
+    if !local_send_allowed(&channel_id) {
+        return Err(coded(
+            "channels_send_too_fast",
+            "You are sending faster than this room accepts. Wait a moment and try again.",
+        ));
+    }
     let join_secret = join_secret_for_channel(&state, &row).await.ok_or_else(|| {
+        refund_local_send(&channel_id);
         coded(
             "channels_send_failed",
             "This device has no key for this channel",
@@ -1464,7 +1560,10 @@ pub async fn send_channel_message(
         .try_send(NetworkCommand::FanoutChannelGossip {
             body: gossip.encode(),
         })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+        .map_err(|e| {
+            refund_local_send(&channel_id);
+            coded_ctx("network_busy", "Network busy", e)
+        })?;
 
     let db = state.db.clone();
     let id = channel_id.clone();
@@ -1485,8 +1584,18 @@ pub async fn send_channel_message(
         )
     })
     .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_send_failed", "Failed to send", e))?;
+    .map_err(|e| {
+        refund_local_send(&channel_id);
+        coded_ctx("channels_task_error", "Task error", e)
+    })?
+    .map_err(|e| {
+        // The line is already on the mesh, so this is not a refund for work not
+        // done — it is for the retry the user is about to make, having been
+        // told the send failed. Charging them twice for one message is the
+        // wrong end of an error they did not cause.
+        refund_local_send(&channel_id);
+        coded_ctx("channels_send_failed", "Failed to send", e)
+    })?;
 
     Ok(ChannelMessageInfo {
         id: row_id,
@@ -1585,6 +1694,54 @@ async fn load_owned_channel(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
+///
+/// Session-scoped on purpose. A restart is not a loophole that matters here:
+/// the point is to stop a runaway loop or a wall of pasted lines, and both
+/// happen inside one session. Slow mode reads its last-send time from the
+/// database instead, because that one is a rule the room agreed to and has to
+/// survive a relaunch.
+type SendTimes = std::collections::HashMap<String, std::collections::VecDeque<Instant>>;
+static LOCAL_SEND_TIMES: std::sync::OnceLock<std::sync::Mutex<SendTimes>> =
+    std::sync::OnceLock::new();
+
+/// Whether this room has room left in its per-minute budget. Records the send
+/// when it does.
+fn local_send_allowed(channel_id: &str) -> bool {
+    let cell = LOCAL_SEND_TIMES.get_or_init(|| std::sync::Mutex::new(SendTimes::new()));
+    // A poisoned lock means an earlier caller panicked mid-update. The window
+    // is a throttle, not a ledger, so recovering and carrying on is better than
+    // making every later send panic too.
+    let mut map = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let window = Duration::from_secs(60);
+    // Rooms nobody has spoken in for a minute keep no state, so this holds the
+    // few being talked in rather than every room ever opened.
+    map.retain(|_, times| {
+        times
+            .back()
+            .is_some_and(|t| now.saturating_duration_since(*t) <= window)
+    });
+    let times = map.entry(channel_id.to_string()).or_default();
+    channel::rate_window_allow(times, now, window, LOCAL_SEND_PER_MINUTE)
+}
+
+/// Hand back the slot a send took when the send did not happen.
+///
+/// The budget exists to bound what we put on the mesh, so a message that never
+/// reached it should not count against the next one. Without this a run of
+/// failures — a busy network queue, a write error — spends the whole minute's
+/// allowance and then locks the user out of a room they have said nothing in.
+fn refund_local_send(channel_id: &str) {
+    let Some(cell) = LOCAL_SEND_TIMES.get() else {
+        return;
+    };
+    let mut map = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(times) = map.get_mut(channel_id) {
+        times.pop_back();
+    }
+}
+
 fn moderation_lock() -> &'static tokio::sync::Mutex<()> {
     MODERATION_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -1633,6 +1790,13 @@ async fn commit_channel_moderation(
         // whole replacement, so an absent field would read as "no opinion" and
         // let members go on inviting after the owner turned it off.
         invites_owner_only: Some(owned.row.invites_owner_only),
+        // Absent rather than zero when off, so a room that never uses slow mode
+        // publishes a tail byte-identical to the one builds without the field
+        // expect. See `ModerationTail::slow_mode_secs`.
+        slow_mode_secs: match owned.row.slow_mode_secs.clamp(0, u16::MAX as i64) as u16 {
+            0 => None,
+            secs => Some(secs),
+        },
     };
     let record = SignedRecord::channel_moderation(
         topic,
@@ -1676,6 +1840,7 @@ async fn commit_channel_moderation(
     let tail_days = tail.claim_after_days;
     let tail_epoch = tail.key_epoch;
     let tail_owner_only = tail.invites_owner_only;
+    let tail_slow_mode = tail.slow_mode_secs;
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
     let topic_s = topic.to_string();
@@ -1695,6 +1860,7 @@ async fn commit_channel_moderation(
             tail_days,
             tail_epoch,
             tail_owner_only,
+            tail_slow_mode,
         )
     })
     .await
@@ -1800,6 +1966,20 @@ async fn load_joined_channel(
         ));
     }
     Ok(row)
+}
+
+/// Whether this device holds moderator rights in a room. Used to exempt the
+/// people running it from slow mode; a lookup failure reads as "not one", so
+/// the limit applies rather than being skipped on an error.
+async fn you_are_moderator(state: &AppState, channel_id: &str) -> bool {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let our_pk = hex::encode(state.identity.ed25519_public_key);
+    tokio::task::spawn_blocking(move || db.channel_member_is_moderator(&id, &our_pk))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(false)
 }
 
 /// Whether *we* are barred from taking part in this room.
@@ -2140,6 +2320,63 @@ pub async fn set_channel_invite_policy(
                 e,
             )
         })?;
+    // Re-read so the snapshot below carries the value just written rather than
+    // the one this command was handed.
+    let owned = OwnedChannel {
+        row: load_owned_channel(&state, &channel_id).await?.row,
+        ..owned
+    };
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    commit_channel_moderation(
+        &state,
+        &owned,
+        &owned.row.topic,
+        &owned.row.welcome,
+        &bans,
+        &mods,
+    )
+    .await?;
+    channel_info_from_id(&state, &channel_id).await
+}
+
+/// Owner-set: how long a member must wait between messages in this room.
+///
+/// Opt-in and visible to everyone, which is the point. An automatic throttle
+/// has to guess, and it guesses worst about the person who just joined and is
+/// answering a question; a human turning this on has already decided the room
+/// needs it. Rides the owner-signed moderation snapshot, so members learn it
+/// the same way they learn bans, and like the invite policy it is enforced by
+/// each client declining to send — a guard against a flood of ordinary clients
+/// rather than against a patched one.
+#[tauri::command]
+pub async fn set_channel_slow_mode(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    secs: u16,
+) -> Result<ChannelInfo, String> {
+    require_ember(&state).await?;
+    if state.db.chat_locked() {
+        return Err(coded(
+            "channels_chat_locked",
+            "Chat history is locked; restore the key file to edit this channel",
+        ));
+    }
+    if !SLOW_MODE_CHOICES.contains(&secs) {
+        return Err(coded(
+            "channels_slow_mode_invalid",
+            "That is not one of the slow-mode delays this room can publish",
+        ));
+    }
+    let channel_id = parse_channel_id(&channel_id)?;
+    let _snapshot = moderation_lock().lock().await;
+    let owned = load_owned_channel(&state, &channel_id).await?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    tokio::task::spawn_blocking(move || db.set_channel_slow_mode(&id, secs))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not save slow mode", e))?;
     // Re-read so the snapshot below carries the value just written rather than
     // the one this command was handed.
     let owned = OwnedChannel {

@@ -6359,6 +6359,7 @@ mod tests {
                 Some(14),
                 None,
                 None,
+                None,
             )
             .unwrap();
         };
@@ -12385,6 +12386,12 @@ struct NetworkState {
     /// cannot flood a room by spreading the load across many hops.
     channel_gossip_author_times:
         HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
+    /// Inbound catch-up requests keyed by (room, signed requester), on their
+    /// own far tighter budget than chat: answering one costs us up to
+    /// `CHANNEL_HISTORY_SYNC_MAX` sealed unicasts, so it is the one frame where
+    /// the asker spends less than we do.
+    channel_history_sync_times:
+        HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
     /// Last history-sync request per (channel_id, neighbor pubkey).
     channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
     /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
@@ -12628,6 +12635,19 @@ fn channel_author_gossip_ok(
 ) -> bool {
     ember::channel::author_gossip_allow(
         &mut state.channel_gossip_author_times,
+        channel_id,
+        author,
+        std::time::Instant::now(),
+    )
+}
+
+fn channel_history_sync_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+) -> bool {
+    ember::channel::history_sync_allow(
+        &mut state.channel_history_sync_times,
         channel_id,
         author,
         std::time::Instant::now(),
@@ -13117,6 +13137,7 @@ fn ingest_channel_moderation_records(
         moderation.tail.claim_after_days,
         moderation.tail.key_epoch,
         moderation.tail.invites_owner_only,
+        moderation.tail.slow_mode_secs,
     )
     .unwrap_or(false)
 }
@@ -13213,6 +13234,15 @@ async fn maybe_publish_owned_channel_records(
                 ),
                 claim_after_days: Some(ch.claim_after_days.clamp(0, u16::MAX as i64) as u16),
                 invites_owner_only: Some(ch.invites_owner_only),
+                // Carried on every republish, not just the edit that set it:
+                // this record is a whole snapshot, so omitting it here would
+                // turn slow mode off across the room a few hours after the
+                // owner switched it on. Absent when off, so a room that never
+                // uses it keeps publishing a tail older builds can read.
+                slow_mode_secs: match ch.slow_mode_secs.clamp(0, u16::MAX as i64) as u16 {
+                    0 => None,
+                    secs => Some(secs),
+                },
             },
             channel_id,
             ident.pubkey,
@@ -14875,6 +14905,19 @@ async fn handle_inbound_channel_gossip(
             .channel_member_is_banned(&channel_id_hex, &sender_hex)
             .unwrap_or(false)
         {
+            return;
+        }
+        // Its own budget, and the tightest one here. Every other branch costs
+        // the sender roughly what it costs us; this one answers a single small
+        // request with up to `CHANNEL_HISTORY_SYNC_MAX` separately sealed
+        // unicasts, so without a ceiling any content-key holder — which in a
+        // public room is anyone, the key comes from the room's own pubkey —
+        // turns each packet they send into thirty-two that we send.
+        if !channel_history_sync_ok(state, gossip.channel_id, &sender_pk) {
+            // Refused for rate, not validity, so the dedup slot goes back and a
+            // genuine retry once the window rolls off is still admissible.
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: rate-limited history sync in {channel_id_hex}");
             return;
         }
         reply_channel_history_sync(
@@ -21470,6 +21513,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_proxy_overlay: HashMap::new(),
         channel_gossip_seen: HashMap::new(),
         channel_gossip_seen_order: VecDeque::new(),
+        channel_history_sync_times: HashMap::new(),
         channel_gossip_sent_times: VecDeque::new(),
         channel_gossip_local_times: VecDeque::new(),
         channel_origin_retry: VecDeque::new(),
@@ -39872,6 +39916,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // refused rather than waved through.
                     ember::channel::prune_author_gossip(
                         &mut state.channel_gossip_author_times,
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(60),
+                    );
+                    // Same reclaim for the catch-up budget: its entries only
+                    // mean anything for a minute, and holding them past that
+                    // fills the map with requesters who asked once and left.
+                    ember::channel::prune_author_gossip(
+                        &mut state.channel_history_sync_times,
                         std::time::Instant::now(),
                         std::time::Duration::from_secs(60),
                     );

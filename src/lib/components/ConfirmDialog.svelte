@@ -43,6 +43,7 @@
   } = $props();
 
   let confirmBtn: HTMLButtonElement | undefined = $state(undefined);
+  let cancelBtn: HTMLButtonElement | undefined = $state(undefined);
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
   // Element focused before the dialog opened, restored on close so keyboard
@@ -120,10 +121,12 @@
   $effect(() => {
     if (open) {
       actionTaken = false;
+      const preferCancel = danger && !alert;
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
-        confirmBtn?.focus();
+        if (preferCancel) cancelBtn?.focus();
+        else confirmBtn?.focus();
       });
     }
     return () => {
@@ -175,7 +178,7 @@
       </p>
       <div class="dialog-actions">
         {#if !alert}
-          <button class="ghost" onclick={handleCancel} disabled={actionTaken}>{cancelLabel}</button>
+          <button bind:this={cancelBtn} class="ghost" onclick={handleCancel} disabled={actionTaken}>{cancelLabel}</button>
         {/if}
         <button bind:this={confirmBtn} class={danger ? 'danger' : ''} onclick={handleConfirm} disabled={actionTaken}>{confirmLabel}</button>
       </div>

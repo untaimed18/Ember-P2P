@@ -552,6 +552,38 @@ tr:hover td {
 }
 
 /*
+ * Preview chip for features that are live but still settling. Rose rather
+ * than accent-blue so it does not compete with unread counts, and not
+ * warning-orange so it does not read as a problem. Same height as the
+ * sidebar count pills so a row with both stays on one baseline.
+ */
+.beta-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: var(--radius-pill);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1;
+  color: var(--ember-color);
+  background: color-mix(in srgb, var(--ember-color) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ember-color) 28%, transparent);
+  flex-shrink: 0;
+  white-space: nowrap;
+  user-select: none;
+}
+
+:lang(zh-CN) .beta-badge,
+:lang(zh-TW) .beta-badge {
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+/*
  * Badge glyph: a small leading sigil (check, warning triangle, dot)
  * paired with the badge color so state is legible without relying on
  * hue alone — satisfies WCAG "use of color" for colorblind users.

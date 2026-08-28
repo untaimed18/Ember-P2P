@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
+  import { getChatMessages, sendChatMessage, markMessagesRead, isChatLocked, type ChatMessage } from '$lib/api/friends';
   import {
     deleteChannelMessage,
     getChannelMessages,
@@ -83,6 +83,23 @@
   // drops inbound and refuses outbound chat, so reflect that in the UI rather
   // than letting the user type into a textarea whose sends will be rejected.
   let chatDisabled = $derived(!isChannel && $appSettings?.friend_chat_disabled === true);
+  let chatLocked = $state(false);
+
+  $effect(() => {
+    let cancelled = false;
+    untrack(() => {
+      isChatLocked()
+        .then((locked) => {
+          if (!cancelled) chatLocked = locked;
+        })
+        .catch(() => {
+          if (!cancelled) chatLocked = false;
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   /**
    * Hard cap on in-memory chat messages per conversation. Old messages beyond
@@ -600,7 +617,7 @@
 
   async function handleSend() {
     const text = inputText.trim();
-    if (!text || sending || youAreBanned || youAreKeyBehind) return;
+    if (!text || sending || youAreBanned || youAreKeyBehind || chatDisabled || chatLocked) return;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
     // can be under 4096 chars yet over 4096 bytes and be rejected server-side
@@ -866,7 +883,7 @@
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0}
-      <div class="conv-empty">{chatDisabled ? m.chat_empty_disabled() : isChannel ? m.channels_empty_chat() : m.chat_say_hello()}</div>
+      <div class="conv-empty">{chatLocked ? m.friends_chat_locked_title() : chatDisabled ? m.chat_empty_disabled() : isChannel ? m.channels_empty_chat() : m.chat_say_hello()}</div>
     {:else}
       {#if hasMoreHistory}
         <div class="conv-load-older">
@@ -955,6 +972,8 @@
     <div class="conv-disabled" role="status">{m.channels_you_are_banned()}</div>
   {:else if youAreKeyBehind}
     <div class="conv-disabled" role="status">{m.channels_key_behind()}</div>
+  {:else if chatLocked}
+    <div class="conv-disabled" role="status">{m.chat_locked_notice()}</div>
   {:else if chatDisabled}
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}

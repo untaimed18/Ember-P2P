@@ -18,7 +18,7 @@
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
-  import { hiddenChannels, ignoredMembers, mutedChannels } from '$lib/stores/channels';
+  import { hiddenChannels, ignoredMembers, mutedChannels, toggleMemberIgnore } from '$lib/stores/channels';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import { notifySpamFilterReset } from '$lib/stores/search';
@@ -45,7 +45,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatSize } from '$lib/utils';
+  import { formatSize, shortPubkey } from '$lib/utils';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
@@ -1118,6 +1118,7 @@
   // delete, IP-filter range remove, etc.) — same focus trap, same dark
   // theme, same Escape-to-cancel.
   let spamResetConfirmOpen = $state(false);
+  let ignoredClearConfirmOpen = $state(false);
 
   function handleResetSpamData() {
     spamResetConfirmOpen = true;
@@ -1565,7 +1566,7 @@
     <button class="ghost" onclick={resetChanges} disabled={!hasUnsavedChanges || !settings}>
       {m.settings_discard()}
     </button>
-    <button class="save-btn" onclick={handleSave} disabled={saving || !settings}>
+    <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges}>
       {#if saving}
         <span class="spinner"></span> {m.settings_saving()}
       {:else}
@@ -2612,20 +2613,38 @@
             </div>
           </div>
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_channels_ignored_members()}</span>
-              <span class="hint">{m.settings_channels_ignored_members_hint()}</span>
+          <div class="field ignored-field">
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_channels_ignored_members()}</span>
+                <span class="hint">{m.settings_channels_ignored_members_hint()}</span>
+              </div>
+              <div class="channels-pref-action">
+                <span class="channels-pref-count">{$ignoredMembers.length}</span>
+                <button
+                  type="button"
+                  class="ghost"
+                  disabled={$ignoredMembers.length === 0}
+                  onclick={() => { ignoredClearConfirmOpen = true; }}
+                >{m.settings_channels_clear()}</button>
+              </div>
             </div>
-            <div class="channels-pref-action">
-              <span class="channels-pref-count">{$ignoredMembers.length}</span>
-              <button
-                type="button"
-                class="ghost"
-                disabled={$ignoredMembers.length === 0}
-                onclick={() => { ignoredMembers.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
-              >{m.settings_channels_clear()}</button>
-            </div>
+            {#if $ignoredMembers.length > 0}
+              <ul class="ignored-list">
+                {#each $ignoredMembers as entry (entry.pubkey)}
+                  <li>
+                    <span class="ignored-name">
+                      <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
+                    </span>
+                    <button
+                      type="button"
+                      class="ghost"
+                      onclick={() => toggleMemberIgnore(entry.pubkey)}
+                    >{m.channels_unignore()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </div>
 
           <div class="field toggle-row">
@@ -3030,6 +3049,15 @@
   confirmLabel={m.settings_spam_reset_confirm()}
   danger={true}
   onconfirm={confirmResetSpamData}
+/>
+
+<ConfirmDialog
+  bind:open={ignoredClearConfirmOpen}
+  title={m.settings_channels_clear_ignored_title()}
+  message={m.settings_channels_clear_ignored_message()}
+  confirmLabel={m.settings_channels_clear()}
+  danger={true}
+  onconfirm={() => { ignoredMembers.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
 />
 
 <ConfirmDialog
@@ -3624,6 +3652,34 @@
     color: var(--text-secondary);
     min-width: 1.5ch;
     text-align: right;
+  }
+
+  .ignored-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .ignored-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+
+  .ignored-name {
+    font-size: 13px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .about-actions {

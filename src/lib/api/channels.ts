@@ -33,7 +33,14 @@ export interface ChannelInfo {
   /** Only the owner may hand out invites. A guard against a careless re-share,
    *  not against a member who patches their client — they hold the key too. */
   invites_owner_only: boolean;
+  /** Seconds a member must wait between messages; 0 when slow mode is off. */
+  slow_mode_secs: number;
 }
+
+/** Slow-mode delays an owner can pick, mirroring `SLOW_MODE_CHOICES` in
+ *  `src-tauri/src/commands/channels.rs`. The backend refuses anything else, so
+ *  the two lists have to agree. */
+export const SLOW_MODE_CHOICES = [0, 5, 10, 30, 60, 300] as const;
 
 export interface ChannelMemberInfo {
   member_pubkey: string;
@@ -242,6 +249,15 @@ export async function setChannelInvitePolicy(
   ownerOnly: boolean,
 ): Promise<ChannelInfo> {
   return invoke('set_channel_invite_policy', { channelId, ownerOnly });
+}
+
+/** Owner only. Seconds a member must wait between messages, 0 to turn it off.
+ *  Rides the same signed snapshot as the invite policy above. */
+export async function setChannelSlowMode(
+  channelId: string,
+  secs: number,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_slow_mode', { channelId, secs });
 }
 
 /** `ember2:<hash>:<pubkey>` for a room member, ready to hand to `addFriend`.

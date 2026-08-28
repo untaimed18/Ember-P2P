@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 38;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 39;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -117,6 +117,9 @@ pub struct StoredChannel {
     /// The owner has asked that only they hand out invites. Carried on their
     /// signed moderation record; false for rooms whose owner never set it.
     pub invites_owner_only: bool,
+    /// Seconds a member must wait between messages, 0 when the owner has not
+    /// turned slow mode on. Carried on the signed moderation record.
+    pub slow_mode_secs: i64,
 }
 
 impl StoredChannel {
@@ -1769,6 +1772,21 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 38)?;
+            tx.commit()?;
+        }
+
+        if version < 39 {
+            // Owner slow mode. Zero is off, which is how every room behaved
+            // before the field existed, so an upgraded database throttles
+            // nobody until an owner asks for it.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "slow_mode_secs",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 39)?;
             tx.commit()?;
         }
 
@@ -3955,7 +3973,7 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted, c.invites_owner_only
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC"
         );
@@ -3977,7 +3995,7 @@ impl Database {
                     c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                     c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                     c.moderation_updated_at, c.moderation_checked_at,
-                    c.in_room, c.deleted, c.invites_owner_only
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
              FROM channels c
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
@@ -4089,7 +4107,7 @@ impl Database {
                         c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
                         c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
                         c.moderation_updated_at, c.moderation_checked_at,
-                        c.in_room, c.deleted, c.invites_owner_only
+                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
                  FROM channels c WHERE c.channel_id = ?1"
                 ),
                 params![channel_id],
@@ -4124,6 +4142,7 @@ impl Database {
             in_room: row.get::<_, i64>(20).unwrap_or(1) != 0,
             deleted: row.get::<_, i64>(21).unwrap_or(0) != 0,
             invites_owner_only: row.get::<_, i64>(22).unwrap_or(0) != 0,
+            slow_mode_secs: row.get::<_, i64>(23).unwrap_or(0),
         })
     }
 
@@ -4815,9 +4834,17 @@ impl Database {
         )?;
         // Presence ingest and private-room chat can still grow the table.
         // Banned rows stay: a ban has to survive eviction or it can be
-        // laundered by flooding new identities. Past the cap we only drop
-        // stale non-banned rows, never the local user, and never a still-
-        // fresh honest peer — a flood of newcomers is refused instead.
+        // laundered by flooding new identities. Moderator rows stay for the
+        // same reason and were the hole in it: the owner's snapshot writes them
+        // with `last_seen = 0`, which is not a stale peer but a row that has
+        // never carried a presence time, and sorting by `last_seen ASC` put
+        // them first in the queue. A flood could evict the people holding the
+        // mop, and this device would stop honouring their ban gossip until the
+        // next snapshot arrived. Both lists are bounded by the record that
+        // carries them, so exempting them cannot stop eviction from working.
+        // Past the cap we only drop stale rows that are neither, never the
+        // local user, and never a still-fresh honest peer — a flood of
+        // newcomers is refused instead.
         let live: i64 = tx.query_row(
             "SELECT COUNT(*) FROM channel_members
              WHERE channel_id = ?1 AND banned = 0",
@@ -4830,7 +4857,7 @@ impl Database {
             tx.execute(
                 "DELETE FROM channel_members WHERE rowid IN (
                     SELECT rowid FROM channel_members
-                     WHERE channel_id = ?1 AND banned = 0
+                     WHERE channel_id = ?1 AND banned = 0 AND moderator = 0
                        AND member_pubkey != ?2
                        AND (?3 IS NULL OR member_pubkey != ?3)
                        AND last_seen < ?4
@@ -5065,6 +5092,7 @@ impl Database {
         claim_after_days: Option<u16>,
         key_epoch: Option<u64>,
         invites_owner_only: Option<bool>,
+        slow_mode_secs: Option<u16>,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let current: i64 = conn
@@ -5180,8 +5208,54 @@ impl Database {
                 params![channel_id, i64::from(owner_only)],
             )?;
         }
+        // Unlike the fields above, absent here means off rather than "the
+        // record does not say". The writer leaves it out when there is no
+        // limit, so treating absence as unknown would leave a room throttled
+        // after its owner turned slow mode back off.
+        tx.execute(
+            "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1",
+            params![channel_id, i64::from(slow_mode_secs.unwrap_or(0))],
+        )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Owner-set: seconds a member must wait between messages, 0 to turn the
+    /// limit off.
+    pub fn set_channel_slow_mode(&self, channel_id: &str, secs: u16) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1 AND is_owner = 1",
+            params![channel_id, i64::from(secs)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Rooms this device owns and has not deleted, which is what the creation
+    /// cap counts. Leaving a room you own does not give the slot back: the name
+    /// is still claimed and the room is still yours to delete.
+    pub fn count_owned_channels(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channels WHERE is_owner = 1 AND deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Timestamp of the newest message we sent to this room, or 0 if we never
+    /// have. Read on the send path to apply the room's slow mode across
+    /// restarts, which an in-memory timer would forget.
+    pub fn last_sent_channel_message_at(&self, channel_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let ts: Option<i64> = conn.query_row(
+            "SELECT MAX(timestamp) FROM channel_messages
+             WHERE channel_id = ?1 AND direction = 'sent'",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts.unwrap_or(0))
     }
 
     /// Owner-set: may members other than the owner mint invites?
@@ -6552,7 +6626,7 @@ mod tests {
         let banned = [0x33u8; 32];
         let banned_hex = hex::encode(banned);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None, None, None, None, None, None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
@@ -6562,12 +6636,12 @@ mod tests {
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
         assert!(!db
-            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None, None, None, None, None, None)
             .unwrap());
         let ch = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(ch.topic, "topic");
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None, None, None, None, None, None)
             .unwrap());
         assert!(!db
             .channel_member_is_banned(&channel_id, &banned_hex)
@@ -6576,7 +6650,7 @@ mod tests {
         let moderator = [0x44u8; 32];
         let mod_hex = hex::encode(moderator);
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None, None, None, None, None, None)
             .unwrap());
         assert!(db
             .channel_member_is_moderator(&channel_id, &mod_hex)
@@ -6596,7 +6670,7 @@ mod tests {
             .channel_member_is_banned(&channel_id, &banned_hex)
             .unwrap());
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None, None, None, None, None, None)
             .unwrap());
         assert!(
             db.channel_member_is_banned(&channel_id, &banned_hex)
@@ -6962,7 +7036,9 @@ mod tests {
             "a room the directory was wrong about must be re-enterable"
         );
 
-        let owned_id = "ab".repeat(16);
+        // A room of its own, not the tombstoned one above: reusing that id made
+        // this a duplicate insert, so the owner case below was never reached.
+        let owned_id = "99".repeat(16);
         db.insert_channel(&owned_id, &"34".repeat(32), "Mine", "public", true, None, None)
             .expect("insert owned");
         let owned_walk = db
@@ -7041,6 +7117,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap());
         assert!(
@@ -7071,6 +7148,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap());
         assert!(
@@ -7081,7 +7159,7 @@ mod tests {
 
         // A later record that predates the field must not erase what we know.
         assert!(db
-            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None, None, None, None, None, None)
             .unwrap());
         assert_eq!(
             db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
@@ -7374,6 +7452,7 @@ mod tests {
                 Some(30),
                 Some(4),
                 None,
+                None,
             )
             .unwrap());
         let row = db.get_channel(&channel_id).unwrap().unwrap();
@@ -7387,6 +7466,7 @@ mod tests {
         assert!(db
             .apply_channel_moderation(
                 &channel_id, "Topic 2", "Welcome", 2_000, &[], &[], None, None, None, None, None,
+                None,
             )
             .unwrap());
         let row = db.get_channel(&channel_id).unwrap().unwrap();
@@ -7407,6 +7487,7 @@ mod tests {
                 None,
                 None,
                 Some(2),
+                None,
                 None,
             )
             .unwrap());
@@ -7438,6 +7519,7 @@ mod tests {
                 Some(21),
                 None,
                 None,
+                None,
             )
             .unwrap());
         assert_eq!(
@@ -7455,6 +7537,7 @@ mod tests {
                 Some(&owner),
                 Some(&[0u8; 32]),
                 Some(0),
+                None,
                 None,
                 None,
             )
@@ -7616,7 +7699,7 @@ mod tests {
         db.upsert_channel_member(&channel_id, &other_hex, "Them", 100, None)
             .unwrap();
         assert!(db
-            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None, None, None)
             .unwrap());
 
         assert!(db.delete_channel(&channel_id, Some(&us_hex)).unwrap());
@@ -7651,7 +7734,7 @@ mod tests {
 
         // The owner lifting it still does, on the next moderation snapshot.
         assert!(db
-            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None, None, None, None, None)
+            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None, None, None, None, None, None)
             .unwrap());
         assert!(!db.channel_member_is_banned(&channel_id, &us_hex).unwrap());
 

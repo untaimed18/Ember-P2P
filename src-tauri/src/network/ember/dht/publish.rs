@@ -87,8 +87,15 @@ pub const CHANNEL_BAN_LIST_MAX: usize = 12;
 pub const CHANNEL_MOD_LIST_MAX: usize = 6;
 
 /// Largest [`ModerationTail::encode`] output: `owner_pubkey(32) +
-/// key_epoch(8) + successor_nominee(32) + claim_after_days(2)`.
-const MODERATION_TAIL_MAX_LEN: usize = 32 + 8 + 32 + 2;
+/// key_epoch(8) + successor_nominee(32) + claim_after_days(2) +
+/// invites_owner_only(1) + slow_mode_secs(2)`.
+///
+/// Every field the encoder can write has to be counted here. This budget is
+/// what [`moderation_snapshot_fits`] reserves, so a field left out of the sum
+/// lets a snapshot sitting on the boundary pass the check and then publish a
+/// record the network refuses — losing the whole governance snapshot, not just
+/// the new field.
+const MODERATION_TAIL_MAX_LEN: usize = 32 + 8 + 32 + 2 + 1 + 2;
 
 /// Fixed cost of a moderation `extra` blob: the three length prefixes plus a
 /// fully-populated tail.
@@ -1428,6 +1435,23 @@ pub struct ModerationTail {
     /// so a patched client could still mint. Absent means the room predates
     /// the field, which reads as "anyone", the behaviour it had then.
     pub invites_owner_only: Option<bool>,
+    /// Seconds a member must wait between messages, or absent for no limit.
+    ///
+    /// Owner-set and opt-in, which is the whole point: an automatic throttle
+    /// misfires on the newcomer saying hello, where a human turning this on has
+    /// already decided the room needs it. Enforced by each sender declining to
+    /// publish, so like [`Self::invites_owner_only`] it is a guardrail against
+    /// a flood of ordinary clients rather than against a patched one.
+    ///
+    /// Unlike the two fields above this one is left absent when off rather than
+    /// written as zero, and that is deliberate. Absent and zero mean the same
+    /// thing here — there is no withdrawal to distinguish, because going back
+    /// to "no limit" *is* the absent state — and builds that predate the field
+    /// refuse a tail with bytes they cannot place. Writing it unconditionally
+    /// would push every room's snapshot past what those builds accept and cost
+    /// them the whole record. This way the wire is byte-identical for every
+    /// room that never turns it on.
+    pub slow_mode_secs: Option<u16>,
 }
 
 impl ModerationTail {
@@ -1454,6 +1478,10 @@ impl ModerationTail {
             return;
         };
         out.push(u8::from(owner_only));
+        let Some(slow) = self.slow_mode_secs else {
+            return;
+        };
+        out.extend_from_slice(&slow.to_le_bytes());
     }
 
     fn decode(mut rest: &[u8]) -> Option<Self> {
@@ -1497,10 +1525,23 @@ impl ModerationTail {
         if rest.is_empty() {
             return Some(tail);
         }
-        if rest.len() != 1 {
+        tail.invites_owner_only = Some(rest[0] != 0);
+        rest = &rest[1..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 2 {
             return None;
         }
-        tail.invites_owner_only = Some(rest[0] != 0);
+        tail.slow_mode_secs = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        // Anything past the last field this build knows is a newer one's
+        // addition, and is ignored rather than refused. A moderation record is
+        // a whole governance snapshot, so rejecting it over an unreadable
+        // trailing field would drop the topic, both lists, and the owner key
+        // that lets members refuse a moderator's ban aimed at the owner — a far
+        // worse outcome than not knowing one new fact. A *partial* known field
+        // above is still malformed, because that one would be misread rather
+        // than skipped.
         Some(tail)
     }
 }
@@ -1523,13 +1564,18 @@ mod moderation_budget_tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    /// The worst case the byte budget has to cover, so **every** field is
+    /// present. Leaving one out silently shrinks what these tests measure:
+    /// this fixture stopped naming `invites_owner_only` when that field was
+    /// added, and the budget below went a byte short without anything failing.
     fn tail() -> ModerationTail {
         ModerationTail {
             owner_pubkey: Some([0x11; 32]),
             key_epoch: Some(7),
             successor_nominee: Some([0x22; 32]),
             claim_after_days: Some(30),
-            invites_owner_only: None,
+            invites_owner_only: Some(true),
+            slow_mode_secs: Some(300),
         }
     }
 
@@ -2616,7 +2662,8 @@ mod tests {
             key_epoch: Some(9),
             successor_nominee: Some(nominee),
             claim_after_days: Some(14),
-            invites_owner_only: None,
+            invites_owner_only: Some(true),
+            slow_mode_secs: Some(30),
         };
 
         let round_trip = |tail: &ModerationTail| -> ModerationTail {
@@ -2627,9 +2674,19 @@ mod tests {
 
         // Every prefix survives, and stopping early does not fabricate the rest.
         assert_eq!(round_trip(&full), full);
+        let no_slow = ModerationTail {
+            slow_mode_secs: None,
+            ..full
+        };
+        assert_eq!(round_trip(&no_slow), no_slow);
+        let no_invites = ModerationTail {
+            invites_owner_only: None,
+            ..no_slow
+        };
+        assert_eq!(round_trip(&no_invites), no_invites);
         let no_days = ModerationTail {
             claim_after_days: None,
-            ..full
+            ..no_invites
         };
         assert_eq!(round_trip(&no_days), no_days);
         let owner_and_epoch = ModerationTail {
@@ -2655,27 +2712,35 @@ mod tests {
             successor_nominee: Some(nominee),
             claim_after_days: Some(7),
             invites_owner_only: None,
+            slow_mode_secs: Some(10),
         };
         assert_eq!(round_trip(&orphan), ModerationTail::default());
 
-        // Every partial field is malformed, not old.
+        // Every partial field is malformed, not old. The lengths a writer can
+        // legitimately stop at are the running totals of the field widths.
+        const FULL_TAIL: usize = 32 + 8 + 32 + 2 + 1 + 2;
+        let legitimate = [0, 32, 40, 72, 74, 75, FULL_TAIL];
         let base = encode_moderation_extra("hi", &[], &[], &full);
-        for cut in 1..=(32 + 8 + 32 + 2) {
-            if cut == 2 || cut == 2 + 32 || cut == 2 + 32 + 8 {
-                // 0, 32, 40 and 72-byte tails are the legitimate prefixes.
+        let prefix_len = base.len() - FULL_TAIL;
+        for tail_len in 0..=FULL_TAIL {
+            if legitimate.contains(&tail_len) {
                 continue;
             }
             let mut truncated = base.clone();
-            truncated.truncate(base.len() - cut);
-            let tail_len = truncated.len() - (base.len() - (32 + 8 + 32 + 2));
-            if matches!(tail_len, 0 | 32 | 40 | 72) {
-                continue;
-            }
+            truncated.truncate(prefix_len + tail_len);
             assert!(
                 decode_moderation_extra(&truncated).is_none(),
                 "a {tail_len}-byte tail is malformed"
             );
         }
+
+        // A field this build has never heard of is skipped, not treated as a
+        // reason to throw away the owner key and both lists with it.
+        let mut from_the_future = base.clone();
+        from_the_future.extend_from_slice(&[0xEE; 6]);
+        let (_, _, _, decoded) = decode_moderation_extra(&from_the_future)
+            .expect("a longer tail from a newer build still decodes");
+        assert_eq!(decoded, full);
     }
 
     #[test]

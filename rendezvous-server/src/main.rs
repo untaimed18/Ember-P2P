@@ -757,6 +757,20 @@ const PUNCH_TTL: Duration = Duration::from_secs(30);
 /// realistic worst case (2 downloads × 8 peers × 2 retries within a
 /// minute = 32) with comfortable headroom.
 const MAX_PUNCH_PER_MINUTE: u64 = 60;
+/// New channel names one IP may claim per hour.
+///
+/// A room name is reserved the moment it is claimed and held for a long time
+/// afterwards, so mass creation is not a load problem — it is a land grab that
+/// takes words out of circulation and buries Discover under rooms nobody is
+/// in. Six an hour is far more than anyone opens by hand and far less than a
+/// script wants.
+///
+/// Only *new* names count. Re-claiming a name the same room already holds is
+/// how an owner refreshes it, and a refresh must never be refused for looking
+/// like creation. Retries after a failed create do spend budget, which is
+/// intended: a client looping on create is exactly what this bounds.
+const MAX_CHANNEL_CREATES_PER_HOUR: u64 = 6;
+const CHANNEL_CREATE_WINDOW: Duration = Duration::from_secs(3600);
 /// Cap on simultaneous pending punch entries per `target_id`. Bounds
 /// the impact of `punch_register` spam against a victim once the
 /// per-IP rate limit is exhausted (the attacker would have to source
@@ -1635,6 +1649,11 @@ struct AppState {
     /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
     /// punch attempts.
     punch_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    /// Per-IP, per-*hour* budget for first-time channel name claims. Separate
+    /// map because it is the only bucket measured over an hour rather than a
+    /// minute; sharing one would either let a minute's worth of room creation
+    /// through unchecked or throttle ordinary traffic to a creation rate.
+    channel_create_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     /// Pending hole-punch registrations, keyed by `(target_id, from_id)`.
     /// Keying by both IDs (rather than just `target_id`) prevents an
     /// unauthenticated attacker from overwriting a legit registrant's
@@ -1947,10 +1966,11 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     extract_client_ip_with_config(proxy_config(), headers, addr)
 }
 
-async fn check_rate_limit_bucket(
+async fn check_rate_limit_bucket_in(
     limits: &Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     ip: IpAddr,
     max_requests: u64,
+    window: Duration,
 ) -> bool {
     let mut limits = limits.write().await;
     let now = Instant::now();
@@ -1960,7 +1980,7 @@ async fn check_rate_limit_bucket(
         // failing closed on a brand-new IP, so a map that's merely
         // full of old churn doesn't 429 every first-time caller until
         // the next sweep cycle happens to run.
-        limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+        limits.retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
         if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
             return false;
         }
@@ -1969,7 +1989,7 @@ async fn check_rate_limit_bucket(
         count: 0,
         window_start: now,
     });
-    if now.duration_since(entry.window_start) >= RATE_WINDOW {
+    if now.duration_since(entry.window_start) >= window {
         entry.count = 1;
         entry.window_start = now;
         true
@@ -1977,6 +1997,14 @@ async fn check_rate_limit_bucket(
         entry.count += 1;
         entry.count <= max_requests
     }
+}
+
+async fn check_rate_limit_bucket(
+    limits: &Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    ip: IpAddr,
+    max_requests: u64,
+) -> bool {
+    check_rate_limit_bucket_in(limits, ip, max_requests, RATE_WINDOW).await
 }
 
 async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
@@ -1988,6 +2016,19 @@ async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
         &state.ticket_read_rate_limits,
         ip,
         MAX_TICKET_READS_PER_MINUTE,
+    )
+    .await
+}
+
+/// Budget for standing up a room nobody has claimed before. Charged only once
+/// the request has proved itself genuine, so a bad signature cannot spend the
+/// allowance of the address it was sent from.
+async fn check_channel_create_rate_limit(state: &AppState, ip: IpAddr) -> bool {
+    check_rate_limit_bucket_in(
+        &state.channel_create_rate_limits,
+        ip,
+        MAX_CHANNEL_CREATES_PER_HOUR,
+        CHANNEL_CREATE_WINDOW,
     )
     .await
 }
@@ -2771,13 +2812,17 @@ async fn claim_channel_name_v4(
     {
         return status;
     }
+    let channel_hex = hex::encode(channel_id);
+    // Only a room the registry has never seen spends creation budget. An owner
+    // re-claiming the name their room already holds is a refresh, and throttling
+    // that would eventually release the name of a live room.
+    let is_new_room = !state.channels_registry.read().await.has_channel(&channel_hex);
+    if is_new_room && !check_channel_create_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     let mut registry = state.channels_registry.write().await;
-    match registry.claim_channel_name(
-        &hex::encode(channel_id),
-        &hex::encode(pubkey),
-        &body.name,
-        body.private,
-    ) {
+    match registry.claim_channel_name(&channel_hex, &hex::encode(pubkey), &body.name, body.private)
+    {
         Ok(()) => StatusCode::OK,
         Err(err) => registry_error_status(err),
     }
@@ -4780,6 +4825,15 @@ async fn sweep_expired(state: AppState) {
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
+        // Swept against its own hour-long window. Using the general one here
+        // would drop entries that are still inside their budget and hand the
+        // creator a fresh six rooms every couple of minutes.
+        {
+            let mut limits = state.channel_create_rate_limits.write().await;
+            limits
+                .retain(|_, entry| now.duration_since(entry.window_start) < CHANNEL_CREATE_WINDOW);
+        }
+
         {
             let mut replay = state.replay_cache.write().await;
             replay.prune_expired(now);
@@ -4882,6 +4936,7 @@ async fn main() {
         legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+        channel_create_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -5120,6 +5175,7 @@ mod relay_ticket_tests {
             legacy_identity_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             ticket_read_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            channel_create_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             punch_requests: Arc::new(RwLock::new(HashMap::new())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
@@ -6984,6 +7040,60 @@ mod relay_ticket_tests {
         let mut id = [0u8; 16];
         id.copy_from_slice(&hash.as_bytes()[..16]);
         id
+    }
+
+    /// Standing up rooms is bounded per address, but keeping one is not: the
+    /// owner refresh path re-claims a name the room already holds, and
+    /// throttling that would eventually release the name of a live room.
+    #[tokio::test]
+    async fn new_rooms_are_capped_per_hour_but_refreshing_one_is_not() {
+        let state = test_state();
+        let addr: SocketAddr = "9.9.9.9:1000".parse().unwrap();
+        // A distinct timestamp per call: two identical claims inside the same
+        // second sign identical bytes, which the replay cache refuses before
+        // any of this is reached.
+        let claim = |state: AppState, seed: u8, name: String, ts: i64| async move {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let pubkey = key.verifying_key().to_bytes();
+            let mut channel_id = [0u8; 16];
+            channel_id.copy_from_slice(&blake3::hash(&pubkey).as_bytes()[..16]);
+            let signed = build_channel_name_v4_msg(&channel_id, &pubkey, &name, false, ts);
+            claim_channel_name_v4(
+                State(state),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(pubkey),
+                    name,
+                    private: false,
+                    ts,
+                    sig: hex::encode(key.sign(&signed).to_bytes()),
+                }),
+            )
+            .await
+        };
+
+        let base_ts = now_unix_secs();
+        for seed in 0..MAX_CHANNEL_CREATES_PER_HOUR as u8 {
+            assert_eq!(
+                claim(state.clone(), seed, format!("room{seed}"), base_ts + seed as i64).await,
+                StatusCode::OK,
+                "room {seed} is inside the hourly budget"
+            );
+        }
+        assert_eq!(
+            claim(state.clone(), 200, "onetoomany".to_string(), base_ts + 100).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "one past the budget is refused"
+        );
+        // The first room re-claiming the name it already holds is a refresh,
+        // and is not charged even though the creation budget is spent.
+        assert_eq!(
+            claim(state.clone(), 0, "room0".to_string(), base_ts + 101).await,
+            StatusCode::OK,
+            "an owner can still keep the name of a room that already exists"
+        );
     }
 
     #[tokio::test]

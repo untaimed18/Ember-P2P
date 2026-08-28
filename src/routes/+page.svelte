@@ -377,6 +377,12 @@
   }
 
   function getConnectButtonLabel(): string {
+    if (connectPending && $networkStats.status !== 'connected' && $networkStats.status !== 'connecting') {
+      return m.kad_connecting();
+    }
+    if (connectPending && $networkStats.status === 'connected') {
+      return m.kad_disconnecting();
+    }
     if ($networkStats.status === 'connected') return m.servers_disconnect();
     if ($networkStats.status === 'connecting') return m.common_cancel();
     return m.servers_connect();
@@ -589,7 +595,12 @@
     <button
       class={$networkStats.status === 'connected' ? 'danger' : ''}
       onclick={handleConnect}
+      disabled={connectPending}
+      aria-busy={connectPending}
     >
+      {#if connectPending}
+        <span class="spinner-inline" aria-hidden="true"></span>
+      {/if}
       {getConnectButtonLabel()}
     </button>
   </div>

@@ -119,6 +119,16 @@ const _: () = assert!(
 pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 /// Recent local messages offered to a neighbor that asks for catch-up.
 pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
+/// Catch-up requests answered for one member of one room per minute.
+///
+/// Far tighter than the chat budget because a sync request is the one frame
+/// that costs the receiver more than the sender: a single 105-byte request is
+/// answered with up to [`CHANNEL_HISTORY_SYNC_MAX`] separately sealed unicast
+/// frames, so at the chat allowance one peer could turn four packets a second
+/// into a hundred and twenty-eight. A member asks once per
+/// [`CHANNEL_HISTORY_SYNC_SECS`] (five minutes), so two a minute is already
+/// far more headroom than the honest path uses.
+pub const CHANNEL_HISTORY_SYNC_PER_MIN: usize = 2;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
 /// Catch-up asks for messages in this window behind our newest timestamp so a
@@ -1791,6 +1801,33 @@ pub fn author_gossip_allow(
     )
 }
 
+/// Admit one history-sync request from `author` in `channel_id`, or refuse it.
+///
+/// Deliberately its own budget rather than sharing the chat one. Answering a
+/// catch-up is the most expensive thing an unproven peer can ask us to do, and
+/// the honest rate is one request per room every few minutes, so the two are
+/// nowhere near each other. Shares the cap and the refuse-when-full rule with
+/// [`author_gossip_allow`] for the same reason: an untracked requester waved
+/// through is exactly the stream of invented identities the cap exists to stop.
+pub fn history_sync_allow(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let key = (channel_id, *author);
+    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
+        return false;
+    }
+    let times = seen.entry(key).or_default();
+    rate_window_allow(
+        times,
+        now,
+        Duration::from_secs(60),
+        CHANNEL_HISTORY_SYNC_PER_MIN,
+    )
+}
+
 /// Drop tracking for authors with no activity inside `window`, so a long
 /// session does not hold a slot for everyone who ever spoke.
 pub fn prune_author_gossip(
@@ -2035,7 +2072,13 @@ impl ChannelGossip {
         channel_id.copy_from_slice(&bytes[1..17]);
         let mut msg_id = [0u8; 16];
         msg_id.copy_from_slice(&bytes[17..33]);
-        let ttl = bytes[33];
+        // Clamped, not trusted. The hop count has to mutate as a frame travels,
+        // so it cannot live under the AEAD like the rest of the header — which
+        // leaves the originator free to write 255 and have the mesh carry the
+        // frame two hundred hops instead of eight. Dedup still stops loops and
+        // holds each node to one relay, so the cost is reach rather than
+        // runaway, but reach is the whole point of a hop budget.
+        let ttl = bytes[33].min(CHANNEL_MSG_TTL_DEFAULT);
         let timestamp = i64::from_le_bytes(bytes[34..42].try_into().ok()?);
         let sender_counter = u64::from_le_bytes(bytes[42..50].try_into().ok()?);
         Some(Self {
@@ -2911,6 +2954,75 @@ mod tests {
             !seen.contains_key(&(room, bob)),
             "Bob has been silent past the window"
         );
+    }
+
+    /// Answering a catch-up is the one exchange that costs the receiver more
+    /// than the sender, so it gets a budget of its own rather than sharing the
+    /// chat one — and that budget has to be far below what chat allows.
+    #[test]
+    fn history_sync_has_a_tighter_budget_than_chat_and_is_per_room() {
+        assert!(
+            CHANNEL_HISTORY_SYNC_PER_MIN < CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
+            "a request answered with {CHANNEL_HISTORY_SYNC_MAX} sealed frames must not be \
+             admitted at the per-second rate plain chat is"
+        );
+
+        let mut seen = HashMap::new();
+        let room = [0x01u8; 16];
+        let other_room = [0x02u8; 16];
+        let alice = [0xAAu8; 32];
+        let bob = [0xBBu8; 32];
+        let start = Instant::now();
+
+        for i in 0..CHANNEL_HISTORY_SYNC_PER_MIN {
+            assert!(
+                history_sync_allow(&mut seen, room, &alice, start),
+                "request {i} is inside the budget"
+            );
+        }
+        assert!(
+            !history_sync_allow(&mut seen, room, &alice, start),
+            "one past the budget is refused"
+        );
+        assert!(
+            history_sync_allow(&mut seen, room, &bob, start),
+            "another member has their own allowance"
+        );
+        assert!(
+            history_sync_allow(&mut seen, other_room, &alice, start),
+            "and Alice still has a full one in a different room"
+        );
+        // A minute on, the window has rolled off and the honest five-minute
+        // catch-up is admitted again.
+        assert!(history_sync_allow(
+            &mut seen,
+            room,
+            &alice,
+            start + Duration::from_secs(61)
+        ));
+    }
+
+    /// The hop count cannot travel under the AEAD, because every relay has to
+    /// change it. Clamping on the way in is what stops an originator writing
+    /// 255 and having the mesh carry one frame two hundred hops.
+    #[test]
+    fn an_inflated_hop_budget_is_clamped_on_ingest() {
+        let key = [0x33u8; 32];
+        let channel_id = [0x44u8; 16];
+        let mut wire = ChannelGossip::new_plaintext(channel_id, &key, 1, b"hello", 255).encode();
+        assert_eq!(wire[33], 255, "the sender put an inflated hop count on it");
+
+        let decoded = ChannelGossip::decode(&wire).expect("still a well-formed frame");
+        assert_eq!(decoded.ttl, CHANNEL_MSG_TTL_DEFAULT);
+        assert_eq!(
+            decoded.decrypt(&key).as_deref(),
+            Some(b"hello".as_slice()),
+            "clamping the hop count must not disturb the sealed body"
+        );
+
+        // A budget under the ceiling is honoured as sent, not raised to it.
+        wire[33] = 3;
+        assert_eq!(ChannelGossip::decode(&wire).unwrap().ttl, 3);
     }
 
     /// Dedup spends a message's id before the body can be decrypted, so a

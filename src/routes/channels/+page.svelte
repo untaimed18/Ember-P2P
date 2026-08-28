@@ -30,12 +30,13 @@
     joinChannel,
     leaveChannel,
     listChannelMembers,
-    listChannelTransfers,
     offerChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
     rotateChannelRoomKey,
     setChannelInvitePolicy,
+    setChannelSlowMode,
+    SLOW_MODE_CHOICES,
     claimChannelOwnership,
     claimChannelUsername,
     sanitizeChannelUsernameInput,
@@ -58,7 +59,7 @@
     forgetChannelMute,
     hiddenChannels,
     hideChannel,
-    ignoredMembers,
+    ignoredMemberKeys,
     mutedChannels,
     refreshChannels,
     unhideChannel,
@@ -70,6 +71,8 @@
     stashActiveChannelOnLeave,
     toggleChannelMute,
     toggleMemberIgnore,
+    channelTransfers,
+    mergeChannelTransfers,
   } from '$lib/stores/channels';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
@@ -154,14 +157,6 @@
   /** Guards against a superseded query's reply landing last and showing hits
    *  for text the box no longer contains. */
   let searchGen = 0;
-  /**
-   * Ember Transfers this session, keyed by transfer id.
-   *
-   * Not persisted, because the backend does not persist them either: a
-   * transfer belongs to the session that started it. Terminal rows are kept
-   * briefly so "complete" or "declined" is actually seen before it vanishes.
-   */
-  let transfers = $state<Record<string, ChannelTransferInfo>>({});
   /** Members we have a send action in flight for, so the menu item can't be
    *  double-fired while the file is being hashed. */
   let sendingTo = $state<string[]>([]);
@@ -264,6 +259,8 @@
         // A room we have not joined tells us nothing about its invite policy,
         // and the control that reads this is owner-only anyway.
         invites_owner_only: false,
+        // Likewise: its slow mode arrives with the moderation record on join.
+        slow_mode_secs: 0,
       });
     }
     return [...byId.values()];
@@ -297,11 +294,11 @@
   /** Hits the transcript can actually show. An ignored sender's messages are
    *  drawn nowhere, so offering them here would be a dead click. */
   let visibleSearchHits = $derived(
-    $ignoredMembers.length === 0
+    $ignoredMemberKeys.length === 0
       ? searchHits
       : searchHits.filter(
           (hit) =>
-            !hit.sender_pubkey || !$ignoredMembers.includes(hit.sender_pubkey.toLowerCase()),
+            !hit.sender_pubkey || !$ignoredMemberKeys.includes(hit.sender_pubkey.toLowerCase()),
         ),
   );
   let sortedMembers = $derived(
@@ -395,6 +392,7 @@
   }
 
   function toggleCompose(mode: 'create' | 'join') {
+    if (needsUsername && composeMode !== mode) return;
     composeMode = composeMode === mode ? null : mode;
     if (composeMode !== 'join') deepLinkJoin = false;
     error = null;
@@ -473,82 +471,10 @@
       if (cancelled) fn();
       else unlistenFound = fn;
     });
-    // Ember Transfer. `xfer-offer` is an offer waiting on the user;
-    // `xfer-update` carries every state change including progress.
-    let unlistenXferOffer: UnlistenFn | undefined;
-    listen<{
-      xfer_id: string;
-      channel_id: string;
-      peer_pubkey: string;
-      name: string;
-      size: number;
-    }>('ember:xfer-offer', (event) => {
-      const p = event.payload;
-      transfers = {
-        ...transfers,
-        [p.xfer_id]: {
-          xfer_id: p.xfer_id,
-          channel_id: p.channel_id,
-          peer_pubkey: p.peer_pubkey,
-          direction: 'receive',
-          name: p.name,
-          size: p.size,
-          transferred: 0,
-          status: 'awaiting',
-        },
-      };
-      // The panel only draws the open room's transfers, so an offer made
-      // while the user is reading somewhere else would sit unseen until it
-      // expired. Say which room it is in instead.
-      if (p.channel_id !== selectedId) {
-        const room = channelList.find((c) => c.channel_id === p.channel_id);
-        toast(
-          room
-            ? m.channels_xfer_offer_elsewhere({ room: room.name })
-            : m.channels_xfer_offer_elsewhere_unknown(),
-        );
-      }
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenXferOffer = fn;
-    });
-    let unlistenXferUpdate: UnlistenFn | undefined;
-    // Keyed by transfer, so a row that reports two terminal states in a row
-    // replaces its own timer instead of stacking a second one.
-    const xferClearTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    listen<ChannelTransferInfo>('ember:xfer-update', (event) => {
-      const t = event.payload;
-      transfers = { ...transfers, [t.xfer_id]: t };
-      // A finished row is worth seeing, not worth keeping. Clearing it after a
-      // few seconds saves the user dismissing every transfer by hand.
-      if (TERMINAL_XFER.includes(t.status)) {
-        const existing = xferClearTimers.get(t.xfer_id);
-        if (existing) clearTimeout(existing);
-        xferClearTimers.set(
-          t.xfer_id,
-          setTimeout(() => {
-            xferClearTimers.delete(t.xfer_id);
-            const { [t.xfer_id]: _done, ...rest } = transfers;
-            transfers = rest;
-          }, 8000),
-        );
-      }
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenXferUpdate = fn;
-    });
-    // Anything already in flight when this page mounted. Merged rather than
-    // assigned, and with live rows winning: the listeners above are already
-    // running, so an offer arriving while this call is in flight would
-    // otherwise be wiped by a snapshot taken before it existed.
-    listChannelTransfers()
-      .then((list) => {
-        if (cancelled) return;
-        transfers = { ...Object.fromEntries(list.map((t) => [t.xfer_id, t])), ...transfers };
-      })
-      .catch((e) => {
-        console.warn('Channels: could not list transfers already in flight', e);
-      });
+    // In-flight transfers live in the shell store so offers toast even when
+    // this page is not mounted. Merge a snapshot here in case one started
+    // between store init and this visit.
+    void mergeChannelTransfers();
     document.addEventListener('pointerdown', onCardMenuPointerDown);
     document.addEventListener('keydown', onPageKeydown);
     // Half the presence-republish interval, so a member crossing the freshness
@@ -560,14 +486,10 @@
       cancelled = true;
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
-      for (const timer of xferClearTimers.values()) clearTimeout(timer);
-      xferClearTimers.clear();
       unlistenMembers?.();
       unlistenModeration?.();
       unlistenHandoff?.();
       unlistenFound?.();
-      unlistenXferOffer?.();
-      unlistenXferUpdate?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
       document.removeEventListener('keydown', onPageKeydown);
       stashActiveChannelOnLeave();
@@ -963,10 +885,7 @@
   }
 
   async function joinCard(ch: ChannelInfo) {
-    if (needsUsername) {
-      composeMode = 'join';
-      return;
-    }
+    if (needsUsername) return;
     if (joiningIds.includes(ch.channel_id)) return;
     joiningIds = [...joiningIds, ch.channel_id];
     error = null;
@@ -1138,6 +1057,28 @@
   let rotateOpen = $state(false);
   let rotatingKey = $state(false);
   let savingInvitePolicy = $state(false);
+  let savingSlowMode = $state(false);
+
+  function slowModeLabel(secs: number): string {
+    if (secs <= 0) return m.channels_slow_mode_off();
+    if (secs % 60 === 0) return m.channels_slow_mode_minutes({ count: secs / 60 });
+    return m.channels_slow_mode_seconds({ count: secs });
+  }
+
+  async function handleSlowMode(secs: number) {
+    const id = selectedId;
+    if (!id || savingSlowMode) return;
+    savingSlowMode = true;
+    try {
+      replaceChannel(await setChannelSlowMode(id, secs));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+      // The select reads off the row, so a refresh is what puts it back.
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingSlowMode = false;
+    }
+  }
 
   async function handleInvitePolicy(ownerOnly: boolean) {
     const id = selectedId;
@@ -1374,25 +1315,13 @@
    *  need the user to do something, and they expire. Everything else keeps a
    *  stable order so a progress bar does not jump around as it fills. */
   let roomTransfers = $derived(
-    Object.values(transfers)
+    Object.values($channelTransfers)
       .filter((t) => t.channel_id === selectedChannelId)
       .sort((a, b) => {
         const waiting = (t: ChannelTransferInfo) => (t.status === 'awaiting' ? 0 : 1);
         return waiting(a) - waiting(b) || a.xfer_id.localeCompare(b.xfer_id);
       }),
   );
-  const TERMINAL_XFER: string[] = [
-    'complete',
-    'declined',
-    'cancelled',
-    'stalled',
-    'expired',
-    'failed',
-    'busy',
-    'too_large',
-    'not_allowed',
-    'source_gone',
-  ];
 
   function transferLabel(t: ChannelTransferInfo): string {
     const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
@@ -1434,7 +1363,10 @@
 
 <div class="page-header">
   <div class="header-title">
-    <h2>{m.nav_channels()}</h2>
+    <h2>
+      {m.nav_channels()}
+      <span class="beta-badge">{m.common_beta()}</span>
+    </h2>
     <!-- Rooms you are in, not rows in the list. The list also carries every
          public room Discover turned up, so counting it read "14 rooms" to
          someone who had joined two. -->
@@ -1454,7 +1386,8 @@
       class="ghost"
       class:active-toggle={composeMode === 'join'}
       onclick={() => toggleCompose('join')}
-      disabled={emberOff}
+      disabled={emberOff || (needsUsername && composeMode !== 'join')}
+      title={needsUsername && composeMode !== 'join' ? m.channels_username_required() : undefined}
     >
       {composeMode === 'join' ? m.common_cancel() : m.channels_join()}
     </button>
@@ -1462,7 +1395,8 @@
       class="add-btn primary"
       class:danger={composeMode === 'create'}
       onclick={() => toggleCompose('create')}
-      disabled={emberOff}
+      disabled={emberOff || (needsUsername && composeMode !== 'create')}
+      title={needsUsername && composeMode !== 'create' ? m.channels_username_required() : undefined}
     >
       {composeMode === 'create' ? m.common_cancel() : m.channels_create()}
     </button>
@@ -1743,6 +1677,7 @@
                         type="button"
                         class="chan-door chan-join"
                         disabled={joiningIds.includes(ch.channel_id) || needsUsername}
+                        title={needsUsername ? m.channels_username_required() : undefined}
                         onclick={() => joinCard(ch)}
                       >{joiningIds.includes(ch.channel_id)
                         ? m.channels_joining()
@@ -1977,6 +1912,20 @@
                   onchange={(v) => void handleInvitePolicy(v)}
                 />
               </div>
+              <div class="succession-form">
+                <p class="succession-title">{m.channels_slow_mode_title()}</p>
+                <p class="succession-hint">{m.channels_slow_mode_hint()}</p>
+                <select
+                  aria-label={m.channels_slow_mode_title()}
+                  disabled={savingSlowMode}
+                  value={String(selected.slow_mode_secs)}
+                  onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
+                >
+                  {#each SLOW_MODE_CHOICES as choice (choice)}
+                    <option value={String(choice)}>{slowModeLabel(choice)}</option>
+                  {/each}
+                </select>
+              </div>
               <!-- Only private rooms have a key worth rotating: a public
                    room's comes from its address, so there is nothing to
                    change it to. -->
@@ -2045,6 +1994,21 @@
                   {deletingOwned ? m.common_loading() : m.channels_delete()}
                 </button>
               </div>
+            {/if}
+            <!-- Everyone sees the room's rule, not just the owner who set it:
+                 a wait nobody announced reads as the app dropping messages.
+                 Owners and moderators are exempt, so it says so rather than
+                 implying a limit they will never hit. -->
+            {#if selected.slow_mode_secs > 0}
+              <p class="room-notice" role="status">
+                {selected.is_owner || selected.you_are_moderator
+                  ? m.channels_slow_mode_notice_exempt({
+                      wait: slowModeLabel(selected.slow_mode_secs),
+                    })
+                  : m.channels_slow_mode_notice({
+                      wait: slowModeLabel(selected.slow_mode_secs),
+                    })}
+              </p>
             {/if}
             {#if roomTransfers.length > 0}
               <!-- Polite, not assertive: an arriving offer is worth announcing
@@ -2163,7 +2127,7 @@
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
                 memberNames={memberNames}
-                ignoredSenders={$ignoredMembers}
+                ignoredSenders={$ignoredMemberKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
                 focusRequest={transcriptFocus}
                 onfocusmissing={() => toast(m.channels_search_too_far())}
@@ -2236,7 +2200,7 @@
                         {#if mem.banned}
                           <span class="badge banned">{m.channels_banned_badge()}</span>
                         {/if}
-                        {#if $ignoredMembers.includes(mem.member_pubkey.toLowerCase())}
+                        {#if $ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())}
                           <span class="badge">{m.channels_ignored_badge()}</span>
                         {/if}
                         {#if !present && mem.last_seen > 0}
@@ -2278,8 +2242,8 @@
                           <button
                             type="button"
                             role="menuitem"
-                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey); }}
-                          >{$ignoredMembers.includes(mem.member_pubkey.toLowerCase())
+                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey, mem.nickname); }}
+                          >{$ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())
                             ? m.channels_unignore()
                             : m.channels_ignore()}</button>
                           {#if canModerate}
@@ -2395,9 +2359,16 @@
 
   .header-title {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 10px;
     min-width: 0;
+  }
+
+  .header-title h2 {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
   }
 
   .header-count {
@@ -3279,6 +3250,17 @@
   }
 
   .mod-label { margin: 0; font-size: 12px; color: var(--text-secondary); }
+
+  .room-notice {
+    margin: 0;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
+    flex-shrink: 0;
+  }
 
   .room-search {
     display: flex;

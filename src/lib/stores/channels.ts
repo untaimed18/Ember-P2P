@@ -1,6 +1,6 @@
 import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { listChannels, type ChannelInfo } from '$lib/api/channels';
+import { listChannels, listChannelTransfers, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
 import { toast } from '$lib/stores/toast';
 import * as m from '$lib/paraglide/messages';
@@ -160,37 +160,69 @@ export function unhideChannel(channelId: string): void {
  * still count toward unread. Nothing here is a security boundary.
  */
 const IGNORED_KEY = 'ember.channels.ignored.v1';
+const IGNORED_NAME_MAX = 64;
 
-function loadIgnored(): string[] {
+export interface IgnoredMember {
+  pubkey: string;
+  name: string;
+}
+
+function parseIgnoredEntry(raw: unknown): IgnoredMember | null {
+  if (typeof raw === 'string' && MEMBER_PUBKEY_RE.test(raw)) {
+    return { pubkey: raw.toLowerCase(), name: '' };
+  }
+  if (!raw || typeof raw !== 'object' || !('pubkey' in raw)) return null;
+  const pk = (raw as { pubkey: unknown }).pubkey;
+  if (typeof pk !== 'string' || !MEMBER_PUBKEY_RE.test(pk)) return null;
+  const nameRaw = (raw as { name?: unknown }).name;
+  const name = typeof nameRaw === 'string' ? nameRaw.trim().slice(0, IGNORED_NAME_MAX) : '';
+  return { pubkey: pk.toLowerCase(), name };
+}
+
+function loadIgnored(): IgnoredMember[] {
   if (typeof localStorage === 'undefined') return [];
   try {
     const raw = localStorage.getItem(IGNORED_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((pk): pk is string => typeof pk === 'string' && MEMBER_PUBKEY_RE.test(pk))
-      .map((pk) => pk.toLowerCase());
+    const seen = new Set<string>();
+    const out: IgnoredMember[] = [];
+    for (const item of parsed) {
+      const entry = parseIgnoredEntry(item);
+      if (!entry || seen.has(entry.pubkey)) continue;
+      seen.add(entry.pubkey);
+      out.push(entry);
+    }
+    return out;
   } catch {
     return [];
   }
 }
 
-export const ignoredMembers = writable<string[]>(loadIgnored());
+export const ignoredMembers = writable<IgnoredMember[]>(loadIgnored());
 
-ignoredMembers.subscribe((keys) => {
+/** Pubkeys only — chat filters and member-row checks still compare hex strings. */
+export const ignoredMemberKeys = derived(ignoredMembers, (list) =>
+  list.map((entry) => entry.pubkey),
+);
+
+ignoredMembers.subscribe((entries) => {
   if (typeof localStorage === 'undefined') return;
   try {
-    localStorage.setItem(IGNORED_KEY, JSON.stringify(keys));
+    localStorage.setItem(IGNORED_KEY, JSON.stringify(entries));
   } catch {
     // Quota exceeded / private mode. Holds for this session.
   }
 });
 
-export function toggleMemberIgnore(memberPubkey: string): void {
+export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
   const pk = memberPubkey.toLowerCase();
-  ignoredMembers.update((keys) =>
-    keys.includes(pk) ? keys.filter((existing) => existing !== pk) : [...keys, pk],
+  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  ignoredMembers.update((list) =>
+    list.some((entry) => entry.pubkey === pk)
+      ? list.filter((entry) => entry.pubkey !== pk)
+      : [...list, { pubkey: pk, name: label }],
   );
 }
 
@@ -207,6 +239,77 @@ export function forgetChannelMute(channelId: string): void {
 let initialized = false;
 let storeEpoch = 0;
 let unlisteners: UnlistenFn[] = [];
+
+/**
+ * Ember Transfers this session, keyed by transfer id.
+ *
+ * Not persisted, because the backend does not persist them either: a
+ * transfer belongs to the session that started it. Terminal rows are kept
+ * briefly so "complete" or "declined" is actually seen before it vanishes.
+ *
+ * Lives in the shell store rather than the Channels page so an offer that
+ * arrives while the user is on Library still toasts, and so walking back
+ * into Channels still shows in-flight rows.
+ */
+export const channelTransfers = writable<Record<string, ChannelTransferInfo>>({});
+
+const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
+  'complete',
+  'declined',
+  'cancelled',
+  'stalled',
+  'expired',
+  'failed',
+  'busy',
+  'too_large',
+  'not_allowed',
+  'source_gone',
+];
+
+const xferClearTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleXferClear(xferId: string, epoch: number): void {
+  const existing = xferClearTimers.get(xferId);
+  if (existing) clearTimeout(existing);
+  xferClearTimers.set(
+    xferId,
+    setTimeout(() => {
+      xferClearTimers.delete(xferId);
+      if (epoch !== storeEpoch) return;
+      channelTransfers.update((cur) => {
+        if (!(xferId in cur)) return cur;
+        const { [xferId]: _done, ...rest } = cur;
+        return rest;
+      });
+    }, 8000),
+  );
+}
+
+function toastXferOffer(channelId: string): void {
+  if (get(activeChannelId) === channelId) return;
+  const room = get(channels).find((c) => c.channel_id === channelId);
+  toast(
+    room
+      ? m.channels_xfer_offer_elsewhere({ room: room.name })
+      : m.channels_xfer_offer_elsewhere_unknown(),
+  );
+}
+
+/** Snapshot of transfers already in flight. Live rows win so an offer that
+ *  arrived while this call was outstanding is not wiped. */
+export async function mergeChannelTransfers(): Promise<void> {
+  const epoch = storeEpoch;
+  try {
+    const list = await listChannelTransfers();
+    if (epoch !== storeEpoch) return;
+    channelTransfers.update((cur) => ({
+      ...Object.fromEntries(list.map((t) => [t.xfer_id, t])),
+      ...cur,
+    }));
+  } catch (e) {
+    console.warn('Channels: could not list transfers already in flight', e);
+  }
+}
 
 export async function refreshChannels(): Promise<void> {
   const list = await listChannels();
@@ -346,12 +449,53 @@ export async function initChannelsStore() {
         refreshChannels().catch(() => {});
       }),
     );
+    registered.push(
+      await listen<{
+        xfer_id: string;
+        channel_id: string;
+        peer_pubkey: string;
+        name: string;
+        size: number;
+      }>('ember:xfer-offer', (event) => {
+        if (myEpoch !== storeEpoch) return;
+        const p = event.payload;
+        const channelId = validChannelId(p?.channel_id);
+        const xferId = typeof p?.xfer_id === 'string' ? p.xfer_id : '';
+        if (!channelId || !xferId) return;
+        channelTransfers.update((cur) => ({
+          ...cur,
+          [xferId]: {
+            xfer_id: xferId,
+            channel_id: channelId,
+            peer_pubkey: p.peer_pubkey,
+            direction: 'receive',
+            name: p.name,
+            size: p.size,
+            transferred: 0,
+            status: 'awaiting',
+          },
+        }));
+        toastXferOffer(channelId);
+      }),
+    );
+    registered.push(
+      await listen<ChannelTransferInfo>('ember:xfer-update', (event) => {
+        if (myEpoch !== storeEpoch) return;
+        const t = event.payload;
+        if (!t?.xfer_id) return;
+        channelTransfers.update((cur) => ({ ...cur, [t.xfer_id]: t }));
+        if (TERMINAL_XFER.includes(t.status)) {
+          scheduleXferClear(t.xfer_id, myEpoch);
+        }
+      }),
+    );
     if (myEpoch !== storeEpoch) {
       for (const fn of registered) fn();
       return;
     }
     unlisteners = registered;
     await refreshChannels().catch(() => {});
+    void mergeChannelTransfers();
   } catch (err) {
     for (const fn of registered) {
       try {
@@ -378,6 +522,9 @@ export function cleanupChannelsStore() {
   initialized = false;
   lastToastAt.clear();
   lastOpenedChannelId = null;
+  for (const timer of xferClearTimers.values()) clearTimeout(timer);
+  xferClearTimers.clear();
+  channelTransfers.set({});
   channels.set([]);
   activeChannelId.set(null);
 }

@@ -188,6 +188,19 @@ impl ChannelRegistry {
         Ok(())
     }
 
+    /// Whether this room already holds a name here.
+    ///
+    /// Lets the creation budget charge for standing a room up without charging
+    /// its owner for keeping it: a re-claim of a name the room already has is
+    /// the refresh path, and refusing that would eventually free the name of a
+    /// room that is very much alive.
+    pub fn has_channel(&self, channel_id: &str) -> bool {
+        let id = channel_id.to_ascii_lowercase();
+        self.names
+            .values()
+            .any(|rec| !rec.deleted && rec.channel_id.eq_ignore_ascii_case(&id))
+    }
+
     pub fn claim_channel_name(
         &mut self,
         channel_id: &str,

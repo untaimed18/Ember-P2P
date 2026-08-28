@@ -1845,6 +1845,7 @@ pub fn run() {
             commands::channels::claim_channel_username,
             commands::channels::rotate_channel_room_key,
             commands::channels::set_channel_invite_policy,
+            commands::channels::set_channel_slow_mode,
             commands::channels::delete_owned_channel,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,

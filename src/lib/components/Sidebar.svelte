@@ -335,6 +335,9 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
+          {#if item.id === 'channels'}
+            <span class="beta-badge">{m.common_beta()}</span>
+          {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
@@ -679,8 +682,22 @@
     justify-content: center;
   }
 
-  .sidebar.collapsed .nav-label {
+  .sidebar.collapsed .nav-label,
+  .sidebar.collapsed .beta-badge {
     display: none;
+  }
+
+  .nav-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Parent row gap is 12px (icon to label). Pull the chip closer to the
+     word so it reads as a label suffix rather than a third column. */
+  .nav-list .beta-badge {
+    margin-inline-start: -6px;
   }
 
   .sidebar.collapsed .nav-badge {
@@ -694,7 +711,7 @@
     padding: 0 3px;
   }
 
-  .sidebar.collapsed .about-btn span:not(.about-icon) {
+  .sidebar.collapsed .about-btn span:not(.about-icon):not(.chats-dot) {
     display: none;
   }
 

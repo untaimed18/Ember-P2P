@@ -3720,6 +3720,7 @@
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
                 <p class="empty-cell-title">{m.transfers_empty_no_matches()}</p>
+                <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}

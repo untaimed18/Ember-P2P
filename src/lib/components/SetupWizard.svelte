@@ -58,6 +58,7 @@
 
   let speedTestRunning = $state(false);
   let speedTestResult = $state('');
+  let speedTestFailed = $state(false);
   let saving = $state(false);
   let saveError = $state('');
   let relaunching = $state(false);
@@ -184,6 +185,7 @@
   async function runSpeedTest() {
     speedTestRunning = true;
     speedTestResult = '';
+    speedTestFailed = false;
     try {
       const result: { recommended_upload_limit: number; recommended_download_limit: number } = await invoke('run_speed_test');
       maxUploadSpeed = result.recommended_upload_limit;
@@ -194,6 +196,7 @@
       });
     } catch {
       speedTestResult = m.wizard_speed_test_failed();
+      speedTestFailed = true;
     } finally {
       speedTestRunning = false;
     }
@@ -449,7 +452,20 @@
           <div class="field">
             <label for="dl-folder">{m.wizard_folder_label()}</label>
             <div class="folder-picker">
-              <input id="dl-folder" type="text" bind:value={downloadFolder} class="text-input folder-input" readonly />
+              <input
+                id="dl-folder"
+                type="text"
+                bind:value={downloadFolder}
+                class="text-input folder-input"
+                readonly
+                onclick={() => void pickFolder()}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    void pickFolder();
+                  }
+                }}
+              />
               <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
             {#if folderError}
@@ -494,7 +510,7 @@
             {speedTestRunning ? m.wizard_speed_test_running() : m.wizard_speed_test_run()}
           </button>
           {#if speedTestResult}
-            <p class="speed-result">{speedTestResult}</p>
+            <p class="speed-result" class:error={speedTestFailed}>{speedTestResult}</p>
           {/if}
         </div>
 
@@ -1044,6 +1060,10 @@
     font-size: 12px;
     color: var(--success);
     margin: 8px 0 0;
+  }
+
+  .speed-result.error {
+    color: var(--danger);
   }
 
   /* Connection options */
