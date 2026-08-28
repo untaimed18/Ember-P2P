@@ -1339,9 +1339,11 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
     let hello_tcp_port = cursor.read_u16::<LittleEndian>()?;
     let tag_count = cursor.read_u32::<LittleEndian>()?;
 
-    let mut caps = PeerCapabilities::default();
-    caps.client_id = client_id;
-    caps.tcp_port = hello_tcp_port;
+    let mut caps = PeerCapabilities {
+        client_id,
+        tcp_port: hello_tcp_port,
+        ..PeerCapabilities::default()
+    };
     let safe_count = tag_count.min(256);
     if tag_count > 256 {
         tracing::debug!("Hello answer has excessive tags: {tag_count}, capping at 256");

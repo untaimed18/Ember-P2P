@@ -34,6 +34,7 @@ export const navItems: NavItem[] = [
   { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
   { href: '/library', label: () => m.nav_library(), id: 'library' },
   { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+  { href: '/channels', label: () => m.nav_channels(), id: 'channels' },
   { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
   { href: '/security', label: () => m.nav_security(), id: 'security' },
   { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
@@ -41,8 +42,9 @@ export const navItems: NavItem[] = [
 
 /**
  * How many entries get an Alt+N shortcut. Alt+1..9 map to the first nine
- * items; Alt+0 maps to the tenth (Settings, today). Anything past that is
- * click-only — worth remembering when reordering.
+ * items; Alt+0 maps to the tenth (Security, today). Anything past that is
+ * click-only — worth remembering when reordering, and the reason this says
+ * "today": inserting Channels moved which page the tenth slot lands on.
  */
 export const NAV_SHORTCUT_LIMIT = 10;
 

@@ -34,9 +34,10 @@ const DYNAMIC_KEY_PREFIX = "error_";
 const MESSAGE_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Keys that are deliberately unreferenced. Empty on purpose: a string with no
- * call site is dead until someone writes down why it isn't, and the staleness
- * check below makes sure an entry cannot outlive its reason.
+ * Keys that are deliberately unreferenced. A string with no call site is dead
+ * until someone writes down why it isn't, and the staleness check below makes
+ * sure an entry cannot outlive its reason: once a key gains a call site, this
+ * test fails until it is removed from here.
  */
 const ALLOWED_ORPHANS = new Map();
 

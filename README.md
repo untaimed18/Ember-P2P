@@ -74,7 +74,7 @@ Shared files are published as keyword records (findable by name) and source reco
 
 ### Current limits
 
-- **Content still moves over eD2K.** [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) holds a 256 KiB chunk protocol and a BLAKE3 hash tree, but nothing imports it yet. Ember discovers the source; the bytes travel the eMule wire. Wiring it up is the largest remaining piece toward a network that does not need the eMule wire at all.
+- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 100 MB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
 - **Bootstrap depends on eMule** — as described above; seed lists are deliberately not planned.
 - **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
@@ -213,6 +213,58 @@ This is a **static** DH, not a ratchet. It gives confidentiality and integrity a
 - **Friend Block List** — Block a Friend ID to reject future requests, chat, browse and offers from that identity. Blocking removes any existing mutual friendship, and unblocking does not restore it.
 - **Optional Peer Relaying** — **Relay for other peers** (Settings) lets your client carry traffic for peers that cannot reach each other directly. It is what makes transfers work behind strict NATs, and it spends your upload bandwidth on people you are not trading with, so it can be turned off.
 
+## Channels — group rooms (beta)
+
+Channels are group chat rooms carried over the [Ember Network](#ember-network) itself. No server hosts a room: messages travel encrypted between the members over the same overlay that carries search and source lookup, and members never publish their IP address to the room.
+
+Friends are one-to-one with people you know. Channels are for a group — a room you can hand an invite to, hand off to someone else, or leave running after you have gone.
+
+Channels are in beta and the app marks them so. The format is still settling; read [What to expect](#what-to-expect) before relying on a room.
+
+### Getting in
+
+You need a **Channel username** first: two to twelve letters or numbers, claimed across Ember so two people in a room are never the same name. It is separate from your friend nickname, and Create and Join stay disabled until you have one.
+
+From there, create a room (names are up to 20 characters, claimed once, first come first served), paste an `ember-channel:` invite, or browse **Discover** for public rooms other people have published.
+
+### Public and private
+
+The choice made at creation cannot be changed afterwards.
+
+- **Public** — listed in Discover so anyone can find and join. Anyone who finds it can also *read* it: the key that unlocks the conversation is derived from the address in its public listing. A public room is a public conversation.
+- **Private** — never listed, and joining needs an invite link that carries the key. Use this if the conversation should stay with the people you invite.
+
+A private room's owner can rotate its key, cutting off anyone holding an older invite — the remedy when a link has travelled further than intended.
+
+### Running a room
+
+Whoever creates a room owns it. Owner tools live in the room's info panel.
+
+- **Topic and welcome** — a line at the top of the room, and a greeting new members see.
+- **Moderators** — up to 6 members who can ban and unban for you. They cannot ban the owner and cannot delete the room.
+- **Bans** — up to 12 at a time.
+- **Owner-only invites** — stops a member re-sharing the room without thinking. Every member holds the key either way, so this guards against carelessness rather than against someone determined.
+- **Slow mode** — how long members wait between messages, from 5 seconds to 5 minutes. Off unless the owner turns it on; owner and moderators are exempt; everyone in the room can see it is on.
+- **Key rotation** — private rooms only, for when an invite has leaked.
+- **Succession** — transfer ownership to a member, or nominate a successor who can claim the room after the owner has been silent for a chosen window. Better than sharing the room key.
+- **Delete** — permanent, and it releases the room name.
+
+One device can own up to 10 rooms at once; deleting one gives the slot back. Joining rooms is not limited. New room names are also rate-limited per connection, so creating many in a burst is refused.
+
+Every member can **mute** a room and **ignore** a member. Both are local to the device and both are listed under Settings > Channels, where they can be undone.
+
+### Sending files
+
+A member can send one other member a file, up to **100 MB**, and only after they accept the offer. Unanswered offers lapse after five minutes and up to 4 transfers run at once. Files go directly between the two members, not to the room. Two firewalled members need a relay and may not connect at all.
+
+### What to expect
+
+- **No forward secrecy.** Everyone in a room shares one key; someone who captures traffic today and later obtains that key can read it. Rotating a private room's key protects future messages, not past ones.
+- **Moderation is local.** A ban stops honest clients from displaying or serving that member. It is not a network-level eviction, and a modified client can ignore it.
+- **Public listings can be spammed.** Discover shows what people published, and nobody vets it.
+- **A room holds up to 256 members**, and a message up to 4096 bytes.
+- **History is what your device kept.** Rooms are not archived centrally. On joining, nearby members share recent messages; older conversation you were not present for is gone. In-room search covers only local history.
+
 ## Network Compatibility
 
 Ember is a first-class citizen of the eMule network:
@@ -257,6 +309,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 ### Social
 
 - **Friends** — Ember-exclusive friend system with v2 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
+- **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 
 ### Security
@@ -273,7 +326,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 - **First-Time Setup Wizard** — Guided configuration on first launch: nickname, download folder, ports, speed limits, KAD auto-connect, and theme.
 - **Backup & Restore** — Save your profile to a single passphrase-encrypted `.emberbackup` file and restore it on another machine or after a reinstall (Settings → Backup). Covers identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfers, server/Kad contacts, IP filter and learned spam data; excludes the shared files themselves and part-finished downloads. Identity keys are DPAPI-unwrapped into the encrypted archive and re-wrapped for the restoring Windows account, so a restore keeps your user hash, credits and friendships. Restores are staged and applied during the next launch, with the replaced files preserved in a `pre-restore-<timestamp>` folder.
 - **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way.
-- **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, and Alt+1–9 jump to the first nine sidebar pages.
+- **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, and Alt+1–9 then Alt+0 jump to the first ten sidebar pages.
 - **Statistics** — Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.
 - **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
 - **GeoIP** — Country identification for connected peers from a bundled MaxMind database.
@@ -291,6 +344,7 @@ Ember currently ships for **Windows 10 and Windows 11**. No external runtimes ar
 5. The [Ember Network](#ember-network) needs no connect step — it is on by default and joins on its own. It finds its first peers *through* KAD and eD2K, though, so keep at least one of them available on a fresh install.
 6. Add folders to your library, search with the Global / KAD / Server / Ember methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
 7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features).
+8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms-beta).
 
 ### Port forwarding
 

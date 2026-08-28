@@ -871,8 +871,20 @@ pub struct EmberDiagnostics {
     /// Inbound Ember DHT frames refused because the version byte is outside
     /// this build's supported range. Counted separately from `ember_dht_malformed`
     /// so a peer we cannot speak to does not look like packet loss.
+    /// Sum of [`Self::ember_dht_version_peer_older`] and
+    /// [`Self::ember_dht_version_peer_newer`].
     #[serde(default)]
     pub ember_dht_version_mismatch: u32,
+    /// Of those mismatches, frames whose version byte is *below* this build —
+    /// the sender should update. Drives the "older peers" Ember-page banner.
+    #[serde(default)]
+    pub ember_dht_version_peer_older: u32,
+    /// Of those mismatches, frames whose version byte is *above* this build —
+    /// we should update. Drives the "check for an update" Ember-page banner.
+    /// A single Noise session can mint a high byte, so this is a hint to run
+    /// the signed updater, not proof of a release and not an install URL.
+    #[serde(default)]
+    pub ember_dht_version_peer_newer: u32,
     /// Completed KAD lookups of the Ember rendezvous key this session.
     #[serde(default)]
     pub ember_dht_rendezvous_lookups: u32,
@@ -1053,6 +1065,11 @@ pub enum NetworkStatus {
 // Completely unreadable JSON still falls back to defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
+    /// Unique handle used in Channels, claimed on Rendezvous. Empty until
+    /// the user chooses one. Distinct from [`Self::nickname`], which is the
+    /// friend display name and is not unique.
+    #[serde(default)]
+    pub channel_username: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     pub max_upload_speed: u64,
@@ -1215,6 +1232,15 @@ pub struct AppSettings {
     /// Encrypt friend sessions with RC4 obfuscation (default true)
     #[serde(default = "default_true")]
     pub friend_session_encryption: bool,
+    /// Who may offer you a file in a channel: `"everyone"`, `"friends"`, or
+    /// `"nobody"`.
+    ///
+    /// Only governs whether the offer is *shown*. Accepting is always an
+    /// explicit choice, so the permissive default cannot cost more than a
+    /// prompt you dismiss. `"friends"` compares the member's Ed25519 key
+    /// against the friends list by its derived Ember hash.
+    #[serde(default = "default_channel_file_offers")]
+    pub channel_file_offers: String,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -1510,6 +1536,15 @@ fn default_max_friends() -> u32 {
     200
 }
 
+/// Anyone in the room may offer, because an offer is only ever a prompt.
+pub const CHANNEL_FILE_OFFERS_EVERYONE: &str = "everyone";
+pub const CHANNEL_FILE_OFFERS_FRIENDS: &str = "friends";
+pub const CHANNEL_FILE_OFFERS_NOBODY: &str = "nobody";
+
+fn default_channel_file_offers() -> String {
+    CHANNEL_FILE_OFFERS_EVERYONE.to_string()
+}
+
 /// Default rendezvous server URL.
 ///
 /// L13: trust model for the V1 default rendezvous host.
@@ -1645,6 +1680,7 @@ impl Default for AppSettings {
 
         Self {
             nickname: format!("Ember-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            channel_username: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             max_upload_speed: 0,
@@ -1704,6 +1740,7 @@ impl Default for AppSettings {
             friend_chat_disabled: false,
             friend_browse_disabled: false,
             friend_session_encryption: true,
+            channel_file_offers: default_channel_file_offers(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,

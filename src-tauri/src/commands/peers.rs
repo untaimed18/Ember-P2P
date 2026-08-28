@@ -184,6 +184,25 @@ fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>)
         return Ok((hash_hex, hash, Some(pubkey)));
     }
     let canonical = trimmed.to_ascii_lowercase();
+    // A bare Ed25519 key, which is what "Copy member ID" in a room puts on the
+    // clipboard. Pasting that here used to fail on the length check, so the two
+    // halves of the same identity disagreed about what counted as an ID.
+    // Unambiguous against a hash — 64 hex characters against 32 — and better
+    // than one, because the key arrives already bound rather than having to be
+    // learned on first contact.
+    if canonical.len() == 64 {
+        let mut pubkey = [0u8; 32];
+        let hash = hex::decode_to_slice(&canonical, &mut pubkey)
+            .ok()
+            .and_then(|()| crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey));
+        return match hash {
+            Some(hash) => Ok((hex::encode(hash), hash, Some(pubkey))),
+            None => Err(coded(
+                "peers_user_hash_invalid",
+                "That is not a valid Ember public key",
+            )),
+        };
+    }
     let hash = parse_user_hash(&canonical)?;
     Ok((canonical, hash, None))
 }
@@ -1554,28 +1573,7 @@ pub async fn ember_ping_peer(
     // (`ember_ping_peer({...})` with no pubkey and
     // `ember_ping_peer({..., peerPubkeyHex: ''})`) both working.
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
-        Some(s) if !s.is_empty() => {
-            let bytes = hex::decode(s).map_err(|e| {
-                coded_ctx(
-                    "peers_pubkey_invalid_hex",
-                    "peer_pubkey_hex is not valid hex",
-                    e,
-                )
-            })?;
-            if bytes.len() != 32 {
-                return Err(coded_ctx(
-                    "peers_pubkey_wrong_length",
-                    format!(
-                        "peer_pubkey_hex must decode to 32 bytes, got {}",
-                        bytes.len()
-                    ),
-                    bytes.len(),
-                ));
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            Some(k)
-        }
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
         _ => None,
     };
 
@@ -1666,28 +1664,7 @@ pub async fn ember_request_sources(
 
     // Same "absent or empty string ⇒ look it up" handling as ember_ping_peer.
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
-        Some(s) if !s.is_empty() => {
-            let bytes = hex::decode(s).map_err(|e| {
-                coded_ctx(
-                    "peers_pubkey_invalid_hex",
-                    "peer_pubkey_hex is not valid hex",
-                    e,
-                )
-            })?;
-            if bytes.len() != 32 {
-                return Err(coded_ctx(
-                    "peers_pubkey_wrong_length",
-                    format!(
-                        "peer_pubkey_hex must decode to 32 bytes, got {}",
-                        bytes.len()
-                    ),
-                    bytes.len(),
-                ));
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            Some(k)
-        }
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
         _ => None,
     };
 
@@ -1753,7 +1730,9 @@ fn require_public_ember_peer_ip(ip: IpAddr, message: &'static str) -> Result<(),
 }
 
 /// Parse a 32-char hex string into a 16-byte Ember node ID / lookup
-/// target.
+/// target. Only the `debug_assertions` DHT harness commands take a
+/// node-id hex argument, so this is compiled out of release builds.
+#[cfg(debug_assertions)]
 fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
     let bytes = hex::decode(hex_str).map_err(|e| {
         coded_ctx(
@@ -2387,7 +2366,54 @@ pub async fn ember_dht_run_maintenance(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{chat_failure_is_permanent, require_public_ember_peer_ip_for_mode};
+    use super::{chat_failure_is_permanent, parse_friend_code, require_public_ember_peer_ip_for_mode};
+
+    /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
+    /// take the same string back, or the two halves of one identity disagree
+    /// about what an ID is.
+    #[test]
+    fn a_bare_member_key_is_accepted_and_carries_its_own_hash() {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let expected = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+
+        let (canonical, hash, parsed_pubkey) =
+            parse_friend_code(&hex::encode(pubkey)).expect("a bare member key is a friend code");
+        assert_eq!(hash, expected);
+        assert_eq!(canonical, hex::encode(expected));
+        assert_eq!(
+            parsed_pubkey,
+            Some(pubkey),
+            "the key must come through, not just the hash it derives"
+        );
+
+        // Same identity written the long way round must land on the same row.
+        let (viacode, code_hash, code_pubkey) =
+            parse_friend_code(&format!("ember2:{}:{}", hex::encode(expected), hex::encode(pubkey)))
+                .expect("the ember2 form still parses");
+        assert_eq!((viacode, code_hash, code_pubkey), (canonical, hash, parsed_pubkey));
+    }
+
+    /// The bare-key branch is keyed on length, so the shapes either side of it
+    /// have to keep behaving: a 16-byte hash is still a friend code, and
+    /// anything that is neither shape is still refused rather than guessed at.
+    #[test]
+    fn a_bare_key_does_not_widen_what_else_counts_as_a_friend_code() {
+        assert!(
+            parse_friend_code(&"ab".repeat(16)).is_ok(),
+            "a 32-hex user hash is still the other accepted shape"
+        );
+        assert!(
+            parse_friend_code(&"zz".repeat(32)).is_err(),
+            "64 characters that are not hex are not a key"
+        );
+        assert!(
+            parse_friend_code(&"ab".repeat(20)).is_err(),
+            "a length between the two shapes is neither"
+        );
+        assert!(parse_friend_code("").is_err());
+    }
 
     /// The exact strings the `SendChatMessage` handler returns. Pinned here so
     /// renaming one on the network side fails this test instead of silently

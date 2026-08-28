@@ -104,6 +104,14 @@ const MAX_STAGED_SESSIONS: usize = 256;
 /// that address, so the stall cannot be renewed.
 const XX_RESPONDER_QUEUE_GRACE: Duration = Duration::from_secs(3);
 
+/// Outgoing payloads one address may park behind an in-progress handshake.
+///
+/// If the handshake stalls, the oldest is dropped rather than letting the queue
+/// grow without bound — these are best-effort app messages, so shedding the
+/// stalest is acceptable back-pressure. Module-scope because a handshake that
+/// supersedes another inherits its queue and has to apply the same ceiling.
+const MAX_QUEUED_PER_HANDSHAKE: usize = 64;
+
 /// How many concurrent sessions one source address may hold. Each is keyed
 /// on `(address, static key)`, so claimants coexist instead of ranking for a
 /// single live slot. Four matches the old 1-live-plus-3-shadow budget.
@@ -1036,6 +1044,17 @@ impl EmberTransport {
             .any(|(session_addr, _)| session_addr == addr)
     }
 
+    /// Whether a completed Noise session exists for this identity at `addr`.
+    ///
+    /// Distinct from [`Self::has_session`]: sessions are keyed by
+    /// `(addr, static key)`, so an XX squatter at the same address must not
+    /// count as a live path to `remote_noise_pub`. Channel relay and transfer
+    /// delivery use this so they never call `prepare_outgoing` in a way that
+    /// starts a handshake and then claim the frame was sent.
+    pub fn has_live_session(&self, addr: &SocketAddr, remote_noise_pub: &[u8; 32]) -> bool {
+        self.sessions.contains_key(&(*addr, *remote_noise_pub))
+    }
+
     /// Whether the one session identified by `remote_noise_pub` completed
     /// Noise_IK.
     ///
@@ -1134,13 +1153,26 @@ impl EmberTransport {
                 Some(PendingHandshake::XxResponderMsg2 { created, .. })
                     if created.elapsed() >= XX_RESPONDER_QUEUE_GRACE
             );
+        // Carried across rather than dropped. The payloads parked behind that
+        // stalled handshake were accepted from callers who were told `Queued`
+        // and treat it as sent, so discarding them here loses them silently —
+        // `handle_xx_cookie` already moves its queue across for the same
+        // reason. This matters more now that `handle_xx_msg1` no longer
+        // restamps `created`: an XX exchange that takes longer than the grace
+        // window is superseded here, and a single lost msg2 plus a retransmit
+        // is enough to reach it.
+        let mut carried_from_stalled: Vec<Vec<u8>> = Vec::new();
         if stalled_inbound_handshake {
             debug!(
                 "Inbound XX handshake for {peer} has not completed in {:?}; dialling \
                  the identity we were asked for instead of queuing behind it",
                 XX_RESPONDER_QUEUE_GRACE
             );
-            self.pending.remove(&peer);
+            if let Some(PendingHandshake::XxResponderMsg2 { queued, .. }) =
+                self.pending.remove(&peer)
+            {
+                carried_from_stalled = queued;
+            }
         }
 
         // Never queue behind a handshake that is reaching for a different
@@ -1180,7 +1212,6 @@ impl EmberTransport {
                     // payload instead of growing without limit. These are
                     // best-effort outgoing app messages, so shedding the
                     // stalest one is acceptable back-pressure.
-                    const MAX_QUEUED_PER_HANDSHAKE: usize = 64;
                     if queued.len() >= MAX_QUEUED_PER_HANDSHAKE {
                         queued.remove(0);
                     }
@@ -1196,7 +1227,7 @@ impl EmberTransport {
         }
 
         if let Some(remote_pub) = remote_noise_pub {
-            self.start_ik_handshake(peer, remote_pub, message)
+            self.start_ik_handshake(peer, remote_pub, message, carried_from_stalled)
         } else {
             self.start_xx_handshake(peer, message)
         }
@@ -1352,8 +1383,25 @@ impl EmberTransport {
     /// Remove expired sessions and pending handshakes.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
-        self.sessions
-            .retain(|_, s| now.duration_since(s.last_activity) < SESSION_TIMEOUT);
+        self.sessions.retain(|_, s| {
+            if now.duration_since(s.last_activity) >= SESSION_TIMEOUT {
+                return false;
+            }
+            // A session that has never decrypted anything is aged from when it
+            // was established, not from when we last used it.
+            //
+            // `last_activity` is refreshed by our own sends, so a session that
+            // can only ever fail never timed out as long as we kept
+            // transmitting. An on-path attacker replaying a captured `IK_INIT`
+            // past `HANDSHAKE_REPLAY_TTL` installs exactly that: keys the real
+            // peer cannot read, at their address, held forever. Every later
+            // send sealed to a peer who sees nothing, self-healing only if they
+            // happened to dial us. `addr_validated` flips on the first
+            // successful decrypt, so "unvalidated" is precisely "has never
+            // heard anything", and `established` is never touched — which makes
+            // it the honest clock for one.
+            s.addr_validated || now.duration_since(s.established) < SESSION_TIMEOUT
+        });
         // A staged session that never decrypted anything is a handshake the
         // peer never followed up on — or a replay that never could. Drop it on
         // the pending-handshake timescale rather than the session one: the
@@ -1569,11 +1617,16 @@ impl EmberTransport {
 
     // ── Noise_IK handshake (1-RTT, we know the peer's static key) ──
 
+    /// `carried` is anything already queued for this address by a handshake
+    /// this one supersedes. It rides out with the rest when the session comes
+    /// up; dropping it instead loses payloads the caller was told were sent,
+    /// because every caller treats `Queued` as success.
     fn start_ik_handshake(
         &mut self,
         peer: SocketAddr,
         remote_pub: &[u8; 32],
         first_message: &[u8],
+        carried: Vec<Vec<u8>>,
     ) -> OutgoingResult {
         let params = match NOISE_PATTERN_IK.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
@@ -1596,11 +1649,18 @@ impl EmberTransport {
         match initiator.write_message(first_message, &mut buf[HEADER_LEN..]) {
             Ok(len) => {
                 buf.truncate(HEADER_LEN + len);
+                let mut queued = carried;
+                // Same ceiling the queuing path enforces, applied here because
+                // a superseded handshake's queue arrives all at once.
+                if queued.len() > MAX_QUEUED_PER_HANDSHAKE {
+                    let excess = queued.len() - MAX_QUEUED_PER_HANDSHAKE;
+                    queued.drain(0..excess);
+                }
                 self.pending.insert(
                     peer,
                     PendingHandshake::IkInitiator {
                         state: initiator,
-                        queued: Vec::new(),
+                        queued,
                         created: Instant::now(),
                         remote_noise_pub: *remote_pub,
                     },
@@ -1732,7 +1792,32 @@ impl EmberTransport {
         // and can confuse a late, stray XX packet into being processed
         // against a handshake state that's no longer relevant now that a
         // session exists.
-        self.pending.remove(&from);
+        //
+        // But not a responder-side XX handshake still inside its grace window.
+        // That state belongs to whoever sent us msg1, not to this handshake,
+        // and anyone can mint a valid `IK_INIT` — it only needs our static key,
+        // which every `FOUND_NODE` contact list publishes — from any source
+        // address they care to write down. Removing it unconditionally meant
+        // one forged packet destroyed a genuine inbound handshake: the peer's
+        // `XX_MSG3` then arrived to "no pending handshake" and the first-contact
+        // payload riding in it was lost.
+        //
+        // Sessions are keyed by `(addr, static key)`, so the session this
+        // handshake just produced coexists with that pending rather than
+        // competing for it, and nothing is confused by leaving it alone. The
+        // grace bound keeps the original cleanup intent for genuinely stale
+        // state. Refusing the `IK_INIT` outright instead would only invert the
+        // problem — an unauthenticated forged `XX_MSG1` would then block real IK
+        // handshakes, which is the worse trade, since msg1 proves nothing at all
+        // while a completed IK is authenticated.
+        let hold_inbound_xx = matches!(
+            self.pending.get(&from),
+            Some(PendingHandshake::XxResponderMsg2 { created, .. })
+                if created.elapsed() < XX_RESPONDER_QUEUE_GRACE
+        );
+        if !hold_inbound_xx {
+            self.pending.remove(&from);
+        }
         trace!("IK handshake completed (responder) with {from}");
 
         self.remember_handshake_response(handshake_digest, resp_buf.clone());
@@ -2238,12 +2323,33 @@ impl EmberTransport {
         if self.pending.len() >= MAX_PENDING {
             self.evict_oldest_pending();
         }
+        // Carry the age and the queued payloads of the attempt this replaces.
+        //
+        // Stamping a fresh `created` on every inbound msg1 handed the sender
+        // control of the timer that exists to protect us from them:
+        // `prepare_outgoing` only stops queuing behind a responder-side pending
+        // once it has sat unfinished past `XX_RESPONDER_QUEUE_GRACE`, so
+        // re-forging a msg1 every couple of seconds kept it perpetually young.
+        // We would then never dial, our own `IkInitiator` would never take the
+        // slot, and the documented mitigation — "once our own `IkInitiator` is
+        // pending, `handle_xx_msg1` refuses further inbound msg1s" — could never
+        // engage. Every `prepare_outgoing` to that address returned `Queued`,
+        // which callers treat as sent, and the fresh `Vec::new()` then destroyed
+        // the payloads. One spoofed packet per victim per three seconds.
+        //
+        // Measuring from the oldest unfinished attempt instead means a genuine
+        // retransmit still refreshes the crypto state while the clock — and the
+        // queue — survive.
+        let (created, queued) = match self.pending.remove(&from) {
+            Some(PendingHandshake::XxResponderMsg2 { created, queued, .. }) => (created, queued),
+            _ => (Instant::now(), Vec::new()),
+        };
         self.pending.insert(
             from,
             PendingHandshake::XxResponderMsg2 {
                 state: responder,
-                queued: Vec::new(),
-                created: Instant::now(),
+                queued,
+                created,
             },
         );
         trace!("XX handshake msg2 sent to {from}");
@@ -2720,6 +2826,11 @@ fn extract_remote_static(
 
 #[cfg(test)]
 mod tests {
+    /// Stand-in for a node's own Noise static key, which v4 binds every frame
+    /// signature to. Encode and decode must agree on it; a test that needs them
+    /// to disagree passes a different key explicitly.
+    const TEST_NOISE_PUB: [u8; 32] = [0xAB; 32];
+
     use super::*;
 
     fn make_keypair() -> ([u8; 32], [u8; 32]) {
@@ -4263,6 +4374,189 @@ mod tests {
     }
 
     /// The header is stripped before dispatch, so hashing the body alone put
+    /// `XX_RESPONDER_QUEUE_GRACE` only lets `prepare_outgoing` give up on a
+    /// responder-side pending once it has sat unfinished past the window. If a
+    /// fresh msg1 restamps `created`, the sender controls that clock: re-forging
+    /// every couple of seconds keeps it perpetually young, so we never dial, our
+    /// own initiator never takes the slot, and every send returns `Queued` —
+    /// which callers treat as sent — while the requeue destroys the payloads.
+    #[test]
+    fn a_repeated_xx_msg1_cannot_hold_the_queue_grace_open() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let attacker: SocketAddr = "9.9.9.9:5000".parse().unwrap();
+
+        let (a_priv, _a_pub) = make_keypair();
+        let mut msg1 = vec![0u8; HEADER_LEN + 128];
+        msg1[0] = EMBER_MAGIC[0];
+        msg1[1] = EMBER_MAGIC[1];
+        msg1[2] = PKT_XX_MSG1;
+        let params: snow::params::NoiseParams = NOISE_PATTERN_XX.parse().unwrap();
+        let mut initiator = snow::Builder::new(params)
+            .local_private_key(&a_priv)
+            .build_initiator()
+            .unwrap();
+        let n = initiator.write_message(&[], &mut msg1[HEADER_LEN..]).unwrap();
+        msg1.truncate(HEADER_LEN + n);
+
+        let _ = bob.process_incoming(&msg1, attacker);
+        let first_created = match bob.pending.get(&attacker) {
+            Some(PendingHandshake::XxResponderMsg2 { created, .. }) => *created,
+            other => panic!("expected a responder pending, got {}", other.is_some()),
+        };
+
+        // A second msg1 from the same address, as the renewal attack sends it.
+        // The crypto state may be rebuilt, but the clock must not restart.
+        let mut msg1b = msg1.clone();
+        msg1b[HEADER_LEN] ^= 0x01;
+        let _ = bob.process_incoming(&msg1b, attacker);
+        match bob.pending.get(&attacker) {
+            Some(PendingHandshake::XxResponderMsg2 { created, .. }) => assert_eq!(
+                *created, first_created,
+                "the grace window must age from the oldest unfinished attempt"
+            ),
+            _ => panic!("expected the responder pending to survive"),
+        }
+    }
+
+    /// Anyone can mint a valid `IK_INIT` — it needs only our static key, which
+    /// every `FOUND_NODE` contact list publishes — from any source address they
+    /// write down. It must not be able to destroy a genuine inbound handshake
+    /// belonging to whoever really is at that address.
+    #[test]
+    fn a_forged_ik_init_does_not_destroy_an_inbound_xx_handshake() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let (victim_priv, _victim_pub) = make_keypair();
+        let (mallory_priv, _mallory_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let victim: SocketAddr = "4.4.4.4:4000".parse().unwrap();
+
+        // The victim opens an XX handshake with Bob.
+        let params: snow::params::NoiseParams = NOISE_PATTERN_XX.parse().unwrap();
+        let mut initiator = snow::Builder::new(params)
+            .local_private_key(&victim_priv)
+            .build_initiator()
+            .unwrap();
+        let mut msg1 = vec![0u8; HEADER_LEN + 128];
+        msg1[0] = EMBER_MAGIC[0];
+        msg1[1] = EMBER_MAGIC[1];
+        msg1[2] = PKT_XX_MSG1;
+        let n = initiator.write_message(&[], &mut msg1[HEADER_LEN..]).unwrap();
+        msg1.truncate(HEADER_LEN + n);
+        assert!(matches!(
+            bob.process_incoming(&msg1, victim),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+        assert!(bob.pending.contains_key(&victim));
+
+        // Mallory forges an IK init from the victim's address.
+        let mut mallory = EmberTransport::new(mallory_priv, _mallory_pub);
+        let forged = match mallory.prepare_outgoing(
+            "5.5.5.5:5000".parse().unwrap(),
+            Some(&bob_pub),
+            b"x",
+        ) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let _ = bob.process_incoming(&forged, victim);
+
+        assert!(
+            matches!(
+                bob.pending.get(&victim),
+                Some(PendingHandshake::XxResponderMsg2 { .. })
+            ),
+            "the victim's inbound handshake must survive a forged IK init"
+        );
+        // The forged handshake still completes into its own session slot —
+        // refusing it outright would only invert the attack, since an
+        // unauthenticated XX msg1 would then block real IK dials. Coexistence
+        // is what makes leaving the pending alone safe, so assert it.
+        assert!(
+            bob.sessions.keys().any(|(addr, _)| *addr == victim),
+            "the IK handshake installs its own session rather than being refused"
+        );
+
+        // And the victim's genuine exchange still finishes, into a *second*
+        // slot. Bob answers a replayed msg1 from its handshake cache, which is
+        // the same msg2 the victim would have received.
+        let msg2 = match bob.process_incoming(&msg1, victim) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets[0].clone(),
+            _ => panic!("expected the cached msg2 for the victim's handshake"),
+        };
+        let mut scratch = [0u8; 256];
+        initiator
+            .read_message(&msg2[HEADER_LEN..], &mut scratch)
+            .expect("the victim reads msg2");
+        let mut msg3 = vec![0u8; HEADER_LEN + 256];
+        msg3[0] = EMBER_MAGIC[0];
+        msg3[1] = EMBER_MAGIC[1];
+        msg3[2] = PKT_XX_MSG3;
+        let n = initiator.write_message(&[], &mut msg3[HEADER_LEN..]).unwrap();
+        msg3.truncate(HEADER_LEN + n);
+        let _ = bob.process_incoming(&msg3, victim);
+
+        assert!(
+            bob.sessions
+                .keys()
+                .filter(|(addr, _)| *addr == victim)
+                .count()
+                >= 2,
+            "the victim's own handshake completes alongside the forged one — \
+             coexistence is what makes leaving the pending in place safe"
+        );
+    }
+
+    /// A session that has never decrypted anything cannot be kept alive by our
+    /// own sends. An on-path replay of a captured IK init installs exactly that
+    /// — keys the real peer cannot read — and it used to be immortal.
+    #[test]
+    fn a_session_that_never_receives_anything_is_aged_out() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let (alice_priv, alice_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            bob.process_incoming(&init, alice_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+        let slot = *bob
+            .sessions
+            .keys()
+            .find(|(addr, _)| *addr == alice_addr)
+            .expect("bob installed a session");
+        assert!(
+            !bob.sessions[&slot].addr_validated,
+            "a responder session starts unproven"
+        );
+
+        // Keep sending, as the DHT's liveness pings would.
+        for _ in 0..3 {
+            let _ = bob.prepare_outgoing(alice_addr, Some(&slot.1), b"ping");
+        }
+        // Backdate only what a send cannot touch. `checked_sub` because
+        // `Instant` subtraction panics on a machine that has been up for less
+        // than the timeout.
+        if let Some(session) = bob.sessions.get_mut(&slot) {
+            session.established = Instant::now()
+                .checked_sub(SESSION_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        bob.cleanup();
+
+        assert!(
+            !bob.sessions.contains_key(&slot),
+            "our own traffic must not keep an unproven session alive forever"
+        );
+    }
+
     /// IK and XX initiations in one namespace — and snow accepts an over-long
     /// XX msg1, so a captured IK init could be re-sent tagged as XX to seed
     /// the entry with the wrong answer and stall the real handshake.
@@ -4335,7 +4629,7 @@ mod tests {
 
         for msg in frames {
             let msg_type = msg.msg_type;
-            let encoded = messages::encode_message(&msg, &signing, true);
+            let encoded = messages::encode_message(&msg, &signing, true, &TEST_NOISE_PUB);
             assert!(
                 EmberControlMessage::decode(&encoded).is_none(),
                 "DHT message type {msg_type:#04x} must not decode as a control frame"

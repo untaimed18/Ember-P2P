@@ -1,8 +1,8 @@
 [package]
 name = "ember"
-version = "1.5.9"
+version = "1.6.0"
 description = "A decentralized P2P file sharing application"
-authors = ["you"]
+authors = ["untaimed18"]
 license = "GPL-3.0-only"
 edition = "2021"
 # `str::floor_char_boundary` (used in the ed2k collection parser and the

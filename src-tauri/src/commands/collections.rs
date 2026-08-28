@@ -598,9 +598,11 @@ pub async fn download_collection_files(
                 let existing = mgr.get_transfer(&existing_id);
                 let existing_pin = existing.and_then(|transfer| transfer.expected_aich.clone());
                 let existing_ember = existing.and_then(|transfer| transfer.ember_file_hash.clone());
-                if expected_aich.is_some() && existing_pin != expected_aich {
-                    failed_count += 1;
-                } else if ember_file_hash.is_some() && existing_ember != ember_file_hash {
+                // Either pin disagreeing with the queued transfer is a refusal:
+                // the row already downloading is not the file being asked for.
+                if (expected_aich.is_some() && existing_pin != expected_aich)
+                    || (ember_file_hash.is_some() && existing_ember != ember_file_hash)
+                {
                     failed_count += 1;
                 } else {
                     skipped_count += 1;

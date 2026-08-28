@@ -360,9 +360,7 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                         ));
                     }
                 }
-            } else if let Err(e) = decompress_result {
-                return Err(e);
-            }
+            } else { decompress_result?; }
 
             let mut result = Vec::with_capacity(1 + decompressed.len());
             result.push(opcode);

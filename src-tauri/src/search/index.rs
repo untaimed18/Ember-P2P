@@ -171,7 +171,7 @@ impl LocalIndex {
                 Some((idx, score))
             })
             .collect();
-        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         results
             .into_iter()
@@ -633,7 +633,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| crate::security::path_matches_dir(&file.path, folder))
-            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
@@ -675,7 +675,7 @@ impl LocalIndex {
             .iter()
             .filter(|file| only_paths.contains(&normalize_path_key(&file.path)))
             .filter(|file| crate::security::path_matches_dir(&file.path, folder))
-            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
@@ -758,7 +758,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| crate::security::path_matches_dir(&file.path, prefix))
-            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
@@ -803,7 +803,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| keys.contains(&normalize_path_key(&file.path)))
-            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files
@@ -852,7 +852,7 @@ impl LocalIndex {
             .files
             .iter()
             .filter(|file| keys.contains(&normalize_path_key(&file.path)))
-            .filter_map(|file| (!file.hash.is_empty()).then(|| file.hash.clone()))
+            .filter(|&file| !file.hash.is_empty() ).map(|file| file.hash.clone())
             .collect();
         let pending_paths: HashSet<String> = self
             .files

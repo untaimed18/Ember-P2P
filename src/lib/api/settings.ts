@@ -120,3 +120,30 @@ export async function takePendingRestoreFailedNotice(): Promise<boolean> {
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');
 }
+
+export async function getEmberWebsiteUrl(): Promise<string> {
+  return invoke('get_ember_website_url');
+}
+
+/** Absolute path to the folder holding `ember.log`, for a bug report. */
+export async function getLogFolderPath(): Promise<string> {
+  return invoke('get_log_folder_path');
+}
+
+export async function openLogFolder(): Promise<void> {
+  return invoke('open_log_folder');
+}
+
+export type EmberShareTarget =
+  | 'x'
+  | 'facebook'
+  | 'reddit'
+  | 'bluesky'
+  | 'linkedin'
+  | 'telegram'
+  | 'whatsapp'
+  | 'email';
+
+export async function openEmberShare(target: EmberShareTarget, text: string): Promise<void> {
+  return invoke('open_ember_share', { target, text });
+}

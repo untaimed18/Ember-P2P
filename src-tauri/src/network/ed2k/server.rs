@@ -150,6 +150,10 @@ pub struct ServerSession {
     pub server_reported_ip: u32,
 }
 
+/// One per server connection, held for its lifetime. Same reasoning as the
+/// upload stream enums: the size difference is a single move at connect time,
+/// and boxing would add an indirection to every server packet.
+#[allow(clippy::large_enum_variant)]
 enum ServerTransport {
     Plain {
         reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,

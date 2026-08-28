@@ -9,6 +9,7 @@ use tracing::{debug, trace, warn};
 use super::messages;
 use super::search::keyword_hash;
 use super::{EmberContact, EmberNodeId};
+use crate::network::ember::channel;
 use crate::network::ember::crypto;
 
 /// Longest file name that still leaves a keyword or source record inside
@@ -47,6 +48,85 @@ const MIN_STORE_NODES: usize = 5;
 /// Record type constants.
 pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
 pub const RECORD_TYPE_SOURCE: u8 = 0x02;
+/// Channel index, presence, or moderation metadata. Never carries an IP.
+pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
+
+pub const CHANNEL_KIND_INDEX: u8 = 1;
+pub const CHANNEL_KIND_PRESENCE: u8 = 2;
+pub const CHANNEL_KIND_MODERATION: u8 = 3;
+pub const CHANNEL_KIND_HANDOFF: u8 = 4;
+pub const CHANNEL_KIND_EPOCH: u8 = 5;
+pub const CHANNEL_KIND_CLAIM: u8 = 6;
+// Adding a kind here does *not* need an `EMBER_DHT_VERSION` bump, and must not
+// get one. That byte versions the frame *layout*, so that a peer handed a frame
+// it would misparse refuses it outright; bumping it partitions the transport for
+// everything — file search, friend presence — not just channels. A kind an older
+// build has never heard of is already a clean refusal: `channel_store_ok` falls
+// through to `false`, and every `parse_channel_*` gates on `kind`. The record
+// simply is not stored or read by that peer, which is the correct outcome.
+//
+// The same holds for appending to a record's `extra`: see [`ModerationTail`],
+// where a reader accepts any prefix and rejects a partial field.
+/// `member(32) || epoch(8) || sealed envelope`.
+const EPOCH_EXTRA_PREFIX_LEN: usize = 32 + 8;
+pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
+/// Presence record that means the publisher has left the room.
+///
+/// Same key and extra shape as a live announcement so storers that do not
+/// know the flag still accept it; ingest on this build drops the member.
+/// Not a wire-format break: `flags` already lives in `file_size`'s second
+/// byte, and unknown bits were ignored. A newer timestamp replaces the live
+/// record under the same `(publisher, channel_id)` store key.
+pub const CHANNEL_FLAG_DEPARTED: u8 = 0x02;
+const CHANNEL_TRAILER_VERSION: u8 = 1;
+/// `version(1) + extra_len(2)` before the variable extra blob.
+const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
+pub const CHANNEL_NAME_MAX: usize = 64;
+pub const CHANNEL_WELCOME_MAX: usize = 256;
+pub const CHANNEL_BAN_LIST_MAX: usize = 12;
+pub const CHANNEL_MOD_LIST_MAX: usize = 6;
+
+/// Largest [`ModerationTail::encode`] output: `owner_pubkey(32) +
+/// key_epoch(8) + successor_nominee(32) + claim_after_days(2) +
+/// invites_owner_only(1) + slow_mode_secs(2)`.
+///
+/// Every field the encoder can write has to be counted here. This budget is
+/// what [`moderation_snapshot_fits`] reserves, so a field left out of the sum
+/// lets a snapshot sitting on the boundary pass the check and then publish a
+/// record the network refuses — losing the whole governance snapshot, not just
+/// the new field.
+const MODERATION_TAIL_MAX_LEN: usize = 32 + 8 + 32 + 2 + 1 + 2;
+
+/// Fixed cost of a moderation `extra` blob: the three length prefixes plus a
+/// fully-populated tail.
+const MODERATION_EXTRA_FIXED_LEN: usize = 2 + 2 + 2 + MODERATION_TAIL_MAX_LEN;
+
+/// A moderation record is a *full snapshot* of a room's governance, so one that
+/// does not fit is not a partial update — it is the loss of the topic, the
+/// welcome, the ban and moderator lists, the owner key that lets members refuse
+/// a moderator's ban aimed at the owner, the key epoch that tells them to fetch
+/// a rotated key, and the successor nomination, all at once.
+///
+/// The four maxima above used to be stated independently of the byte budget and
+/// were jointly unreachable by more than a factor of two: `CHANNEL_BAN_LIST_MAX`
+/// alone at 32 needed 1024 bytes of a ~967-byte allowance. Past the real limit
+/// the record was refused by our own store and by every recipient's decoder, so
+/// no `STORE_ACK` ever came back, the last good copy expired a day later, and
+/// the UI reported success throughout.
+///
+/// This pins them together. Anything that widens the welcome, lengthens the
+/// tail or grows either list now fails to compile instead of silently
+/// un-publishing rooms.
+const _: () = assert!(
+    RECORD_HEADER_LEN
+        + CHANNEL_NAME_MAX
+        + CHANNEL_TRAILER_MIN_LEN
+        + MODERATION_EXTRA_FIXED_LEN
+        + CHANNEL_WELCOME_MAX
+        + 32 * (CHANNEL_BAN_LIST_MAX + CHANNEL_MOD_LIST_MAX)
+        <= messages::MAX_STORE_RECORD_BYTES,
+    "the advertised channel moderation limits must fit one STORE record"
+);
 
 /// Wire size of the trailing contact block a source record appends after
 /// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
@@ -443,6 +523,107 @@ impl DiscoveredSource {
     }
 }
 
+/// Channel-specific trailer parsed from a `RECORD_TYPE_CHANNEL` body.
+///
+/// `kind`/`flags` are also packed into `file_size` so the store can pick a
+/// TTL without walking the variable-length name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRecordMeta {
+    pub kind: u8,
+    pub flags: u8,
+    pub extra: Vec<u8>,
+}
+
+impl ChannelRecordMeta {
+    pub fn is_private(&self) -> bool {
+        self.flags & CHANNEL_FLAG_PRIVATE != 0
+    }
+
+    pub fn is_departed(&self) -> bool {
+        self.flags & CHANNEL_FLAG_DEPARTED != 0
+    }
+}
+
+/// A member announced under a channel presence key. No address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelPresenceMember {
+    pub publisher_key: [u8; 32],
+    pub nickname: String,
+    pub timestamp: i64,
+    pub noise_pub: [u8; 32],
+    /// True when this is a leave tombstone (`CHANNEL_FLAG_DEPARTED`).
+    pub departed: bool,
+}
+
+/// Newest-wins across presence records for one publisher.
+///
+/// Current and previous epoch are two FIND_VALUE walks; without merging
+/// first, a prev-epoch live announce ingested after a current-epoch
+/// tombstone re-inserts a departed member, and a prev-epoch tombstone
+/// deletes a rejoiner. Equal timestamps prefer the tombstone so a
+/// same-second leave cannot be revived by parse order.
+pub fn keep_latest_presence_member(
+    latest: &mut HashMap<[u8; 32], ChannelPresenceMember>,
+    member: ChannelPresenceMember,
+) {
+    match latest.get(&member.publisher_key) {
+        Some(prev) if prev.timestamp > member.timestamp => {}
+        Some(prev) if prev.timestamp == member.timestamp && prev.departed && !member.departed => {}
+        _ => {
+            latest.insert(member.publisher_key, member);
+        }
+    }
+}
+
+/// Owner-signed topic, welcome, ban list, and delegated moderators. No addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModeration {
+    pub topic: String,
+    pub welcome: String,
+    pub banned_pubkeys: Vec<[u8; 32]>,
+    pub moderator_pubkeys: Vec<[u8; 32]>,
+    /// Owner-signed facts appended after the original three fields. Each is
+    /// `None` for a record published before it existed — unknown, not a
+    /// definite negative.
+    pub tail: ModerationTail,
+    pub timestamp: i64,
+    pub publisher_key: [u8; 32],
+}
+
+/// Owner-signed successor mapping. `file_hash` is the **old** channel_id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelHandoff {
+    pub version: u64,
+    pub successor_pubkey: [u8; 32],
+    pub successor_channel_id: [u8; 16],
+    pub flags: u8,
+    pub timestamp: i64,
+    pub publisher_key: [u8; 32],
+}
+
+pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
+    u64::from(kind) | (u64::from(flags) << 8)
+}
+
+pub fn channel_kind_from_data(data: &[u8]) -> Option<u8> {
+    // `file_size` sits at offset 65 in the fixed header and is little-endian,
+    // so the low byte — the kind — is `data[65]`.
+    if data.first() == Some(&RECORD_TYPE_CHANNEL) {
+        data.get(65).copied()
+    } else {
+        None
+    }
+}
+
+/// Second byte of packed `file_size` (kind at `[65]`, flags at `[66]`).
+pub fn channel_flags_from_data(data: &[u8]) -> Option<u8> {
+    if data.first() == Some(&RECORD_TYPE_CHANNEL) {
+        data.get(66).copied()
+    } else {
+        None
+    }
+}
+
 /// A signed record ready for DHT storage.
 #[derive(Debug, Clone)]
 pub struct SignedRecord {
@@ -461,6 +642,8 @@ pub struct SignedRecord {
     /// Present only for `RECORD_TYPE_SOURCE`: the publisher's reachable
     /// contact, appended to `data` after the file name and thus signed.
     pub source_contact: Option<SourceContact>,
+    /// Present only for `RECORD_TYPE_CHANNEL`.
+    pub channel: Option<ChannelRecordMeta>,
 }
 
 impl SignedRecord {
@@ -481,6 +664,7 @@ impl SignedRecord {
             ember_file_hash,
             file_size,
             file_name,
+            None,
             None,
             signing_key,
         )
@@ -505,8 +689,348 @@ impl SignedRecord {
             file_size,
             file_name,
             Some(contact),
+            None,
             signing_key,
         )
+    }
+
+    /// Public/private index listing, signed by the **channel** key.
+    pub fn channel_index(
+        name: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let name = truncate_utf8(name, CHANNEL_NAME_MAX);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::index_key_for_channel(&channel_id),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_INDEX, flags),
+            name,
+            None,
+            Some(Vec::new()),
+            signing_key,
+        )
+    }
+
+    /// Membership presence: pubkey + nickname + Noise static key, never an
+    /// address. Signed by the **member**, with the channel pubkey in
+    /// `ember_file_hash`. `noise_pub` lets XOR-neighbors start Noise_IK
+    /// after a rendezvous lookup without publishing an IP.
+    pub fn channel_presence(
+        nickname: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        epoch: i64,
+        noise_pub: &[u8; 32],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let (nickname, extra) = channel::encode_presence_extra(
+            private,
+            &channel::content_key(join_secret),
+            &channel_id,
+            noise_pub,
+            nickname,
+        );
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::presence_key(&channel_id, join_secret, epoch),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            &nickname,
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Leave tombstone under the same presence key as a live announcement.
+    ///
+    /// Extra is still well-formed so storers accept it; `CHANNEL_FLAG_DEPARTED`
+    /// is what ingest uses to drop the member. A newer timestamp replaces the
+    /// live record. Older builds ignore the unknown flag and treat this as a
+    /// last announce until TTL elapses — the least-breaking option without a
+    /// new record kind.
+    pub fn channel_presence_departure(
+        nickname: &str,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        epoch: i64,
+        noise_pub: &[u8; 32],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = (if private { CHANNEL_FLAG_PRIVATE } else { 0 }) | CHANNEL_FLAG_DEPARTED;
+        let (nickname, extra) = channel::encode_presence_extra(
+            private,
+            &channel::content_key(join_secret),
+            &channel_id,
+            noise_pub,
+            nickname,
+        );
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::presence_key(&channel_id, join_secret, epoch),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            &nickname,
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Moderation record signed by the **channel** key: topic, welcome, bans, mods.
+    pub fn channel_moderation(
+        topic: &str,
+        welcome: &str,
+        banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
+        tail: &ModerationTail,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Option<Self> {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
+        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
+        // `None` rather than an oversized record: this is a full snapshot of a
+        // room's governance, so publishing one the network refuses does not
+        // leave the previous state standing — it lets the last good copy expire
+        // and takes the topic, welcome, ban and moderator lists, owner key, key
+        // epoch and successor nomination with it. The caller has to be able to
+        // tell the user their edit did not go out.
+        if RECORD_HEADER_LEN + topic.len() + CHANNEL_TRAILER_MIN_LEN + extra.len()
+            > messages::MAX_STORE_RECORD_BYTES
+        {
+            return None;
+        }
+        Some(Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::moderation_key(&channel_id),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_MODERATION, flags),
+            topic,
+            None,
+            Some(extra),
+            signing_key,
+        ))
+    }
+
+    /// One member's copy of one rotated content key, signed by the channel key
+    /// so only the owner can mint it, and sealed so only that member can read
+    /// it. Published per member; the room key itself never appears in the clear.
+    pub fn channel_key_epoch(
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        member_pubkey: &[u8; 32],
+        epoch: i64,
+        sealed: &[u8],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let mut extra = Vec::with_capacity(EPOCH_EXTRA_PREFIX_LEN + sealed.len());
+        extra.extend_from_slice(member_pubkey);
+        extra.extend_from_slice(&epoch.to_le_bytes());
+        extra.extend_from_slice(sealed);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::epoch_key(&channel_id, member_pubkey, epoch),
+            channel_id,
+            channel_pubkey,
+            // Always private in effect: a public room's key is derivable by
+            // anyone, so rotating one would evict nobody.
+            pack_channel_file_size(CHANNEL_KIND_EPOCH, CHANNEL_FLAG_PRIVATE),
+            "",
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Parse an epoch record for `expected_channel_id`, returning the recipient
+    /// it was sealed for, the epoch, and the sealed envelope.
+    pub fn parse_channel_key_epoch(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<([u8; 32], i64, Vec<u8>)> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_EPOCH {
+            return None;
+        }
+        let (member, epoch, envelope) = decode_epoch_extra(&meta.extra)?;
+        Some((member, epoch, envelope.to_vec()))
+    }
+
+    /// A nominee claiming a room whose owner has gone silent, signed by the
+    /// nominee's own user key.
+    ///
+    /// `ember_file_hash` stays the old channel pubkey so the record still
+    /// belongs to that room; the publisher is the claimant. Members decide
+    /// whether to honour it by checking the claimant against the nomination in
+    /// the owner's last signed record, and the silence against their own copy
+    /// of its timestamp.
+    pub fn channel_succession_claim(
+        old_channel_id: [u8; 16],
+        old_channel_pubkey: [u8; 32],
+        successor_pubkey: &[u8; 32],
+        witnessed_moderation_ts: i64,
+        private: bool,
+        claimant_signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let extra = channel::encode_claim_extra(successor_pubkey, witnessed_moderation_ts);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::claim_key(&old_channel_id),
+            old_channel_id,
+            old_channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_CLAIM, flags),
+            "",
+            None,
+            Some(extra),
+            claimant_signing_key,
+        )
+    }
+
+    /// Parse a succession claim: `(claimant, successor_pubkey,
+    /// successor_channel_id, witnessed_moderation_ts, keep_join_secret)`.
+    pub fn parse_channel_succession_claim(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<([u8; 32], [u8; 32], [u8; 16], i64, bool)> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_CLAIM {
+            return None;
+        }
+        let (successor_pubkey, successor_channel_id, ts) =
+            channel::decode_claim_extra(&meta.extra)?;
+        let keep = meta.flags & CHANNEL_FLAG_PRIVATE != 0;
+        Some((
+            rec.publisher_key,
+            successor_pubkey,
+            successor_channel_id,
+            ts,
+            keep,
+        ))
+    }
+
+    /// Successor mapping signed by the **old** channel key. Does not copy
+    /// the seed; members follow `successor_channel_id`.
+    pub fn channel_handoff(
+        version: u64,
+        successor_pubkey: [u8; 32],
+        old_channel_id: [u8; 16],
+        old_channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let flags = if private {
+            channel::HANDOFF_FLAG_KEEP_JOIN_SECRET
+        } else {
+            0
+        };
+        let extra = channel::encode_handoff_extra(version, &successor_pubkey, flags);
+        Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::handoff_key(&old_channel_id),
+            old_channel_id,
+            old_channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_HANDOFF, flags),
+            "",
+            None,
+            Some(extra),
+            signing_key,
+        )
+    }
+
+    /// Whether a STORE of this channel record is well-formed enough to keep.
+    ///
+    /// Storers cannot check a private presence key (it folds in `join_secret`),
+    /// but they can refuse a record whose channel_id does not match the
+    /// claimed channel pubkey, an index/moderation record not signed by that
+    /// key, or an index filed under the wrong shard.
+    pub fn channel_store_ok(&self) -> bool {
+        if self.record_type != RECORD_TYPE_CHANNEL {
+            return false;
+        }
+        let Some(meta) = &self.channel else {
+            return false;
+        };
+        let Some(expected_id) = crypto::node_id_from_ed25519_bytes(&self.ember_file_hash) else {
+            return false;
+        };
+        if self.file_hash != expected_id {
+            return false;
+        }
+        match meta.kind {
+            CHANNEL_KIND_INDEX => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::index_key_for_channel(&self.file_hash)
+            }
+            CHANNEL_KIND_PRESENCE => {
+                crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
+                    && channel::presence_extra_store_ok(&meta.extra)
+            }
+            CHANNEL_KIND_MODERATION => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::moderation_key(&self.file_hash)
+            }
+            CHANNEL_KIND_HANDOFF => {
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::handoff_key(&self.file_hash)
+                    && channel::decode_handoff_extra(&meta.extra).is_some()
+            }
+            CHANNEL_KIND_EPOCH => {
+                // Fully self-validating: the recipient and epoch are in the
+                // extra, so a storer can recompute the key this record claims
+                // to live under and refuse one filed anywhere else. It cannot
+                // read the envelope, only check its shape.
+                let Some((member, epoch, envelope)) = decode_epoch_extra(&meta.extra) else {
+                    return false;
+                };
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::epoch_key(&self.file_hash, &member, epoch)
+                    && channel::epoch_envelope_store_ok(envelope)
+            }
+            CHANNEL_KIND_CLAIM => {
+                // Signed by the *nominee's* user key, not the room key — the
+                // whole point is that the owner is unreachable — so unlike a
+                // handoff this does not require publisher == channel pubkey.
+                // Whether the claim is legitimate is a question only a member
+                // holding the owner's nomination can answer; a storer just
+                // checks the shape and the slot.
+                crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
+                    && self.keyword_hash == channel::claim_key(&self.file_hash)
+                    && channel::decode_claim_extra(&meta.extra).is_some()
+            }
+            _ => false,
+        }
     }
 
     fn build(
@@ -517,12 +1041,20 @@ impl SignedRecord {
         file_size: u64,
         file_name: &str,
         source_contact: Option<SourceContact>,
+        channel_extra: Option<Vec<u8>>,
         signing_key: &SigningKey,
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
         let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
-        let file_name = clamp_name_to_record_budget(file_name, contact_bytes);
+        // The channel trailer is written below but was left out of the name
+        // budget, so a record could be clamped to "fit" and then have up to two
+        // kilobytes appended past the cap. Both trailing blocks have to be
+        // charged here, since the name is the only part this can shorten.
+        let trailer_bytes = channel_extra
+            .as_ref()
+            .map_or(0, |extra| CHANNEL_TRAILER_MIN_LEN + extra.len());
+        let file_name = clamp_name_to_record_budget(file_name, contact_bytes + trailer_bytes);
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len();
 
@@ -546,6 +1078,42 @@ impl SignedRecord {
             encode_source_contact(&mut data, &sc);
         }
 
+        let channel = if let Some(extra) = channel_extra {
+            let extra_len = extra.len().min(u16::MAX as usize);
+            data.push(CHANNEL_TRAILER_VERSION);
+            data.write_u16::<LittleEndian>(extra_len as u16).unwrap();
+            data.extend_from_slice(&extra[..extra_len]);
+            Some(ChannelRecordMeta {
+                kind: (file_size & 0xff) as u8,
+                flags: ((file_size >> 8) & 0xff) as u8,
+                extra: extra[..extra_len].to_vec(),
+            })
+        } else {
+            None
+        };
+
+        // Last line of defence. Trimming the name cannot save a record whose
+        // trailer alone overruns the cap, and one that does is not merely
+        // large: our own store refuses it, every recipient's decoder refuses
+        // it, so no `STORE_ACK` ever returns and the caller cannot tell a
+        // record nobody would take from one nobody happened to answer. Callers
+        // that can produce a variable trailer check the budget up front and
+        // report it; this catches anything that does not.
+        debug_assert!(
+            data.len() <= messages::MAX_STORE_RECORD_BYTES,
+            "record body of {} bytes exceeds the {} the network accepts",
+            data.len(),
+            messages::MAX_STORE_RECORD_BYTES
+        );
+        if data.len() > messages::MAX_STORE_RECORD_BYTES {
+            tracing::error!(
+                "Ember: built a {}-byte record body of type {record_type}, over the \
+                 {}-byte store limit; it will be refused by every peer",
+                data.len(),
+                messages::MAX_STORE_RECORD_BYTES
+            );
+        }
+
         let signature = crypto::sign(signing_key, &data);
 
         Self {
@@ -560,6 +1128,7 @@ impl SignedRecord {
             data,
             signature,
             source_contact,
+            channel,
         }
     }
 
@@ -592,6 +1161,98 @@ impl SignedRecord {
         Self::from_wire(data, signature)
     }
 
+    /// Parse a channel presence blob into the member's identity. IPs never
+    /// appear here; `noise_pub` is the Ember UDP static key for a later
+    /// Noise_IK handshake after rendezvous supplies an address.
+    pub fn parse_channel_presence_member(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+        content_key: Option<&[u8; 32]>,
+    ) -> Option<ChannelPresenceMember> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_PRESENCE {
+            return None;
+        }
+        let (noise_pub, nickname) = channel::decode_presence_extra(
+            content_key,
+            expected_channel_id,
+            &meta.extra,
+            &rec.file_name,
+        )?;
+        Some(ChannelPresenceMember {
+            publisher_key: rec.publisher_key,
+            nickname,
+            timestamp: rec.timestamp,
+            noise_pub,
+            departed: meta.is_departed(),
+        })
+    }
+
+    /// Parse an owner-signed moderation blob. Topic lives in `file_name`;
+    /// welcome and the ban list are in the trailer extra.
+    pub fn parse_channel_moderation(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelModeration> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_MODERATION {
+            return None;
+        }
+        let (welcome, banned_pubkeys, moderator_pubkeys, tail) =
+            decode_moderation_extra(&meta.extra)?;
+        Some(ChannelModeration {
+            topic: rec.file_name,
+            welcome,
+            banned_pubkeys,
+            moderator_pubkeys,
+            tail,
+            timestamp: rec.timestamp,
+            publisher_key: rec.publisher_key,
+        })
+    }
+
+    /// Parse an owner-signed handoff blob for `expected_channel_id` (the old id).
+    pub fn parse_channel_handoff(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelHandoff> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_HANDOFF {
+            return None;
+        }
+        let (version, successor_pubkey, successor_channel_id, flags) =
+            channel::decode_handoff_extra(&meta.extra)?;
+        Some(ChannelHandoff {
+            version,
+            successor_pubkey,
+            successor_channel_id,
+            flags,
+            timestamp: rec.timestamp,
+            publisher_key: rec.publisher_key,
+        })
+    }
+
     /// Whether `blob` carries a signature its embedded publisher key really
     /// made, without building the record.
     ///
@@ -615,6 +1276,12 @@ impl SignedRecord {
         if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
             return false;
         }
+        if data[0] == RECORD_TYPE_CHANNEL
+            && !channel_trailer_len(data, name_len)
+                .is_some_and(|n| data.len() == 115 + name_len + n)
+        {
+            return false;
+        }
         let (Ok(signature), Ok(publisher_key)) = (
             <[u8; 64]>::try_from(sig_bytes),
             <[u8; 32]>::try_from(&data[73..105]),
@@ -627,6 +1294,24 @@ impl SignedRecord {
 
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
+        let parsed = Self::parse_unverified(data, signature)?;
+        let pk = crypto::verifying_key_from_bytes(&parsed.publisher_key)?;
+        if !crypto::verify(&pk, data, &signature) {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// Parse a record body's structure **without checking its signature**.
+    ///
+    /// Everything returned is derived from `data` alone, so it says nothing
+    /// about who wrote it: a caller that does not verify must not act on the
+    /// identity fields. It exists for callers that verify separately — and
+    /// would otherwise pay twice. `DhtStore::restore` is the one that matters:
+    /// it runs synchronously at startup against a 20,000-record ceiling sized
+    /// on one Ed25519 check each, so a second one per record is a real launch
+    /// cost rather than a micro-optimisation.
+    pub fn parse_unverified(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
         //          size(8) + pub_key(32) + timestamp(8) + name_len(2) = 115
         if data.len() < 115 {
@@ -661,11 +1346,24 @@ impl SignedRecord {
             None
         };
 
-        // Verify signature
-        let pk = crypto::verifying_key_from_bytes(&publisher_key)?;
-        if !crypto::verify(&pk, data, &signature) {
-            return None;
-        }
+        let channel = if record_type == RECORD_TYPE_CHANNEL {
+            let off = 115 + name_len;
+            let trailer_len = channel_trailer_len(data, name_len)?;
+            if data.len() != off + trailer_len {
+                return None;
+            }
+            if data[off] != CHANNEL_TRAILER_VERSION {
+                return None;
+            }
+            let extra_len = u16::from_le_bytes([data[off + 1], data[off + 2]]) as usize;
+            Some(ChannelRecordMeta {
+                kind: (file_size & 0xff) as u8,
+                flags: ((file_size >> 8) & 0xff) as u8,
+                extra: data[off + 3..off + 3 + extra_len].to_vec(),
+            })
+        } else {
+            None
+        };
 
         Some(Self {
             record_type,
@@ -679,8 +1377,450 @@ impl SignedRecord {
             data: data.to_vec(),
             signature,
             source_contact,
+            channel,
         })
     }
+}
+
+fn channel_trailer_len(data: &[u8], name_len: usize) -> Option<usize> {
+    let off = 115 + name_len;
+    if data.len() < off + CHANNEL_TRAILER_MIN_LEN {
+        return None;
+    }
+    let extra_len = u16::from_le_bytes([data[off + 1], data[off + 2]]) as usize;
+    Some(CHANNEL_TRAILER_MIN_LEN + extra_len)
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The owner-signed facts appended to a moderation record after its original
+/// three fields.
+///
+/// Encoded as an append-only run in declaration order, each field readable only
+/// if the whole of it is present. Any prefix is valid, so a reader accepts
+/// every version of the record ever published and a writer never has to
+/// coordinate with one; a *partial* field is malformed, not old.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModerationTail {
+    /// The owner's own user identity. Lets any member refuse a moderator's ban
+    /// aimed at the owner — nothing else on the wire identifies them.
+    pub owner_pubkey: Option<[u8; 32]>,
+    /// Current content-key epoch, so a member can tell they are behind and go
+    /// looking for the epoch record sealed to them.
+    pub key_epoch: Option<u64>,
+    /// Who may take the room over if the owner goes quiet.
+    ///
+    /// All zeros means "explicitly nobody", which is not the same as absent: a
+    /// current build always writes this field, so zeros are how an owner
+    /// *withdraws* a nomination. Without that distinction there is no way to
+    /// clear one — stopping at `None` would truncate the field away, and a
+    /// reader cannot tell a truncated tail from a withdrawal, so members would
+    /// honour a nominee the owner had already dropped.
+    pub successor_nominee: Option<[u8; 32]>,
+    /// How long the owner must be silent before that claim is honoured.
+    pub claim_after_days: Option<u16>,
+    /// Whether only the owner may hand out invites.
+    ///
+    /// A guardrail against a careless member re-sharing the key, not a control
+    /// against a hostile one: every member necessarily holds the key already,
+    /// so a patched client could still mint. Absent means the room predates
+    /// the field, which reads as "anyone", the behaviour it had then.
+    pub invites_owner_only: Option<bool>,
+    /// Seconds a member must wait between messages, or absent for no limit.
+    ///
+    /// Owner-set and opt-in, which is the whole point: an automatic throttle
+    /// misfires on the newcomer saying hello, where a human turning this on has
+    /// already decided the room needs it. Enforced by each sender declining to
+    /// publish, so like [`Self::invites_owner_only`] it is a guardrail against
+    /// a flood of ordinary clients rather than against a patched one.
+    ///
+    /// Unlike the two fields above this one is left absent when off rather than
+    /// written as zero, and that is deliberate. Absent and zero mean the same
+    /// thing here — there is no withdrawal to distinguish, because going back
+    /// to "no limit" *is* the absent state — and builds that predate the field
+    /// refuse a tail with bytes they cannot place. Writing it unconditionally
+    /// would push every room's snapshot past what those builds accept and cost
+    /// them the whole record. This way the wire is byte-identical for every
+    /// room that never turns it on.
+    pub slow_mode_secs: Option<u16>,
+}
+
+impl ModerationTail {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Stops at the first absent field: a later field cannot be located
+        // without the earlier ones, so writing one alone would be unreadable.
+        let Some(owner) = self.owner_pubkey else {
+            return;
+        };
+        out.extend_from_slice(&owner);
+        let Some(epoch) = self.key_epoch else {
+            return;
+        };
+        out.extend_from_slice(&epoch.to_le_bytes());
+        let Some(nominee) = self.successor_nominee else {
+            return;
+        };
+        out.extend_from_slice(&nominee);
+        let Some(days) = self.claim_after_days else {
+            return;
+        };
+        out.extend_from_slice(&days.to_le_bytes());
+        let Some(owner_only) = self.invites_owner_only else {
+            return;
+        };
+        out.push(u8::from(owner_only));
+        let Some(slow) = self.slow_mode_secs else {
+            return;
+        };
+        out.extend_from_slice(&slow.to_le_bytes());
+    }
+
+    fn decode(mut rest: &[u8]) -> Option<Self> {
+        let mut tail = Self::default();
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&rest[..32]);
+        tail.owner_pubkey = Some(owner);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 8 {
+            return None;
+        }
+        tail.key_epoch = Some(u64::from_le_bytes(rest[..8].try_into().ok()?));
+        rest = &rest[8..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        let mut nominee = [0u8; 32];
+        nominee.copy_from_slice(&rest[..32]);
+        tail.successor_nominee = Some(nominee);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 2 {
+            return None;
+        }
+        tail.claim_after_days = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        rest = &rest[2..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        tail.invites_owner_only = Some(rest[0] != 0);
+        rest = &rest[1..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 2 {
+            return None;
+        }
+        tail.slow_mode_secs = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        // Anything past the last field this build knows is a newer one's
+        // addition, and is ignored rather than refused. A moderation record is
+        // a whole governance snapshot, so rejecting it over an unreadable
+        // trailing field would drop the topic, both lists, and the owner key
+        // that lets members refuse a moderator's ban aimed at the owner — a far
+        // worse outcome than not knowing one new fact. A *partial* known field
+        // above is still malformed, because that one would be misread rather
+        // than skipped.
+        Some(tail)
+    }
+}
+
+fn decode_epoch_extra(extra: &[u8]) -> Option<([u8; 32], i64, &[u8])> {
+    if extra.len() <= EPOCH_EXTRA_PREFIX_LEN {
+        return None;
+    }
+    let mut member = [0u8; 32];
+    member.copy_from_slice(&extra[..32]);
+    let epoch = i64::from_le_bytes(extra[32..EPOCH_EXTRA_PREFIX_LEN].try_into().ok()?);
+    if epoch < 0 {
+        return None;
+    }
+    Some((member, epoch, &extra[EPOCH_EXTRA_PREFIX_LEN..]))
+}
+
+#[cfg(test)]
+mod moderation_budget_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    /// The worst case the byte budget has to cover, so **every** field is
+    /// present. Leaving one out silently shrinks what these tests measure:
+    /// this fixture stopped naming `invites_owner_only` when that field was
+    /// added, and the budget below went a byte short without anything failing.
+    fn tail() -> ModerationTail {
+        ModerationTail {
+            owner_pubkey: Some([0x11; 32]),
+            key_epoch: Some(7),
+            successor_nominee: Some([0x22; 32]),
+            claim_after_days: Some(30),
+            invites_owner_only: Some(true),
+            slow_mode_secs: Some(300),
+        }
+    }
+
+    /// The constant the compile-time budget assert is written against.
+    #[test]
+    fn a_full_tail_encodes_to_the_length_the_budget_assumes() {
+        let mut out = Vec::new();
+        tail().encode(&mut out);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN);
+    }
+
+    /// Everything the advertised maxima allow, at once, has to fit — that is
+    /// what the `const _: () = assert!` beside them pins, and this is the
+    /// runtime half showing the encoder really produces what it predicts.
+    #[test]
+    fn the_advertised_maxima_fit_one_record() {
+        let topic = "t".repeat(CHANNEL_NAME_MAX);
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX];
+        let mods = vec![[0xBB; 32]; CHANNEL_MOD_LIST_MAX];
+        assert!(moderation_snapshot_fits(
+            &topic, &welcome, &bans, &mods, &tail()
+        ));
+
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let record = SignedRecord::channel_moderation(
+            &topic,
+            &welcome,
+            &bans,
+            &mods,
+            &tail(),
+            [0x33; 16],
+            [0x44; 32],
+            false,
+            &sk,
+        )
+        .expect("the advertised maxima must be publishable");
+        assert!(record.data.len() <= messages::MAX_STORE_RECORD_BYTES);
+    }
+
+    /// More bans than the cap is reported as not fitting, because the encoder
+    /// would drop the surplus and the room would go on believing it had banned
+    /// them. The record itself still publishes — a governance snapshot that
+    /// lapses entirely is far worse than one missing its newest entries — so
+    /// the caller has to be the one to refuse.
+    #[test]
+    fn a_snapshot_that_would_be_truncated_does_not_count_as_fitting() {
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX + 1];
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        assert!(!moderation_snapshot_fits(
+            "topic",
+            &welcome,
+            &bans,
+            &[],
+            &tail()
+        ));
+
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let record = SignedRecord::channel_moderation(
+            "topic",
+            &welcome,
+            &bans,
+            &[],
+            &tail(),
+            [0x33; 16],
+            [0x44; 32],
+            false,
+            &sk,
+        )
+        .expect("a truncated snapshot still publishes rather than lapsing");
+        assert!(record.data.len() <= messages::MAX_STORE_RECORD_BYTES);
+
+        // An over-long welcome is caught the same way.
+        assert!(!moderation_snapshot_fits(
+            "topic",
+            &"w".repeat(CHANNEL_WELCOME_MAX + 1),
+            &[],
+            &[],
+            &tail()
+        ));
+    }
+
+    /// The channel trailer used to be written after the name was clamped, so a
+    /// record could be trimmed to "fit" and then overrun anyway.
+    #[test]
+    fn the_name_clamp_accounts_for_the_channel_trailer() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX];
+        let record = SignedRecord::channel_moderation(
+            &"n".repeat(CHANNEL_NAME_MAX),
+            &welcome,
+            &bans,
+            &[],
+            &tail(),
+            [0x55; 16],
+            [0x66; 32],
+            false,
+            &sk,
+        )
+        .expect("fits");
+        assert!(
+            record.data.len() <= messages::MAX_STORE_RECORD_BYTES,
+            "body of {} bytes overran the {}-byte store cap",
+            record.data.len(),
+            messages::MAX_STORE_RECORD_BYTES
+        );
+    }
+}
+
+/// Whether a moderation snapshot would be published *whole*.
+///
+/// `false` means something would be silently dropped on the way out —
+/// [`encode_moderation_extra`] truncates the welcome and both lists to the
+/// advertised maxima, which keeps a room publishable but quietly stops
+/// enforcing the entries past the cut. Callers use this to refuse the edit and
+/// say so, instead of reporting success for a ban that will never take effect.
+///
+/// Both halves are checked because they fail differently. Exceeding a list
+/// maximum is silent truncation; exceeding the byte budget is a record the
+/// network refuses outright. The maxima are pinned to fit the budget by the
+/// assert beside them, so the second half only bites if those constants are
+/// ever changed apart — which is exactly when a caller would want to know.
+pub fn moderation_snapshot_fits(
+    topic: &str,
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> bool {
+    if banned_pubkeys.len() > CHANNEL_BAN_LIST_MAX
+        || moderator_pubkeys.len() > CHANNEL_MOD_LIST_MAX
+        || welcome.len() > CHANNEL_WELCOME_MAX
+    {
+        return false;
+    }
+    let topic_len = truncate_utf8(topic, CHANNEL_NAME_MAX).len();
+    let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
+    RECORD_HEADER_LEN + topic_len + CHANNEL_TRAILER_MIN_LEN + extra.len()
+        <= messages::MAX_STORE_RECORD_BYTES
+}
+
+fn encode_moderation_extra(
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> Vec<u8> {
+    let welcome = truncate_utf8(welcome, CHANNEL_WELCOME_MAX);
+    let bans = banned_pubkeys
+        .iter()
+        .take(CHANNEL_BAN_LIST_MAX)
+        .collect::<Vec<_>>();
+    let mods = moderator_pubkeys
+        .iter()
+        .take(CHANNEL_MOD_LIST_MAX)
+        .collect::<Vec<_>>();
+    // Truncation keeps the room publishable, which is the right trade against
+    // letting its whole governance snapshot lapse — but the entries past the
+    // cut stop being enforced, and a room that has carried more than this
+    // (these limits were once set well above what one record could hold) has no
+    // other way to find out. `moderation_snapshot_fits` is what stops a *new*
+    // edit reaching this point silently.
+    if banned_pubkeys.len() > bans.len() || moderator_pubkeys.len() > mods.len() {
+        tracing::warn!(
+            "Ember: channel moderation snapshot trimmed to {} ban(s) of {} and {} moderator(s) \
+             of {} to fit one record; the rest are no longer published",
+            bans.len(),
+            banned_pubkeys.len(),
+            mods.len(),
+            moderator_pubkeys.len()
+        );
+    }
+    let mut extra =
+        Vec::with_capacity(2 + welcome.len() + 2 + bans.len() * 32 + 2 + mods.len() * 32 + 32);
+    extra.extend_from_slice(&(welcome.len() as u16).to_le_bytes());
+    extra.extend_from_slice(welcome.as_bytes());
+    extra.extend_from_slice(&(bans.len() as u16).to_le_bytes());
+    for pk in bans {
+        extra.extend_from_slice(pk);
+    }
+    extra.extend_from_slice(&(mods.len() as u16).to_le_bytes());
+    for pk in mods {
+        extra.extend_from_slice(pk);
+    }
+    tail.encode(&mut extra);
+    extra
+}
+
+/// Decode the extra blob from a moderation record.
+///
+/// The format has grown twice and every addition is optional on the way in, so
+/// a reader accepts whatever a record carries: no delegation list (pre-
+/// delegation), and any prefix of [`ModerationTail`] after it. An absent field
+/// means "this record does not say", which readers must treat as unknown
+/// rather than as a definite negative.
+type ModerationExtra = (String, Vec<[u8; 32]>, Vec<[u8; 32]>, ModerationTail);
+
+pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
+    if extra.len() < 4 {
+        return None;
+    }
+    let welcome_len = u16::from_le_bytes([extra[0], extra[1]]) as usize;
+    if extra.len() < 2 + welcome_len + 2 {
+        return None;
+    }
+    let welcome = String::from_utf8(extra[2..2 + welcome_len].to_vec()).ok()?;
+    let ban_off = 2 + welcome_len;
+    let ban_count = u16::from_le_bytes([extra[ban_off], extra[ban_off + 1]]) as usize;
+    if ban_count > CHANNEL_BAN_LIST_MAX {
+        return None;
+    }
+    let bans_end = ban_off + 2 + ban_count * 32;
+    if extra.len() < bans_end {
+        return None;
+    }
+    let mut bans = Vec::with_capacity(ban_count);
+    for chunk in extra[ban_off + 2..bans_end].chunks_exact(32) {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(chunk);
+        bans.push(pk);
+    }
+    let rest = &extra[bans_end..];
+    if rest.is_empty() {
+        return Some((welcome, bans, Vec::new(), ModerationTail::default()));
+    }
+    if rest.len() < 2 {
+        return None;
+    }
+    let mod_count = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+    if mod_count > CHANNEL_MOD_LIST_MAX {
+        return None;
+    }
+    let mods_end = 2 + mod_count * 32;
+    if rest.len() < mods_end {
+        return None;
+    }
+    let mut mods = Vec::with_capacity(mod_count);
+    for chunk in rest[2..mods_end].chunks_exact(32) {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(chunk);
+        mods.push(pk);
+    }
+    let tail = ModerationTail::decode(&rest[mods_end..])?;
+    Some((welcome, bans, mods, tail))
 }
 
 /// Tracks a single publish operation: store a record on the closest K nodes.
@@ -795,6 +1935,18 @@ impl PublishManager {
             operations: HashMap::new(),
             next_id: 1,
         }
+    }
+
+    /// Store on the closest verified contacts currently in `routing`.
+    /// Channel presence, moderation, and handoff still use this snapshot.
+    pub fn start_publish(
+        &mut self,
+        record: SignedRecord,
+        routing: &super::routing::RoutingTable,
+    ) -> Option<u32> {
+        let dht_key = EmberNodeId(record.keyword_hash);
+        let targets = routing.find_closest_prefer_verified(&dht_key, super::K_BUCKET_SIZE);
+        self.start_publish_to(record, targets)
     }
 
     /// Start a publish onto an already-resolved target set.
@@ -1192,6 +2344,679 @@ mod tests {
         }
         assert!(op.complete);
         assert_eq!(op.acked.len(), to_store.len());
+    }
+
+    #[test]
+    fn channel_index_round_trip_and_store_ok() {
+        let ident = channel::ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert_eq!(record.record_type, RECORD_TYPE_CHANNEL);
+        assert_eq!(
+            record.keyword_hash,
+            channel::index_key_for_channel(&ident.channel_id)
+        );
+        assert!(record.channel_store_ok());
+        assert_eq!(record.channel.as_ref().unwrap().kind, CHANNEL_KIND_INDEX);
+        assert!(!record.channel.as_ref().unwrap().is_private());
+
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.file_name, "Lobby");
+        assert_eq!(parsed.file_hash, ident.channel_id);
+        assert!(parsed.channel_store_ok());
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert!(SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    #[test]
+    fn channel_index_rejects_wrong_shard() {
+        let ident = channel::ChannelIdentity::generate();
+        let mut record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        record.keyword_hash = channel::index_key(index_other_shard(&ident.channel_id));
+        assert!(!record.channel_store_ok());
+    }
+
+    fn index_other_shard(channel_id: &[u8; 16]) -> u8 {
+        (channel::index_shard(channel_id) + 1) % channel::INDEX_SHARD_COUNT
+    }
+
+    #[test]
+    fn channel_presence_is_signed_by_member_not_channel() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&channel.pubkey);
+        let noise_pub = [0x42u8; 32];
+        let mut record = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &noise_pub,
+            &member,
+        );
+        assert_eq!(record.publisher_key, member.verifying_key().to_bytes());
+        assert_ne!(record.publisher_key, channel.pubkey);
+        assert!(record.channel_store_ok());
+        assert_eq!(
+            record.keyword_hash,
+            channel::presence_key(&channel.channel_id, &join, 3)
+        );
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.file_name, "Ada");
+        assert_eq!(parsed.channel.as_ref().unwrap().kind, CHANNEL_KIND_PRESENCE);
+        assert_eq!(parsed.channel.as_ref().unwrap().extra, noise_pub);
+        assert!(parsed.source_contact.is_none());
+
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let member_info =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).unwrap();
+        assert_eq!(member_info.publisher_key, member.verifying_key().to_bytes());
+        assert_eq!(member_info.nickname, "Ada");
+        assert_eq!(member_info.noise_pub, noise_pub);
+        assert!(!member_info.departed);
+        assert!(SignedRecord::parse_channel_presence_member(&blob, &[0x00; 16], None).is_none());
+        record.channel.as_mut().unwrap().extra.clear();
+        assert!(!record.channel_store_ok());
+    }
+
+    #[test]
+    fn a_presence_departure_is_the_same_key_with_the_departed_flag() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&channel.pubkey);
+        let noise_pub = [0x42u8; 32];
+        let live = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &noise_pub,
+            &member,
+        );
+        let left = SignedRecord::channel_presence_departure(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            false,
+            3,
+            &noise_pub,
+            &member,
+        );
+        assert_eq!(live.keyword_hash, left.keyword_hash);
+        assert_eq!(live.file_hash, left.file_hash);
+        assert!(left.channel.as_ref().unwrap().is_departed());
+        let mut blob = left.data.clone();
+        blob.extend_from_slice(&left.signature);
+        let parsed =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).unwrap();
+        assert!(parsed.departed);
+        assert_eq!(parsed.publisher_key, member.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn newest_presence_wins_and_equal_timestamp_prefers_the_tombstone() {
+        fn member(pk: [u8; 32], timestamp: i64, departed: bool) -> ChannelPresenceMember {
+            ChannelPresenceMember {
+                publisher_key: pk,
+                nickname: String::new(),
+                timestamp,
+                noise_pub: [0u8; 32],
+                departed,
+            }
+        }
+        let pk = [0xAAu8; 32];
+        let mut latest = HashMap::new();
+        keep_latest_presence_member(&mut latest, member(pk, 200, false));
+        keep_latest_presence_member(&mut latest, member(pk, 50, true));
+        assert!(
+            !latest[&pk].departed && latest[&pk].timestamp == 200,
+            "an older tombstone must not drop a newer live announce"
+        );
+
+        latest.clear();
+        keep_latest_presence_member(&mut latest, member(pk, 100, false));
+        keep_latest_presence_member(&mut latest, member(pk, 100, true));
+        assert!(
+            latest[&pk].departed,
+            "equal timestamps prefer the leave tombstone"
+        );
+
+        latest.clear();
+        keep_latest_presence_member(&mut latest, member(pk, 100, true));
+        keep_latest_presence_member(&mut latest, member(pk, 100, false));
+        assert!(
+            latest[&pk].departed,
+            "a same-second live record must not revive a tombstone that arrived first"
+        );
+    }
+
+    #[test]
+    fn private_channel_presence_extra_is_encrypted() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = [0x77u8; 32];
+        let noise_pub = [0x42u8; 32];
+        let record = SignedRecord::channel_presence(
+            "Ada",
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            true,
+            3,
+            &noise_pub,
+            &member,
+        );
+        assert!(record.channel_store_ok());
+        assert!(record.file_name.is_empty());
+        assert_ne!(record.channel.as_ref().unwrap().extra, noise_pub);
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert!(
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, None).is_none()
+        );
+        let key = channel::content_key(&join);
+        let member_info =
+            SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, Some(&key))
+                .unwrap();
+        assert_eq!(member_info.nickname, "Ada");
+        assert_eq!(member_info.noise_pub, noise_pub);
+    }
+
+    #[test]
+    fn channel_moderation_round_trip() {
+        let ident = channel::ChannelIdentity::generate();
+        let banned = [[0x11u8; 32], [0x22u8; 32]];
+        let mods = [[0xAAu8; 32]];
+        let owner = [0x77u8; 32];
+        let owner_tail = ModerationTail {
+            owner_pubkey: Some(owner),
+            ..Default::default()
+        };
+        let record = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &banned,
+            &mods,
+            &owner_tail,
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("the fixture fits one record");
+        assert!(record.channel_store_ok());
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        let (welcome, bans, parsed_mods, parsed_tail) =
+            decode_moderation_extra(&parsed.channel.unwrap().extra).unwrap();
+        assert_eq!(parsed.file_name, "rules");
+        assert_eq!(welcome, "be kind");
+        assert_eq!(bans, banned);
+        assert_eq!(parsed_mods, mods);
+        assert_eq!(parsed_tail.owner_pubkey, Some(owner));
+
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let mod_info = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
+        assert_eq!(mod_info.topic, "rules");
+        assert_eq!(mod_info.welcome, "be kind");
+        assert_eq!(mod_info.banned_pubkeys, banned);
+        assert_eq!(mod_info.moderator_pubkeys, mods);
+        assert_eq!(
+            mod_info.tail.owner_pubkey,
+            Some(owner),
+            "members can only refuse a ban on the owner if the record names them"
+        );
+        assert_eq!(mod_info.publisher_key, ident.pubkey);
+        assert!(SignedRecord::parse_channel_moderation(&blob, &[0x00; 16]).is_none());
+
+        // A record that omits the owner is readable, and reports unknown rather
+        // than defaulting to some pubkey nobody holds.
+        let anonymous = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &banned,
+            &mods,
+            &ModerationTail::default(),
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("the fixture fits one record");
+        let mut anon_blob = anonymous.data.clone();
+        anon_blob.extend_from_slice(&anonymous.signature);
+        let anon_info =
+            SignedRecord::parse_channel_moderation(&anon_blob, &ident.channel_id).unwrap();
+        assert_eq!(anon_info.tail.owner_pubkey, None);
+        assert_eq!(anon_info.banned_pubkeys, banned);
+
+        let successor = channel::ChannelIdentity::generate();
+        let handoff = SignedRecord::channel_handoff(
+            1,
+            successor.pubkey,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+        );
+        assert!(handoff.channel_store_ok());
+        assert_ne!(handoff.keyword_hash, record.keyword_hash);
+        let mut hblob = handoff.data.clone();
+        hblob.extend_from_slice(&handoff.signature);
+        let parsed = SignedRecord::parse_channel_handoff(&hblob, &ident.channel_id).unwrap();
+        assert_eq!(parsed.successor_pubkey, successor.pubkey);
+        assert_eq!(parsed.successor_channel_id, successor.channel_id);
+        assert_eq!(parsed.flags, channel::HANDOFF_FLAG_KEEP_JOIN_SECRET);
+        assert!(SignedRecord::parse_channel_handoff(&hblob, &[0u8; 16]).is_none());
+
+        // Pre-delegation extra: welcome + bans and nothing after.
+        let mut legacy = encode_moderation_extra("hi", &banned, &[], &ModerationTail::default());
+        legacy.truncate(legacy.len() - 2);
+        let (w, b, m, legacy_tail) = decode_moderation_extra(&legacy).unwrap();
+        assert_eq!(w, "hi");
+        assert_eq!(b, banned);
+        assert!(m.is_empty());
+        assert_eq!(legacy_tail, ModerationTail::default());
+
+        // A partial owner key is malformed, not an older record: accepting a
+        // short tail would let a truncated pubkey stand in for the owner.
+        let mut short_owner = encode_moderation_extra(
+            "hi",
+            &banned,
+            &[],
+            &ModerationTail { owner_pubkey: Some([0x99u8; 32]), ..Default::default() },
+        );
+        short_owner.truncate(short_owner.len() - 1);
+        assert!(decode_moderation_extra(&short_owner).is_none());
+    }
+
+    /// The moderation tail is how a member learns who owns a room, which epoch
+    /// it is on, and who may inherit it. Fields were appended over time, so
+    /// every prefix has to stay readable — a reader that rejected an older
+    /// record would lose all three facts, and one that accepted a partial field
+    /// would invent a truncated pubkey.
+    #[test]
+    fn every_prefix_of_the_moderation_tail_decodes_and_partials_do_not() {
+        let owner = [0x11u8; 32];
+        let nominee = [0x22u8; 32];
+        let full = ModerationTail {
+            owner_pubkey: Some(owner),
+            key_epoch: Some(9),
+            successor_nominee: Some(nominee),
+            claim_after_days: Some(14),
+            invites_owner_only: Some(true),
+            slow_mode_secs: Some(30),
+        };
+
+        let round_trip = |tail: &ModerationTail| -> ModerationTail {
+            let extra = encode_moderation_extra("hi", &[[0x01u8; 32]], &[[0x02u8; 32]], tail);
+            let (_, _, _, decoded) = decode_moderation_extra(&extra).expect("decodes");
+            decoded
+        };
+
+        // Every prefix survives, and stopping early does not fabricate the rest.
+        assert_eq!(round_trip(&full), full);
+        let no_slow = ModerationTail {
+            slow_mode_secs: None,
+            ..full
+        };
+        assert_eq!(round_trip(&no_slow), no_slow);
+        let no_invites = ModerationTail {
+            invites_owner_only: None,
+            ..no_slow
+        };
+        assert_eq!(round_trip(&no_invites), no_invites);
+        let no_days = ModerationTail {
+            claim_after_days: None,
+            ..no_invites
+        };
+        assert_eq!(round_trip(&no_days), no_days);
+        let owner_and_epoch = ModerationTail {
+            successor_nominee: None,
+            ..no_days
+        };
+        assert_eq!(round_trip(&owner_and_epoch), owner_and_epoch);
+        let owner_only = ModerationTail {
+            owner_pubkey: Some(owner),
+            ..Default::default()
+        };
+        assert_eq!(round_trip(&owner_only), owner_only);
+        assert_eq!(
+            round_trip(&ModerationTail::default()),
+            ModerationTail::default()
+        );
+
+        // A later field without its predecessor cannot be located, so it is
+        // dropped on the way out rather than written somewhere unreadable.
+        let orphan = ModerationTail {
+            owner_pubkey: None,
+            key_epoch: Some(4),
+            successor_nominee: Some(nominee),
+            claim_after_days: Some(7),
+            invites_owner_only: None,
+            slow_mode_secs: Some(10),
+        };
+        assert_eq!(round_trip(&orphan), ModerationTail::default());
+
+        // Every partial field is malformed, not old. The lengths a writer can
+        // legitimately stop at are the running totals of the field widths.
+        const FULL_TAIL: usize = 32 + 8 + 32 + 2 + 1 + 2;
+        let legitimate = [0, 32, 40, 72, 74, 75, FULL_TAIL];
+        let base = encode_moderation_extra("hi", &[], &[], &full);
+        let prefix_len = base.len() - FULL_TAIL;
+        for tail_len in 0..=FULL_TAIL {
+            if legitimate.contains(&tail_len) {
+                continue;
+            }
+            let mut truncated = base.clone();
+            truncated.truncate(prefix_len + tail_len);
+            assert!(
+                decode_moderation_extra(&truncated).is_none(),
+                "a {tail_len}-byte tail is malformed"
+            );
+        }
+
+        // A field this build has never heard of is skipped, not treated as a
+        // reason to throw away the owner key and both lists with it.
+        let mut from_the_future = base.clone();
+        from_the_future.extend_from_slice(&[0xEE; 6]);
+        let (_, _, _, decoded) = decode_moderation_extra(&from_the_future)
+            .expect("a longer tail from a newer build still decodes");
+        assert_eq!(decoded, full);
+    }
+
+    #[test]
+    fn truncated_channel_trailer_is_rejected() {
+        let ident = channel::ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "x",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let truncated = &record.data[..record.data.len() - 1];
+        assert!(SignedRecord::from_wire(truncated, record.signature).is_none());
+        let mut blob = truncated.to_vec();
+        blob.extend_from_slice(&record.signature);
+        assert!(!SignedRecord::value_blob_is_authentic(&blob));
+    }
+
+    /// `decode_source_contact` carries the most length arithmetic in this file
+    /// — the 41-byte contact block plus a 174-byte buddy/endorsement trailer —
+    /// and the record-level fuzz essentially never reached it: a random buffer
+    /// gets there only if byte 0 happens to be `RECORD_TYPE_SOURCE` *and* the
+    /// random `u16` name length is small enough for the body to hold it, which
+    /// is a fraction of a percent per iteration. Fuzzing the decoder directly is
+    /// what the moderation test already does, and is the model here.
+    #[test]
+    fn decode_source_contact_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x50C0_17AC);
+
+        let plain = SourceContact {
+            ip: std::net::Ipv4Addr::new(203, 0, 113, 7),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [0x33; 32],
+            user_hash: None,
+            buddy: None,
+            callback_token: None,
+        };
+        let with_buddy = SourceContact {
+            flags: crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE,
+            user_hash: Some([0x44; 16]),
+            callback_token: Some([0x55; 16]),
+            buddy: Some(SourceBuddy {
+                ip: std::net::Ipv4Addr::new(198, 51, 100, 9),
+                udp_port: 4672,
+                noise_pub: [0x66; 32],
+                ed25519_pub: [0x77; 32],
+                endorsed_until: 1_900_000_000,
+                endorsement: [0x88; 64],
+            }),
+            ..plain
+        };
+        let mut seeds = Vec::new();
+        for sc in [plain, with_buddy] {
+            let mut buf = Vec::new();
+            encode_source_contact(&mut buf, &sc);
+            seeds.push(buf);
+        }
+
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            // Mostly random, with well-formed encodings and bit-flipped copies
+            // mixed in so the trailer's own length checks are actually reached.
+            let buf = match i % 7 {
+                0 => seeds[i % seeds.len()].clone(),
+                1 => {
+                    let mut b = seeds[i % seeds.len()].clone();
+                    if !b.is_empty() {
+                        let at = rng.gen_range(0..b.len());
+                        b[at] ^= 1 << rng.gen_range(0..8);
+                    }
+                    b
+                }
+                2 => {
+                    let mut b = seeds[i % seeds.len()].clone();
+                    let keep = rng.gen_range(0..=b.len());
+                    b.truncate(keep);
+                    b
+                }
+                _ => {
+                    let len = rng.gen_range(0..=400usize);
+                    let mut b = vec![0u8; len];
+                    rng.fill(&mut b[..]);
+                    b
+                }
+            };
+            // Offsets past the end included deliberately: the decoder has to
+            // refuse them rather than index into nothing.
+            let off = if i % 3 == 0 {
+                0
+            } else {
+                rng.gen_range(0..=buf.len().saturating_add(8))
+            };
+            if decode_source_contact(&buf, off).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a contact the decoder accepted"
+        );
+    }
+
+    /// The channel sub-decoders sit behind `channel_store_ok`, which is only
+    /// reached after an Ed25519 signature verifies — so random and bit-flipped
+    /// buffers cannot get to them, and the record-level fuzz's two deterministic
+    /// seeds are fixed at kinds 2 and 3. That left EPOCH, CLAIM and HANDOFF with
+    /// no fuzz input at all.
+    #[test]
+    fn decode_epoch_extra_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE70C_4EA5);
+
+        let mut well_formed = Vec::new();
+        well_formed.extend_from_slice(&[0x21u8; 32]);
+        well_formed.extend_from_slice(&1_900_000_000i64.to_le_bytes());
+        well_formed.extend_from_slice(&[0xEE; 48]);
+
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            let buf = match i % 5 {
+                0 => well_formed.clone(),
+                1 => {
+                    let mut b = well_formed.clone();
+                    let at = rng.gen_range(0..b.len());
+                    b[at] ^= 1 << rng.gen_range(0..8);
+                    b
+                }
+                2 => {
+                    let mut b = well_formed.clone();
+                    b.truncate(rng.gen_range(0..=b.len()));
+                    b
+                }
+                _ => {
+                    let len = rng.gen_range(0..=300usize);
+                    let mut b = vec![0u8; len];
+                    rng.fill(&mut b[..]);
+                    b
+                }
+            };
+            if decode_epoch_extra(&buf).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced an epoch blob the decoder accepted"
+        );
+    }
+
+    #[test]
+    fn decode_moderation_extra_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_E07A);
+        let well_formed = encode_moderation_extra(
+            "welcome ☕",
+            &[[0x11u8; 32], [0x22u8; 32]],
+            &[[0xAAu8; 32]],
+            &ModerationTail { owner_pubkey: Some([0x77u8; 32]), ..Default::default() },
+        );
+        let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[], &ModerationTail::default());
+        legacy.truncate(legacy.len() - 2);
+        let mut decoded_ok = 0usize;
+        for i in 0..2_000 {
+            let extra = match i {
+                0 => well_formed.clone(),
+                1 => legacy.clone(),
+                _ => {
+                    let len = rng.gen_range(0..=800);
+                    let mut buf = vec![0u8; len];
+                    rng.fill(&mut buf[..]);
+                    if i % 19 == 0 {
+                        buf = well_formed.clone();
+                        let at = rng.gen_range(0..buf.len());
+                        buf[at] ^= rng.gen_range(1u8..=255);
+                    }
+                    buf
+                }
+            };
+            if decode_moderation_extra(&extra).is_some() {
+                decoded_ok += 1;
+            }
+        }
+        let (welcome, bans, mods, fuzz_tail) = decode_moderation_extra(&well_formed).unwrap();
+        assert_eq!(welcome, "welcome ☕");
+        assert_eq!(bans.len(), 2);
+        assert_eq!(mods.len(), 1);
+        assert_eq!(fuzz_tail.owner_pubkey, Some([0x77u8; 32]));
+        assert!(
+            decoded_ok > 0,
+            "the fuzz never produced a buffer that reached decode_moderation_extra"
+        );
+    }
+
+    #[test]
+    fn channel_record_parse_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_51C6);
+        let ident = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = channel::public_join_secret(&ident.pubkey);
+        let presence = SignedRecord::channel_presence(
+            "Ada",
+            ident.channel_id,
+            ident.pubkey,
+            &join,
+            false,
+            3,
+            &[0x42u8; 32],
+            &member,
+        );
+        let moderation = SignedRecord::channel_moderation(
+            "rules",
+            "be kind",
+            &[[0x11u8; 32]],
+            &[[0xAAu8; 32]],
+            &ModerationTail { owner_pubkey: Some([0x77u8; 32]), ..Default::default() },
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("the fixture fits one record");
+        let mut presence_blob = presence.data.clone();
+        presence_blob.extend_from_slice(&presence.signature);
+        let mut moderation_blob = moderation.data.clone();
+        moderation_blob.extend_from_slice(&moderation.signature);
+        let mut parsed_ok = 0usize;
+        for i in 0..2_000 {
+            let buf = match i {
+                0 => presence_blob.clone(),
+                1 => moderation_blob.clone(),
+                _ => {
+                    let len = rng.gen_range(0..=1_200);
+                    let mut buf = vec![0u8; len];
+                    rng.fill(&mut buf[..]);
+                    if i % 21 == 0 {
+                        buf = if i % 2 == 0 {
+                            presence_blob.clone()
+                        } else {
+                            moderation_blob.clone()
+                        };
+                        let at = rng.gen_range(0..buf.len());
+                        buf[at] ^= rng.gen_range(1u8..=255);
+                    }
+                    buf
+                }
+            };
+            let _ = SignedRecord::from_value_blob(&buf);
+            let _ = SignedRecord::value_blob_is_authentic(&buf);
+            if SignedRecord::parse_channel_presence_member(&buf, &ident.channel_id, None).is_some()
+            {
+                parsed_ok += 1;
+            }
+            if SignedRecord::parse_channel_moderation(&buf, &ident.channel_id).is_some() {
+                parsed_ok += 1;
+            }
+            let _ = SignedRecord::parse_channel_presence_member(&buf, &[0u8; 16], None);
+            let _ = SignedRecord::parse_channel_moderation(&buf, &[0u8; 16]);
+        }
+        assert!(SignedRecord::parse_channel_presence_member(
+            &presence_blob,
+            &ident.channel_id,
+            None
+        )
+        .is_some());
+        assert!(
+            SignedRecord::parse_channel_moderation(&moderation_blob, &ident.channel_id).is_some()
+        );
+        assert!(
+            parsed_ok > 0,
+            "the fuzz never produced a buffer that reached the channel record parsers"
+        );
     }
 
     #[test]

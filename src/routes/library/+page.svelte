@@ -596,53 +596,63 @@
 
   let mounted = false;
   let busy = false;
+  /** Cleared by the first load that actually succeeds, not the first attempt.
+   *  A watchdog timeout or a backend error leaves it set so the table keeps
+   *  showing a spinner while the 3s scan poll retries, rather than announcing
+   *  an empty library the user may not have. */
+  let initialLoadDone = $state(false);
+  let firstLoadSlow = $state(false);
   let pendingRefresh = false;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let loadGen = 0;
 
   function debouncedRefresh() {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
   }
 
-  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<T>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('timeout')), ms);
-    });
-    // Clear the watchdog once either side settles so the loser timer doesn't
-    // linger (and can't reject after the real promise already resolved).
-    return Promise.race([promise, timeout]).finally(() => {
-      if (timer) clearTimeout(timer);
-    });
-  }
-
-  async function refresh() {
+  async function refresh(force = false) {
     if (!mounted) return;
-    if (busy) {
+    if (busy && !force) {
       pendingRefresh = true;
       return;
     }
+    const gen = ++loadGen;
     busy = true;
     pendingRefresh = false;
+    if (!initialLoadDone) firstLoadSlow = false;
+    const work = Promise.all([
+      getSharedFolders(),
+      getSharedFiles(),
+      getScanStatus(),
+      getFolderPriorities(),
+      getLibraryScanTruncated(),
+      getStatistics().catch(() => null),
+    ]);
+    // The watchdog must not discard the in-flight result. A large library can
+    // take longer than 5s, and racing Promise.race used to drop that payload
+    // while leaving initialLoadDone false — a spinner that never ended.
+    // Busy stays set so the 3s scan poll queues instead of stealing this
+    // generation; Retry passes `force` to abandon a hung load on purpose.
+    const timeoutId = setTimeout(() => {
+      if (!mounted || gen !== loadGen) return;
+      if (!initialLoadDone) {
+        firstLoadSlow = true;
+        lastLoadError = m.library_load_timeout();
+        error = lastLoadError;
+      }
+    }, 5000);
     try {
-      const [newFolders, newFiles, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await withTimeout(
-        Promise.all([
-          getSharedFolders(),
-          getSharedFiles(),
-          getScanStatus(),
-          getFolderPriorities(),
-          getLibraryScanTruncated(),
-          getStatistics().catch(() => null),
-        ]),
-        5000,
-      );
-      if (!mounted) return;
+      const [newFolders, newFiles, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await work;
+      if (!mounted || gen !== loadGen) return;
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
+      initialLoadDone = true;
+      firstLoadSlow = false;
       // Successful load: clear a previously-surfaced load error (but leave
       // any error a user action raised in the meantime untouched).
       if (lastLoadError !== null) {
@@ -677,31 +687,27 @@
         if (selectedPath && !present.has(selectedPath)) selectedPath = null;
       }
     } catch (e) {
-      // Tauri rejects `invoke()` with the raw `Result::Err` payload — a plain
-      // string for these commands, never an Error. Only the local watchdog
-      // above throws an Error, and only with the message 'timeout', so testing
-      // for `instanceof Error` here would swallow every real backend failure.
-      if (mounted && !(e instanceof Error && e.message === 'timeout')) {
-        console.error('Failed to load shared files:', e);
-        // Surface the failure in the UI banner only when there is no data to
-        // show (initial load / fully-empty library); a transient failure of a
-        // background poll while files are already listed stays silent to avoid
-        // flicker. Tracked via `lastLoadError` so the next success can clear it.
-        if (files.length === 0) {
-          lastLoadError = toErr(e);
-          error = lastLoadError;
-        }
+      if (!mounted || gen !== loadGen) return;
+      console.error('Failed to load shared files:', e);
+      // Surface the failure in the UI banner only when there is no data to
+      // show (initial load / fully-empty library); a transient failure of a
+      // background poll while files are already listed stays silent to avoid
+      // flicker. Tracked via `lastLoadError` so the next success can clear it.
+      if (files.length === 0) {
+        lastLoadError = toErr(e);
+        error = lastLoadError;
       }
     } finally {
-      if (mounted) {
+      clearTimeout(timeoutId);
+      if (mounted && gen === loadGen) {
         busy = false;
         if (pendingRefresh) {
           pendingRefresh = false;
           debouncedRefresh();
         }
+        void refreshMissingSet();
       }
     }
-    if (mounted) void refreshMissingSet();
   }
 
   function toErr(e: unknown): string {
@@ -900,6 +906,8 @@
   }
 
   async function handleReload() {
+    if (reloading) return;
+    reloading = true;
     error = null;
     // An explicit reload is a fresh user-initiated rescan, so clear any
     // prior "stopped by user" state. Otherwise the progress listener and
@@ -919,8 +927,15 @@
         scanning = false;
         error = toErr(e);
       }
+    } finally {
+      if (mounted) reloading = false;
     }
   }
+
+  /** Guards the Reload button only. The rescan itself runs on in the backend
+   *  and reports through `scanning`; this just stops a second click stacking
+   *  another one on top of it. */
+  let reloading = $state(false);
 
   let stopConfirmVisible = $state(false);
   let stoppingHashing = $state(false);
@@ -2583,7 +2598,7 @@
       {/if}
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
-    <button class="ghost" onclick={handleReload}>{m.library_reload()}</button>
+    <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
     <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>
@@ -3189,6 +3204,20 @@
         </svg>
         <p>{m.library_empty_no_matches()}</p>
         <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button></p>
+      </div>
+    {:else if sortedFiles.length === 0 && !initialLoadDone}
+      <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
+           succeeded, an empty table means unknown, not empty. Offering Add
+           Folder to someone whose library is merely still loading tells them
+           their shares are gone. -->
+      <div class="empty-state">
+        {#if firstLoadSlow}
+          <p>{m.library_load_timeout()}</p>
+          <button type="button" class="empty-action" onclick={() => { error = null; void refresh(true); }}>{m.common_retry()}</button>
+        {:else}
+          <div class="spinner lg"></div>
+          <p>{m.common_loading()}</p>
+        {/if}
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">

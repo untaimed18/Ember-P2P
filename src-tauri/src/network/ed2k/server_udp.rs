@@ -636,7 +636,7 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             }
             // eMule default: if flag says TCP obfuscation but no port, use the main TCP port
             if tcp_obf_port == 0 && (udp_flags & SRV_UDPFLG_TCPOBFUSCATION) != 0 {
-                tcp_obf_port = addr.port().saturating_sub(4) as u16;
+                tcp_obf_port = addr.port().saturating_sub(4);
             }
 
             Some(ServerUdpResponse::StatusResponse {

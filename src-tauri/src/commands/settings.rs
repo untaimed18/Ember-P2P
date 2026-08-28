@@ -449,6 +449,41 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let offers = settings.channel_file_offers.trim().to_ascii_lowercase();
+    if offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
+        && offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
+        && offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
+    {
+        settings.channel_file_offers = crate::types::CHANNEL_FILE_OFFERS_EVERYONE.to_string();
+        changed = true;
+    } else if offers != settings.channel_file_offers {
+        settings.channel_file_offers = offers;
+        changed = true;
+    }
+
+    // A username stored under the older, looser rule (spaces, punctuation, up
+    // to 32 bytes) is not a corrupt config — but `validate_settings` now
+    // refuses it, and on load that answer means backup-and-reset of every
+    // other setting. Repair it to the closest legal handle instead, and clear
+    // it when nothing legal is left: empty is a valid state that makes the
+    // Channels page ask for a new one.
+    if !settings.channel_username.is_empty()
+        && crate::commands::channels::sanitize_channel_username(&settings.channel_username).is_err()
+    {
+        let repaired: String = settings
+            .channel_username
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(crate::commands::channels::CHANNEL_USERNAME_MAX)
+            .collect();
+        settings.channel_username =
+            match crate::commands::channels::sanitize_channel_username(&repaired) {
+                Ok(name) => name,
+                Err(_) => String::new(),
+            };
+        changed = true;
+    }
+
     let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
     if freq != "daily" && freq != "weekly" && freq != "monthly" {
         settings.update_check_frequency = "daily".to_string();
@@ -562,6 +597,15 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_close_behavior_invalid",
             "Close behavior must be 'ask', 'tray', or 'exit'",
+        ));
+    }
+    if settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
+        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
+        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
+    {
+        return Err(coded(
+            "settings_channel_file_offers_invalid",
+            "Channel file offers must be 'everyone', 'friends', or 'nobody'",
         ));
     }
     if settings.update_check_frequency != "daily"
@@ -753,6 +797,9 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Nickname must be 128 bytes or fewer",
         ));
     }
+    if !settings.channel_username.is_empty() {
+        crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
+    }
     let is_filesystem_root = |path: &std::path::Path| {
         path.has_root()
             && !path
@@ -942,6 +989,7 @@ pub async fn update_settings(
     let mut settings = merge_renderer_settings(settings, &old_settings)?;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
+    settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
@@ -968,6 +1016,15 @@ pub async fn update_settings(
         .collect::<String>()
         .trim()
         .to_string();
+    settings.channel_username = settings
+        .channel_username
+        .chars()
+        .filter(|c| {
+            !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c)
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
     let shared_folders = std::mem::take(&mut settings.shared_folders);
     settings.shared_folders =
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
@@ -978,6 +1035,23 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    }
+
+    if settings.channel_username != old_settings.channel_username {
+        if settings.channel_username.is_empty() {
+            if !old_settings.channel_username.is_empty() {
+                return Err(coded(
+                    "channels_username_required",
+                    "Choose a Channel username before creating or joining a room",
+                ));
+            }
+        } else {
+            settings.channel_username = crate::commands::channels::claim_username_on_registry(
+                &state,
+                &settings.channel_username,
+            )
+            .await?;
+        }
     }
 
     if settings.settings_revision != old_settings.settings_revision {
@@ -1660,9 +1734,206 @@ pub async fn open_ember_website() -> Result<(), String> {
     })
 }
 
+/// The official site, for copying. Same constant [`open_ember_website`] opens
+/// so the clipboard and the browser cannot drift.
+#[tauri::command]
+pub fn get_ember_website_url() -> String {
+    EMBER_WEBSITE_URL.to_string()
+}
+
+/// Where `ember.log` and its rotated copies live.
+///
+/// Resolved here rather than taken from the renderer, so neither this nor
+/// [`open_log_folder`] can be pointed somewhere else. Shown as text as well as
+/// opened: a bug report needs the path even when the file manager will not
+/// launch, and a tester on a locked-down machine can still get there by hand.
+#[tauri::command]
+pub fn get_log_folder_path() -> String {
+    crate::storage::paths::resolve_data_dir()
+        .join("logs")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Reveal the log folder in the system file manager.
+///
+/// Logs are pseudonymised — IPs, paths, hashes and search text are replaced
+/// with tokens — unless `EMBER_VERBOSE_DIAGNOSTICS` was set for the session,
+/// which stays env-only precisely so this button cannot produce a file that is
+/// unsafe to send anyone.
+#[tauri::command]
+pub async fn open_log_folder() -> Result<(), String> {
+    let dir = crate::storage::paths::resolve_data_dir().join("logs");
+    // Created rather than reported missing: file logging makes this on startup,
+    // but if that failed then an empty folder still answers "where do the logs
+    // go" better than an error the user cannot act on.
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        coded_ctx(
+            "settings_open_logs_failed",
+            "Failed to open the log folder",
+            e,
+        )
+    })?;
+    opener::open(&dir).map_err(|e| {
+        coded_ctx(
+            "settings_open_logs_failed",
+            "Failed to open the log folder",
+            e,
+        )
+    })
+}
+
+/// Longest share caption the frontend may send. Tweet-sized; anything larger
+/// is not a caption, it is a way to stuff a query string.
+const EMBER_SHARE_TEXT_MAX: usize = 280;
+
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Intent URL for a named share target. The site is always
+/// [`EMBER_WEBSITE_URL`]; `target` is an allowlist, not a URL.
+fn ember_share_intent_url(target: &str, text: &str) -> Result<String, String> {
+    if text.len() > EMBER_SHARE_TEXT_MAX {
+        return Err(coded(
+            "settings_share_text_too_long",
+            "Share text is too long",
+        ));
+    }
+    if text.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        return Err(coded(
+            "settings_share_text_invalid",
+            "Share text contains invalid characters",
+        ));
+    }
+    let url_q = percent_encode_query(EMBER_WEBSITE_URL);
+    let text_q = percent_encode_query(text);
+    let intent = match target {
+        "x" => format!("https://x.com/intent/tweet?url={url_q}&text={text_q}"),
+        "facebook" => format!("https://www.facebook.com/sharer/sharer.php?u={url_q}"),
+        "reddit" => format!("https://www.reddit.com/submit?url={url_q}&title={text_q}"),
+        "bluesky" => format!("https://bsky.app/intent/compose?text={text_q}%20{url_q}"),
+        "linkedin" => format!("https://www.linkedin.com/sharing/share-offsite/?url={url_q}"),
+        "telegram" => format!("https://t.me/share/url?url={url_q}&text={text_q}"),
+        "whatsapp" => format!("https://api.whatsapp.com/send?text={text_q}%20{url_q}"),
+        "email" => {
+            let body_q = percent_encode_query(&format!("{text}\n\n{EMBER_WEBSITE_URL}"));
+            format!("mailto:?subject={text_q}&body={body_q}")
+        }
+        _ => {
+            return Err(coded(
+                "settings_unknown_share_target",
+                "Unknown share target",
+            ))
+        }
+    };
+    Ok(intent)
+}
+
+/// Open a share sheet for the official Ember website in the default browser
+/// (or the mail client, for email).
+///
+/// `target` is a name (`x`, `facebook`, …), never a URL. The site itself is
+/// the same hardcoded constant [`open_ember_website`] uses, so a compromised
+/// renderer cannot point this at an arbitrary host.
+#[tauri::command]
+pub async fn open_ember_share(target: String, text: String) -> Result<(), String> {
+    let intent = ember_share_intent_url(&target, &text)?;
+    opener::open(&intent).map_err(|e| {
+        coded_ctx(
+            "settings_open_share_failed",
+            "Failed to open the share link",
+            e,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ember_share_intents_stay_on_allowlisted_hosts_and_the_official_site() {
+        let text = "Ember P2P";
+        let encoded_site = percent_encode_query(EMBER_WEBSITE_URL);
+
+        let x = ember_share_intent_url("x", text).unwrap();
+        assert!(x.starts_with("https://x.com/intent/tweet?"));
+        assert!(x.contains(&encoded_site));
+
+        let facebook = ember_share_intent_url("facebook", text).unwrap();
+        assert!(facebook.starts_with("https://www.facebook.com/sharer/sharer.php?"));
+        assert!(facebook.contains(&encoded_site));
+
+        let reddit = ember_share_intent_url("reddit", text).unwrap();
+        assert!(reddit.starts_with("https://www.reddit.com/submit?"));
+        assert!(reddit.contains(&encoded_site));
+
+        let bluesky = ember_share_intent_url("bluesky", text).unwrap();
+        assert!(bluesky.starts_with("https://bsky.app/intent/compose?"));
+        assert!(bluesky.contains(&encoded_site));
+
+        let linkedin = ember_share_intent_url("linkedin", text).unwrap();
+        assert!(linkedin.starts_with("https://www.linkedin.com/sharing/share-offsite/?"));
+        assert!(linkedin.contains(&encoded_site));
+
+        let telegram = ember_share_intent_url("telegram", text).unwrap();
+        assert!(telegram.starts_with("https://t.me/share/url?"));
+        assert!(telegram.contains(&encoded_site));
+
+        let whatsapp = ember_share_intent_url("whatsapp", text).unwrap();
+        assert!(whatsapp.starts_with("https://api.whatsapp.com/send?"));
+        assert!(whatsapp.contains(&encoded_site));
+
+        let email = ember_share_intent_url("email", text).unwrap();
+        assert!(email.starts_with("mailto:?"));
+        assert!(email.contains(&encoded_site));
+
+        let encoded_text = percent_encode_query(text);
+        assert!(x.contains(&encoded_text), "X caption must be encoded into the intent");
+        assert!(reddit.contains(&encoded_text));
+        assert!(bluesky.contains(&encoded_text));
+        assert!(telegram.contains(&encoded_text));
+        assert!(whatsapp.contains(&encoded_text));
+        assert!(email.contains(&encoded_text));
+    }
+
+    #[test]
+    fn ember_share_encodes_text_so_it_cannot_inject_query_params() {
+        let hijack = "hi&url=https://evil.example/";
+        let x = ember_share_intent_url("x", hijack).unwrap();
+        assert!(
+            !x.contains("&url=https://evil.example/"),
+            "raw ampersands in caption must not add query parameters"
+        );
+        assert!(x.contains(&percent_encode_query(hijack)));
+        assert!(x.contains(&percent_encode_query(EMBER_WEBSITE_URL)));
+    }
+
+    #[test]
+    fn ember_share_rejects_unknown_targets_and_overlong_text() {
+        assert!(ember_share_intent_url("https://evil.example/", "hi").is_err());
+        assert!(ember_share_intent_url("javascript", "hi").is_err());
+        assert!(ember_share_intent_url("X", "hi").is_err(), "allowlist is lowercase");
+        let too_long = "n".repeat(EMBER_SHARE_TEXT_MAX + 1);
+        assert!(ember_share_intent_url("x", &too_long).is_err());
+        assert!(ember_share_intent_url("x", "ok\0no").is_err());
+    }
+
+    #[test]
+    fn get_ember_website_url_is_the_hardcoded_site() {
+        assert_eq!(get_ember_website_url(), EMBER_WEBSITE_URL);
+        assert!(EMBER_WEBSITE_URL.starts_with("https://"));
+    }
 
     #[test]
     fn config_write_failure_restores_exact_approved_root_snapshot() {
@@ -1730,14 +2001,55 @@ mod tests {
         }
     }
 
+    /// Tightening the Channel username to 2–12 alphanumerics made every
+    /// handle stored under the old 32-byte rule fail `validate_settings` — and
+    /// on load that answer backs up `config.json` and resets *every* setting.
+    /// Soft repair has to salvage those instead.
+    #[test]
+    fn a_legacy_channel_username_is_repaired_not_treated_as_corrupt() {
+        for (stored, expected) in [
+            ("Ada Lovelace", "AdaLovelace"),
+            ("ada_lovelace_the_first", "adalovelacet"),
+            ("Ada!", "Ada"),
+            ("!!", ""),
+            ("日本語", ""),
+        ] {
+            let mut settings = AppSettings {
+                channel_username: stored.to_string(),
+                ..AppSettings::default()
+            };
+            assert!(
+                soft_repair_settings(&mut settings),
+                "{stored:?} needs repairing"
+            );
+            assert_eq!(settings.channel_username, expected, "repairing {stored:?}");
+            validate_settings(&settings)
+                .unwrap_or_else(|e| panic!("repaired {stored:?} must load: {e}"));
+        }
+    }
+
+    /// A handle that already obeys the rule must survive untouched, or a save
+    /// would silently rename the user in every room.
+    #[test]
+    fn a_valid_channel_username_is_left_alone() {
+        let mut settings = AppSettings {
+            channel_username: "Ada1".to_string(),
+            ..AppSettings::default()
+        };
+        soft_repair_settings(&mut settings);
+        assert_eq!(settings.channel_username, "Ada1");
+    }
+
     /// An empty download folder used to skip the path-safety block instead of
     /// failing it, then compose the relative path `Downloads` against the
     /// process CWD — never created, never registered as an approved root, so
     /// every download failed with nothing to point the user at.
     #[test]
     fn empty_download_folder_is_rejected_not_skipped() {
-        let mut settings = AppSettings::default();
-        settings.download_folder = String::new();
+        let settings = AppSettings {
+            download_folder: String::new(),
+            ..AppSettings::default()
+        };
         let err = validate_settings(&settings).expect_err("an empty download folder must fail");
         assert!(
             err.contains("settings_download_folder_not_picked"),
@@ -1780,12 +2092,14 @@ mod tests {
 
     #[test]
     fn soft_repair_clamps_ranges_and_enums() {
-        let mut settings = AppSettings::default();
-        settings.tcp_port = 0;
-        settings.max_concurrent_downloads = 999;
-        settings.spam_filter_profile = "nope".to_string();
-        settings.uss_enabled = true;
-        settings.max_upload_speed = 0;
+        let mut settings = AppSettings {
+            tcp_port: 0,
+            max_concurrent_downloads: 999,
+            spam_filter_profile: "nope".to_string(),
+            uss_enabled: true,
+            max_upload_speed: 0,
+            ..AppSettings::default()
+        };
         assert!(soft_repair_settings(&mut settings));
         assert_ne!(settings.tcp_port, 0);
         assert_eq!(settings.max_concurrent_downloads, 50);
@@ -1796,17 +2110,21 @@ mod tests {
 
     #[test]
     fn soft_repair_forces_friend_session_encryption_on() {
-        let mut settings = AppSettings::default();
-        settings.friend_session_encryption = false;
+        let mut settings = AppSettings {
+            friend_session_encryption: false,
+            ..AppSettings::default()
+        };
         assert!(soft_repair_settings(&mut settings));
         assert!(settings.friend_session_encryption);
     }
 
     #[test]
     fn uss_requires_nonzero_upload_limit() {
-        let mut settings = AppSettings::default();
-        settings.uss_enabled = true;
-        settings.max_upload_speed = 0;
+        let mut settings = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 0,
+            ..AppSettings::default()
+        };
         let err = validate_settings(&settings).expect_err("USS + unlimited must fail");
         assert!(
             err.contains("settings_uss_requires_upload_limit"),
@@ -1956,9 +2274,11 @@ mod tests {
 
     #[test]
     fn renderer_settings_cannot_replace_backend_owned_fields() {
-        let mut authoritative = AppSettings::default();
-        authoritative.shared_folders = vec!["/trusted/share".into()];
-        authoritative.default_shared_folder_seeded = true;
+        let mut authoritative = AppSettings {
+            shared_folders: vec!["/trusted/share".into()],
+            default_shared_folder_seeded: true,
+            ..AppSettings::default()
+        };
         authoritative
             .folder_priorities
             .insert("/trusted/share".into(), "high".into());

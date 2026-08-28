@@ -470,20 +470,19 @@ impl SearchState {
                 self.store_pending.remove(&contact_id);
                 self.store_pending_times.remove(&contact_id);
             }
-            KadMessage::KadReq { .. } => {
+            KadMessage::KadReq { .. }
                 // `take_priority_queries` removes the contact from the eager
                 // queue. Reinsert every unsent lookup request at the front;
                 // regular `next_to_query` contacts are safe here too, and this
                 // preserves the intended immediate priority on the retry.
                 if !self.queried.contains(&contact_id)
                     && !self.priority_queries.iter().any(|c| c.id == contact_id)
-                {
+                => {
                     if let Some(contact) = self.closest.iter().find(|c| c.id == contact_id).cloned()
                     {
                         self.priority_queries.insert(0, contact);
                     }
                 }
-            }
             _ => {}
         }
     }

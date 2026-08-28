@@ -759,12 +759,9 @@ pub async fn register_punch_with_ip(
     our_ember_hash_for_identity: &[u8; 16],
 ) -> Result<(), String> {
     require_https(rendezvous_url)?;
-    let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
     if matches!(advertised_ip, IpAddr::V6(_)) {
         return Err("punch registration rejects IPv6 until end-to-end verify lands".to_string());
     }
-    let (from_id, from_raw) = punch_identity(from_ember_hash);
-    let (target_id, target_raw) = punch_identity(target_ember_hash);
     let ts = crate::network::rendezvous::current_timestamp();
     let epoch = super::crypto::pairwise_capability_epoch(ts);
     let our_pubkey = our_punch_pubkey(secret_key);
@@ -784,6 +781,43 @@ pub async fn register_punch_with_ip(
         epoch,
     )
     .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
+    register_punch_with_capability(
+        rendezvous_url,
+        from_ember_hash,
+        target_ember_hash,
+        capability,
+        epoch,
+        port,
+        nat_type,
+        advertised_ip,
+        secret_key,
+    )
+    .await
+}
+
+/// Register a punch using a pre-derived capability (channel gossip neighbors).
+///
+/// Skips the friend identity oracle so a room peer cannot be confused with
+/// a friend punch slot.
+pub async fn register_punch_with_capability(
+    rendezvous_url: &str,
+    from_ember_hash: &[u8; 16],
+    target_ember_hash: &[u8; 16],
+    capability: [u8; 32],
+    epoch: i64,
+    port: u16,
+    nat_type: u8,
+    advertised_ip: IpAddr,
+    secret_key: &[u8; 32],
+) -> Result<(), String> {
+    require_https(rendezvous_url)?;
+    let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
+    if matches!(advertised_ip, IpAddr::V6(_)) {
+        return Err("punch registration rejects IPv6 until end-to-end verify lands".to_string());
+    }
+    let (from_id, from_raw) = punch_identity(from_ember_hash);
+    let (target_id, target_raw) = punch_identity(target_ember_hash);
+    let ts = crate::network::rendezvous::current_timestamp();
     let nonce = punch_nonce();
     let (_, _, route) = punch_register_wire(protocol);
     let signed = build_punch_register_message(
@@ -2713,7 +2747,7 @@ mod tests {
             QUIC_ACCEPT_ORDINARY_CAP + QUIC_ACCEPT_RESERVED_FRIENDS,
             QUIC_ACCEPT_INFLIGHT_CAP
         );
-        assert!(QUIC_HANDSHAKE_OVERFLOW_CAP > 0);
+        const _: () = assert!(QUIC_HANDSHAKE_OVERFLOW_CAP > 0);
         assert_eq!(QUIC_PENDING_PER_IP, 4);
     }
 

@@ -1145,15 +1145,14 @@ impl ServerList {
 
     /// Inverse lookup: given an inbound UDP `(src_ip, src_port)`, find
     /// which server it belongs to and return:
-    ///   * `base_key`  — server's `dwServerUDPKey` for obfuscation,
-    ///                   or 0 if obfuscation isn't applicable here
-    ///                   (still returned for the canonicalisation path)
-    ///   * `tcp_port`  — server's canonical TCP port, used to
-    ///                   normalise the recv source addr so downstream
-    ///                   handlers' `addr.port() - 4` arithmetic
-    ///                   continues to give the right value even when
-    ///                   the reply arrived from a non-standard
-    ///                   `obfuscation_port_udp`.
+    ///
+    /// * `base_key` — server's `dwServerUDPKey` for obfuscation, or 0 if
+    ///   obfuscation isn't applicable here (still returned for the
+    ///   canonicalisation path).
+    /// * `tcp_port` — server's canonical TCP port, used to normalise the recv
+    ///   source addr so downstream handlers' `addr.port() - 4` arithmetic
+    ///   continues to give the right value even when the reply arrived from a
+    ///   non-standard `obfuscation_port_udp`.
     ///
     /// Returns `None` only when no server in the list matches the
     /// given source `(ip, port)` pair via either the standard UDP

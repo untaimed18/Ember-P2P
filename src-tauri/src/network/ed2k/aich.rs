@@ -153,7 +153,7 @@ pub(crate) fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8;
         return all_leaves[0];
     }
 
-    let num_parts = ((file_size as u64 + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize;
+    let num_parts = ((file_size + PARTSIZE as u64 - 1) / PARTSIZE as u64) as usize;
     if num_parts <= 1 {
         return build_tree_recursive(all_leaves, true);
     }
@@ -180,7 +180,7 @@ fn compute_all_part_hashes(
     let part_is_left = compute_part_is_left(num_parts);
     let mut part_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_parts);
     let mut offset = 0;
-    for p in 0..num_parts {
+    for (p, &is_left) in part_is_left.iter().enumerate() {
         let part_data_size = if p < num_parts - 1 {
             PARTSIZE
         } else {
@@ -197,7 +197,7 @@ fn compute_all_part_hashes(
         if part_leaves.len() == 1 {
             part_hashes.push(part_leaves[0]);
         } else {
-            part_hashes.push(build_tree_recursive(part_leaves, part_is_left[p]));
+            part_hashes.push(build_tree_recursive(part_leaves, is_left));
         }
         offset = end;
     }
@@ -978,7 +978,7 @@ mod tests {
     fn corrupt_blocks_from_aich_recovery_roundtrip() {
         let data = vec![0x42u8; AICH_BLOCK_SIZE * 2];
         let trusted = AICHRecoveryHashSet::build_from_data(&data);
-        let recovery = trusted.create_part_recovery_data(0, PARTSIZE as usize);
+        let recovery = trusted.create_part_recovery_data(0, PARTSIZE);
         let mut bad = data.clone();
         bad[AICH_BLOCK_SIZE + 10] ^= 0xFF;
         let corrupt = corrupt_blocks_from_aich_recovery(

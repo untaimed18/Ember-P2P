@@ -1363,7 +1363,7 @@ where
                 ));
             }
             Err(_) => {
-                return InSessionRequeueResult::Timeout(format!("read timeout during re-queue"));
+                return InSessionRequeueResult::Timeout("read timeout during re-queue".to_string());
             }
         };
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -1745,7 +1745,9 @@ impl MultiSourceDownload {
             // real rarity balancing takes over on the second round,
             // once we've learned the peer's actual bitmap via
             // `OP_FILESTATUS`.
-            for src_idx in 0..self.sources.len() {
+            // `source_parts` is built one entry per source, so iterating it is
+            // the same walk as indexing by source.
+            for (src_idx, chosen_for_src) in source_parts.iter_mut().enumerate() {
                 let src = &self.sources[src_idx];
                 let src_is_unknown = src.available_parts.is_empty();
 
@@ -1766,7 +1768,7 @@ impl MultiSourceDownload {
                 };
 
                 if let Some(p) = chosen_part {
-                    source_parts[src_idx].push(p);
+                    chosen_for_src.push(p);
                     part_source_count[p] += 1;
                     assigned[p] = true;
                     active.push(p);
@@ -1782,8 +1784,8 @@ impl MultiSourceDownload {
             // pass — pick the lowest non-excluded part rather than
             // letting the rarity selector re-randomise ties onto a
             // rare tail we don't yet know the peer can serve.
-            for src_idx in 0..self.sources.len() {
-                if !source_parts[src_idx].is_empty() {
+            for (src_idx, chosen_for_src) in source_parts.iter_mut().enumerate() {
+                if !chosen_for_src.is_empty() {
                     continue;
                 }
                 let src = &self.sources[src_idx];
@@ -1816,7 +1818,7 @@ impl MultiSourceDownload {
                 };
 
                 if let Some(p) = chosen_part {
-                    source_parts[src_idx].push(p);
+                    chosen_for_src.push(p);
                     part_source_count[p] += 1;
                 }
             }
@@ -4740,11 +4742,11 @@ async fn download_parts_from_source(
             }
 
             let mut conn_is_obf = false;
-            let (mut rr, mut ww): (DynRead, DynWrite) = if (prefer_obf || force_obf)
-                && !force_plain
-                && peer_hash_opt.is_some()
-            {
-                let peer_hash = peer_hash_opt.unwrap();
+            // Obfuscation needs the peer hash, so the hash and the policy are
+            // one condition rather than a policy check followed by an unwrap.
+            let obfuscate_with =
+                peer_hash_opt.filter(|_| (prefer_obf || force_obf) && !force_plain);
+            let (mut rr, mut ww): (DynRead, DynWrite) = if let Some(peer_hash) = obfuscate_with {
                 debug!(
                     "Source {} attempting obfuscated handshake (attempt {})",
                     _src_idx, attempt
@@ -6604,9 +6606,9 @@ async fn download_parts_from_source(
                 } else {
                     source_available.clone()
                 };
-                for p in 0..avail.len() {
+                for (p, has_part) in avail.iter_mut().enumerate() {
                     if peer_known_missing(p) {
-                        avail[p] = false;
+                        *has_part = false;
                     }
                 }
                 let pp = control.is_preview_priority();
@@ -6953,7 +6955,7 @@ async fn download_parts_from_source(
             // overall queue-wait timeout are both evaluated while we wait. A
             // tick expiry with no packet is NORMAL while queued (it is NOT the
             // timeout — that is the `elapsed > queue_wait_secs` check above).
-            let poll_secs = queue_wait_secs.saturating_sub(elapsed).min(5).max(1);
+            let poll_secs = queue_wait_secs.saturating_sub(elapsed).clamp(1, 5);
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(poll_secs),
                 read_packet_async_ms(&mut *reader),
@@ -7436,11 +7438,7 @@ async fn download_parts_from_source(
                     .map(|&(gs, ge)| {
                         let s = gs.max(ps);
                         let e = ge.min(pe);
-                        if s < e {
-                            e - s
-                        } else {
-                            0
-                        }
+                        e.saturating_sub(s)
                     })
                     .sum()
             };
@@ -7754,11 +7752,11 @@ async fn download_parts_from_source(
                             // Tag the error so `classify_error` can surface
                             // it distinctly in the UI and so the log grep
                             // is easy.
-                            return Err(anyhow::Error::from(e).context(
+                            return Err(e.context(
                             "stage:peer_dropped_after_accept peer FINed after OP_REQUESTPARTS with 0 bytes received",
                         ));
                         }
-                        return Err(e.into());
+                        return Err(e);
                     }
                     Err(()) => {
                         if outstanding_ranges.is_empty() && sent_idx >= batches.len() {
@@ -7786,8 +7784,7 @@ async fn download_parts_from_source(
                                 // outstanding for this part (indices 0..sent_idx).
                                 // Re-sending already-requested ranges is safe: the
                                 // gap tracker ignores bytes for gaps already filled.
-                                for i in 0..sent_idx {
-                                    let batch = &batches[i];
+                                for batch in &batches[..sent_idx] {
                                     let (req_payload, req_proto, req_op) = if needs_i64 {
                                         (
                                             build_request_parts_i64(file_hash, batch),
@@ -9014,11 +9011,7 @@ async fn download_parts_from_source(
                     .map(|&(gs, ge)| {
                         let s = gs.max(ps);
                         let e = ge.min(pe);
-                        if s < e {
-                            e - s
-                        } else {
-                            0
-                        }
+                        e.saturating_sub(s)
                     })
                     .sum()
             };
@@ -9541,7 +9534,7 @@ async fn download_parts_from_source(
         // Cap re-queue wait at the configured slot wait but never less
         // than 60s (eMule's queue rotation interval is typically 30-120s
         // depending on peer load and our queue position).
-        let requeue_timeout_secs = queue_wait_secs.max(60).min(180);
+        let requeue_timeout_secs = queue_wait_secs.clamp(60, 180);
         info!(
         "DIAG: source {} ({}) attempting in-session re-queue after OUTOFPARTREQS (timeout={}s, src_transferred={})",
         _src_idx, addr, requeue_timeout_secs, src_transferred,
@@ -10696,7 +10689,7 @@ where
             }
             None => out.push(0),
         }
-        ember_trailer.extend_from_slice(&ember.map(|digest| *digest).unwrap_or([0u8; 32]));
+        ember_trailer.extend_from_slice(&ember.copied().unwrap_or([0u8; 32]));
         count += 1;
     }
     out[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());

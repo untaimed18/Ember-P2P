@@ -5,12 +5,20 @@
     downloadNodesDat,
     downloadIpfilter,
     openEmberWebsite,
+    getLogFolderPath,
+    openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
+  import {
+    CHANNEL_USERNAME_MAX,
+    isValidChannelUsername,
+    sanitizeChannelUsernameInput,
+  } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
+  import { hiddenChannels, ignoredMembers, mutedChannels, toggleMemberIgnore } from '$lib/stores/channels';
   import { get } from 'svelte/store';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import { notifySpamFilterReset } from '$lib/stores/search';
@@ -37,7 +45,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatSize } from '$lib/utils';
+  import { formatSize, shortPubkey } from '$lib/utils';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
@@ -128,6 +136,30 @@
       await openEmberWebsite();
     } catch (e) {
       websiteOpenError = translateError(e);
+    }
+  }
+
+  /** Where `ember.log` lives. Resolved once so the path is on screen to copy
+   *  into a bug report whether or not the folder will open. */
+  let logFolderPath = $state('');
+  let logsOpenError = $state('');
+
+  $effect(() => {
+    getLogFolderPath()
+      .then((path) => {
+        logFolderPath = path;
+      })
+      .catch(() => {
+        // Only the displayed path is lost; the button still works.
+      });
+  });
+
+  async function revealLogs() {
+    logsOpenError = '';
+    try {
+      await openLogFolder();
+    } catch (e) {
+      logsOpenError = translateError(e);
     }
   }
 
@@ -237,11 +269,19 @@
     }
   }
 
-  function clearRestoreState() {
+  function resetLocalRestoreFields() {
     restoreSource = null;
     restorePreview = null;
     restorePassphrase = '';
-    void clearPickedBackup();
+  }
+
+  async function clearRestoreState() {
+    resetLocalRestoreFields();
+    try {
+      await clearPickedBackup();
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+    }
   }
 
   async function handleExportBackup() {
@@ -314,8 +354,11 @@
     showBackupMsg(m.settings_backup_restoring(), false);
     try {
       restoreStaged = await importBackup(restorePassphrase);
-      clearRestoreState();
+      resetLocalRestoreFields();
       backupMessage = null;
+      // Import already succeeded. Clearing the picker mutex must not reuse
+      // the restore-failed toast — a stuck mutex is not a failed restore.
+      await clearPickedBackup().catch(() => {});
       await refreshPendingRestore();
       showRestoreRestartPrompt = true;
     } catch (e) {
@@ -428,7 +471,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'backup' | 'about';
   let activeSection: SettingsSection = $state('general');
 
   const sections: SettingsSection[] = [
@@ -438,6 +481,7 @@
     'network',
     'security',
     'friends',
+    'channels',
     'search',
     'backup',
     'about',
@@ -451,6 +495,7 @@
       case 'network': return m.settings_section_network();
       case 'security': return m.settings_section_security();
       case 'friends': return m.settings_section_friends();
+      case 'channels': return m.settings_section_channels();
       case 'search': return m.settings_section_search();
       case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
@@ -601,6 +646,9 @@
     // authoritative byte check (multi-byte UTF-8 can exceed it).
     if (new TextEncoder().encode(s.nickname).length > 128) {
       return { error: m.error_settings_nickname_too_long(), adjusted: false };
+    }
+    if (s.channel_username.trim() && !isValidChannelUsername(s.channel_username)) {
+      return { error: m.error_channels_username_invalid(), adjusted: false };
     }
     if (!s.download_folder.trim()) {
       return { error: m.settings_validation_folder_empty(), adjusted: false };
@@ -756,6 +804,7 @@
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_browse_disabled: settings.friend_browse_disabled,
         friend_session_encryption: true,
+        channel_file_offers: settings.channel_file_offers,
       });
     }
     if (friendTogglePersistInFlight) {
@@ -776,6 +825,7 @@
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_browse_disabled: settings.friend_browse_disabled,
             friend_session_encryption: true,
+            channel_file_offers: settings.channel_file_offers,
           };
           try {
             const result = await updateSettings(candidate);
@@ -787,6 +837,7 @@
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
+              baseline.channel_file_offers = result.settings.channel_file_offers;
               baseline.settings_revision = result.settings.settings_revision;
               originalSettings = JSON.stringify(baseline);
             }
@@ -797,6 +848,10 @@
           }
         }
       } while (friendTogglePersistPending);
+      // These persist without the Save button, which on a page where almost
+      // everything else needs it reads as "my change was ignored". Failure
+      // already rolls back and reports; success has to say so too.
+      showSaveMsg(m.settings_saved_automatically(), false, 2000);
     } catch (e) {
       // These are privacy controls, and the wire-level gates in the network
       // task read its own copy of the settings, which is only refreshed by a
@@ -810,6 +865,7 @@
           settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
+          settings.channel_file_offers = persisted.channel_file_offers;
           settings.settings_revision = persisted.settings_revision;
         }
         // Move the baseline with it. If the revision advanced out from under us
@@ -821,6 +877,7 @@
           baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
+          baseline.channel_file_offers = persisted.channel_file_offers;
           baseline.settings_revision = persisted.settings_revision;
           originalSettings = JSON.stringify(baseline);
         }
@@ -1061,6 +1118,7 @@
   // delete, IP-filter range remove, etc.) — same focus trap, same dark
   // theme, same Escape-to-cancel.
   let spamResetConfirmOpen = $state(false);
+  let ignoredClearConfirmOpen = $state(false);
 
   function handleResetSpamData() {
     spamResetConfirmOpen = true;
@@ -1296,6 +1354,9 @@
         if (unmounted || gen !== antileechToggleGen) return;
         antileechSnapshot = snap;
       }
+      // Applied live, like the friend toggles. Worth confirming for a control
+      // that turns protection off in one click.
+      showSaveMsg(m.settings_saved_automatically(), false, 2000);
     } catch (e: unknown) {
       if (unmounted || gen !== antileechToggleGen) return;
       const text = m.settings_antileech_toggle_failed({ error: translateError(e) });
@@ -1403,6 +1464,14 @@
     settings.close_to_tray_behavior = behavior;
   }
 
+  /** Strips as you type, so the field can only ever hold a legal handle. A
+   *  named function rather than an inline handler: inside the template the
+   *  callback outlives the `{#if settings}` narrowing around it. */
+  function setChannelUsername(raw: string) {
+    if (!settings) return;
+    settings.channel_username = sanitizeChannelUsernameInput(raw);
+  }
+
   function handleRadioGroupKey(
     event: KeyboardEvent,
     values: string[],
@@ -1497,7 +1566,7 @@
     <button class="ghost" onclick={resetChanges} disabled={!hasUnsavedChanges || !settings}>
       {m.settings_discard()}
     </button>
-    <button class="save-btn" onclick={handleSave} disabled={saving || !settings}>
+    <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges}>
       {#if saving}
         <span class="spinner"></span> {m.settings_saving()}
       {:else}
@@ -1569,6 +1638,13 @@
                   <circle cx="14" cy="7" r="2.5"/>
                   <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                   <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
+                </svg>
+              {:else if section === 'channels'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="7.5" y1="3" x2="6" y2="17"/>
+                  <line x1="14" y1="3" x2="12.5" y2="17"/>
+                  <line x1="3" y1="7.5" x2="16.5" y2="7.5"/>
+                  <line x1="2.5" y1="12.5" x2="16" y2="12.5"/>
                 </svg>
               {:else if section === 'search'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2456,8 +2532,136 @@
 
           <!-- Friend session encryption stays forced on (see handleSave /
                applyFriendTogglesLive). Max friends + rendezvous URL remain
-               in AppSettings for config.json only — not everyday controls. -->
+               in AppSettings for config.json only — not everyday controls.
+               Channel file offers moved to the Channels section. -->
 
+        </div>
+      </section>
+
+      <!-- Channels -->
+      <section class="card" class:hidden={activeSection !== 'channels'}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="7.5" y1="3" x2="6" y2="17"/>
+              <line x1="14" y1="3" x2="12.5" y2="17"/>
+              <line x1="3" y1="7.5" x2="16.5" y2="7.5"/>
+              <line x1="2.5" y1="12.5" x2="16" y2="12.5"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.settings_section_channels()}</h3>
+            <p class="card-desc">{m.settings_channels_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          {#if $appSettings?.ember_native_enabled === false}
+            <p class="channels-notice" role="status">{m.settings_channels_ember_off()}</p>
+          {/if}
+
+          <div class="field">
+            <label for="channel_username">{m.settings_channel_username_label()}</label>
+            <input
+              id="channel_username"
+              value={settings.channel_username}
+              maxlength={CHANNEL_USERNAME_MAX}
+              spellcheck="false"
+              autocomplete="username"
+              autocapitalize="off"
+              placeholder={m.settings_channel_username_placeholder()}
+              oninput={(e) => setChannelUsername(e.currentTarget.value)}
+            />
+            <span class="hint">{m.settings_channel_username_hint()}</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
+            <select
+              id="channel-file-offers"
+              bind:value={settings.channel_file_offers}
+              onchange={() => void applyFriendTogglesLive()}
+            >
+              <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
+              <option value="friends">{m.settings_channel_file_offers_friends()}</option>
+              <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
+            </select>
+            <span class="hint">{m.settings_channel_file_offers_hint()}</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <!-- Muting and ignoring are per-device preferences kept in
+               localStorage, not room state, so nothing else in the app lists
+               them. Ignoring in particular is applied from a member's row and
+               hides them everywhere — without this there is no way to see who
+               is hidden, let alone undo it. -->
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_channels_muted_rooms()}</span>
+              <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
+            </div>
+            <div class="channels-pref-action">
+              <span class="channels-pref-count">{$mutedChannels.length}</span>
+              <button
+                type="button"
+                class="ghost"
+                disabled={$mutedChannels.length === 0}
+                onclick={() => { mutedChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+              >{m.settings_channels_clear()}</button>
+            </div>
+          </div>
+
+          <div class="field ignored-field">
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_channels_ignored_members()}</span>
+                <span class="hint">{m.settings_channels_ignored_members_hint()}</span>
+              </div>
+              <div class="channels-pref-action">
+                <span class="channels-pref-count">{$ignoredMembers.length}</span>
+                <button
+                  type="button"
+                  class="ghost"
+                  disabled={$ignoredMembers.length === 0}
+                  onclick={() => { ignoredClearConfirmOpen = true; }}
+                >{m.settings_channels_clear()}</button>
+              </div>
+            </div>
+            {#if $ignoredMembers.length > 0}
+              <ul class="ignored-list">
+                {#each $ignoredMembers as entry (entry.pubkey)}
+                  <li>
+                    <span class="ignored-name">
+                      <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
+                    </span>
+                    <button
+                      type="button"
+                      class="ghost"
+                      onclick={() => toggleMemberIgnore(entry.pubkey)}
+                    >{m.channels_unignore()}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_channels_hidden_rooms()}</span>
+              <span class="hint">{m.settings_channels_hidden_rooms_hint()}</span>
+            </div>
+            <div class="channels-pref-action">
+              <span class="channels-pref-count">{$hiddenChannels.length}</span>
+              <button
+                type="button"
+                class="ghost"
+                disabled={$hiddenChannels.length === 0}
+                onclick={() => { hiddenChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+              >{m.settings_channels_clear()}</button>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2643,20 +2847,60 @@
             </div>
             <p class="about-description">{m.about_dialog_description()}</p>
             <p class="about-license">{m.about_dialog_license({ license: appLicense })}</p>
-            <div class="about-website-row">
-              <button type="button" class="about-website-link" onclick={() => void openWebsite()}>
-                <span>{m.settings_about_website_btn()}</span>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M6.5 3.5H3.5A1.5 1.5 0 0 0 2 5v7.5A1.5 1.5 0 0 0 3.5 14H11a1.5 1.5 0 0 0 1.5-1.5V9.5" />
-                  <path d="M9.5 2H14v4.5" />
-                  <path d="M14 2 7.5 8.5" />
-                </svg>
+            <!-- One row per action, each with its own description beneath the
+                 label. Laid out as rows rather than link-plus-inline-hint: the
+                 two descriptions differ enough in length that side by side they
+                 left a ragged column, and the log path had nowhere to sit but
+                 loose under both of them. -->
+            <div class="about-actions">
+              <button type="button" class="about-action" onclick={() => void openWebsite()}>
+                <span class="about-action-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8" cy="8" r="6" />
+                    <path d="M2.2 6.4h11.6M2.2 9.6h11.6" />
+                    <path d="M8 2c-1.8 2-1.8 10 0 12 1.8-2 1.8-10 0-12z" />
+                  </svg>
+                </span>
+                <span class="about-action-body">
+                  <span class="about-action-title">{m.settings_about_website_btn()}</span>
+                  <span class="about-action-desc">{m.settings_about_website_hint()}</span>
+                  {#if websiteOpenError}
+                    <span class="feedback error" role="alert">{websiteOpenError}</span>
+                  {/if}
+                </span>
+                <span class="about-action-go" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9.5 2H14v4.5" />
+                    <path d="M14 2 7.5 8.5" />
+                    <path d="M6.5 3.5H3.5A1.5 1.5 0 0 0 2 5v7.5A1.5 1.5 0 0 0 3.5 14H11a1.5 1.5 0 0 0 1.5-1.5V9.5" />
+                  </svg>
+                </span>
               </button>
-              <span class="hint about-website-hint">{m.settings_about_website_hint()}</span>
+              <button type="button" class="about-action" onclick={() => void revealLogs()}>
+                <span class="about-action-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 2h4.5A1.5 1.5 0 0 1 14 6.5v5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z" />
+                  </svg>
+                </span>
+                <span class="about-action-body">
+                  <span class="about-action-title">{m.settings_about_logs_btn()}</span>
+                  <span class="about-action-desc">{m.settings_about_logs_hint()}</span>
+                  <!-- Inside the row it belongs to, and selectable: copying it
+                       into a bug report is the reason it is on screen at all. -->
+                  {#if logFolderPath}
+                    <code class="about-action-path">{logFolderPath}</code>
+                  {/if}
+                  {#if logsOpenError}
+                    <span class="feedback error" role="alert">{logsOpenError}</span>
+                  {/if}
+                </span>
+                <span class="about-action-go" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 4l4 4-4 4" />
+                  </svg>
+                </span>
+              </button>
             </div>
-            {#if websiteOpenError}
-              <span class="feedback error" role="alert">{websiteOpenError}</span>
-            {/if}
           </div>
 
           <div class="divider"></div>
@@ -2805,6 +3049,15 @@
   confirmLabel={m.settings_spam_reset_confirm()}
   danger={true}
   onconfirm={confirmResetSpamData}
+/>
+
+<ConfirmDialog
+  bind:open={ignoredClearConfirmOpen}
+  title={m.settings_channels_clear_ignored_title()}
+  message={m.settings_channels_clear_ignored_message()}
+  confirmLabel={m.settings_channels_clear()}
+  danger={true}
+  onconfirm={() => { ignoredMembers.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
 />
 
 <ConfirmDialog
@@ -3374,47 +3627,145 @@
     color: var(--text-muted);
   }
 
-  .about-website-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 8px 14px;
+  .channels-notice {
+    margin: 0 0 4px;
+    padding: 9px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 9%, transparent);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
   }
 
-  .about-website-link {
+  .channels-pref-action {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    color: var(--accent);
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-  }
-
-  .about-website-link svg {
-    width: 13px;
-    height: 13px;
+    gap: 10px;
     flex-shrink: 0;
   }
 
-  .about-website-link:hover {
-    filter: brightness(1.08);
+  .channels-pref-count {
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    min-width: 1.5ch;
+    text-align: right;
   }
 
-  .about-website-link:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: var(--radius-sm);
-  }
-
-  .about-website-hint {
+  .ignored-list {
+    list-style: none;
     margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
+
+  .ignored-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+
+  .ignored-name {
+    font-size: 13px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .about-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .about-action {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition:
+      background-color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease;
+  }
+
+  .about-action:hover,
+  .about-action:focus-visible {
+    background: var(--bg-hover);
+    border-color: var(--accent-dim);
+  }
+
+  .about-action-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+
+  .about-action-icon svg { width: 15px; height: 15px; }
+
+  .about-action-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .about-action-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .about-action-desc {
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .about-action-path {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+    user-select: text;
+    overflow-wrap: anywhere;
+  }
+
+  .about-action-go {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    align-self: center;
+    color: var(--text-muted);
+  }
+
+  .about-action-go svg { width: 14px; height: 14px; }
+
+  .about-action:hover .about-action-go { color: var(--accent); }
+
 
   .about-frequency-disabled {
     opacity: 0.55;

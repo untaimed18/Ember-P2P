@@ -44,20 +44,17 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const NAT_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum NatType {
     Open,
     FullCone,
     RestrictedCone,
     PortRestricted,
     Symmetric,
+    #[default]
     Unknown,
 }
 
-impl Default for NatType {
-    fn default() -> Self {
-        NatType::Unknown
-    }
-}
 
 impl NatType {
     /// Whether a hole-punch between two NAT types is likely to succeed.
@@ -68,15 +65,17 @@ impl NatType {
     /// the peer's type only after the punch request is already in flight.
     #[allow(dead_code)]
     pub fn can_punch_with(&self, other: &NatType) -> bool {
-        match (self, other) {
-            (NatType::Open, _) | (_, NatType::Open) => true,
-            (NatType::FullCone, _) | (_, NatType::FullCone) => true,
-            (NatType::RestrictedCone, NatType::RestrictedCone) => true,
-            (NatType::RestrictedCone, NatType::PortRestricted) => true,
-            (NatType::PortRestricted, NatType::RestrictedCone) => true,
-            (NatType::PortRestricted, NatType::PortRestricted) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (NatType::Open, _)
+                | (_, NatType::Open)
+                | (NatType::FullCone, _)
+                | (_, NatType::FullCone)
+                | (NatType::RestrictedCone, NatType::RestrictedCone)
+                | (NatType::RestrictedCone, NatType::PortRestricted)
+                | (NatType::PortRestricted, NatType::RestrictedCone)
+                | (NatType::PortRestricted, NatType::PortRestricted)
+        )
     }
 
     pub fn as_u8(&self) -> u8 {
@@ -487,11 +486,10 @@ pub(crate) fn parse_binding_response(
                     xor_mapped = parse_xor_mapped_address(attr_data);
                 }
             }
-            ATTR_MAPPED_ADDRESS => {
-                if mapped.is_none() {
+            ATTR_MAPPED_ADDRESS
+                if mapped.is_none() => {
                     mapped = parse_mapped_address(attr_data);
                 }
-            }
             _ => {}
         }
 

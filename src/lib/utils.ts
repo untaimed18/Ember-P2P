@@ -258,6 +258,33 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+/** First eight hex chars of a member or channel id, for UI labels. */
+export function shortPubkey(id: string): string {
+  if (!id) return '';
+  return id.slice(0, 8) + '\u2026';
+}
+
+/** Roster / chat label: append a short id when the nickname is shared in-room. */
+export function disambiguatedMemberName(
+  nickname: string | undefined | null,
+  pubkey: string,
+  roomNicknames: readonly (string | undefined | null)[],
+): string {
+  const nick = (nickname ?? '').trim();
+  if (!nick) return shortPubkey(pubkey);
+  const lower = nick.toLowerCase();
+  let hits = 0;
+  for (const other of roomNicknames) {
+    if ((other ?? '').trim().toLowerCase() === lower) {
+      hits += 1;
+      if (hits > 1) {
+        return `${nick} (${shortPubkey(pubkey)})`;
+      }
+    }
+  }
+  return nick;
+}
+
 /** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */
 export async function readFromClipboard(): Promise<string | null> {
   try {

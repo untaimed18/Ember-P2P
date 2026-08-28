@@ -19,6 +19,11 @@
 
 use super::*;
 
+// Ember Transfer replies travel to the UI through a Tauri command's `Result`,
+// so they carry the same coded shape the rest of the command layer uses and
+// stay translatable.
+use crate::commands::errors::{coded, coded_ctx};
+
 /// Panic-isolating wrapper around [`handle_command_inner`]. Frontend/IPC
 /// commands drive nearly every operation; a panic in one handler must not
 /// permanently freeze networking, so it is caught and the loop carries on.
@@ -2170,6 +2175,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::AddEmberDhtContact {
             addr,
             ed25519_pub,
@@ -2339,6 +2345,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtPing {
             addr,
             peer_pubkey,
@@ -2425,6 +2432,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtFindNode {
             addr,
             peer_pubkey,
@@ -2518,6 +2526,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(EmberDhtFindPending { contacts_rx }));
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::SendEmberDhtIterativeFindNode { target, tx } => {
             // Start a multi-hop lookup and let the driver fan out
             // FIND_NODE rounds across the closest contacts it learns.
@@ -2549,6 +2558,7 @@ async fn handle_command_inner(
             drive_ember_search(socket, state, search_id).await;
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::PublishEmberKeyword {
             keyword,
             file_name,
@@ -2606,6 +2616,7 @@ async fn handle_command_inner(
             drive_ember_publish(socket, state, publish_id).await;
         }
 
+        #[cfg(debug_assertions)]
         NetworkCommand::FindEmberValue { keyword, tx } => {
             if !settings.ember_native_enabled {
                 let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
@@ -2641,13 +2652,454 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
-            let _ = tx.send(Ok(EmberValueLookupPending { records_rx }));
+            let _ = tx.send(Ok(EmberValueLookupPending {
+                search_id,
+                records_rx,
+            }));
 
             // Kick off the first round (and resolve immediately if the
             // routing table had nothing to seed the shortlist with).
             drive_ember_search(socket, state, search_id).await;
         }
 
+        NetworkCommand::PublishEmberRecord { record, tx } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
+                return;
+            }
+            #[cfg(debug_assertions)]
+            let key_hex = hex::encode(record.keyword_hash);
+            let publish_id = match state
+                .ember_publish
+                .start_publish(record, state.ember_dht.routing())
+            {
+                Some(id) => id,
+                None => {
+                    let _ = tx.send(Err(format!(
+                        "Too many active Ember DHT publishes ({})",
+                        state.ember_publish.active_count()
+                    )));
+                    return;
+                }
+            };
+            let (result_tx, result_rx) = oneshot::channel();
+            state
+                .ember_dht_pending_publishes
+                .insert(publish_id, result_tx);
+            let _ = tx.send(Ok(EmberPublishPending {
+                #[cfg(debug_assertions)]
+                key: key_hex,
+                result_rx,
+            }));
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+
+        NetworkCommand::FindEmberKeys { keys, tx } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
+                return;
+            }
+            if keys.is_empty() {
+                let _ = tx.send(Err("No DHT keys".to_string()));
+                return;
+            }
+            let cap = ember::dht::messages::MAX_FIND_VALUE_KEYS;
+            let keys: Vec<[u8; 16]> = keys.into_iter().take(cap).collect();
+            let primary_hash = keys[0];
+            let extras: Vec<[u8; 16]> = keys.iter().skip(1).copied().collect();
+            let primary = ember::dht::EmberNodeId(primary_hash);
+            let search_id = match state.ember_search.start_find_value(
+                primary,
+                extras.clone(),
+                state.ember_dht.routing(),
+            ) {
+                Some(id) => id,
+                None => {
+                    let _ = tx.send(Err(format!(
+                        "Too many active Ember DHT searches ({})",
+                        state.ember_search.active_count()
+                    )));
+                    return;
+                }
+            };
+            seed_ember_local_records(state, search_id, &primary_hash, &extras);
+            let (records_tx, records_rx) = oneshot::channel();
+            state
+                .ember_dht_pending_value_lookups
+                .insert(search_id, records_tx);
+            let _ = tx.send(Ok(EmberValueLookupPending {
+                search_id,
+                records_rx,
+            }));
+            drive_ember_search(socket, state, search_id).await;
+        }
+
+        NetworkCommand::CancelEmberSearch { search_id } => {
+            // The Tauri waiter has already given up. Drop the slot rather
+            // than let FIND_VALUE run to SEARCH_TIMEOUT_SECS (60s) after a
+            // 6s Discover probe. Completing would only send to a dropped
+            // oneshot; the slot is what matters.
+            state.ember_dht_pending_value_lookups.remove(&search_id);
+            state.ember_search.remove(search_id);
+            state
+                .ember_dht_search_requests
+                .retain(|_, r| r.search_id != search_id);
+            if let Some(channel_id) = state.ember_channel_presence_searches.remove(&search_id)
+            {
+                flush_channel_presence_if_idle(state, channel_id);
+            }
+        }
+
+        NetworkCommand::FanoutChannelGossip { body } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+                let _ = remember_channel_gossip(state, gossip.msg_id);
+            }
+            fanout_channel_gossip_body(socket, state, db, body, None).await;
+        }
+
+        NetworkCommand::RefreshChannelMembers { channel_id } => {
+            if !settings.ember_native_enabled || db.chat_locked() {
+                return;
+            }
+            let channel_id_hex = hex::encode(channel_id);
+            let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+                return;
+            };
+            let now = chrono::Utc::now().timestamp();
+            start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
+        }
+
+        NetworkCommand::OfferChannelTransfer {
+            channel_id,
+            peer,
+            xfer_id,
+            path,
+            name,
+            size,
+            root,
+            tx,
+        } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err(coded(
+                    "channels_ember_disabled",
+                    "Channels require the Ember Network to be on",
+                )));
+                return;
+            }
+            // Per peer *and* overall. Without the second bound, offering to
+            // one member each across many rooms would grow `xfer_send` — and
+            // the open file handle each entry holds — without limit.
+            let to_peer = state
+                .xfer_send
+                .values()
+                .filter(|send| send.peer == peer)
+                .count();
+            if to_peer >= ember::channel::XFER_MAX_ACTIVE
+                || state.xfer_send.len() >= ember::channel::XFER_MAX_ACTIVE * 4
+            {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_busy",
+                    "Too many transfers already running with this member",
+                )));
+                return;
+            }
+            let Some(key) = ember::channel::derive_xfer_key(
+                &state.local_ed25519_seed,
+                &peer,
+                &channel_id,
+                &xfer_id,
+            ) else {
+                // Only reachable if the member's key is not a usable Ed25519
+                // point, which membership records should already have caught.
+                let _ = tx.send(Err(coded(
+                    "channels_member_invalid",
+                    "Invalid member key",
+                )));
+                return;
+            };
+            state.xfer_send.insert(
+                xfer_id,
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path),
+            );
+            let plain = ember::channel::encode_xfer_offer(
+                &key,
+                &ember::channel::XferOffer {
+                    sender: state.local_ed25519_pubkey,
+                    target: peer,
+                    xfer_id,
+                    size,
+                    root,
+                    name: name.clone(),
+                },
+            );
+            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+            if !sent {
+                state.xfer_send.remove(&xfer_id);
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_unreachable",
+                    "Could not reach that member right now",
+                )));
+                return;
+            }
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &channel_id,
+                &peer,
+                "send",
+                &name,
+                size,
+                0,
+                "offered",
+            );
+            let _ = tx.send(Ok(()));
+        }
+
+        NetworkCommand::RespondChannelTransfer {
+            xfer_id,
+            accept,
+            download_folder,
+            tx,
+        } => {
+            // Read rather than remove: if the disk work below fails, the offer
+            // has to stay answerable. Consuming it first left the user with an
+            // error, no way to retry or decline, and a sender still waiting.
+            let Some(offer) = state.xfer_pending.get(&xfer_id) else {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer waiting",
+                )));
+                return;
+            };
+            let offer = ember::xfer::PendingOffer {
+                channel_id: offer.channel_id,
+                peer: offer.peer,
+                key: offer.key,
+                name: offer.name.clone(),
+                size: offer.size,
+                root: offer.root,
+                received_at: offer.received_at,
+            };
+            let reply = if accept {
+                ember::channel::XferReply::Accept
+            } else {
+                ember::channel::XferReply::Decline
+            };
+            if accept {
+                // Part files sit beside the ones eD2K downloads use, so a
+                // half-received transfer never appears in the finished folder.
+                let temp_dir = download_folder.join("Temp");
+                let done_dir = download_folder.join("Downloads");
+                let part_path = temp_dir.join(format!("ember-xfer-{}.part", hex::encode(xfer_id)));
+                let prepared = std::fs::create_dir_all(&temp_dir)
+                    .and_then(|_| std::fs::create_dir_all(&done_dir))
+                    .and_then(|_| {
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .read(true)
+                            .truncate(true)
+                            .open(&part_path)
+                    });
+                let file = match prepared {
+                    Ok(file) => file,
+                    Err(e) => {
+                        let _ = tx.send(Err(coded_ctx(
+                            "channels_xfer_failed",
+                            "Could not open a place to save the file",
+                            e,
+                        )));
+                        return;
+                    }
+                };
+                state.xfer_recv.insert(
+                    xfer_id,
+                    ember::xfer::RecvState::new(
+                        offer.channel_id,
+                        offer.peer,
+                        offer.key,
+                        offer.name.clone(),
+                        offer.size,
+                        offer.root,
+                        part_path,
+                        done_dir.join(&offer.name),
+                        file,
+                    ),
+                );
+            }
+            state.xfer_pending.remove(&xfer_id);
+            let plain = ember::channel::encode_xfer_reply(
+                &offer.key,
+                &state.local_ed25519_pubkey,
+                &offer.peer,
+                &xfer_id,
+                reply,
+            );
+            send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &offer.channel_id,
+                &offer.peer,
+                "receive",
+                &offer.name,
+                offer.size,
+                0,
+                if accept { "active" } else { "declined" },
+            );
+            let _ = tx.send(Ok(()));
+        }
+
+        NetworkCommand::CancelChannelTransfer { xfer_id, tx } => {
+            let me = state.local_ed25519_pubkey;
+            #[allow(clippy::type_complexity)]
+            let mut target: Option<([u8; 16], [u8; 32], [u8; 32], String, u64, &'static str)> =
+                None;
+            if let Some(offer) = state.xfer_pending.remove(&xfer_id) {
+                target = Some((
+                    offer.channel_id,
+                    offer.peer,
+                    offer.key,
+                    offer.name,
+                    offer.size,
+                    "receive",
+                ));
+            } else if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+                let _ = std::fs::remove_file(&recv.part_path);
+                target = Some((
+                    recv.channel_id,
+                    recv.peer,
+                    recv.key,
+                    recv.name,
+                    recv.size,
+                    "receive",
+                ));
+            } else if let Some(send) = state.xfer_send.remove(&xfer_id) {
+                target = Some((
+                    send.channel_id,
+                    send.peer,
+                    send.key,
+                    send.name,
+                    send.size,
+                    "send",
+                ));
+            }
+            let Some((channel_id, peer, key, name, size, direction)) = target else {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer running",
+                )));
+                return;
+            };
+            let plain = ember::channel::encode_xfer_cancel(
+                &key,
+                &me,
+                &peer,
+                &xfer_id,
+                ember::channel::XferCancel::User,
+            );
+            send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &channel_id,
+                &peer,
+                direction,
+                &name,
+                size,
+                0,
+                "cancelled",
+            );
+            let _ = tx.send(Ok(()));
+        }
+
+        NetworkCommand::DropChannelTransfers { channel_id } => {
+            let mut ended: Vec<([u8; 16], [u8; 32], String, u64, &'static str)> = Vec::new();
+            state.xfer_pending.retain(|xfer_id, offer| {
+                let keep = offer.channel_id != channel_id;
+                if !keep {
+                    ended.push((*xfer_id, offer.peer, offer.name.clone(), offer.size, "receive"));
+                }
+                keep
+            });
+            state.xfer_recv.retain(|xfer_id, recv| {
+                let keep = recv.channel_id != channel_id;
+                if !keep {
+                    let _ = std::fs::remove_file(&recv.part_path);
+                    ended.push((*xfer_id, recv.peer, recv.name.clone(), recv.size, "receive"));
+                }
+                keep
+            });
+            state.xfer_send.retain(|xfer_id, send| {
+                let keep = send.channel_id != channel_id;
+                if !keep {
+                    ended.push((*xfer_id, send.peer, send.name.clone(), send.size, "send"));
+                }
+                keep
+            });
+            for (xfer_id, peer, name, size, direction) in ended {
+                emit_xfer_update(
+                    app_handle,
+                    &xfer_id,
+                    &channel_id,
+                    &peer,
+                    direction,
+                    &name,
+                    size,
+                    0,
+                    "cancelled",
+                );
+            }
+        }
+
+        NetworkCommand::ListChannelTransfers { tx } => {
+            let mut out = Vec::new();
+            for (xfer_id, offer) in &state.xfer_pending {
+                out.push(ChannelTransferSnapshot {
+                    xfer_id: hex::encode(xfer_id),
+                    channel_id: hex::encode(offer.channel_id),
+                    peer_pubkey: hex::encode(offer.peer),
+                    direction: "receive".into(),
+                    name: offer.name.clone(),
+                    size: offer.size,
+                    transferred: 0,
+                    status: "awaiting".into(),
+                });
+            }
+            for (xfer_id, recv) in &state.xfer_recv {
+                out.push(ChannelTransferSnapshot {
+                    xfer_id: hex::encode(xfer_id),
+                    channel_id: hex::encode(recv.channel_id),
+                    peer_pubkey: hex::encode(recv.peer),
+                    direction: "receive".into(),
+                    name: recv.name.clone(),
+                    size: recv.size,
+                    transferred: recv.bytes_received(),
+                    status: "active".into(),
+                });
+            }
+            for (xfer_id, send) in &state.xfer_send {
+                out.push(ChannelTransferSnapshot {
+                    xfer_id: hex::encode(xfer_id),
+                    channel_id: hex::encode(send.channel_id),
+                    peer_pubkey: hex::encode(send.peer),
+                    direction: "send".into(),
+                    name: send.name.clone(),
+                    size: send.size,
+                    transferred: send
+                        .sent_blocks
+                        .saturating_mul(ember::channel::XFER_BLOCK_SIZE as u64)
+                        .min(send.size),
+                    status: if send.accepted { "active" } else { "offered" }.into(),
+                });
+            }
+            let _ = tx.send(out);
+        }
+
+        #[cfg(debug_assertions)]
         NetworkCommand::RunEmberMaintenance { tx } => {
             if !settings.ember_native_enabled {
                 let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
@@ -4806,7 +5258,7 @@ async fn handle_command_inner(
 
                     let part_path = crate::security::filesystem::verify_existing_path(
                         &part_path,
-                        &[download_folder.clone()],
+                        std::slice::from_ref(&download_folder),
                     )
                     .map_err(|e| format!("Invalid or changed part-file path: {e}"))?;
                     let file_name_for_preview = file_name.clone();
@@ -5679,10 +6131,8 @@ async fn handle_command_inner(
                     "FindFriendAndConnect: {} already online/connected, skipping",
                     hex::encode(target_hash),
                 );
-            } else if !state.outbound_session_tasks.contains_key(&target_hash) {
-                state
-                    .outbound_session_tasks
-                    .insert(target_hash, std::time::Instant::now());
+            } else if let std::collections::hash_map::Entry::Vacant(e) = state.outbound_session_tasks.entry(target_hash) {
+                e.insert(std::time::Instant::now());
                 let _ = app_handle.emit(
                     "ember:friend-searching",
                     serde_json::json!({

@@ -2233,8 +2233,14 @@
     searchStatus = new Map(searchStatus);
   }
 
+  /** One footer action at a time. Pause and Stop in particular are slow enough
+   *  to invite a second click, and the pair racing leaves the row in whichever
+   *  state finished last rather than the one asked for. */
+  let selectedActionBusy = $state(false);
+
   async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview') {
-    if (!selectedTransfer) return;
+    if (!selectedTransfer || selectedActionBusy) return;
+    selectedActionBusy = true;
     try {
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
@@ -2243,6 +2249,8 @@
       if (action === 'preview') await previewFile(selectedTransfer.id);
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
+    } finally {
+      selectedActionBusy = false;
     }
   }
 
@@ -3712,6 +3720,7 @@
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
                 <p class="empty-cell-title">{m.transfers_empty_no_matches()}</p>
+                <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}
@@ -3747,18 +3756,18 @@
         </div>
         <div class="selection-actions">
           <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
-            <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
+            <button class="tb-btn" disabled={selectedActionBusy || !canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
           </span>
           <span class="tb-btn-wrap" title={!canResume(selectedTransfer) ? m.transfers_action_cannot_resume() : undefined}>
-            <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
+            <button class="tb-btn" disabled={selectedActionBusy || !canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
           </span>
           <span class="tb-btn-wrap" title={!canStop(selectedTransfer) ? m.transfers_action_cannot_stop() : undefined}>
-            <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
+            <button class="tb-btn" disabled={selectedActionBusy || !canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
           </span>
           <span class="tb-btn-wrap" title={isFinished(selectedTransfer) ? m.transfers_action_cannot_find_sources() : undefined}>
-            <button class="tb-btn" disabled={isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
+            <button class="tb-btn" disabled={selectedActionBusy || isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
           </span>
-          <button class="tb-btn" disabled={!canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          <button class="tb-btn" disabled={selectedActionBusy || !canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
           {#if selectedTransfer}
             {@const copyOne = selectedTransfer}
             <button class="tb-btn" disabled={copyingAllDownloadLinks || !copyOne.file_hash?.trim()} onclick={() => void copyDownloadLinks([copyOne])} title={m.transfers_ctx_copy_link()}>{m.transfers_copy_link_btn()}</button>

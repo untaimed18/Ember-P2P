@@ -47,11 +47,18 @@
   let upnpEnabled = $state(_init.upnp_enabled);
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
-  let autoConnectKad = $state(_init.auto_connect_kad);
+  // Deliberately not `_init.auto_connect_kad`. The stored default is off so a
+  // fresh launch reaches for no network before the user asks — but this wizard
+  // *is* that ask, and the copy beside the switch recommends KAD. Starting it
+  // off meant most people finished setup disconnected from the very thing the
+  // page told them to turn on, then found search slow with no clue why. Anyone
+  // who does not want it can see the switch and turn it off before it runs.
+  let autoConnectKad = $state(true);
   let selectedTheme: Theme = $state(getInitialTheme());
 
   let speedTestRunning = $state(false);
   let speedTestResult = $state('');
+  let speedTestFailed = $state(false);
   let saving = $state(false);
   let saveError = $state('');
   let relaunching = $state(false);
@@ -178,6 +185,7 @@
   async function runSpeedTest() {
     speedTestRunning = true;
     speedTestResult = '';
+    speedTestFailed = false;
     try {
       const result: { recommended_upload_limit: number; recommended_download_limit: number } = await invoke('run_speed_test');
       maxUploadSpeed = result.recommended_upload_limit;
@@ -188,6 +196,7 @@
       });
     } catch {
       speedTestResult = m.wizard_speed_test_failed();
+      speedTestFailed = true;
     } finally {
       speedTestRunning = false;
     }
@@ -443,7 +452,20 @@
           <div class="field">
             <label for="dl-folder">{m.wizard_folder_label()}</label>
             <div class="folder-picker">
-              <input id="dl-folder" type="text" bind:value={downloadFolder} class="text-input folder-input" readonly />
+              <input
+                id="dl-folder"
+                type="text"
+                bind:value={downloadFolder}
+                class="text-input folder-input"
+                readonly
+                onclick={() => void pickFolder()}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    void pickFolder();
+                  }
+                }}
+              />
               <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
             {#if folderError}
@@ -488,7 +510,7 @@
             {speedTestRunning ? m.wizard_speed_test_running() : m.wizard_speed_test_run()}
           </button>
           {#if speedTestResult}
-            <p class="speed-result">{speedTestResult}</p>
+            <p class="speed-result" class:error={speedTestFailed}>{speedTestResult}</p>
           {/if}
         </div>
 
@@ -591,6 +613,9 @@
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
           </div>
+          <!-- Said before the button rather than discovered after it: the
+               finish step restarts the app, which is alarming if unannounced. -->
+          <p class="step-hint">{m.wizard_ready_restart_note()}</p>
           {#if saveError}
             <p class="save-error">{saveError}</p>
           {/if}
@@ -1035,6 +1060,10 @@
     font-size: 12px;
     color: var(--success);
     margin: 8px 0 0;
+  }
+
+  .speed-result.error {
+    color: var(--danger);
   }
 
   /* Connection options */

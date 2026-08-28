@@ -670,7 +670,7 @@ impl FloodProtection {
         let key = (addr.ip(), opcode);
         let count = self.outgoing_requests.entry(key).or_insert(0);
         *count = count.saturating_add(1);
-        if matches!(opcode, 0x33 | 0x34 | 0x35) {
+        if matches!(opcode, 0x33..=0x35) {
             let budget = self.search_response_budgets.entry(key).or_insert(0);
             *budget = budget.saturating_add(SEARCH_RES_BUDGET_PER_REQUEST);
         }

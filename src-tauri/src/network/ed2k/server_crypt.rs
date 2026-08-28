@@ -377,7 +377,7 @@ mod tests {
         key_buf[..PRIMESIZE_BYTES].copy_from_slice(&biguint_to_be_padded(shared, PRIMESIZE_BYTES));
         let [requester, server] = [MAGICVALUE_REQUESTER, MAGICVALUE_SERVER].map(|magic| {
             key_buf[PRIMESIZE_BYTES] = magic;
-            let mut key = Rc4State::new(&md5::Md5::digest(&key_buf));
+            let mut key = Rc4State::new(&md5::Md5::digest(key_buf));
             key.skip(RC4_DROP_BYTES);
             key
         });
@@ -432,7 +432,7 @@ mod tests {
         tail.push(ENM_OBFUSCATION);
         tail.push(ENM_OBFUSCATION);
         tail.push(SERVER_PAD_LEN as u8);
-        tail.extend(std::iter::repeat(0xABu8).take(SERVER_PAD_LEN));
+        tail.extend(std::iter::repeat_n(0xABu8, SERVER_PAD_LEN));
         let mut encrypted = vec![0u8; tail.len()];
         server_to_client.process(&tail, &mut encrypted);
         socket.write_all(&encrypted).await.unwrap();

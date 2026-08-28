@@ -77,10 +77,12 @@ pub(crate) fn verify_auth_nonce(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EmberAuthState {
     /// No CHALLENGE seen yet on this session. May transition to
     /// `PeerChallenged` when the initiator sends one, or stay here
     /// indefinitely (vanilla peer / older Ember release).
+    #[default]
     NotStarted,
     /// We received the peer's CHALLENGE, generated our nonce, and the
     /// dispatcher has been told to emit both our CHALLENGE and our
@@ -97,11 +99,6 @@ pub enum EmberAuthState {
     Failed,
 }
 
-impl Default for EmberAuthState {
-    fn default() -> Self {
-        EmberAuthState::NotStarted
-    }
-}
 
 impl EmberAuthState {
     pub fn is_verified(&self) -> bool {

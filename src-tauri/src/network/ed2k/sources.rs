@@ -1626,7 +1626,7 @@ impl SourceManager {
                     .collect()
             })
             .unwrap_or_default();
-        sources.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        sources.sort_by_key(|s| std::cmp::Reverse(s.last_seen));
         sources.truncate(MAX_SOURCES_IN_RESPONSE);
 
         let entry_size = match version {
@@ -1679,7 +1679,7 @@ impl SourceManager {
                     .collect()
             })
             .unwrap_or_default();
-        sources.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        sources.sort_by_key(|s| std::cmp::Reverse(s.last_seen));
         sources.truncate(MAX_SOURCES_IN_RESPONSE);
 
         build_answer_sources1_versioned(&sources, file_hash, requested_version)
@@ -3448,7 +3448,7 @@ mod tests {
         }
 
         assert!(
-            sm.sources.get(&hash).map_or(true, |e| e.is_empty()),
+            sm.sources.get(&hash).is_none_or(|e| e.is_empty()),
             "a zero LowID must never be tracked, however many times it is offered"
         );
     }

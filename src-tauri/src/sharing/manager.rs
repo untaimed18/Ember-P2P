@@ -450,9 +450,10 @@ impl TransferManager {
     fn queued_wait_status(transfer: &Transfer) -> TransferStatus {
         if transfer.direction == TransferDirection::Upload {
             TransferStatus::Active
-        } else if transfer.sources == 0 && transfer.queued_sources == 0 {
-            TransferStatus::Searching
-        } else if transfer.peer_id.is_empty() && transfer.sources == 0 {
+        // Nothing found at all, or nothing found and nobody to ask.
+        } else if (transfer.sources == 0 && transfer.queued_sources == 0)
+            || (transfer.peer_id.is_empty() && transfer.sources == 0)
+        {
             TransferStatus::Searching
         } else {
             TransferStatus::Queued
@@ -558,7 +559,7 @@ impl TransferManager {
             let history = self
                 .speed_history
                 .entry(id.to_string())
-                .or_insert_with(VecDeque::new);
+                .or_default();
 
             history.push_back((transferred, now));
 
@@ -581,12 +582,10 @@ impl TransferManager {
             let speed = if history.len() >= 2 {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
                 let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
-                if elapsed_ms > 0 {
-                    let bytes_delta = transferred.saturating_sub(*oldest_bytes);
-                    (bytes_delta as u128 * 1000 / elapsed_ms) as u64
-                } else {
-                    transfer.speed
-                }
+                let bytes_delta = transferred.saturating_sub(*oldest_bytes);
+                (bytes_delta as u128 * 1000)
+                    .checked_div(elapsed_ms)
+                    .map_or(transfer.speed, |bytes_per_sec| bytes_per_sec as u64)
             } else {
                 0
             };
@@ -1558,9 +1557,7 @@ mod tests {
 
         // `retrying_after` is the only variant `compute_health_state` cannot
         // reach: only the network loop knows a retry is in progress.
-        assert!(TransferHealthCode::ALL
-            .iter()
-            .any(|c| *c == TransferHealthCode::RetryingAfter));
+        assert!(TransferHealthCode::ALL.contains(&TransferHealthCode::RetryingAfter));
     }
 
     /// The row the UI renders must never carry one half of the pair: English

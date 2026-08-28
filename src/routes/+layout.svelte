@@ -14,6 +14,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
@@ -208,7 +209,7 @@
   async function initStores(): Promise<unknown[]> {
     // Essential = what the app shell itself reads: the network store backs the
     // status bar and both polls, and the settings cache gates the wizard, the
-    // close behavior and the update check below. The other three each back one
+    // close behavior and the update check below. The other four each back one
     // feature — and transfers keeps its own `list_transfers` poll — so they
     // degrade to a toast rather than a blank window.
     const stores: Array<{ init: () => Promise<void>; essential: boolean }> = [
@@ -216,6 +217,7 @@
       { init: initTransferStore, essential: false },
       { init: initSearchStore, essential: false },
       { init: initFriendsStore, essential: false },
+      { init: initChannelsStore, essential: false },
       { init: loadAppSettings, essential: true },
     ];
     const outcomes = await Promise.allSettled(stores.map((s) => s.init()));
@@ -561,6 +563,7 @@
           cleanupTransferStore();
           cleanupSearchStore();
           cleanupFriendsStore();
+          cleanupChannelsStore();
         }
       })
       .catch((e) => {
@@ -568,6 +571,7 @@
         cleanupTransferStore();
         cleanupSearchStore();
         cleanupFriendsStore();
+        cleanupChannelsStore();
         initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
@@ -587,6 +591,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      cleanupChannelsStore();
       clearAllToasts();
       clearAppSettings();
       if (unlistenClose) unlistenClose();

@@ -470,14 +470,18 @@
     };
   });
 
+  let myHashError = $state(false);
+
   async function loadMyHash() {
     try {
       const h = await getMyEmberHash();
       if (destroyed) return;
       myHash = h;
+      myHashError = false;
     } catch {
       if (destroyed) return;
       myHash = '';
+      myHashError = true;
     }
   }
 
@@ -799,7 +803,7 @@
 <div class="page-header">
   <h2>{m.nav_friends()}</h2>
   <div class="header-actions">
-    <button class="ghost" onclick={() => loadFriends()}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => loadFriends()} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>
 
@@ -913,6 +917,18 @@
           {m.common_copy()}
         {/if}
       </button>
+    </div>
+  {:else if myHashError}
+    <!-- Hiding the card outright made a transient failure look like the app
+         had no identity, with nothing to retry and no explanation. -->
+    <div class="my-id-card">
+      <div class="my-id-left">
+        <div class="my-id-info">
+          <span class="my-id-label">{m.friends_your_id_label()}</span>
+          <span class="my-id-hint">{m.friends_id_load_failed()}</span>
+        </div>
+      </div>
+      <button type="button" class="my-id-copy" onclick={() => void loadMyHash()}>{m.common_retry()}</button>
     </div>
   {/if}
 

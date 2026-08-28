@@ -2,11 +2,12 @@
 
 The protocol specification is
 [ember-dht-specification.pdf](ember-dht-specification.pdf), written against wire
-version 2 as implemented in Ember 1.5.6. **The wire is now version 3 and the PDF
+version 2 as implemented in Ember 1.5.6. **The wire is now version 4 and the PDF
 is behind it** — see [item 1](#1-the-serving-ceiling--done-wire-v3) and
 [item 7](#7-contact-encoding-wasted-18-of-every-response--done-wire-v3) for the
-two frame changes. This file is the standing work log: what is left, what was
-compared against KAD, and what is explicitly not planned.
+two v3 frame changes, and [item 2](#2-wire-versioning-rejects-cleanly-but-cannot-negotiate)
+for what moved it to v4. This file is the standing work log: what is left, what
+was compared against KAD, and what is explicitly not planned.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at
@@ -59,24 +60,60 @@ identity-to-IP map of every participant.
 
 ## What's left
 
-### 1. Ember-native transfers are dormant
+### 1. Ember-native transfers are partly wired
 
 [`network/ember/transfer.rs`](../src-tauri/src/network/ember/transfer.rs)
-holds the 256 KiB chunk protocol and the BLAKE3 hash tree, but nothing
-imports it — there is no reference to `ember::transfer::` anywhere in the
-tree. Ember discovers the source; the bytes still move over eD2K
-client-to-client. Wiring it up is the largest remaining piece if the goal
-is a network that does not need the eMule wire at all.
+holds the 256 KiB chunk protocol and the BLAKE3 hash tree. Its `HashTree` is
+now live: **Ember Transfer**
+([`network/ember/xfer.rs`](../src-tauri/src/network/ember/xfer.rs)) uses it to
+identify a file that one channel member hands to another, over the
+authenticated Noise/UDP session the room already provides. One sender, one
+recipient, an explicit accept before any bytes move, receiver-driven block
+requests, and its own send budget so a transfer never starves chat.
+
+Every transfer frame is authenticated to the two members it is between. The
+room's content key is shared by all of them, so on its own it proves only that
+a frame came from *somebody* in the room — enough for chat, not enough for a
+prompt that names who is sending you a file. Each frame therefore carries a
+16-byte tag under a key derived from static X25519 Diffie-Hellman between the
+two Ed25519 identities the presence records already publish
+(`channel::derive_xfer_key`), bound to the room and the transfer id. A member
+cannot forge another member's offer, accept, cancel, block request, or block
+data; a non-member cannot produce a frame at all. Symmetric rather than a
+signature because 64 bytes per frame would push a block past the unfragmented
+datagram budget, and nothing here needs to be provable to a third party.
+
+What is still dormant is the rest of that module — the QUIC stream framing
+(`MSG_REQUEST_CHUNKS` and friends) and any multi-source notion. Ordinary
+library downloads still discover sources over Ember and move bytes over eD2K
+client-to-client. The two remaining pieces, if the goal is a network that
+does not need the eMule wire at all:
+
+- **Reach.** Rendezvous publishes presence for the 8 XOR-closest members of at
+  most 4 rooms, so an arbitrary member holding a file may not be dialable.
+  Ember Transfer falls back to the channel relay, which works but is slower
+  than a direct session.
+- **Throughput.** Blocks are 1008 bytes and paced by
+  `XFER_BLOCKS_OUT_PER_SEC`, sized so the block plus its authenticator, gossip
+  envelope, and relay header stay inside one unfragmented datagram
+  (`xfer_block_frame_fits_one_unfragmented_datagram` pins the arithmetic).
+  Moving the same offers onto QUIC would lift that ceiling without changing the
+  offer/accept handshake, which is why the file is identified by its hash-tree
+  root rather than by anything transport-specific.
 
 ### 2. Wire versioning rejects cleanly but cannot negotiate
 
-`EMBER_DHT_VERSION` is now **3**, with `EMBER_DHT_MIN_VERSION` 3 alongside it:
+`EMBER_DHT_VERSION` is now **4**, with `EMBER_DHT_MIN_VERSION` 4 alongside it:
 the decoder accepts a *range*, and a frame outside it is refused at the version
 byte instead of becoming a malformed-frame counter that reads like packet loss. A
 change that only adds to the format can lower the minimum rather than raising
-both — v3 could not, because it changed the shape of two existing frames
-(contact lists lost `node_id`, `FOUND_VALUE` gained two positions), and a v2
-peer reads both at fixed offsets.
+both — neither of the last two could. v3 changed the shape of two existing frames
+(contact lists lost `node_id`, `FOUND_VALUE` gained two positions), which a v2
+peer reads at fixed offsets. v4 appends the sender's own Noise static key to the
+*signed* bytes without transmitting it, binding a frame to the session it
+arrives on so a signed frame stops being a bearer token any prior recipient can
+replay; a v3 signature cannot verify here and ours cannot verify there, so the
+version byte has to move with it.
 
 **This is the breaking change the section used to warn about**, and it has now
 landed on an overlay that ships **on**. Two peers on incompatible versions fail
@@ -479,7 +516,7 @@ settled.
 
 Protocol constants live in
 [`dht/mod.rs`](../src-tauri/src/network/ember/dht/mod.rs): 128-bit node IDs
-(BLAKE3 of the Ed25519 public key), k = 20, α = 5, wire version 3.
+(BLAKE3 of the Ed25519 public key), k = 20, α = 5, wire version 4.
 
 `MAX_CONTACTS_PER_RESPONSE` is 20 but is still not reachable: `encode_contact_list`
 trims by bytes, and at 71 bytes per IPv4 contact (7 address + 32 Noise key + 32

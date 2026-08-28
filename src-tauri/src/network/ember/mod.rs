@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod channel;
 pub mod crypto;
 pub mod ingest;
 pub mod mapping_keepalive;
@@ -8,7 +9,8 @@ pub mod relay;
 
 // `dht` is live on the Noise path when `ember_native_enabled` (routing,
 // STORE/FIND_VALUE, bootstrap, auto-publish, ANNOUNCE_PEER/PEER_LIST).
-// `transfer` is still dormant.
+// `transfer` holds the chunk/hash-tree primitives; `xfer` is the first
+// working use of them, moving a file between two channel members.
 // `reputation` is persisted and consulted by the live eD2K/EPX paths in
 // network/mod.rs (ban/credit events); `transport` backs the Ember UDP
 // control-message dispatch (Ping/ExchangeRequest, is_ember_packet routing)
@@ -18,6 +20,7 @@ pub mod reputation;
 #[allow(dead_code)]
 pub mod transfer;
 pub mod transport;
+pub mod xfer;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_dalek::SigningKey;
@@ -821,7 +824,7 @@ mod tests {
                 ip: Ipv4Addr::new(90, 1, 1, 2),
                 tcp_port: 4662,
             }],
-            &[attestation.clone()],
+            std::slice::from_ref(&attestation),
         );
 
         let parsed = parse_exchange_payload(&udp).expect("a truncated build must still parse");
@@ -890,7 +893,7 @@ mod tests {
     fn relay_attestation_round_trip_and_verifies() {
         let now: u64 = 1_700_000_000;
         let att = make_attestation(now + 600);
-        let payload = build_exchange_payload_with_relay_attestations(&[], &[], &[att.clone()]);
+        let payload = build_exchange_payload_with_relay_attestations(&[], &[], std::slice::from_ref(&att));
         let result = parse_exchange_payload(&payload).unwrap();
         assert_eq!(result.relay_attestations, vec![att.clone()]);
         assert!(verify_relay_attestation(&att, now));

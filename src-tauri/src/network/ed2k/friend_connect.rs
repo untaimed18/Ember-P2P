@@ -924,6 +924,10 @@ pub async fn connect_friend_with_fallback(
     }
 }
 
+/// One per friend connection that had to fall back, chosen at setup and then
+/// held for the session. Boxing the larger arm to even the variants out would
+/// buy nothing: the value is moved once and read through thereafter.
+#[allow(clippy::large_enum_variant)]
 enum FallbackTransport {
     Punch(quinn::SendStream, quinn::RecvStream),
     Relay(crate::network::ember::relay::WsStream),
@@ -1564,14 +1568,15 @@ async fn try_complete_friend_punch(
     let expected_capability = match expected_capability {
         Some(capability) => capability,
         None => {
-            ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
+            // Leave the mailbox entry: a channel punch uses a different
+            // capability, and acknowledging here would delete it before
+            // the channel poller sees it.
             return Err("punch identity lookup failed".to_string());
         }
     };
     if info.from_id != crate::network::rendezvous::hashed_id(&friend_ember_hash)
         || info.capability != expected_capability
     {
-        ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
         return Err("punch identity or capability mismatch".to_string());
     }
     let peer_nat = crate::network::ember::nat::NatType::from_u8(info.nat_type);
@@ -1716,6 +1721,334 @@ async fn relay_friend(
 }
 
 use super::multi_source::parse_browse_response;
+
+async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
+    writer: &mut W,
+    protocol: u8,
+    opcode: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    writer.write_u8(protocol).await?;
+    let pkt_len = (1 + payload.len()) as u32;
+    writer.write_u32_le(pkt_len).await?;
+    writer.write_u8(opcode).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    let len = reader.read_u32_le().await?;
+    if len == 0 || len > 5_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid packet length",
+        ));
+    }
+    let opcode = reader.read_u8().await?;
+    let payload_len = (len - 1) as usize;
+    // Grow the buffer as bytes actually arrive rather than allocating the full
+    // declared length (up to ~5 MiB) before reading. A peer that announces a
+    // large packet then stalls would otherwise pin that allocation per
+    // friend-connect session (mirrors `read_packet_async` in transfer.rs).
+    let mut payload = Vec::new();
+    let mut remaining = payload_len;
+    const READ_STEP: usize = 65536;
+    while remaining > 0 {
+        let want = remaining.min(READ_STEP);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        reader.read_exact(&mut payload[start..start + want]).await?;
+        remaining -= want;
+    }
+    Ok((protocol, opcode, payload))
+}
+
+/// Maximum time we'll wait for the peer's `OP_EMBER_HELLO` /
+/// `OP_EMBER_HELLOANSWER` after we send ours. Short enough that a
+/// vanilla eMule peer (which will never respond) doesn't add noticeable
+/// latency to friend-connect; long enough to absorb normal-internet
+/// jitter for the small handful of packets that may queue ahead of the
+/// Ember hello.
+#[allow(dead_code)]
+const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
+/// Cap on the number of unrelated packets we'll consume while looking
+/// for the peer's Ember hello. A well-behaved Ember peer sends its
+/// hello immediately after the EmuleInfo exchange, so 0–1 unrelated
+/// packets are normal (e.g. `OP_SECIDENTSTATE`); a higher count may
+/// indicate the peer is racing in unrelated traffic. Bounded so a
+/// chatty peer can't pin us in this loop.
+#[allow(dead_code)]
+const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
+
+/// Drives a synchronous `OP_EMBER_HELLO` exchange right after the
+/// EmuleInfo round-trip. We send our hello (with our Ed25519 pubkey
+/// when available) and then read packets for up to
+/// [`EMBER_HELLO_TIMEOUT_SECS`] looking for the peer's hello. On
+/// success we populate `hello_caps.is_ember`, `.ember_hash`,
+/// `.ember_pubkey`, `.mod_version`, and `.peer_name` from the parsed
+/// payload — the only place in `friend_connect.rs` that ever sets
+/// `is_ember = true` (the public Hello / EmuleInfo handshake is kept
+/// byte-identical to vanilla eMule so anti-leecher mods don't queue-ban
+/// us, see the long comment in `messages.rs::build_emule_info`).
+///
+/// If the peer beat us to it and sent `OP_EMBER_HELLO` instead of an
+/// answer, we reply with our own `OP_EMBER_HELLOANSWER` so they also
+/// learn our pubkey in the same round-trip. Vanilla peers and older
+/// Ember peers that don't speak this opcode just hit the timeout and
+/// the handshake proceeds without `ember_pubkey` set — the downstream
+/// `is_ember` check at the call sites then bails cleanly.
+#[allow(dead_code)]
+async fn exchange_ember_hello<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    our_ember_hash: &[u8; 16],
+    our_nickname: &str,
+    our_pubkey: Option<&[u8; 32]>,
+    hello_caps: &mut PeerCapabilities,
+    addr: SocketAddr,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    let payload = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await?;
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
+    for _ in 0..EMBER_HELLO_MAX_LOOKAHEAD {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, read_packet_inner(reader)).await {
+            Ok(Ok((proto, opcode, packet_payload))) => {
+                if proto == OP_EMULEPROT
+                    && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER)
+                {
+                    if let Some(ident) = parse_ember_hello(&packet_payload) {
+                        hello_caps.is_ember = true;
+                        if !ident.mod_version.is_empty() {
+                            hello_caps.mod_version = ident.mod_version;
+                        }
+                        if !ident.nickname.is_empty() {
+                            hello_caps.peer_name = ident.nickname;
+                        }
+                        if ident.ember_hash != [0u8; 16] {
+                            hello_caps.ember_hash = Some(ident.ember_hash);
+                        }
+                        if let Some(pk) = ident.ed25519_pubkey {
+                            hello_caps.ember_pubkey = Some(pk);
+                        }
+                        if opcode == OP_EMBER_HELLO {
+                            let answer =
+                                build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
+                            let _ =
+                                write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &answer)
+                                    .await;
+                        }
+                    }
+                    return Ok(());
+                }
+                debug!(
+                    "friend_connect {addr}: skipping proto=0x{proto:02X} op=0x{opcode:02X} while waiting for OP_EMBER_HELLO"
+                );
+            }
+            // Timeout or read error → peer is vanilla eMule, an older
+            // Ember release, or the connection died. Either way the
+            // caller will surface the actual failure mode (auth skipped
+            // or `is_ember` bail).
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// Maximum unrelated packets we'll skip while looking for a
+/// specific Ember auth opcode. Bounded to prevent a chatty peer
+/// from pinning us in this loop forever; in practice we expect
+/// 0–1 skips (just OP_SECIDENTSTATE).
+const AUTH_PACKET_MAX_SKIPS: usize = 3;
+/// Per-attempt timeout while waiting for the next packet during
+/// auth. L7: tightened from 10 s × 8 skips (~80 s worst case) to
+/// 5 s × 3 skips (~15 s worst case). The previous 80 s window let
+/// a chatty peer pin our auth path for over a minute by spraying
+/// unrelated frames, which made friend-connect look hung. In
+/// practice the only legitimate skip is a single OP_SECIDENTSTATE
+/// emitted by the upload side as part of its initial burst, so
+/// 3 skips is plenty of headroom while still bounding the total
+/// stall a misbehaving peer can inflict.
+const AUTH_PACKET_TIMEOUT_SECS: u64 = 5;
+
+/// Read the next packet matching `expected_opcode` (with
+/// `expected_payload_len`), skipping a bounded number of unrelated
+/// packets first.
+///
+/// `on_deferred` is invoked for each intervening non-AUTH packet so
+/// callers that care about those packets (e.g. the multi-source
+/// download loop, which must process `OP_SECIDENTSTATE` to keep
+/// SecIdent credit accounting correct) can capture them for later
+/// replay. Pass a no-op callback (`|_, _, _| {}`) to restore the
+/// original drop-on-the-floor behaviour used by friend-connect,
+/// which doesn't process SecIdent itself.
+///
+/// Returns the matched packet's payload. Errors if we hit the
+/// per-packet read timeout, hit `AUTH_PACKET_MAX_SKIPS` non-matching
+/// packets, or read a stream error.
+async fn read_specific_auth_packet<R, D>(
+    reader: &mut R,
+    expected_opcode: u8,
+    expected_payload_len: usize,
+    addr: SocketAddr,
+    label: &'static str,
+    mut on_deferred: D,
+) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    D: FnMut(u8, u8, Vec<u8>),
+{
+    for _ in 0..=AUTH_PACKET_MAX_SKIPS {
+        let (proto, opcode, payload) = read_packet_with_timeout(reader, AUTH_PACKET_TIMEOUT_SECS)
+            .await
+            .map_err(|e| anyhow::anyhow!("Ember auth: failed to read {label} from {addr}: {e}"))?;
+        if proto == OP_EMULEPROT && opcode == expected_opcode {
+            if payload.len() != expected_payload_len {
+                anyhow::bail!(
+                    "Ember auth: {label} from {addr} has wrong payload length: got {}, expected {}",
+                    payload.len(),
+                    expected_payload_len,
+                );
+            }
+            return Ok(payload);
+        }
+        debug!(
+            "Ember auth: deferring intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
+        );
+        on_deferred(proto, opcode, payload);
+    }
+    anyhow::bail!(
+        "Ember auth: never received {label} from {addr} after {AUTH_PACKET_MAX_SKIPS} unrelated packets"
+    );
+}
+
+async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    timeout_secs: u64,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        read_packet_inner(reader),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// Perform the Ember Ed25519 challenge-response authentication exchange.
+///
+/// Both sides send a 32-byte random nonce as `OP_EMBER_AUTH_CHALLENGE`, then
+/// sign the received nonce with their Ed25519 key and send the signature as
+/// `OP_EMBER_AUTH_RESPONSE` (32-byte pubkey + 64-byte signature).
+///
+/// Ember authentication for callers that must preserve intervening
+/// non-AUTH packets while waiting for the challenge and response.
+///
+/// Any packet read off the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
+/// `OP_EMBER_AUTH_RESPONSE` is appended to `deferred_packets` so the
+/// caller can re-dispatch it through its main loop. This is what
+/// unblocks the multi-source download path: the uploader sends
+/// `OP_SECIDENTSTATE` (and sometimes EPX) in the same packet burst as
+/// its OP_EMBER_HELLO, and dropping those frames would break
+/// SecIdent credit accounting and silently lose source-exchange
+/// data for every Ember-to-Ember download.
+///
+/// On success (or cryptographic failure), `deferred_packets` holds the
+/// full sequence of non-AUTH frames observed during the auth round
+/// trip, in arrival order. On a timeout / read error the partial
+/// buffer is preserved so the caller can still drain it.
+pub(crate) async fn perform_ember_auth_buffered<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    peer_ember_hash: Option<&[u8; 16]>,
+    addr: SocketAddr,
+    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
+) -> anyhow::Result<()>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    // Same pubkey ↔ ember_hash check as the non-buffered path.
+    if let Some(expected_hash) = peer_ember_hash {
+        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
+        if derived_hash != *expected_hash {
+            anyhow::bail!(
+                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
+                hex::encode(derived_hash),
+                hex::encode(expected_hash)
+            );
+        }
+    }
+
+    let mut our_nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut our_nonce);
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
+
+    let peer_nonce_payload = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_CHALLENGE,
+        32,
+        addr,
+        "AUTH_CHALLENGE",
+        |p, o, pl| deferred_packets.push_back((p, o, pl)),
+    )
+    .await?;
+
+    let signing_key = SigningKey::from_bytes(our_secret_key);
+    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
+    let mut response = Vec::with_capacity(96);
+    response.extend_from_slice(our_pubkey);
+    response.extend_from_slice(&signature.to_bytes());
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
+
+    let peer_response = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_RESPONSE,
+        96,
+        addr,
+        "AUTH_RESPONSE",
+        |p, o, pl| deferred_packets.push_back((p, o, pl)),
+    )
+    .await?;
+
+    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
+    if resp_pubkey != *peer_pubkey {
+        anyhow::bail!("Ember auth: response pubkey doesn't match advertised pubkey from {addr}");
+    }
+
+    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
+    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if !verify_auth_nonce(&peer_vk, &our_nonce, &peer_sig) {
+        anyhow::bail!("Ember auth: signature verification failed for {addr}");
+    }
+
+    info!(
+        "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",
+        hex::encode(&peer_pubkey[..8]),
+        addr,
+        deferred_packets.len(),
+    );
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2372,332 +2705,4 @@ mod tests {
             "got {err}"
         );
     }
-}
-
-async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
-    writer: &mut W,
-    protocol: u8,
-    opcode: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    writer.write_u8(protocol).await?;
-    let pkt_len = (1 + payload.len()) as u32;
-    writer.write_u32_le(pkt_len).await?;
-    writer.write_u8(opcode).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
-    reader: &mut R,
-) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    let protocol = reader.read_u8().await?;
-    let len = reader.read_u32_le().await?;
-    if len == 0 || len > 5_000_000 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid packet length",
-        ));
-    }
-    let opcode = reader.read_u8().await?;
-    let payload_len = (len - 1) as usize;
-    // Grow the buffer as bytes actually arrive rather than allocating the full
-    // declared length (up to ~5 MiB) before reading. A peer that announces a
-    // large packet then stalls would otherwise pin that allocation per
-    // friend-connect session (mirrors `read_packet_async` in transfer.rs).
-    let mut payload = Vec::new();
-    let mut remaining = payload_len;
-    const READ_STEP: usize = 65536;
-    while remaining > 0 {
-        let want = remaining.min(READ_STEP);
-        let start = payload.len();
-        payload.resize(start + want, 0);
-        reader.read_exact(&mut payload[start..start + want]).await?;
-        remaining -= want;
-    }
-    Ok((protocol, opcode, payload))
-}
-
-/// Maximum time we'll wait for the peer's `OP_EMBER_HELLO` /
-/// `OP_EMBER_HELLOANSWER` after we send ours. Short enough that a
-/// vanilla eMule peer (which will never respond) doesn't add noticeable
-/// latency to friend-connect; long enough to absorb normal-internet
-/// jitter for the small handful of packets that may queue ahead of the
-/// Ember hello.
-#[allow(dead_code)]
-const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
-/// Cap on the number of unrelated packets we'll consume while looking
-/// for the peer's Ember hello. A well-behaved Ember peer sends its
-/// hello immediately after the EmuleInfo exchange, so 0–1 unrelated
-/// packets are normal (e.g. `OP_SECIDENTSTATE`); a higher count may
-/// indicate the peer is racing in unrelated traffic. Bounded so a
-/// chatty peer can't pin us in this loop.
-#[allow(dead_code)]
-const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
-
-/// Drives a synchronous `OP_EMBER_HELLO` exchange right after the
-/// EmuleInfo round-trip. We send our hello (with our Ed25519 pubkey
-/// when available) and then read packets for up to
-/// [`EMBER_HELLO_TIMEOUT_SECS`] looking for the peer's hello. On
-/// success we populate `hello_caps.is_ember`, `.ember_hash`,
-/// `.ember_pubkey`, `.mod_version`, and `.peer_name` from the parsed
-/// payload — the only place in `friend_connect.rs` that ever sets
-/// `is_ember = true` (the public Hello / EmuleInfo handshake is kept
-/// byte-identical to vanilla eMule so anti-leecher mods don't queue-ban
-/// us, see the long comment in `messages.rs::build_emule_info`).
-///
-/// If the peer beat us to it and sent `OP_EMBER_HELLO` instead of an
-/// answer, we reply with our own `OP_EMBER_HELLOANSWER` so they also
-/// learn our pubkey in the same round-trip. Vanilla peers and older
-/// Ember peers that don't speak this opcode just hit the timeout and
-/// the handshake proceeds without `ember_pubkey` set — the downstream
-/// `is_ember` check at the call sites then bails cleanly.
-#[allow(dead_code)]
-async fn exchange_ember_hello<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    our_ember_hash: &[u8; 16],
-    our_nickname: &str,
-    our_pubkey: Option<&[u8; 32]>,
-    hello_caps: &mut PeerCapabilities,
-    addr: SocketAddr,
-) -> std::io::Result<()>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
-{
-    let payload = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await?;
-
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
-    for _ in 0..EMBER_HELLO_MAX_LOOKAHEAD {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, read_packet_inner(reader)).await {
-            Ok(Ok((proto, opcode, packet_payload))) => {
-                if proto == OP_EMULEPROT
-                    && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER)
-                {
-                    if let Some(ident) = parse_ember_hello(&packet_payload) {
-                        hello_caps.is_ember = true;
-                        if !ident.mod_version.is_empty() {
-                            hello_caps.mod_version = ident.mod_version;
-                        }
-                        if !ident.nickname.is_empty() {
-                            hello_caps.peer_name = ident.nickname;
-                        }
-                        if ident.ember_hash != [0u8; 16] {
-                            hello_caps.ember_hash = Some(ident.ember_hash);
-                        }
-                        if let Some(pk) = ident.ed25519_pubkey {
-                            hello_caps.ember_pubkey = Some(pk);
-                        }
-                        if opcode == OP_EMBER_HELLO {
-                            let answer =
-                                build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
-                            let _ =
-                                write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &answer)
-                                    .await;
-                        }
-                    }
-                    return Ok(());
-                }
-                debug!(
-                    "friend_connect {addr}: skipping proto=0x{proto:02X} op=0x{opcode:02X} while waiting for OP_EMBER_HELLO"
-                );
-            }
-            // Timeout or read error → peer is vanilla eMule, an older
-            // Ember release, or the connection died. Either way the
-            // caller will surface the actual failure mode (auth skipped
-            // or `is_ember` bail).
-            _ => return Ok(()),
-        }
-    }
-    Ok(())
-}
-
-/// Maximum unrelated packets we'll skip while looking for a
-/// specific Ember auth opcode. Bounded to prevent a chatty peer
-/// from pinning us in this loop forever; in practice we expect
-/// 0–1 skips (just OP_SECIDENTSTATE).
-const AUTH_PACKET_MAX_SKIPS: usize = 3;
-/// Per-attempt timeout while waiting for the next packet during
-/// auth. L7: tightened from 10 s × 8 skips (~80 s worst case) to
-/// 5 s × 3 skips (~15 s worst case). The previous 80 s window let
-/// a chatty peer pin our auth path for over a minute by spraying
-/// unrelated frames, which made friend-connect look hung. In
-/// practice the only legitimate skip is a single OP_SECIDENTSTATE
-/// emitted by the upload side as part of its initial burst, so
-/// 3 skips is plenty of headroom while still bounding the total
-/// stall a misbehaving peer can inflict.
-const AUTH_PACKET_TIMEOUT_SECS: u64 = 5;
-
-/// Read the next packet matching `expected_opcode` (with
-/// `expected_payload_len`), skipping a bounded number of unrelated
-/// packets first.
-///
-/// `on_deferred` is invoked for each intervening non-AUTH packet so
-/// callers that care about those packets (e.g. the multi-source
-/// download loop, which must process `OP_SECIDENTSTATE` to keep
-/// SecIdent credit accounting correct) can capture them for later
-/// replay. Pass a no-op callback (`|_, _, _| {}`) to restore the
-/// original drop-on-the-floor behaviour used by friend-connect,
-/// which doesn't process SecIdent itself.
-///
-/// Returns the matched packet's payload. Errors if we hit the
-/// per-packet read timeout, hit `AUTH_PACKET_MAX_SKIPS` non-matching
-/// packets, or read a stream error.
-async fn read_specific_auth_packet<R, D>(
-    reader: &mut R,
-    expected_opcode: u8,
-    expected_payload_len: usize,
-    addr: SocketAddr,
-    label: &'static str,
-    mut on_deferred: D,
-) -> anyhow::Result<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    D: FnMut(u8, u8, Vec<u8>),
-{
-    for _ in 0..=AUTH_PACKET_MAX_SKIPS {
-        let (proto, opcode, payload) = read_packet_with_timeout(reader, AUTH_PACKET_TIMEOUT_SECS)
-            .await
-            .map_err(|e| anyhow::anyhow!("Ember auth: failed to read {label} from {addr}: {e}"))?;
-        if proto == OP_EMULEPROT && opcode == expected_opcode {
-            if payload.len() != expected_payload_len {
-                anyhow::bail!(
-                    "Ember auth: {label} from {addr} has wrong payload length: got {}, expected {}",
-                    payload.len(),
-                    expected_payload_len,
-                );
-            }
-            return Ok(payload);
-        }
-        debug!(
-            "Ember auth: deferring intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
-        );
-        on_deferred(proto, opcode, payload);
-    }
-    anyhow::bail!(
-        "Ember auth: never received {label} from {addr} after {AUTH_PACKET_MAX_SKIPS} unrelated packets"
-    );
-}
-
-async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
-    reader: &mut R,
-    timeout_secs: u64,
-) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        read_packet_inner(reader),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
-}
-
-/// Perform the Ember Ed25519 challenge-response authentication exchange.
-///
-/// Both sides send a 32-byte random nonce as `OP_EMBER_AUTH_CHALLENGE`, then
-/// sign the received nonce with their Ed25519 key and send the signature as
-/// `OP_EMBER_AUTH_RESPONSE` (32-byte pubkey + 64-byte signature).
-///
-/// Ember authentication for callers that must preserve intervening
-/// non-AUTH packets while waiting for the challenge and response.
-///
-/// Any packet read off the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
-/// `OP_EMBER_AUTH_RESPONSE` is appended to `deferred_packets` so the
-/// caller can re-dispatch it through its main loop. This is what
-/// unblocks the multi-source download path: the uploader sends
-/// `OP_SECIDENTSTATE` (and sometimes EPX) in the same packet burst as
-/// its OP_EMBER_HELLO, and dropping those frames would break
-/// SecIdent credit accounting and silently lose source-exchange
-/// data for every Ember-to-Ember download.
-///
-/// On success (or cryptographic failure), `deferred_packets` holds the
-/// full sequence of non-AUTH frames observed during the auth round
-/// trip, in arrival order. On a timeout / read error the partial
-/// buffer is preserved so the caller can still drain it.
-pub(crate) async fn perform_ember_auth_buffered<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    our_pubkey: &[u8; 32],
-    our_secret_key: &[u8; 32],
-    peer_pubkey: &[u8; 32],
-    peer_ember_hash: Option<&[u8; 16]>,
-    addr: SocketAddr,
-    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
-) -> anyhow::Result<()>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
-{
-    // Same pubkey ↔ ember_hash check as the non-buffered path.
-    if let Some(expected_hash) = peer_ember_hash {
-        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
-        if derived_hash != *expected_hash {
-            anyhow::bail!(
-                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
-                hex::encode(derived_hash),
-                hex::encode(expected_hash)
-            );
-        }
-    }
-
-    let mut our_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut our_nonce);
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
-
-    let peer_nonce_payload = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_CHALLENGE,
-        32,
-        addr,
-        "AUTH_CHALLENGE",
-        |p, o, pl| deferred_packets.push_back((p, o, pl)),
-    )
-    .await?;
-
-    let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
-    let mut response = Vec::with_capacity(96);
-    response.extend_from_slice(our_pubkey);
-    response.extend_from_slice(&signature.to_bytes());
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
-
-    let peer_response = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_RESPONSE,
-        96,
-        addr,
-        "AUTH_RESPONSE",
-        |p, o, pl| deferred_packets.push_back((p, o, pl)),
-    )
-    .await?;
-
-    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
-    if resp_pubkey != *peer_pubkey {
-        anyhow::bail!("Ember auth: response pubkey doesn't match advertised pubkey from {addr}");
-    }
-
-    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
-    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    if !verify_auth_nonce(&peer_vk, &our_nonce, &peer_sig) {
-        anyhow::bail!("Ember auth: signature verification failed for {addr}");
-    }
-
-    info!(
-        "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",
-        hex::encode(&peer_pubkey[..8]),
-        addr,
-        deferred_packets.len(),
-    );
-    Ok(())
 }

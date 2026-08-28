@@ -452,11 +452,11 @@
         </div>
         <div class="reputation-row">
           <div class="rep-stat">
-            <span class="rep-label">{m.stats_tracked_peers()}</span>
+            <span class="rep-label" title={m.stats_tracked_peers_hint()}>{m.stats_tracked_peers()}</span>
             <span class="rep-value">{repStats.tracked_peers.toLocaleString()}</span>
           </div>
           <div class="rep-stat">
-            <span class="rep-label">{m.stats_banned_peers()}</span>
+            <span class="rep-label" title={m.stats_banned_peers_hint()}>{m.stats_banned_peers()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
               {repStats.banned_peers.toLocaleString()}
             </span>

@@ -23,7 +23,8 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_SOURCE,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
@@ -236,6 +237,12 @@ pub struct DhtInbound {
     /// Carries the wire `request_id` so the caller can ACK only after
     /// `start_publish_to` succeeds.
     pub proxy_store_forward: Option<(u32, SignedRecord)>,
+    /// Authenticated channel gossip body (`MSG_CHANNEL_MSG`). The DHT
+    /// frame is already bound to `sender_id`; the body is AEAD under the
+    /// channel content key and is handled by the network task.
+    pub channel_msg: Option<Vec<u8>>,
+    /// Overlay relay envelope (`MSG_CHANNEL_RELAY`).
+    pub channel_relay: Option<Vec<u8>>,
     /// A verified `CALLBACK_REQ` the caller should encrypt and send to this
     /// publisher (addr, noise_pub, already-signed CALLBACK frame).
     pub callback_forward: Option<(SocketAddr, [u8; 32], Vec<u8>)>,
@@ -426,7 +433,16 @@ impl EmberDht {
     /// (`NodeIdentity::ed25519_secret_key`). Our node ID is
     /// `BLAKE3(ed25519_pub)[..16]`, identical to the `ember_hash`, so
     /// every Ember subsystem agrees on who we are.
-    pub fn new(ed25519_secret_key: [u8; 32], block_private_ips: bool) -> Self {
+    /// `noise_public_key` is our own Noise static key. Every outbound frame is
+    /// signed over it and every inbound frame is verified against the session's
+    /// peer key, so it has to be right from the first frame — it used to be
+    /// filled in later by `set_advertised_buddy` and default to zero, which
+    /// would now mean signing against a key no peer will check us with.
+    pub fn new(
+        ed25519_secret_key: [u8; 32],
+        noise_public_key: [u8; 32],
+        block_private_ips: bool,
+    ) -> Self {
         let signing_key = crypto::signing_key_from_bytes(&ed25519_secret_key);
         let local_id = EmberNodeId(crypto::node_id_from_public_key(
             &signing_key.verifying_key(),
@@ -443,7 +459,13 @@ impl EmberDht {
             store,
             signing_key,
             local_id,
-            next_request_id: 1,
+            // Random rather than 1. A counter's *next* value is guessable from
+            // any observed frame whatever it starts at, so this does not hide
+            // that; what a fixed start leaked was the absolute count — every
+            // frame announced how many we had sent since launch, which is an
+            // uptime and activity oracle any peer could read. Correlation only
+            // needs local uniqueness, which a random start preserves.
+            next_request_id: rand::random::<u32>().max(1),
             store_sig_seen: HashMap::new(),
             store_sig_order: VecDeque::new(),
             store_sig_cache_max: MAX_STORE_SIG_CACHE,
@@ -458,7 +480,7 @@ impl EmberDht {
             store_reject_verify: 0,
             store_reject_source_ip: 0,
             store_reject_proximity: 0,
-            local_noise_pub: [0u8; 32],
+            local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
             buddy_endorsements: HashMap::new(),
@@ -473,6 +495,21 @@ impl EmberDht {
         self.local_contact_udp = udp_port;
     }
 
+    /// Whether we have a reachable endpoint to offer as someone's buddy.
+    ///
+    /// This used to be inferred from `local_noise_pub` still being all zeroes,
+    /// which worked only while that field was filled in by
+    /// [`Self::set_advertised_buddy`] and nothing else. It is now our real Noise
+    /// static key from construction — every frame signature binds to it — so the
+    /// zero test would never fire again and we would claim to be a usable buddy
+    /// having never been told where we are reachable. The endpoint is the honest
+    /// signal, and it is what `sign_buddy_endorsement` already required.
+    fn advertises_buddy_endpoint(&self) -> bool {
+        self.local_contact_udp != 0
+            && !self.local_contact_ip.is_unspecified()
+            && !crate::security::is_special_use_v4(self.local_contact_ip)
+    }
+
     /// Sign our own endpoint as `publisher`'s buddy, so `publisher` can name us
     /// in a source trailer and any searcher can verify it without knowing us.
     ///
@@ -485,7 +522,7 @@ impl EmberDht {
         publisher: EmberNodeId,
         now: i64,
     ) -> Option<(i64, [u8; 64])> {
-        if self.local_noise_pub == [0u8; 32] {
+        if !self.advertises_buddy_endpoint() {
             return None;
         }
         let candidate = SourceBuddy {
@@ -541,7 +578,7 @@ impl EmberDht {
         let msg = messages::build_buddy_endorse_req(self.local_id, request_id);
         Some((
             request_id,
-            messages::encode_message(&msg, &self.signing_key, true),
+            messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub),
         ))
     }
 
@@ -639,7 +676,7 @@ impl EmberDht {
         let Some(buddy) = sc.buddy else {
             return false;
         };
-        if self.local_noise_pub == [0u8; 32] || !buddy.is_routable() {
+        if !self.advertises_buddy_endpoint() || !buddy.is_routable() {
             return false;
         }
         if buddy.has_identity() {
@@ -668,6 +705,12 @@ impl EmberDht {
     /// Snapshot of every contact (for the dev panel / diagnostics).
     pub fn contacts(&self) -> Vec<EmberContact> {
         self.routing.all_contacts()
+    }
+
+    /// Contacts parked in a bucket's replacement cache rather than holding a
+    /// slot. See [`RoutingTable::cached_contacts`].
+    pub fn cached_contacts(&self) -> Vec<EmberContact> {
+        self.routing.cached_contacts()
     }
 
     /// Borrow the routing table (read-only). The iterative-lookup driver
@@ -763,8 +806,29 @@ impl EmberDht {
     /// Insert a contact directly (manual harness seeding). Returns
     /// `true` if it landed in a bucket, `false` if rejected (self,
     /// subnet-diversity limit) or only cached behind a full bucket.
+    /// Live traffic uses [`RoutingTable::add_contact`] via signed frames;
+    /// this wrapper exists for the `add_ember_dht_contact` harness
+    /// command and for unit tests.
+    /// Offer a contact to the routing table, reporting what the table decided.
+    ///
+    /// Ungated, unlike the boolean [`Self::add_contact`] beside it: that one is
+    /// a test convenience, and calling it from the network loop meant the code
+    /// only existed under `debug_assertions` — a release build did not compile,
+    /// which no amount of `cargo test` or `cargo clippy --all-targets` would
+    /// show, since both enable them.
+    ///
+    /// Returning [`AddResult`] rather than a bool also keeps `PingOldest`
+    /// actionable. A full bucket parks the newcomer in the replacement cache
+    /// and asks the caller to probe the incumbent; collapsing that to `false`
+    /// silently drops the request, so the newcomer waits for a slot that
+    /// nothing will ever free.
+    pub fn offer_contact(&mut self, contact: EmberContact) -> AddResult {
+        self.routing.add_contact(contact)
+    }
+
+    #[cfg(any(test, debug_assertions))]
     pub fn add_contact(&mut self, contact: EmberContact) -> bool {
-        matches!(self.routing.add_contact(contact), AddResult::Added)
+        matches!(self.offer_contact(contact), AddResult::Added)
     }
 
     /// Whether we should accept a `STORE_RECORD` for `key`.
@@ -813,6 +877,11 @@ impl EmberDht {
         };
         if !source_ip_ok {
             self.store_reject_source_ip = self.store_reject_source_ip.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+
+        if parsed.record_type == RECORD_TYPE_CHANNEL && !parsed.channel_store_ok() {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
 
@@ -1270,7 +1339,7 @@ impl EmberDht {
             searcher_user_hash,
             callback_token,
         );
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1296,7 +1365,7 @@ impl EmberDht {
             searcher_user_hash,
             callback_token,
         );
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1394,7 +1463,7 @@ impl EmberDht {
     pub fn build_ping(&mut self) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_ping(self.local_id, request_id);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1404,7 +1473,7 @@ impl EmberDht {
     pub fn build_find_node(&mut self, target: EmberNodeId) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_find_node(self.local_id, request_id, target);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1413,7 +1482,23 @@ impl EmberDht {
     pub fn build_announce_peer(&mut self, contacts: Vec<EmberContact>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         let msg = messages::build_announce_peer(self.local_id, request_id, contacts);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
+        (request_id, bytes)
+    }
+
+    /// Build a signed `CHANNEL_MSG` gossip frame. No ack is expected.
+    pub fn build_channel_msg(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_channel_msg(self.local_id, request_id, body);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
+        (request_id, bytes)
+    }
+
+    /// Build a signed `CHANNEL_RELAY` frame for a HighID overlay hop.
+    pub fn build_channel_relay(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
+        let request_id = self.next_request_id();
+        let msg = messages::build_channel_relay(self.local_id, request_id, body);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1429,7 +1514,7 @@ impl EmberDht {
         let request_id = self.next_request_id();
         let msg =
             messages::build_store_record(self.local_id, request_id, key, record, record_signature);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1444,7 +1529,7 @@ impl EmberDht {
         let request_id = self.next_request_id();
         let msg =
             messages::build_proxy_store(self.local_id, request_id, key, record, record_signature);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1452,7 +1537,7 @@ impl EmberDht {
     /// successfully starting the fan-out publish).
     pub fn build_proxy_store_ack_frame(&self, request_id: u32, key: [u8; 16]) -> Vec<u8> {
         let msg = messages::build_proxy_store_ack(self.local_id, request_id, key);
-        messages::encode_message(&msg, &self.signing_key, true)
+        messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub)
     }
 
     /// Build a signed `FIND_VALUE` frame querying for `keys` from
@@ -1474,7 +1559,7 @@ impl EmberDht {
         keys.truncate(messages::MAX_FIND_VALUE_KEYS);
         let request_id = self.next_request_id();
         let msg = messages::build_find_value(self.local_id, request_id, keys, start_position);
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
 
@@ -1508,7 +1593,7 @@ impl EmberDht {
         }
         let request_id = self.next_request_id();
         let msg = messages::build_store_batch(self.local_id, request_id, records[..taken].to_vec());
-        let bytes = messages::encode_message(&msg, &self.signing_key, true);
+        let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         Some((request_id, bytes, taken))
     }
 
@@ -1862,11 +1947,13 @@ impl EmberDht {
             return out;
         }
 
-        // `decode_message(.., true)` verifies the Ed25519 signature and
-        // the `sender_id == BLAKE3(pubkey)[..16]` binding, so a frame
-        // that decodes here is cryptographically attributable to its
-        // sender_id and cannot poison the table under a forged ID.
-        let msg = match messages::decode_message(payload, true) {
+        // Verifies the Ed25519 signature, the `sender_id == BLAKE3(pubkey)[..16]`
+        // binding, and — against `remote_noise_pub` — that the frame was signed
+        // for *this* Noise session. A frame that decodes here is therefore
+        // attributable to its sender_id and was sent by the party that owns the
+        // session, so the address and static key we learn below are genuinely
+        // theirs and cannot be a replay captured from another session.
+        let msg = match messages::decode_message(payload, true, &remote_noise_pub) {
             Ok(m) => m,
             Err(e) => {
                 out.error = Some(e.to_string());
@@ -1905,7 +1992,7 @@ impl EmberDht {
                 out.ping_received = true;
                 let pong = messages::build_pong(self.local_id, msg.request_id, from);
                 out.responses
-                    .push(messages::encode_message(&pong, &self.signing_key, true));
+                    .push(messages::encode_message(&pong, &self.signing_key, true, &self.local_noise_pub));
             }
             DhtPayload::Pong { observed } => {
                 out.pong_received = true;
@@ -1920,7 +2007,7 @@ impl EmberDht {
                 let closest = self.closest_excluding(&target, msg.sender_id, session_contacts);
                 let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                 out.responses
-                    .push(messages::encode_message(&found, &self.signing_key, true));
+                    .push(messages::encode_message(&found, &self.signing_key, true, &self.local_noise_pub));
             }
             DhtPayload::FoundNode { contacts } => {
                 // Merge every returned contact into the table (standard
@@ -1942,7 +2029,7 @@ impl EmberDht {
                         out.stored_record = true;
                         let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
                         out.responses
-                            .push(messages::encode_message(&ack, &self.signing_key, true));
+                            .push(messages::encode_message(&ack, &self.signing_key, true, &self.local_noise_pub));
                     }
                     StoreOutcome::Replay => {
                         // Same as STORE_BATCH: a replay means we already hold
@@ -1954,7 +2041,7 @@ impl EmberDht {
                         out.store_replay_rejected = true;
                         let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
                         out.responses
-                            .push(messages::encode_message(&ack, &self.signing_key, true));
+                            .push(messages::encode_message(&ack, &self.signing_key, true, &self.local_noise_pub));
                     }
                     // A record that fails to parse/verify, whose key does not
                     // match its content, or (for a non-firewalled source)
@@ -1996,7 +2083,7 @@ impl EmberDht {
                 // so it can retry rather than assume the records are placed.
                 let ack = messages::build_store_batch_ack(self.local_id, msg.request_id, accepted);
                 out.responses
-                    .push(messages::encode_message(&ack, &self.signing_key, true));
+                    .push(messages::encode_message(&ack, &self.signing_key, true, &self.local_noise_pub));
             }
             DhtPayload::StoreBatchAck { accepted } => {
                 out.store_batch_ack = Some((msg.request_id, accepted));
@@ -2053,6 +2140,7 @@ impl EmberDht {
                     &peer_list,
                     &self.signing_key,
                     true,
+                    &self.local_noise_pub,
                 ));
             }
             DhtPayload::PeerList { contacts } => {
@@ -2091,7 +2179,7 @@ impl EmberDht {
                         reply.total_available,
                     );
                     out.responses
-                        .push(messages::encode_message(&fv, &self.signing_key, true));
+                        .push(messages::encode_message(&fv, &self.signing_key, true, &self.local_noise_pub));
                 } else {
                     let target = keys
                         .first()
@@ -2104,7 +2192,7 @@ impl EmberDht {
                     let closest = self.closest_excluding(&target, msg.sender_id, session_contacts);
                     let found = messages::build_found_node(self.local_id, msg.request_id, closest);
                     out.responses
-                        .push(messages::encode_message(&found, &self.signing_key, true));
+                        .push(messages::encode_message(&found, &self.signing_key, true, &self.local_noise_pub));
                 }
             }
             DhtPayload::StoreAck { key: _ } => {
@@ -2122,6 +2210,12 @@ impl EmberDht {
                     next_position,
                     total_available,
                 });
+            }
+            DhtPayload::ChannelMsg { body } => {
+                out.channel_msg = Some(body);
+            }
+            DhtPayload::ChannelRelay { body } => {
+                out.channel_relay = Some(body);
             }
             DhtPayload::CallbackReq {
                 publisher_id,
@@ -2156,7 +2250,7 @@ impl EmberDht {
                                     callback_token,
                                 );
                                 let bytes =
-                                    messages::encode_message(&reply, &self.signing_key, true);
+                                    messages::encode_message(&reply, &self.signing_key, true, &self.local_noise_pub);
                                 out.callback_forward = Some((dest, noise, bytes));
                             }
                         }
@@ -2210,7 +2304,7 @@ impl EmberDht {
                         signature,
                     );
                     out.responses
-                        .push(messages::encode_message(&reply, &self.signing_key, true));
+                        .push(messages::encode_message(&reply, &self.signing_key, true, &self.local_noise_pub));
                 }
             }
             DhtPayload::BuddyEndorse {
@@ -2514,7 +2608,7 @@ mod tests {
     use super::*;
 
     fn dht(seed: u8) -> EmberDht {
-        let mut d = EmberDht::new([seed; 32], false);
+        let mut d = EmberDht::new([seed; 32], [seed; 32], false);
         d.set_advertised_buddy([seed; 32], Ipv4Addr::new(8, 8, 8, seed), 4672);
         d
     }
@@ -2689,12 +2783,72 @@ mod tests {
         assert_eq!(d.local_id().0, expected);
     }
 
+    /// The reason v4 binds a signature to its Noise session.
+    ///
+    /// Before it, a signed frame was a bearer token: it proved only that its
+    /// sender_id had once signed those bytes, never that whoever handed them
+    /// over was that sender. Anyone Alice had ever spoken to could replay her
+    /// frame verbatim inside their own session, and Carol — who learns a
+    /// *verified* contact from the session's address and static key on every
+    /// frame that decodes — would file Alice as living at the replayer's
+    /// address with the replayer's key. The `noise_pub` pin then held that
+    /// entry against the real Alice, and replaying kept it fresh so it never
+    /// aged out.
+    #[test]
+    fn a_frame_replayed_into_another_session_is_refused() {
+        let mut alice = dht(41);
+        let mut mallory = dht(42);
+        let mut carol = dht(43);
+        let alice_addr = addr(41, 4672);
+        let mallory_addr = addr(42, 4672);
+
+        // Alice pings Mallory, so Mallory holds a genuine Alice-signed frame.
+        let (_rid, alice_ping) = alice.build_ping();
+        let on_mallory =
+            mallory.handle_message(&alice_ping, alice_addr, alice.local_noise_pub, 1000);
+        assert!(on_mallory.error.is_none(), "the frame is genuinely Alice's");
+        assert!(on_mallory.learned_contact);
+
+        // Mallory replays it to Carol inside Mallory's own Noise session. The
+        // bytes are untouched and Alice's signature over them is still valid,
+        // so everything except the session binding checks out.
+        let on_carol =
+            carol.handle_message(&alice_ping, mallory_addr, mallory.local_noise_pub, 1001);
+        assert!(
+            on_carol.error.is_some(),
+            "a frame signed for Mallory's session must not verify in Carol's"
+        );
+        assert!(
+            !on_carol.learned_contact,
+            "and it must teach Carol nothing"
+        );
+        assert_eq!(
+            carol.contact_count(),
+            0,
+            "Alice's node id must not be captured at Mallory's address"
+        );
+
+        // Alice reaching Carol directly still works, so the binding refuses
+        // only the replay and not the peer.
+        let (_rid2, direct) = alice.build_ping();
+        let on_carol_direct =
+            carol.handle_message(&direct, alice_addr, alice.local_noise_pub, 1002);
+        assert!(on_carol_direct.error.is_none());
+        assert!(on_carol_direct.learned_contact);
+        let held = carol
+            .routing()
+            .get_contact(&alice.local_id())
+            .expect("Carol learns the real Alice");
+        assert_eq!(held.addr, alice_addr);
+        assert_eq!(held.noise_pub, alice.local_noise_pub);
+    }
+
     #[test]
     fn ping_pong_round_trip_learns_both_contacts() {
         let mut a = dht(1);
         let mut b = dht(2);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(1, 4672);
         let b_addr = addr(2, 4672);
 
@@ -2735,8 +2889,8 @@ mod tests {
     fn find_node_returns_closest_and_asker_learns_them() {
         let mut a = dht(10);
         let mut b = dht(11);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(10, 4672);
         let b_addr = addr(11, 4672);
 
@@ -2784,8 +2938,8 @@ mod tests {
     fn announce_peer_exchanges_lists_and_learns_contacts() {
         let mut a = dht(20);
         let mut b = dht(21);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(20, 4672);
         let b_addr = addr(21, 4672);
 
@@ -2843,14 +2997,14 @@ mod tests {
 
     #[test]
     fn announce_to_a_lan_neighbour_includes_session_contacts() {
-        let mut a = EmberDht::new([20; 32], true);
-        let mut b = EmberDht::new([21; 32], true);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let mut a = EmberDht::new([20; 32], [20; 32], true);
+        let mut b = EmberDht::new([21; 32], [21; 32], true);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = SocketAddr::from(([192, 168, 1, 20], 4672));
         let b_addr = SocketAddr::from(([192, 168, 1, 21], 4672));
 
-        let island = EmberDht::new([22; 32], true);
+        let island = EmberDht::new([22; 32], [22; 32], true);
         let lan = EmberContact {
             node_id: island.local_id(),
             addr: SocketAddr::from(([192, 168, 1, 50], 4672)),
@@ -2947,8 +3101,8 @@ mod tests {
     fn a_store_batch_stores_every_record_and_fits_one_datagram() {
         let mut a = dht(30);
         let mut b = dht(31);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(30, 4672);
         let b_addr = addr(31, 4672);
 
@@ -3117,7 +3271,7 @@ mod tests {
         // the searcher sees only a timeout.
         let mut a = dht(26);
         let mut b = dht(27);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(26, 4672);
 
         let probe = a.build_keyword_record("linux", [0u8; 16], [0u8; 32], 1, "x.iso");
@@ -3152,7 +3306,7 @@ mod tests {
         );
 
         // And it still round-trips with real records in it.
-        let on_a = a.handle_message(frame, addr(27, 4672), [0xBB; 32], 1001);
+        let on_a = a.handle_message(frame, addr(27, 4672), b.local_noise_pub, 1001);
         let blobs = on_a
             .found_value
             .expect("A should see a FOUND_VALUE")
@@ -3186,7 +3340,7 @@ mod tests {
         // would otherwise go unanswered by every node it reached.
         let mut a = dht(24);
         let mut b = dht(25);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(24, 4672);
 
         let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
@@ -3218,8 +3372,8 @@ mod tests {
     fn store_then_find_value_round_trip() {
         let mut a = dht(20); // publisher / searcher
         let mut b = dht(21); // storer
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(20, 4672);
         let b_addr = addr(21, 4672);
 
@@ -3262,8 +3416,8 @@ mod tests {
     fn a_store_record_replay_still_acks() {
         let mut a = dht(20);
         let mut b = dht(21);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(20, 4672);
         let b_addr = addr(21, 4672);
 
@@ -3301,8 +3455,8 @@ mod tests {
     fn a_record_skipped_mid_page_is_served_by_a_later_one() {
         let mut a = dht(40);
         let mut b = dht(41);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(40, 4672);
         let b_addr = addr(41, 4672);
 
@@ -3385,7 +3539,7 @@ mod tests {
     fn a_rewound_page_does_not_report_what_it_served_as_withheld() {
         let mut a = dht(44);
         let mut b = dht(45);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(44, 4672);
 
         // The same shape as `a_record_skipped_mid_page_is_served_by_a_later_one`:
@@ -3440,8 +3594,8 @@ mod tests {
 
         let mut a = dht(46);
         let mut b = dht(47);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(46, 4672);
         let b_addr = addr(47, 4672);
 
@@ -3552,7 +3706,7 @@ mod tests {
     fn a_max_size_store_record_is_served_on_find_value() {
         let mut a = dht(20);
         let mut b = dht(21);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(20, 4672);
 
         let name_budget =
@@ -3585,8 +3739,8 @@ mod tests {
     fn a_truncated_found_value_reports_what_it_could_not_carry() {
         let mut a = dht(20); // publisher / searcher
         let mut b = dht(21); // storer
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(20, 4672);
         let b_addr = addr(21, 4672);
 
@@ -3647,8 +3801,8 @@ mod tests {
     fn paging_a_truncated_key_reaches_every_record() {
         let mut a = dht(22);
         let mut b = dht(23);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(22, 4672);
         let b_addr = addr(23, 4672);
 
@@ -3745,9 +3899,9 @@ mod tests {
         let mut a = dht(30);
         let mut b = dht(31);
         let mut c = dht(32); // second publisher (store dedupes by publisher key)
-        let a_noise = [0xAA; 32];
-        let c_noise = [0xCC; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let c_noise = c.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(30, 4672);
         let c_addr = addr(32, 4672);
         let b_addr = addr(31, 4672);
@@ -3792,8 +3946,8 @@ mod tests {
         // still return primary hits (filename AND filters at the searcher).
         let mut a = dht(33);
         let mut b = dht(34);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(33, 4672);
         let b_addr = addr(34, 4672);
 
@@ -3824,8 +3978,8 @@ mod tests {
         // the searcher is the right filter.
         let mut a = dht(35);
         let mut b = dht(36);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(35, 4672);
         let b_addr = addr(36, 4672);
 
@@ -3886,12 +4040,14 @@ mod tests {
         else {
             return false;
         };
-        let on_buddy = buddy.handle_message(&req, addr(1, 4672), [0x01; 32], now);
+        let publisher_noise = publisher.local_noise_pub;
+        let buddy_noise = buddy.local_noise_pub;
+        let on_buddy = buddy.handle_message(&req, addr(1, 4672), publisher_noise, now);
         let Some(reply) = on_buddy.responses.first() else {
             return false;
         };
         publisher
-            .handle_message(reply, addr(2, 4672), [0x02; 32], now)
+            .handle_message(reply, addr(2, 4672), buddy_noise, now)
             .buddy_endorsed
     }
 
@@ -3987,7 +4143,7 @@ mod tests {
     fn a_source_record_may_only_live_under_the_key_its_file_hash_derives() {
         let mut a = dht(64);
         let mut b = dht(65);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(40, 4672);
 
         let sk = ed25519_dalek::SigningKey::from_bytes(&[64u8; 32]);
@@ -4028,7 +4184,7 @@ mod tests {
         let planted = [0xC3; 16];
         let (data, sig) = source_record_under_key(&sk, planted, [0x7B; 16], firewalled_contact_at(92));
         let (_rid, frame) = publisher.build_proxy_store(planted, data, sig);
-        let on_buddy = buddy.handle_message(&frame, addr(92, 4672), [0xAA; 32], 2000);
+        let on_buddy = buddy.handle_message(&frame, addr(92, 4672), publisher.local_noise_pub, 2000);
         assert!(
             on_buddy.proxy_store_forward.is_none(),
             "a misfiled source record must not be amplified"
@@ -4045,7 +4201,7 @@ mod tests {
     fn a_buddy_cannot_amplify_its_own_records_without_limit() {
         let mut publisher = dht(88);
         let mut buddy = dht(89);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(88, 4672);
         let contact = firewalled_for_buddy(88, &mut publisher, &mut buddy, 2000);
 
@@ -4077,7 +4233,7 @@ mod tests {
         let (_rid, frame) =
             other.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(
-            commit_inbound_proxy(&mut buddy, &frame, addr(90, 4672), [0x90; 32], 2001),
+            commit_inbound_proxy(&mut buddy, &frame, addr(90, 4672), other.local_noise_pub, 2001),
             "a second buddy must not inherit the first's spent allowance"
         );
     }
@@ -4110,7 +4266,9 @@ mod tests {
             accepted, MAX_PROXY_FORWARDS_IN_FLIGHT,
             "proxied work must never be able to take the whole publish driver"
         );
-        assert!(
+        // Const-evaluated so a change to either bound fails the build rather
+        // than waiting for this test to run.
+        const _: () = assert!(
             MAX_PROXY_FORWARDS_IN_FLIGHT * 2 < 128,
             "and the bound has to sit well under MAX_ACTIVE_PUBLISHES to mean anything"
         );
@@ -4126,7 +4284,7 @@ mod tests {
     fn a_replay_of_a_record_its_publisher_superseded_is_not_a_fresh_store() {
         let mut a = dht(20);
         let mut b = dht(21);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(20, 4672);
 
         let sk = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
@@ -4173,7 +4331,7 @@ mod tests {
     fn the_replay_cache_evicts_its_oldest_entry() {
         let mut a = dht(20);
         let mut b = dht(21);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(20, 4672);
         b.set_sig_cache_max_for_test(4);
 
@@ -4220,7 +4378,7 @@ mod tests {
         let (_rid, frame) =
             a.build_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(
-            b.handle_message(&frame, addr(20, 4672), [0xAA; 32], 1000)
+            b.handle_message(&frame, addr(20, 4672), a.local_noise_pub, 1000)
                 .stored_record
         );
         assert!(
@@ -4233,8 +4391,8 @@ mod tests {
     fn source_store_then_find_value_round_trip() {
         let mut a = dht(60); // publisher (the source itself)
         let mut b = dht(61); // storer
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(20, 4672); // 10.0.0.20 — matches the claimed contact IP
         let b_addr = addr(21, 4672);
 
@@ -4271,7 +4429,7 @@ mod tests {
     fn source_store_rejected_on_ip_mismatch() {
         let mut a = dht(62);
         let mut b = dht(63);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(30, 4672); // 10.0.0.30
 
         // The record claims a *different* IP (10.0.0.99) than the address B
@@ -4296,7 +4454,7 @@ mod tests {
     fn firewalled_source_store_allows_ip_mismatch() {
         let mut a = dht(70);
         let mut b = dht(71);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         // Observed sender IP differs from claimed contact IP (buddy path /
         // symmetric NAT). FIREWALLED exempts anti-reflection.
         let a_addr = addr(30, 4672);
@@ -4317,7 +4475,7 @@ mod tests {
     fn proxy_store_forwards_firewalled_source() {
         let mut publisher = dht(80);
         let mut buddy = dht(81);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(80, 4672);
 
         let contact = firewalled_for_buddy(80, &mut publisher, &mut buddy, 2000);
@@ -4367,7 +4525,7 @@ mod tests {
     fn proxy_store_rejects_non_firewalled_source() {
         let mut publisher = dht(82);
         let mut buddy = dht(83);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(82, 4672);
 
         // HighID source must not ride PROXY_STORE (would bypass anti-reflection).
@@ -4388,7 +4546,7 @@ mod tests {
     fn proxy_store_accepts_an_unendorsed_trailer_naming_our_noise() {
         let mut publisher = dht(80);
         let mut buddy = dht(81);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(80, 4672);
 
         let mut contact = firewalled_contact_at(80);
@@ -4420,7 +4578,7 @@ mod tests {
         let mut publisher = dht(70);
         let mut buddy = dht(71);
         let mut victim = dht(72);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(70, 4672);
 
         let contact = firewalled_for_buddy(70, &mut publisher, &mut victim, 2000);
@@ -4441,7 +4599,7 @@ mod tests {
     fn proxy_store_rejects_an_endorsement_we_did_not_make_for_this_publisher() {
         let mut publisher = dht(74);
         let mut buddy = dht(75);
-        let pub_noise = [0xAA; 32];
+        let pub_noise = publisher.local_noise_pub;
         let pub_addr = addr(74, 4672);
 
         let honest = firewalled_for_buddy(74, &mut publisher, &mut buddy, 2000);
@@ -4527,7 +4685,7 @@ mod tests {
 
         // A buddy with no routable endpoint of its own has nothing to sign, and
         // says so by staying silent rather than signing 0.0.0.0.
-        let mut homeless = EmberDht::new([102u8; 32], false);
+        let mut homeless = EmberDht::new([102u8; 32], [102u8; 32], false);
         let (_rid, req) = publisher
             .build_buddy_endorse_req(homeless.local_id(), Instant::now())
             .expect("fresh candidate");
@@ -4557,8 +4715,8 @@ mod tests {
         let mut publisher = dht(90);
         let mut buddy = dht(91);
         let mut searcher = dht(92);
-        let pub_noise = [0xAAu8; 32];
-        let searcher_noise = [0xCCu8; 32];
+        let pub_noise = publisher.local_noise_pub;
+        let searcher_noise = searcher.local_noise_pub;
         let pub_addr = addr(90, 4672);
         let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
 
@@ -4588,13 +4746,13 @@ mod tests {
 
         publisher.note_proxy_store_sent(buddy.local_id(), proxy_rid, file_hash, Instant::now());
         let ack = buddy.build_proxy_store_ack_frame(proxy_rid, record.keyword_hash);
-        let on_ack = publisher.handle_message(&ack, addr(91, 4672), [0xBBu8; 32], 2002);
+        let on_ack = publisher.handle_message(&ack, addr(91, 4672), buddy.local_noise_pub, 2002);
         assert!(
             on_ack.proxy_store_ack.is_some(),
             "matching PROXY_STORE_ACK unlocks CALLBACK"
         );
 
-        let on_pub = publisher.handle_message(&frame, addr(91, 4672), [0xBBu8; 32], 2003);
+        let on_pub = publisher.handle_message(&frame, addr(91, 4672), buddy.local_noise_pub, 2003);
         let connect = on_pub
             .callback_connect
             .expect("publisher should connect-serve the searcher");
@@ -4611,7 +4769,7 @@ mod tests {
         let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
         let (_rid, req) =
             searcher.build_callback_req(EmberNodeId([0x99; 16]), [1u8; 16], 4662, 0, [0u8; 16], [0x44u8; 16]);
-        let on_buddy = buddy.handle_message(&req, searcher_addr, [0xCCu8; 32], 2000);
+        let on_buddy = buddy.handle_message(&req, searcher_addr, searcher.local_noise_pub, 2000);
         assert!(on_buddy.callback_forward.is_none());
     }
 
@@ -4720,7 +4878,7 @@ mod tests {
 
         // The buddy ACKs request id 0 — it accepted the first ask it saw.
         let ack = buddy.build_proxy_store_ack_frame(0, [0xABu8; 16]);
-        let on_ack = publisher.handle_message(&ack, addr(121, 4672), [0xEEu8; 32], 3000);
+        let on_ack = publisher.handle_message(&ack, addr(121, 4672), buddy.local_noise_pub, 3000);
         assert!(
             on_ack.proxy_store_ack.is_some(),
             "the first ask of a tick must still be ACK-able after the tick is recorded"
@@ -4736,7 +4894,7 @@ mod tests {
             [0u8; 16],
             token,
         );
-        let on_cb = publisher.handle_message(&callback, addr(121, 4672), [0xEEu8; 32], 3001);
+        let on_cb = publisher.handle_message(&callback, addr(121, 4672), buddy.local_noise_pub, 3001);
         assert!(
             on_cb.callback_connect.is_some(),
             "the ACKed file must be reachable by CALLBACK"
@@ -4755,7 +4913,7 @@ mod tests {
         let (_cb_rid, callback) =
             buddy.build_callback(file_hash, searcher_ip, 4662, 0, [0u8; 16], token);
         let buddy_addr = addr(98, 4672);
-        let buddy_noise = [0xEEu8; 32];
+        let buddy_noise = buddy.local_noise_pub;
 
         // Sent but never ACKed: the buddy we transmitted to cannot aim us.
         publisher.note_proxy_store_sent(buddy.local_id(), rid, file_hash, Instant::now());
@@ -4825,8 +4983,8 @@ mod tests {
     fn find_value_without_record_returns_closest_nodes() {
         let mut a = dht(30);
         let mut b = dht(31);
-        let a_noise = [0xAA; 32];
-        let b_noise = [0xBB; 32];
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
         let a_addr = addr(30, 4672);
         let b_addr = addr(31, 4672);
 
@@ -4860,7 +5018,7 @@ mod tests {
     fn store_rejects_key_content_mismatch() {
         let mut a = dht(40);
         let mut b = dht(41);
-        let a_noise = [0xAA; 32];
+        let a_noise = a.local_noise_pub;
         let a_addr = addr(40, 4672);
 
         let record = a.build_keyword_record("debian", [1u8; 16], [0u8; 32], 10, "d.iso");
@@ -4901,7 +5059,7 @@ mod tests {
         // Flip a byte inside the signed region (the request id).
         ping_bytes[3] ^= 0xFF;
 
-        let on_b = b.handle_message(&ping_bytes, addr(3, 4672), [0xAA; 32], 1000);
+        let on_b = b.handle_message(&ping_bytes, addr(3, 4672), a.local_noise_pub, 1000);
         assert!(on_b.error.is_some(), "signature check must fail");
         assert!(!on_b.ping_received);
         assert!(on_b.responses.is_empty());

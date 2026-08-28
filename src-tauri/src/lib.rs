@@ -808,6 +808,19 @@ pub fn run() {
             {
                 let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
                 storage::known_files::migrate_aich_v2(&data_dir);
+                // Sealed bytes from the withdrawn room-attachment feature. The
+                // rows that described them went with schema v34, so without
+                // this the blobs are unreferenced files nothing will ever open
+                // or clean up.
+                let legacy_channel_files = data_dir.join("channel-files");
+                if legacy_channel_files.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&legacy_channel_files) {
+                        tracing::warn!(
+                            error = %e,
+                            "could not remove stored room attachments from the previous version"
+                        );
+                    }
+                }
             }
 
             // Allow WebView media playback for files under shared/download dirs.
@@ -1823,6 +1836,39 @@ pub fn run() {
             commands::peers::get_ember_dht_store,
             $($harness,)*
             commands::peers::ember_request_sources,
+            commands::channels::list_channels,
+            commands::channels::create_channel,
+            commands::channels::join_channel,
+            commands::channels::enter_channel,
+            commands::channels::leave_channel,
+            commands::channels::forget_channel,
+            commands::channels::claim_channel_username,
+            commands::channels::rotate_channel_room_key,
+            commands::channels::set_channel_invite_policy,
+            commands::channels::set_channel_slow_mode,
+            commands::channels::delete_owned_channel,
+            commands::channels::get_channel_invite,
+            commands::channels::list_channel_members,
+            commands::channels::get_channel_messages,
+            commands::channels::search_channel_messages,
+            commands::channels::delete_channel_message,
+            commands::channels::send_channel_message,
+            commands::channels::mark_channel_messages_read,
+            commands::channels::gather_channels,
+            commands::channels::cached_channels,
+            commands::channels::update_channel_moderation,
+            commands::channels::ban_channel_member,
+            commands::channels::unban_channel_member,
+            commands::channels::add_channel_moderator,
+            commands::channels::remove_channel_moderator,
+            commands::channels::transfer_channel_ownership,
+            commands::channels::set_channel_successor_nominee,
+            commands::channels::claim_channel_ownership,
+            commands::channels::channel_member_friend_code,
+            commands::channels::offer_channel_transfer,
+            commands::channels::respond_channel_transfer,
+            commands::channels::cancel_channel_transfer,
+            commands::channels::list_channel_transfers,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
@@ -1836,6 +1882,10 @@ pub fn run() {
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
             commands::settings::open_ember_website,
+            commands::settings::get_ember_website_url,
+            commands::settings::open_ember_share,
+            commands::settings::get_log_folder_path,
+            commands::settings::open_log_folder,
             commands::security::get_security_policy_state,
             commands::security::acknowledge_security_policy_reset,
             commands::security::get_ip_filter_stats,

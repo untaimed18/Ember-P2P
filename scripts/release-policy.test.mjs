@@ -342,7 +342,7 @@ test("an unbumped wire version and unwritten notes are both left alone", () => {
 test("the declared Ember DHT wire version is the one this release ships", () => {
   // Hardcoded like the security epoch above: a bump is supposed to be noticed
   // here, not absorbed by a check that reads whatever the source happens to say.
-  assert.equal(verifyEmberDhtVersion({ root }).wireVersion, 3);
+  assert.equal(verifyEmberDhtVersion({ root }).wireVersion, 4);
 });
 
 test("a missing wire-version constant is a hard error, not a skip", () => {

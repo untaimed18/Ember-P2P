@@ -909,7 +909,7 @@ async fn delete_file_with_retry(
     ))
 }
 
-fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<FileInfo> {
+fn resolve_from_known(files: &mut [FileInfo], known: &KnownFileList) -> Vec<FileInfo> {
     let mut needs_hashing = Vec::new();
     for file in files.iter_mut() {
         if let Some(record) = known.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
@@ -2670,7 +2670,7 @@ pub async fn set_file_priority(
         // path while it was still hashing, or a later rehash would revert the
         // user's choice. Best-effort: a stale entry is also swept by the
         // post-scan prune.
-        if let Err(e) = persist_pending_intents(&state, &[], &[], &[], &[file_path.clone()]).await {
+        if let Err(e) = persist_pending_intents(&state, &[], &[], &[], std::slice::from_ref(&file_path)).await {
             warn!("Failed to clear pending priority intent for {file_path}: {e}");
         }
     } else {

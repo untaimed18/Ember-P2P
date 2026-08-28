@@ -43,5 +43,5 @@ pub const SENSITIVE_DIR_NAMES: &[&str] = &[
 /// True when `name` is a sensitive directory basename (ASCII case-insensitive).
 pub fn is_sensitive_dir_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    SENSITIVE_DIR_NAMES.iter().any(|s| lower.as_str() == *s)
+    SENSITIVE_DIR_NAMES.contains(&lower.as_str())
 }

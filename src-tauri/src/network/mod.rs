@@ -197,6 +197,31 @@ mod firewall_request_bound_tests {
     }
 }
 
+/// Result of a background rendezvous lookup for a channel gossip neighbor.
+/// Applied on the 1s stats tick so we do not add another `select!` arm
+/// (the loop is already at tokio's 64-branch ceiling). Never writes
+/// `friend_hashes`.
+struct ChannelNeighborLookupResult {
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    endpoint: Option<(Ipv4Addr, u16)>,
+}
+
+/// Channel-scoped WebSocket relay events. Drained on the stats tick.
+enum ChannelRelayEvent {
+    Opened {
+        peer_pubkey: [u8; 32],
+        outbound_tx: mpsc::Sender<Vec<u8>>,
+    },
+    Frame {
+        peer_pubkey: [u8; 32],
+        body: Vec<u8>,
+    },
+    Closed {
+        peer_pubkey: [u8; 32],
+    },
+}
+
 fn relay_ticket_next_round_delay(
     round_started_at: tokio::time::Instant,
     completed_at: tokio::time::Instant,
@@ -803,9 +828,7 @@ fn matching_active_transfer_ids_for_hash(
     file_hash_hex: &str,
 ) -> Vec<String> {
     state
-        .active_source_senders
-        .iter()
-        .filter_map(|(tid, _)| {
+        .active_source_senders.keys().filter_map(|tid| {
             transfer_manager
                 .get_transfer(tid)
                 .filter(|transfer| transfer.file_hash == file_hash_hex)
@@ -1249,7 +1272,7 @@ fn kad_bridge_candidates_at(
         })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
-    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
     candidates
         .into_iter()
         .take(max)
@@ -1384,7 +1407,7 @@ fn xx_bridge_candidates_at(
         })
         .map(|(key, seen)| (key.0, key.1, *seen))
         .collect();
-    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
     candidates
         .into_iter()
         .take(max)
@@ -1522,6 +1545,41 @@ fn ember_overlay_contact_count(state: &NetworkState) -> usize {
 /// against a single `nodes_ember.dat` seed that never answered.
 fn ember_publishable_peer_count(state: &NetworkState) -> usize {
     state.ember_dht.routing().verified_held() + ember_session_overlay_extras(state, true)
+}
+
+/// Everything worth writing to `nodes_ember.dat`, from all three places a
+/// contact can live.
+///
+/// [`ember_dht_ui_contact_counts`] counts bucket contacts, replacement-cache
+/// entries and session peers alike, but only the first of those was ever
+/// persisted — so the overlay figure on screen could be several times what the
+/// file held, and the peers a LAN or CGNAT node was actually talking to were
+/// never remembered at all.
+///
+/// The bucket set comes through [`ember::dht::engine::EmberDht::bootstrap_contacts`],
+/// which keeps its existing rule: proven contacts first, then untried leads to
+/// fill the remaining slots. Elsewhere only *verified* contacts qualify. That
+/// preserves the reason the replacement cache was excluded in the first place —
+/// it is where unproven gossip accumulates, and a file full of hearsay is worse
+/// than a short one — while no longer throwing away a peer we have genuinely
+/// spoken to merely because a full bucket or the IP filter put it there.
+fn ember_persistable_contacts(state: &NetworkState) -> Vec<ember::dht::EmberContact> {
+    let mut out = state
+        .ember_dht
+        .bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+    out.extend(
+        state
+            .ember_dht
+            .cached_contacts()
+            .into_iter()
+            .chain(state.ember_session_dht_contacts.values().cloned())
+            .filter(|c| {
+                c.is_verified()
+                    && c.is_dialable()
+                    && c.failed_queries < ember::dht::MAX_FAILED_QUERIES
+            }),
+    );
+    out
 }
 
 fn ember_session_overlay_extras(state: &NetworkState, verified_only: bool) -> usize {
@@ -2350,7 +2408,7 @@ fn udp_search_leg_should_complete(
 /// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
 /// (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
-    availability.max(1).min(ED2K_SEARCH_SOURCE_CAP)
+    availability.clamp(1, ED2K_SEARCH_SOURCE_CAP)
 }
 
 /// Hashes already shared or downloading — eMule `AddResultCount` skips these
@@ -4519,7 +4577,7 @@ mod friend_transfer_tests {
             relay_offer_digest(&[b.clone(), a.clone()], now)
         );
         assert_ne!(
-            relay_offer_digest(&[a.clone()], now),
+            relay_offer_digest(std::slice::from_ref(&a), now),
             relay_offer_digest(&[a, b], now)
         );
     }
@@ -4534,7 +4592,7 @@ mod friend_transfer_tests {
             relay_offer_digest(&offer, now),
             relay_offer_digest(&offer, now + RELAY_OFFER_REFRESH_SECS)
         );
-        assert!(
+        const _: () = assert!(
             RELAY_OFFER_REFRESH_SECS < ember::RELAY_ATTESTATION_MAX_TTL_SECS,
             "a refresh must land before the friend's copy expires"
         );
@@ -5882,8 +5940,8 @@ async fn process_inbound_friend_request(
                 debug!("Revoked auto-confirm for {} — blocked mid-flight", hash_hex);
                 return;
             }
-            if !online_friends.contains_key(&req_hash) {
-                online_friends.insert(req_hash, chrono::Utc::now().timestamp());
+            if let std::collections::hash_map::Entry::Vacant(e) = online_friends.entry(req_hash) {
+                e.insert(chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(
                     "ember:friend-online",
                     serde_json::json!({
@@ -6220,6 +6278,139 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// A succession claim hands a room to someone new, so the checks that gate
+    /// it are the most consequential in the feature. "The owner is silent" and
+    /// "we have not looked" are the same observation locally, and the claimant
+    /// picks the timestamp they cite — so neither our snapshot nor their word
+    /// can be trusted alone.
+    #[test]
+    fn a_succession_claim_is_refused_unless_both_we_and_it_show_real_silence() {
+        use crate::network::ember::channel::ChannelIdentity;
+        use crate::network::ember::dht::publish::SignedRecord;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng as RandOsRng;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-claim-gate-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let room = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let nominee = SigningKey::generate(&mut RandOsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let owner_pk = [0x11u8; 32];
+        let channel_id_hex = hex::encode(room.channel_id);
+
+        // A room we are a member of, with a 14-day succession window.
+        db.insert_channel(
+            &channel_id_hex,
+            &hex::encode(room.pubkey),
+            "Room",
+            "private",
+            false,
+            None,
+            Some(&[0xABu8; 32]),
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1, None)
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let day = 86_400i64;
+        // Stands in for the drain recording that a moderation search came back
+        // *and* that some peer answered it — the drain only writes this when
+        // `responded_count() > 0`, so an unanswered search leaves it untouched.
+        let confirm_silence_at = |ts: i64| {
+            db.touch_channel_moderation_checked(&channel_id_hex, ts).unwrap();
+        };
+        let claim_blob = |witnessed_ts: i64| -> Vec<u8> {
+            let rec = SignedRecord::channel_succession_claim(
+                room.channel_id,
+                room.pubkey,
+                &successor.pubkey,
+                witnessed_ts,
+                true,
+                &nominee,
+            );
+            let mut blob = rec.data.clone();
+            blob.extend_from_slice(&rec.signature);
+            blob
+        };
+        // Our own snapshot of the owner's last word, 30 days stale.
+        let stale_owner_ts = now - 30 * day;
+        let seed_moderation = |ts: i64| {
+            db.apply_channel_moderation(
+                &channel_id_hex,
+                "Topic",
+                "",
+                ts,
+                &[],
+                &[],
+                Some(&owner_pk),
+                Some(&nominee_pk),
+                Some(14),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        };
+        seed_moderation(stale_owner_ts);
+
+        // Not having looked is not the same as the owner being quiet. A client
+        // that just started up with a month-old snapshot must not hand the room
+        // over before it has asked whether the owner is still publishing.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            None,
+            "a claim must not be honoured before we have polled at all"
+        );
+        confirm_silence_at(now - ember::channel::MODERATION_FETCH_SECS * 3 - 60);
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            None,
+            "nor on a stale poll"
+        );
+
+        // From here on we have confirmed the silence recently.
+        confirm_silence_at(now - 10);
+
+        // A claim whose own evidence shows the owner active an hour ago is
+        // refused however stale our snapshot is. This was the hole: the window
+        // was measured only against our own copy, so a claimant could prove the
+        // owner was alive and inherit the room anyway.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(now - 3_600)]),
+            None,
+            "a claim citing a live owner must be refused"
+        );
+
+        // A claimant cannot backdate below what we hold, either.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts - day)]),
+            None,
+            "a claim older than our own record must be refused"
+        );
+
+        // Both sides agreeing on real silence, and we have looked: honoured.
+        assert_eq!(
+            ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(stale_owner_ts)]),
+            Some(successor.channel_id),
+            "genuine silence, freshly confirmed, is what succession is for"
+        );
+        assert_eq!(
+            db.get_channel(&channel_id_hex).unwrap().unwrap().successor_id,
+            hex::encode(successor.channel_id)
+        );
+    }
     use crate::network::kad::messages::SearchResultEntry;
     use crate::network::kad::types::{
         KadTag, TagName, TagValue, TAG_DESCRIPTION, TAG_FILENAME, TAG_FILERATING,
@@ -7755,7 +7946,7 @@ mod tests {
             ember_maint_ping_budget(starved, starved),
             EMBER_MAINT_MAX_PINGS
         );
-        assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
+        const _: () = assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
     }
 
     /// The budget used to be one absolute rate for every table size, so a full
@@ -7934,6 +8125,79 @@ mod tests {
     /// A table big enough that the deliverable bound is not what binds, so
     /// these cases exercise the TTL arithmetic rather than the flush budget.
     const ROOMY_TABLE: usize = K_EMBER_REPLICAS * 64;
+
+    /// A room busy enough to spend the relay allowance must still be able to
+    /// carry what this user typed.
+    ///
+    /// The two buckets are what make that true, so this exhausts the relay one
+    /// and checks the local one is untouched. Sharing a bucket was the bug: the
+    /// local copy of a line is written and drawn before fanout is even
+    /// attempted, so a send refused here leaves the user looking at a message
+    /// no peer will ever be offered again.
+    #[test]
+    fn a_saturated_relay_budget_cannot_swallow_what_the_user_typed() {
+        let mut relayed = VecDeque::new();
+        let mut local = VecDeque::new();
+        let now = std::time::Instant::now();
+
+        for _ in 0..ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC {
+            assert!(ember::channel::rate_window_allow(
+                &mut relayed,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+            ));
+        }
+        assert!(
+            !ember::channel::rate_window_allow(
+                &mut relayed,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+            ),
+            "the relay allowance is meant to run out, that is what stops a flood"
+        );
+
+        assert!(
+            ember::channel::rate_window_allow(
+                &mut local,
+                now,
+                CHANNEL_GOSSIP_RATE_WINDOW,
+                ember::channel::CHANNEL_GOSSIP_LOCAL_PER_SEC,
+            ),
+            "originating must not be charged the allowance relaying just spent"
+        );
+    }
+
+    /// A room nobody else is in yet must be re-asked on a cadence a waiting
+    /// user would accept, and the driver that applies it has to tick at least
+    /// that often or the constant is decoration. `maybe_refresh_channel_members`
+    /// moved off the sixty-second maintenance tick onto the one-second one for
+    /// exactly this reason; putting it back would silently round the empty-room
+    /// interval up to a minute while every value here still read as intended.
+    ///
+    /// `member_count` is presence-fresh (including us). Historical roster rows
+    /// do not keep the slow interval — 1 means nobody else has announced
+    /// recently, which is the empty-room poll case.
+    #[test]
+    fn an_empty_room_asks_for_its_roster_far_sooner_than_a_settled_one() {
+        let empty = channel_presence_interval(1);
+        let settled = channel_presence_interval(4);
+
+        assert_eq!(empty, ember::channel::PRESENCE_FETCH_EMPTY_SECS);
+        assert_eq!(settled, ember::channel::PRESENCE_FETCH_SECS);
+        assert!(
+            empty < settled,
+            "an empty room is the case somebody is waiting on"
+        );
+        // Zero should not be reachable — we write our own member row on join —
+        // but it is the same "nobody else" situation if it ever is.
+        assert_eq!(channel_presence_interval(0), empty);
+        assert!(
+            empty < ember::channel::PRESENCE_REPUBLISH_SECS,
+            "asking less often than members announce would miss arrivals"
+        );
+    }
 
     #[test]
     fn keyword_publish_budget_covers_the_library_within_its_ttl() {
@@ -10093,6 +10357,8 @@ pub enum NetworkCommand {
     /// Manually seed an Ember DHT contact into the routing table
     /// (harness / dev: bootstrap a node without waiting for live
     /// traffic). The node ID is derived from `ed25519_pub`.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     AddEmberDhtContact {
         addr: SocketAddr,
         ed25519_pub: [u8; 32],
@@ -10116,6 +10382,8 @@ pub enum NetworkCommand {
     /// PING/PONG path (and so populates the routing table on both
     /// ends). `peer_pubkey` is the peer's Noise key; when `None` it is
     /// resolved from the KAD-fed cache.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtPing {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -10126,6 +10394,8 @@ pub enum NetworkCommand {
     /// lands in a later slice). `peer_pubkey` is the peer's Noise key;
     /// when `None` it is resolved from the KAD-fed cache. A `None`
     /// `target` asks the peer for the contacts closest to a random ID.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtFindNode {
         addr: SocketAddr,
         peer_pubkey: Option<[u8; 32]>,
@@ -10137,6 +10407,8 @@ pub enum NetworkCommand {
     /// hops (α-parallel `FIND_NODE` rounds over the closest contacts it
     /// learns) until it converges, then returns the closest contacts
     /// that responded. A `None` `target` runs a random self-style probe.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     SendEmberDhtIterativeFindNode {
         target: Option<[u8; 16]>,
         tx: oneshot::Sender<Result<EmberDhtLookupPending, String>>,
@@ -10145,6 +10417,8 @@ pub enum NetworkCommand {
     /// task signs the record with our identity, finds the closest known
     /// contacts to the keyword's key, and `STORE`s on them, returning how
     /// many acknowledged. `file_hash` is random per dev-published record.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     PublishEmberKeyword {
         keyword: String,
         file_name: String,
@@ -10156,15 +10430,86 @@ pub enum NetworkCommand {
     /// network task drives a `SearchManager` search that sends `FIND_VALUE`
     /// (falling back to `FOUND_NODE` hops) until it gathers signed records
     /// or converges, then returns the verified records it collected.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     FindEmberValue {
         keyword: String,
         tx: oneshot::Sender<Result<EmberValueLookupPending, String>>,
+    },
+    /// Publish an already-signed Ember DHT record (channel index/presence/moderation).
+    PublishEmberRecord {
+        record: crate::network::ember::dht::publish::SignedRecord,
+        tx: oneshot::Sender<Result<EmberPublishPending, String>>,
+    },
+    /// Iterative FIND_VALUE for raw 16-byte DHT keys (channel Gather).
+    FindEmberKeys {
+        keys: Vec<[u8; 16]>,
+        tx: oneshot::Sender<Result<EmberValueLookupPending, String>>,
+    },
+    /// Fan a sealed channel gossip frame to XOR-closest members we already
+    /// have a Noise session with. Fire-and-forget: local persist already
+    /// succeeded in the Tauri command.
+    FanoutChannelGossip {
+        body: Vec<u8>,
+    },
+    /// Drop an in-flight Ember `FIND_VALUE` the caller has already given
+    /// up on, so the search slot is not held until [`ember::dht::search`]
+    /// times out on its own (60s). Discover presence probes wait 6s.
+    CancelEmberSearch {
+        search_id: u32,
+    },
+    /// Walk this room's presence keys now rather than at the next maintenance
+    /// tick. Sent on join and create: publishing our own presence tells the
+    /// room we exist, but nothing pulls the roster the other way, so without
+    /// this a joiner sat with an empty member list — and therefore no one to
+    /// gossip to and no working chat — until a tick came round.
+    RefreshChannelMembers {
+        channel_id: [u8; 16],
+    },
+    /// Ember Transfer: offer one file to one channel member. The file is
+    /// already hashed by the caller, so the network task never blocks on a
+    /// 100 MB read.
+    OfferChannelTransfer {
+        channel_id: [u8; 16],
+        peer: [u8; 32],
+        xfer_id: [u8; 16],
+        path: PathBuf,
+        name: String,
+        size: u64,
+        root: [u8; 32],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Answer an offer that is waiting on the user. `download_folder` comes
+    /// from the caller because settings live on that side; the network task
+    /// only knows the file name.
+    RespondChannelTransfer {
+        xfer_id: [u8; 16],
+        accept: bool,
+        download_folder: PathBuf,
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Stop a transfer in either direction and tell the other end why.
+    CancelChannelTransfer {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Everything in flight, for the Channels page to draw.
+    ListChannelTransfers {
+        tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
+    },
+    /// Drop every transfer tied to a room, because it has just been left.
+    /// Sends no cancel: the room's content key is what those frames travel
+    /// under, and it is gone along with the membership.
+    DropChannelTransfers {
+        channel_id: [u8; 16],
     },
     /// Run one Ember DHT maintenance cycle on demand (dev/harness): refresh
     /// stale buckets, liveness-ping stale contacts, and republish stored
     /// records. With the timer this happens automatically; the command
     /// forces a cycle (ignoring staleness gates) so it can be observed
     /// immediately. Returns a tally of what it kicked off.
+    /// Compiled out of release: the Tauri command is `debug_assertions`-only.
+    #[cfg(debug_assertions)]
     RunEmberMaintenance {
         tx: oneshot::Sender<Result<EmberMaintenanceResult, String>>,
     },
@@ -10198,6 +10543,7 @@ pub struct EmberPingPending {
 /// Returned by the network task when an outgoing Ember DHT `FIND_NODE`
 /// has been scheduled. The Tauri command awaits `contacts_rx` with a
 /// timeout; the waiter resolves with the contacts the peer returned.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberDhtFindPending {
     pub contacts_rx: oneshot::Receiver<Vec<EmberDhtContactInfo>>,
@@ -10207,6 +10553,7 @@ pub struct EmberDhtFindPending {
 /// The Tauri command awaits `contacts_rx` with a timeout; the waiter
 /// resolves with the closest contacts that responded once the multi-hop
 /// search converges.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 pub struct EmberDhtLookupPending {
     pub contacts_rx: oneshot::Receiver<Vec<EmberDhtContactInfo>>,
@@ -10218,7 +10565,10 @@ pub struct EmberDhtLookupPending {
 #[derive(Debug)]
 pub struct EmberPublishPending {
     /// The DHT key (hex) the record was published under, so the caller
-    /// can later `FIND_VALUE` the same key.
+    /// can later `FIND_VALUE` the same key. Only the harness publish
+    /// command reads this; production channel publishes wait on
+    /// `result_rx` alone.
+    #[cfg(debug_assertions)]
     pub key: String,
     pub result_rx: oneshot::Receiver<EmberPublishResult>,
 }
@@ -10275,7 +10625,27 @@ struct EmberVerifiedHighwater {
 /// waiter resolves with the verified records collected by the search.
 #[derive(Debug)]
 pub struct EmberValueLookupPending {
+    pub search_id: u32,
     pub records_rx: oneshot::Receiver<Vec<Vec<u8>>>,
+}
+
+/// One in-flight Ember Transfer, flattened for IPC.
+///
+/// Deliberately not persisted: a transfer belongs to the session that started
+/// it. Resuming across a restart would mean keeping half-written files and the
+/// peer's agreement to send them, neither of which survives a restart today.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelTransferSnapshot {
+    pub xfer_id: String,
+    pub channel_id: String,
+    pub peer_pubkey: String,
+    /// `"send"` or `"receive"`.
+    pub direction: String,
+    pub name: String,
+    pub size: u64,
+    pub transferred: u64,
+    /// `"offered"`, `"awaiting"`, `"active"`.
+    pub status: String,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.
@@ -11531,6 +11901,22 @@ struct NetworkState {
     /// keeps sending signed frames renews its entry without needing a fresh
     /// eD2K introduction.
     ember_session_dht_contacts: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
+    /// Every Ember peer we remember, across restarts — the thing
+    /// `nodes_ember.dat` actually holds.
+    ///
+    /// Deliberately not the routing table. The table is live state: a lead that
+    /// will not answer three pings has to lose its bucket slot, and a peer the
+    /// public table refuses outright (LAN or CGNAT under `block_private_ips`)
+    /// never gets one at all. Writing the file straight from the table made
+    /// those two facts mean "forget this address", which cost a node most of
+    /// its peers on every restart and could only ever shrink the file. See
+    /// [`ember::dht::peer_cache`].
+    ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache,
+    /// Whether this session actually read `nodes_ember.dat`. Lets the save path
+    /// tell "the book is genuinely empty" from "we never got to look at it" —
+    /// see [`ember::dht::bootstrap::save_nodes`]. `true` when the file is simply
+    /// absent, which is a new profile rather than a failure.
+    ember_nodes_loaded: bool,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
     ember_rendezvous_published_at: i64,
@@ -11977,6 +12363,113 @@ struct NetworkState {
     /// Firewalled source records waiting for `PROXY_STORE_ACK` before overlay
     /// `STORE_BATCH`. Keyed by `(buddy, request_id)`.
     ember_pending_proxy_overlay: HashMap<(ember::dht::EmberNodeId, u32), EmberPendingProxyOverlay>,
+    /// Channel gossip ids already persisted or flooded this session.
+    channel_gossip_seen: HashMap<[u8; 16], std::time::Instant>,
+    channel_gossip_seen_order: VecDeque<[u8; 16]>,
+    /// Timestamps of recent relayed `CHANNEL_MSG` frames (token bucket).
+    channel_gossip_sent_times: VecDeque<std::time::Instant>,
+    /// The same, for frames this user originated.
+    ///
+    /// Separate from the relay bucket because the two deserve opposite
+    /// treatment when the room is busy. Relaying is work done on the mesh's
+    /// behalf and shedding it is how a flood stops spreading; a line the user
+    /// typed is the one frame in the system that has no second chance, since
+    /// the local copy is already stored and on screen, so dropping it shows
+    /// them a message the room never received.
+    channel_gossip_local_times: VecDeque<std::time::Instant>,
+    /// Originated gossip that had no neighbor (or hit the local send budget)
+    /// and is waiting to be tried again.
+    channel_origin_retry: VecDeque<(std::time::Instant, Vec<u8>)>,
+    /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
+    channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
+    /// Inbound chat timestamps keyed by (room, signed author), so one member
+    /// cannot flood a room by spreading the load across many hops.
+    channel_gossip_author_times:
+        HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
+    /// Inbound catch-up requests keyed by (room, signed requester), on their
+    /// own far tighter budget than chat: answering one costs us up to
+    /// `CHANNEL_HISTORY_SYNC_MAX` sealed unicasts, so it is the one frame where
+    /// the asker spends less than we do.
+    channel_history_sync_times:
+        HashMap<([u8; 16], [u8; 32]), VecDeque<std::time::Instant>>,
+    /// Last history-sync request per (channel_id, neighbor pubkey).
+    channel_history_sync_at: HashMap<([u8; 16], [u8; 32]), std::time::Instant>,
+    /// In-flight FIND_VALUE of channel presence keys (`search_id` → channel).
+    ember_channel_presence_searches: HashMap<u32, [u8; 16]>,
+    /// Presence blobs accumulated for a channel while any FIND_VALUE for it
+    /// is still in flight. Applied only when the last search completes, so
+    /// current and previous epoch are newest-wins together rather than two
+    /// independent races.
+    ember_channel_presence_buffer: HashMap<[u8; 16], Vec<Vec<u8>>>,
+    /// Presence blobs waiting for DB upsert + UI emit (async drain).
+    ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// Last presence FIND_VALUE start per channel.
+    channel_presence_fetch_at: HashMap<[u8; 16], i64>,
+    /// In-flight FIND_VALUE of channel moderation keys (`search_id` → channel).
+    ember_channel_moderation_searches: HashMap<u32, [u8; 16]>,
+    /// Moderation blobs waiting for DB apply + UI emit (async drain), with how
+    /// many peers answered the search that produced them. Zero means we learned
+    /// nothing either way, which succession has to tell apart from a room whose
+    /// owner really has stopped publishing.
+    ember_pending_channel_moderation: Vec<([u8; 16], Vec<Vec<u8>>, usize)>,
+    /// Last moderation FIND_VALUE start per channel.
+    channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
+    /// Last owner moderation STORE per channel.
+    channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// Last Channel-username refresh against Rendezvous.
+    channel_username_refresh_at: i64,
+    /// Rendezvous base URL, refreshed from settings on the channel heartbeat.
+    /// Cached because the gossip handlers need it to hand a room's registry
+    /// name to its successor, and they are several layers below the loop that
+    /// holds `AppSettings`.
+    rendezvous_url: String,
+    /// Member Ed25519 → Noise static key from presence extra (no IP).
+    ember_channel_noise_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
+    channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
+    channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// Live channel-capability WebSocket relays (`peer Ed25519` → outbound).
+    channel_relay_outboxes: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    channel_relay_offer_at: HashMap<[u8; 32], std::time::Instant>,
+    /// In-flight FIND_VALUE of channel handoff keys (`search_id` → old id).
+    ember_channel_handoff_searches: HashMap<u32, [u8; 16]>,
+    ember_pending_channel_handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    channel_handoff_fetch_at: HashMap<[u8; 16], i64>,
+    /// Our Ed25519 seed, for deriving the pairwise key that authenticates
+    /// transfer frames. Held here because the gossip handlers have to verify
+    /// an inbound frame before anything else looks at it, and they are far
+    /// from the command loop that owns the identity.
+    local_ed25519_seed: [u8; 32],
+    /// Ember Transfer: files we have offered or are sending, by transfer id.
+    xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
+    /// Ember Transfer: files we accepted and are pulling in.
+    xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
+    /// Offers waiting on the user to accept or decline.
+    xfer_pending: HashMap<[u8; 16], ember::xfer::PendingOffer>,
+    /// Data-block send budget. Separate from the chat one on purpose — see
+    /// [`xfer_block_rate_ok`].
+    xfer_block_times: VecDeque<std::time::Instant>,
+    /// Mirror of `channel_file_offers`, so an inbound offer can be judged
+    /// without reaching back into the settings the command loop owns.
+    xfer_offer_policy: String,
+    /// Read-only view of the friends list, for the `"friends"` offer policy.
+    xfer_friend_hashes: crate::app_state::SharedFriendHashes,
+    /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
+    /// channel + epoch).
+    ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
+    /// Epoch blobs waiting to be opened and stored (async drain).
+    ember_pending_channel_epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    /// Last epoch FIND_VALUE start per channel.
+    ///
+    /// Per channel rather than per (channel, epoch): we only ever chase the one
+    /// epoch the owner currently advertises, and keying on the epoch too meant
+    /// a long-lived client accumulated an entry for every rotation a room had
+    /// ever had, with nothing to remove them.
+    channel_epoch_fetch_at: HashMap<[u8; 16], i64>,
+    /// In-flight FIND_VALUE of a succession claim (`search_id` → channel).
+    ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
+    /// Claim blobs waiting to be verified against the owner's nomination.
+    ember_pending_channel_claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -12027,6 +12520,3694 @@ fn seed_ember_local_records(
         .ember_search
         .seed_local_results(search_id, local_id, local);
     debug!("Ember DHT: seeded {seeded} local record(s) into search {search_id}");
+}
+
+/// Re-announce our presence in joined channels so other members can find us.
+///
+/// Members, not storers, republish presence (presence records are skipped by
+/// `take_republish_batch`). Gated to a handful per tick so a large join list
+/// cannot stall the network loop.
+async fn maybe_publish_channel_presence(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let due = match db.channels_due_for_presence(now, ember::channel::PRESENCE_REPUBLISH_SECS) {
+        Ok(ids) => ids,
+        Err(e) => {
+            debug!("Channel presence scan failed: {e}");
+            return;
+        }
+    };
+    let nickname = {
+        let name = settings.channel_username.trim();
+        if name.is_empty() {
+            return;
+        }
+        name.to_string()
+    };
+    let refresh_username = !due.is_empty()
+        && now.saturating_sub(state.channel_username_refresh_at)
+            >= ember::channel::USERNAME_REFRESH_SECS
+        && !settings.rendezvous_url.is_empty();
+    let signing = ed25519_dalek::SigningKey::from_bytes(&identity.ed25519_secret_key);
+    for channel_id_hex in due.into_iter().take(4) {
+        let Some(ch) = db.get_channel(&channel_id_hex).ok().flatten() else {
+            continue;
+        };
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(pk_bytes) = hex::decode(&ch.pubkey) else {
+            continue;
+        };
+        if id_bytes.len() != 16 || pk_bytes.len() != 32 {
+            continue;
+        }
+        let mut channel_id = [0u8; 16];
+        channel_id.copy_from_slice(&id_bytes);
+        let mut channel_pubkey = [0u8; 32];
+        channel_pubkey.copy_from_slice(&pk_bytes);
+        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        // The current epoch, not the `join_secret` column: a private room's
+        // presence extra is sealed with the content key, and publishing it under
+        // a retired epoch would leave an evicted member able to enumerate the
+        // room's membership while the members who rotated could not read it.
+        let Some(join_secret) = current_channel_join_secret(db, &ch) else {
+            continue;
+        };
+        let record = ember::dht::publish::SignedRecord::channel_presence(
+            &nickname,
+            channel_id,
+            channel_pubkey,
+            &join_secret,
+            private,
+            ember::channel::presence_epoch(now),
+            &identity.noise_public_key,
+            &signing,
+        );
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            let _ = db.touch_channel_presence(&channel_id_hex, now);
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+    if refresh_username {
+        let url = settings.rendezvous_url.clone();
+        let pk = identity.ed25519_public_key;
+        let sk = identity.ed25519_secret_key;
+        let name = nickname.to_lowercase();
+        state.channel_username_refresh_at = now;
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::network::rendezvous::claim_channel_username(&url, &pk, &sk, &name).await
+            {
+                tracing::debug!(?error, "could not refresh the channel username claim");
+            }
+        });
+    }
+}
+
+const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn remember_channel_gossip(state: &mut NetworkState, msg_id: [u8; 16]) -> bool {
+    ember::channel::remember_gossip_id(
+        &mut state.channel_gossip_seen,
+        &mut state.channel_gossip_seen_order,
+        ember::channel::CHANNEL_GOSSIP_SEEN_CAP,
+        msg_id,
+        std::time::Instant::now(),
+    )
+}
+
+fn channel_author_gossip_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+) -> bool {
+    ember::channel::author_gossip_allow(
+        &mut state.channel_gossip_author_times,
+        channel_id,
+        author,
+        std::time::Instant::now(),
+    )
+}
+
+fn channel_history_sync_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+) -> bool {
+    ember::channel::history_sync_allow(
+        &mut state.channel_history_sync_times,
+        channel_id,
+        author,
+        std::time::Instant::now(),
+    )
+}
+
+fn forget_channel_gossip(state: &mut NetworkState, msg_id: &[u8; 16]) {
+    ember::channel::forget_gossip_id(
+        &mut state.channel_gossip_seen,
+        &mut state.channel_gossip_seen_order,
+        msg_id,
+    );
+}
+
+fn queue_channel_origin_retry(
+    state: &mut NetworkState,
+    body: Vec<u8>,
+    queued_at: std::time::Instant,
+) {
+    while state.channel_origin_retry.len() >= ember::channel::CHANNEL_ORIGIN_RETRY_CAP {
+        state.channel_origin_retry.pop_front();
+    }
+    state
+        .channel_origin_retry
+        .push_back((queued_at, body));
+}
+
+async fn drain_channel_origin_retry(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+) {
+    if state.channel_origin_retry.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.channel_origin_retry);
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(ember::channel::CHANNEL_ORIGIN_RETRY_SECS);
+    for (queued_at, body) in pending {
+        if now.saturating_duration_since(queued_at) >= ttl {
+            continue;
+        }
+        fanout_channel_gossip_retry(socket, state, db, body, None, Some(queued_at)).await;
+    }
+}
+
+/// Admit one outbound fanout, against the bucket that fits where it came from.
+///
+/// A relay is charged the shared allowance, which is what stops this node
+/// amplifying a flood. Something the user typed is charged its own, so a room
+/// busy enough to spend the relay budget cannot silently swallow their message.
+/// Failed origination is queued and retried; unbounded sending would still
+/// turn a send loop into an outbound flood with no ceiling at all.
+fn channel_gossip_rate_ok(state: &mut NetworkState, local_origin: bool) -> bool {
+    let (times, limit) = if local_origin {
+        (
+            &mut state.channel_gossip_local_times,
+            ember::channel::CHANNEL_GOSSIP_LOCAL_PER_SEC,
+        )
+    } else {
+        (
+            &mut state.channel_gossip_sent_times,
+            ember::channel::CHANNEL_GOSSIP_OUT_PER_SEC,
+        )
+    };
+    ember::channel::rate_window_allow(
+        times,
+        std::time::Instant::now(),
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        limit,
+    )
+}
+
+fn channel_gossip_inbound_ok(state: &mut NetworkState, from_id: &ember::dht::EmberNodeId) -> bool {
+    let now = std::time::Instant::now();
+    if state.channel_gossip_from_times.len() >= ember::channel::CHANNEL_GOSSIP_IN_PEER_CAP
+        && !state.channel_gossip_from_times.contains_key(&from_id.0)
+    {
+        return false;
+    }
+    let times = state
+        .channel_gossip_from_times
+        .entry(from_id.0)
+        .or_default();
+    ember::channel::rate_window_allow(
+        times,
+        now,
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        ember::channel::CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+    )
+}
+
+/// Content keys this room can be read with, newest epoch first.
+///
+/// Private rooms rotate on a ban, so anything already in flight — a relayed
+/// message, a history-sync reply, an attachment sealed on disk before the
+/// rotation — is still sealed under an older epoch. Readers try these in
+/// order; an AEAD failure is a clean signal, and the retained window is small.
+///
+/// Public rooms have exactly one key, derived from the channel pubkey that
+/// anyone can compute, so rotating one would evict nobody.
+fn channel_content_keys(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Vec<[u8; 32]> {
+    if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
+        let Some(pk) = hex::decode(&ch.pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            return Vec::new();
+        };
+        return vec![ember::channel::content_key(
+            &ember::channel::public_join_secret(&pk),
+        )];
+    }
+    let mut keys: Vec<[u8; 32]> = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, secret)| ember::channel::content_key(&secret))
+        .collect();
+    // Epoch 0 is the secret the invite was minted with, still in `join_secret`
+    // for any room that has never rotated.
+    if let Ok(Some(secret)) = db.load_channel_join_secret(&ch.channel_id) {
+        let legacy = ember::channel::content_key(&secret);
+        if !keys.contains(&legacy) {
+            keys.push(legacy);
+        }
+    }
+    keys
+}
+
+/// The join secret this room seals *new* traffic with: its newest epoch, or the
+/// original invite secret for a room that has never rotated.
+///
+/// Distinct from [`channel_content_keys`] because presence takes the secret
+/// itself rather than the derived content key.
+fn current_channel_join_secret(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Option<[u8; 32]> {
+    if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
+        return hex::decode(&ch.pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(|pk| ember::channel::public_join_secret(&pk));
+    }
+    if let Some((_, secret)) = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+    {
+        return Some(secret);
+    }
+    db.load_channel_join_secret(&ch.channel_id).ok().flatten()
+}
+
+/// The key this room seals *new* traffic with.
+fn channel_content_key(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Option<[u8; 32]> {
+    channel_content_keys(db, ch).into_iter().next()
+}
+
+fn channel_member_pubkeys(
+    db: &Database,
+    channel_id_hex: &str,
+) -> Vec<[u8; 32]> {
+    let Ok(rows) = db.list_channel_members(channel_id_hex) else {
+        return Vec::new();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now.saturating_sub(ember::channel::PRESENCE_FRESH_SECS);
+    rows.into_iter()
+        .filter_map(|row| {
+            if row.banned {
+                return None;
+            }
+            if row.last_seen < cutoff {
+                return None;
+            }
+            let bytes = hex::decode(row.member_pubkey).ok()?;
+            <[u8; 32]>::try_from(bytes).ok()
+        })
+        .collect()
+}
+
+fn collect_channel_neighbor_caps(
+    db: &Database,
+    our_pubkey: &[u8; 32],
+) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
+    let mut members_by_channel = Vec::new();
+    for ch in db.list_channels_lite()? {
+        if !ch.in_room_now() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        members_by_channel.push((channel_id, channel_member_pubkeys(db, &ch.channel_id)));
+    }
+    Ok(ember::channel::rendezvous_neighbor_targets(
+        our_pubkey,
+        &members_by_channel,
+        ember::channel::CHANNEL_RENDEZVOUS_MAX_CHANNELS,
+        ember::channel::CHANNEL_NEIGHBOR_COUNT,
+    ))
+}
+
+async fn load_rendezvous_register_targets(
+    db: &Arc<Database>,
+    our_pubkey: [u8; 32],
+) -> (
+    Vec<([u8; 16], [u8; 32])>,
+    Vec<([u8; 16], [u8; 32])>,
+) {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let friends = db.get_friend_public_keys().unwrap_or_default();
+        let neighbors = collect_channel_neighbor_caps(&db, &our_pubkey).unwrap_or_default();
+        (friends, neighbors)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS);
+const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
+const CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK: usize = 2;
+const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
+const CHANNEL_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
+
+/// How long to leave a room's presence keys alone before walking them again.
+///
+/// A room we are alone in is asked about far more often than a settled one. The
+/// five-minute cadence is sized for keeping a roster we already have fresh, and
+/// applying it to an empty room made the one case where somebody is actually
+/// waiting the slowest case there is — they have just joined, or they are first
+/// in and somebody else is arriving. Until presence names a second member there
+/// is nobody to gossip to either, so chat cannot move until this resolves.
+///
+/// `member_count` includes us, so 1 means nobody else yet.
+fn channel_presence_interval(member_count: i64) -> i64 {
+    if member_count > 1 {
+        ember::channel::PRESENCE_FETCH_SECS
+    } else {
+        ember::channel::PRESENCE_FETCH_EMPTY_SECS
+    }
+}
+
+/// FIND_VALUE the current (and previous) presence keys for one room.
+///
+/// Extra FIND_VALUE keys intersect by `file_hash`, which would drop members who
+/// only appear in one epoch, so the two keys are walked as independent
+/// searches. Returns whether a walk actually started, so the caller can charge
+/// it against a per-tick budget.
+async fn start_channel_presence_fetch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    now: i64,
+) -> bool {
+    if state
+        .ember_channel_presence_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return false;
+    }
+    // Has to be the same secret the publisher used, because the presence
+    // slot's DHT key is derived from it. Reading the raw `join_secret` here
+    // while publishing under the current epoch would put the two sides on
+    // different keys and members would stop discovering each other outright
+    // the first time a room rotated.
+    //
+    // Members briefly on different epochs therefore cannot see each other's
+    // presence. That resolves as they pick up the new key, and it does not
+    // block recovery: an epoch record is fetched by a key derived from the
+    // channel and our own identity, never from presence.
+    let Some(join_secret) = current_channel_join_secret(db, ch) else {
+        return false;
+    };
+    let epoch = ember::channel::presence_epoch(now);
+    let current_key = ember::channel::presence_key(&channel_id, &join_secret, epoch);
+    let prev_key = ember::channel::presence_key(&channel_id, &join_secret, epoch - 1);
+    let mut keys = vec![current_key];
+    if prev_key != current_key {
+        keys.push(prev_key);
+    }
+    let mut any = false;
+    for key in keys {
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_presence_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        any = true;
+    }
+    if any {
+        state.channel_presence_fetch_at.insert(channel_id, now);
+    }
+    any
+}
+
+/// Walk presence for the rooms that are due, so members are learned without
+/// prior gossip.
+async fn maybe_refresh_channel_members(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels_lite() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
+        if started >= CHANNEL_PRESENCE_FETCH_PER_TICK {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let last = state
+            .channel_presence_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        // Even an empty room is not walked more often than this. Count the
+        // roster only when that gate is open — the 1 Hz tick used to run
+        // COUNT(*) for every joined room on every pass.
+        if now.saturating_sub(last) < ember::channel::PRESENCE_FETCH_EMPTY_SECS {
+            continue;
+        }
+        let fresh = db
+            .count_fresh_channel_members(
+                &ch.channel_id,
+                now,
+                ember::channel::PRESENCE_FRESH_SECS,
+            )
+            .unwrap_or(0);
+        if now.saturating_sub(last) < channel_presence_interval(fresh) {
+            continue;
+        }
+        if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
+            started += 1;
+        }
+    }
+}
+
+const CHANNEL_MODERATION_FETCH_PER_TICK: usize = 2;
+const CHANNEL_MODERATION_PUBLISH_PER_TICK: usize = 2;
+
+/// FIND_VALUE the owner-signed moderation record (topic, welcome, bans).
+/// One key per channel — extra FIND_VALUE keys intersect by `file_hash`.
+async fn maybe_refresh_channel_moderation(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
+        if started >= CHANNEL_MODERATION_FETCH_PER_TICK {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        if state
+            .ember_channel_moderation_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let last = state
+            .channel_moderation_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::MODERATION_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::moderation_key(&channel_id);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_moderation_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_moderation_fetch_at.insert(channel_id, now);
+        started += 1;
+    }
+}
+
+fn ingest_channel_moderation_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
+        return false;
+    };
+    let mut best: Option<ember::dht::publish::ChannelModeration> = None;
+    for blob in records {
+        let Some(parsed) =
+            ember::dht::publish::SignedRecord::parse_channel_moderation(blob, &channel_id)
+        else {
+            continue;
+        };
+        if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|cur| parsed.timestamp > cur.timestamp)
+        {
+            best = Some(parsed);
+        }
+    }
+    let Some(moderation) = best else {
+        return false;
+    };
+    db.apply_channel_moderation(
+        &channel_id_hex,
+        &moderation.topic,
+        &moderation.welcome,
+        moderation.timestamp,
+        &moderation.banned_pubkeys,
+        &moderation.moderator_pubkeys,
+        moderation.tail.owner_pubkey.as_ref(),
+        moderation.tail.successor_nominee.as_ref(),
+        moderation.tail.claim_after_days,
+        moderation.tail.key_epoch,
+        moderation.tail.invites_owner_only,
+        moderation.tail.slow_mode_secs,
+    )
+    .unwrap_or(false)
+}
+
+/// Owners re-STORE the records only they can sign, so the 24h DHT TTL cannot
+/// age them out: the moderation record, plus the public-index listing for
+/// public rooms. Both share that TTL, and remaining life is derived from the
+/// publisher's signed creation time, so replication between storers cannot
+/// stand in for the owner re-signing (see `DhtStore::store`).
+async fn maybe_publish_owned_channel_records(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    // The gossip handlers cannot reach `AppSettings`, so keep their copy of the
+    // Rendezvous URL current from the loop that can.
+    if settings.rendezvous_url != state.rendezvous_url {
+        state.rendezvous_url = settings.rendezvous_url.clone();
+    }
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if ch.deleted {
+            continue;
+        }
+        if started >= CHANNEL_MODERATION_PUBLISH_PER_TICK {
+            break;
+        }
+        if !ch.is_owner {
+            continue;
+        }
+        if !ch.successor_id.is_empty() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let last = state
+            .channel_moderation_publish_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::MODERATION_REPUBLISH_SECS {
+            continue;
+        }
+        let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
+            continue;
+        };
+        let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+        if ident.channel_id != channel_id {
+            continue;
+        }
+        let mut bans = db
+            .list_banned_channel_pubkeys(&ch.channel_id)
+            .unwrap_or_default();
+        // Same rule as `commands::channels::load_banned_pubkeys`: never re-sign
+        // our own key into the ban list of a room we own, or a moderator's
+        // gossip becomes an owner-signed ban that outlives every republish.
+        let our_pk = state.local_ed25519_pubkey;
+        bans.retain(|pk| pk != &our_pk);
+        let mods = db
+            .list_moderator_channel_pubkeys(&ch.channel_id)
+            .unwrap_or_default();
+        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        let record = ember::dht::publish::SignedRecord::channel_moderation(
+            &ch.topic,
+            &ch.welcome,
+            &bans,
+            &mods,
+            // We own this room, so our own identity is the owner identity every
+            // member needs in order to refuse a ban aimed at us, and our epoch
+            // is how they tell they are behind.
+            &ember::dht::publish::ModerationTail {
+                owner_pubkey: Some(our_pk),
+                key_epoch: Some(ch.key_epoch.max(0) as u64),
+                // Zeros rather than absent when unset, so withdrawing a
+                // nomination actually reaches members.
+                successor_nominee: Some(
+                    hex::decode(&ch.successor_nominee)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .unwrap_or([0u8; 32]),
+                ),
+                claim_after_days: Some(ch.claim_after_days.clamp(0, u16::MAX as i64) as u16),
+                invites_owner_only: Some(ch.invites_owner_only),
+                // Carried on every republish, not just the edit that set it:
+                // this record is a whole snapshot, so omitting it here would
+                // turn slow mode off across the room a few hours after the
+                // owner switched it on. Absent when off, so a room that never
+                // uses it keeps publishing a tail older builds can read.
+                slow_mode_secs: match ch.slow_mode_secs.clamp(0, u16::MAX as i64) as u16 {
+                    0 => None,
+                    secs => Some(secs),
+                },
+            },
+            channel_id,
+            ident.pubkey,
+            private,
+            &ident.signing_key,
+        );
+        // A snapshot too large for one record cannot be republished at all, and
+        // the copy the network holds expires within the day. Say so once per
+        // refresh rather than letting the room quietly lose its governance.
+        let Some(record) = record else {
+            warn!(
+                "Ember: channel {} moderation snapshot does not fit one record; its published \
+                 state will lapse until the welcome or the ban/moderator lists are shortened",
+                hex::encode(channel_id)
+            );
+            continue;
+        };
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            state.channel_moderation_publish_at.insert(channel_id, now);
+            drive_ember_publish(socket, state, publish_id).await;
+            started += 1;
+            // Everything a room's survival depends on is renewed from here, so
+            // this loop running *is* the owner's liveness signal: the directory
+            // entry, the name claim, and the succession clock all age from the
+            // last pass. Walking out of a room you own is not abandonment and
+            // must not start that clock — closing Ember for good is, and that
+            // stops this loop on its own.
+            if !settings.rendezvous_url.is_empty() {
+                let url = settings.rendezvous_url.clone();
+                let cid = ident.channel_id;
+                let cpk = ident.pubkey;
+                let seed = ident.seed();
+                let cname = ch.name.clone();
+                // A room we inherited still has its name bound to the room it
+                // came from, and the handover at claim time is one shot — it
+                // fails whenever Rendezvous happens to be unreachable. Retrying
+                // it here is what makes that recoverable rather than a wait for
+                // the abandoned name to lapse.
+                let predecessor = hex::decode(&ch.predecessor_id)
+                    .ok()
+                    .and_then(|b| <[u8; 16]>::try_from(b).ok());
+                // Whoever we nominated has to be on record with the registry or
+                // they cannot take the name when they take the room. Sent from
+                // here as well as at nomination time, because that one-shot is
+                // lost if the registry was unreachable — or if the room had no
+                // name claim yet for the nomination to attach to.
+                let nominee = hex::decode(&ch.successor_nominee)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .filter(|_| ch.claim_after_days > 0);
+                let claim_after_days = ch.claim_after_days.clamp(0, u32::MAX as i64) as u32;
+                let our_pk = identity.ed25519_public_key;
+                let our_sk = identity.ed25519_secret_key;
+                tokio::spawn(async move {
+                    let claimed = crate::network::rendezvous::claim_channel_name(
+                        &url, &cid, &cpk, &seed, &cname, private,
+                    )
+                    .await;
+                    if claimed.is_ok() {
+                        if let Some(nominee) = nominee {
+                            if let Err(error) =
+                                crate::network::rendezvous::register_channel_nominee(
+                                    &url,
+                                    &cid,
+                                    &cpk,
+                                    &seed,
+                                    Some(&nominee),
+                                    claim_after_days,
+                                )
+                                .await
+                            {
+                                tracing::debug!(?error, "could not re-register the room's nominee");
+                            }
+                        }
+                        return;
+                    }
+                    let taken = matches!(
+                        claimed,
+                        Err(crate::network::rendezvous::ChannelRegistryError::Taken)
+                    );
+                    let Some(old_id) = predecessor.filter(|_| taken) else {
+                        return;
+                    };
+                    if let Err(error) = crate::network::rendezvous::handover_channel_name(
+                        &url, &old_id, &cid, &cpk, &our_pk, &our_sk,
+                    )
+                    .await
+                    {
+                        tracing::debug!(?error, "could not move the inherited channel name");
+                    }
+                });
+            }
+            // The listing Discover walks was published once, at creation, so an
+            // established room aged out of the index after a day while its
+            // members carried on none the wiser. Renewed on the same cadence
+            // because this is the only loop that already holds the room key,
+            // and 6h against a 24h TTL survives a missed pass.
+            if !private {
+                let index = ember::dht::publish::SignedRecord::channel_index(
+                    &ch.name,
+                    channel_id,
+                    ident.pubkey,
+                    false,
+                    &ident.signing_key,
+                );
+                if let Some(index_id) = state
+                    .ember_publish
+                    .start_publish(index, state.ember_dht.routing())
+                {
+                    drive_ember_publish(socket, state, index_id).await;
+                }
+            }
+            // Renew the current epoch alongside it. Rotation publishes these
+            // once, on the ban, and if that pass failed — app closed mid-way, no
+            // route to the storing nodes, records aged out — every remaining
+            // member is locked out of a room they are still entitled to read,
+            // with nothing to re-ask of. This is the recovery path, and it is
+            // cheap: republishing an epoch a member already holds is a no-op.
+            if private && ch.key_epoch > 0 {
+                republish_channel_key_epoch(socket, state, db, &ch, &ident, identity, our_pk).await;
+            }
+        }
+    }
+}
+
+/// Re-seal the room's current content key to every member still entitled to it.
+///
+/// Skips banned members and ourselves, exactly as the rotation did. Reads the
+/// `banned` flag from the database, which is safe here because any ban that
+/// triggered a rotation was committed long before this timer runs.
+async fn republish_channel_key_epoch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    ident: &ember::channel::ChannelIdentity,
+    identity: &crate::storage::identity::NodeIdentity,
+    our_pk: [u8; 32],
+) {
+    let epoch = ch.key_epoch;
+    let Some(secret) = db
+        .load_channel_key_epochs(&ch.channel_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(e, _)| *e == epoch)
+        .map(|(_, secret)| secret)
+    else {
+        return;
+    };
+    let our_seed = identity.ed25519_secret_key;
+    for member in db.list_channel_members(&ch.channel_id).unwrap_or_default() {
+        if member.banned {
+            continue;
+        }
+        let Some(member_pk) = hex::decode(&member.member_pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        if member_pk == our_pk {
+            continue;
+        }
+        let Some(wrap) = ember::channel::derive_channel_epoch_secret(
+            &our_seed,
+            &member_pk,
+            &ident.channel_id,
+            epoch,
+        ) else {
+            continue;
+        };
+        let sealed =
+            ember::channel::seal_channel_key_epoch(&wrap, &ident.channel_id, epoch, &secret);
+        let record = ember::dht::publish::SignedRecord::channel_key_epoch(
+            ident.channel_id,
+            ident.pubkey,
+            &member_pk,
+            epoch,
+            &sealed,
+            &ident.signing_key,
+        );
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
+const CHANNEL_EPOCH_FETCH_PER_TICK: usize = 2;
+/// Re-ask for an epoch record we could not find yet. Short, because until it
+/// lands the member cannot read anything new in the room.
+const CHANNEL_EPOCH_FETCH_SECS: i64 = 60;
+
+/// FIND_VALUE our own copy of a rotated content key.
+///
+/// Only for private rooms we do not own: the owner mints epochs, and a public
+/// room's key is derivable by anyone so rotating one would evict nobody. Driven
+/// by `key_epoch_wanted` running ahead of `key_epoch`, both of which come from
+/// the owner's signed moderation record.
+async fn maybe_refresh_channel_key_epoch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let our_pk = identity.ed25519_public_key;
+    let mut started = 0usize;
+    for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
+        if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
+            break;
+        }
+        if ch.is_owner
+            || ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE
+            || ch.key_epoch_wanted <= ch.key_epoch
+            || !ch.successor_id.is_empty()
+        {
+            continue;
+        }
+        let Ok(channel_id) = hex::decode(&ch.channel_id)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
+        else {
+            continue;
+        };
+        let target = ch.key_epoch_wanted;
+        if state
+            .ember_channel_epoch_searches
+            .values()
+            .any(|(id, epoch)| *id == channel_id && *epoch == target)
+        {
+            continue;
+        }
+        let last = state
+            .channel_epoch_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < CHANNEL_EPOCH_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::epoch_key(&channel_id, &our_pk, target);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_epoch_searches
+            .insert(search_id, (channel_id, target));
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_epoch_fetch_at.insert(channel_id, now);
+        started += 1;
+    }
+}
+
+/// Open an epoch record sealed to us and store the key it carries.
+///
+/// The wrapping key is pairwise with the owner, so a blob sealed to anyone else
+/// simply fails to open — which is exactly what makes a ban an eviction.
+fn ingest_channel_epoch_records(
+    db: &Database,
+    identity: &crate::storage::identity::NodeIdentity,
+    channel_id: [u8; 16],
+    epoch: i64,
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Some(owner_pk) = hex::decode(&ch.owner_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        // We have not learned who owns the room, so there is nobody to derive
+        // the wrapping key against yet. The moderation poll fixes that.
+        return false;
+    };
+    let Some(wrap) = ember::channel::derive_channel_epoch_secret(
+        &identity.ed25519_secret_key,
+        &owner_pk,
+        &channel_id,
+        epoch,
+    ) else {
+        return false;
+    };
+    for blob in records {
+        let Some((member, record_epoch, envelope)) =
+            ember::dht::publish::SignedRecord::parse_channel_key_epoch(blob, &channel_id)
+        else {
+            continue;
+        };
+        // Only our own slot, and only for the epoch we asked about: the record
+        // is self-validating about both, so a mismatch is somebody else's.
+        if member != identity.ed25519_public_key || record_epoch != epoch {
+            continue;
+        }
+        let Some(secret) =
+            ember::channel::open_channel_key_epoch(&wrap, &channel_id, epoch, &envelope)
+        else {
+            continue;
+        };
+        match db.insert_channel_key_epoch(&channel_id_hex, epoch, &secret) {
+            Ok(()) => return true,
+            Err(e) => {
+                debug!("Ember channel epoch {epoch} for {channel_id_hex} not stored: {e}");
+            }
+        }
+    }
+    false
+}
+
+const CHANNEL_HANDOFF_FETCH_PER_TICK: usize = 2;
+
+/// FIND_VALUE the owner-signed successor record. Separate from moderation:
+/// extra FIND_VALUE keys intersect by `file_hash`, and these records share
+/// that hash but live under different DHT keys.
+async fn maybe_refresh_channel_handoff(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels() else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
+        if started >= CHANNEL_HANDOFF_FETCH_PER_TICK {
+            break;
+        }
+        if !ch.successor_id.is_empty() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        if state
+            .ember_channel_handoff_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let last = state
+            .channel_handoff_fetch_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < ember::channel::HANDOFF_FETCH_SECS {
+            continue;
+        }
+        let key = ember::channel::handoff_key(&channel_id);
+        let Some(search_id) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(key),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            break;
+        };
+        seed_ember_local_records(state, search_id, &key, &[]);
+        state
+            .ember_channel_handoff_searches
+            .insert(search_id, channel_id);
+        drive_ember_search(socket, state, search_id).await;
+        state.channel_handoff_fetch_at.insert(channel_id, now);
+        started += 1;
+
+        // A succession claim lives under its own key, because it is signed by
+        // the nominee rather than the room. Only worth asking for once the
+        // owner has actually been silent long enough to honour one.
+        if ch.successor_nominee.is_empty()
+            || ch.claim_after_days <= 0
+            || ch.moderation_updated_at <= 0
+            || now.saturating_sub(ch.moderation_updated_at)
+                < ch.claim_after_days.saturating_mul(86_400)
+        {
+            continue;
+        }
+        if state
+            .ember_channel_claim_searches
+            .values()
+            .any(|id| *id == channel_id)
+        {
+            continue;
+        }
+        let claim = ember::channel::claim_key(&channel_id);
+        let Some(claim_search) = state.ember_search.start_find_value(
+            ember::dht::EmberNodeId(claim),
+            Vec::new(),
+            state.ember_dht.routing(),
+        ) else {
+            continue;
+        };
+        seed_ember_local_records(state, claim_search, &claim, &[]);
+        state
+            .ember_channel_claim_searches
+            .insert(claim_search, channel_id);
+        drive_ember_search(socket, state, claim_search).await;
+    }
+}
+
+fn ingest_channel_handoff_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> Option<[u8; 16]> {
+    if db.chat_locked() {
+        return None;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return None;
+    };
+    let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
+        return None;
+    };
+    let mut best: Option<ember::dht::publish::ChannelHandoff> = None;
+    for blob in records {
+        let Some(parsed) =
+            ember::dht::publish::SignedRecord::parse_channel_handoff(blob, &channel_id)
+        else {
+            continue;
+        };
+        if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|cur| {
+            parsed.version > cur.version || parsed.timestamp > cur.timestamp
+        }) {
+            best = Some(parsed);
+        }
+    }
+    let handoff = best?;
+    let keep = handoff.flags & ember::channel::HANDOFF_FLAG_KEEP_JOIN_SECRET != 0;
+    let successor_pk = hex::encode(handoff.successor_pubkey);
+    let successor_id = hex::encode(handoff.successor_channel_id);
+    let seed = db
+        .load_handoff_pending_seed(&channel_id_hex, &successor_pk, handoff.version)
+        .ok()
+        .flatten();
+    if db
+        .apply_channel_handoff(
+            &channel_id_hex,
+            &successor_pk,
+            &successor_id,
+            handoff.version,
+            keep,
+            seed.as_ref(),
+        )
+        .unwrap_or(false)
+    {
+        Some(handoff.successor_channel_id)
+    } else {
+        None
+    }
+}
+
+/// Honour a nominee's claim on a room whose owner has gone silent.
+///
+/// The claim itself proves nothing — it is signed by the claimant, who has
+/// every reason to publish one. What makes it safe is that each member decides
+/// independently, against facts only the owner could have authored: the
+/// nomination in their last signed moderation record, and the timestamp of that
+/// record.
+///
+/// The awkward part is that "the owner is silent" and "we have not looked" are
+/// the same observation from here. So the window is measured from the *newest*
+/// evidence available — ours or the claim's own — and only once
+/// [`owner_silence_is_confirmed`] says we have actually been asking.
+fn ingest_channel_claim_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> Option<[u8; 16]> {
+    if db.chat_locked() {
+        return None;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return None;
+    };
+    if !ember::channel::owner_silence_is_confirmed(ch.moderation_checked_at) {
+        return None;
+    }
+    if !ch.successor_id.is_empty() || ch.is_owner {
+        return None;
+    }
+    // Succession is opt-in: no nomination, or no window, means the owner never
+    // set it up and the room stays as it is.
+    if ch.successor_nominee.is_empty() || ch.claim_after_days <= 0 {
+        return None;
+    }
+    if ch.moderation_updated_at <= 0 {
+        // We have never held an owner-signed record, so we have no idea how
+        // long they have been quiet and no nomination we can trust.
+        return None;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let silent_for = now.saturating_sub(ch.moderation_updated_at);
+    let required = ch.claim_after_days.saturating_mul(86_400);
+    if silent_for < required {
+        return None;
+    }
+    // Pick one claim by a rule every member applies identically, rather than
+    // whichever the DHT happened to return first. A nominee can publish two
+    // claims naming different successor rooms; first-wins would let members
+    // follow different ones and split the room, which is exactly what
+    // succession is supposed to avoid. Newest witness wins, ties broken on the
+    // successor id so the ordering is total.
+    let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
+        .iter()
+        .filter_map(|blob| {
+            ember::dht::publish::SignedRecord::parse_channel_succession_claim(blob, &channel_id)
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.2.cmp(&b.2)));
+    for (claimant, successor_pk, successor_id, witnessed_ts, keep) in candidates {
+        let claimant_hex = hex::encode(claimant);
+        if !ch.successor_nominee.eq_ignore_ascii_case(&claimant_hex) {
+            continue;
+        }
+        // A nominee who was banned before the owner went quiet does not inherit
+        // the room. The owner clears the nomination when they ban, but their
+        // final record may never have reached us, so this is checked again here
+        // against the ban we do hold.
+        if db
+            .channel_member_is_banned(&channel_id_hex, &claimant_hex)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        // A claimant cannot backdate the owner's last word: they may only cite
+        // a record at least as new as the one we hold.
+        if witnessed_ts < ch.moderation_updated_at {
+            continue;
+        }
+        // And their own evidence has to clear the window too. Checking only our
+        // local copy meant a claim that openly cited a record from an hour ago
+        // was still honoured by anyone whose snapshot happened to be older —
+        // the claimant proved the owner was alive and inherited the room anyway.
+        if now.saturating_sub(witnessed_ts) < required {
+            continue;
+        }
+        let successor_pk_hex = hex::encode(successor_pk);
+        let successor_id_hex = hex::encode(successor_id);
+        if db
+            .apply_channel_handoff(
+                &channel_id_hex,
+                &successor_pk_hex,
+                &successor_id_hex,
+                // Version is the claim's own witness timestamp: monotonic, and
+                // it cannot collide with the owner's own handoff versions.
+                witnessed_ts.max(1) as u64,
+                keep,
+                None,
+            )
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                channel_id = %channel_id_hex,
+                "followed a succession claim after {silent_for}s of owner silence"
+            );
+            return Some(successor_id);
+        }
+    }
+    None
+}
+
+fn ingest_channel_presence_records(
+    state: &mut NetworkState,
+    db: &Database,
+    our_pubkey: &[u8; 32],
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    if !ch.in_room_now() {
+        return false;
+    };
+    // A private room's presence extra is sealed under the content key, so a
+    // member who has not yet picked up the newest epoch is still readable under
+    // the one they published with.
+    let content_keys = channel_content_keys(db, &ch);
+    let existing: HashSet<String> = db
+        .list_channel_members(&channel_id_hex)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.member_pubkey)
+        .collect();
+    // Current and previous epoch are two FIND_VALUE walks. Newest-wins has
+    // to see both before any row is written, or a prev-epoch live announce
+    // re-inserts after the current tombstone and a prev-epoch tombstone
+    // deletes a rejoiner. Equal timestamps prefer the leave.
+    let now = chrono::Utc::now().timestamp();
+    let mut latest: HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember> =
+        HashMap::new();
+    for blob in records {
+        let Some(member) = content_keys.iter().find_map(|candidate| {
+            ember::dht::publish::SignedRecord::parse_channel_presence_member(
+                blob,
+                &channel_id,
+                Some(candidate),
+            )
+        }) else {
+            continue;
+        };
+        let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {
+            continue;
+        };
+        let mut member = member;
+        member.timestamp = ts;
+        ember::dht::publish::keep_latest_presence_member(&mut latest, member);
+    }
+    let our_hex = hex::encode(our_pubkey);
+    let mut changed = false;
+    for member in latest.into_values() {
+        let pk_hex = hex::encode(member.publisher_key);
+        if member.departed {
+            if !ember::channel::presence_departure_applies(
+                &member.publisher_key,
+                our_pubkey,
+                ch.in_room_now(),
+            ) {
+                continue;
+            }
+            match db.remove_channel_member(&channel_id_hex, &pk_hex, member.timestamp) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        channel_id = %channel_id_hex,
+                        member = %pk_hex,
+                        error = %e,
+                        "could not apply a presence leave tombstone"
+                    );
+                }
+            }
+            state.ember_channel_noise_keys.remove(&member.publisher_key);
+            if existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
+                changed = true;
+            }
+            continue;
+        }
+        let nick = crate::security::sanitize_display_name(&member.nickname);
+        if db
+            .upsert_channel_member(
+                &channel_id_hex,
+                &pk_hex,
+                &nick,
+                member.timestamp,
+                Some(&our_hex),
+            )
+            .is_ok()
+        {
+            state
+                .ember_channel_noise_keys
+                .insert(member.publisher_key, member.noise_pub);
+            if !existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Hold presence blobs until every FIND_VALUE for this room (current and
+/// previous epoch) has finished, then queue one newest-wins ingest.
+fn buffer_channel_presence_records(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    records: Vec<Vec<u8>>,
+) {
+    if !records.is_empty() {
+        state
+            .ember_channel_presence_buffer
+            .entry(channel_id)
+            .or_default()
+            .extend(records);
+    }
+    flush_channel_presence_if_idle(state, channel_id);
+}
+
+fn flush_channel_presence_if_idle(state: &mut NetworkState, channel_id: [u8; 16]) {
+    if state
+        .ember_channel_presence_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return;
+    }
+    if let Some(records) = state.ember_channel_presence_buffer.remove(&channel_id) {
+        state
+            .ember_pending_channel_presence
+            .push((channel_id, records));
+    }
+}
+
+async fn maybe_dial_channel_neighbors(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Database,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    result_tx: &mpsc::UnboundedSender<ChannelNeighborLookupResult>,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    if settings.rendezvous_url.is_empty() {
+        return;
+    }
+    let Ok(neighbors) = collect_channel_neighbor_caps(db, &our_pubkey) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut started = 0usize;
+    let mut find_nodes = 0usize;
+    let mut pending_find = Vec::new();
+    let punch = state.external_ip.map(|ip| (ip, advertised_udp_port(state), state.nat_info.nat_type.as_u8()));
+    for (channel_id, peer_pubkey) in neighbors {
+        if started >= CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK {
+            break;
+        }
+        if state.channel_neighbor_lookup_inflight.contains(&peer_pubkey) {
+            continue;
+        }
+        if state
+            .channel_neighbor_lookup_at
+            .get(&peer_pubkey)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL)
+        {
+            continue;
+        }
+        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer_pubkey));
+        if state.ember_dht.routing().get_contact(&node_id).is_some() {
+            continue;
+        }
+        state.channel_neighbor_lookup_at.insert(peer_pubkey, now);
+        state.channel_neighbor_lookup_inflight.insert(peer_pubkey);
+        spawn_channel_neighbor_lookup(
+            settings.rendezvous_url.clone(),
+            ember_hash,
+            our_pubkey,
+            our_secret,
+            peer_pubkey,
+            channel_id,
+            punch,
+            result_tx.clone(),
+        );
+        started += 1;
+        if find_nodes < CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK {
+            if let Some(search_id) = state
+                .ember_search
+                .start_find_node(node_id, state.ember_dht.routing())
+            {
+                find_nodes += 1;
+                pending_find.push(search_id);
+            }
+        }
+    }
+    for search_id in pending_find {
+        drive_ember_search(socket, state, search_id).await;
+    }
+}
+
+fn spawn_channel_neighbor_lookup(
+    rv_url: String,
+    our_ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    punch: Option<(Ipv4Addr, u16, u8)>,
+    result_tx: mpsc::UnboundedSender<ChannelNeighborLookupResult>,
+) {
+    tokio::spawn(async move {
+        let mut endpoint = rendezvous::lookup_channel_presence(
+            &rv_url,
+            &our_ember_hash,
+            &our_pubkey,
+            &our_secret,
+            &peer_pubkey,
+            &channel_id,
+        )
+        .await
+        .ok()
+        .flatten();
+        if endpoint.is_none() {
+            if let Some((ip, port, nat_type)) = punch {
+                endpoint = punch_channel_neighbor(
+                    &rv_url,
+                    our_ember_hash,
+                    our_pubkey,
+                    our_secret,
+                    peer_pubkey,
+                    channel_id,
+                    ip,
+                    port,
+                    nat_type,
+                )
+                .await;
+            }
+        }
+        let _ = result_tx.send(ChannelNeighborLookupResult {
+            peer_pubkey,
+            channel_id,
+            endpoint,
+        });
+    });
+}
+
+/// Coordinated UDP punch keyed by the channel presence capability.
+/// Advertises the Ember UDP port (not QUIC). Does not ack punches whose
+/// capability belongs to a friend slot.
+async fn punch_channel_neighbor(
+    rendezvous_url: &str,
+    our_ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    advertised_ip: Ipv4Addr,
+    port: u16,
+    nat_type: u8,
+) -> Option<(Ipv4Addr, u16)> {
+    if port == 0 {
+        return None;
+    }
+    let ts = rendezvous::current_timestamp();
+    let epoch = ember::crypto::pairwise_capability_epoch(ts);
+    let register_cap = ember::channel::derive_channel_presence_capability(
+        &our_secret,
+        &peer_pubkey,
+        &peer_pubkey,
+        &channel_id,
+        epoch,
+    )?;
+    let expected_cap = ember::channel::derive_channel_presence_capability(
+        &our_secret,
+        &peer_pubkey,
+        &our_pubkey,
+        &channel_id,
+        epoch,
+    )?;
+    let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
+    let expected_from = rendezvous::hashed_id(&peer_hash);
+    if ember::relay::register_punch_with_capability(
+        rendezvous_url,
+        &our_ember_hash,
+        &peer_hash,
+        register_cap,
+        epoch,
+        port,
+        nat_type,
+        IpAddr::V4(advertised_ip),
+        &our_secret,
+    )
+    .await
+    .is_err()
+    {
+        return None;
+    }
+    for _ in 0..CHANNEL_PUNCH_POLL_ATTEMPTS {
+        tokio::time::sleep(CHANNEL_PUNCH_POLL_INTERVAL).await;
+        match ember::relay::poll_punch(rendezvous_url, &our_ember_hash, &our_secret).await {
+            Ok(Some(info)) => {
+                if info.from_id != expected_from || info.capability != expected_cap {
+                    continue;
+                }
+                let Ok(IpAddr::V4(ip)) = info.ip.parse::<IpAddr>() else {
+                    let _ = ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        &our_secret,
+                    )
+                    .await;
+                    continue;
+                };
+                if crate::security::is_special_use_v4(ip) || info.port == 0 {
+                    let _ = ember::relay::ack_punch(
+                        rendezvous_url,
+                        &our_ember_hash,
+                        &info.punch_id,
+                        &info.capability,
+                        info.epoch,
+                        &our_secret,
+                    )
+                    .await;
+                    continue;
+                }
+                let _ = ember::relay::ack_punch(
+                    rendezvous_url,
+                    &our_ember_hash,
+                    &info.punch_id,
+                    &info.capability,
+                    info.epoch,
+                    &our_secret,
+                )
+                .await;
+                return Some((ip, info.port));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!("Ember channel punch poll error: {e}");
+            }
+        }
+    }
+    None
+}
+
+async fn apply_channel_neighbor_lookup(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    result: ChannelNeighborLookupResult,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    relay_event_tx: &mpsc::UnboundedSender<ChannelRelayEvent>,
+) {
+    state
+        .channel_neighbor_lookup_inflight
+        .remove(&result.peer_pubkey);
+    if let Some((ip, port)) = result.endpoint {
+        if !(state.external_ip == Some(ip) && port == advertised_udp_port(state)) {
+            // Channel peers resolve over Ember UDP and must never enter the
+            // friend-privilege set. This path only DHT-PINGs.
+            let addr = SocketAddr::new(IpAddr::V4(ip), port);
+            let noise = state
+                .ember_channel_noise_keys
+                .get(&result.peer_pubkey)
+                .copied();
+            if let Some(noise_pub) = noise {
+                state
+                    .ember_noise_keys
+                    .insert((ip, port), (noise_pub, std::time::Instant::now()));
+            }
+            ping_ember_udp_peer(socket, state, addr, noise.as_ref()).await;
+            return;
+        }
+    }
+    maybe_offer_channel_relay(
+        state,
+        settings,
+        ember_hash,
+        our_pubkey,
+        our_secret,
+        result.peer_pubkey,
+        result.channel_id,
+        relay_event_tx,
+    );
+}
+
+async fn ping_ember_udp_peer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    addr: SocketAddr,
+    noise_pub: Option<&[u8; 32]>,
+) {
+    let (_rid, frame) = state.ember_dht.build_ping();
+    match state
+        .ember_transport
+        .prepare_outgoing(addr, noise_pub, &frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            if let Err(e) = socket.send_to(&packet, addr).await {
+                debug!("Ember channel neighbor: ping to {addr} failed: {e}");
+            }
+        }
+        ember::transport::OutgoingResult::Queued => {}
+        ember::transport::OutgoingResult::Error(e) => {
+            debug!("Ember channel neighbor: transport error pinging {addr}: {e}");
+        }
+    }
+}
+
+const CHANNEL_RELAY_OFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CHANNEL_RELAY_WS_MAGIC: &[u8; 4] = b"ECR1";
+const MAX_CHANNEL_RELAY_SESSIONS: usize = 8;
+
+fn maybe_offer_channel_relay(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    ember_hash: [u8; 16],
+    our_pubkey: [u8; 32],
+    our_secret: [u8; 32],
+    peer_pubkey: [u8; 32],
+    channel_id: [u8; 16],
+    relay_event_tx: &mpsc::UnboundedSender<ChannelRelayEvent>,
+) {
+    if settings.rendezvous_url.is_empty() {
+        return;
+    }
+    if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+        return;
+    }
+    if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if state
+        .channel_relay_offer_at
+        .get(&peer_pubkey)
+        .is_some_and(|at| now.saturating_duration_since(*at) < CHANNEL_RELAY_OFFER_INTERVAL)
+    {
+        return;
+    }
+    state.channel_relay_offer_at.insert(peer_pubkey, now);
+    let rv_url = settings.rendezvous_url.clone();
+    let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
+    let event_tx = relay_event_tx.clone();
+    tokio::spawn(async move {
+        let offer = match rendezvous::offer_channel_relay_ticket(
+            &rv_url,
+            &ember_hash,
+            &peer_hash,
+            &our_pubkey,
+            &our_secret,
+            &channel_id,
+        )
+        .await
+        {
+            Ok(offer) => offer,
+            Err(e) => {
+                debug!("Ember channel relay offer failed: {e}");
+                return;
+            }
+        };
+        let deadline = tokio::time::Instant::now() + rendezvous::FRIEND_RELAY_TICKET_INITIATOR_WAIT;
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                debug!("Ember channel relay ticket was not accepted before timeout");
+                return;
+            }
+            tokio::time::sleep(remaining.min(delay)).await;
+            match rendezvous::friend_relay_ticket_accepted(
+                &rv_url,
+                &ember_hash,
+                &offer.ticket_id,
+                &our_secret,
+            )
+            .await
+            {
+                Ok(true) => break,
+                Ok(false) => delay = std::time::Duration::from_secs(1),
+                Err(e) => {
+                    if rendezvous::is_transient_relay_ticket_read_error(&e) {
+                        delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                    debug!("Ember channel relay ticket status failed: {e}");
+                    return;
+                }
+            }
+        }
+        match ember::relay::connect_server_relay(&rv_url, &offer.ticket_id, &offer.initiator_token)
+            .await
+        {
+            Ok(ws) => run_channel_relay_session(ws, peer_pubkey, event_tx).await,
+            Err(e) => debug!("Ember channel relay join failed: {e}"),
+        }
+    });
+}
+
+async fn run_channel_relay_session(
+    ws: ember::relay::WsStream,
+    peer_pubkey: [u8; 32],
+    event_tx: mpsc::UnboundedSender<ChannelRelayEvent>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(ws);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(32);
+    if event_tx
+        .send(ChannelRelayEvent::Opened {
+            peer_pubkey,
+            outbound_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+    if writer.write_all(CHANNEL_RELAY_WS_MAGIC).await.is_err() {
+        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+        return;
+    }
+    let mut magic = [0u8; 4];
+    if reader.read_exact(&mut magic).await.is_err() || magic != *CHANNEL_RELAY_WS_MAGIC {
+        let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+        return;
+    }
+    let mut len_buf = [0u8; 4];
+    loop {
+        tokio::select! {
+            body = outbound_rx.recv() => {
+                let Some(body) = body else { break; };
+                if body.len() > ember::dht::messages::MAX_DHT_PAYLOAD {
+                    continue;
+                }
+                let len = (body.len() as u32).to_le_bytes();
+                if writer.write_all(&len).await.is_err() || writer.write_all(&body).await.is_err() {
+                    break;
+                }
+            }
+            read = reader.read_exact(&mut len_buf) => {
+                if read.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 || len > ember::dht::messages::MAX_DHT_PAYLOAD {
+                    break;
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+                if event_tx
+                    .send(ChannelRelayEvent::Frame {
+                        peer_pubkey,
+                        body,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = event_tx.send(ChannelRelayEvent::Closed { peer_pubkey });
+}
+
+async fn apply_channel_relay_event(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    event: ChannelRelayEvent,
+) {
+    match event {
+        ChannelRelayEvent::Opened {
+            peer_pubkey,
+            outbound_tx,
+        } => {
+            state.channel_relay_outboxes.insert(peer_pubkey, outbound_tx);
+        }
+        ChannelRelayEvent::Closed { peer_pubkey } => {
+            state.channel_relay_outboxes.remove(&peer_pubkey);
+        }
+        ChannelRelayEvent::Frame { peer_pubkey, body } => {
+            let from_id =
+                ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer_pubkey));
+            handle_inbound_channel_gossip(socket, state, db, app_handle, body, from_id).await;
+        }
+    }
+}
+
+fn ember_has_live_session(
+    state: &NetworkState,
+    contact: &ember::dht::EmberContact,
+) -> bool {
+    state
+        .ember_transport
+        .has_live_session(&contact.addr, &contact.noise_pub)
+}
+
+/// Handshake-capable send. Channel gossip, transfer, and CHANNEL_RELAY
+/// must not use this: `HandshakeStarted` used to count as delivered and
+/// skip overlay + the WebSocket outbox. DHT lookups still start sessions
+/// through their own `prepare_outgoing` paths.
+#[allow(dead_code)]
+async fn send_ember_dht_frame(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    contact: &ember::dht::EmberContact,
+    frame: &[u8],
+) -> bool {
+    match state
+        .ember_transport
+        .prepare_outgoing(contact.addr, Some(&contact.noise_pub), frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            if let Err(e) = socket.send_to(&packet, contact.addr).await {
+                debug!("Ember channel gossip: send to {} failed: {e}", contact.addr);
+                false
+            } else {
+                true
+            }
+        }
+        ember::transport::OutgoingResult::Queued => true,
+        ember::transport::OutgoingResult::Error(e) => {
+            debug!(
+                "Ember channel gossip: transport error for {}: {e}",
+                contact.addr
+            );
+            false
+        }
+    }
+}
+
+/// Seal and send only if a Noise session for this identity already exists.
+/// Does not start a handshake — `prepare_outgoing` is not called unless
+/// [`ember_has_live_session`] is true, so CHANNEL_RELAY cannot re-seal an
+/// attacker body under our identity.
+async fn send_ember_dht_frame_established(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    contact: &ember::dht::EmberContact,
+    frame: &[u8],
+) -> bool {
+    if !ember_has_live_session(state, contact) {
+        return false;
+    }
+    match state
+        .ember_transport
+        .prepare_outgoing(contact.addr, Some(&contact.noise_pub), frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet } => {
+            socket.send_to(&packet, contact.addr).await.is_ok()
+        }
+        _ => false,
+    }
+}
+
+async fn fanout_channel_gossip_body(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    body: Vec<u8>,
+    exclude: Option<ember::dht::EmberNodeId>,
+) {
+    fanout_channel_gossip_retry(socket, state, db, body, exclude, None).await;
+}
+
+async fn fanout_channel_gossip_retry(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    body: Vec<u8>,
+    exclude: Option<ember::dht::EmberNodeId>,
+    origin_queued_at: Option<std::time::Instant>,
+) {
+    // `exclude` names the hop a frame arrived from, so its absence is what
+    // marks this as something we originated rather than are passing on.
+    let local_origin = exclude.is_none();
+    let retry_at = origin_queued_at.unwrap_or_else(std::time::Instant::now);
+    if !channel_gossip_rate_ok(state, local_origin) {
+        if local_origin {
+            queue_channel_origin_retry(state, body, retry_at);
+        }
+        return;
+    }
+    let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
+        return;
+    };
+    let channel_id_hex = hex::encode(gossip.channel_id);
+    let in_room = db
+        .get_channel(&channel_id_hex)
+        .ok()
+        .flatten()
+        .is_some_and(|ch| ch.in_room_now());
+    if !in_room {
+        return;
+    }
+    let members = channel_member_pubkeys(db, &channel_id_hex);
+    let others: Vec<[u8; 32]> = members
+        .iter()
+        .copied()
+        .filter(|pk| pk != &state.local_ed25519_pubkey)
+        .collect();
+    if local_origin && others.is_empty() {
+        // Alone in the roster: keep the frame until presence names someone.
+        // Relays of other people's frames do not wait.
+        queue_channel_origin_retry(state, body, retry_at);
+        return;
+    }
+    let neighbors = ember::channel::xor_closest_neighbors(
+        &state.local_ed25519_pubkey,
+        &members,
+        ember::channel::CHANNEL_NEIGHBOR_COUNT,
+    );
+    let mut direct = Vec::new();
+    let mut missing = Vec::new();
+    for pk in &neighbors {
+        let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+        if exclude == Some(node_id) {
+            continue;
+        }
+        if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+            if ember::channel::channel_fanout_uses_direct_session(ember_has_live_session(
+                state, &contact,
+            )) {
+                direct.push((*pk, contact));
+                continue;
+            }
+        }
+        missing.push(*pk);
+    }
+    if direct.len() + missing.len() < ember::channel::CHANNEL_NEIGHBOR_COUNT {
+        for pk in &members {
+            if direct.len() + missing.len() >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
+                break;
+            }
+            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+            if exclude == Some(node_id)
+                || *pk == state.local_ed25519_pubkey
+                || direct.iter().any(|(p, _)| p == pk)
+                || missing.contains(pk)
+            {
+                continue;
+            }
+            if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+                if ember::channel::channel_fanout_uses_direct_session(ember_has_live_session(
+                    state, &contact,
+                )) {
+                    direct.push((*pk, contact));
+                    continue;
+                }
+            }
+            missing.push(*pk);
+        }
+    }
+    for (pk, contact) in direct {
+        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+        if !send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+            missing.push(pk);
+        }
+    }
+    // Every unreachable neighbor is tried over the overlay, which is UDP
+    // between members, before the rendezvous tunnel, which is a TCP WebSocket
+    // through a server. The tunnel is not skipped for the peers that hold one:
+    // an overlay hop only forwards to a target it already has a contact for and
+    // says nothing when it cannot, so overlay delivery is best-effort and
+    // indistinguishable from silence. Dropping a working tunnel on the strength
+    // of an attempt that reports nothing would trade a delivery for a hope.
+    //
+    // Sending both is close to free. Receivers deduplicate on `msg_id`, so a
+    // line that arrives twice is stored and forwarded once, and only neighbors
+    // we could not reach directly cost anything at all.
+    if !missing.is_empty() {
+        overlay_forward_channel_gossip(
+            socket,
+            state,
+            &gossip.channel_id,
+            &body,
+            &missing,
+            &members,
+        )
+        .await;
+    }
+    for pk in &missing {
+        if let Some(tx) = state.channel_relay_outboxes.get(pk) {
+            let _ = tx.try_send(body.clone());
+        }
+    }
+}
+
+async fn overlay_forward_channel_gossip(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    channel_id: &[u8; 16],
+    body: &[u8],
+    missing: &[[u8; 32]],
+    roster: &[[u8; 32]],
+) -> bool {
+    // After inbound CHANNEL_RELAY refuses hops that are not in this room,
+    // random routing-table contacts drop the envelope. Prefer other members
+    // we already have a live session with.
+    let local = state.local_ed25519_pubkey;
+    let mut hops: Vec<ember::dht::EmberContact> = roster
+        .iter()
+        .filter(|pk| **pk != local && !missing.iter().any(|m| m == *pk))
+        .filter_map(|pk| {
+            let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk));
+            state.ember_dht.routing().get_contact(&node_id).cloned()
+        })
+        .filter(|c| ember_has_live_session(state, c))
+        .take(3)
+        .collect();
+    if hops.is_empty() {
+        hops = state
+            .ember_dht
+            .contacts()
+            .into_iter()
+            .filter(|c| {
+                ember_has_live_session(state, c)
+                    && !missing
+                        .iter()
+                        .any(|pk| ember::channel::channel_id_from_pubkey(pk) == c.node_id.0)
+            })
+            .take(3)
+            .collect();
+    }
+    if hops.is_empty() {
+        return false;
+    }
+    let mut sent = false;
+    for pk in missing {
+        let target = ember::channel::channel_id_from_pubkey(pk);
+        let envelope = ember::channel::encode_channel_relay_envelope(channel_id, &target, body);
+        let (_rid, frame) = state.ember_dht.build_channel_relay(envelope);
+        for hop in &hops {
+            if send_ember_dht_frame_established(socket, state, hop, &frame).await {
+                sent = true;
+            }
+        }
+    }
+    sent
+}
+
+async fn handle_inbound_channel_relay(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    body: Vec<u8>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let Some((channel_id, target_id, inner)) = ember::channel::decode_channel_relay_envelope(&body)
+    else {
+        return;
+    };
+    if !channel_gossip_inbound_ok(state, &from_id) {
+        let _ = state
+            .reputation
+            .record_event(&from_id.0, ember::reputation::ReputationEvent::ProtocolViolation);
+        return;
+    }
+    let local = state.ember_dht.local_id();
+    if target_id == local.0 {
+        handle_inbound_channel_gossip(socket, state, db, app_handle, inner.to_vec(), from_id)
+            .await;
+        return;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let in_room = db
+        .get_channel(&channel_id_hex)
+        .ok()
+        .flatten()
+        .is_some_and(|ch| ch.in_room_now());
+    let roster = if in_room {
+        channel_member_pubkeys(db, &channel_id_hex)
+    } else {
+        Vec::new()
+    };
+    let target_on_roster = if roster.is_empty() {
+        None
+    } else {
+        Some(
+            roster
+                .iter()
+                .any(|pk| ember::channel::channel_id_from_pubkey(pk) == target_id),
+        )
+    };
+    let Some(contact) = state
+        .ember_dht
+        .routing()
+        .get_contact(&ember::dht::EmberNodeId(target_id))
+        .cloned()
+    else {
+        return;
+    };
+    let live = ember_has_live_session(state, &contact);
+    if !ember::channel::inbound_channel_relay_may_forward(in_room, target_on_roster, live) {
+        return;
+    }
+    let (_rid, frame) = state.ember_dht.build_channel_msg(inner.to_vec());
+    send_ember_dht_frame_established(socket, state, &contact, &frame).await;
+}
+
+async fn handle_inbound_channel_gossip(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    body: Vec<u8>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
+        return;
+    };
+    if !channel_gossip_inbound_ok(state, &from_id) {
+        let _ = state
+            .reputation
+            .record_event(&from_id.0, ember::reputation::ReputationEvent::ProtocolViolation);
+        return;
+    }
+    if !remember_channel_gossip(state, gossip.msg_id) {
+        return;
+    }
+    if !ember::channel::gossip_timestamp_ok(
+        gossip.timestamp,
+        chrono::Utc::now().timestamp(),
+    ) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    if db.chat_locked() {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    let channel_id_hex = hex::encode(gossip.channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    };
+    if !ch.in_room_now() {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    // Decrypt may succeed under an older epoch; that key is only used to
+    // *read*. Replies (history sync) are sealed under the current epoch so a
+    // banned member who still holds a retired key cannot be handed new chat.
+    let Some((_opened_key, plain)) = channel_content_keys(db, &ch)
+        .into_iter()
+        .find_map(|candidate| gossip.decrypt(&candidate).map(|plain| (candidate, plain)))
+    else {
+        debug!("Ember channel gossip: decrypt failed for {channel_id_hex}");
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    };
+    // Ember Transfer frames are addressed to one member and never relayed on,
+    // so they are matched before the gossip types and always return.
+    //
+    // One gate for all of them: the frame has to name us, and its
+    // authenticator has to check out under the key only we and the claimed
+    // sender can derive. Everything past this point can treat `sender` as the
+    // member it says it is, which the room's shared content key alone would
+    // not establish.
+    if let Some((sender, target, xfer_id)) = ember::channel::xfer_frame_peek(&plain) {
+        if target != state.local_ed25519_pubkey {
+            return;
+        }
+        let Some(key) = ember::channel::derive_xfer_key(
+            &state.local_ed25519_seed,
+            &sender,
+            &gossip.channel_id,
+            &xfer_id,
+        ) else {
+            return;
+        };
+        let Some(body) = ember::channel::xfer_verify(&key, &plain) else {
+            debug!(
+                "Ember Transfer: dropped a frame in {channel_id_hex} whose authenticator did not \
+                 match the member it named"
+            );
+            return;
+        };
+        if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(body) {
+            apply_xfer_block_data(
+                socket, state, db, app_handle, xfer_id, sender, offset, data,
+            )
+            .await;
+        } else if let Some((_, _, _, offset, count)) =
+            ember::channel::decode_xfer_block_request(body)
+        {
+            apply_xfer_block_request(state, xfer_id, sender, offset, count);
+        } else if let Some(offer) = ember::channel::decode_xfer_offer(body) {
+            apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
+        } else if let Some((_, _, _, reply)) = ember::channel::decode_xfer_reply(body) {
+            apply_xfer_reply(state, app_handle, xfer_id, sender, reply).await;
+        } else if let Some((_, _, _, reason)) = ember::channel::decode_xfer_cancel(body) {
+            apply_xfer_cancel(state, app_handle, xfer_id, sender, reason);
+        } else if ember::channel::decode_xfer_done(body).is_some() {
+            apply_xfer_done(state, app_handle, xfer_id, sender);
+        }
+        return;
+    }
+    let channel_pk = hex::decode(&ch.pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    if let Some((sender_pk, target_pk, version)) = channel_pk.and_then(|pk| {
+        ember::channel::decode_channel_handoff_offer(&plain, &gossip.channel_id, &pk)
+    }) {
+        apply_channel_handoff_offer(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &gossip,
+            from_id,
+            sender_pk,
+            target_pk,
+            version,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, successor_pk, version)) =
+        ember::channel::decode_channel_handoff_ready(&plain, &gossip.channel_id)
+    {
+        apply_channel_handoff_ready(
+            socket,
+            state,
+            db,
+            app_handle,
+            &ch,
+            &gossip,
+            from_id,
+            sender_pk,
+            successor_pk,
+            version,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, since_ts)) = ember::channel::decode_channel_sync_request(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
+        let sender_hex = hex::encode(sender_pk);
+        if db
+            .channel_member_is_banned(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // Its own budget, and the tightest one here. Every other branch costs
+        // the sender roughly what it costs us; this one answers a single small
+        // request with up to `CHANNEL_HISTORY_SYNC_MAX` separately sealed
+        // unicasts, so without a ceiling any content-key holder — which in a
+        // public room is anyone, the key comes from the room's own pubkey —
+        // turns each packet they send into thirty-two that we send.
+        if !channel_history_sync_ok(state, gossip.channel_id, &sender_pk) {
+            // Refused for rate, not validity, so the dedup slot goes back and a
+            // genuine retry once the window rolls off is still admissible.
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: rate-limited history sync in {channel_id_hex}");
+            return;
+        }
+        reply_channel_history_sync(
+            socket,
+            state,
+            db,
+            &ch,
+            sender_pk,
+            since_ts,
+        )
+        .await;
+        return;
+    }
+    if let Some((sender_pk, target_pk, banned)) = ember::channel::decode_channel_mod_action(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
+        let sender_hex = hex::encode(sender_pk);
+        if db
+            .channel_member_is_banned(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if !db
+            .channel_member_is_moderator(&channel_id_hex, &sender_hex)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // Same author budget as chat: a moderator spraying ban/unban actions
+        // rewrites every peer's member list as fast as they can send.
+        if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: rate-limited mod action in {channel_id_hex}");
+            return;
+        }
+        // A moderator cannot ban the room owner, on anyone's device.
+        //
+        // `ch.owner_pubkey` comes from the owner's signed moderation record, so
+        // every member can apply this rule rather than only the owner's own
+        // machine — which was the hole: elsewhere the ban landed and the
+        // owner's messages were silently dropped by every peer. The `is_owner`
+        // arm still covers us before we have ingested our own record. Not
+        // relayed either, to stop it spreading further. An unban still applies:
+        // that direction only ever clears a bad row.
+        let target_hex_lower = hex::encode(target_pk);
+        let targets_owner = ch.owner_pubkey.eq_ignore_ascii_case(&target_hex_lower)
+            || (ch.is_owner && target_pk == state.local_ed25519_pubkey);
+        if banned && targets_owner {
+            debug!("Ember channel gossip: refused a moderator ban on the owner of {channel_id_hex}");
+            return;
+        }
+        let target_hex = hex::encode(target_pk);
+        let _ = db.apply_channel_ban_action(
+            &channel_id_hex,
+            &target_hex,
+            banned,
+            gossip.timestamp,
+        );
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": channel_id_hex }),
+        );
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+        return;
+    }
+    let Some((sender_pk, text, author_sig)) = ember::channel::decode_channel_chat_plain(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) else {
+        debug!(
+            "Ember channel gossip: dropped a chat line in {channel_id_hex} that did not carry a \
+             signature from the member it named"
+        );
+        return;
+    };
+    // Ahead of any DB work, and ahead of the relay below: a member flooding a
+    // room must not be forwarded on by us, or the mesh amplifies it.
+    if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+        // Release the dedup slot: this was refused for rate, not validity, so a
+        // retransmit once the window rolls off has to still be admissible.
+        forget_channel_gossip(state, &gossip.msg_id);
+        debug!("Ember channel gossip: rate-limited author in {channel_id_hex}");
+        return;
+    }
+    let sender_hex = hex::encode(sender_pk);
+    if db
+        .channel_member_is_banned(&channel_id_hex, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let cleaned = crate::security::sanitize_chat_text(&text);
+    if cleaned.is_empty() || cleaned.len() > 4096 {
+        return;
+    }
+    let msg_id_hex = hex::encode(gossip.msg_id);
+    if db
+        .channel_message_exists(&channel_id_hex, &msg_id_hex)
+        .unwrap_or(false)
+    {
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+        return;
+    }
+    let now = gossip.timestamp;
+    // Keep the author's signature only when sanitising left the text alone.
+    // The signature covers what they wrote; if we had to change it, the two no
+    // longer agree, and storing the signature anyway would produce a re-serve
+    // that every recipient rejects. Such a line stays readable here and simply
+    // is not passed on.
+    let stored_sig = if cleaned == text {
+        hex::encode(author_sig)
+    } else {
+        String::new()
+    };
+    match db.insert_channel_message(
+        &channel_id_hex,
+        &sender_hex,
+        "received",
+        &cleaned,
+        &msg_id_hex,
+        now,
+        &stored_sig,
+        false,
+    ) {
+        Ok(row_id) => {
+            if ember::channel::chat_author_joins_gossip_roster(
+                ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+            ) {
+                let _ = db.upsert_channel_member(
+                    &channel_id_hex,
+                    &sender_hex,
+                    "",
+                    now,
+                    Some(&hex::encode(state.local_ed25519_pubkey)),
+                );
+            } else {
+                // Public rooms do not INSERT strangers from chat (anti-eclipse).
+                // A line from someone already on the roster still refreshes
+                // last_seen so they do not age out while visibly talking.
+                let _ = db.touch_channel_member_last_seen(&channel_id_hex, &sender_hex, now);
+            }
+            let _ = app_handle.emit(
+                "ember:channel-message",
+                serde_json::json!({
+                    "id": row_id,
+                    "channel_id": channel_id_hex,
+                    "sender_pubkey": sender_hex,
+                    "direction": "received",
+                    "message": cleaned,
+                    "timestamp": now,
+                }),
+            );
+        }
+        Err(e) => {
+            debug!("Ember channel gossip: persist failed for {channel_id_hex}: {e}");
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn apply_channel_handoff_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    _sender_pk: [u8; 32],
+    target_pk: [u8; 32],
+    version: u64,
+) {
+    if target_pk == state.local_ed25519_pubkey {
+        let ident = match db.load_handoff_pending_row(&ch.channel_id) {
+            Ok(Some((_pk, ver, seed))) if ver == version => {
+                ember::channel::ChannelIdentity::from_seed(&seed)
+            }
+            _ => {
+                let ident = ember::channel::ChannelIdentity::generate();
+                let _ = db.store_handoff_pending_seed(
+                    &ch.channel_id,
+                    version,
+                    &hex::encode(ident.pubkey),
+                    &ident.seed(),
+                );
+                ident
+            }
+        };
+        if let Some(key) = channel_content_key(db, ch) {
+            let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
+            let plain = ember::channel::encode_channel_handoff_ready(
+                &signing,
+                &gossip.channel_id,
+                &state.local_ed25519_pubkey,
+                &ident.pubkey,
+                version,
+            );
+            let reply = ember::channel::ChannelGossip::new_plaintext(
+                gossip.channel_id,
+                &key,
+                version,
+                &plain,
+                ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+            );
+            let _ = remember_channel_gossip(state, reply.msg_id);
+            fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
+            let _ = app_handle.emit(
+                "ember:channel-handoff",
+                serde_json::json!({
+                    "channel_id": ch.channel_id,
+                    "phase": "ready",
+                }),
+            );
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn apply_channel_handoff_ready(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    sender_pk: [u8; 32],
+    successor_pk: [u8; 32],
+    version: u64,
+) {
+    if ch.is_owner {
+        if let Ok(Some((pending, pending_ver))) = db.channel_pending_handoff(&ch.channel_id) {
+            if pending.eq_ignore_ascii_case(&hex::encode(sender_pk)) && pending_ver == version {
+                if let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) {
+                    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+                    let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+                    let record = ember::dht::publish::SignedRecord::channel_handoff(
+                        version,
+                        successor_pk,
+                        gossip.channel_id,
+                        ident.pubkey,
+                        private,
+                        &ident.signing_key,
+                    );
+                    if let Some(publish_id) = state
+                        .ember_publish
+                        .start_publish(record, state.ember_dht.routing())
+                    {
+                        drive_ember_publish(socket, state, publish_id).await;
+                    }
+                    let keep = private;
+                    let successor_id = ember::channel::channel_id_from_pubkey(&successor_pk);
+                    // We are about to stop being this room's owner, and the
+                    // successor's key has never held our registry name. Hand it
+                    // over while we can still sign for it — after
+                    // `apply_channel_handoff` the seed is gone, and the new
+                    // owner cannot sign for a name that is still ours.
+                    //
+                    // This is the only chance, so a blip does not get to cost
+                    // the room its name for a year: retry while the registry is
+                    // merely unreachable, and give up at once on a refusal,
+                    // which retrying cannot change. The old seed lives in this
+                    // task for a few seconds longer than the request as a
+                    // result, and nowhere else.
+                    if !state.rendezvous_url.is_empty() {
+                        let url = state.rendezvous_url.clone();
+                        let old_id = gossip.channel_id;
+                        let old_pk = ident.pubkey;
+                        let old_seed = seed;
+                        tokio::spawn(async move {
+                            for backoff_secs in [0u64, 3, 12, 45] {
+                                if backoff_secs > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        backoff_secs,
+                                    ))
+                                    .await;
+                                }
+                                match crate::network::rendezvous::handover_channel_name(
+                                    &url,
+                                    &old_id,
+                                    &successor_id,
+                                    &successor_pk,
+                                    &old_pk,
+                                    &old_seed,
+                                )
+                                .await
+                                {
+                                    Ok(()) => return,
+                                    Err(
+                                        error @ crate::network::rendezvous::ChannelRegistryError::Unavailable,
+                                    ) => {
+                                        tracing::debug!(
+                                            ?error,
+                                            "name handover to the successor did not land; retrying"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            ?error,
+                                            "the registry refused to hand the channel name over"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    let _ = db.apply_channel_handoff(
+                        &ch.channel_id,
+                        &hex::encode(successor_pk),
+                        &hex::encode(successor_id),
+                        version,
+                        keep,
+                        None,
+                    );
+                    let _ = app_handle.emit(
+                        "ember:channel-handoff",
+                        serde_json::json!({
+                            "channel_id": ch.channel_id,
+                            "successor_id": hex::encode(successor_id),
+                            "phase": "published",
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+async fn send_channel_gossip_unicast(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    body: Vec<u8>,
+) -> bool {
+    // History catch-up, in both directions: automated mesh traffic rather than
+    // anything the user typed, and it retries on its own timer, so it belongs
+    // on the shared allowance and not the one reserved for a line that gets no
+    // second attempt.
+    if !channel_gossip_rate_ok(state, false) {
+        return false;
+    }
+    // Same ladder as `send_xfer_frame`: a routing-table hit (including the
+    // unverified replacement cache) is not a live path. History catch-up used
+    // to return here after `get_contact`, which skipped overlay and the
+    // WebSocket relay for every peer we merely had a lead for.
+    let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
+    if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+        if ember_has_live_session(state, &contact) {
+            let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+            if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+                return true;
+            }
+        }
+    }
+    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+        if tx.try_send(body.clone()).is_ok() {
+            return true;
+        }
+    }
+    let roster = channel_member_pubkeys(db, &hex::encode(channel_id));
+    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+}
+
+// --- Ember Transfer -------------------------------------------------------
+
+/// Data-block budget, deliberately separate from the chat one.
+///
+/// The withdrawn attachment path spent `CHANNEL_GOSSIP_OUT_PER_SEC` on file
+/// chunks, which had two consequences: a transfer silenced the room's chat
+/// while it ran, and it abandoned itself the moment the shared allowance ran
+/// out — a few kilobytes in, with no way to resume. Blocks get their own
+/// allowance; the small control frames keep using the chat one, where they
+/// belong.
+fn xfer_block_rate_ok(state: &mut NetworkState) -> bool {
+    ember::channel::rate_window_allow(
+        &mut state.xfer_block_times,
+        std::time::Instant::now(),
+        CHANNEL_GOSSIP_RATE_WINDOW,
+        ember::channel::XFER_BLOCKS_OUT_PER_SEC,
+    )
+}
+
+/// Seal one transfer frame and send it to a single member.
+///
+/// Direct Noise session first, then the channel WebSocket relay, then the
+/// overlay — the same ladder chat uses, so two firewalled members can still
+/// move a file. Never fans out: a transfer is nobody's business but the two
+/// ends', and broadcasting it is exactly what made the old path unusable.
+async fn send_xfer_frame(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+) -> bool {
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return false;
+    };
+    let Some(key) = channel_content_key(db, &ch) else {
+        return false;
+    };
+    // TTL 1: addressed, so no one should ever relay it onward as gossip.
+    let gossip = ember::channel::ChannelGossip::new_plaintext(
+        channel_id,
+        &key,
+        chrono::Utc::now().timestamp().max(0) as u64,
+        plain,
+        1,
+    );
+    let body = gossip.encode();
+    // Remember our own id: a relay can loop the frame back, and the dedup set
+    // is what stops us reading our own block as an inbound one.
+    let _ = remember_channel_gossip(state, gossip.msg_id);
+    let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
+    if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
+        if ember_has_live_session(state, &contact) {
+            let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
+            if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
+                return true;
+            }
+        }
+    }
+    if let Some(tx) = state.channel_relay_outboxes.get(&peer) {
+        if tx.try_send(body.clone()).is_ok() {
+            return true;
+        }
+    }
+    let roster = channel_member_pubkeys(db, &channel_id_hex);
+    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+}
+
+fn emit_xfer_update(
+    app_handle: &tauri::AppHandle,
+    xfer_id: &[u8; 16],
+    channel_id: &[u8; 16],
+    peer: &[u8; 32],
+    direction: &str,
+    name: &str,
+    size: u64,
+    transferred: u64,
+    status: &str,
+) {
+    let _ = app_handle.emit(
+        "ember:xfer-update",
+        serde_json::json!({
+            "xfer_id": hex::encode(xfer_id),
+            "channel_id": hex::encode(channel_id),
+            "peer_pubkey": hex::encode(peer),
+            "direction": direction,
+            "name": name,
+            "size": size,
+            "transferred": transferred,
+            "status": status,
+        }),
+    );
+}
+
+/// Whether `peer` is allowed to put an offer in front of the user.
+///
+/// This gates the *prompt*, not the transfer — accepting is always a separate,
+/// explicit act. So the permissive default costs at most a dialog you dismiss,
+/// and the stricter settings exist for people who do not want even that.
+async fn xfer_offer_allowed(state: &NetworkState, peer: &[u8; 32]) -> bool {
+    match state.xfer_offer_policy.as_str() {
+        crate::types::CHANNEL_FILE_OFFERS_NOBODY => false,
+        crate::types::CHANNEL_FILE_OFFERS_FRIENDS => {
+            // Channel members and friends are the same identity keyed two
+            // ways: a friend's Ember hash is BLAKE3 of this same pubkey.
+            let hash = ember::channel::channel_id_from_pubkey(peer);
+            state.xfer_friend_hashes.read().await.contains(&hash)
+        }
+        _ => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_xfer_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    offer: ember::channel::XferOffer,
+    key: [u8; 32],
+) {
+    let sender_hex = hex::encode(offer.sender);
+    if db
+        .channel_member_is_banned(&ch.channel_id, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Only someone we can see in the room may offer. Without this a member
+    // who left, or was never here, could still put a dialog on screen.
+    if !channel_member_pubkeys(db, &ch.channel_id).contains(&offer.sender) {
+        return;
+    }
+    // An offer costs the recipient a prompt, so it is rate-limited exactly
+    // like a chat line from the same author.
+    if !channel_author_gossip_ok(state, gossip.channel_id, &offer.sender) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    let name = crate::security::sanitize_filename(&offer.name);
+    if name.is_empty() {
+        return;
+    }
+
+    let refusal = if !xfer_offer_allowed(state, &offer.sender).await {
+        Some(ember::channel::XferReply::NotAllowed)
+    } else if offer.size > ember::channel::XFER_MAX_BYTES {
+        Some(ember::channel::XferReply::TooLarge)
+    } else if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE
+        || state.xfer_pending.len() >= ember::channel::XFER_MAX_ACTIVE
+    {
+        Some(ember::channel::XferReply::Busy)
+    } else {
+        None
+    };
+    if let Some(reply) = refusal {
+        let plain = ember::channel::encode_xfer_reply(
+            &key,
+            &state.local_ed25519_pubkey,
+            &offer.sender,
+            &offer.xfer_id,
+            reply,
+        );
+        send_xfer_frame(socket, state, db, gossip.channel_id, offer.sender, &plain).await;
+        return;
+    }
+
+    state.xfer_pending.insert(
+        offer.xfer_id,
+        ember::xfer::PendingOffer {
+            channel_id: gossip.channel_id,
+            peer: offer.sender,
+            key,
+            name: name.clone(),
+            size: offer.size,
+            root: offer.root,
+            received_at: std::time::Instant::now(),
+        },
+    );
+    let _ = app_handle.emit(
+        "ember:xfer-offer",
+        serde_json::json!({
+            "xfer_id": hex::encode(offer.xfer_id),
+            "channel_id": ch.channel_id,
+            "peer_pubkey": sender_hex,
+            "name": name,
+            "size": offer.size,
+        }),
+    );
+}
+
+async fn apply_xfer_reply(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    reply: ember::channel::XferReply,
+) {
+    let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+        return;
+    };
+    // Only the member we offered it to gets to answer.
+    if send.peer != sender {
+        return;
+    }
+    // An offer is answered once. Without this a second reply — a duplicate
+    // that took the relay's slower path, or one forged by another member —
+    // could tear down a transfer that is already running.
+    if send.accepted {
+        return;
+    }
+    if reply == ember::channel::XferReply::Accept {
+        send.accepted = true;
+        send.updated_at = std::time::Instant::now();
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &send.channel_id,
+            &send.peer,
+            "send",
+            &send.name,
+            send.size,
+            0,
+            "accepted",
+        );
+        return;
+    }
+    let (channel_id, peer, name, size) = (send.channel_id, send.peer, send.name.clone(), send.size);
+    state.xfer_send.remove(&xfer_id);
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &channel_id,
+        &peer,
+        "send",
+        &name,
+        size,
+        0,
+        reply.as_str(),
+    );
+}
+
+fn apply_xfer_block_request(
+    state: &mut NetworkState,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    offset: u64,
+    count: u16,
+) {
+    let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+        return;
+    };
+    if send.peer != sender || !send.accepted {
+        return;
+    }
+    send.enqueue(offset, count);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_xfer_block_data(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    offset: u64,
+    data: &[u8],
+) {
+    let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+        return;
+    };
+    if recv.peer != sender {
+        return;
+    }
+    match recv.write_block(offset, data) {
+        Ok(_) => {}
+        Err(e) => {
+            let (channel_id, peer, name, size) =
+                (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
+            tracing::warn!(error = %e, "Ember Transfer: could not write an incoming block");
+            if let Some(dead) = state.xfer_recv.remove(&xfer_id) {
+                // Half a file helps nobody, and leaving it behind means the
+                // download folder collects `.part` files nothing will finish.
+                let _ = std::fs::remove_file(&dead.part_path);
+            }
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &channel_id,
+                &peer,
+                "receive",
+                &name,
+                size,
+                0,
+                "failed",
+            );
+            return;
+        }
+    }
+    if let Some(_pct) = recv.progress_step() {
+        let (channel_id, peer, name, size, done) = (
+            recv.channel_id,
+            recv.peer,
+            recv.name.clone(),
+            recv.size,
+            recv.bytes_received(),
+        );
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &channel_id,
+            &peer,
+            "receive",
+            &name,
+            size,
+            done,
+            "active",
+        );
+    }
+    if recv.is_complete() {
+        finish_xfer_recv(socket, state, db, app_handle, xfer_id).await;
+    }
+}
+
+/// `path`, or `name (2).ext` beside it if something is already there.
+///
+/// Two people sending you `photo.jpg` should give you two files, not one
+/// overwritten one. Gives up after a bounded number of tries and returns the
+/// last candidate, letting the rename fail rather than spinning.
+fn unique_download_path(path: &std::path::Path) -> std::path::PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let mut candidate = path.to_path_buf();
+    for n in 2..1000u32 {
+        let name = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+/// Verify a finished download and move it into place.
+///
+/// The root is recomputed with the same [`ember::transfer::HashTree`] the
+/// sender used, so "the file I have" and "the file you offered" are compared
+/// by the same function rather than by two that merely agree today.
+async fn finish_xfer_recv(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+) {
+    let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
+        return;
+    };
+    let (channel_id, peer, name, size) =
+        (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
+    let outcome = (|| -> std::io::Result<bool> {
+        recv.finish()?;
+        let file = std::fs::File::open(&recv.part_path)?;
+        let tree = ember::transfer::HashTree::from_reader(std::io::BufReader::new(file))?;
+        if tree.root_hash != recv.root {
+            return Ok(false);
+        }
+        if let Some(parent) = recv.final_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = unique_download_path(&recv.final_path);
+        std::fs::rename(&recv.part_path, &target)?;
+        Ok(true)
+    })();
+    let status = match outcome {
+        Ok(true) => "complete",
+        Ok(false) => {
+            // Content did not match what was offered. Keep nothing.
+            let _ = std::fs::remove_file(&recv.part_path);
+            tracing::warn!("Ember Transfer: {name} failed its hash check and was discarded");
+            "failed"
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&recv.part_path);
+            tracing::warn!(error = %e, "Ember Transfer: could not finalise {name}");
+            "failed"
+        }
+    };
+    // Tell the sender how it ended either way. It has no other way to find
+    // out: it answers requests and then hears nothing, so without this its
+    // own stall timer would eventually report a finished transfer as failed.
+    let plain = if status == "complete" {
+        ember::channel::encode_xfer_done(&recv.key, &state.local_ed25519_pubkey, &peer, &xfer_id)
+    } else {
+        ember::channel::encode_xfer_cancel(
+            &recv.key,
+            &state.local_ed25519_pubkey,
+            &peer,
+            &xfer_id,
+            ember::channel::XferCancel::User,
+        )
+    };
+    send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+    let done = if status == "complete" { size } else { 0 };
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &channel_id,
+        &peer,
+        "receive",
+        &name,
+        size,
+        done,
+        status,
+    );
+}
+
+/// The recipient has the whole file and it matched. Retire the send side.
+fn apply_xfer_done(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+) {
+    let Some(send) = state.xfer_send.get(&xfer_id) else {
+        return;
+    };
+    if send.peer != sender {
+        return;
+    }
+    let send = state.xfer_send.remove(&xfer_id).expect("just checked");
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &send.channel_id,
+        &send.peer,
+        "send",
+        &send.name,
+        send.size,
+        send.size,
+        "complete",
+    );
+}
+
+fn apply_xfer_cancel(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+    reason: ember::channel::XferCancel,
+) {
+    if let Some(pending) = state.xfer_pending.get(&xfer_id) {
+        if pending.peer == sender {
+            let pending = state.xfer_pending.remove(&xfer_id).expect("just checked");
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &pending.channel_id,
+                &pending.peer,
+                "receive",
+                &pending.name,
+                pending.size,
+                0,
+                reason.as_str(),
+            );
+        }
+        return;
+    }
+    if let Some(recv) = state.xfer_recv.get(&xfer_id) {
+        if recv.peer != sender {
+            return;
+        }
+        let recv = state.xfer_recv.remove(&xfer_id).expect("just checked");
+        // Half a file is not a file. Nothing is left in the download folder.
+        let _ = std::fs::remove_file(&recv.part_path);
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &recv.channel_id,
+            &recv.peer,
+            "receive",
+            &recv.name,
+            recv.size,
+            0,
+            reason.as_str(),
+        );
+        return;
+    }
+    if let Some(send) = state.xfer_send.get(&xfer_id) {
+        if send.peer != sender {
+            return;
+        }
+        let send = state.xfer_send.remove(&xfer_id).expect("just checked");
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &send.channel_id,
+            &send.peer,
+            "send",
+            &send.name,
+            send.size,
+            0,
+            reason.as_str(),
+        );
+    }
+}
+
+/// One pass of the transfer engine: answer block requests, top up the
+/// receivers' request windows, and shed anything that has gone quiet.
+async fn drive_channel_transfers(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+) {
+    if state.xfer_send.is_empty() && state.xfer_recv.is_empty() && state.xfer_pending.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let me = state.local_ed25519_pubkey;
+
+    // Offers nobody answered. Dropping them keeps a stale dialog from
+    // accepting into a transfer the other side has long forgotten.
+    let lapsed: Vec<[u8; 16]> = state
+        .xfer_pending
+        .iter()
+        .filter(|(_, offer)| {
+            now.saturating_duration_since(offer.received_at)
+                > std::time::Duration::from_secs(ember::channel::XFER_OFFER_TTL_SECS as u64)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in lapsed {
+        if let Some(offer) = state.xfer_pending.remove(&xfer_id) {
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &offer.channel_id,
+                &offer.peer,
+                "receive",
+                &offer.name,
+                offer.size,
+                0,
+                "expired",
+            );
+        }
+    }
+
+    // Answer whatever the far ends have asked for, within this tick's budget.
+    let senders: Vec<[u8; 16]> = state
+        .xfer_send
+        .iter()
+        .filter(|(_, send)| send.has_work())
+        .map(|(id, _)| *id)
+        .collect();
+    // Labelled so running out of send budget breaks out to the receive side
+    // below rather than returning. A node doing both at once would otherwise
+    // stop asking for its own blocks whenever it was busy answering someone
+    // else's, and the two transfers would take turns stalling each other.
+    'sending: for xfer_id in senders {
+        // Everything the block needs is copied out while the borrow is live,
+        // so the body below is free to touch `state` again for the send.
+        while let Some((block, channel_id, peer, key, size)) =
+            state.xfer_send.get_mut(&xfer_id).and_then(|send| {
+                if !send.has_work() {
+                    return None;
+                }
+                let block = send.next_block()?;
+                Some((block, send.channel_id, send.peer, send.key, send.size))
+            })
+        {
+            if !xfer_block_rate_ok(state) {
+                // Out of budget for this tick. Put the block back so the next
+                // tick picks it up rather than dropping it on the floor — the
+                // old path abandoned the rest of the file here, which is
+                // precisely why attachments never finished.
+                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                    send.enqueue(block, 1);
+                }
+                break 'sending;
+            }
+            let offset = block * ember::channel::XFER_BLOCK_SIZE as u64;
+            let want = ((size - offset) as usize).min(ember::channel::XFER_BLOCK_SIZE);
+            let read = state
+                .xfer_send
+                .get_mut(&xfer_id)
+                .map(|send| send.read_block(offset, want));
+            let Some(Ok(buf)) = read else {
+                // The file moved or became unreadable mid-transfer. Say so
+                // rather than letting the other end time out guessing.
+                let plain = ember::channel::encode_xfer_cancel(
+                    &key,
+                    &me,
+                    &peer,
+                    &xfer_id,
+                    ember::channel::XferCancel::SourceGone,
+                );
+                send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+                if let Some(send) = state.xfer_send.remove(&xfer_id) {
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &channel_id,
+                        &peer,
+                        "send",
+                        &send.name,
+                        send.size,
+                        0,
+                        "source_gone",
+                    );
+                }
+                continue 'sending;
+            };
+            let Some(plain) =
+                ember::channel::encode_xfer_block_data(&key, &me, &peer, &xfer_id, offset, &buf)
+            else {
+                break;
+            };
+            send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                send.note_sent();
+                if let Some(_pct) = send.progress_step() {
+                    let (name, sent) = (send.name.clone(), send.bytes_sent());
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &channel_id,
+                        &peer,
+                        "send",
+                        &name,
+                        size,
+                        sent,
+                        "active",
+                    );
+                }
+            }
+        }
+    }
+
+    // Top up each receiver's window.
+    let receivers: Vec<[u8; 16]> = state.xfer_recv.keys().copied().collect();
+    for xfer_id in receivers {
+        let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
+            continue;
+        };
+        let (channel_id, peer, key) = (recv.channel_id, recv.peer, recv.key);
+        let runs = recv.next_requests(now);
+        for (start, count) in runs {
+            let plain =
+                ember::channel::encode_xfer_block_request(&key, &me, &peer, &xfer_id, start, count);
+            send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+        }
+    }
+
+    // Shed transfers that have gone quiet in either direction.
+    let stalled_send: Vec<[u8; 16]> = state
+        .xfer_send
+        .iter()
+        .filter(|(_, send)| send.is_stalled(now))
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in stalled_send {
+        if let Some(send) = state.xfer_send.remove(&xfer_id) {
+            let plain = ember::channel::encode_xfer_cancel(
+                &send.key,
+                &me,
+                &send.peer,
+                &xfer_id,
+                ember::channel::XferCancel::Stalled,
+            );
+            send_xfer_frame(socket, state, db, send.channel_id, send.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &send.channel_id,
+                &send.peer,
+                "send",
+                &send.name,
+                send.size,
+                send.bytes_sent(),
+                // Nobody ever answered, versus a transfer that started and
+                // then went quiet. The two read very differently to whoever
+                // offered the file.
+                if send.accepted { "stalled" } else { "expired" },
+            );
+        }
+    }
+    let stalled_recv: Vec<[u8; 16]> = state
+        .xfer_recv
+        .iter()
+        .filter(|(_, recv)| recv.is_stalled(now))
+        .map(|(id, _)| *id)
+        .collect();
+    for xfer_id in stalled_recv {
+        if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+            let _ = std::fs::remove_file(&recv.part_path);
+            let plain = ember::channel::encode_xfer_cancel(
+                &recv.key,
+                &me,
+                &recv.peer,
+                &xfer_id,
+                ember::channel::XferCancel::Stalled,
+            );
+            send_xfer_frame(socket, state, db, recv.channel_id, recv.peer, &plain).await;
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &recv.channel_id,
+                &recv.peer,
+                "receive",
+                &recv.name,
+                recv.size,
+                0,
+                "stalled",
+            );
+        }
+    }
+}
+
+async fn reply_channel_history_sync(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    to: [u8; 32],
+    since_ts: i64,
+) {
+    let Some(key) = channel_content_key(db, ch) else {
+        return;
+    };
+    let Ok(rows) = db.list_channel_messages_for_sync(
+        &ch.channel_id,
+        since_ts.max(0),
+        ember::channel::CHANNEL_HISTORY_SYNC_MAX as i64,
+    ) else {
+        return;
+    };
+    let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+        return;
+    };
+    let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+        return;
+    };
+    for (msg_id_hex, sender_hex, text, timestamp, author_sig_hex) in rows {
+        let Ok(msg_id_bytes) = hex::decode(&msg_id_hex) else {
+            continue;
+        };
+        let Ok(msg_id) = <[u8; 16]>::try_from(msg_id_bytes) else {
+            continue;
+        };
+        let Ok(sender_bytes) = hex::decode(&sender_hex) else {
+            continue;
+        };
+        let Ok(sender_pk) = <[u8; 32]>::try_from(sender_bytes) else {
+            continue;
+        };
+        // Replaying the author's own signature, never one of ours. This loop
+        // re-serves lines other members wrote, so signing here would let any
+        // node answer a catch-up with a conversation that never happened.
+        let Ok(sig_bytes) = hex::decode(&author_sig_hex) else {
+            continue;
+        };
+        let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
+            continue;
+        };
+        let plain =
+            ember::channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &text);
+        let gossip = ember::channel::ChannelGossip::sealed(
+            channel_id,
+            msg_id,
+            &key,
+            timestamp.max(0) as u64,
+            &plain,
+            1,
+            timestamp,
+        );
+        send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
+    }
+}
+
+async fn maybe_sync_channel_history(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let Ok(channels) = db.list_channels_lite() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let interval = std::time::Duration::from_secs(ember::channel::CHANNEL_HISTORY_SYNC_SECS);
+    let our_pk = state.local_ed25519_pubkey;
+    let mut sent = 0usize;
+    for ch in channels {
+        if !ch.in_room_now() {
+            continue;
+        }
+        if sent >= 4 {
+            break;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        // Cheap per-room gate: if every neighbor slot was asked recently,
+        // skip loading the roster. A room with fewer stamps may have grown
+        // new XOR-neighbors and still needs the member list.
+        let recent_stamps = state
+            .channel_history_sync_at
+            .iter()
+            .filter(|((cid, _), at)| {
+                *cid == channel_id && now.saturating_duration_since(**at) < interval
+            })
+            .count();
+        if recent_stamps >= ember::channel::CHANNEL_NEIGHBOR_COUNT {
+            continue;
+        }
+        let members = channel_member_pubkeys(db, &ch.channel_id);
+        let neighbors = ember::channel::xor_closest_neighbors(
+            &our_pk,
+            &members,
+            ember::channel::CHANNEL_NEIGHBOR_COUNT,
+        );
+        let due: Vec<[u8; 32]> = neighbors
+            .into_iter()
+            .filter(|pk| {
+                let stamp_key = (channel_id, *pk);
+                !state
+                    .channel_history_sync_at
+                    .get(&stamp_key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < interval)
+            })
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let Some(key) = channel_content_key(db, &ch) else {
+            continue;
+        };
+        let wall = chrono::Utc::now().timestamp();
+        let latest = db
+            .latest_channel_message_timestamp(&ch.channel_id)
+            .unwrap_or(0)
+            .min(wall);
+        let since = if latest <= 0 {
+            0
+        } else {
+            latest
+                .saturating_sub(ember::channel::CHANNEL_HISTORY_SYNC_LOOKBACK_SECS)
+                .max(0)
+        };
+        let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
+        for pk in due {
+            if sent >= 4 {
+                break;
+            }
+            let stamp_key = (channel_id, pk);
+            let ts = chrono::Utc::now().timestamp();
+            let mut msg_id = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut msg_id);
+            let plain = ember::channel::encode_channel_sync_request(
+                &signing,
+                &our_pk,
+                &channel_id,
+                &msg_id,
+                ts,
+                since,
+            );
+            let gossip = ember::channel::ChannelGossip::sealed(
+                channel_id,
+                msg_id,
+                &key,
+                ts.max(0) as u64,
+                &plain,
+                1,
+                ts,
+            );
+            if send_channel_gossip_unicast(socket, state, db, channel_id, pk, gossip.encode())
+                .await
+            {
+                state.channel_history_sync_at.insert(stamp_key, now);
+                sent += 1;
+            }
+        }
+    }
 }
 
 /// Record a live eD2K Ember session as a DHT introduction and ping it now.
@@ -12536,14 +16717,14 @@ fn hydrate_ember_publish_schedule(
             if age < EMBER_SOURCE_RECORD_TTL.as_secs() {
                 published_sources.insert(record.file_hash);
             }
-            if !source_dest.contains_key(&record.file_hash) {
+            if let std::collections::hash_map::Entry::Vacant(e) = source_dest.entry(record.file_hash) {
                 if let Some(at) = ember_publish_instant(
                     record.last_ember_source_publish,
                     now_unix,
                     now_inst,
                     EMBER_SOURCE_REPUBLISH,
                 ) {
-                    source_dest.insert(record.file_hash, at);
+                    e.insert(at);
                 }
             }
         }
@@ -12551,14 +16732,14 @@ fn hydrate_ember_publish_schedule(
             keyword_unix
                 .entry(record.file_hash)
                 .or_insert(record.last_ember_keyword_publish);
-            if !keyword_dest.contains_key(&record.file_hash) {
+            if let std::collections::hash_map::Entry::Vacant(e) = keyword_dest.entry(record.file_hash) {
                 if let Some(at) = ember_publish_instant(
                     record.last_ember_keyword_publish,
                     now_unix,
                     now_inst,
                     EMBER_KEYWORD_REPUBLISH,
                 ) {
-                    keyword_dest.insert(record.file_hash, at);
+                    e.insert(at);
                 }
             }
         }
@@ -13312,6 +17493,26 @@ const EMBER_BRIDGE_FAST_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// rejoin from cold even if most have churned, without persisting the whole
 /// table (which also meant persisting gossip we had never reached).
 const EMBER_PERSIST_MAX_CONTACTS: usize = 200;
+
+/// Remembered peers handed to the routing table at once, at launch and on each
+/// top-up.
+///
+/// Equal to the starved liveness budget, so a batch is fully probed in the tick
+/// it arrives and resolves — answered or three-struck — before the next one is
+/// needed. Larger batches do not join faster: the table cannot preserve the
+/// cache's ranking (see [`ember::dht::peer_cache::BootstrapCache::seed_batch`]),
+/// so anything past what one tick can dial just queues in XOR order and delays
+/// the peers most likely to answer.
+const EMBER_SEED_BATCH: usize = EMBER_MAINT_MAX_PINGS_STARVED;
+
+/// Batches `drive_ember_search` will pull in one call while none of them reach
+/// the wire.
+///
+/// Each barren round retires its whole batch, so the shortlist shrinks by at
+/// least ALPHA every pass and this is a safety net rather than a working limit
+/// — a shortlist is bounded by k plus its pins plus what is in flight, so eight
+/// passes at ALPHA covers any real one several times over.
+const EMBER_SEARCH_MAX_BARREN_ROUNDS: usize = 8;
 
 // ── Self-lookup and disconnect detection ──
 
@@ -15692,11 +19893,7 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
             let responded = search.responded_during_lookup.len() as u32;
             let pending = search.pending.len() as u32;
             let load_total = queried.saturating_add(pending);
-            let load_pct = if queried == 0 {
-                0
-            } else {
-                (responded * 100) / queried
-            };
+            let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
             KadSearchInfo {
                 id: sid.0,
                 target: search.target.to_hex(),
@@ -16183,7 +20380,7 @@ async fn known_clients_snapshot(
         .collect();
     // Stable, useful default order: most-recently-seen first. The UI
     // can re-sort by any column.
-    out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
     out
 }
 
@@ -16305,6 +20502,36 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_proxy_overlay.clear();
     state.ember_keyword_searches.clear();
     state.ember_pending_keyword_results.clear();
+    state.ember_channel_presence_searches.clear();
+    state.ember_channel_presence_buffer.clear();
+    state.ember_pending_channel_presence.clear();
+    state.channel_presence_fetch_at.clear();
+    state.ember_channel_moderation_searches.clear();
+    state.ember_pending_channel_moderation.clear();
+    state.channel_moderation_fetch_at.clear();
+    state.channel_moderation_publish_at.clear();
+    state.channel_username_refresh_at = 0;
+    state.ember_channel_noise_keys.clear();
+    state.channel_neighbor_lookup_at.clear();
+    state.channel_neighbor_lookup_inflight.clear();
+    state.channel_relay_outboxes.clear();
+    state.channel_relay_offer_at.clear();
+    state.ember_channel_handoff_searches.clear();
+    state.ember_pending_channel_handoff.clear();
+    state.channel_handoff_fetch_at.clear();
+    state.xfer_send.clear();
+    state.xfer_recv.clear();
+    state.xfer_pending.clear();
+    state.xfer_block_times.clear();
+    state.ember_channel_epoch_searches.clear();
+    state.ember_pending_channel_epoch.clear();
+    state.channel_epoch_fetch_at.clear();
+    state.ember_channel_claim_searches.clear();
+    state.ember_pending_channel_claim.clear();
+    state.channel_gossip_from_times.clear();
+    state.channel_gossip_author_times.clear();
+    state.channel_history_sync_at.clear();
+    state.channel_origin_retry.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
@@ -16402,6 +20629,7 @@ fn apply_network_settings(
         // Do not clear on unrelated settings saves while already enabled.
         reset_stun_keepalive_session(state);
     }
+    state.xfer_offer_policy = new_settings.channel_file_offers.clone();
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,
@@ -16838,7 +21066,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // share the same policy: a blocked address is refused whichever table
     // learned it, and `evict_filtered_contacts` runs once ranges are ready.
     let ember_dht =
-        ember::dht::engine::EmberDht::new(identity.ed25519_secret_key, settings.block_private_ips);
+        ember::dht::engine::EmberDht::new(
+            identity.ed25519_secret_key,
+            identity.noise_public_key,
+            settings.block_private_ips,
+        );
     // Shared with StatsManager below so send_kad_packet / Ember UDP
     // send-recv can record wire bytes without holding the manager.
     let kad_upload_overhead = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -17016,6 +21248,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache::new(),
+        ember_nodes_loaded: false,
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
@@ -17277,6 +21511,45 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_source_injections: Vec::new(),
         ember_pending_callback_connects: Vec::new(),
         ember_pending_proxy_overlay: HashMap::new(),
+        channel_gossip_seen: HashMap::new(),
+        channel_gossip_seen_order: VecDeque::new(),
+        channel_history_sync_times: HashMap::new(),
+        channel_gossip_sent_times: VecDeque::new(),
+        channel_gossip_local_times: VecDeque::new(),
+        channel_origin_retry: VecDeque::new(),
+        channel_gossip_from_times: HashMap::new(),
+        channel_gossip_author_times: HashMap::new(),
+        channel_history_sync_at: HashMap::new(),
+        ember_channel_presence_searches: HashMap::new(),
+        ember_channel_presence_buffer: HashMap::new(),
+        ember_pending_channel_presence: Vec::new(),
+        channel_presence_fetch_at: HashMap::new(),
+        ember_channel_moderation_searches: HashMap::new(),
+        ember_pending_channel_moderation: Vec::new(),
+        channel_moderation_fetch_at: HashMap::new(),
+        channel_moderation_publish_at: HashMap::new(),
+        channel_username_refresh_at: 0,
+        rendezvous_url: settings.rendezvous_url.clone(),
+        ember_channel_noise_keys: HashMap::new(),
+        channel_neighbor_lookup_at: HashMap::new(),
+        channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_relay_outboxes: HashMap::new(),
+        channel_relay_offer_at: HashMap::new(),
+        ember_channel_handoff_searches: HashMap::new(),
+        ember_pending_channel_handoff: Vec::new(),
+        channel_handoff_fetch_at: HashMap::new(),
+        local_ed25519_seed: ed25519_secret_key,
+        xfer_send: HashMap::new(),
+        xfer_recv: HashMap::new(),
+        xfer_pending: HashMap::new(),
+        xfer_block_times: VecDeque::new(),
+        xfer_offer_policy: settings.channel_file_offers.clone(),
+        xfer_friend_hashes: friend_hashes.clone(),
+        ember_channel_epoch_searches: HashMap::new(),
+        ember_pending_channel_epoch: Vec::new(),
+        channel_epoch_fetch_at: HashMap::new(),
+        ember_channel_claim_searches: HashMap::new(),
+        ember_pending_channel_claim: Vec::new(),
     };
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
@@ -17294,23 +21567,86 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     if nodes_ember_path.exists() {
         // Read + parse on the blocking pool: this is a synchronous whole-file
         // `std::fs` read inside an async fn that shares its runtime with the UI.
+        let load_path = nodes_ember_path.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_nodes(&nodes_ember_path)
+            ember::dht::bootstrap::load_nodes(&load_path)
         })
         .await;
         match loaded {
-            Ok(Ok(contacts)) => {
-                let n = contacts.len();
-                state.ember_dht.load_contacts(contacts);
+            Ok(Ok(entries)) => {
+                let n = entries.len();
+                state.ember_nodes_loaded = true;
+                state.ember_bootstrap_cache.load(entries);
+                // Through `seed_batch`, never straight from the file: the table
+                // has to receive every remembered peer as unproven, while the
+                // cache keeps the timestamps that say when we last reached one.
+                // Only the first batch goes in now — `run_ember_maintenance`
+                // tops the table up as leads fail, so the peers most likely to
+                // answer are dialled in the first tick instead of queuing behind
+                // an address book the ping budget would take many minutes to
+                // work through.
+                let local_id = state.ember_dht.local_id();
+                let seed = state.ember_bootstrap_cache.seed_batch(
+                    &local_id,
+                    &HashSet::new(),
+                    EMBER_SEED_BATCH,
+                );
+                let seeded: Vec<ember::dht::EmberNodeId> =
+                    seed.iter().map(|c| c.node_id).collect();
+                state.ember_dht.load_contacts(seed);
+                // Whatever the table took is genuinely being tried this session,
+                // so its silence counts at shutdown. The bulk loader reports no
+                // per-contact result, hence asking the table afterwards.
+                let admitted: Vec<ember::dht::EmberNodeId> = seeded
+                    .into_iter()
+                    .filter(|id| state.ember_dht.contact_for(id).is_some())
+                    .collect();
+                state
+                    .ember_bootstrap_cache
+                    .note_offered(admitted.into_iter());
                 info!(
-                    "Loaded {n} Ember DHT contacts from nodes_ember.dat ({} seeded into routing table)",
+                    "Loaded {n} remembered Ember peers from nodes_ember.dat ({} seeded into routing table)",
                     state.ember_dht.contact_count()
                 );
             }
-            Ok(Err(e)) => warn!("Failed to load nodes_ember.dat: {e}"),
+            Ok(Err(e)) => {
+                // A file we cannot parse would otherwise wedge saving forever:
+                // `ember_nodes_loaded` stays false on every launch, so the
+                // shrink guard refuses every write and the node can never
+                // persist a contact again. Quarantine it once — a version
+                // downgrade, a corrupt header or an over-large file are all
+                // permanent for this build — and carry on as if the file had
+                // been absent. The truncation path already keeps a dated copy
+                // this way.
+                warn!("Failed to load nodes_ember.dat: {e}");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let quarantine = nodes_ember_path.with_extension(format!("dat.unreadable.{ts}"));
+                match std::fs::rename(&nodes_ember_path, &quarantine) {
+                    Ok(()) => {
+                        state.ember_nodes_loaded = true;
+                        warn!(
+                            "Moved the unreadable nodes_ember.dat aside to {} so this node can \
+                             remember peers again",
+                            quarantine.display()
+                        );
+                    }
+                    Err(e) => warn!(
+                        "Could not move the unreadable nodes_ember.dat aside ({e}); peer \
+                         persistence stays disabled until it is removed"
+                    ),
+                }
+            }
+            // A panicked or cancelled task says nothing about the file, so the
+            // guard stays armed and the next launch tries again.
             Err(e) => warn!("nodes_ember.dat load task failed: {e}"),
         }
     } else {
+        // Absent is not unreadable: there is nothing to preserve, so the save
+        // path is free to write whatever this session learns.
+        state.ember_nodes_loaded = true;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
     state
@@ -18081,6 +22417,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         mpsc::unbounded_channel::<UpnpMaintainResult>();
     let (rendezvous_register_result_tx, mut rendezvous_register_result_rx) =
         mpsc::unbounded_channel::<RendezvousRegisterResult>();
+    let (channel_neighbor_lookup_tx, mut channel_neighbor_lookup_rx) =
+        mpsc::unbounded_channel::<ChannelNeighborLookupResult>();
+    let (channel_relay_event_tx, mut channel_relay_event_rx) =
+        mpsc::unbounded_channel::<ChannelRelayEvent>();
     let (friend_relay_ticket_poll_result_tx, mut friend_relay_ticket_poll_result_rx) =
         mpsc::unbounded_channel::<FriendRelayTicketPollResult>();
     let (friend_relay_ticket_session_done_tx, mut friend_relay_ticket_session_done_rx) =
@@ -18674,14 +23014,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
 
-        if part_progress_task.is_none()
-            && part_progress_map.is_none()
-            && pending_incomplete_downloads.is_some()
+        if let Some(pending) = pending_incomplete_downloads
+            .as_ref()
+            .filter(|_| part_progress_task.is_none() && part_progress_map.is_none())
         {
             let dl_folder = settings.download_folder.clone();
-            let jobs: Vec<(String, u64, String)> = pending_incomplete_downloads
-                .as_ref()
-                .unwrap()
+            let jobs: Vec<(String, u64, String)> = pending
                 .iter()
                 .map(|t| (t.id.clone(), t.total_size, t.file_name.clone()))
                 .collect();
@@ -19485,6 +23823,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &transfer_manager,
                                     &source_manager,
                                     &local_index,
+                                    &db,
+                                    &app_handle,
                                 ).await;
                             }
                         } else {
@@ -19547,6 +23887,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         &transfer_manager,
                                         &source_manager,
                                         &local_index,
+                                        &db,
+                                        &app_handle,
                                     ).await;
                                 }
                             } else {
@@ -19770,7 +24112,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     let mut fh = [0u8; 16];
                                     fh.copy_from_slice(&fh_bytes);
                                     if let Ok(mut map) = state.aich_recovery_pending.write() {
-                                        map.retain(|&(ref h, _), _| *h != fh);
+                                        map.retain(|(h, _), _| *h != fh);
                                     }
                                 }
                             }
@@ -21593,13 +25935,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ember_hash,
                         ip,
                         port,
-                    } => {
+                    }
                         // Gate on current membership: FriendSeen fires post-PoP for a
                         // peer that was a friend at emit time, but a concurrent
                         // removal can still race it. Without this a just-removed
                         // friend could be resurrected as "online" in the UI until the
                         // 5-minute sweep.
-                        if friend_hashes.read().await.contains(ember_hash) {
+                        if friend_hashes.read().await.contains(ember_hash) => {
                             let hash_hex = hex::encode(ember_hash);
                             let now = chrono::Utc::now().timestamp();
                             state.online_friends.insert(*ember_hash, now);
@@ -21658,7 +26000,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             )
                             .await;
                         }
-                    }
                     _ => {}
                 }
 
@@ -23132,7 +27473,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             local_results =
                                 filter_results_by_type(local_results, &file_type_filter);
                         }
-                        local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
+                        local_results
+                            .sort_by_key(|r| std::cmp::Reverse(r.availability));
                         local_results.truncate(2000);
                         // Intentional: the `search_files` IPC call returns as soon as
                         // the KAD leg (normally the slowest, ~45-60s) finishes, rather
@@ -23532,7 +27874,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         buddy_ip,
                                         buddy_port_raw,
                                         buddy_hash,
-                                        fh.clone(),
+                                        fh,
                                     ).await {
                                         if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                                             pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port, cb_src.source_user_hash);
@@ -25474,6 +29816,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // correct current value of it.
                     let rv_url = settings.rendezvous_url.clone();
                     let rv_port = advertised_tcp_port(&state);
+                    let rv_udp_port = advertised_udp_port(&state);
                     let rv_hash = ember_hash;
                     // The outer `if !state.friend_presence_initial_done
                     // && state.external_ip.is_some()` already guarantees
@@ -25488,14 +29831,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if let Some(rv_ip) = state.external_ip {
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
-                        let rv_key_db = db.clone();
-                        let rv_friends = tokio::task::spawn_blocking(move || {
-                            rv_key_db.get_friend_public_keys()
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
+                        let (rv_friends, rv_channel_neighbors) =
+                            load_rendezvous_register_targets(&db, rv_pubkey).await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -25508,10 +29845,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &rv_url,
                                     &rv_hash,
                                     rv_port,
+                                    rv_udp_port,
                                     rv_ip,
                                     &rv_pubkey,
                                     &rv_secret,
                                     &rv_friends,
+                                    &rv_channel_neighbors,
                                 )
                                     .await;
                             let _ = tx.send(RendezvousRegisterResult {
@@ -25555,17 +29894,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if let Some(rv_ip) = state.external_ip {
                         let rv_url = settings.rendezvous_url.clone();
                         let rv_port = advertised_tcp_port(&state);
+                        let rv_udp_port = advertised_udp_port(&state);
                         let rv_hash = ember_hash;
                         let rv_pubkey = ed25519_pubkey;
                         let rv_secret = ed25519_secret_key;
-                        let rv_key_db = db.clone();
-                        let rv_friends = tokio::task::spawn_blocking(move || {
-                            rv_key_db.get_friend_public_keys()
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
+                        let (rv_friends, rv_channel_neighbors) =
+                            load_rendezvous_register_targets(&db, rv_pubkey).await;
                         let tx = rendezvous_register_result_tx.clone();
                         rendezvous_register_in_flight = true;
                         rendezvous_register_started_at = Some(tokio::time::Instant::now());
@@ -25578,10 +29912,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 &rv_url,
                                 &rv_hash,
                                 rv_port,
+                                rv_udp_port,
                                 rv_ip,
                                 &rv_pubkey,
                                 &rv_secret,
                                 &rv_friends,
+                                &rv_channel_neighbors,
                             )
                             .await;
                             let _ = tx.send(RendezvousRegisterResult {
@@ -25713,6 +30049,75 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // relationships. Filter offers locally, then keep at most the
                 // accepted-ticket capacity worth of join/session tasks alive.
                 for offer in offers {
+                    if let Some(channel_id) = offer.channel_id {
+                        if state.channel_relay_outboxes.len() >= MAX_CHANNEL_RELAY_SESSIONS {
+                            continue;
+                        }
+                        let members = channel_member_pubkeys(&db, &hex::encode(channel_id));
+                        let Some(peer_pubkey) = members.into_iter().find(|pk| {
+                            let hash = ember::channel::channel_id_from_pubkey(pk);
+                            rendezvous::hashed_id(&hash)
+                                .eq_ignore_ascii_case(&offer.initiator_id)
+                        }) else {
+                            tracing::debug!(
+                                "Ignoring channel relay ticket from an unknown member"
+                            );
+                            continue;
+                        };
+                        if state.channel_relay_outboxes.contains_key(&peer_pubkey) {
+                            continue;
+                        }
+                        let ticket_id = offer.ticket_id;
+                        if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
+                            continue;
+                        }
+                        let rv_url = settings.rendezvous_url.clone();
+                        let done_tx = friend_relay_ticket_session_done_tx.clone();
+                        let event_tx = channel_relay_event_tx.clone();
+                        let fc_our_ember_hash = ember_hash;
+                        tokio::spawn(async move {
+                            let responder_token = match tokio::time::timeout(
+                                rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
+                                rendezvous::accept_friend_relay_ticket(
+                                    &rv_url,
+                                    &fc_our_ember_hash,
+                                    &ticket_id,
+                                    &ed25519_secret_key,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(token)) => token,
+                                Ok(Err(e)) => {
+                                    tracing::debug!("Channel relay ticket accept failed: {e}");
+                                    let _ = done_tx.send(ticket_id);
+                                    return;
+                                }
+                                Err(_) => {
+                                    tracing::debug!("Channel relay ticket accept timed out");
+                                    let _ = done_tx.send(ticket_id);
+                                    return;
+                                }
+                            };
+                            match ember::relay::connect_server_relay(
+                                &rv_url,
+                                &ticket_id,
+                                &responder_token,
+                            )
+                            .await
+                            {
+                                Ok(ws) => {
+                                    run_channel_relay_session(ws, peer_pubkey, event_tx).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Channel relay ticket join failed: {e}");
+                                }
+                            }
+                            let _ = done_tx.send(ticket_id);
+                        });
+                        continue;
+                    }
+
                     if friend_relay_ticket_sessions_in_flight.len()
                         >= MAX_FRIEND_RELAY_TICKET_SESSIONS
                     {
@@ -27390,6 +31795,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule CKademlia::Process big timer: RandomLookup at most once per tick (~100ms cadence).
             _ = kad_process_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
+                // Ember Transfer pacing shares this 100ms tick rather than
+                // taking its own arm — `tokio::select!` tops out at 64
+                // branches and this loop is already at the limit. It runs
+                // ahead of the KAD status gate below because Ember is a
+                // separate overlay: a room transfer has no reason to stop
+                // because the eMule network is disconnected. Returns straight
+                // away when nothing is in flight.
+                if settings.ember_native_enabled {
+                    drive_channel_transfers(&udp_socket, &mut state, &db, &app_handle).await;
+                }
                 if state.stats.status == NetworkStatus::Disconnected { return; }
                 let now_bt = chrono::Utc::now().timestamp();
                 if let Some(target) =
@@ -28530,7 +32945,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
 
                 // High-priority downloads get processed first
-                to_retry.sort_by(|a, b| b.1.cmp(&a.1));
+                to_retry.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
                 // eMule-style: check persistent per-file source lists for sources
                 // whose reask timer has expired. These are sources we already know
@@ -29557,7 +33972,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     {
                         let mgr = transfer_manager.read().await;
                         let sm = source_manager.read().await;
-                        for (tid, _sender) in &state.active_source_senders {
+                        for tid in state.active_source_senders.keys() {
                             if state.pending_downloads.contains_key(tid) { continue; }
                             let (last_at, count) = state.active_kad_search_state
                                 .get(tid)
@@ -29964,7 +34379,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .map(|pfs| pfs.file_hash)
                         .collect();
                     let mut a4af = a4af_shared.write().await;
-                    for (_tid, pfs) in &state.per_file_sources {
+                    for pfs in state.per_file_sources.values() {
                         for src in &pfs.sources {
                             if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
                                 let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
@@ -33312,10 +37727,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         });
                     });
                 }
-                // Persist the Ember DHT routing table too (slice 7). Skip
-                // when empty so we don't churn a zero-contact file over a
-                // previously-populated one.
-                let ember_contacts = state.ember_dht.bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+                // Fold the live overlay into the remembered set and persist that
+                // (slice 7). Additive by construction: a peer that has just been
+                // evicted as an unresponsive lead stays in the cache, so this
+                // write can grow the file or refresh it but never cuts it down
+                // to whatever the table happens to hold five minutes into a
+                // session. Retiring an address is a once-per-session decision
+                // and belongs to the shutdown path. Still skipped when empty, so
+                // a brand-new profile doesn't churn a zero-contact file.
+                let live = ember_persistable_contacts(&state);
+                state.ember_bootstrap_cache.observe(live.iter());
+                let local_id = state.ember_dht.local_id();
+                // Bound the in-memory set here too, not only on the way out. It
+                // takes the whole replacement cache and every session peer every
+                // five minutes, and a peer answering FIND_NODE with invented
+                // contacts can inject fresh ids at will, so over a long session
+                // it would grow into the tens of thousands — and each save sorts
+                // the lot. Trimming to the same ceiling the file is written under
+                // discards only entries that could never have been saved anyway,
+                // and is a no-op below it.
+                state
+                    .ember_bootstrap_cache
+                    .trim_to(&local_id, EMBER_PERSIST_MAX_CONTACTS);
+                let ember_contacts = state
+                    .ember_bootstrap_cache
+                    .snapshot(&local_id, EMBER_PERSIST_MAX_CONTACTS);
                 if !ember_contacts.is_empty() {
                     let ember_path = state.data_dir.join("nodes_ember.dat");
                     // Off the loop, like the nodes.dat write above and for the
@@ -33336,11 +37772,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
                         return;
                     };
+                    let nodes_were_loaded = state.ember_nodes_loaded;
                     tokio::task::spawn_blocking(move || {
                         let _ownership = ownership;
-                        if let Err(e) =
-                            ember::dht::bootstrap::save_nodes(&ember_path, &ember_contacts)
-                        {
+                        if let Err(e) = ember::dht::bootstrap::save_nodes(
+                            &ember_path,
+                            &ember_contacts,
+                            nodes_were_loaded,
+                        ) {
                             error!("Failed periodic nodes_ember.dat save: {e}");
                         }
                     });
@@ -33848,6 +38287,52 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if changed {
                         debug!("Ember digest for {hash_hex} computed after completion");
                     }
+                }
+                while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
+                    apply_channel_neighbor_lookup(
+                        &udp_socket,
+                        &mut state,
+                        lookup,
+                        &settings,
+                        ember_hash,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                        &channel_relay_event_tx,
+                    )
+                    .await;
+                }
+                while let Ok(event) = channel_relay_event_rx.try_recv() {
+                    apply_channel_relay_event(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &app_handle,
+                        event,
+                    )
+                    .await;
+                }
+                if settings.ember_native_enabled {
+                    maybe_dial_channel_neighbors(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        ember_hash,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
+                        &channel_neighbor_lookup_tx,
+                    )
+                    .await;
+                    // Driven from the one-second tick rather than the minute
+                    // one it used to share with DHT maintenance. Its own
+                    // per-room gates decide when a walk actually happens, and
+                    // on the slow tick the shorter of those gates could not
+                    // mean anything: a room we are alone in asks every twenty
+                    // seconds, which a sixty-second caller rounds up to sixty
+                    // whatever the constant says.
+                    maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
+                    maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
+                    drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
                 }
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
@@ -34458,7 +38943,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .filter(|((ip, _), _)| !state.ip_filter.is_blocked_readonly(*ip))
                         .map(|((ip, port), ts)| ((*ip, *port), *ts))
                         .collect();
-                    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
                     candidates
                         .into_iter()
                         .take(ember::MAX_EPX_PEERS)
@@ -34588,6 +39073,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     && state.ember_pending_callback_connects.is_empty()
                     && state.ember_pending_proxy_overlay.is_empty()
                     && state.ember_pending_keyword_results.is_empty()
+                    && state.ember_pending_channel_presence.is_empty()
+                    && state.ember_channel_presence_buffer.is_empty()
+                    && state.ember_pending_channel_moderation.is_empty()
+                    && state.ember_pending_channel_handoff.is_empty()
+                    && state.ember_pending_channel_epoch.is_empty()
+                    && state.ember_pending_channel_claim.is_empty()
                     // The batch publisher is on an entirely separate path from
                     // the maps above — `flush_ember_batch_publish` only ever
                     // writes `in_flight` — and `expire()` below is its only
@@ -34671,6 +39162,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                         maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
                     }
+                    if let Some(channel_id) =
+                        state.ember_channel_presence_searches.remove(&search_id)
+                    {
+                        flush_channel_presence_if_idle(&mut state, channel_id);
+                    }
+                    state.ember_channel_moderation_searches.remove(&search_id);
+                    state.ember_channel_handoff_searches.remove(&search_id);
+                    state.ember_channel_epoch_searches.remove(&search_id);
+                    state.ember_channel_claim_searches.remove(&search_id);
                     // A publish-target lookup can end here rather than through
                     // `maybe_finish_ember_search`: if every send in its first
                     // batch fails, the whole shortlist goes back to Pending, so
@@ -35270,6 +39770,105 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         }
                     }
                 }
+                if !state.ember_pending_channel_presence.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_presence);
+                    let mut any_new = false;
+                    let mut updated_ids = HashSet::new();
+                    for (channel_id, records) in pending {
+                        if ingest_channel_presence_records(
+                            &mut state,
+                            &db,
+                            &ed25519_pubkey,
+                            channel_id,
+                            &records,
+                        ) {
+                            any_new = true;
+                            updated_ids.insert(hex::encode(channel_id));
+                        }
+                    }
+                    if any_new {
+                        // New XOR neighbors: re-register channel capabilities
+                        // without waiting out the friend heartbeat.
+                        state.rendezvous_last_register = None;
+                        drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
+                    }
+                    for channel_id in updated_ids {
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id }),
+                        );
+                    }
+                }
+                if !state.ember_pending_channel_moderation.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_moderation);
+                    let checked_at = chrono::Utc::now().timestamp();
+                    for (channel_id, records, answered) in pending {
+                        // Only a search some peer actually answered counts as
+                        // having looked. Finding no owner record because nobody
+                        // replied is not evidence the owner has gone, and
+                        // succession is the one feature that acts on absence.
+                        if answered > 0 {
+                            let _ = db.touch_channel_moderation_checked(
+                                &hex::encode(channel_id),
+                                checked_at,
+                            );
+                        }
+                        if ingest_channel_moderation_records(&db, channel_id, &records) {
+                            let _ = app_handle.emit(
+                                "ember:channel-moderation",
+                                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+                            );
+                        }
+                    }
+                }
+                if !state.ember_pending_channel_claim.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_claim);
+                    for (channel_id, records) in pending {
+                        if let Some(successor_id) =
+                            ingest_channel_claim_records(&db, channel_id, &records)
+                        {
+                            let _ = app_handle.emit(
+                                "ember:channel-handoff",
+                                serde_json::json!({
+                                    "channel_id": hex::encode(channel_id),
+                                    "successor_id": hex::encode(successor_id),
+                                    "phase": "claimed",
+                                }),
+                            );
+                        }
+                    }
+                }
+                if !state.ember_pending_channel_epoch.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_epoch);
+                    for (channel_id, epoch, records) in pending {
+                        if ingest_channel_epoch_records(&db, &identity, channel_id, epoch, &records)
+                        {
+                            // The room is readable again, so the list's badges
+                            // and the composer state want refreshing.
+                            let _ = app_handle.emit(
+                                "ember:channel-moderation",
+                                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+                            );
+                        }
+                    }
+                }
+                if !state.ember_pending_channel_handoff.is_empty() {
+                    let pending = std::mem::take(&mut state.ember_pending_channel_handoff);
+                    for (channel_id, records) in pending {
+                        if let Some(successor_id) =
+                            ingest_channel_handoff_records(&db, channel_id, &records)
+                        {
+                            let _ = app_handle.emit(
+                                "ember:channel-handoff",
+                                serde_json::json!({
+                                    "channel_id": hex::encode(channel_id),
+                                    "successor_id": hex::encode(successor_id),
+                                    "phase": "followed",
+                                }),
+                            );
+                        }
+                    }
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'ember_search_timer' panicked: {}", describe_panic(&*__p));
@@ -35293,6 +39892,53 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         || !state.ember_keyless_peers.is_empty())
                 {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
+                    maybe_publish_channel_presence(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                    )
+                    .await;
+                    maybe_publish_owned_channel_records(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                    )
+                    .await;
+                }
+                if settings.ember_native_enabled {
+                    // Release per-author flood slots for members who have gone
+                    // quiet. Without this the map fills in a busy room and then
+                    // refuses newcomers, since an untracked author has to be
+                    // refused rather than waved through.
+                    ember::channel::prune_author_gossip(
+                        &mut state.channel_gossip_author_times,
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(60),
+                    );
+                    // Same reclaim for the catch-up budget: its entries only
+                    // mean anything for a minute, and holding them past that
+                    // fills the map with requesters who asked once and left.
+                    ember::channel::prune_author_gossip(
+                        &mut state.channel_history_sync_times,
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(60),
+                    );
+                    maybe_refresh_channel_moderation(&udp_socket, &mut state, &db, &settings)
+                        .await;
+                    maybe_refresh_channel_handoff(&udp_socket, &mut state, &db, &settings)
+                        .await;
+                    maybe_refresh_channel_key_epoch(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                    )
+                    .await;
                 }
 
                 // Nothing to bridge from means nobody has crossed our path yet.
@@ -35571,7 +40217,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 {
                     let mgr = transfer_manager.read().await;
                     let mut seen: std::collections::HashSet<[u8; 16]> = all_for_udp.iter().map(|(fh, _)| *fh).collect();
-                    for (tid, _sender) in &state.active_source_senders {
+                    for tid in state.active_source_senders.keys() {
                         if let Some(transfer) = mgr.get_transfer(tid) {
                             if let Ok(hash_bytes) = hex::decode(&transfer.file_hash) {
                                 if hash_bytes.len() == 16 {
@@ -35647,7 +40293,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let mgr = transfer_manager.read().await;
                     let sm = source_manager.read().await;
                     let seen: std::collections::HashSet<String> = all_downloads.iter().map(|(t, _, _, _)| t.clone()).collect();
-                    for (tid, _sender) in &state.active_source_senders {
+                    for tid in state.active_source_senders.keys() {
                         if seen.contains(tid) { continue; }
                         if let Some(transfer) = mgr.get_transfer(tid) {
                             if let Ok(raw) = hex::decode(&transfer.file_hash) {
@@ -35930,7 +40576,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let responded = search.responded_during_lookup.len() as u32;
                         let pending = search.pending.len() as u32;
                         let load_total = queried.saturating_add(pending);
-                        let load_pct = if queried == 0 { 0 } else { (responded * 100) / queried };
+                        let load_pct = (responded * 100).checked_div(queried).unwrap_or(0);
                         KadSearchInfo {
                             id: sid.0,
                             target: search.target.to_hex(),
@@ -36310,11 +40956,33 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         }
     }
 
-    // Persist the Ember DHT routing table (slice 7) so the next session
-    // can rejoin the DHT immediately.
+    // Persist the remembered peer set (slice 7) so the next session can rejoin
+    // the DHT immediately.
+    //
+    // The only place an address is ever forgotten, and only ever for want of
+    // room. A session long enough to have pinged the peers it offered the table
+    // sinks each silent one in the ranking; the trim then keeps the best
+    // `EMBER_PERSIST_MAX_CONTACTS` of them, proven addresses ahead of gossip. A peer that is merely offline
+    // tonight is still here tomorrow — which matters most on a small overlay,
+    // where the addresses of a handful of peers who happen to be asleep are the
+    // only way back in. Charging misses per save instead would turn a session
+    // into five minutes and put the old ratchet back.
+    let live = ember_persistable_contacts(&state);
+    state.ember_bootstrap_cache.observe(live.iter());
+    let now_secs = chrono::Utc::now().timestamp();
+    let sunk = state.ember_bootstrap_cache.charge_silent_session(now_secs);
+    let local_id = state.ember_dht.local_id();
+    let dropped = state
+        .ember_bootstrap_cache
+        .trim_to(&local_id, EMBER_PERSIST_MAX_CONTACTS);
     let ember_contacts = state
-        .ember_dht
-        .bootstrap_contacts(EMBER_PERSIST_MAX_CONTACTS);
+        .ember_bootstrap_cache
+        .snapshot(&local_id, EMBER_PERSIST_MAX_CONTACTS);
+    info!(
+        "Ember bootstrap cache: remembering {} peer(s) ({sunk} silent this session, \
+         {dropped} dropped for room)",
+        ember_contacts.len(),
+    );
     if !ember_contacts.is_empty() {
         let ember_nodes_path = state.data_dir.join("nodes_ember.dat");
         // Wait out a periodic save that is still in flight, bounded by the shared
@@ -36329,9 +40997,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .await
         {
             Ok(_ownership) => {
-                if let Err(e) =
-                    ember::dht::bootstrap::save_nodes(&ember_nodes_path, &ember_contacts)
-                {
+                if let Err(e) = ember::dht::bootstrap::save_nodes(
+                    &ember_nodes_path,
+                    &ember_contacts,
+                    state.ember_nodes_loaded,
+                ) {
                     error!("Failed to save nodes_ember.dat on shutdown: {e}");
                 }
             }
@@ -37777,6 +42447,8 @@ async fn handle_ember_native_udp(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
         socket,
@@ -37786,6 +42458,8 @@ async fn handle_ember_native_udp(
         transfer_manager,
         source_manager,
         local_index,
+        db,
+        app_handle,
     ))
     .catch_unwind()
     .await
@@ -37806,6 +42480,8 @@ async fn handle_ember_native_udp_inner(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
 ) {
     let outcome = state.ember_transport.dispatch_incoming(data, from);
 
@@ -37858,7 +42534,16 @@ async fn handle_ember_native_udp_inner(
     // two kinds.
     if let Some(remote_noise_pub) = outcome.remote_noise_pub {
         for payload in &outcome.app_payloads {
-            handle_ember_dht_message(socket, payload, from, remote_noise_pub, state).await;
+            handle_ember_dht_message(
+                socket,
+                payload,
+                from,
+                remote_noise_pub,
+                state,
+                db,
+                app_handle,
+            )
+            .await;
         }
     }
 
@@ -38109,18 +42794,62 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
         None => return,
     };
 
-    let batch = match state.ember_search.get_mut(search_id) {
-        Some(s) => s.next_to_query(),
-        None => return,
-    };
-
     let mut batch_sent = 0u32;
-    for query in batch {
+    // Keep pulling batches until one of them actually reaches the wire.
+    //
+    // Nothing re-drives a search except a response or a query deadline, and a
+    // query that was never sent has neither — so a call that retires its whole
+    // batch without transmitting leaves the walk idle until `cleanup_expired`
+    // reaps it two minutes later, holding a search slot and resolving its
+    // waiter empty. A scattered send failure rarely takes a whole batch, but an
+    // address the IP policy refuses is *systematically* correlated: an attacker
+    // can choose node ids near the target (the id is theirs to pick, which is
+    // the premise of the gate below) with addresses in a blocked range and
+    // occupy the head of the shortlist deliberately.
+    let mut barren_rounds = 0usize;
+    loop {
+        let batch = match state.ember_search.get_mut(search_id) {
+            Some(s) => s.next_to_query(),
+            None => return,
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for query in batch {
         let ember::dht::search::QueryTarget {
             contact,
             request_id: per_search_req_id,
             start_position,
         } = query;
+        // The shortlist is not the routing table, and its contents arrive
+        // straight out of a peer's `FOUND_NODE`. The table refuses an address
+        // the user blocked, but a search dialled its own shortlist directly, so
+        // a peer could name any IPv4 address it liked — a blocked range,
+        // special-use space, or a third party — and have us open unsolicited
+        // Noise handshakes to it. Getting into the top of the shortlist is
+        // cheap, since the node id is the attacker's to choose. Every other
+        // Ember dial path already consults this gate.
+        //
+        // `definitely_blocked`, not `!admits_addr`: the latter is fail-*closed*
+        // while `ipfilter.dat` is still parsing, and Ember addresses are never
+        // Kad seeds, so during that window it refuses every peer — which would
+        // have made a search on any node with the filter enabled retire its
+        // whole shortlist without dialling anyone. "Known bad" is the right
+        // question for whether to dial; the routing table draws the same
+        // distinction for admission versus eviction.
+        if state.ember_dht.routing().definitely_blocked(&contact.addr) {
+            debug!(
+                "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
+                contact.addr
+            );
+            if let Some(search) = state.ember_search.get_mut(search_id) {
+                let _ = search.mark_failed_with(
+                    per_search_req_id,
+                    ember::dht::search::QueryFailure::NotSent,
+                );
+            }
+            continue;
+        }
         let (wire_req_id, frame) = match search_type {
             ember::dht::search::SearchType::FindNode => state.ember_dht.build_find_node(target),
             ember::dht::search::SearchType::FindValue => {
@@ -38244,6 +42973,22 @@ async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search
                 sent_unix: chrono::Utc::now().timestamp(),
             },
         );
+        }
+        if batch_sent > 0 {
+            break;
+        }
+        // Nothing left this call. Bounded so a shortlist of entries we cannot
+        // dial costs one pass, not a spin: every barren round retires its
+        // whole batch, so the shortlist strictly shrinks and this terminates
+        // well before the cap on any real search.
+        barren_rounds += 1;
+        if barren_rounds >= EMBER_SEARCH_MAX_BARREN_ROUNDS {
+            debug!(
+                "Ember search {search_id}: gave up after {barren_rounds} batches that could \
+                 not be dialled"
+            );
+            break;
+        }
     }
 
     if batch_sent > 0 {
@@ -38411,6 +43156,43 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                         results,
                         final_batch: true,
                     });
+            } else if let Some(channel_id) =
+                state.ember_channel_presence_searches.remove(&search_id)
+            {
+                buffer_channel_presence_records(state, channel_id, records);
+            } else if let Some(channel_id) =
+                state.ember_channel_claim_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_claim
+                    .push((channel_id, records));
+            } else if let Some((channel_id, epoch)) =
+                state.ember_channel_epoch_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_epoch
+                    .push((channel_id, epoch, records));
+            } else if let Some(channel_id) =
+                state.ember_channel_moderation_searches.remove(&search_id)
+            {
+                // How many peers actually answered. An empty result from a
+                // search nobody answered says nothing about the owner — it says
+                // we could not reach the network — and succession must not read
+                // the two the same way.
+                let answered = state
+                    .ember_search
+                    .get(search_id)
+                    .map(|s| s.responded_count())
+                    .unwrap_or(0);
+                state
+                    .ember_pending_channel_moderation
+                    .push((channel_id, records, answered));
+            } else if let Some(channel_id) =
+                state.ember_channel_handoff_searches.remove(&search_id)
+            {
+                state
+                    .ember_pending_channel_handoff
+                    .push((channel_id, records));
             }
         }
     }
@@ -38706,10 +43488,7 @@ fn majority_ember_digest_with_count(
             *counts.entry(*digest).or_insert(0) += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(d, n)| (d, n))
+    counts.into_iter().max_by_key(|(_, n)| *n)
 }
 
 /// Distinct publishers that must agree before a DHT-sourced digest is allowed
@@ -39128,7 +43907,7 @@ fn ember_publish_queue_is_backed_up(state: &NetworkState) -> bool {
 /// The queue depth, in entries, at which selection should wait a tick.
 fn ember_publish_backpressure_threshold(contacts: usize) -> usize {
     // What one tick's worth of records actually occupies in the queue.
-    let fan_out = contacts.min(K_EMBER_REPLICAS).max(1);
+    let fan_out = contacts.clamp(1, K_EMBER_REPLICAS);
     // Capped at half the queue, or the gate stops existing on a table above about
     // seventy contacts: the threshold grows with the table while the queue does
     // not, so past that point only `enqueue`'s hard ceiling pushes back — and it
@@ -40060,7 +44839,7 @@ async fn maybe_publish_ember_sources(
                     && x.failed_queries == 0
                     && x.is_verified()
             });
-            c.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            c.sort_by_key(|contact| std::cmp::Reverse(contact.last_seen));
             let named = c.iter().find_map(|contact| {
                 ember_named_source_buddy(state, contact, now_ts)
                     .map(|buddy| (contact.clone(), buddy))
@@ -40141,7 +44920,7 @@ async fn maybe_publish_ember_sources(
             };
             ranked.push((staleness, i));
         }
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
         ranked.truncate(ember_source_files_per_tick(
             publishable,
@@ -40479,7 +45258,7 @@ async fn maybe_publish_ember_keywords(
         // inside the republish interval. A fixed budget silently stopped
         // republishing everything past the first few thousand files.
         let publishable = files.iter().filter(|f| is_ember_publishable(f)).count();
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
         ranked.truncate(ember_keyword_files_per_tick(
             publishable,
@@ -40633,6 +45412,90 @@ async fn start_ember_source_search(
 /// a measured cold start. Re-running it is close to free once the candidates
 /// are spent, because `bridge_retry_due` holds every attempted peer until its
 /// backoff expires and the extra passes just build an empty candidate list.
+/// Probe the oldest contact of each bucket a newcomer could not enter.
+///
+/// Kademlia bucket pressure: `add_contact` answers `PingOldest` when the bucket
+/// is full. The newcomer is already parked in that bucket's replacement cache,
+/// and whether it ever gets a slot depends entirely on this probe. If the
+/// incumbent answers it keeps its slot (proven-live contacts win, and the
+/// newcomer ages out of the cache); if it stays silent past
+/// `EMBER_MAINT_PING_TIMEOUT` the 1-second sweep faults and evicts it,
+/// promoting the newcomer. Registering the probe in the same
+/// `ember_dht_maint_pings` map the liveness sweep drains is what makes that
+/// fault/evict/promote path fire for free.
+///
+/// Shared by the inbound path and the bootstrap-cache top-up so the two cannot
+/// drift — the top-up originally discarded `PingOldest` entirely, which left
+/// the peers it parked waiting on an eviction nothing would ever trigger.
+async fn probe_bucket_oldest(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    targets: &[(SocketAddr, ember::dht::EmberNodeId, [u8; 32])],
+    now: i64,
+) {
+    for (oldest_addr, oldest_id, oldest_noise) in targets {
+        // One probe per contact: if a liveness or earlier bucket-pressure
+        // ping to it is already outstanding, that one already decides its
+        // fate — piling on would over-count failures and waste packets.
+        if state
+            .ember_dht_maint_pings
+            .values()
+            .any(|p| p.node_id == *oldest_id)
+        {
+            continue;
+        }
+        let (wire_req_id, frame) = state.ember_dht.build_ping();
+        let mut behind_handshake = false;
+        let sent =
+            match state
+                .ember_transport
+                .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
+            {
+                ember::transport::OutgoingResult::Ready { packet } => {
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    behind_handshake = true;
+                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {
+                    behind_handshake = true;
+                    true
+                }
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
+                    false
+                }
+            };
+        if sent {
+            state.ember_dht_maint_pings.insert(
+                wire_req_id,
+                new_ember_maint_ping(*oldest_id, behind_handshake, now),
+            );
+            state.ember_diagnostics.ember_dht_liveness_pings_sent = state
+                .ember_diagnostics
+                .ember_dht_liveness_pings_sent
+                .saturating_add(1);
+        }
+    }
+}
+
 async fn run_ember_kad_bridge(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -40731,17 +45594,39 @@ async fn run_ember_maintenance(
         }
 
         let contacts = ember_overlay_contact_count(state);
+        // Whether the "overlay just emptied" edge was acted on. It used to be
+        // consumed either way, so a transition suppressed by the rate limiter
+        // was lost for good: empty at t=100 re-arms, the fresh batch is
+        // admitted, all of it is three-struck by t=160, the count returns to
+        // zero — but 60s is inside `EMBER_EMPTY_REARM_SECS`, so nothing fires,
+        // and with the edge already spent it can never recur. The node then
+        // holds a fully-consumed `offered` set and cannot re-dial a single
+        // remembered peer for the rest of the session, however reachable they
+        // become. This is the cache's only recovery path, so it must survive
+        // being rate-limited.
+        let mut rearmed = false;
         if contacts == 0
             && state.ember_last_overlay_contacts > 0
             && now_secs.saturating_sub(state.ember_empty_rearmed_at) >= EMBER_EMPTY_REARM_SECS
         {
+            rearmed = true;
             info!("Ember DHT: overlay emptied, re-arming bootstrap");
             state.ember_kad_bridge_attempted.clear();
             state.ember_bridge_fast_at = None;
             state.ember_rendezvous_looked_up_at = 0;
+            // Let the remembered peers be offered again. Each is handed to the
+            // table once per session, which is right while the table still
+            // holds them and wrong the moment it does not — a suspend/resume,
+            // an interface change or an `ipfilter.dat` reload can empty it, and
+            // without this the address book is unusable until a restart.
+            state.ember_bootstrap_cache.rearm_offers();
             state.ember_empty_rearmed_at = now_secs;
         }
-        state.ember_last_overlay_contacts = contacts;
+        // Hold the edge open while it is still pending, so a suppressed
+        // transition is retried once the floor passes.
+        if contacts > 0 || rearmed {
+            state.ember_last_overlay_contacts = contacts;
+        }
     }
 
     // 0a) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
@@ -40771,6 +45656,94 @@ async fn run_ember_maintenance(
     let admitted = state.ember_dht.promote_cached_contacts();
     if admitted > 0 {
         debug!("Ember DHT: promoted {admitted} cached contact(s) into free bucket slots");
+    }
+
+    // 0b2) Top the table up from the remembered set. Runs after the purge and
+    //      the eviction sweep it follows, so the slots the last batch just
+    //      vacated are refilled in time for this tick's liveness pings.
+    //
+    //      Only while the table is still short of a working set: once we hold a
+    //      bucket's worth of proven contacts, gossip and lookups keep it fed and
+    //      dialling an address book is pointless traffic. Each peer is offered
+    //      once per session, so this walks steadily through the book instead of
+    //      re-dialling whatever died most recently, and stops on its own when
+    //      there is nothing left to offer.
+    //
+    //      Held back while a batch of *ours* is still outstanding, or the
+    //      timer's immediate first tick would stack a second batch on the one
+    //      seeded at launch and put back the queueing this is here to avoid.
+    //      Counted as seeds still sitting unproven in the table, not as bucket
+    //      leads at large: gossip is also unverified and arrives far faster, so
+    //      measuring all leads let two answered FIND_NODEs pin the gate shut
+    //      while the verified count was still nearly zero and leave the rest of
+    //      the address book — the entries with real history — undialled.
+    let held: HashSet<ember::dht::EmberNodeId> = state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .chain(state.ember_dht.cached_contacts())
+        .map(|c| c.node_id)
+        .chain(state.ember_session_dht_contacts.values().map(|c| c.node_id))
+        .collect();
+    // Cache entries count too, or a seed the table parked there is neither
+    // re-offered (it is in `held`, which includes the cache) nor counted as
+    // outstanding — so it would silently open the gate for another batch.
+    let held_leads: HashSet<ember::dht::EmberNodeId> = state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .chain(state.ember_dht.cached_contacts())
+        .filter(|c| !c.is_verified())
+        .map(|c| c.node_id)
+        .collect();
+    let outstanding = state.ember_bootstrap_cache.offers_outstanding(&held_leads);
+    if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+        && outstanding < EMBER_SEED_BATCH
+    {
+        let local_id = state.ember_dht.local_id();
+        let batch = state
+            .ember_bootstrap_cache
+            .seed_batch(&local_id, &held, EMBER_SEED_BATCH);
+        if !batch.is_empty() {
+            let offered_count = batch.len();
+            // One at a time through the admission gate, not `load_contacts`:
+            // that detaches the range filter, which is right only at startup,
+            // where it is fail-closed because `ipfilter.dat` has not parsed yet.
+            // By now it has, and bypassing it here would dial addresses the user
+            // blocked.
+            let mut admitted = Vec::with_capacity(batch.len());
+            let mut pressure = Vec::new();
+            for contact in batch {
+                match state.ember_dht.offer_contact(contact.clone()) {
+                    ember::dht::routing::AddResult::Added => admitted.push(contact.node_id),
+                    // The bucket is full; the newcomer is parked in its
+                    // replacement cache and gets a slot only if the incumbent
+                    // fails the probe the table just asked for. Dropping this
+                    // would leave it waiting on an eviction nothing triggers.
+                    ember::dht::routing::AddResult::PingOldest {
+                        addr,
+                        node_id,
+                        noise_pub,
+                    } => pressure.push((addr, node_id, noise_pub)),
+                    ember::dht::routing::AddResult::Rejected => {}
+                }
+            }
+            // Only what the table actually took counts as tried. Marking the
+            // whole batch would let a book be consumed without a single peer
+            // being dialled — a contact the IP policy or a diversity cap
+            // refuses never enters the table, so it would never appear in
+            // `held_leads` either, and the gate would reopen immediately.
+            state
+                .ember_bootstrap_cache
+                .note_offered(admitted.iter().copied());
+            debug!(
+                "Ember DHT: offered {offered_count} remembered peer(s) to the routing table, \
+                 {} admitted, {} behind a full bucket",
+                admitted.len(),
+                pressure.len()
+            );
+            probe_bucket_oldest(socket, state, &pressure, now_secs).await;
+        }
     }
 
     // Announce bookkeeping only means anything for contacts we still hold,
@@ -41143,6 +46116,8 @@ async fn handle_ember_dht_message(
     from: SocketAddr,
     remote_noise_pub: [u8; 32],
     state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
 ) {
     // Slice 14: per-IP rate limit before any crypto/table work. Wire layout
     // is version(1) + msg_type(1) + …; a truncated frame is dropped by the
@@ -41355,6 +46330,17 @@ async fn handle_ember_dht_message(
             .ember_diagnostics
             .ember_dht_version_mismatch
             .saturating_add(1);
+        if ember::dht::messages::dht_version_is_newer_than_us(version) {
+            state.ember_diagnostics.ember_dht_version_peer_newer = state
+                .ember_diagnostics
+                .ember_dht_version_peer_newer
+                .saturating_add(1);
+        } else {
+            state.ember_diagnostics.ember_dht_version_peer_older = state
+                .ember_diagnostics
+                .ember_dht_version_peer_older
+                .saturating_add(1);
+        }
         debug!(
             "Ember DHT: dropping frame from {from}: unsupported version {version} \
              (this build speaks {}..={})",
@@ -41559,77 +46545,7 @@ async fn handle_ember_dht_message(
         }
     }
 
-    // Kademlia bucket pressure: learning the sender (or a FOUND_NODE
-    // contact) hit a full bucket, so the engine asks us to ping the
-    // *oldest* contact there. The newcomer is already parked in that
-    // bucket's replacement cache. If the oldest answers it keeps its
-    // slot (proven-live contacts win — the newcomer ages out of the
-    // cache); if it stays silent past EMBER_MAINT_PING_TIMEOUT the
-    // 1-second sweep faults and evicts it, promoting the newcomer. We
-    // register these probes in the same `ember_dht_maint_pings` map the
-    // liveness sweep already drains, so that fault/evict/promote path
-    // fires for free.
-    for (oldest_addr, oldest_id, oldest_noise) in &inbound.ping_oldest {
-        // One probe per contact: if a liveness or earlier bucket-pressure
-        // ping to it is already outstanding, that one already decides its
-        // fate — piling on would over-count failures and waste packets.
-        if state
-            .ember_dht_maint_pings
-            .values()
-            .any(|p| p.node_id == *oldest_id)
-        {
-            continue;
-        }
-        let (wire_req_id, frame) = state.ember_dht.build_ping();
-        let mut behind_handshake = false;
-        let sent =
-            match state
-                .ember_transport
-                .prepare_outgoing(*oldest_addr, Some(oldest_noise), &frame)
-            {
-                ember::transport::OutgoingResult::Ready { packet } => {
-                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                    behind_handshake = true;
-                    match send_ember_udp(socket, &packet, *oldest_addr, &state.ember_dht_overhead)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
-                            false
-                        }
-                    }
-                }
-                ember::transport::OutgoingResult::Queued => {
-                    behind_handshake = true;
-                    true
-                }
-                ember::transport::OutgoingResult::Error(e) => {
-                    debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
-                    false
-                }
-            };
-        if sent {
-            state.ember_dht_maint_pings.insert(
-                wire_req_id,
-                new_ember_maint_ping(*oldest_id, behind_handshake, now),
-            );
-            state.ember_diagnostics.ember_dht_liveness_pings_sent = state
-                .ember_diagnostics
-                .ember_dht_liveness_pings_sent
-                .saturating_add(1);
-        }
-    }
+    probe_bucket_oldest(socket, state, &inbound.ping_oldest, now).await;
 
     // While the public table is still too thin to run lookups, ask this
     // peer for their contact list now instead of waiting for the 60s tick.
@@ -41926,6 +46842,17 @@ async fn handle_ember_dht_message(
             debug!("Ember DHT: FOUND_VALUE request_id {rid} from {from} matched no pending search");
         }
     }
+
+    if let Some(body) = inbound.channel_msg {
+        if let Some(from_id) = inbound.sender_id {
+            handle_inbound_channel_gossip(socket, state, db, app_handle, body, from_id).await;
+        }
+    }
+    if let Some(body) = inbound.channel_relay {
+        if let Some(from_id) = inbound.sender_id {
+            handle_inbound_channel_relay(socket, state, db, app_handle, body, from_id).await;
+        }
+    }
 }
 
 /// Panic-isolating wrapper around [`handle_udp_packet_inner`]. Untrusted
@@ -42058,6 +46985,8 @@ async fn handle_udp_packet_inner(
                     transfer_manager,
                     source_manager,
                     local_index,
+                    db,
+                    app_handle,
                 )
                 .await;
             }
@@ -42144,7 +47073,7 @@ async fn handle_udp_packet_inner(
                                     file.size,
                                     vec![
                                         true;
-                                        ed2k::messages::ed2k_wire_part_count(file.size) as usize
+                                        ed2k::messages::ed2k_wire_part_count(file.size)
                                     ],
                                 )
                             })
@@ -44801,7 +49730,7 @@ async fn handle_udp_packet_inner(
                 };
                 let allow_obfuscation = settings.obfuscation_enabled;
                 let mut mgr_clone = BuddyManager::new(
-                    state.buddy_manager.local_id().clone(),
+                    *state.buddy_manager.local_id(),
                     state.user_hash,
                     settings.nickname.clone(),
                     advertised_tcp_port(state),
@@ -44809,7 +49738,7 @@ async fn handle_udp_packet_inner(
                     state.pending_buddy_hashes.clone(),
                 );
                 state.pending_outgoing_buddy = Some(tokio::spawn(async move {
-                    match mgr_clone
+                    mgr_clone
                         .handle_findbuddy_response(
                             buddy_id,
                             buddy_ip,
@@ -44818,13 +49747,7 @@ async fn handle_udp_packet_inner(
                             connect_options,
                             allow_obfuscation,
                         )
-                        .await
-                    {
-                        Some((rx, writer, reader_handle)) => {
-                            Some((buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
-                        }
-                        None => None,
-                    }
+                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
                 }));
             }
         }
@@ -45708,14 +50631,16 @@ async fn handle_upload_event(
             // Cumulative byte totals live in `StatsManager`, not in the
             // per-session `Transfer`, so dropping the row loses no
             // historical data.
-            let promoted = match {
+            // Bound so the write guard is released before anything below it
+            // runs, rather than living as long as the `match` it scrutinises.
+            let completed = {
                 let mut mgr = transfer_manager.write().await;
                 let promoted = mgr.complete(&event.transfer_id);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
-            } {
-                Some(promoted) => promoted,
-                None => return,
+            };
+            let Some(promoted) = completed else {
+                return;
             };
             // Only count Statistics "Completed Uploads" when this peer
             // received the entire file — matching hash-verified download
@@ -45752,14 +50677,16 @@ async fn handle_upload_event(
             // `failure_reason` or upload history.
             let upload_failure =
                 ed2k::transfer::classify_failure(&error, &ed2k::transfer::classify_error(&error));
-            let promoted = match {
+            // Same as the Completed arm: bind the block so the write guard
+            // does not outlive it.
+            let failed = {
                 let mut mgr = transfer_manager.write().await;
                 let promoted = mgr.fail(&event.transfer_id, upload_failure, None, None);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
-            } {
-                Some(promoted) => promoted,
-                None => return,
+            };
+            let Some(promoted) = failed else {
+                return;
             };
             for t in &promoted {
                 info!(

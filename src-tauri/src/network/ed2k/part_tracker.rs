@@ -589,12 +589,18 @@ impl PartTracker {
         for &(gs, ge) in &self.gaps {
             let first_part = (gs / PARTSIZE) as usize;
             let last_part = (ge.saturating_sub(1) / PARTSIZE) as usize;
-            for p in first_part..=last_part.min(self.part_count.saturating_sub(1)) {
+            let last = last_part.min(self.part_count.saturating_sub(1));
+            for (p, bytes) in result
+                .iter_mut()
+                .enumerate()
+                .take(last + 1)
+                .skip(first_part)
+            {
                 let (ps, pe) = self.part_range(p);
                 let overlap_start = gs.max(ps);
                 let overlap_end = ge.min(pe);
                 if overlap_start < overlap_end {
-                    result[p] += overlap_end - overlap_start;
+                    *bytes += overlap_end - overlap_start;
                 }
             }
         }
@@ -1815,9 +1821,9 @@ mod tests {
         assert!(!serveable[3], "incomplete part 3 must NOT be serveable");
 
         // Advertised (serveable) parts must stay within the serve gate.
-        for p in 0..4 {
+        for (p, &is_serveable) in serveable.iter().enumerate().take(4) {
             let (s, e) = reloaded.part_range(p);
-            if serveable[p] {
+            if is_serveable {
                 assert!(
                     reloaded.is_range_safe_to_serve(s, e),
                     "serveable part {p} must be safe to serve after reload"

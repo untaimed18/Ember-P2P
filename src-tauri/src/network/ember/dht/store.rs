@@ -5,7 +5,10 @@ use tracing::debug;
 
 use crate::network::ember::crypto;
 
-use super::publish::RECORD_TYPE_SOURCE;
+use super::publish::{
+    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_INDEX,
+    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_SOURCE,
+};
 use super::{scale, EmberNodeId};
 
 /// Maximum records per key (anti-spam).
@@ -127,10 +130,57 @@ const KEYWORD_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 /// tighter margin than this.
 const SOURCE_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// Presence records are re-announced by members every 10 minutes; a 45-minute
+/// TTL survives a few missed republishes without keeping a departed member
+/// listed for a full day.
+const CHANNEL_PRESENCE_TTL: Duration = Duration::from_secs(45 * 60);
+/// Leave tombstones replace the live record under the same store key; they
+/// only need to outlive a republish interval so stragglers still see the
+/// departure. Storers that do not know `CHANNEL_FLAG_DEPARTED` keep applying
+/// the live TTL, which is why ingest also drops the member.
+const CHANNEL_PRESENCE_DEPARTED_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// A room's public-index listing, which is what Discover walks.
+///
+/// Only the owner can refresh one: the record is signed by the *channel* key,
+/// so no member can republish on the room's behalf, and a storer replicating it
+/// re-sends the identical bytes that every node derives the same expiry from.
+/// Under the 24-hour keyword default an established room therefore fell out of
+/// Discover one day after its owner closed the app, while the members still
+/// inside it carried on talking — the room had not died, it had only become
+/// impossible to find. A week survives an ordinary absence.
+///
+/// The cost is the other direction: a room genuinely abandoned keeps its
+/// listing for up to a week, so Discover can offer a room with nobody in it.
+/// Presence records expire in 45 minutes and would show that room as empty, so
+/// a stale listing is recoverable in the UI whereas a vanished one is not.
+const CHANNEL_INDEX_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+// The whole point of the constant is that it outlasts the default it used to
+// inherit. Equal values would compile, pass every test below, and quietly put
+// rooms back to expiring a day after their owner leaves.
+const _: () = assert!(
+    CHANNEL_INDEX_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "a room listing must outlive the generic keyword TTL"
+);
+
 /// How long a record of this type lives, from its leading type byte.
 fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
         Some(&RECORD_TYPE_SOURCE) => SOURCE_RECORD_TTL,
+        Some(&RECORD_TYPE_CHANNEL) => match channel_kind_from_data(data) {
+            Some(CHANNEL_KIND_PRESENCE) => {
+                if channel_flags_from_data(data)
+                    .is_some_and(|f| f & CHANNEL_FLAG_DEPARTED != 0)
+                {
+                    CHANNEL_PRESENCE_DEPARTED_TTL
+                } else {
+                    CHANNEL_PRESENCE_TTL
+                }
+            }
+            Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
+            _ => KEYWORD_RECORD_TTL,
+        },
         _ => KEYWORD_RECORD_TTL,
     }
 }
@@ -831,6 +881,37 @@ impl DhtStore {
             );
             return false;
         }
+        // `key` arrives beside `data` rather than out of it, and only the body
+        // is signed — so unless it is checked against the body, this trusts the
+        // caller for the fact that decides where a record lives. Every caller
+        // does check today, which is why this was never exploitable, but the
+        // invariant was written down in `search.rs` as something the store
+        // enforces and it did not. `key` decides XOR distance, and distance is
+        // what both eviction rankers order victims by, so a future caller that
+        // skipped the check would hand an attacker the choice of what to
+        // displace. Deriving it here makes the claim true wherever it is read.
+        //
+        // Only the key. `publisher_key` is already pinned by
+        // `verify_record_signature` below — a body naming someone else cannot
+        // produce a signature this key verifies — and `created_at` is
+        // deliberately the caller's, because the zero-digest republish path
+        // passes a timestamp that is legitimately not the resident body's.
+        let Some((signed_key, _, _)) = signed_identity_from_record_data(&data) else {
+            self.unparseable_rejections = self.unparseable_rejections.saturating_add(1);
+            return false;
+        };
+        if signed_key != key {
+            // Counted, or a caller misfiling records systematically is
+            // invisible in `reject_stats()` — which is the only place this
+            // would ever show up, since it is unreachable from the wire.
+            self.unparseable_rejections = self.unparseable_rejections.saturating_add(1);
+            debug!(
+                "DHT store: refusing record filed under {} whose signed body names {}",
+                hex::encode(key),
+                hex::encode(signed_key),
+            );
+            return false;
+        }
         if !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
@@ -896,7 +977,7 @@ impl DhtStore {
             republish_due: false,
         };
 
-        let records = self.entries.entry(key).or_insert_with(Vec::new);
+        let records = self.entries.entry(key).or_default();
 
         // Deduplicate on (publisher, file), not on publisher alone. A keyword
         // key legitimately holds one record per file a publisher shares under
@@ -924,15 +1005,35 @@ impl DhtStore {
             }
 
             let existing_ember = ember_digest_from_record_data(&records[pos].data);
-            if existing_ember != [0u8; 32] && incoming_ember == [0u8; 32] {
+            // Only while the resident is still live. Now that its expiry is no
+            // longer advanced, it can be past its own — and it always expires
+            // first, since its `created_at` is by construction at or before the
+            // incoming one. Keeping a lapsed body and ACKing the live record
+            // that would have replaced it leaves the key holding nothing
+            // servable until the publisher's next republish, up to an hour
+            // away. The reclaim pass that would have dropped it runs later, so
+            // it cannot help here.
+            if existing_ember != [0u8; 32]
+                && incoming_ember == [0u8; 32]
+                && records[pos].expires_at > now
+            {
                 // Keep the richer digest, but still treat this as the
                 // republish it is: the publisher is alive and re-announcing,
                 // so the record's life should be extended. Previously this
                 // ACKed and did nothing, letting a publisher whose file has
                 // left the local index watch its record expire on schedule
                 // while every republish reported success.
-                records[pos].created_at = created_at;
-                records[pos].expires_at = expires_at;
+                // Keep the resident body's own dates. Advancing them from the
+                // record we are *discarding* gave this copy a life its
+                // signature does not support: `take_republish_batch` re-sends
+                // the older bytes, so every peer recomputes the shorter life
+                // from the signed timestamp inside them, and only we believed
+                // the longer one. Extending it here therefore bought nothing
+                // the network agreed with — the record lapses elsewhere on
+                // schedule regardless — while leaving our copy claiming an
+                // expiry no reader could derive. Stamping `last_republished` is
+                // the part that was actually wanted: it stops us re-sending
+                // this record on the very next tick.
                 records[pos].last_republished = now;
                 return true;
             }
@@ -1254,7 +1355,9 @@ impl DhtStore {
                 // re-announces its own source records on its publish tick, so
                 // they stay alive without storer-side replication. Only
                 // address-free records (e.g. keyword) replicate here.
-                if r.data.first() == Some(&RECORD_TYPE_SOURCE) {
+                if r.data.first() == Some(&RECORD_TYPE_SOURCE)
+                    || channel_kind_from_data(&r.data) == Some(CHANNEL_KIND_PRESENCE)
+                {
                     continue;
                 }
                 // A lapsed record is not worth a replica set of frames. Expiry is
@@ -1372,16 +1475,37 @@ impl DhtStore {
             // newer-copy guard above against that publisher's real republishes for
             // as long as the skew allowance.
             //
-            // A few records legitimately carry a file `created_at` later than their
-            // signed timestamp, because the zero-digest republish branch above
-            // advances it while keeping the older signed body. Those restore with
-            // the shorter life the signature actually supports, which is what every
-            // other node in the network already computes for them.
+            // The file's own `created_at` column is ignored for the same reason:
+            // it is not signed, so it is not evidence. Every record restores with
+            // exactly the life its signed body supports, which is what every other
+            // node in the network computes for it.
             let Some((key, publisher_key, created_at)) =
                 signed_identity_from_record_data(&record.data)
             else {
                 continue;
             };
+            // Channel records get the shard-key check the wire path applies at
+            // `engine.rs`'s `accept_record`. The two waivers above — the
+            // proximity gate and the source-address bind — are deliberate and
+            // documented; this one was not. Anything able to write the data
+            // directory could otherwise file a harvested, validly-signed channel
+            // record under a key `accept_record` would have refused, and the
+            // rest of the store would then serve it as ours.
+            if record.data.first() == Some(&RECORD_TYPE_CHANNEL) {
+                // `parse_unverified`, because `store_attributed` verifies the
+                // signature moments later and `channel_store_ok` reads only
+                // fields derived from the body. Going through `from_wire` would
+                // cost a second Ed25519 check per channel record on the
+                // synchronous startup path — the exact expense
+                // `signed_identity_from_record_data` exists to avoid, against a
+                // ceiling sized on one each.
+                let ok =
+                    super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
+                        .is_some_and(|parsed| parsed.channel_store_ok());
+                if !ok {
+                    continue;
+                }
+            }
             if self.store_attributed(
                 key,
                 record.data,
@@ -1408,6 +1532,7 @@ impl DhtStore {
             .values()
             .flat_map(|records| records.iter())
             .filter(|r| r.data.first() != Some(&RECORD_TYPE_SOURCE))
+            .filter(|r| channel_kind_from_data(&r.data) != Some(CHANNEL_KIND_PRESENCE))
             // Counted on the same terms the batch selects on, or the gauge
             // reports work that will never be done.
             .filter(|r| r.expires_at > now)
@@ -1541,7 +1666,7 @@ impl DhtStore {
                 })
             })
             .collect();
-        out.sort_by(|a, b| b.record_count.cmp(&a.record_count));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.record_count));
         out.truncate(max);
         out
     }
@@ -1597,10 +1722,10 @@ fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {
 /// offsets `SignedRecord::from_wire` reads them from. `None` for a body too short
 /// to be a record at all.
 ///
-/// Deliberately does not verify, and does not need to: the only caller
-/// ([`DhtStore::restore`]) hands the same bytes straight to `store_attributed`,
-/// which verifies the signature over exactly this range — so if these fields are
-/// wrong the record is refused a moment later, and if it is accepted they were
+/// Deliberately does not verify, and does not need to: both callers
+/// ([`DhtStore::restore`] and [`DhtStore::store_attributed`] itself) sit on the
+/// same bytes `verify_record_signature` covers — so if these fields are wrong
+/// the record is refused a moment later, and if it is accepted they were
 /// signed. Going through `from_wire` for this instead cost a second Ed25519
 /// verification per record on the synchronous startup path, doubling the work the
 /// persisted-record ceiling was sized against.
@@ -1676,6 +1801,50 @@ mod tests {
         data
     }
 
+    /// [`padded`], with the key written where a real record header carries it.
+    ///
+    /// `store_attributed` re-derives the key from the signed body and refuses a
+    /// body naming something other than what it is being filed under, so a
+    /// fixture that leaves those bytes zeroed is not a record the store would
+    /// ever have accepted. Everything else about these bodies stays synthetic:
+    /// the leading bytes that tell records apart are still the caller's.
+    /// A keyword body of exactly `len` bytes, naming `key`.
+    ///
+    /// The byte-budget tests want a known record size across many keys; one
+    /// shared body — and one signature — cannot serve them now that the store
+    /// checks a record against the key it is filed under, because a body names
+    /// exactly one key.
+    fn sized_for(key: [u8; 16], len: usize) -> Vec<u8> {
+        // The fill byte lands in the name-length field at `data[113..115]` too,
+        // so these bodies declare a 0x0101-byte name. `store_attributed`
+        // refuses a body shorter than the name it claims, which would make a
+        // small `len` silently unstorable and the calling test inscrutable.
+        assert!(
+            len >= 115 + 0x0101,
+            "sized_for({len}) is shorter than the name its fill byte declares"
+        );
+        let mut data = vec![super::super::publish::RECORD_TYPE_KEYWORD; len];
+        data[1..17].copy_from_slice(&key);
+        data
+    }
+
+    fn padded_for(key: [u8; 16], prefix: &[u8]) -> Vec<u8> {
+        let mut data = padded(prefix);
+        // Byte 0 is the record type and stays exactly as the caller wrote it.
+        // The key goes where a real header carries it, and whatever else the
+        // caller used to tell its records apart moves into the file-hash field
+        // — writing the key over those bytes would make every record under one
+        // key identical, which is not what any of these tests mean.
+        let tail: Vec<u8> = prefix.iter().skip(1).copied().collect();
+        data[1..17].copy_from_slice(&key);
+        for (i, b) in tail.iter().enumerate() {
+            if 17 + i < 33 {
+                data[17 + i] = *b;
+            }
+        }
+        data
+    }
+
     /// A store filled to its key cap with keys at a fixed XOR distance from a
     /// local id of all-zeroes, so "closer" and "further" are just the leading
     /// byte. Returns the store, ready at capacity.
@@ -1689,7 +1858,7 @@ mod tests {
             key[1] = (i >> 8) as u8;
             key[2] = (i & 0xFF) as u8;
             let (sk, pk) = keypair();
-            let data = padded(&[i as u8]);
+            let data = padded_for(key, &[i as u8]);
             let sig = sign(&sk, &data);
             assert!(store.store(key, data, sig, pk, now_ts()));
         }
@@ -1731,7 +1900,7 @@ mod tests {
 
         let near = [0x01u8; 16];
         let (sk, pk) = keypair();
-        let data = padded(&[0xAA]);
+        let data = padded_for(near, &[0xAA]);
         let sig = sign(&sk, &data);
         assert!(
             store.store(near, data, sig, pk, now_ts()),
@@ -1755,7 +1924,7 @@ mod tests {
 
         let far = [0xFFu8; 16];
         let (sk, pk) = keypair();
-        let data = padded(&[0xBB]);
+        let data = padded_for(far, &[0xBB]);
         let sig = sign(&sk, &data);
         assert!(
             !store.store(far, data, sig, pk, now_ts()),
@@ -1785,7 +1954,7 @@ mod tests {
         for i in 0..8u8 {
             let mut key = [0x20u8; 16];
             key[15] = i;
-            let data = padded(&[i]);
+            let data = padded_for(key, &[i]);
             if i < 4 {
                 assert!(store.store(key, data.clone(), sign(&hog, &data), hog_pk, now_ts()));
             } else {
@@ -1798,7 +1967,7 @@ mod tests {
         // A key right against our ID — closer than everything held, so distance
         // alone would have displaced an honest key for it.
         let near = [0u8; 16];
-        let data = padded(&[0xAA]);
+        let data = padded_for(near, &[0xAA]);
         assert!(
             !store.store(near, data.clone(), sign(&hog, &data), hog_pk, now_ts()),
             "a publisher over its share must be refused however close its key is"
@@ -1826,7 +1995,7 @@ mod tests {
             let mut key = [0u8; 16];
             key[15] = i;
             hog_keys.push(key);
-            let data = padded(&[i]);
+            let data = padded_for(key, &[i]);
             assert!(store.store(key, data.clone(), sign(&hog, &data), hog_pk, now_ts()));
         }
         let mut honest_keys = Vec::new();
@@ -1835,7 +2004,7 @@ mod tests {
             key[15] = i;
             honest_keys.push(key);
             let (sk, pk) = keypair();
-            let data = padded(&[i]);
+            let data = padded_for(key, &[i]);
             assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
         }
 
@@ -1843,7 +2012,7 @@ mod tests {
         // refuses it outright.
         let far = [0xFFu8; 16];
         let (newcomer, newcomer_pk) = keypair();
-        let data = padded(&[0xEE]);
+        let data = padded_for(far, &[0xEE]);
         assert!(
             store.store(far, data.clone(), sign(&newcomer, &data), newcomer_pk, now_ts()),
             "a crowding publisher's key is the one to give up"
@@ -1871,17 +2040,17 @@ mod tests {
         store.set_local_id(EmberNodeId([0u8; 16]));
         store.set_publisher_shares_for_test(4, usize::MAX);
 
-        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 1024];
-        store.set_byte_budget_for_test(record_cost(body.len()) * 8);
+        const BODY_LEN: usize = 1024;
+        store.set_byte_budget_for_test(record_cost(BODY_LEN) * 8);
 
         let (hog, hog_pk) = keypair();
-        let hog_sig = sign(&hog, &body);
         let mut hog_keys = Vec::new();
         for i in 0..4u8 {
             let mut key = [0u8; 16];
             key[15] = i;
             hog_keys.push(key);
-            assert!(store.store(key, body.clone(), hog_sig, hog_pk, now_ts()));
+            let body = sized_for(key, BODY_LEN);
+            assert!(store.store(key, body.clone(), sign(&hog, &body), hog_pk, now_ts()));
         }
         let mut honest_keys = Vec::new();
         for i in 4..8u8 {
@@ -1889,12 +2058,14 @@ mod tests {
             key[15] = i;
             honest_keys.push(key);
             let (sk, pk) = keypair();
+            let body = sized_for(key, BODY_LEN);
             assert!(store.store(key, body.clone(), sign(&sk, &body), pk, now_ts()));
         }
 
         // One more record takes the store over budget, so eviction has to pick
         // a victim.
         let (last, last_pk) = keypair();
+        let body = sized_for([0x7Fu8; 16], BODY_LEN);
         assert!(store.store([0x7Fu8; 16], body.clone(), sign(&last, &body), last_pk, now_ts()));
 
         for key in &honest_keys {
@@ -1977,7 +2148,7 @@ mod tests {
         // it empties.
         store.set_byte_budget_for_test(store.byte_len() / 2);
         let (spare, spare_pk) = keypair();
-        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 512];
+        let body = sized_for([0x7Fu8; 16], 512);
         assert!(store.store([0x7Fu8; 16], body.clone(), sign(&spare, &body), spare_pk, now_ts()));
         store.assert_publisher_index_consistent();
 
@@ -1985,7 +2156,7 @@ mod tests {
         assert!(store.key_count() > 0);
         store.set_key_budget_for_test(store.key_count());
         let (closest, closest_pk) = keypair();
-        let near = padded(&[super::super::publish::RECORD_TYPE_KEYWORD, 3]);
+        let near = padded_for([0u8; 16], &[super::super::publish::RECORD_TYPE_KEYWORD, 3]);
         assert!(store.store([0u8; 16], near.clone(), sign(&closest, &near), closest_pk, now_ts()));
         store.assert_publisher_index_consistent();
 
@@ -2078,7 +2249,7 @@ mod tests {
             let mut far = [0xFFu8; 16];
             far[15] = i;
             let (sk, pk) = keypair();
-            let data = padded(&[i]);
+            let data = padded_for(far, &[i]);
             let sig = sign(&sk, &data);
             assert!(!store.store(far, data, sig, pk, now_ts()));
         }
@@ -2101,7 +2272,7 @@ mod tests {
         // Provoke a refusal so the bound is populated.
         let far = [0xFFu8; 16];
         let (sk, pk) = keypair();
-        let data = padded(&[1]);
+        let data = padded_for(far, &[1]);
         assert!(!store.store(far, data.clone(), sign(&sk, &data), pk, now_ts()));
         assert!(store.furthest_key_distance.is_some());
 
@@ -2109,7 +2280,7 @@ mod tests {
         store.set_key_budget_for_test(16);
         let fresh = [0x02u8; 16];
         let (sk2, pk2) = keypair();
-        let d2 = padded(&[2]);
+        let d2 = padded_for(fresh, &[2]);
         assert!(store.store(fresh, d2.clone(), sign(&sk2, &d2), pk2, now_ts()));
         assert!(
             store.furthest_key_distance.is_none(),
@@ -2122,7 +2293,7 @@ mod tests {
         let mut store = DhtStore::new();
         let key = [1u8; 16];
         let (sk, pk) = keypair();
-        let data = padded(&[42]);
+        let data = padded_for(key, &[42]);
         let sig = sign(&sk, &data);
         assert!(store.store(key, data.clone(), sig, pk, now_ts()));
         assert_eq!(store.total_records(), 1);
@@ -2140,9 +2311,9 @@ mod tests {
         let (sk_a, pk_a) = keypair();
         let (sk_b, pk_b) = keypair();
 
-        let d1 = padded(&[1]);
-        let d2 = padded(&[2]);
-        let d3 = padded(&[3]);
+        let d1 = padded_for(key, &[1]);
+        let d2 = padded_for(key, &[2]);
+        let d3 = padded_for(key, &[3]);
         store.store(key, d1.clone(), sign(&sk_a, &d1), pk_a, now_ts());
         store.store(key, d2.clone(), sign(&sk_a, &d2), pk_a, now_ts()); // same publisher
         store.store(key, d3.clone(), sign(&sk_b, &d3), pk_b, now_ts()); // different publisher
@@ -2536,11 +2707,18 @@ mod tests {
         );
     }
 
-    /// A publisher whose file has left the local index republishes with a
-    /// zero digest. That is a genuine liveness signal, so it must extend the
-    /// record rather than being ACKed and discarded.
+    /// A publisher whose file has left the local index republishes with a zero
+    /// digest. The richer body is kept — and so are its own dates.
+    ///
+    /// Adopting the incoming record's expiry while keeping the resident body
+    /// gave this copy a life its signature does not support: `take_republish_batch`
+    /// re-sends the resident bytes, so every peer recomputes the shorter life
+    /// from the signed timestamp inside them and only we believed the longer
+    /// one. The extension bought nothing the network agreed with. When the
+    /// resident copy does lapse, the next republish stores the zero-digest body
+    /// fresh, so the record is not lost — it just stops diverging.
     #[test]
-    fn a_zero_digest_republish_still_extends_the_record() {
+    fn a_zero_digest_republish_keeps_the_richer_body_without_inventing_a_longer_life() {
         use super::super::publish::SignedRecord;
 
         let mut store = DhtStore::new();
@@ -2573,9 +2751,14 @@ mod tests {
             [9u8; 32],
             "the richer digest is kept"
         );
-        assert!(
-            held[0].expires_at > first_expiry,
-            "but the republish must still extend the record's life"
+        assert_eq!(
+            held[0].expires_at, first_expiry,
+            "and its expiry stays the one its own signed body supports — which is \
+             what every other holder derives from the bytes we re-send"
+        );
+        assert_eq!(
+            held[0].created_at, rich.timestamp,
+            "the resident body's own creation time is what it is dated from"
         );
     }
 
@@ -2589,16 +2772,16 @@ mod tests {
         let budget = 64 * 1024;
         store.set_byte_budget_for_test(budget);
 
-        let body = vec![super::super::publish::RECORD_TYPE_KEYWORD; 1024];
+        const BODY_LEN: usize = 1024;
         let (sk, pk) = keypair();
-        let sig = sign(&sk, &body);
         // Twice the budget's worth, so eviction has to run repeatedly.
-        let needed = (budget / body.len()) * 2;
+        let needed = (budget / BODY_LEN) * 2;
 
         for i in 0..needed {
             let mut key = [0u8; 16];
             key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-            store.store(key, body.clone(), sig, pk, now_ts());
+            let body = sized_for(key, BODY_LEN);
+            store.store(key, body.clone(), sign(&sk, &body), pk, now_ts());
         }
 
         assert!(
@@ -2637,7 +2820,7 @@ mod tests {
         for i in 0..total {
             let sk = SigningKey::generate(&mut OsRng);
             let pk = sk.verifying_key().to_bytes();
-            let data = padded(&[super::super::publish::RECORD_TYPE_KEYWORD, i as u8]);
+            let data = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD, i as u8]);
             assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
         }
         assert_eq!(store.get(&key).unwrap().len(), total);
@@ -2669,7 +2852,7 @@ mod tests {
         for i in 0..total {
             // Keyword records: source records are deliberately not relayed by
             // storers, so they would be skipped by this scan.
-            let data = padded(&[super::super::publish::RECORD_TYPE_KEYWORD, i as u8]);
+            let data = padded_for([i as u8; 16], &[super::super::publish::RECORD_TYPE_KEYWORD, i as u8]);
             assert!(store.store([i as u8; 16], data.clone(), sign(&sk, &data), pk, now_ts()));
         }
 
@@ -2701,7 +2884,7 @@ mod tests {
         let key = [1u8; 16];
         let (_sk, pk) = keypair();
         // bogus signature for `data`
-        assert!(!store.store(key, padded(&[42]), [0u8; 64], pk, now_ts()));
+        assert!(!store.store(key, padded_for(key, &[42]), [0u8; 64], pk, now_ts()));
         assert_eq!(store.total_records(), 0);
         assert_eq!(store.reject_stats().signature, 1);
     }
@@ -2711,7 +2894,7 @@ mod tests {
         let mut store = DhtStore::new();
         let key = [1u8; 16];
         let (sk, _pk) = keypair();
-        let data = padded(&[42]);
+        let data = padded_for(key, &[42]);
         let sig = sign(&sk, &data);
         // sign with sk but claim a different publisher_key
         assert!(!store.store(key, data, sig, [0xCC; 32], now_ts()));
@@ -2723,7 +2906,7 @@ mod tests {
     fn republish_batch_respects_interval_and_force() {
         let mut store = DhtStore::new();
         let (sk, pk) = keypair();
-        let d = padded(&[7]);
+        let d = padded_for([1u8; 16], &[7]);
         assert!(store.store([1u8; 16], d.clone(), sign(&sk, &d), pk, now_ts()));
 
         // Freshly stored ⇒ not due within a long interval.
@@ -2739,7 +2922,7 @@ mod tests {
         assert_eq!(forced[0].0, d);
 
         // A zero interval makes everything due (and `max` bounds the batch).
-        let d2 = padded(&[8]);
+        let d2 = padded_for([2u8; 16], &[8]);
         let (sk2, pk2) = keypair();
         assert!(store.store([2u8; 16], d2.clone(), sign(&sk2, &d2), pk2, now_ts()));
         let all_due = store.take_republish_batch(Duration::from_secs(0), 1, false);
@@ -2756,7 +2939,7 @@ mod tests {
         let mut store = DhtStore::new();
         let (sk, pk) = keypair();
         let key = [3u8; 16];
-        let d = padded(&[0x01, 9, 9]);
+        let d = padded_for(key, &[0x01, 9, 9]);
         let sig = sign(&sk, &d);
         assert!(store.store(key, d.clone(), sig, pk, now_ts()));
 
@@ -2791,12 +2974,12 @@ mod tests {
         // its address is bound to the original publisher, so a re-STORE from us
         // (a different IP) would be rejected — we must not relay it.
         let (sk, pk) = keypair();
-        let src = padded(&[RECORD_TYPE_SOURCE, 1]);
+        let src = padded_for([1u8; 16], &[RECORD_TYPE_SOURCE, 1]);
         assert!(store.store([1u8; 16], src.clone(), sign(&sk, &src), pk, now_ts()));
 
         // A non-source (keyword) record stays eligible for replication.
         let (sk2, pk2) = keypair();
-        let kw = padded(&[0x01u8, 2]);
+        let kw = padded_for([2u8; 16], &[0x01u8, 2]);
         assert!(store.store([2u8; 16], kw.clone(), sign(&sk2, &kw), pk2, now_ts()));
 
         // Even with `force`, only the non-source record is handed back.
@@ -2813,7 +2996,7 @@ mod tests {
     fn rejects_record_dated_past_ttl() {
         let mut store = DhtStore::new();
         let (sk, pk) = keypair();
-        let d = padded(&[1]);
+        let d = padded_for([1u8; 16], &[1]);
         // A record created just over the 24h TTL ago is already dead and must
         // not be revived with a fresh local TTL (replay defense).
         let stale_ts = now_ts() - (24 * 3600 + 60);
@@ -2826,7 +3009,7 @@ mod tests {
     fn rejects_record_dated_far_in_future() {
         let mut store = DhtStore::new();
         let (sk, pk) = keypair();
-        let d = padded(&[1]);
+        let d = padded_for([1u8; 16], &[1]);
         let future_ts = now_ts() + (CLOCK_SKEW_TOLERANCE_SECS + 60);
         assert!(!store.store([1u8; 16], d.clone(), sign(&sk, &d), pk, future_ts));
         assert_eq!(store.total_records(), 0);
@@ -2837,7 +3020,7 @@ mod tests {
     fn expiry_tracks_creation_time_not_receipt() {
         let mut store = DhtStore::new();
         let (sk, pk) = keypair();
-        let d = padded(&[1]);
+        let d = padded_for([5u8; 16], &[1]);
         // Created 23h ago ⇒ stored with ~1h of life left, not a fresh 24h.
         let old_ts = now_ts() - 23 * 3600;
         assert!(store.store([5u8; 16], d.clone(), sign(&sk, &d), pk, old_ts));
@@ -3018,12 +3201,124 @@ mod tests {
         );
     }
 
+    /// [`record_ttl`] singles out the index kind from inside the channel record
+    /// type, so the arm has to be narrow enough to leave the room's other records
+    /// on the default. Moderation standing in for all of them: it shares the type
+    /// byte and differs only in the packed kind.
+    #[test]
+    fn only_the_index_kind_of_a_channel_record_gets_the_long_ttl() {
+        use super::super::publish::{ModerationTail, SignedRecord};
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let ident = ChannelIdentity::generate();
+
+        let index = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert_eq!(record_ttl(&index.data), CHANNEL_INDEX_TTL);
+
+        let moderation = SignedRecord::channel_moderation(
+            "",
+            "",
+            &[],
+            &[],
+            &ModerationTail::default(),
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("the fixture fits one record");
+        assert_eq!(record_ttl(&moderation.data), KEYWORD_RECORD_TTL);
+    }
+
+    /// Only the room's owner can renew its listing — the record is signed by the
+    /// channel key, and the owner maintenance loop in `network::mod` re-signs one
+    /// every 6 hours while the app is open. Replication cannot stand in for that,
+    /// which is the point of this test: remaining life comes from the publisher's
+    /// signed creation time, so a storer offered the identical bytes past the TTL
+    /// refuses them instead of granting a fresh term. Discover
+    /// (`commands::channels::gather_channels`) walks exactly these keys, so
+    /// [`CHANNEL_INDEX_TTL`] is how long a room stays findable after its owner
+    /// goes offline.
+    #[test]
+    fn a_channel_index_record_cannot_outlive_its_signed_creation_time() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        let ttl = CHANNEL_INDEX_TTL.as_secs() as i64;
+
+        let mut inside = DhtStore::new();
+        assert!(
+            inside.store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+                record.publisher_key,
+                now_ts() - ttl + 600,
+            ),
+            "ten minutes short of the TTL a storer still holds the listing"
+        );
+        assert_eq!(inside.get_live(&record.keyword_hash).len(), 1);
+
+        // What a replica re-offering the record looks like once the owner has
+        // not re-signed a newer one.
+        let mut lapsed = DhtStore::new();
+        assert!(
+            !lapsed.store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+                record.publisher_key,
+                now_ts() - ttl - 600,
+            ),
+            "past the TTL the same signed bytes buy no further life"
+        );
+        assert!(lapsed.get_live(&record.keyword_hash).is_empty());
+
+        // And what the owner's republish does instead: index records dedupe on
+        // publisher plus room id, so a newly signed listing takes the aged
+        // one's place with a full TTL rather than piling up beside it.
+        let renewed = SignedRecord::channel_index(
+            "Lobby",
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        );
+        assert!(inside.store(
+            renewed.keyword_hash,
+            renewed.data.clone(),
+            renewed.signature,
+            renewed.publisher_key,
+            now_ts(),
+        ));
+        let held = inside.get_live(&renewed.keyword_hash);
+        assert_eq!(held.len(), 1, "a republish replaces, it does not accumulate");
+        assert!(
+            held[0].expires_at > Instant::now() + Duration::from_secs((ttl - 3600) as u64),
+            "the replacement carries a fresh full lifetime"
+        );
+    }
+
     #[test]
     fn get_live_skips_expired_records() {
         let mut store = DhtStore::new();
         let key = [9u8; 16];
         let (sk, pk) = keypair();
-        let d = padded(&[1]);
+        let d = padded_for(key, &[1]);
         assert!(store.store(key, d.clone(), sign(&sk, &d), pk, now_ts()));
         assert_eq!(store.get_live(&key).len(), 1);
 
@@ -3077,10 +3372,10 @@ mod tests {
         let (sk, pk) = keypair();
         let key = [7u8; 16];
         // Packed layout: type(1) + keyword(16) + file(16) + ember(32) …
-        let mut good = padded(&[super::super::publish::RECORD_TYPE_KEYWORD]);
+        let mut good = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD]);
         good[33..65].fill(0xAB);
         assert!(store.store(key, good.clone(), sign(&sk, &good), pk, now_ts()));
-        let zero_ember = padded(&[super::super::publish::RECORD_TYPE_KEYWORD]);
+        let zero_ember = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD]);
         assert!(store.store(
             key,
             zero_ember.clone(),
@@ -3153,7 +3448,7 @@ mod tests {
         let (sk, pk) = keypair();
         for i in 0u8..64 {
             let key = [i; 16];
-            let mut data = padded(&[1]);
+            let mut data = padded_for(key, &[1]);
             data[33] = i;
             assert!(store.store(key, data.clone(), sign(&sk, &data), pk, now_ts()));
         }

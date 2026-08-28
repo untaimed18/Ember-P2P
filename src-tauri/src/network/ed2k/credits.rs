@@ -763,8 +763,7 @@ impl CreditManager {
         ratio1
             .min(ratio2)
             .min(ratio3)
-            .min(MAX_CREDIT_RATIO)
-            .max(MIN_CREDIT_RATIO)
+            .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
     }
 
     /// Queue score for upload slot selection.
@@ -1206,8 +1205,7 @@ impl CreditManager {
         ratio1
             .min(ratio2)
             .min(ratio3)
-            .min(MAX_CREDIT_RATIO)
-            .max(MIN_CREDIT_RATIO)
+            .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
     }
 
     /// Composite Ember queue score.
@@ -2262,7 +2260,7 @@ mod tests {
         let r = cm.get_ember_record(&pk).unwrap();
         assert_eq!(r.total_sessions, 1);
         assert_eq!(r.completed_sessions, 1);
-        let expected = (1_048_576u64 as f64 / 10.0).round() as u64;
+        let expected = (1_048_576_f64 / 10.0).round() as u64;
         assert_eq!(
             r.avg_upload_speed, expected,
             "first sample must seed EWMA without prior-zero mixing"

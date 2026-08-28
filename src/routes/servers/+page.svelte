@@ -317,7 +317,11 @@
     return /^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(host);
   }
 
+  let addingServer = $state(false);
+  let updatingMet = $state(false);
+
   async function handleAddServer() {
+    if (addingServer) return;
     const ip = newIp.trim();
     const portStr = newPort.trim();
     const portNum = portStr ? parseInt(portStr, 10) : 4661;
@@ -338,6 +342,7 @@
     const port = portNum;
 
     error = null;
+    addingServer = true;
     try {
       const msg = await addServer(ip, port, name);
       log(msg);
@@ -348,6 +353,8 @@
       await refresh();
     } catch (e: unknown) {
       error = toErrorMsg(e);
+    } finally {
+      addingServer = false;
     }
   }
 
@@ -418,12 +425,14 @@
   }
 
   async function handleUpdateServerMet() {
+    if (updatingMet) return;
     const url = serverMetUrl.trim();
     if (!url || !url.includes('://')) {
       error = m.servers_validation_met_url();
       return;
     }
     error = null;
+    updatingMet = true;
     log(m.servers_log_downloading_met({ url }));
     try {
       const result = await downloadServerMet(url);
@@ -434,6 +443,8 @@
       const msg = toErrorMsg(e);
       error = msg;
       log(m.servers_log_failed({ error: msg }));
+    } finally {
+      updatingMet = false;
     }
   }
 
@@ -884,7 +895,7 @@
               />
             </div>
           </div>
-          <button class="add-btn" onclick={handleAddServer}>{m.servers_add_server()}</button>
+          <button class="add-btn" onclick={handleAddServer} disabled={addingServer}>{m.servers_add_server()}</button>
         </div>
       </div>
 
@@ -902,7 +913,7 @@
               onkeydown={handleKeydownMet}
             />
           </div>
-          <button class="add-btn" onclick={handleUpdateServerMet}>{m.servers_update()}</button>
+          <button class="add-btn" onclick={handleUpdateServerMet} disabled={updatingMet}>{m.servers_update()}</button>
         </div>
       </div>
 

@@ -348,6 +348,12 @@ use crate::network::kad::types::cuint128_swap;
 // in `run_session`) so the outbound connect-and-serve path can build the same
 // concrete reader/writer the inbound path uses and hand them to the shared
 // session logic. An enum avoids dyn dispatch on the hot upload read/write path.
+// `large_enum_variant` wants the obfuscated arm boxed. That would undo the
+// line above: the variants differ because one carries the RC4 buffers inline,
+// and a box puts a pointer chase back on every read. The enum is built once
+// per connection and then read through in place, so the size difference is a
+// single move at setup, not a per-packet cost.
+#[allow(clippy::large_enum_variant)]
 enum StreamReader {
     Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
     Obfuscated(
@@ -361,6 +367,7 @@ enum StreamReader {
     /// `friend_connect::run_friend_session_over_transport`.
     Boxed(Box<dyn tokio::io::AsyncRead + Unpin + Send>),
 }
+#[allow(clippy::large_enum_variant)] // Same as `StreamReader` above.
 enum StreamWriter {
     Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
     Obfuscated(
@@ -1062,7 +1069,7 @@ impl FileRequestTracker {
         if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
             let mut by_age: Vec<((Ipv4Addr, [u8; 16]), std::time::Instant)> =
                 self.entries.iter().map(|(k, (t, _))| (*k, *t)).collect();
-            by_age.sort_by(|a, b| b.1.cmp(&a.1));
+            by_age.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             let keep: std::collections::HashSet<(Ipv4Addr, [u8; 16])> = by_age
                 .into_iter()
                 .take(MAX_FILE_REQUEST_ENTRIES)
@@ -2196,10 +2203,9 @@ pub(crate) fn combined_file_prio_and_credit(
     ) {
         return 0.0;
     }
-    let ratio = if ember_verified && ember_pubkey.is_some() {
-        cm.get_ember_score_ratio(ember_pubkey.expect("guarded"))
-    } else {
-        cm.get_score_ratio(user_hash, peer_ip)
+    let ratio = match ember_pubkey.filter(|_| ember_verified) {
+        Some(pubkey) => cm.get_ember_score_ratio(pubkey),
+        None => cm.get_score_ratio(user_hash, peer_ip),
     };
     10.0 * ratio * prio_num
 }
@@ -7581,9 +7587,9 @@ impl UploadHandler {
                             }
                             let ember_verified = secure_v2_authenticated;
                             queue[pos].ember_verified |= ember_verified;
-                            if !same_session {
-                                queue[pos].ember_pubkey = hello_caps.ember_pubkey;
-                            } else if queue[pos].ember_pubkey.is_none() {
+                            // A new session always re-learns the key; the same
+                            // session only fills one in if it had none.
+                            if !same_session || queue[pos].ember_pubkey.is_none() {
                                 queue[pos].ember_pubkey = hello_caps.ember_pubkey;
                             }
                             let my_score = score_queue_entry(
@@ -7594,11 +7600,11 @@ impl UploadHandler {
                                 is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
-                            let rank_val = compute_queue_rank(
+                            
+                            compute_queue_rank(
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, queue[pos].join_time,
-                            );
-                            rank_val
+                            )
                         } else if queue
                             .iter()
                             .filter(|e| {
@@ -7751,11 +7757,11 @@ impl UploadHandler {
                                 is_verified_friend,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
-                            let rank_val = compute_queue_rank(
+                            
+                            compute_queue_rank(
                                 &cm, &idx_snap, &queue,
                                 &queue_identity, my_score, join_time,
-                            );
-                            rank_val
+                            )
                         };
                         drop(queue);
                         drop(idx_snap);
@@ -7975,11 +7981,7 @@ impl UploadHandler {
                             if end > total_size {
                                 debug!("Peer requested range past file end: {end} > {total_size}");
                                 false
-                            } else if start >= end {
-                                false
-                            } else {
-                                true
-                            }
+                            } else { start < end }
                         })
                         .collect();
 
@@ -9056,9 +9058,9 @@ impl UploadHandler {
                                 if secure_v2_authenticated {
                                     entry.ember_verified = true;
                                 }
-                                if !same_session {
-                                    entry.ember_pubkey = hello_caps.ember_pubkey;
-                                } else if entry.ember_pubkey.is_none() {
+                                // A new session always re-learns the key; the
+                                // same session only fills one in if it had none.
+                                if !same_session || entry.ember_pubkey.is_none() {
                                     entry.ember_pubkey = hello_caps.ember_pubkey;
                                 }
                                 true
@@ -10393,12 +10395,12 @@ impl UploadHandler {
                                         stale.close();
                                         sessions.remove(&eh);
                                     }
-                                    if !sessions.contains_key(&eh) {
+                                    if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(eh) {
                                         let handle =
                                             EmberSessionHandle::new(outbound_tx.clone(), pk);
                                         ember_shutdown_rx = Some(handle.subscribe_shutdown());
                                         ember_session_handle = Some(handle.clone());
-                                        sessions.insert(eh, handle);
+                                        e.insert(handle);
                                         owns_ember_slot = true;
                                     }
                                 }
@@ -11821,11 +11823,12 @@ mod scoring_tests {
     #[test]
     fn peer_high_id_classification_trusts_client_id() {
         let addr: SocketAddr = "8.8.8.8:4662".parse().unwrap();
-        let mut caps = PeerCapabilities::default();
-        caps.tcp_port = 4662;
-
-        // Real LowID must NOT become dialable just because tcp_port is set.
-        caps.client_id = 12345; // < LOWID_THRESHOLD
+        let mut caps = PeerCapabilities {
+            tcp_port: 4662,
+            // Real LowID must NOT become dialable just because tcp_port is set.
+            client_id: 12345, // < LOWID_THRESHOLD
+            ..PeerCapabilities::default()
+        };
         assert!(!peer_is_high_id_for_queue(&caps, addr));
 
         caps.client_id = crate::network::ed2k::server::LOWID_THRESHOLD;
@@ -12198,7 +12201,7 @@ mod ember_session_handle_tests {
         // Even if two legacy sessions independently complete/replay their old
         // PoP transcript, neither supplies the v2-authenticated bit consumed
         // by authorization.
-        assert!(!crate::network::ed2k::LEGACY_FRIEND_AUTH_ENABLED);
+        const _: () = assert!(!crate::network::ed2k::LEGACY_FRIEND_AUTH_ENABLED);
         assert!(!friend_privileges_allowed(false, true));
         assert!(!friend_privileges_allowed(true, false));
         // Canonical outbound-slot ownership is not part of chat/browse auth.
@@ -12267,8 +12270,8 @@ mod ember_session_handle_tests {
     #[test]
     fn port_test_reserve_does_not_expand_ordinary_capacity() {
         assert_eq!(MAX_TOTAL_CONNECTIONS, 100);
-        assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
-        assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
+        const _: () = assert!(RESERVED_PORT_TEST_CONNECTIONS > 0);
+        const _: () = assert!(INBOUND_PREAUTH_DEADLINE_SECS < CLIENT_TIMEOUT_SECS);
     }
 
     #[tokio::test]

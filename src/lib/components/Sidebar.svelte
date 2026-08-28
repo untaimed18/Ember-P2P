@@ -3,17 +3,26 @@
   import { goto } from '$app/navigation';
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
+  import ShareEmberDialog from '$lib/components/ShareEmberDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import { totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { navItems, navIndexFromShortcutEvent, navShortcutDigit, type NavItem } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
+  import { appSettings } from '$lib/stores/settings';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
   let shortcutsOpen = $state(false);
+  let shareOpen = $state(false);
+  let visibleNav = $derived(
+    $appSettings?.ember_native_enabled === false
+      ? navItems.filter((item) => item.id !== 'channels')
+      : navItems,
+  );
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -132,6 +141,7 @@
   // previously the only signal was per-friend badges on /friends,
   // which required navigating there to notice activity.
   let totalUnreadChats = $derived($totalUnread);
+  let totalUnreadChannels = $derived($totalChannelUnread);
 
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
@@ -209,9 +219,9 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const idx = navIndexFromShortcutEvent(e);
-    if (idx === null || idx >= navItems.length) return;
+    if (idx === null || idx >= visibleNav.length) return;
     e.preventDefault();
-    navigateTo(navItems[idx].href);
+    navigateTo(visibleNav[idx].href);
   }
 
   onMount(() => {
@@ -239,7 +249,7 @@
   </div>
 
   <ul class="nav-list">
-    {#each navItems as item, i}
+    {#each visibleNav as item, i}
       {@const digit = navShortcutDigit(i)}
       <li>
         <a
@@ -295,6 +305,11 @@
                 <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                 <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
               </svg>
+            {:else if item.id === 'channels'}
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5h9a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 2.5V13H4a2 2 0 01-2-2V7a2 2 0 012-2z"/>
+                <path d="M16 7.5h.5A1.5 1.5 0 0118 9v3.5a1.5 1.5 0 01-1.5 1.5H16v1.5L14.5 14"/>
+              </svg>
             {:else if item.id === 'ember'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M10 2.5C11.5 5.5 14.5 6.5 14.5 11a4.5 4.5 0 0 1-9 0c0-1.6.7-2.8 1.6-3.7C8.3 6.2 8.8 5 8 3.5c1 .4 1.6 1 2 2z"/>
@@ -320,6 +335,9 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
+          {#if item.id === 'channels'}
+            <span class="beta-badge">{m.common_beta()}</span>
+          {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
@@ -345,6 +363,14 @@
                 ? m.sidebar_friend_requests_title_one()
                 : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
             >{pendingFriendRequestCount}</span>
+          {/if}
+          {#if item.id === 'channels' && totalUnreadChannels > 0}
+            <span
+              class="nav-badge"
+              title={totalUnreadChannels === 1
+                ? m.channels_unread_title_one()
+                : m.channels_unread_title_other({ count: totalUnreadChannels })}
+            >{totalUnreadChannels > 99 ? '99+' : totalUnreadChannels}</span>
           {/if}
         </a>
       </li>
@@ -416,6 +442,18 @@
       </span>
       <span>{m.sidebar_about()}</span>
     </button>
+    <button type="button" class="about-btn" onclick={() => (shareOpen = true)} title={m.sidebar_share_ember_title()} aria-label={m.sidebar_share_ember_title()}>
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="5" cy="10" r="2.2"/>
+          <circle cx="14.5" cy="5" r="2.2"/>
+          <circle cx="14.5" cy="15" r="2.2"/>
+          <line x1="7" y1="9.2" x2="12.4" y2="6"/>
+          <line x1="7" y1="10.8" x2="12.4" y2="14"/>
+        </svg>
+      </span>
+      <span>{m.sidebar_share_ember()}</span>
+    </button>
     <button
       type="button"
       class="about-btn collapse-btn"
@@ -440,6 +478,7 @@
   </div>
 
   <AboutDialog bind:open={aboutOpen} />
+  <ShareEmberDialog bind:open={shareOpen} />
   <KeyboardShortcutsDialog bind:open={shortcutsOpen} />
 </nav>
 
@@ -537,6 +576,7 @@
     padding: 4px 0 8px;
     flex: 1;
     min-height: 0;
+    overflow-y: auto;
   }
 
   .sidebar-footer {
@@ -642,8 +682,22 @@
     justify-content: center;
   }
 
-  .sidebar.collapsed .nav-label {
+  .sidebar.collapsed .nav-label,
+  .sidebar.collapsed .beta-badge {
     display: none;
+  }
+
+  .nav-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Parent row gap is 12px (icon to label). Pull the chip closer to the
+     word so it reads as a label suffix rather than a third column. */
+  .nav-list .beta-badge {
+    margin-inline-start: -6px;
   }
 
   .sidebar.collapsed .nav-badge {
@@ -657,7 +711,7 @@
     padding: 0 3px;
   }
 
-  .sidebar.collapsed .about-btn span:not(.about-icon) {
+  .sidebar.collapsed .about-btn span:not(.about-icon):not(.chats-dot) {
     display: none;
   }
 

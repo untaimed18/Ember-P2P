@@ -1435,7 +1435,7 @@ pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<
         // one reveal that followed the raw config string, so a download root
         // retargeted by a junction — the case `verify_root` exists to revoke —
         // would be opened anyway.
-        let dir = crate::security::filesystem::verify_existing_path(&dir, &[dl_folder.clone()])
+        let dir = crate::security::filesystem::verify_existing_path(&dir, std::slice::from_ref(&dl_folder))
             .map_err(|e| {
                 coded_ctx(
                     "transfers_invalid_path",
@@ -2125,7 +2125,7 @@ pub async fn recover_archive(
         ));
     }
     let canonical_part =
-        crate::security::filesystem::verify_existing_path(&part_path, &[dl_folder.clone()])
+        crate::security::filesystem::verify_existing_path(&part_path, std::slice::from_ref(&dl_folder))
             .map_err(|e| {
                 coded_ctx(
                     "transfers_part_path_invalid",
@@ -2135,7 +2135,7 @@ pub async fn recover_archive(
             })?;
     let canonical_temp = crate::security::filesystem::verify_existing_path(
         &std::path::PathBuf::from(&dl_folder).join("Temp"),
-        &[dl_folder.clone()],
+        std::slice::from_ref(&dl_folder),
     )
     .map_err(|e| {
         coded_ctx(

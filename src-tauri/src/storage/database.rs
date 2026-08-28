@@ -9,16 +9,24 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::network::ed2k::transfer::TransferFailureCode;
+use crate::network::ember::channel::{CHANNEL_MEMBERS_MAX, PRESENCE_FRESH_SECS};
 use crate::storage::paths;
 use crate::types::*;
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+/// Rooms kept in the Discover cache. Far more than a browse can usefully show,
+/// and small enough that the table stays a rounding error on disk.
+const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
+/// A cached listing this old has been absent from the DHT for many times the
+/// index record's own lifetime, so offering it would only send the user at a
+/// room that no longer answers.
+const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// Highest `schema_version` this build knows how to open. Opening a newer
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 27;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 39;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -46,6 +54,91 @@ pub type CreditRowRef<'a> = (
     Option<&'a [u8; 16]>,
     bool,
 );
+
+/// One public room remembered from an earlier Discover walk.
+///
+/// A hint for what to draw while the DHT is being asked again, never an
+/// assertion that the room is still there. The `last_seen` column behind this
+/// orders and expires the cache in SQL; nothing in Rust needs to read it.
+#[derive(Debug, Clone)]
+pub struct CachedChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+}
+
+/// One joined channel, as listed in the Channels page.
+#[derive(Debug, Clone)]
+pub struct StoredChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+    pub visibility: String,
+    pub is_owner: bool,
+    pub topic: String,
+    pub welcome: String,
+    pub joined_at: i64,
+    pub last_active: i64,
+    pub member_count: i64,
+    pub unread: i64,
+    /// Empty unless this room's owner published a successor mapping.
+    pub successor_id: String,
+    /// Empty unless we joined this room by following a handoff.
+    pub predecessor_id: String,
+    /// The owner's user pubkey (64-char hex) as published in their signed
+    /// moderation record, or empty when we have not learned it. Load-bearing:
+    /// it is the only thing that lets a member refuse a moderator's ban aimed
+    /// at the owner.
+    pub owner_pubkey: String,
+    /// Current content-key epoch for a private room. 0 means the room has
+    /// never rotated and still uses `join_secret` as minted.
+    pub key_epoch: i64,
+    /// Owner-nominated successor (64-char hex), empty when unset.
+    pub successor_nominee: String,
+    /// Days of owner silence before that nomination may be claimed. 0 disables
+    /// succession, which leaves the room frozen if the owner never returns.
+    pub claim_after_days: i64,
+    /// Epoch the owner last announced. Ahead of `key_epoch` means we are behind
+    /// and have an epoch record to go and fetch.
+    pub key_epoch_wanted: i64,
+    /// Timestamp of the newest owner-signed moderation record applied here.
+    /// Doubles as the owner's liveness signal: they republish on a timer, so
+    /// silence past `claim_after_days` is what lets a nomination be claimed.
+    pub moderation_updated_at: i64,
+    /// When we last got an answer back from a search for that record. Silence is
+    /// only evidence of an absent owner if we have been asking.
+    pub moderation_checked_at: i64,
+    /// Whether this device is currently inside the room. Leave walks out
+    /// without deleting the local row, so Join can reopen the same door.
+    pub in_room: bool,
+    /// Owner has permanently deleted this room. The row stays so the owner
+    /// cannot recreate the same name by accident on this device.
+    pub deleted: bool,
+    /// The owner has asked that only they hand out invites. Carried on their
+    /// signed moderation record; false for rooms whose owner never set it.
+    pub invites_owner_only: bool,
+    /// Seconds a member must wait between messages, 0 when the owner has not
+    /// turned slow mode on. Carried on the signed moderation record.
+    pub slow_mode_secs: i64,
+}
+
+impl StoredChannel {
+    /// Presence, send, and gossip: only while we are actually in the room
+    /// and it has not been tombstoned.
+    pub fn in_room_now(&self) -> bool {
+        self.in_room && !self.deleted
+    }
+}
+
+/// One member of a joined channel. `member_pubkey` is 64-char hex.
+#[derive(Debug, Clone)]
+pub struct StoredChannelMember {
+    pub member_pubkey: String,
+    pub nickname: String,
+    pub last_seen: i64,
+    pub banned: bool,
+    pub moderator: bool,
+}
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -66,6 +159,9 @@ pub const CHAT_FAILED: i64 = 2;
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
+const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
+const CHANNEL_SECRET_AAD_DOMAIN: &[u8] = b"ember-channel-secret-v1\0";
+const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -411,6 +507,154 @@ impl Database {
             })?;
         String::from_utf8(plaintext)
             .map_err(|_| anyhow::anyhow!("Chat history row {id} decrypted to invalid UTF-8"))
+    }
+
+    fn channel_secret_aad(channel_id: &str, label: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHANNEL_SECRET_AAD_DOMAIN.len() + 4 + channel_id.len() + 4 + label.len(),
+        );
+        aad.extend_from_slice(CHANNEL_SECRET_AAD_DOMAIN);
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad.extend_from_slice(&(label.len() as u32).to_le_bytes());
+        aad.extend_from_slice(label.as_bytes());
+        aad
+    }
+
+    fn encrypt_channel_secret(
+        key: &[u8; 32],
+        channel_id: &str,
+        label: &str,
+        plaintext: &[u8; 32],
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_secret_aad(channel_id, label);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt channel secret"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!(
+            "{CHANNEL_SECRET_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        ))
+    }
+
+    fn decrypt_channel_secret(
+        key: &[u8; 32],
+        channel_id: &str,
+        label: &str,
+        stored: &str,
+    ) -> anyhow::Result<[u8; 32]> {
+        let encoded = stored
+            .strip_prefix(CHANNEL_SECRET_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("Channel secret for {channel_id} is not encrypted"))?;
+        let envelope = STANDARD_NO_PAD.decode(encoded).map_err(|_| {
+            anyhow::anyhow!("Channel secret for {channel_id} has invalid ciphertext")
+        })?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            anyhow::bail!("Channel secret for {channel_id} is truncated");
+        }
+        let aad = Self::channel_secret_aad(channel_id, label);
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("Channel secret authentication failed for {channel_id}")
+            })?;
+        <[u8; 32]>::try_from(plaintext)
+            .map_err(|_| anyhow::anyhow!("Channel secret for {channel_id} has invalid length"))
+    }
+
+    fn channel_row_aad(id: i64, channel_id: &str, direction: &str, timestamp: i64) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHANNEL_MSG_AAD_DOMAIN.len() + 8 + 8 + 4 + channel_id.len() + 4 + direction.len(),
+        );
+        aad.extend_from_slice(CHANNEL_MSG_AAD_DOMAIN);
+        aad.extend_from_slice(&id.to_le_bytes());
+        aad.extend_from_slice(&timestamp.to_le_bytes());
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad.extend_from_slice(&(direction.len() as u32).to_le_bytes());
+        aad.extend_from_slice(direction.as_bytes());
+        aad
+    }
+
+    fn encrypt_channel_message_body(
+        key: &[u8; 32],
+        id: i64,
+        channel_id: &str,
+        direction: &str,
+        timestamp: i64,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_row_aad(id, channel_id, direction, timestamp);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt channel message"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!(
+            "{CHAT_CIPHERTEXT_PREFIX}{}",
+            STANDARD_NO_PAD.encode(envelope)
+        ))
+    }
+
+    fn decrypt_channel_message_body(
+        key: &[u8; 32],
+        id: i64,
+        channel_id: &str,
+        direction: &str,
+        timestamp: i64,
+        stored: &str,
+    ) -> anyhow::Result<String> {
+        let encoded = stored
+            .strip_prefix(CHAT_CIPHERTEXT_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("Channel message {id} is not encrypted"))?;
+        let envelope = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("Channel message {id} has invalid ciphertext"))?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            anyhow::bail!("Channel message {id} is truncated");
+        }
+        let aad = Self::channel_row_aad(id, channel_id, direction, timestamp);
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Channel message {id} failed authentication"))?;
+        String::from_utf8(plaintext)
+            .map_err(|_| anyhow::anyhow!("Channel message {id} decrypted to invalid UTF-8"))
     }
 
     fn is_corruption_error(error: &anyhow::Error) -> bool {
@@ -1220,6 +1464,329 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "transfers", "ember_file_hash", "TEXT")?;
             set_version(&tx, 27)?;
+            tx.commit()?;
+        }
+
+        if version < 28 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channels (
+                    channel_id TEXT PRIMARY KEY,
+                    pubkey TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    visibility TEXT NOT NULL,
+                    is_owner INTEGER NOT NULL DEFAULT 0,
+                    owner_seed TEXT,
+                    join_secret TEXT,
+                    topic TEXT NOT NULL DEFAULT '',
+                    welcome TEXT NOT NULL DEFAULT '',
+                    joined_at INTEGER NOT NULL,
+                    last_active INTEGER NOT NULL DEFAULT 0,
+                    presence_published_at INTEGER NOT NULL DEFAULT 0,
+                    moderation_updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS channel_members (
+                    channel_id TEXT NOT NULL,
+                    member_pubkey TEXT NOT NULL,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    last_seen INTEGER NOT NULL DEFAULT 0,
+                    banned INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (channel_id, member_pubkey)
+                );
+                CREATE TABLE IF NOT EXISTS channel_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT NOT NULL,
+                    sender_pubkey TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0,
+                    msg_id TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_dedup
+                    ON channel_messages(channel_id, msg_id);
+                CREATE INDEX IF NOT EXISTS idx_channel_messages_chan
+                    ON channel_messages(channel_id, id);
+                CREATE INDEX IF NOT EXISTS idx_channel_members_chan
+                    ON channel_members(channel_id);",
+            )?;
+            set_version(&tx, 28)?;
+            tx.commit()?;
+        }
+
+        if version < 29 {
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "moderation_updated_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 29)?;
+            tx.commit()?;
+        }
+
+        if version < 30 {
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_members",
+                "moderator",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_members",
+                "ban_revised_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 30)?;
+            tx.commit()?;
+        }
+
+        if version < 31 {
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "successor_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "predecessor_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "pending_successor",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "pending_handoff_version",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_handoff_pending (
+                    old_channel_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    successor_pubkey TEXT NOT NULL,
+                    owner_seed TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS channel_attachments (
+                    channel_id TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    sender_pubkey TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, digest)
+                );",
+            )?;
+            set_version(&tx, 31)?;
+            tx.commit()?;
+        }
+
+        if version < 32 {
+            // The owner's own user identity, learned from their signed
+            // moderation record. Members need it to refuse a moderator's ban
+            // gossip that names the owner: nothing else on the wire says which
+            // pubkey owns a room, so before this every member applied such a
+            // ban and silently dropped the owner's messages. Empty means "not
+            // learned yet" — no record seen, or one predating the field.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "owner_pubkey",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 32)?;
+            tx.commit()?;
+        }
+
+        if version < 33 {
+            // Private rooms rotate their content key so a ban can actually
+            // evict: the join secret used to be minted once and baked into
+            // every invite, which meant anyone who ever held one could read
+            // the room forever. Each epoch's secret is stored under the chat
+            // key like the others; `channels.key_epoch` names the current one,
+            // and epoch 0 is the pre-rotation `join_secret` still in place.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "key_epoch",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_key_epochs (
+                    channel_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    secret_enc TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, epoch)
+                );",
+            )?;
+            // Succession: who may take a room over once its owner has gone
+            // quiet, and for how long they must have been quiet. Both come
+            // from the owner-signed moderation record. Either one empty or
+            // zero means the owner has not set it up, and the room simply
+            // freezes if they vanish — the status quo.
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "successor_nominee",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "claim_after_days",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            // The epoch the owner says is current, against `key_epoch` which is
+            // the newest we actually hold a key for. Wanted ahead of held is
+            // what sends a member looking for the record sealed to them.
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "key_epoch_wanted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            // When a search for this room's owner record last came back, as
+            // against `moderation_updated_at` which is how new that record was.
+            // Succession needs both: an owner-silence window is only meaningful
+            // if we have actually been asking, and locally "they have gone
+            // quiet" is otherwise indistinguishable from "we have not looked".
+            // Persisted rather than kept in memory so a restart cannot make a
+            // month-old snapshot look freshly confirmed.
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "moderation_checked_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 33)?;
+            tx.commit()?;
+        }
+
+        if version < 34 {
+            // Room attachments are gone. They broadcast a file to everyone in
+            // the room whether or not anybody asked for it, capped at 256 KB,
+            // with no acknowledgement and no way to resume — so in practice a
+            // transfer died a few kilobytes in and could not recover. Ember
+            // Transfer replaces it: one member offers a file to one member,
+            // who has to accept before any bytes move.
+            //
+            // The sealed blobs these rows pointed at live outside the database,
+            // so startup removes the `channel-files` directory separately.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("DROP TABLE IF EXISTS channel_attachments;")?;
+            set_version(&tx, 34)?;
+            tx.commit()?;
+        }
+
+        if version < 35 {
+            // Discover began from nothing on every open: a cold DHT walk across
+            // sixteen index shards with an empty list on screen until the
+            // slowest of them answered, which on a table that had just started
+            // warming meant the better part of a minute showing nothing. This
+            // remembers what the last walk turned up so the browse can open on
+            // it and replace the rows as fresh records land. Cache only — the
+            // DHT stays the authority, and a listing here is never treated as
+            // proof the room is still alive.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_index_cache (
+                    channel_id TEXT PRIMARY KEY,
+                    pubkey TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 35)?;
+            tx.commit()?;
+        }
+
+        if version < 36 {
+            // The author's own signature over a chat line, hex, empty when we
+            // do not have one.
+            //
+            // History sync used to re-encode a stored message under whatever
+            // `sender_pubkey` the row carried, which meant any member answering
+            // a catch-up request could invent a conversation and attribute it to
+            // anyone. Chat lines now carry an Ed25519 signature from their
+            // author, and a re-serve has to replay that original rather than
+            // mint a new one, so the signature has to survive in the row.
+            //
+            // Rows written before this are left empty and simply are not
+            // re-served; their text is still readable locally.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "author_sig",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 36)?;
+            tx.commit()?;
+        }
+
+        if version < 37 {
+            // Membership is presence: Leave walks out without wiping the row,
+            // so Join can reopen the same door. Existing rows are rooms this
+            // device already joined, so they start inside.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "in_room",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "deleted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 37)?;
+            tx.commit()?;
+        }
+
+        if version < 38 {
+            // Owner-only invites. Defaults off, which is the behaviour every
+            // room had before the flag existed, so an upgraded database keeps
+            // letting members invite until an owner says otherwise.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "invites_owner_only",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 38)?;
+            tx.commit()?;
+        }
+
+        if version < 39 {
+            // Owner slow mode. Zero is off, which is how every room behaved
+            // before the field existed, so an upgraded database throttles
+            // nobody until an owner asks for it.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "slow_mode_secs",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 39)?;
             tx.commit()?;
         }
 
@@ -3392,6 +3959,1663 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn list_channels(&self) -> anyhow::Result<Vec<StoredChannel>> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                    c.joined_at, c.last_active,
+                    (SELECT COUNT(*) FROM channel_members m
+                     WHERE m.channel_id = c.channel_id
+                       AND m.banned = 0
+                       AND m.last_seen >= unixepoch() - {PRESENCE_FRESH_SECS}),
+                    (SELECT COUNT(*) FROM channel_messages msg
+                     WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
+                    c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
+                    c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
+                    c.moderation_updated_at, c.moderation_checked_at,
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+             FROM channels c
+             ORDER BY c.last_active DESC, c.joined_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| Self::stored_channel_from_row(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Joined-room rows without the two COUNT(*) subqueries. The network loop
+    /// ticks this once a second; unread and historical member totals are UI
+    /// figures it does not read.
+    pub fn list_channels_lite(&self) -> anyhow::Result<Vec<StoredChannel>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                    c.joined_at, c.last_active, 0, 0,
+                    c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
+                    c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
+                    c.moderation_updated_at, c.moderation_checked_at,
+                    c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+             FROM channels c
+             ORDER BY c.last_active DESC, c.joined_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Self::stored_channel_from_row(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Presence-fresh members, including us if we are not banned. `1`
+    /// means nobody else has announced recently — the empty-room poll case.
+    pub fn count_fresh_channel_members(
+        &self,
+        channel_id: &str,
+        now: i64,
+        fresh_secs: i64,
+    ) -> anyhow::Result<i64> {
+        let cutoff = now.saturating_sub(fresh_secs);
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_members
+             WHERE channel_id = ?1 AND banned = 0 AND last_seen >= ?2",
+            params![channel_id, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Remember what a Discover walk turned up.
+    ///
+    /// Upsert rather than replace-all, because a walk that lost a shard to a
+    /// timeout still knows everything the previous one did about the other
+    /// fifteen. Clearing the table each time would empty the cache precisely
+    /// when the network is least able to refill it.
+    pub fn cache_channel_listings(&self, rows: &[(String, String, String)]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO channel_index_cache (channel_id, pubkey, name, last_seen)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    pubkey = excluded.pubkey,
+                    name = excluded.name,
+                    last_seen = excluded.last_seen",
+            )?;
+            for (channel_id, pubkey, name) in rows {
+                stmt.execute(params![channel_id, pubkey, name, now])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM channel_index_cache WHERE last_seen < ?1",
+            params![now - CHANNEL_CACHE_MAX_AGE_SECS],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_index_cache WHERE channel_id NOT IN (
+                 SELECT channel_id FROM channel_index_cache
+                 ORDER BY last_seen DESC LIMIT ?1
+             )",
+            params![MAX_CHANNEL_CACHE_ROWS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rooms an earlier Discover walk found, most recently seen first.
+    pub fn list_cached_channels(&self) -> anyhow::Result<Vec<CachedChannel>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, pubkey, name FROM channel_index_cache
+             ORDER BY last_seen DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CachedChannel {
+                    channel_id: row.get(0)?,
+                    pubkey: row.get(1)?,
+                    name: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_channel(&self, channel_id: &str) -> anyhow::Result<Option<StoredChannel>> {
+        let conn = self.conn.lock();
+        Self::get_channel_locked(&conn, channel_id)
+    }
+
+    fn get_channel_locked(
+        conn: &Connection,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<StoredChannel>> {
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT c.channel_id, c.pubkey, c.name, c.visibility, c.is_owner, c.topic, c.welcome,
+                        c.joined_at, c.last_active,
+                        (SELECT COUNT(*) FROM channel_members m
+                         WHERE m.channel_id = c.channel_id
+                           AND m.banned = 0
+                           AND m.last_seen >= unixepoch() - {PRESENCE_FRESH_SECS}),
+                        (SELECT COUNT(*) FROM channel_messages msg
+                         WHERE msg.channel_id = c.channel_id AND msg.read = 0 AND msg.direction = 'received'),
+                        c.successor_id, c.predecessor_id, c.owner_pubkey, c.key_epoch,
+                        c.successor_nominee, c.claim_after_days, c.key_epoch_wanted,
+                        c.moderation_updated_at, c.moderation_checked_at,
+                        c.in_room, c.deleted, c.invites_owner_only, c.slow_mode_secs
+                 FROM channels c WHERE c.channel_id = ?1"
+                ),
+                params![channel_id],
+                |row| Self::stored_channel_from_row(row),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn stored_channel_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
+        Ok(StoredChannel {
+            channel_id: row.get(0)?,
+            pubkey: row.get(1)?,
+            name: row.get(2)?,
+            visibility: row.get(3)?,
+            is_owner: row.get::<_, i64>(4)? != 0,
+            topic: row.get(5)?,
+            welcome: row.get(6)?,
+            joined_at: row.get(7)?,
+            last_active: row.get(8)?,
+            member_count: row.get(9)?,
+            unread: row.get(10)?,
+            successor_id: row.get::<_, String>(11).unwrap_or_default(),
+            predecessor_id: row.get::<_, String>(12).unwrap_or_default(),
+            owner_pubkey: row.get::<_, String>(13).unwrap_or_default(),
+            key_epoch: row.get::<_, i64>(14).unwrap_or(0),
+            successor_nominee: row.get::<_, String>(15).unwrap_or_default(),
+            claim_after_days: row.get::<_, i64>(16).unwrap_or(0),
+            key_epoch_wanted: row.get::<_, i64>(17).unwrap_or(0),
+            moderation_updated_at: row.get::<_, i64>(18).unwrap_or(0),
+            moderation_checked_at: row.get::<_, i64>(19).unwrap_or(0),
+            in_room: row.get::<_, i64>(20).unwrap_or(1) != 0,
+            deleted: row.get::<_, i64>(21).unwrap_or(0) != 0,
+            invites_owner_only: row.get::<_, i64>(22).unwrap_or(0) != 0,
+            slow_mode_secs: row.get::<_, i64>(23).unwrap_or(0),
+        })
+    }
+
+    pub fn insert_channel(
+        &self,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        is_owner: bool,
+        owner_seed: Option<&[u8; 32]>,
+        join_secret: Option<&[u8; 32]>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        self.insert_channel_locked(
+            &conn,
+            channel_id,
+            pubkey,
+            name,
+            visibility,
+            is_owner,
+            owner_seed,
+            join_secret,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_channel_locked(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        is_owner: bool,
+        owner_seed: Option<&[u8; 32]>,
+        join_secret: Option<&[u8; 32]>,
+    ) -> anyhow::Result<()> {
+        let owner_enc = match owner_seed {
+            Some(seed) => Some(Self::encrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "owner",
+                seed,
+            )?),
+            None => None,
+        };
+        let join_enc = match join_secret {
+            Some(secret) => Some(Self::encrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "join",
+                secret,
+            )?),
+            None => None,
+        };
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO channels (channel_id, pubkey, name, visibility, is_owner, owner_seed,
+                 join_secret, topic, welcome, joined_at, last_active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', '', ?8, ?8)",
+            params![
+                channel_id,
+                pubkey,
+                name,
+                visibility,
+                if is_owner { 1 } else { 0 },
+                owner_enc,
+                join_enc,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Walk in or out without dropping secrets or history.
+    pub fn set_channel_in_room(&self, channel_id: &str, in_room: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET in_room = ?2 WHERE channel_id = ?1 AND deleted = 0",
+            params![channel_id, if in_room { 1 } else { 0 }],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Owner-only permanent delete on this device: leave the door and keep the
+    /// row so the same name is not minted again locally.
+    pub fn tombstone_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Walk this device out of rooms the directory lists as deleted.
+    ///
+    /// Deliberately *not* a tombstone. The directory is an unsigned hint —
+    /// nothing in the response proves the room's owner asked for this — and
+    /// `deleted` is one-way: it hides the room, refuses re-entry, and there is
+    /// no way back from the UI. A directory bug or a compromised server could
+    /// therefore erase every room a user belongs to, private ones included,
+    /// whose ids the server has no authority over in the first place.
+    ///
+    /// Walking out is the recoverable half of the same action: the row, its
+    /// history and its join secret stay, the room reappears as a Join, and
+    /// re-entry is local so it works even while the directory still lies.
+    /// Owners are skipped — an owner's own delete goes through
+    /// [`Self::tombstone_channel`], so a row saying we own it and a directory
+    /// saying it is gone means the directory is the one that is wrong.
+    pub fn walk_out_deleted_channels(&self, deleted_ids: &[String]) -> anyhow::Result<Vec<String>> {
+        if deleted_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut walked = Vec::new();
+        for id in deleted_ids {
+            let n = conn.execute(
+                "UPDATE channels SET in_room = 0 \
+                 WHERE channel_id = ?1 AND deleted = 0 AND is_owner = 0 AND in_room = 1",
+                params![id],
+            )?;
+            if n > 0 {
+                walked.push(id.clone());
+            }
+        }
+        Ok(walked)
+    }
+
+    /// Forget a channel. A ban recorded against `keep_banned_member` survives,
+    /// because a ban belongs to the room rather than to the membership: wiping
+    /// it made leaving and rejoining a client-side ban reset, and the local
+    /// flag is what stops the composer accepting sends that every remaining
+    /// member will discard. Pass `None` when there is nothing to preserve
+    /// (rolling back a room that was never published).
+    pub fn delete_channel(
+        &self,
+        channel_id: &str,
+        keep_banned_member: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM channel_messages WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        // Any half-finished handoff goes with the room. Left behind it is an
+        // unreachable row keyed to a channel that no longer exists.
+        tx.execute(
+            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        match keep_banned_member {
+            Some(pk) => tx.execute(
+                "DELETE FROM channel_members
+                 WHERE channel_id = ?1
+                   AND NOT (banned = 1 AND lower(member_pubkey) = lower(?2))",
+                params![channel_id, pk],
+            )?,
+            None => tx.execute(
+                "DELETE FROM channel_members WHERE channel_id = ?1",
+                params![channel_id],
+            )?,
+        };
+        let n = tx.execute(
+            "DELETE FROM channels WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn load_channel_owner_seed(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock();
+        self.load_channel_secret_locked(&conn, channel_id, "owner_seed", "owner")
+    }
+
+    pub fn load_channel_join_secret(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock();
+        self.load_channel_secret_locked(&conn, channel_id, "join_secret", "join")
+    }
+
+    /// The secret a room is *currently* sealing with: its newest epoch, or the
+    /// original `join_secret` if it has never rotated.
+    ///
+    /// A handoff that carries a secret forward has to carry this one. Rotation
+    /// writes new keys to `channel_key_epochs` and never touches `join_secret`,
+    /// so inheriting that column would hand the successor room the key the last
+    /// ban rotated away from — letting an evicted member who kept their original
+    /// invite read the new room, and quietly undoing the eviction.
+    fn load_current_channel_secret_locked(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let newest: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT epoch, secret_enc FROM channel_key_epochs
+                 WHERE channel_id = ?1 ORDER BY epoch DESC LIMIT 1",
+                params![channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((epoch, enc)) = newest {
+            return Ok(Some(Self::decrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                &format!("epoch{epoch}"),
+                &enc,
+            )?));
+        }
+        self.load_channel_secret_locked(conn, channel_id, "join_secret", "join")
+    }
+
+    /// Shared body for the two secret loaders, callable while the connection
+    /// lock is already held — the handoff needs to read and write in one
+    /// transaction, and taking the lock again inside it would deadlock.
+    fn load_channel_secret_locked(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+        column: &str,
+        label: &str,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let stored: Option<String> = conn
+            .query_row(
+                &format!("SELECT {column} FROM channels WHERE channel_id = ?1"),
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        match stored {
+            Some(enc) => Ok(Some(Self::decrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                label,
+                &enc,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// How many content-key epochs a room keeps.
+    ///
+    /// A member who was offline across a rotation still has to read what
+    /// arrived in the gap, and history sync replays messages sealed under
+    /// whichever epoch was current when they were sent. Four is the margin;
+    /// past that a member needs a fresh invite, which is the same position an
+    /// evicted member is in and the point of rotating at all.
+    pub const CHANNEL_KEY_EPOCHS_KEPT: usize = 4;
+
+    /// Record a rotated content key and make it current, dropping epochs past
+    /// the retention window.
+    pub fn insert_channel_key_epoch(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        secret: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let enc = Self::encrypt_channel_secret(
+            self.require_chat_key()?,
+            channel_id,
+            &format!("epoch{epoch}"),
+            secret,
+        )?;
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO channel_key_epochs (channel_id, epoch, secret_enc, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(channel_id, epoch) DO UPDATE SET secret_enc = excluded.secret_enc",
+            params![channel_id, epoch, enc, chrono::Utc::now().timestamp()],
+        )?;
+        // Never walk the epoch backwards: an out-of-order record must not
+        // demote the room to an older key for everything it sends next.
+        tx.execute(
+            "UPDATE channels SET key_epoch = ?2 WHERE channel_id = ?1 AND key_epoch < ?2",
+            params![channel_id, epoch],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_key_epochs WHERE channel_id = ?1 AND epoch NOT IN (
+                 SELECT epoch FROM channel_key_epochs WHERE channel_id = ?1
+                 ORDER BY epoch DESC LIMIT ?2
+             )",
+            params![channel_id, Self::CHANNEL_KEY_EPOCHS_KEPT as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Undo a rotation whose moderation snapshot never got committed.
+    ///
+    /// The epoch and the snapshot announcing it have to land together: the owner
+    /// seals new traffic with whatever `key_epoch` says, and members only go
+    /// looking for a key the snapshot names. Keeping a rotation whose snapshot
+    /// failed would leave the owner talking under a key nobody knows to fetch.
+    pub fn rollback_channel_key_epoch(&self, channel_id: &str, epoch: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM channel_key_epochs WHERE channel_id = ?1 AND epoch = ?2",
+            params![channel_id, epoch],
+        )?;
+        tx.execute(
+            "UPDATE channels SET key_epoch = (
+                 SELECT COALESCE(MAX(epoch), 0) FROM channel_key_epochs WHERE channel_id = ?1
+             ) WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retained content-key secrets for a room, newest epoch first.
+    ///
+    /// Callers try these in order, so the current epoch is attempted before
+    /// any older one. Empty when the room has never rotated — the caller then
+    /// falls back to `load_channel_join_secret`, which is epoch 0.
+    pub fn load_channel_key_epochs(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<(i64, [u8; 32])>> {
+        let stored: Vec<(i64, String)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT epoch, secret_enc FROM channel_key_epochs
+                 WHERE channel_id = ?1 ORDER BY epoch DESC",
+            )?;
+            let mapped = stmt.query_map(params![channel_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if stored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chat_key = self.require_chat_key()?;
+        let mut out = Vec::with_capacity(stored.len());
+        for (epoch, enc) in stored {
+            match Self::decrypt_channel_secret(
+                chat_key,
+                channel_id,
+                &format!("epoch{epoch}"),
+                &enc,
+            ) {
+                Ok(secret) => out.push((epoch, secret)),
+                // One unreadable epoch must not hide the others: the current
+                // key may well be fine and the room still usable.
+                Err(error) => {
+                    tracing::warn!(
+                        "Channel {channel_id} epoch {epoch} secret is unreadable: {error}"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Note that a search for this room's owner-signed record came back.
+    ///
+    /// Recorded when results are drained rather than when the search starts:
+    /// asking and getting no answer means we could not reach anyone, which is
+    /// not evidence that the owner has stopped publishing.
+    pub fn touch_channel_moderation_checked(
+        &self,
+        channel_id: &str,
+        checked_at: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET moderation_checked_at = ?2
+             WHERE channel_id = ?1 AND moderation_checked_at < ?2",
+            params![channel_id, checked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Record the owner's succession settings. Empty nominee or zero days
+    /// disables it, which leaves the room frozen if the owner never returns.
+    pub fn set_channel_succession(
+        &self,
+        channel_id: &str,
+        nominee: &str,
+        claim_after_days: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET successor_nominee = ?2, claim_after_days = ?3
+             WHERE channel_id = ?1",
+            params![channel_id, nominee, claim_after_days],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_channel_pending_handoff(
+        &self,
+        channel_id: &str,
+        successor_member: &str,
+        version: u64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET pending_successor = ?2, pending_handoff_version = ?3
+             WHERE channel_id = ?1",
+            params![channel_id, successor_member, version as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_pending_handoff(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<(String, u64)>> {
+        let conn = self.conn.lock();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT pending_successor, pending_handoff_version FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(pk, ver)| {
+            if pk.is_empty() || ver <= 0 {
+                None
+            } else {
+                Some((pk, ver as u64))
+            }
+        }))
+    }
+
+    pub fn store_handoff_pending_seed(
+        &self,
+        old_channel_id: &str,
+        version: u64,
+        successor_pubkey: &str,
+        owner_seed: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let enc = Self::encrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            owner_seed,
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO channel_handoff_pending (old_channel_id, version, successor_pubkey, owner_seed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(old_channel_id) DO UPDATE SET
+                version = excluded.version,
+                successor_pubkey = excluded.successor_pubkey,
+                owner_seed = excluded.owner_seed,
+                created_at = excluded.created_at",
+            params![old_channel_id, version as i64, successor_pubkey, enc, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_handoff_pending_row(
+        &self,
+        old_channel_id: &str,
+    ) -> anyhow::Result<Option<(String, u64, [u8; 32])>> {
+        let stored: Option<(String, i64, String)> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT successor_pubkey, version, owner_seed FROM channel_handoff_pending
+                 WHERE old_channel_id = ?1",
+                params![old_channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+        };
+        let Some((pk, ver, enc)) = stored else {
+            return Ok(None);
+        };
+        let seed = Self::decrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            &enc,
+        )?;
+        Ok(Some((pk, ver as u64, seed)))
+    }
+
+    pub fn load_handoff_pending_seed(
+        &self,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        version: u64,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let Some((pk, ver, seed)) = self.load_handoff_pending_row(old_channel_id)? else {
+            return Ok(None);
+        };
+        if pk != successor_pubkey || ver != version {
+            return Ok(None);
+        }
+        Ok(Some(seed))
+    }
+
+    pub fn clear_handoff_pending(&self, old_channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![old_channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Follow an owner-signed handoff: create the successor room, copy local
+    /// history, and mark the old id as superseded. Never copies `owner_seed`
+    /// from the old row.
+    pub fn apply_channel_handoff(
+        &self,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        successor_channel_id: &str,
+        _version: u64,
+        keep_join_secret: bool,
+        successor_owner_seed: Option<&[u8; 32]>,
+    ) -> anyhow::Result<bool> {
+        // The identity-critical part runs as one transaction. Each step used to
+        // take the connection lock on its own, so a crash between them could
+        // leave a successor room with no seed, or an old room pointed at a
+        // successor that was never created — states nothing later repairs.
+        //
+        // History replay stays outside it: 5,000 inserts is too long to hold
+        // the write lock for, and it is safe to resume because `predecessor_id`
+        // is already recorded and the message IDs are deterministic.
+        //
+        // What happens next is decided inside the transaction but acted on after
+        // the lock is released — `clear_handoff_pending` and the replay both
+        // take the lock themselves, and this mutex is not reentrant.
+        let _replayed = {
+            let conn = self.conn.lock();
+            let tx = conn.unchecked_transaction()?;
+            let old = match Self::get_channel_locked(&tx, old_channel_id)? {
+                Some(ch) => ch,
+                None => return Ok(false),
+            };
+            if !old.successor_id.is_empty() {
+                if old.successor_id != successor_channel_id {
+                    return Ok(false);
+                }
+                // Already applied. Still worth a pass: the nominee may be
+                // installing the seed for a successor row a previous run
+                // created without it.
+                if let Some(seed) = successor_owner_seed {
+                    if self
+                        .load_channel_secret_locked(&tx, successor_channel_id, "owner_seed", "owner")?
+                        .is_none()
+                    {
+                        let enc = Self::encrypt_channel_secret(
+                            self.require_chat_key()?,
+                            successor_channel_id,
+                            "owner",
+                            seed,
+                        )?;
+                        tx.execute(
+                            "UPDATE channels SET is_owner = 1, owner_seed = ?2
+                             WHERE channel_id = ?1",
+                            params![successor_channel_id, enc],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+                true
+            } else {
+                let successor_exists =
+                    Self::get_channel_locked(&tx, successor_channel_id)?.is_some();
+                if successor_exists {
+                    // The owner may have created the successor row first,
+                    // without the new seed. The named successor installs it
+                    // here — never by copying the old `owner_seed`.
+                    if let Some(seed) = successor_owner_seed {
+                        let enc = Self::encrypt_channel_secret(
+                            self.require_chat_key()?,
+                            successor_channel_id,
+                            "owner",
+                            seed,
+                        )?;
+                        tx.execute(
+                            "UPDATE channels SET is_owner = 1, owner_seed = ?2
+                             WHERE channel_id = ?1",
+                            params![successor_channel_id, enc],
+                        )?;
+                    }
+                } else {
+                    let join_secret = if keep_join_secret {
+                        self.load_current_channel_secret_locked(&tx, old_channel_id)?
+                    } else {
+                        hex::decode(successor_pubkey)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .map(|p| crate::network::ember::channel::public_join_secret(&p))
+                    };
+                    self.insert_channel_locked(
+                        &tx,
+                        successor_channel_id,
+                        successor_pubkey,
+                        &old.name,
+                        &old.visibility,
+                        successor_owner_seed.is_some(),
+                        successor_owner_seed,
+                        join_secret.as_ref(),
+                    )?;
+                    tx.execute(
+                        "UPDATE channels SET predecessor_id = ?2, topic = ?3, welcome = ?4
+                         WHERE channel_id = ?1",
+                        params![successor_channel_id, old_channel_id, old.topic, old.welcome],
+                    )?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO channel_members
+                            (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
+                         SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator
+                         FROM channel_members WHERE channel_id = ?1",
+                        params![old_channel_id, successor_channel_id],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE channels SET successor_id = ?2, is_owner = 0, owner_seed = NULL,
+                         pending_successor = '', pending_handoff_version = 0
+                     WHERE channel_id = ?1",
+                    params![old_channel_id, successor_channel_id],
+                )?;
+                tx.commit()?;
+                true
+            }
+        };
+        let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
+        for (id, sender, direction, message, timestamp, read) in history.into_iter().rev() {
+            let msg_id = format!("handoff-{old_channel_id}-{id}");
+            // No signature travels with a handoff copy. The author signed the
+            // line against the *old* room's id, so the original does not verify
+            // under the successor's, and re-signing here is the forgery the
+            // signature exists to prevent. The copy stays readable locally and
+            // is not re-served to anyone else.
+            let _ = self.insert_channel_message(
+                successor_channel_id,
+                &sender,
+                &direction,
+                &message,
+                &msg_id,
+                timestamp,
+                "",
+                read,
+            );
+        }
+        let _ = self.clear_handoff_pending(old_channel_id);
+        Ok(true)
+    }
+
+    pub fn upsert_channel_member(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        nickname: &str,
+        last_seen: i64,
+        local_pubkey: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        // Signed records can claim a last_seen up to an hour ahead of us
+        // (DHT store CLOCK_SKEW). Eviction sorts by last_seen, so an
+        // unclamped future value would sit at the end of the list while
+        // honest (and our own) rows are dropped first.
+        let last_seen = last_seen.min(now);
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let existed: bool = tx
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        tx.execute(
+            "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
+             VALUES (?1, ?2, ?3, ?4, 0, 0)
+             ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                nickname = CASE WHEN excluded.nickname = '' THEN channel_members.nickname ELSE excluded.nickname END,
+                last_seen = MAX(channel_members.last_seen, excluded.last_seen)",
+            params![channel_id, member_pubkey, nickname, last_seen],
+        )?;
+        // Presence ingest and private-room chat can still grow the table.
+        // Banned rows stay: a ban has to survive eviction or it can be
+        // laundered by flooding new identities. Moderator rows stay for the
+        // same reason and were the hole in it: the owner's snapshot writes them
+        // with `last_seen = 0`, which is not a stale peer but a row that has
+        // never carried a presence time, and sorting by `last_seen ASC` put
+        // them first in the queue. A flood could evict the people holding the
+        // mop, and this device would stop honouring their ban gossip until the
+        // next snapshot arrived. Both lists are bounded by the record that
+        // carries them, so exempting them cannot stop eviction from working.
+        // Past the cap we only drop stale rows that are neither, never the
+        // local user, and never a still-fresh honest peer — a flood of
+        // newcomers is refused instead.
+        let live: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM channel_members
+             WHERE channel_id = ?1 AND banned = 0",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        if live > CHANNEL_MEMBERS_MAX as i64 {
+            let extra = live - CHANNEL_MEMBERS_MAX as i64;
+            let cutoff = now.saturating_sub(PRESENCE_FRESH_SECS);
+            tx.execute(
+                "DELETE FROM channel_members WHERE rowid IN (
+                    SELECT rowid FROM channel_members
+                     WHERE channel_id = ?1 AND banned = 0 AND moderator = 0
+                       AND member_pubkey != ?2
+                       AND (?3 IS NULL OR member_pubkey != ?3)
+                       AND last_seen < ?4
+                     ORDER BY last_seen ASC, member_pubkey ASC
+                     LIMIT ?5
+                 )",
+                params![channel_id, member_pubkey, local_pubkey, cutoff, extra],
+            )?;
+            let live: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM channel_members
+                 WHERE channel_id = ?1 AND banned = 0",
+                params![channel_id],
+                |row| row.get(0),
+            )?;
+            if live > CHANNEL_MEMBERS_MAX as i64
+                && !existed
+                && local_pubkey != Some(member_pubkey)
+            {
+                tx.execute(
+                    "DELETE FROM channel_members
+                     WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0",
+                    params![channel_id, member_pubkey],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Refresh `last_seen` for a pubkey that already has a row. No INSERT:
+    /// public-room chat must not admit strangers onto the gossip roster.
+    pub fn touch_channel_member_last_seen(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        last_seen: i64,
+    ) -> anyhow::Result<bool> {
+        let last_seen = last_seen.min(chrono::Utc::now().timestamp());
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channel_members
+             SET last_seen = MAX(channel_members.last_seen, ?3)
+             WHERE channel_id = ?1 AND member_pubkey = ?2",
+            params![channel_id, member_pubkey, last_seen],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn remove_channel_member(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        last_seen: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM channel_members
+             WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0
+               AND last_seen <= ?3",
+            params![channel_id, member_pubkey, last_seen],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_channel_members(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<StoredChannelMember>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT member_pubkey, nickname, last_seen, banned, moderator
+             FROM channel_members WHERE channel_id = ?1
+             ORDER BY nickname COLLATE NOCASE, member_pubkey",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id], |row| {
+                Ok(StoredChannelMember {
+                    member_pubkey: row.get(0)?,
+                    nickname: row.get(1)?,
+                    last_seen: row.get(2)?,
+                    banned: row.get::<_, i64>(3)? != 0,
+                    moderator: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn channel_member_is_banned(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let banned: Option<i64> = conn
+            .query_row(
+                "SELECT banned FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(banned.unwrap_or(0) != 0)
+    }
+
+    pub fn channel_member_is_moderator(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let flag: Option<i64> = conn
+            .query_row(
+                "SELECT moderator FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flag.unwrap_or(0) != 0)
+    }
+
+    fn hex_pubkeys_from_query(
+        conn: &Connection,
+        sql: &str,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![channel_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for pk_hex in rows {
+            let Ok(pk_hex) = pk_hex else {
+                continue;
+            };
+            let Ok(bytes) = hex::decode(pk_hex) else {
+                continue;
+            };
+            if let Ok(pk) = <[u8; 32]>::try_from(bytes) {
+                out.push(pk);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_banned_channel_pubkeys(&self, channel_id: &str) -> anyhow::Result<Vec<[u8; 32]>> {
+        let conn = self.conn.lock();
+        Self::hex_pubkeys_from_query(
+            &conn,
+            "SELECT member_pubkey FROM channel_members
+             WHERE channel_id = ?1 AND banned = 1
+             ORDER BY member_pubkey",
+            channel_id,
+        )
+    }
+
+    pub fn list_moderator_channel_pubkeys(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let conn = self.conn.lock();
+        Self::hex_pubkeys_from_query(
+            &conn,
+            "SELECT member_pubkey FROM channel_members
+             WHERE channel_id = ?1 AND moderator = 1
+             ORDER BY member_pubkey",
+            channel_id,
+        )
+    }
+
+    /// Apply a gossip ban/unban from a delegated moderator. Wins only if newer
+    /// than the last owner snapshot *and* any previous revision on that row.
+    pub fn apply_channel_ban_action(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+        banned: bool,
+        timestamp: i64,
+    ) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        if !crate::network::ember::channel::gossip_timestamp_ok(timestamp, now) {
+            return Ok(false);
+        }
+        let timestamp = timestamp.min(now);
+        let conn = self.conn.lock();
+        let snapshot: i64 = conn
+            .query_row(
+                "SELECT moderation_updated_at FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if timestamp < snapshot {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "INSERT INTO channel_members
+                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+             VALUES (?1, ?2, '', 0, ?3, 0, ?4)
+             ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                banned = excluded.banned,
+                ban_revised_at = excluded.ban_revised_at
+             WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
+            params![
+                channel_id,
+                member_pubkey,
+                if banned { 1 } else { 0 },
+                timestamp
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Apply an owner-signed moderation snapshot if it is newer than what we hold.
+    /// Replaces bans and the moderator list; a later gossip action can still
+    /// override an individual ban via `ban_revised_at`.
+    /// Apply an owner-signed snapshot.
+    ///
+    /// Each of the trailing facts is only written when the record actually
+    /// carries it, so a record predating a field cannot erase what a newer one
+    /// already told us. The owner is never added to the ban list even if the
+    /// snapshot names them — the owner is the authority a ban derives from, so
+    /// a record banning them is corrupt or hostile either way.
+    pub fn apply_channel_moderation(
+        &self,
+        channel_id: &str,
+        topic: &str,
+        welcome: &str,
+        timestamp: i64,
+        banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
+        owner_pubkey: Option<&[u8; 32]>,
+        successor_nominee: Option<&[u8; 32]>,
+        claim_after_days: Option<u16>,
+        key_epoch: Option<u64>,
+        invites_owner_only: Option<bool>,
+        slow_mode_secs: Option<u16>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let current: i64 = conn
+            .query_row(
+                "SELECT moderation_updated_at FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if timestamp < current {
+            return Ok(false);
+        }
+        let topic = crate::security::sanitize_remote_text(topic, 64);
+        let welcome = crate::security::sanitize_remote_text(welcome, 512);
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE channels SET topic = ?2, welcome = ?3, moderation_updated_at = ?4
+             WHERE channel_id = ?1",
+            params![channel_id, topic, welcome, timestamp],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE channel_members SET banned = 0
+             WHERE channel_id = ?1 AND ban_revised_at <= ?2",
+            params![channel_id, timestamp],
+        )?;
+        tx.execute(
+            "UPDATE channel_members SET moderator = 0 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        let owner_hex = owner_pubkey.map(hex::encode);
+        for pk in banned_pubkeys.iter().take(32) {
+            let hex_pk = hex::encode(pk);
+            // The owner is the authority a ban derives from, so a snapshot
+            // naming them is corrupt or hostile either way. Skipping is enough:
+            // the sweep above has already cleared their row.
+            if owner_hex.as_deref() == Some(hex_pk.as_str()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 1, 0, ?3)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                    banned = 1,
+                    ban_revised_at = excluded.ban_revised_at
+                 WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
+                params![channel_id, hex_pk, timestamp],
+            )?;
+        }
+        for pk in moderator_pubkeys.iter().take(16) {
+            let hex_pk = hex::encode(pk);
+            tx.execute(
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 0, 1, 0)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET moderator = 1",
+                params![channel_id, hex_pk],
+            )?;
+        }
+        // Only overwrite when this record actually carries an owner: a record
+        // predating the field must not erase what a newer one already told us.
+        if let Some(hex_owner) = owner_hex.as_deref() {
+            tx.execute(
+                "UPDATE channels SET owner_pubkey = ?2 WHERE channel_id = ?1",
+                params![channel_id, hex_owner],
+            )?;
+            // A ban recorded against the owner before we knew who they were is
+            // exactly the state this whole change exists to undo.
+            tx.execute(
+                "UPDATE channel_members SET banned = 0
+                 WHERE channel_id = ?1 AND lower(member_pubkey) = lower(?2)",
+                params![channel_id, hex_owner],
+            )?;
+        }
+        if let Some(nominee) = successor_nominee {
+            // All zeros is the owner withdrawing the nomination, not a member
+            // whose key happens to be zero. Absent (`None`) is a record that
+            // does not say, which must leave what we already know alone.
+            let hex_nominee = if nominee.iter().all(|b| *b == 0) {
+                String::new()
+            } else {
+                hex::encode(nominee)
+            };
+            tx.execute(
+                "UPDATE channels SET successor_nominee = ?2 WHERE channel_id = ?1",
+                params![channel_id, hex_nominee],
+            )?;
+        }
+        if let Some(days) = claim_after_days {
+            tx.execute(
+                "UPDATE channels SET claim_after_days = ?2 WHERE channel_id = ?1",
+                params![channel_id, days as i64],
+            )?;
+        }
+        // Never walk it backwards: an out-of-order record must not send a
+        // member hunting for an epoch that has already been superseded.
+        if let Some(epoch) = key_epoch {
+            tx.execute(
+                "UPDATE channels SET key_epoch_wanted = ?2
+                 WHERE channel_id = ?1 AND key_epoch_wanted < ?2",
+                params![channel_id, epoch as i64],
+            )?;
+        }
+        // Absent means the record predates the field, which must leave the
+        // stored policy alone rather than reading as "anyone may invite".
+        if let Some(owner_only) = invites_owner_only {
+            tx.execute(
+                "UPDATE channels SET invites_owner_only = ?2 WHERE channel_id = ?1",
+                params![channel_id, i64::from(owner_only)],
+            )?;
+        }
+        // Unlike the fields above, absent here means off rather than "the
+        // record does not say". The writer leaves it out when there is no
+        // limit, so treating absence as unknown would leave a room throttled
+        // after its owner turned slow mode back off.
+        tx.execute(
+            "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1",
+            params![channel_id, i64::from(slow_mode_secs.unwrap_or(0))],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Owner-set: seconds a member must wait between messages, 0 to turn the
+    /// limit off.
+    pub fn set_channel_slow_mode(&self, channel_id: &str, secs: u16) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1 AND is_owner = 1",
+            params![channel_id, i64::from(secs)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Rooms this device owns and has not deleted, which is what the creation
+    /// cap counts. Leaving a room you own does not give the slot back: the name
+    /// is still claimed and the room is still yours to delete.
+    pub fn count_owned_channels(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channels WHERE is_owner = 1 AND deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Timestamp of the newest message we sent to this room, or 0 if we never
+    /// have. Read on the send path to apply the room's slow mode across
+    /// restarts, which an in-memory timer would forget.
+    pub fn last_sent_channel_message_at(&self, channel_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let ts: Option<i64> = conn.query_row(
+            "SELECT MAX(timestamp) FROM channel_messages
+             WHERE channel_id = ?1 AND direction = 'sent'",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts.unwrap_or(0))
+    }
+
+    /// Owner-set: may members other than the owner mint invites?
+    pub fn set_channel_invite_policy(
+        &self,
+        channel_id: &str,
+        owner_only: bool,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET invites_owner_only = ?2 WHERE channel_id = ?1 AND is_owner = 1",
+            params![channel_id, i64::from(owner_only)],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn touch_channel_presence(&self, channel_id: &str, when: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET presence_published_at = ?2 WHERE channel_id = ?1",
+            params![channel_id, when],
+        )?;
+        Ok(())
+    }
+
+    pub fn channels_due_for_presence(
+        &self,
+        now: i64,
+        interval_secs: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id FROM channels
+             WHERE presence_published_at <= ?1 AND successor_id = ''
+               AND in_room = 1 AND deleted = 0
+             ORDER BY presence_published_at ASC",
+        )?;
+        let cutoff = now.saturating_sub(interval_secs);
+        let rows = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `author_sig` is the author's hex Ed25519 signature over the line, or
+    /// empty when we hold none — a locally copied handoff, or a row written
+    /// before signatures existed. Only a row that has one can be re-served to
+    /// another member, since a re-serve replays the original rather than
+    /// signing afresh.
+    pub fn insert_channel_message(
+        &self,
+        channel_id: &str,
+        sender_pubkey: &str,
+        direction: &str,
+        message: &str,
+        msg_id: &str,
+        timestamp: i64,
+        author_sig: &str,
+        read: bool,
+    ) -> anyhow::Result<i64> {
+        const MAX_CHANNEL_MESSAGE_LEN: usize = 4096;
+        const MAX_MESSAGES_PER_CHANNEL: i64 = 5_000;
+        let message: &str = if message.len() > MAX_CHANNEL_MESSAGE_LEN {
+            let mut end = MAX_CHANNEL_MESSAGE_LEN;
+            while end > 0 && !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            &message[..end]
+        } else {
+            message
+        };
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let now = if timestamp > 0 {
+            timestamp
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                channel_id,
+                sender_pubkey,
+                direction,
+                CHAT_CIPHERTEXT_PREFIX,
+                now,
+                if read { 1 } else { 0 },
+                msg_id,
+                author_sig
+            ],
+        )?;
+        if tx.changes() == 0 {
+            let existing: i64 = tx.query_row(
+                "SELECT id FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+                params![channel_id, msg_id],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let new_id = tx.last_insert_rowid();
+        let encrypted = Self::encrypt_channel_message_body(
+            self.require_chat_key()?,
+            new_id,
+            channel_id,
+            direction,
+            now,
+            message,
+        )?;
+        tx.execute(
+            "UPDATE channel_messages SET message = ?1 WHERE id = ?2",
+            params![encrypted, new_id],
+        )?;
+        tx.execute(
+            "UPDATE channels SET last_active = ?2 WHERE channel_id = ?1",
+            params![channel_id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_messages WHERE id IN (
+                 SELECT id FROM channel_messages
+                 WHERE channel_id = ?1
+                 ORDER BY id DESC
+                 LIMIT -1 OFFSET ?2
+             )",
+            params![channel_id, MAX_MESSAGES_PER_CHANNEL],
+        )?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// Substring match over a room's history, newest first.
+    ///
+    /// Cannot be a SQL `LIKE`: `encrypt_channel_message_body` binds each body
+    /// to its own row id, room, direction and timestamp, so the stored column
+    /// is ciphertext and every candidate has to be decrypted here. Bounded by
+    /// the per-room retention cap above, and stops as soon as `limit` matches
+    /// are found so the common case walks only the recent tail.
+    pub fn search_channel_messages(
+        &self,
+        channel_id: &str,
+        needle: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, sender_pubkey, direction, message, timestamp, read
+                 FROM channel_messages WHERE channel_id = ?1
+                 ORDER BY id DESC",
+            )?;
+            let mapped = stmt.query_map(params![channel_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        // No key means no plaintext to match against; report nothing rather
+        // than a page of "unavailable" placeholders that all "match".
+        let Some(chat_key) = self.chat_key.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut hits = Vec::new();
+        for (id, sender, direction, stored, timestamp, read) in rows {
+            if hits.len() as i64 >= limit {
+                break;
+            }
+            let Ok(message) = Self::decrypt_channel_message_body(
+                chat_key, id, channel_id, &direction, timestamp, &stored,
+            ) else {
+                continue;
+            };
+            if message.to_lowercase().contains(&needle) {
+                hits.push((id, sender, direction, message, timestamp, read));
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Forget one message on this device. Local only: the copy every other
+    /// member holds is untouched, and nothing is gossiped.
+    pub fn delete_channel_message(&self, channel_id: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
+            params![channel_id, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn get_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
+        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+            let conn = self.conn.lock();
+            if let Some(bid) = before_id {
+                let mut stmt = conn.prepare(
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                     FROM channel_messages WHERE channel_id = ?1 AND id < ?2
+                     ORDER BY id DESC LIMIT ?3",
+                )?;
+                let mapped = stmt.query_map(params![channel_id, bid, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                     FROM channel_messages WHERE channel_id = ?1
+                     ORDER BY id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![channel_id, limit], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let Some(chat_key) = self.chat_key.as_deref() else {
+            return Ok(rows
+                .into_iter()
+                .map(|(id, sender, direction, _, timestamp, read)| {
+                    (
+                        id,
+                        sender,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                    )
+                })
+                .collect());
+        };
+        let mut messages = Vec::with_capacity(rows.len());
+        for (id, sender, direction, stored, timestamp, read) in rows {
+            match Self::decrypt_channel_message_body(
+                chat_key, id, channel_id, &direction, timestamp, &stored,
+            ) {
+                Ok(message) => messages.push((id, sender, direction, message, timestamp, read)),
+                Err(error) => {
+                    tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
+                    messages.push((
+                        id,
+                        sender,
+                        direction,
+                        CHAT_UNAVAILABLE_TEXT.to_string(),
+                        timestamp,
+                        read,
+                    ));
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    pub fn mark_channel_messages_read(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channel_messages SET read = 1 WHERE channel_id = ?1 AND read = 0",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_message_exists(&self, channel_id: &str, msg_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+            params![channel_id, msg_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Recent decrypted messages for neighbor history catch-up.
+    /// Returns `(msg_id, sender_pubkey, body, timestamp, author_sig)` newest-first.
+    ///
+    /// Rows with no stored signature are skipped: a re-serve has to replay the
+    /// author's own signature, and this node cannot produce one on their behalf.
+    /// That is the point rather than a shortcoming — it is what stops a member
+    /// answering a catch-up with a conversation nobody had.
+    pub fn list_channel_messages_for_sync(
+        &self,
+        channel_id: &str,
+        since_ts: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, String, String, i64, String)>> {
+        let limit = limit.clamp(1, 64);
+        let rows: Vec<(i64, String, String, String, String, i64, String)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig
+                 FROM channel_messages
+                 WHERE channel_id = ?1 AND timestamp >= ?2 AND author_sig <> ''
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(chat_key) = self.chat_key.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, msg_id, sender, direction, stored, timestamp, author_sig) in rows {
+            if let Ok(message) = Self::decrypt_channel_message_body(
+                chat_key, id, channel_id, &direction, timestamp, &stored,
+            ) {
+                out.push((msg_id, sender, message, timestamp, author_sig));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn latest_channel_message_timestamp(&self, channel_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let ts: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(timestamp), 0) FROM channel_messages WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
+    }
+
     /// Reclaim unused pages freed by DELETE operations.
     /// Should be called periodically (e.g. alongside credit flush).
     pub fn incremental_vacuum(&self) {
@@ -3940,9 +6164,8 @@ mod tests {
 
         // `Ok(false)`, not an error: the caller has to tell a block from a
         // genuine save failure so it can name the reason the user must act on.
-        assert_eq!(
-            db.add_friend("11", "Mallory", None).expect("no db error"),
-            false,
+        assert!(
+            !db.add_friend("11", "Mallory", None).expect("no db error"),
             "a blocked identity must be refused, not written"
         );
         assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
@@ -4354,6 +6577,1226 @@ mod tests {
             )
             .expect("version");
         assert_eq!(version, MAX_SUPPORTED_SCHEMA_VERSION);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channels_round_trip_secrets_and_messages() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channels-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+
+        let channel_id = "ab".repeat(16);
+        let pubkey = "cd".repeat(32);
+        let seed = [0x11u8; 32];
+        let join = [0x22u8; 32];
+        db.insert_channel(
+            &channel_id,
+            &pubkey,
+            "Lobby",
+            "private",
+            true,
+            Some(&seed),
+            Some(&join),
+        )
+        .expect("insert channel");
+        assert_eq!(db.load_channel_owner_seed(&channel_id).unwrap(), Some(seed));
+        assert_eq!(
+            db.load_channel_join_secret(&channel_id).unwrap(),
+            Some(join)
+        );
+
+        db.upsert_channel_member(&channel_id, &pubkey, "Ada", 100, None)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].nickname, "Ada");
+
+        let banned = [0x33u8; 32];
+        let banned_hex = hex::encode(banned);
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 50, &[banned], &[], None, None, None, None, None, None)
+            .unwrap());
+        let ch = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(ch.topic, "topic");
+        assert_eq!(ch.welcome, "welcome");
+        assert!(db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
+        assert!(!db.channel_member_is_banned(&channel_id, &pubkey).unwrap());
+        assert!(!db
+            .apply_channel_moderation(&channel_id, "older", "stale", 10, &[], &[], None, None, None, None, None, None)
+            .unwrap());
+        let ch = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(ch.topic, "topic");
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 60, &[], &[], None, None, None, None, None, None)
+            .unwrap());
+        assert!(!db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
+
+        let moderator = [0x44u8; 32];
+        let mod_hex = hex::encode(moderator);
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 70, &[], &[moderator], None, None, None, None, None, None)
+            .unwrap());
+        assert!(db
+            .channel_member_is_moderator(&channel_id, &mod_hex)
+            .unwrap());
+        assert!(!db
+            .channel_member_is_moderator(&channel_id, &pubkey)
+            .unwrap());
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &banned_hex, true, 80)
+            .unwrap());
+        assert!(
+            !db.apply_channel_ban_action(&channel_id, &banned_hex, true, i64::MAX)
+                .unwrap(),
+            "a far-future gossip timestamp must not stick a ban past every owner snapshot"
+        );
+        assert!(db
+            .channel_member_is_banned(&channel_id, &banned_hex)
+            .unwrap());
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "welcome", 75, &[], &[moderator], None, None, None, None, None, None)
+            .unwrap());
+        assert!(
+            db.channel_member_is_banned(&channel_id, &banned_hex)
+                .unwrap(),
+            "newer gossip ban must survive an older owner snapshot"
+        );
+
+        let msg_id = "aa".repeat(16);
+        let id = db
+            .insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "sent",
+                "hello room",
+                &msg_id,
+                1_700_000_000,
+                &"cd".repeat(64),
+                true,
+            )
+            .unwrap();
+        let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, id);
+        assert_eq!(msgs[0].3, "hello room");
+        assert_eq!(msgs[0].4, 1_700_000_000);
+        let newer_id = "bb".repeat(16);
+        db.insert_channel_message(
+            &channel_id,
+            &pubkey,
+            "sent",
+            "later line",
+            &newer_id,
+            1_700_000_100,
+            &"ce".repeat(64),
+            true,
+        )
+        .unwrap();
+        let sync = db
+            .list_channel_messages_for_sync(&channel_id, 0, 32)
+            .unwrap();
+        assert_eq!(sync.len(), 2);
+        assert_eq!(
+            sync[0].0, newer_id,
+            "catch-up with since=0 must offer newest first, not oldest"
+        );
+
+        let listed = db.list_channels().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Lobby");
+        assert!(listed[0].is_owner);
+
+        assert!(db.delete_channel(&channel_id, None).unwrap());
+        assert!(db.list_channels().unwrap().is_empty());
+        assert!(
+            db.list_channel_members(&channel_id).unwrap().is_empty(),
+            "no member is preserved when the caller keeps nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channel_member_upsert_keeps_nickname_and_last_seen_monotonic() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-upsert-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let pk = "ee".repeat(32);
+        db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &pk, "", 50, None)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members[0].nickname, "Ada");
+        assert_eq!(
+            members[0].last_seen, 200,
+            "an older chat timestamp must not rewind presence last_seen"
+        );
+        db.upsert_channel_member(&channel_id, &pk, "Ada2", 250, None)
+            .unwrap();
+        let members = db.list_channel_members(&channel_id).unwrap();
+        assert_eq!(members[0].nickname, "Ada2");
+        assert_eq!(members[0].last_seen, 250);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn list_channels_member_count_counts_only_presence_fresh_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-fresh-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.upsert_channel_member(&channel_id, &"11".repeat(32), "Us", now, None)
+            .unwrap();
+        db.upsert_channel_member(
+            &channel_id,
+            &"22".repeat(32),
+            "Gone",
+            now - PRESENCE_FRESH_SECS - 30,
+            None,
+        )
+        .unwrap();
+        let listed = db.list_channels().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].member_count, 1,
+            "a stale last_seen must not keep the empty-room poll from firing"
+        );
+        assert_eq!(
+            db.count_fresh_channel_members(&channel_id, now, PRESENCE_FRESH_SECS)
+                .unwrap(),
+            1
+        );
+        let banned_pk = "33".repeat(32);
+        db.upsert_channel_member(&channel_id, &banned_pk, "Banned", now, None)
+            .unwrap();
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &banned_pk, true, now)
+            .unwrap());
+        assert_eq!(
+            db.list_channels().unwrap()[0].member_count,
+            1,
+            "a banned member must not keep the empty-room poll from firing"
+        );
+        assert_eq!(
+            db.count_fresh_channel_members(&channel_id, now, PRESENCE_FRESH_SECS)
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn an_older_tombstone_does_not_delete_a_newer_live_row() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-presence-tombstone-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let pk = "ee".repeat(32);
+        db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
+            .unwrap();
+        assert!(
+            !db.remove_channel_member(&channel_id, &pk, 100).unwrap(),
+            "an older tombstone must not delete a newer live last_seen"
+        );
+        assert_eq!(db.list_channel_members(&channel_id).unwrap().len(), 1);
+        assert!(
+            db.remove_channel_member(&channel_id, &pk, 200).unwrap(),
+            "equal timestamps prefer the tombstone"
+        );
+        assert!(db.list_channel_members(&channel_id).unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_flood_of_newcomers_does_not_evict_a_still_fresh_local_or_honest_row() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-member-cap-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let local = "11".repeat(32);
+        let honest = "22".repeat(32);
+        db.upsert_channel_member(&channel_id, &local, "Us", now, Some(&local))
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &honest, "Ada", now, Some(&local))
+            .unwrap();
+        for i in 0..CHANNEL_MEMBERS_MAX.saturating_sub(2) {
+            let pk = format!("{i:064x}");
+            db.upsert_channel_member(&channel_id, &pk, "Flood", now, Some(&local))
+                .unwrap();
+        }
+        assert_eq!(
+            db.list_channel_members(&channel_id)
+                .unwrap()
+                .iter()
+                .filter(|m| !m.banned)
+                .count(),
+            CHANNEL_MEMBERS_MAX
+        );
+        for i in 0..16 {
+            let pk = format!("{:064x}", 10_000 + i);
+            db.upsert_channel_member(&channel_id, &pk, "New", now, Some(&local))
+                .unwrap();
+        }
+        let members = db.list_channel_members(&channel_id).unwrap();
+        let live: Vec<_> = members.iter().filter(|m| !m.banned).collect();
+        assert!(
+            live.iter().any(|m| m.member_pubkey == local),
+            "the local user's row must survive a newcomer flood"
+        );
+        assert!(
+            live.iter().any(|m| m.member_pubkey == honest),
+            "a still-fresh honest peer must not be dropped to admit identity 257"
+        );
+        assert!(
+            live.len() <= CHANNEL_MEMBERS_MAX,
+            "refusing newcomers must not grow the table past the cap"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn leave_keeps_the_row_and_skips_presence() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-in-room-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"cd".repeat(32),
+            "Lobby",
+            "public",
+            true,
+            Some(&[0x11u8; 32]),
+            None,
+        )
+        .expect("insert");
+        let listed = db.list_channels().unwrap();
+        assert!(listed[0].in_room);
+        assert!(!listed[0].deleted);
+        let due = db.channels_due_for_presence(i64::MAX, 1).unwrap();
+        assert_eq!(due, vec![channel_id.clone()]);
+
+        assert!(db.set_channel_in_room(&channel_id, false).unwrap());
+        let left = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!left.in_room);
+        assert!(db.load_channel_owner_seed(&channel_id).unwrap().is_some());
+        assert!(
+            db.channels_due_for_presence(i64::MAX, 1)
+                .unwrap()
+                .is_empty(),
+            "a device that walked out must not republish presence"
+        );
+
+        assert!(db.set_channel_in_room(&channel_id, true).unwrap());
+        assert!(db.get_channel(&channel_id).unwrap().unwrap().in_room);
+
+        assert!(db.tombstone_channel(&channel_id).unwrap());
+        let gone = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(!gone.in_room);
+        assert!(gone.deleted);
+        assert!(
+            !db.set_channel_in_room(&channel_id, true).unwrap(),
+            "a tombstoned room cannot be re-entered on this device"
+        );
+
+        let other_id = "ef".repeat(16);
+        db.insert_channel(
+            &other_id,
+            &"12".repeat(32),
+            "Elsewhere",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert other");
+        let walked = db
+            .walk_out_deleted_channels(std::slice::from_ref(&other_id))
+            .unwrap();
+        assert_eq!(walked, vec![other_id.clone()]);
+        let hidden = db.get_channel(&other_id).unwrap().unwrap();
+        assert!(!hidden.in_room);
+        assert!(
+            !hidden.deleted,
+            "the directory is an unsigned hint: it walks a device out, it does \
+             not tombstone a room beyond recovery"
+        );
+        assert!(
+            db.set_channel_in_room(&other_id, true).unwrap(),
+            "a room the directory was wrong about must be re-enterable"
+        );
+
+        // A room of its own, not the tombstoned one above: reusing that id made
+        // this a duplicate insert, so the owner case below was never reached.
+        let owned_id = "99".repeat(16);
+        db.insert_channel(&owned_id, &"34".repeat(32), "Mine", "public", true, None, None)
+            .expect("insert owned");
+        let owned_walk = db
+            .walk_out_deleted_channels(std::slice::from_ref(&owned_id))
+            .unwrap();
+        assert!(
+            owned_walk.is_empty(),
+            "a room we own is not walked out on the directory's say-so"
+        );
+        assert!(db.get_channel(&owned_id).unwrap().unwrap().in_room);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A moderator could name the room owner in ban gossip and every member
+    /// applied it, silently dropping the owner's messages — nothing on the wire
+    /// said who the owner was, so no recipient had grounds to refuse. The owner
+    /// now signs their own identity into the moderation record; this covers the
+    /// storage half of that: the key is remembered, a snapshot naming the owner
+    /// cannot ban them, and learning who the owner is undoes a ban recorded
+    /// before we knew.
+    #[test]
+    fn a_moderation_snapshot_can_never_ban_the_room_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-owner-ban-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "3c".repeat(16);
+        let channel_pubkey = "4d".repeat(32);
+        let owner = [0x0Au8; 32];
+        let owner_hex = hex::encode(owner);
+        let nuisance = [0x0Bu8; 32];
+        let nuisance_hex = hex::encode(nuisance);
+
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        // Stand in for the hole: a moderator's gossip ban on the owner, applied
+        // before this device had ever seen an owner-signed record.
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &owner_hex, true, 40)
+            .unwrap());
+        assert!(db.channel_member_is_banned(&channel_id, &owner_hex).unwrap());
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey, "");
+
+        // The owner's own snapshot arrives. It names them, so the stale ban goes
+        // and the identity is remembered for the gossip path to check against.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "topic",
+                "",
+                50,
+                &[nuisance],
+                &[],
+                Some(&owner),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap());
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &owner_hex).unwrap(),
+            "learning who the owner is must undo a ban recorded before we knew"
+        );
+        assert!(
+            db.channel_member_is_banned(&channel_id, &nuisance_hex).unwrap(),
+            "everyone else in the snapshot is still banned"
+        );
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
+            owner_hex
+        );
+
+        // And a snapshot that names the owner in its own ban list is refused
+        // that one entry rather than being applied wholesale.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "topic",
+                "",
+                60,
+                &[owner, nuisance],
+                &[],
+                Some(&owner),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap());
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &owner_hex).unwrap(),
+            "a record banning its own owner is corrupt or hostile either way"
+        );
+        assert!(db.channel_member_is_banned(&channel_id, &nuisance_hex).unwrap());
+
+        // A later record that predates the field must not erase what we know.
+        assert!(db
+            .apply_channel_moderation(&channel_id, "topic", "", 70, &[], &[], None, None, None, None, None, None)
+            .unwrap());
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
+            owner_hex,
+            "a record that says nothing about the owner is not a record saying nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The handoff writes a successor room, moves the seed, and points the old
+    /// room at it. Those used to be separate lock acquisitions, so a crash
+    /// between them could strand a successor with no seed or an old room
+    /// pointing at a room that was never created. Re-running it has to be safe
+    /// and has to converge, because that is what recovery depends on.
+    #[test]
+    fn applying_a_handoff_twice_converges_on_the_same_state() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-handoff-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let old_id = "7a".repeat(16);
+        let successor_id = "8b".repeat(16);
+        let successor_pk = "9c".repeat(32);
+        db.insert_channel(&old_id, &"a1".repeat(32), "Room", "private", true, None, None)
+            .expect("insert channel");
+        db.upsert_channel_member(&old_id, &"b2".repeat(32), "Them", 100, None)
+            .unwrap();
+        db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
+            .unwrap();
+
+        let seed = [0x44u8; 32];
+        assert!(db
+            .apply_channel_handoff(&old_id, &successor_pk, &successor_id, 1, true, Some(&seed))
+            .expect("apply handoff"));
+
+        let successor = db.get_channel(&successor_id).unwrap().expect("successor row");
+        assert!(successor.is_owner, "the claimant owns the successor");
+        assert_eq!(successor.predecessor_id, old_id);
+        assert_eq!(successor.name, "Room");
+        assert_eq!(
+            db.load_channel_owner_seed(&successor_id).unwrap(),
+            Some(seed),
+            "the seed lands with the room, not after it"
+        );
+        let old = db.get_channel(&old_id).unwrap().expect("old row");
+        assert_eq!(old.successor_id, successor_id);
+        assert!(!old.is_owner, "the old room hands ownership over");
+        assert!(
+            db.load_channel_owner_seed(&old_id).unwrap().is_none(),
+            "the old seed is dropped, never copied forward"
+        );
+        // Members and history come across.
+        assert_eq!(db.list_channel_members(&successor_id).unwrap().len(), 1);
+        assert_eq!(
+            db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
+            1
+        );
+        let copied = db.get_channel_messages(&successor_id, 10, None).unwrap();
+        assert!(
+            copied[0].5,
+            "a read received line must stay read on the successor"
+        );
+        assert_eq!(
+            db.get_channel(&successor_id).unwrap().unwrap().unread,
+            0,
+            "handoff must not turn copied history into unread"
+        );
+
+        db.insert_channel_message(
+            &old_id,
+            &"b2".repeat(32),
+            "received",
+            "after crash",
+            "m2",
+            101,
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(db
+            .apply_channel_handoff(&old_id, &successor_pk, &successor_id, 1, true, Some(&seed))
+            .expect("resume handoff"));
+        assert_eq!(
+            db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
+            2,
+            "a second apply must copy lines missed by a crash mid-replay"
+        );
+
+        // Replaying is idempotent: same successor, no duplicated history.
+        assert!(db
+            .apply_channel_handoff(&old_id, &successor_pk, &successor_id, 1, true, Some(&seed))
+            .expect("replay handoff"));
+        assert_eq!(
+            db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
+            2,
+            "a replay must not duplicate history"
+        );
+
+        // And a second, different successor cannot hijack a room already moved.
+        assert!(!db
+            .apply_channel_handoff(&old_id, &"d4".repeat(32), &"c3".repeat(16), 2, true, None)
+            .expect("rival handoff"));
+        assert_eq!(
+            db.get_channel(&old_id).unwrap().unwrap().successor_id,
+            successor_id
+        );
+    }
+
+    /// Rotation is only useful if the keys survive in a readable window and the
+    /// window is actually bounded: too few and a member offline across a ban
+    /// cannot read the gap, unbounded and every key a room ever used stays on
+    /// disk forever.
+    #[test]
+    fn rotating_a_room_key_keeps_a_bounded_window_of_readable_epochs() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-epochs-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "3c".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"4d".repeat(32),
+            "Private",
+            "private",
+            true,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        // Rotate well past the retention window.
+        let kept = Database::CHANNEL_KEY_EPOCHS_KEPT as i64;
+        let total = kept + 3;
+        for epoch in 1..=total {
+            db.insert_channel_key_epoch(&channel_id, epoch, &[epoch as u8; 32])
+                .expect("insert epoch");
+        }
+
+        let epochs = db.load_channel_key_epochs(&channel_id).expect("load");
+        assert_eq!(epochs.len(), kept as usize, "retention window is bounded");
+        // Newest first, because readers try the current key before older ones.
+        assert_eq!(epochs[0].0, total);
+        assert_eq!(epochs[0].1, [total as u8; 32]);
+        assert!(
+            epochs.windows(2).all(|w| w[0].0 > w[1].0),
+            "candidates must be newest-first"
+        );
+        assert_eq!(
+            epochs.last().map(|(e, _)| *e),
+            Some(total - kept + 1),
+            "the oldest retained epoch is exactly one window back"
+        );
+
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.key_epoch, total, "the newest epoch becomes current");
+
+        // An out-of-order record must not demote the room: everything we send
+        // next would be sealed under a key half the members have dropped.
+        db.insert_channel_key_epoch(&channel_id, total - 2, &[0xEEu8; 32])
+            .expect("insert stale epoch");
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.key_epoch, total, "a late arrival cannot walk it back");
+
+        // Dropping the room drops its keys with it.
+        db.delete_channel(&channel_id, None).expect("delete");
+        assert!(db
+            .load_channel_key_epochs(&channel_id)
+            .expect("load")
+            .is_empty());
+    }
+
+    /// A handoff that carries a secret forward has to carry the *current* one.
+    /// Rotation writes to `channel_key_epochs` and never touches `join_secret`,
+    /// so inheriting that column handed the successor room the key the last ban
+    /// rotated away from — which an evicted member still holds, letting them
+    /// read the new room and undoing the eviction.
+    #[test]
+    fn a_successor_room_inherits_the_rotated_key_not_the_original_invite() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-succ-key-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let old_id = "1f".repeat(16);
+        let successor_id = "2e".repeat(16);
+        let original_invite = [0x01u8; 32];
+        db.insert_channel(
+            &old_id,
+            &"3d".repeat(32),
+            "Private",
+            "private",
+            true,
+            None,
+            Some(&original_invite),
+        )
+        .expect("insert channel");
+
+        // Two bans' worth of rotation.
+        let rotated = [0x02u8; 32];
+        db.insert_channel_key_epoch(&old_id, 1, &[0x09u8; 32]).unwrap();
+        db.insert_channel_key_epoch(&old_id, 2, &rotated).unwrap();
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &"4c".repeat(32), &successor_id, 1, true, None)
+            .expect("apply handoff"));
+
+        let inherited = db
+            .load_channel_join_secret(&successor_id)
+            .expect("load")
+            .expect("successor has a secret");
+        assert_eq!(
+            inherited, rotated,
+            "the successor must start from the newest epoch"
+        );
+        assert_ne!(
+            inherited, original_invite,
+            "an evicted member's original invite must not open the successor room"
+        );
+    }
+
+    /// Succession has to be opt-in and driven only by owner-signed facts: the
+    /// nomination and the window both come from the moderation record, and a
+    /// record that predates those fields must not silently erase them.
+    #[test]
+    fn succession_settings_come_only_from_owner_signed_records() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-succession-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "5e".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"6f".repeat(32),
+            "Room",
+            "private",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(row.successor_nominee.is_empty(), "off by default");
+        assert_eq!(row.claim_after_days, 0);
+        assert_eq!(row.key_epoch_wanted, 0);
+
+        let owner = [0x11u8; 32];
+        let nominee = [0x22u8; 32];
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "Topic",
+                "Welcome",
+                1_000,
+                &[],
+                &[],
+                Some(&owner),
+                Some(&nominee),
+                Some(30),
+                Some(4),
+                None,
+                None,
+            )
+            .unwrap());
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.successor_nominee, hex::encode(nominee));
+        assert_eq!(row.claim_after_days, 30);
+        assert_eq!(row.key_epoch_wanted, 4);
+        assert_eq!(row.moderation_updated_at, 1_000);
+
+        // A newer record carrying none of the trailing fields — an older build,
+        // say — leaves what we already learned intact rather than wiping it.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id, "Topic 2", "Welcome", 2_000, &[], &[], None, None, None, None, None,
+                None,
+            )
+            .unwrap());
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.successor_nominee, hex::encode(nominee));
+        assert_eq!(row.claim_after_days, 30);
+        assert_eq!(row.key_epoch_wanted, 4);
+
+        // And a stale epoch cannot send members hunting for a superseded key.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "Topic 3",
+                "Welcome",
+                3_000,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some(2),
+                None,
+                None,
+            )
+            .unwrap());
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().key_epoch_wanted,
+            4
+        );
+
+        // The owner can clear their own nomination.
+        db.set_channel_succession(&channel_id, "", 0).unwrap();
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(row.successor_nominee.is_empty());
+        assert_eq!(row.claim_after_days, 0);
+
+        // And a withdrawal has to reach members. An all-zero nominee is the
+        // owner saying "nobody" — distinct from a record that simply omits the
+        // field, which must leave what we already know alone. Without this an
+        // owner could never call a nomination back.
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "Topic 4",
+                "Welcome",
+                4_000,
+                &[],
+                &[],
+                Some(&owner),
+                Some(&nominee),
+                Some(21),
+                None,
+                None,
+                None,
+            )
+            .unwrap());
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().successor_nominee,
+            hex::encode(nominee)
+        );
+        assert!(db
+            .apply_channel_moderation(
+                &channel_id,
+                "Topic 5",
+                "Welcome",
+                5_000,
+                &[],
+                &[],
+                Some(&owner),
+                Some(&[0u8; 32]),
+                Some(0),
+                None,
+                None,
+                None,
+            )
+            .unwrap());
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert!(
+            row.successor_nominee.is_empty(),
+            "an all-zero nominee withdraws the nomination"
+        );
+        assert_eq!(row.claim_after_days, 0);
+    }
+
+    /// Succession is the one feature that acts on *absence*, so the record of
+    /// having looked must never move backwards — a late-arriving older
+    /// confirmation could otherwise make a freshly-checked room look unverified,
+    /// or worse, be replayed to make a stale check look current.
+    #[test]
+    fn the_record_of_having_checked_for_an_owner_only_moves_forward() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-checked-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "9d".repeat(16);
+        db.insert_channel(&channel_id, &"ae".repeat(32), "Room", "private", false, None, None)
+            .expect("insert channel");
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().moderation_checked_at,
+            0,
+            "a room we have never polled has not been checked"
+        );
+
+        db.touch_channel_moderation_checked(&channel_id, 5_000).unwrap();
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().moderation_checked_at,
+            5_000
+        );
+
+        db.touch_channel_moderation_checked(&channel_id, 4_000).unwrap();
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().moderation_checked_at,
+            5_000,
+            "an older confirmation cannot un-verify a room"
+        );
+
+        db.touch_channel_moderation_checked(&channel_id, 9_000).unwrap();
+        assert_eq!(
+            db.get_channel(&channel_id).unwrap().unwrap().moderation_checked_at,
+            9_000
+        );
+
+        // It belongs to the room, so a fresh successor starts unverified rather
+        // than inheriting our confidence about the room it replaced.
+        let successor_id = "bf".repeat(16);
+        assert!(db
+            .apply_channel_handoff(&channel_id, &"c0".repeat(32), &successor_id, 1, false, None)
+            .expect("apply handoff"));
+        assert_eq!(
+            db.get_channel(&successor_id).unwrap().unwrap().moderation_checked_at,
+            0,
+            "a successor room has its own owner to verify"
+        );
+    }
+
+    /// A rotation and the snapshot announcing it have to land together. The
+    /// owner seals under whatever `key_epoch` says, and members only fetch a key
+    /// the snapshot names — so a rotation whose commit failed has to come back
+    /// off, or the owner talks under a key nobody knows to look for.
+    #[test]
+    fn rolling_back_a_rotation_restores_the_previous_epoch() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-rollback-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "6a".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"7b".repeat(32),
+            "Private",
+            "private",
+            true,
+            None,
+            Some(&[0xAAu8; 32]),
+        )
+        .expect("insert channel");
+
+        db.insert_channel_key_epoch(&channel_id, 1, &[0x01u8; 32]).unwrap();
+        db.insert_channel_key_epoch(&channel_id, 2, &[0x02u8; 32]).unwrap();
+        assert_eq!(db.get_channel(&channel_id).unwrap().unwrap().key_epoch, 2);
+
+        db.rollback_channel_key_epoch(&channel_id, 2).unwrap();
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.key_epoch, 1, "the epoch falls back to the previous one");
+        let epochs = db.load_channel_key_epochs(&channel_id).unwrap();
+        assert_eq!(epochs.len(), 1);
+        assert_eq!(epochs[0], (1, [0x01u8; 32]));
+
+        // Rolling back the only epoch leaves the room on its original invite
+        // secret rather than on nothing at all.
+        db.rollback_channel_key_epoch(&channel_id, 1).unwrap();
+        let row = db.get_channel(&channel_id).unwrap().unwrap();
+        assert_eq!(row.key_epoch, 0);
+        assert!(db.load_channel_key_epochs(&channel_id).unwrap().is_empty());
+        assert_eq!(
+            db.load_channel_join_secret(&channel_id).unwrap(),
+            Some([0xAAu8; 32])
+        );
+    }
+
+    /// Leaving used to wipe `channel_members`, so rejoining re-inserted the
+    /// member with `banned = 0` and the client offered a composer whose sends
+    /// every remaining member discards. A ban belongs to the room, not to the
+    /// membership, so it has to outlive an explicit leave.
+    #[test]
+    fn leaving_keeps_our_own_ban_but_forgets_everything_else() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-leave-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "1a".repeat(16);
+        let channel_pubkey = "2b".repeat(32);
+        let us = [0x55u8; 32];
+        let us_hex = hex::encode(us);
+        let other = [0x66u8; 32];
+        let other_hex = hex::encode(other);
+
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 100, None)
+            .unwrap();
+        db.upsert_channel_member(&channel_id, &other_hex, "Them", 100, None)
+            .unwrap();
+        assert!(db
+            .apply_channel_moderation(&channel_id, "", "", 50, &[us, other], &[], None, None, None, None, None, None)
+            .unwrap());
+
+        assert!(db.delete_channel(&channel_id, Some(&us_hex)).unwrap());
+        assert!(db.get_channel(&channel_id).unwrap().is_none());
+        assert!(
+            db.channel_member_is_banned(&channel_id, &us_hex).unwrap(),
+            "our ban must outlive leaving the room"
+        );
+        assert!(
+            !db.channel_member_is_banned(&channel_id, &other_hex).unwrap(),
+            "another member's ban is not ours to keep once we have left"
+        );
+
+        // Rejoining must not launder the ban: `upsert_channel_member` refreshes
+        // the nickname and last-seen but leaves `banned` alone.
+        db.insert_channel(
+            &channel_id,
+            &channel_pubkey,
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("rejoin channel");
+        db.upsert_channel_member(&channel_id, &us_hex, "Us", 200, None)
+            .unwrap();
+        assert!(
+            db.channel_member_is_banned(&channel_id, &us_hex).unwrap(),
+            "rejoining must not clear the ban"
+        );
+
+        // The owner lifting it still does, on the next moderation snapshot.
+        assert!(db
+            .apply_channel_moderation(&channel_id, "", "", 60, &[], &[], None, None, None, None, None, None)
+            .unwrap());
+        assert!(!db.channel_member_is_banned(&channel_id, &us_hex).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channel_handoff_installs_successor_seed_without_copying_old() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-handoff-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let old = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let old_id = hex::encode(old.channel_id);
+        let new_id = hex::encode(successor.channel_id);
+        let old_pk = hex::encode(old.pubkey);
+        let new_pk = hex::encode(successor.pubkey);
+        let old_seed = old.seed();
+        let new_seed = successor.seed();
+        let join = [0x55u8; 32];
+
+        db.insert_channel(&old_id, &old_pk, "Lobby", "private", true, Some(&old_seed), Some(&join))
+            .unwrap();
+        let keep_id = "aa".repeat(16);
+        db.insert_channel_message(&old_id, &old_pk, "sent", "keep me", &keep_id, 10, "", true)
+            .unwrap();
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &new_pk, &new_id, 1, true, None)
+            .unwrap());
+        let old_row = db.get_channel(&old_id).unwrap().unwrap();
+        assert!(!old_row.is_owner);
+        assert_eq!(old_row.successor_id, new_id);
+        assert!(db.load_channel_owner_seed(&old_id).unwrap().is_none());
+        assert!(db.load_channel_owner_seed(&new_id).unwrap().is_none());
+        assert_eq!(db.load_channel_join_secret(&new_id).unwrap(), Some(join));
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &new_pk, &new_id, 1, true, Some(&new_seed))
+            .unwrap());
+        assert_eq!(db.load_channel_owner_seed(&new_id).unwrap(), Some(new_seed));
+        assert_ne!(db.load_channel_owner_seed(&new_id).unwrap(), Some(old_seed));
+        let new_row = db.get_channel(&new_id).unwrap().unwrap();
+        assert!(new_row.is_owner);
+        assert_eq!(new_row.predecessor_id, old_id);
+        let history = db.get_channel_messages(&new_id, 50, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].3, "keep me");
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

@@ -32,6 +32,11 @@ const RDV_V4_DOMAIN: &[u8] = b"ember-rdv-v4";
 const OP_IDENTITY_LOOKUP_V4: u8 = 0x20;
 const OP_CAPABILITY_REGISTER_V4: u8 = 0x21;
 const OP_CAPABILITY_LOOKUP_V4: u8 = 0x22;
+const OP_CHANNEL_USERNAME_V4: u8 = 0x26;
+const OP_CHANNEL_NAME_V4: u8 = 0x27;
+const OP_CHANNEL_DELETE_V4: u8 = 0x28;
+const OP_CHANNEL_NOMINEE_V4: u8 = 0x29;
+const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 const SIGNED_IP_V4: u8 = 4;
 const SIGNED_IP_V6: u8 = 6;
 
@@ -420,6 +425,9 @@ pub(crate) fn current_timestamp() -> i64 {
 /// "future-proof" reasons but no current code path needs that much
 /// — the smaller cap matches main and shrinks the DoS surface.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024;
+/// Public directory listings are larger than a single signed lookup. 256 KiB
+/// still bounds a malicious dump while covering a few thousand rooms.
+const MAX_DIRECTORY_RESPONSE_BYTES: usize = 256 * 1024;
 
 pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     let mut hasher = Sha256::new();
@@ -550,6 +558,11 @@ impl RegistrationOutcome {
 /// checker / KAD probe has produced a confirmed IPv4 address before
 /// invoking this function.
 ///
+/// `port` is the TCP listener friends dial. `udp_port` is advertised
+/// only on channel-neighbor capabilities so gossip peers DHT-PING the
+/// Ember UDP socket instead of opening a friend TCP session.
+/// `channel_neighbors` are `(channel_id, peer_pubkey)` pairs.
+///
 /// `Ok` means the classic `/register` POST succeeded — the node is on
 /// the server and later heartbeats / courtesy unregister should run.
 /// The protocol probe runs *before* that POST, so a probe failure is
@@ -562,10 +575,12 @@ pub async fn register(
     base_url: &str,
     ember_hash: &[u8; 16],
     port: u16,
+    udp_port: u16,
     external_ip: Ipv4Addr,
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     friend_identities: &[([u8; 16], [u8; 32])],
+    channel_neighbors: &[([u8; 16], [u8; 32])],
 ) -> Result<RegistrationOutcome, String> {
     require_https(base_url)?;
     // Probe *before* the mutating POST. A later `?` on GET /v4/protocol used
@@ -663,6 +678,40 @@ pub async fn register(
             {
                 pairwise_failed += 1;
                 last_pairwise_error = Some(error);
+            }
+        }
+        // Channel gossip neighbors resolve over Ember UDP, not the friend
+        // TCP listener. Capability `port` is per-entry, so these sit
+        // alongside friend slots without changing `/register`.
+        if udp_port > 0 {
+            for (channel_id, neighbor_pubkey) in channel_neighbors {
+                let Some(capability) =
+                    crate::network::ember::channel::derive_channel_presence_capability(
+                        secret_key,
+                        neighbor_pubkey,
+                        pubkey,
+                        channel_id,
+                        epoch,
+                    )
+                else {
+                    continue;
+                };
+                if let Err(error) = register_capability_presence(
+                    base_url,
+                    &capability,
+                    epoch,
+                    udp_port,
+                    external_ip,
+                    pubkey,
+                    neighbor_pubkey,
+                    secret_key,
+                    protocol,
+                    false,
+                )
+                .await
+                {
+                    debug!("Channel presence registration failed: {error}");
+                }
             }
         }
         if let Some(error) = last_pairwise_error {
@@ -961,10 +1010,7 @@ pub async fn lookup(
     else {
         return Ok(None);
     };
-    let requester_id = hashed_id(our_ember_hash);
-    let requester_raw = sha256_id_raw(our_ember_hash);
     let friend_id = hashed_id(friend_hash);
-    let protocol = negotiate_protocol(base_url).await?;
     let now = current_timestamp();
     let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
 
@@ -985,6 +1031,78 @@ pub async fn lookup(
             candidates.push((pairwise, epoch, *our_pubkey));
         }
     }
+    lookup_capability_entries(
+        base_url,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+        &friend_pubkey,
+        &friend_id,
+        candidates,
+    )
+    .await
+}
+
+/// Look up a channel gossip neighbor whose Ed25519 pubkey is already known
+/// from a DHT presence record. Skips the friend identity oracle and uses
+/// the channel-bound pairwise capability so a room neighbor cannot read
+/// a friend presence slot.
+pub async fn lookup_channel_presence(
+    base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    require_https(base_url)?;
+    let peer_hash = crate::network::ember::channel::channel_id_from_pubkey(peer_pubkey);
+    let peer_id = hashed_id(&peer_hash);
+    let now = current_timestamp();
+    let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(now);
+    let mut candidates: Vec<([u8; 32], i64, [u8; 32])> = Vec::with_capacity(2);
+    for epoch in [current_epoch, current_epoch - 1] {
+        if let Some(capability) =
+            crate::network::ember::channel::derive_channel_presence_capability(
+                our_secret_key,
+                peer_pubkey,
+                peer_pubkey,
+                channel_id,
+                epoch,
+            )
+        {
+            candidates.push((capability, epoch, *our_pubkey));
+        }
+    }
+    lookup_capability_entries(
+        base_url,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+        peer_pubkey,
+        &peer_id,
+        candidates,
+    )
+    .await
+}
+
+async fn lookup_capability_entries(
+    base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    expected_pubkey: &[u8; 32],
+    expected_id: &str,
+    candidates: Vec<([u8; 32], i64, [u8; 32])>,
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    let requester_id = hashed_id(our_ember_hash);
+    let requester_raw = sha256_id_raw(our_ember_hash);
+    let protocol = negotiate_protocol(base_url).await?;
+    let log_id = if expected_id.len() >= 8 {
+        &expected_id[..8]
+    } else {
+        expected_id
+    };
 
     let mut successful: Option<(reqwest::Response, [u8; 32], i64, [u8; 32])> = None;
     for (capability, epoch, proof_peer_pubkey) in candidates {
@@ -1059,9 +1177,7 @@ pub async fn lookup(
     let raw_port = body["port"].as_u64().unwrap_or_default();
     if raw_port == 0 || raw_port > u16::MAX as u64 {
         debug!(
-            "Rendezvous: lookup for {}… returned invalid port: {}",
-            &friend_id[..8],
-            raw_port
+            "Rendezvous: lookup for {log_id}… returned invalid port: {raw_port}"
         );
         return Ok(None);
     }
@@ -1096,24 +1212,20 @@ pub async fn lookup(
     let sig_ok = hex::decode_to_slice(sig_hex, &mut sig).is_ok();
     if !pubkey_ok || !sig_ok {
         warn!(
-            "Rendezvous: lookup for {}… missing/malformed auth fields; refusing to connect",
-            &friend_id[..8]
+            "Rendezvous: lookup for {log_id}… missing/malformed auth fields; refusing to connect"
         );
         return Ok(None);
     }
-    if pubkey != friend_pubkey || !pubkey_matches_id(&pubkey, &friend_id) {
+    if pubkey != *expected_pubkey || !pubkey_matches_id(&pubkey, expected_id) {
         warn!(
-            "Rendezvous: lookup for {}… pubkey does not derive to requested id; refusing to connect (server may be compromised)",
-            &friend_id[..8]
+            "Rendezvous: lookup for {log_id}… pubkey does not derive to requested id; refusing to connect (server may be compromised)"
         );
         return Ok(None);
     }
     let now = current_timestamp();
     if lookup_signature_age_exceeded(now, ts) {
         warn!(
-            "Rendezvous: lookup for {}… returned a stale signed registration (ts={}); refusing to connect",
-            &friend_id[..8],
-            ts
+            "Rendezvous: lookup for {log_id}… returned a stale signed registration (ts={ts}); refusing to connect"
         );
         return Ok(None);
     }
@@ -1146,44 +1258,30 @@ pub async fn lookup(
                 ts,
             ),
             _ => {
-                warn!(
-                    "Rendezvous: lookup for {}… returned unknown proof version",
-                    &friend_id[..8]
-                );
+                warn!("Rendezvous: lookup for {log_id}… returned unknown proof version");
                 return Ok(None);
             }
         };
         if !ed25519_verify_lookup(&pubkey, &msg, &sig) {
             warn!(
-                "Rendezvous: lookup for {}… signature verification failed; refusing to connect (server may be compromised)",
-                &friend_id[..8]
+                "Rendezvous: lookup for {log_id}… signature verification failed; refusing to connect (server may be compromised)"
             );
             return Ok(None);
         }
         if port > 0 && is_routable_public_v4(ip) {
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.
-            debug!(
-                "Rendezvous: presence found for {}… at {}:{}",
-                &friend_id[..8],
-                ip,
-                port
-            );
+            debug!("Rendezvous: presence found for {log_id}… at {ip}:{port}");
             return Ok(Some((ip, port)));
         }
         if port > 0 {
             warn!(
-                "Rendezvous: lookup for {}… returned non-public IP ({}); refusing to connect",
-                &friend_id[..8],
-                ip
+                "Rendezvous: lookup for {log_id}… returned non-public IP ({ip}); refusing to connect"
             );
             return Ok(None);
         }
     }
-    debug!(
-        "Rendezvous: lookup for {}… returned unparseable data",
-        &friend_id[..8]
-    );
+    debug!("Rendezvous: lookup for {log_id}… returned unparseable data");
     Ok(None)
 }
 
@@ -1333,6 +1431,14 @@ mod lookup_filter_tests {
     }
 
     #[test]
+    fn channel_neighbor_id_matches_rendezvous_pubkey_binding() {
+        let sk = SigningKey::from_bytes(&[7; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let node_id = crate::network::ember::channel::channel_id_from_pubkey(&pk);
+        assert!(pubkey_matches_id(&pk, &hashed_id(&node_id)));
+    }
+
+    #[test]
     fn relay_mailbox_poll_contains_only_self_identity() {
         let self_id = [0x11; 32];
         let nonce = [0x22; 16];
@@ -1375,9 +1481,11 @@ mod lookup_filter_tests {
             epoch,
             &ticket_id,
             &alice.to_bytes(),
+            "friend",
+            None,
         )
         .unwrap();
-        let initiator = decrypt_relay_mailbox_envelope(
+        let (initiator, channel_id) = decrypt_relay_mailbox_envelope(
             &bob_hash,
             &bob.to_bytes(),
             &capability,
@@ -1386,6 +1494,7 @@ mod lookup_filter_tests {
         )
         .unwrap();
         assert_eq!(initiator, hashed_id(&alice_hash));
+        assert_eq!(channel_id, None);
         let mut tampered = envelope;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decrypt_relay_mailbox_envelope(
@@ -1443,10 +1552,13 @@ pub struct FriendRelayTicketOffer {
     pub initiator_token: String,
 }
 
-/// An unaccepted friend relay ticket visible only to its signed responder.
+/// An unaccepted friend or channel relay ticket visible only to its signed responder.
 pub struct PendingFriendRelayTicket {
     pub ticket_id: String,
     pub initiator_id: String,
+    /// Set when the mailbox envelope is a channel-capability offer. Friend
+    /// tickets keep this `None` and still require `friend_hashes` admission.
+    pub channel_id: Option<[u8; 16]>,
 }
 
 /// One bounded page of authenticated self-mailbox offers.
@@ -1471,6 +1583,8 @@ fn encrypt_relay_mailbox_envelope(
     epoch: i64,
     ticket_id: &str,
     secret_key: &[u8; 32],
+    purpose: &str,
+    channel_id: Option<&[u8; 16]>,
 ) -> Result<Vec<u8>, String> {
     let key = crate::network::ember::crypto::derive_pairwise_capability(
         secret_key,
@@ -1479,14 +1593,18 @@ fn encrypt_relay_mailbox_envelope(
         epoch,
     )
     .ok_or_else(|| "could not derive responder mailbox key".to_string())?;
-    let plaintext = serde_json::to_vec(&serde_json::json!({
+    let mut body = serde_json::json!({
         "initiator_id": hashed_id(initiator_ember_hash),
         "initiator_pubkey": hex::encode(initiator_pubkey),
         "ticket_id": ticket_id,
-        "purpose": "friend",
+        "purpose": purpose,
         "epoch": epoch,
-    }))
-    .map_err(|e| format!("could not serialize relay mailbox offer: {e}"))?;
+    });
+    if let Some(channel_id) = channel_id {
+        body["channel_id"] = serde_json::Value::String(hex::encode(channel_id));
+    }
+    let plaintext = serde_json::to_vec(&body)
+        .map_err(|e| format!("could not serialize relay mailbox offer: {e}"))?;
     let responder_raw = sha256_id_raw(responder_ember_hash);
     let aad = relay_mailbox_aad(&responder_raw, capability);
     let mut nonce = [0u8; RELAY_MAILBOX_NONCE_LEN];
@@ -1516,7 +1634,7 @@ fn decrypt_relay_mailbox_envelope(
     capability: &[u8; 32],
     expected_ticket_id: &str,
     envelope: &[u8],
-) -> Result<String, String> {
+) -> Result<(String, Option<[u8; 16]>), String> {
     const HEADER: usize = 1 + 8 + 32 + RELAY_MAILBOX_NONCE_LEN;
     if envelope.len() < HEADER + 16 || envelope[0] != RELAY_MAILBOX_ENVELOPE_VERSION {
         return Err("invalid relay mailbox envelope".to_string());
@@ -1539,16 +1657,6 @@ fn decrypt_relay_mailbox_envelope(
     let responder_pubkey = signing_key_from_secret(responder_secret_key)
         .verifying_key()
         .to_bytes();
-    let expected_capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
-        responder_secret_key,
-        &sender_pubkey,
-        &responder_pubkey,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive relay mailbox capability".to_string())?;
-    if expected_capability != *capability {
-        return Err("relay mailbox capability mismatch".to_string());
-    }
     let aad = relay_mailbox_aad(&sha256_id_raw(responder_ember_hash), capability);
     let plaintext = XChaCha20Poly1305::new(ChaChaKey::from_slice(&key))
         .decrypt(
@@ -1562,15 +1670,48 @@ fn decrypt_relay_mailbox_envelope(
     let body: serde_json::Value = serde_json::from_slice(&plaintext)
         .map_err(|_| "invalid relay mailbox plaintext".to_string())?;
     let initiator_id = body["initiator_id"].as_str().unwrap_or_default();
-    if body["purpose"].as_str() != Some("friend")
-        || body["epoch"].as_i64() != Some(epoch)
+    if body["epoch"].as_i64() != Some(epoch)
         || body["ticket_id"].as_str() != Some(expected_ticket_id)
         || body["initiator_pubkey"].as_str() != Some(hex::encode(sender_pubkey).as_str())
         || !pubkey_matches_id(&sender_pubkey, initiator_id)
     {
         return Err("relay mailbox signed context mismatch".to_string());
     }
-    Ok(initiator_id.to_owned())
+    let purpose = body["purpose"].as_str().unwrap_or_default();
+    let channel_id = match purpose {
+        "friend" => {
+            let expected = crate::network::ember::crypto::derive_pairwise_presence_capability(
+                responder_secret_key,
+                &sender_pubkey,
+                &responder_pubkey,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive relay mailbox capability".to_string())?;
+            if expected != *capability {
+                return Err("relay mailbox capability mismatch".to_string());
+            }
+            None
+        }
+        "channel" => {
+            let mut channel_id = [0u8; 16];
+            hex::decode_to_slice(body["channel_id"].as_str().unwrap_or_default(), &mut channel_id)
+                .map_err(|_| "invalid channel relay mailbox id".to_string())?;
+            let expected = crate::network::ember::channel::derive_channel_presence_capability(
+                responder_secret_key,
+                &sender_pubkey,
+                &responder_pubkey,
+                &channel_id,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive channel relay mailbox capability".to_string())?;
+            if expected != *capability {
+                return Err("relay mailbox capability mismatch".to_string());
+            }
+            Some(channel_id)
+        }
+        _ => return Err("relay mailbox signed context mismatch".to_string()),
+    };
+    Ok((initiator_id.to_owned(), channel_id))
 }
 
 fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
@@ -1639,6 +1780,8 @@ pub async fn offer_friend_relay_ticket(
         epoch,
         &ticket_id,
         secret_key,
+        "friend",
+        None,
     )?;
     let nonce = random_nonce();
     let signed = build_relay_mailbox_offer_msg(
@@ -1679,6 +1822,110 @@ pub async fn offer_friend_relay_ticket(
     let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
     if returned_ticket_id != ticket_id {
         return Err("relay ticket offer acknowledgement mismatch".to_string());
+    }
+    let initiator_token = body["initiator_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    validate_ticket_response_field(&ticket_id, "ticket_id")?;
+    validate_ticket_response_field(&initiator_token, "initiator_token")?;
+    Ok(FriendRelayTicketOffer {
+        ticket_id,
+        initiator_token,
+    })
+}
+
+/// Offer a rendezvous WebSocket relay bound to a channel presence capability.
+/// Never uses the friend pairwise capability or `friend_hashes`.
+pub async fn offer_channel_relay_ticket(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    responder_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    channel_id: &[u8; 16],
+) -> Result<FriendRelayTicketOffer, String> {
+    require_https(base_url)?;
+    let initiator_id = hashed_id(initiator_ember_hash);
+    let responder_id = hashed_id(responder_ember_hash);
+    let initiator_raw = sha256_id_raw(initiator_ember_hash);
+    let responder_raw = sha256_id_raw(responder_ember_hash);
+    let responder_pubkey = fetch_identity_pubkey_authenticated(
+        base_url,
+        responder_ember_hash,
+        initiator_ember_hash,
+        initiator_pubkey,
+        secret_key,
+    )
+    .await?
+    .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
+    let ts = current_timestamp();
+    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
+    let capability = crate::network::ember::channel::derive_channel_presence_capability(
+        secret_key,
+        &responder_pubkey,
+        &responder_pubkey,
+        channel_id,
+        epoch,
+    )
+    .ok_or_else(|| "could not derive channel relay responder capability".to_string())?;
+    let mut ticket_raw = [0u8; 32];
+    OsRng.fill_bytes(&mut ticket_raw);
+    let ticket_id = hex::encode(ticket_raw);
+    let envelope = encrypt_relay_mailbox_envelope(
+        initiator_ember_hash,
+        initiator_pubkey,
+        responder_ember_hash,
+        &responder_pubkey,
+        &capability,
+        epoch,
+        &ticket_id,
+        secret_key,
+        "channel",
+        Some(channel_id),
+    )?;
+    let nonce = random_nonce();
+    let signed = build_relay_mailbox_offer_msg(
+        &initiator_raw,
+        &responder_raw,
+        &capability,
+        epoch,
+        &ticket_raw,
+        &envelope,
+        &nonce,
+        ts,
+    );
+    let sig = sign_relay_ticket_message(secret_key, &signed);
+    let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
+    let resp = client(base_url)
+        .await?
+        .post(&url)
+        .json(&serde_json::json!({
+            "initiator_id": initiator_id,
+            "responder_id": responder_id,
+            "capability": hex::encode(capability),
+            "epoch": epoch,
+            "ticket_id": ticket_id,
+            "envelope": hex::encode(envelope),
+            "ts": ts,
+            "nonce": hex::encode(nonce),
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("channel relay ticket offer: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "channel relay ticket offer: status {}",
+            resp.status()
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("channel relay ticket offer bad body: {e}"))?;
+    let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
+    if returned_ticket_id != ticket_id {
+        return Err("channel relay ticket offer acknowledgement mismatch".to_string());
     }
     let initiator_token = body["initiator_token"]
         .as_str()
@@ -1778,23 +2025,26 @@ async fn parse_friend_relay_mailbox_response(
             Ok(envelope) => envelope,
             Err(_) => continue,
         };
-        let initiator_id = match decrypt_relay_mailbox_envelope(
+        match decrypt_relay_mailbox_envelope(
             responder_ember_hash,
             secret_key,
             &capability,
             &ticket_id,
             &envelope,
         ) {
-            Ok(id) => id,
+            Ok((id, channel_id)) => {
+                tickets.push(PendingFriendRelayTicket {
+                    ticket_id,
+                    initiator_id: id,
+                    channel_id,
+                });
+                continue;
+            }
             Err(error) => {
                 debug!("Ignoring unauthenticated relay mailbox item: {error}");
                 continue;
             }
         };
-        tickets.push(PendingFriendRelayTicket {
-            ticket_id,
-            initiator_id,
-        });
     }
     Ok(FriendRelayTicketPollPage { tickets })
 }
@@ -1907,6 +2157,363 @@ pub async fn friend_relay_ticket_accepted(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChannelRegistryError {
+    Unavailable,
+    Taken,
+    Forbidden,
+    Invalid,
+}
+
+fn map_registry_status(status: reqwest::StatusCode) -> ChannelRegistryError {
+    if status == reqwest::StatusCode::CONFLICT {
+        ChannelRegistryError::Taken
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        ChannelRegistryError::Forbidden
+    } else if status == reqwest::StatusCode::BAD_REQUEST {
+        ChannelRegistryError::Invalid
+    } else {
+        ChannelRegistryError::Unavailable
+    }
+}
+
+fn build_channel_username_v4_msg(pubkey: &[u8; 32], name: &str, ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 32 + name.len() + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_USERNAME_V4);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_name_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    name: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + name.len() + 1 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(name.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_DELETE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_nominee_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    nominee: &[u8; 32],
+    claim_after_days: u32,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 32 + 4 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_NOMINEE_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(nominee);
+    message.extend_from_slice(&claim_after_days.to_le_bytes());
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+fn build_channel_handover_v4_msg(
+    old_channel_id: &[u8; 16],
+    new_channel_id: &[u8; 16],
+    new_pubkey: &[u8; 32],
+    signer: &[u8; 32],
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 16 + 32 + 32 + 8);
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_HANDOVER_V4);
+    message.extend_from_slice(old_channel_id);
+    message.extend_from_slice(new_channel_id);
+    message.extend_from_slice(new_pubkey);
+    message.extend_from_slice(signer);
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
+/// Tell the registry who may inherit this room's name if we stop refreshing it.
+/// Signed with the **channel** key. `nominee` of `None` withdraws.
+pub(crate) async fn register_channel_nominee(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    nominee: Option<&[u8; 32]>,
+    claim_after_days: u32,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let nominee_bytes = nominee.copied().unwrap_or([0u8; 32]);
+    let days = if nominee.is_some() { claim_after_days } else { 0 };
+    let signed =
+        build_channel_nominee_v4_msg(channel_id, pubkey, &nominee_bytes, days, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/nominee",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "nominee": nominee.map(hex::encode).unwrap_or_default(),
+            "claim_after_days": days,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Move a room's registry name onto its successor room.
+///
+/// `signer_secret` is the **old channel** key for an explicit transfer, or the
+/// nominee's **user** key for a takeover — the server applies the matching rule
+/// and only lets the nominee through once the owner's claim has gone stale.
+pub(crate) async fn handover_channel_name(
+    base_url: &str,
+    old_channel_id: &[u8; 16],
+    new_channel_id: &[u8; 16],
+    new_pubkey: &[u8; 32],
+    signer_pubkey: &[u8; 32],
+    signer_secret: &[u8; 32],
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_handover_v4_msg(
+        old_channel_id,
+        new_channel_id,
+        new_pubkey,
+        signer_pubkey,
+        ts,
+    );
+    let sig = signing_key_from_secret(signer_secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/handover",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "old_channel_id": hex::encode(old_channel_id),
+            "new_channel_id": hex::encode(new_channel_id),
+            "new_pubkey": hex::encode(new_pubkey),
+            "signer": hex::encode(signer_pubkey),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Claim or rename this device's Channel username. `name` must already be the
+/// normalised lowercase form the server stores.
+pub(crate) async fn claim_channel_username(
+    base_url: &str,
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    name: &str,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_username_v4_msg(pubkey, name, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/username",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "pubkey": hex::encode(pubkey),
+            "name": name,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Claim a unique channel name with the **channel** key.
+pub(crate) async fn claim_channel_name(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+    name: &str,
+    private: bool,
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed_name = name.to_lowercase();
+    let signed = build_channel_name_v4_msg(channel_id, pubkey, &signed_name, private, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/name",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "name": name,
+            "private": private,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+/// Tombstone a room. Signed with the **channel** key so the server cannot
+/// invent deletes.
+pub(crate) async fn delete_channel_registry(
+    base_url: &str,
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    secret: &[u8; 32],
+) -> Result<(), ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    use ed25519_dalek::Signer;
+    let ts = current_timestamp();
+    let signed = build_channel_delete_v4_msg(channel_id, pubkey, ts);
+    let sig = signing_key_from_secret(secret).sign(&signed);
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .post(format!(
+            "{}/v4/channels/delete",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "channel_id": hex::encode(channel_id),
+            "pubkey": hex::encode(pubkey),
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if resp.status().is_success() {
+        let _ = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await;
+        return Ok(());
+    }
+    Err(map_registry_status(resp.status()))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct DirectoryChannel {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub name: String,
+}
+
+pub(crate) async fn fetch_channel_directory(
+    base_url: &str,
+) -> Result<Vec<DirectoryChannel>, ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .get(format!(
+            "{}/v4/channels/directory",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if !resp.status().is_success() {
+        return Err(map_registry_status(resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let Some(list) = body.get("channels") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+}
+
+pub(crate) async fn fetch_deleted_channel_ids(
+    base_url: &str,
+) -> Result<Vec<String>, ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let resp = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?
+        .get(format!(
+            "{}/v4/channels/deleted",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    if !resp.status().is_success() {
+        return Err(map_registry_status(resp.status()));
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES).await.map_err(|_| ChannelRegistryError::Unavailable)?)
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let Some(list) = body.get("ids") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(list.clone()).map_err(|_| ChannelRegistryError::Unavailable)
+}
+
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
@@ -1922,6 +2529,11 @@ mod relay_ticket_tests {
         assert_eq!(OP_IDENTITY_LOOKUP_V4, 0x20);
         assert_eq!(OP_CAPABILITY_REGISTER_V4, 0x21);
         assert_eq!(OP_CAPABILITY_LOOKUP_V4, 0x22);
+        assert_eq!(OP_CHANNEL_USERNAME_V4, 0x26);
+        assert_eq!(OP_CHANNEL_NAME_V4, 0x27);
+        assert_eq!(OP_CHANNEL_DELETE_V4, 0x28);
+        assert_eq!(OP_CHANNEL_NOMINEE_V4, 0x29);
+        assert_eq!(OP_CHANNEL_HANDOVER_V4, 0x2a);
     }
 
     #[test]

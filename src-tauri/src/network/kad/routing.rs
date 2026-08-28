@@ -671,9 +671,7 @@ impl RoutingZone {
             return None;
         }
 
-        let Some(bin) = self.bin.as_ref() else {
-            return None;
-        };
+        let bin = self.bin.as_ref()?;
         let qualifies = self.zone_index.less_than_u32(KK as u32)
             || self.level < KBASE as u32
             || bin.remaining() as f64 >= K_BUCKET_SIZE as f64 * 0.8;
@@ -896,9 +894,7 @@ fn apply_existing_contact_update(
     global_ip_count: &HashMap<Ipv4Addr, u32>,
     global_subnet_count: &HashMap<u32, u32>,
 ) -> Option<(Ipv4Addr, Ipv4Addr)> {
-    let Some(existing) = bin.get_contact_mut(&contact.id) else {
-        return None;
-    };
+    let existing = bin.get_contact_mut(&contact.id)?;
     // eMule UDPKey sender verification: once a contact has a valid UDP key, an
     // update claiming its KadID must present the same key. Prevents contact
     // hijacking, since a claimant cannot produce the value without the original
@@ -965,9 +961,7 @@ fn apply_existing_contact_update(
     {
         return None;
     }
-    let Some(existing) = bin.get_contact_mut(&contact.id) else {
-        return None;
-    };
+    let existing = bin.get_contact_mut(&contact.id)?;
     existing.udp_port = contact.udp_port;
     existing.tcp_port = contact.tcp_port;
     if contact.version >= existing.version {
@@ -977,7 +971,7 @@ fn apply_existing_contact_update(
         existing.verified = true;
     }
     if contact.udp_key.is_some() {
-        existing.udp_key = contact.udp_key.clone();
+        existing.udp_key = contact.udp_key;
     }
     existing.kad_options = contact.kad_options;
     if contact.received_hello {

@@ -1071,6 +1071,8 @@ footer.doc-end {
     <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
     <tr><td>0x0F</td><td>CALLBACK_REQ</td><td>→</td><td>publisher id (16) + file hash (16) + searcher TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Searcher → HighID buddy. The searcher's IP is the UDP source, not in the payload.</td></tr>
     <tr><td>0x10</td><td>CALLBACK</td><td>→</td><td>file hash (16) + searcher IPv4 (4) + TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Buddy → firewalled publisher: connect-and-serve this searcher.</td></tr>
+    <tr><td>0x11</td><td>CHANNEL_MSG</td><td>→</td><td>AEAD channel gossip body. Develop overlay rooms; additive vs v2.</td></tr>
+    <tr><td>0x12</td><td>CHANNEL_RELAY</td><td>→</td><td>opaque CHANNEL_MSG envelope for a HighID hop to forward to a LowID target.</td></tr>
   </tbody>
 </table>
 

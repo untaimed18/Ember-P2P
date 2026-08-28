@@ -14,6 +14,14 @@ primary_region = 'iad'
   # immediate connection is from Fly's private/local proxy network.
   TRUST_PROXY = 'fly'
   TRUSTED_PROXY_HOPS = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,fc00::/7,::1/128'
+  # Channel username and room-name uniqueness. The volume below keeps this
+  # across `auto_stop`; without it every claimed name would vanish on halt.
+  CHANNELS_REGISTRY_PATH = '/data/channels-registry.json'
+
+# Create once: `fly volumes create channels_registry --size 1 --region iad`
+[[mounts]]
+  source = 'channels_registry'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080

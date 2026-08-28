@@ -36,8 +36,8 @@ impl Rc4State {
     pub fn new(key: &[u8]) -> Self {
         debug_assert!(!key.is_empty(), "Rc4State::new requires a non-empty key");
         let mut s = [0u8; 256];
-        for i in 0..256 {
-            s[i] = i as u8;
+        for (i, slot) in s.iter_mut().enumerate() {
+            *slot = i as u8;
         }
         // Every caller passes a fixed-length key (an MD5 digest), so an empty
         // key is unreachable in practice — but guard the `% key.len()` below so

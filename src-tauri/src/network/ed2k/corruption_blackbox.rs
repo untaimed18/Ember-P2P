@@ -294,7 +294,7 @@ impl CorruptionBlackBox {
             })
             .collect();
         if kept.len() + aggregates.len() > target {
-            aggregates.sort_unstable_by(|a, b| b.len().cmp(&a.len()));
+            aggregates.sort_unstable_by_key(|a| std::cmp::Reverse(a.len()));
             aggregates.truncate(target.saturating_sub(kept.len()));
         }
 
@@ -589,7 +589,7 @@ mod tests {
         let h = hash(6);
         bb.record_data(h, 0, 1000, ip(1, 1, 1, 1));
         bb.remove_file(&h);
-        assert!(bb.records.get(&h).is_none());
+        assert!(!bb.records.contains_key(&h));
     }
 
     #[test]
@@ -683,11 +683,11 @@ mod tests {
             "tracked file count must never exceed MAX_TRACKED_FILES"
         );
         assert!(
-            bb.records.get(&hash_n(0)).is_none(),
+            !bb.records.contains_key(&hash_n(0)),
             "oldest file must be evicted first"
         );
         assert!(
-            bb.records.get(&hash_n(MAX_TRACKED_FILES as u16)).is_some(),
+            bb.records.contains_key(&hash_n(MAX_TRACKED_FILES as u16)),
             "most recently added file must survive eviction"
         );
     }
