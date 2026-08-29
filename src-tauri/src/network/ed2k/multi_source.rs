@@ -2060,6 +2060,7 @@ impl MultiSourceDownload {
             part_path.clone(),
             super::write_coordinator::OpenMode::OpenExisting,
             allowed_roots.clone(),
+            Some(self.control.cancelled_flag()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
@@ -7047,6 +7048,7 @@ async fn download_parts_from_source(
             part_path.to_path_buf(),
             super::write_coordinator::OpenMode::OpenExisting,
             allowed,
+            Some(control.cancelled_flag()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?

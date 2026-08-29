@@ -30,7 +30,7 @@ pub fn set_global_preview_priority(enabled: bool) {
 }
 
 pub struct TransferControl {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     paused: AtomicBool,
     cancel_notify: tokio::sync::Notify,
     pause_notify: tokio::sync::Notify,
@@ -57,7 +57,7 @@ impl std::fmt::Debug for TransferControl {
 impl TransferControl {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
             cancel_notify: tokio::sync::Notify::new(),
             pause_notify: tokio::sync::Notify::new(),
@@ -87,6 +87,13 @@ impl TransferControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Clone of the cancel flag for std threads (the part-file writer) that
+    /// cannot await `wait_cancelled` but must drop their `.part` handle as
+    /// soon as the user cancels.
+    pub fn cancelled_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
     }
 
     /// Resolves as soon as the control is cancelled. Used by network tasks

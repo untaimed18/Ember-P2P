@@ -543,15 +543,30 @@ async fn handle_command_inner(
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
+            // Capture *before* `cleanup_ack.take()` below. The ack is moved
+            // into the join task when a worker is running, so a later
+            // `cleanup_ack.is_some()` would be false for every live download
+            // and would skip tracker removal + `.part.met` suppression —
+            // in-flight saves then recreate the sidecar after cleanup.
+            let deleting = cleanup_ack.is_some();
             // Cancel (delete) clears known sources; Stop preserves them for resume.
-            if cleanup_ack.is_some() {
+            if deleting {
                 state.per_file_sources.remove(&transfer_id);
+                let met_path = PathBuf::from(&settings.download_folder)
+                    .join("Temp")
+                    .join(format!("{transfer_id}.part.met"));
+                ed2k::part_tracker::mark_met_saves_suppressed(&met_path);
             }
+            let cancel_tracker = if deleting {
+                state.tracker_registry.lock().remove(&transfer_id)
+            } else {
+                None
+            };
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 // Stop path: preserve .part.met for resume. Snapshot the
                 // tracker `Arc` here (a cheap registry lookup) so the save can
                 // run off-loop with the rest of the teardown.
-                let stop_tracker = if cleanup_ack.is_none() {
+                let stop_tracker = if !deleting {
                     state.tracker_registry.lock().get(&transfer_id).cloned()
                 } else {
                     None
@@ -574,18 +589,39 @@ async fn handle_command_inner(
                 // in-memory state with no such dependency.
                 let ack = cleanup_ack.take();
                 let tid = transfer_id.clone();
+                let delete_roots = deleting.then(|| vec![settings.download_folder.clone()]);
                 tokio::spawn(async move {
                     if let Some(tracker) = stop_tracker {
                         save_part_tracker_snapshot(tracker, &tid, "cancel/stop").await;
                     }
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                    if let (Some(tracker), Some(allowed)) = (cancel_tracker, delete_roots) {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tracker.read(),
+                        )
+                        .await
+                        {
+                            Ok(t) => t.delete_met(&allowed),
+                            Err(_) => warn!(
+                                "Timed out acquiring tracker lock to delete .part.met for {tid}"
+                            ),
+                        }
+                    }
                     if let Some(tx) = ack {
                         let _ = tx.send(());
                     }
                 });
-            }
-            if cleanup_ack.is_some() {
-                state.tracker_registry.lock().remove(&transfer_id);
+            } else if let Some(tracker) = cancel_tracker {
+                let allowed = vec![settings.download_folder.clone()];
+                tokio::spawn(async move {
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
+                        .await
+                    {
+                        Ok(t) => t.delete_met(&allowed),
+                        Err(_) => {}
+                    }
+                });
             }
 
             // Remove partial download from KAD source publish. `cancel_hash`

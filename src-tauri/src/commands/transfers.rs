@@ -445,6 +445,40 @@ fn pin_cleanup_target(
     }
 }
 
+async fn cleanup_one_partial(
+    path: &Path,
+    allowed_roots: &[String],
+    max_attempts: u32,
+    delay_ms: u64,
+) {
+    for attempt in 0..max_attempts {
+        match pin_cleanup_target(path, allowed_roots) {
+            Ok(None) => return,
+            Ok(Some((pinned, identity))) => {
+                delete_with_retry(&pinned, allowed_roots, &identity, max_attempts, delay_ms).await;
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt + 1 < max_attempts => {
+                tracing::debug!(
+                    "Pin {} attempt {}/{} failed ({}), retrying...",
+                    path.display(),
+                    attempt + 1,
+                    max_attempts,
+                    error
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Refusing to delete unverified path {} after {max_attempts} attempts: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         tracing::warn!("cleanup_partial_files: invalid transfer_id, skipping");
@@ -453,36 +487,19 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
+    crate::network::ed2k::part_tracker::suppress_met_saves(&met_path);
     let allowed = vec![download_folder.to_string()];
-    let part = match pin_cleanup_target(&part_path, &allowed) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Refusing to delete unverified part path: {error}");
-            return;
-        }
-    };
-    let met = match pin_cleanup_target(&met_path, &allowed) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Refusing to delete unverified part metadata path: {error}");
-            return;
-        }
-    };
-    match (part, met) {
-        (Some((part_path, part_identity)), Some((met_path, met_identity))) => {
-            tokio::join!(
-                delete_with_retry(&part_path, &allowed, &part_identity, 6, 500),
-                delete_with_retry(&met_path, &allowed, &met_identity, 6, 500),
-            );
-        }
-        (Some((part_path, part_identity)), None) => {
-            delete_with_retry(&part_path, &allowed, &part_identity, 6, 500).await;
-        }
-        (None, Some((met_path, met_identity))) => {
-            delete_with_retry(&met_path, &allowed, &met_identity, 6, 500).await;
-        }
-        (None, None) => {}
-    }
+    tokio::join!(
+        cleanup_one_partial(&part_path, &allowed, 6, 500),
+        cleanup_one_partial(&met_path, &allowed, 6, 500),
+    );
+}
+
+fn spawn_deferred_partial_cleanup(download_folder: String, transfer_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        cleanup_partial_files(&download_folder, &transfer_id).await;
+    });
 }
 
 /// Relocate a failed download's `.part` into `Downloads/` so "Remove from List"
@@ -1245,6 +1262,7 @@ pub async fn cancel_transfers_batch(
     };
     for transfer_id in cancelled_ids {
         cleanup_partial_files(&dl_folder, &transfer_id).await;
+        spawn_deferred_partial_cleanup(dl_folder.clone(), transfer_id.clone());
         {
             let db = state.db.clone();
             let tid = transfer_id.clone();
@@ -1626,6 +1644,7 @@ pub async fn cancel_transfer(
         ),
     }
     cleanup_partial_files(&dl_folder, &transfer_id).await;
+    spawn_deferred_partial_cleanup(dl_folder, transfer_id.clone());
 
     {
         let db = state.db.clone();
@@ -1710,6 +1729,7 @@ pub async fn remove_transfer(
         })
         .await;
     },);
+    spawn_deferred_partial_cleanup(dl_folder, transfer_id.clone());
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -2300,5 +2320,59 @@ mod ipc_lifecycle_tests {
             normalize_primary_peer_ip("::ffff:203.0.113.7".to_string()).unwrap(),
             "203.0.113.7"
         );
+    }
+
+    fn approved_download_folder(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "ember-cleanup-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("downloads");
+        let data = base.join("data");
+        std::fs::create_dir_all(root.join("Temp")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_s),
+        )
+        .unwrap();
+        (root, base)
+    }
+
+    #[tokio::test]
+    async fn cancel_cleanup_deletes_part_and_part_met() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("both");
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let temp = root.join("Temp");
+        let part = temp.join(format!("{transfer_id}.part"));
+        let met = temp.join(format!("{transfer_id}.part.met"));
+        std::fs::write(&part, b"partial-bytes").unwrap();
+        std::fs::write(&met, b"met").unwrap();
+
+        super::cleanup_partial_files(&root.to_string_lossy(), &transfer_id).await;
+
+        assert!(!part.exists(), ".part must be deleted on cancel cleanup");
+        assert!(!met.exists(), ".part.met must be deleted on cancel cleanup");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn cancel_cleanup_deletes_part_met_when_part_is_already_gone() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("met-only");
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let met = root.join("Temp").join(format!("{transfer_id}.part.met"));
+        std::fs::write(&met, b"met").unwrap();
+
+        super::cleanup_partial_files(&root.to_string_lossy(), &transfer_id).await;
+
+        assert!(!met.exists(), ".part.met must still be deleted if .part is missing");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

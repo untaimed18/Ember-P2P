@@ -22,6 +22,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -74,18 +75,36 @@ enum WriteOp {
     /// Causes the worker to drop the file handle and exit cleanly.
     /// Sent by `Inner::Drop` when the last clone goes away.
     Close,
+    /// Cancel/remove: skip remaining queued writes and skip the trailing
+    /// fsync so the `.part` handle is released immediately.
+    Abandon,
 }
 
 struct Inner {
     tx: mpsc::Sender<WriteOp>,
+    /// Set by the transfer's `TransferControl` so a user cancel unblocks the
+    /// writer thread even while it still has queued writes / a trailing fsync.
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Inner {
+    fn should_abandon(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Best-effort shutdown signal; if the channel is already closed
-        // the worker is already on its way out.
-        let (ack, _ack_rx) = oneshot::channel();
-        let _ = self.tx.try_send(WriteOp::SyncData { ack });
+        if self.should_abandon() {
+            let _ = self.tx.try_send(WriteOp::Abandon);
+            return;
+        }
+        // Do not queue SyncData here: a cancel that loses the race with Drop
+        // would fsync a multi-GB `.part` before the handle is released, which
+        // is exactly what leaves Temp/{id}.part visible on Windows. Graceful
+        // close still fsyncs once in `writer_loop` after draining writes.
         let _ = self.tx.try_send(WriteOp::Close);
     }
 }
@@ -122,10 +141,15 @@ impl PartFileWriter {
     /// The worker is a `std::thread::spawn` (not `tokio::task::spawn_blocking`)
     /// so it doesn't compete for slots in the bounded blocking pool with
     /// short-lived tasks like hash verification or `.part.met` saves.
+    ///
+    /// `cancel` is the transfer's cancel flag. When set, the worker drops the
+    /// file handle without draining remaining writes or fsyncing, so cancel
+    /// can delete Temp/{id}.part on Windows.
     pub async fn open(
         path: PathBuf,
         mode: OpenMode,
         allowed_roots: Vec<String>,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
         // Open on a blocking thread because creating + sizing the file can
         // be slow on cold disks. After this returns the worker thread takes
@@ -139,6 +163,7 @@ impl PartFileWriter {
                 })??;
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
+        let cancel_for_loop = cancel.clone();
 
         std::thread::Builder::new()
             .name(format!(
@@ -147,13 +172,13 @@ impl PartFileWriter {
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
             ))
-            .spawn(move || writer_loop(file, &mut rx))
+            .spawn(move || writer_loop(file, &mut rx, cancel_for_loop))
             .map_err(|e| {
                 io::Error::other(format!("spawn writer thread: {e}"))
             })?;
 
         Ok(Self {
-            inner: Arc::new(Inner { tx }),
+            inner: Arc::new(Inner { tx, cancel }),
         })
     }
 
@@ -263,10 +288,53 @@ fn open_file(path: &Path, mode: OpenMode, allowed_roots: &[String]) -> io::Resul
     }
 }
 
-fn writer_loop(mut file: std::fs::File, rx: &mut mpsc::Receiver<WriteOp>) {
-    // `blocking_recv` is documented to work outside an async context, which
-    // is exactly the situation here (we're on a `std::thread`).
-    while let Some(op) = rx.blocking_recv() {
+fn writer_loop(
+    mut file: std::fs::File,
+    rx: &mut mpsc::Receiver<WriteOp>,
+    cancel: Option<Arc<AtomicBool>>,
+) {
+    fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
+        cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn next_op(
+        rx: &mut mpsc::Receiver<WriteOp>,
+        cancel: &Option<Arc<AtomicBool>>,
+    ) -> Option<WriteOp> {
+        // When a cancel flag is attached, poll it while idle so a user cancel
+        // can drop the `.part` handle even if the tokio download task is still
+        // parked in `spawn_blocking` and has not dropped this writer yet.
+        // `blocking_recv` would hold the file open until that Drop sends
+        // `Abandon`. Without a flag (tests) stay on a blocking recv so an idle
+        // writer does not wake up on a timer.
+        if cancel.is_none() {
+            return rx.blocking_recv();
+        }
+        loop {
+            if cancelled(cancel) {
+                return Some(WriteOp::Abandon);
+            }
+            match rx.try_recv() {
+                Ok(op) => return Some(op),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    let mut abandon = cancelled(&cancel);
+    while !abandon {
+        let Some(op) = next_op(rx, &cancel) else {
+            break;
+        };
+        if cancelled(&cancel) {
+            abandon = true;
+            break;
+        }
         match op {
             WriteOp::Write { offset, data, ack } => {
                 let res = (|| -> io::Result<()> {
@@ -298,14 +366,34 @@ fn writer_loop(mut file: std::fs::File, rx: &mut mpsc::Receiver<WriteOp>) {
                 let _ = ack.send(res);
             }
             WriteOp::SyncData { ack } => {
+                if cancelled(&cancel) {
+                    abandon = true;
+                    let _ = ack.send(Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "part writer abandoned",
+                    )));
+                    break;
+                }
                 let _ = ack.send(file.sync_data());
             }
             WriteOp::Close => break,
+            WriteOp::Abandon => {
+                abandon = true;
+                break;
+            }
+        }
+        if cancelled(&cancel) {
+            abandon = true;
+            break;
         }
     }
     // Final best-effort flush so a sudden process exit after the last
-    // queued write doesn't lose data the OS hadn't written yet.
-    let _ = file.sync_data();
+    // queued write doesn't lose data the OS hadn't written yet. Skip it
+    // on cancel: the `.part` is about to be deleted and fsync is what
+    // keeps the handle open on Windows.
+    if !abandon {
+        let _ = file.sync_data();
+    }
     drop(file);
 }
 
@@ -353,6 +441,7 @@ mod tests {
                 truncate_existing: true,
             },
             allowed,
+            None,
         )
         .await
         .unwrap();
@@ -376,6 +465,7 @@ mod tests {
                 truncate_existing: true,
             },
             allowed,
+            None,
         )
         .await
         .unwrap();
@@ -405,6 +495,7 @@ mod tests {
                 truncate_existing: true,
             },
             allowed,
+            None,
         )
         .await
         .unwrap();
@@ -428,5 +519,34 @@ mod tests {
 
         drop(writer);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_releases_the_file_without_waiting_on_fsync() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("abandon");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let writer = PartFileWriter::open(
+            path.clone(),
+            OpenMode::CreateOrOpen {
+                set_len_to: Some(4096),
+                truncate_existing: true,
+            },
+            allowed,
+            Some(cancel.clone()),
+        )
+        .await
+        .unwrap();
+        writer.write(0, vec![0xCDu8; 64]).await.unwrap();
+        cancel.store(true, Ordering::Release);
+        drop(writer);
+        for _ in 0..50 {
+            if std::fs::remove_file(&path).is_ok() {
+                let _ = std::fs::remove_dir_all(base);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("cancelled writer did not release {}", path.display());
     }
 }
