@@ -1203,9 +1203,11 @@ impl SearchManager {
         match search_type {
             SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => 0,
             SearchType::FindNode | SearchType::FindBuddy => 1,
-            SearchType::FindKeyword
-            | SearchType::FindSource { .. }
-            | SearchType::FindNotes { .. } => 2,
+            SearchType::FindSource { .. } | SearchType::FindNotes { .. } => 2,
+            // User keyword search outranks download source lookups so a busy
+            // download queue cannot silently reject the Search page at the
+            // 20-slot cap (SearchId(0) with no UI signal).
+            SearchType::FindKeyword => 3,
         }
     }
 
@@ -2049,5 +2051,27 @@ mod tests {
         assert!(manager.get(&sid).is_none());
         assert!(manager.active.is_empty());
         assert!(manager.target_map.is_empty());
+    }
+
+    #[test]
+    fn find_keyword_evicts_find_source_at_the_active_cap() {
+        let mut manager = SearchManager::new();
+        let mut source_ids = Vec::new();
+        for i in 0..20u8 {
+            let (sid, ..) = manager.start_search(
+                kad_id(i),
+                SearchType::FindSource { file_size: 1 },
+                Vec::new(),
+            );
+            assert_ne!(sid, SearchId(0), "FindSource {i} should start");
+            source_ids.push(sid);
+        }
+        let (keyword, evicted, ..) =
+            manager.start_search(kad_id(21), SearchType::FindKeyword, Vec::new());
+        assert_ne!(keyword, SearchId(0), "user keyword search must not be rejected");
+        assert_eq!(evicted.len(), 1);
+        assert!(source_ids.contains(&evicted[0]));
+        assert!(manager.get(&keyword).is_some());
+        assert!(manager.get(&evicted[0]).is_none());
     }
 }

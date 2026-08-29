@@ -238,6 +238,7 @@ pub(crate) fn community_ratings_for(
 
 #[tauri::command]
 pub async fn search_files(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     query: String,
     method: Option<SearchMethod>,
@@ -290,37 +291,31 @@ pub async fn search_files(
         .map(|expression| expression.positive_terms())
         .unwrap_or_default();
 
-    let (local_hits, timeout_secs) = {
-        let (li, c) = tokio::join!(state.local_index.read(), state.config.read(),);
-        (
-            li.search(query.trim()),
-            c.settings
-                .search_timeout_secs
-                .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX),
-        )
-    };
-
-    // Apply the same boolean query semantics (implicit/explicit AND, OR, NOT,
-    // `-` exclusion, quoted phrases, parentheses) to our own shared-library
-    // hits that the network path applies to KAD/server results, so local
-    // results stay at parity. `LocalIndex::search` scores by any-token match
-    // (OR-ish) and can't express NOT, so without this a query like
-    // `movie -cam` would still surface local `cam` files, and a multi-word
-    // query would surface files matching only one of the words. Trivial
-    // single-keyword queries are left untouched (no behavior change there).
-    let local_hits = match crate::search::query::parse(&query) {
-        Some(expr) if !expr.is_trivial() => local_hits
-            .into_iter()
-            .filter(|r| expr.matches(&r.file.name.to_lowercase()))
-            .collect(),
-        _ => local_hits,
-    };
-
     let ui_file_type = file_type.clone();
     let client_min_size = min_size;
     let client_max_size = max_size;
     let client_file_extension = file_extension.clone();
     let client_min_availability = min_availability;
+    // eMule: Program search clears the local type filter; Archive/CD-Image keep
+    // theirs so Pro-wire replies can be narrowed client-side.
+    let file_type_filter =
+        crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
+
+    let (local_hits, timeout_secs) = {
+        let (li, c) = tokio::join!(state.local_index.read(), state.config.read(),);
+        (
+            li.search_with_filters(
+                query.trim(),
+                file_type_filter.as_deref(),
+                client_min_size,
+                client_max_size,
+                client_file_extension.as_deref(),
+            ),
+            c.settings
+                .search_timeout_secs
+                .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX),
+        )
+    };
     let filters = if min_size.is_some()
         || max_size.is_some()
         || ui_file_type.is_some()
@@ -338,10 +333,27 @@ pub async fn search_files(
         None
     };
 
-    // eMule: Program search clears the local type filter; Archive/CD-Image keep
-    // theirs so Pro-wire replies can be narrowed client-side.
-    let file_type_filter =
-        crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
+    let mut streamed_local = local_hits.clone();
+    streamed_local.retain(|r| {
+        merge::result_matches_client_filters(
+            r,
+            file_type_filter.as_deref(),
+            client_min_size,
+            client_max_size,
+            client_file_extension.as_deref(),
+            client_min_availability,
+        )
+    });
+    enrich_results_with_batch(&mut streamed_local, &state, &keywords, None, false).await;
+    if !streamed_local.is_empty() {
+        let _ = app.emit(
+            "search-results",
+            serde_json::json!({
+                "request_id": request_id,
+                "results": streamed_local,
+            }),
+        );
+    }
 
     state
         .network_tx
@@ -580,7 +592,7 @@ pub async fn publish_note(
         })?;
 
     match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-        Ok(Ok(Ok(()))) => Ok("Note publish started".to_string()),
+        Ok(Ok(Ok(()))) => Ok("search_note_publish_started".to_string()),
         Ok(Ok(Err(message))) => Err(coded("search_note_publish_unavailable", message)),
         Ok(Err(_)) => Err(coded(
             "search_note_publish_failed",
@@ -589,7 +601,7 @@ pub async fn publish_note(
         // Oneshot was delivered; the network task may still complete publish
         // after our wait. Soften timeout to a queued ack so the UI does not
         // treat a slow KAD publish as a hard failure.
-        Err(_) => Ok("Note publish queued".to_string()),
+        Err(_) => Ok("search_note_publish_queued".to_string()),
     }
 }
 
@@ -1058,6 +1070,8 @@ pub async fn explain_spam_result(
     search_query: Option<String>,
     rating: Option<u8>,
     result_origin: Option<String>,
+    batch_file_hashes: Option<Vec<String>>,
+    batch_file_names: Option<Vec<String>>,
 ) -> Result<SpamExplainResponse, String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
@@ -1127,15 +1141,67 @@ pub async fn explain_spam_result(
     };
 
     let spam = state.spam_filter.read().await;
-    // Batch-local heuristics still need the full result set; those reasons are
-    // stored on the row at enrich time (`spam_reasons`) and preferred by the UI.
+    const MAX_EXPLAIN_BATCH: usize = 256;
+    let batch = match (batch_file_hashes.as_deref(), batch_file_names.as_deref()) {
+        (Some(hashes), Some(names)) if !hashes.is_empty() && hashes.len() == names.len() => {
+            let stubs: Vec<SearchResult> = hashes
+                .iter()
+                .zip(names.iter())
+                .take(MAX_EXPLAIN_BATCH)
+                .map(|(hash, name)| SearchResult {
+                    file: crate::types::FileInfo {
+                        id: hash.clone(),
+                        name: name.clone(),
+                        path: String::new(),
+                        size: 0,
+                        hash: hash.clone(),
+                        aich_hash: String::new(),
+                        ember_file_hash: String::new(),
+                        extension: String::new(),
+                        modified_at: 0,
+                        priority: "normal".to_string(),
+                        requests: 0,
+                        accepted: 0,
+                        bytes_transferred: 0,
+                        alltime_requests: 0,
+                        alltime_accepted: 0,
+                        alltime_transferred: 0,
+                        complete_sources: 0,
+                        folder: String::new(),
+                        shared: false,
+                        friends_only: false,
+                        shared_kad: false,
+                        shared_ed2k: false,
+                        shared_ember: false,
+                    },
+                    peer_id: String::new(),
+                    peer_name: String::new(),
+                    availability: 0,
+                    file_type: String::new(),
+                    source_addresses: Vec::new(),
+                    rating: None,
+                    comment: None,
+                    media: None,
+                    spam_rating: 0,
+                    is_spam: false,
+                    clean_name: String::new(),
+                    result_origin: String::new(),
+                    origin_server_ip: None,
+                    spam_reasons: Vec::new(),
+                    spam_reason_details: Vec::new(),
+                })
+                .collect();
+            BatchSpamContext::analyze(&stubs)
+        }
+        _ => BatchSpamContext::default(),
+    };
     let details = spam.explain_result(
         &result,
         &keywords,
         server_ip.as_deref(),
         profile,
         community,
-        &BatchSpamContext::default(),
+        &batch,
     );
     Ok(SpamExplainResponse {
         score: details.score,

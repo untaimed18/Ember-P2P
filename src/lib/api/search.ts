@@ -151,7 +151,13 @@ export async function explainSpamResult(
   fileSize: number,
   sourceAddresses: string[],
   searchQuery: string,
-  opts?: { serverIp?: string | null; rating?: number | null; resultOrigin?: string | null },
+  opts?: {
+    serverIp?: string | null;
+    rating?: number | null;
+    resultOrigin?: string | null;
+    batchFileHashes?: string[];
+    batchFileNames?: string[];
+  },
 ): Promise<SpamExplanation> {
   return invoke('explain_spam_result', {
     fileHash,
@@ -163,6 +169,8 @@ export async function explainSpamResult(
     searchQuery: searchQuery || null,
     rating: opts?.rating ?? null,
     resultOrigin: opts?.resultOrigin ?? null,
+    batchFileHashes: opts?.batchFileHashes ?? null,
+    batchFileNames: opts?.batchFileNames ?? null,
   });
 }
 

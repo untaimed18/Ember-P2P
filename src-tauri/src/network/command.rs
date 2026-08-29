@@ -321,6 +321,7 @@ async fn handle_command_inner(
             }
 
             // --- KAD search ---
+            let mut kad_skip_phase: Option<&'static str> = None;
             let kad_started = 'kad: {
                 if !run_kad {
                     break 'kad false;
@@ -330,9 +331,11 @@ async fn handle_command_inner(
                 // before any side effects — so future logic drift degrades to a
                 // skipped KAD search instead of panicking the whole network task.
                 let Some(query_expr) = query_expr.clone() else {
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
                 let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
                 let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
@@ -348,6 +351,7 @@ async fn handle_command_inner(
 
                 if closest.is_empty() {
                     info!("KAD search: no closest contacts in routing table");
+                    kad_skip_phase = Some("KadNoContacts");
                     break 'kad false;
                 }
 
@@ -361,6 +365,7 @@ async fn handle_command_inner(
 
                 if sid == SearchId(0) {
                     info!("KAD search: rejected (too many active searches)");
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 }
                 // eMule GetSearchPacket (Kad): for AND-only trees, strip the
@@ -400,6 +405,18 @@ async fn handle_command_inner(
                 );
                 true
             };
+
+            if let Some(phase) = kad_skip_phase {
+                let _ = app_handle.emit(
+                    "search-progress",
+                    SearchProgressEvent {
+                        request_id,
+                        nodes_contacted: 0,
+                        results_so_far: 0,
+                        phase: phase.to_string(),
+                    },
+                );
+            }
 
             // --- Ember DHT keyword search (slice 10 + multi-keyword wire) ---
             // Streaming-only: it never touches the invoke oneshot (`tx`); its

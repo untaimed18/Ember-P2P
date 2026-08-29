@@ -13,6 +13,7 @@
     appendSearchResults,
     clearPendingSearchResults,
     closeSearchTab,
+    flushPendingSearchResults,
     newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
@@ -45,9 +46,9 @@
    * is already in `searchTimeouts`. */
   const searchInvokeSettled = new Set<number>();
 
-  /// Upper bound on a search query length sent over IPC. ed2k keywords are
-  /// short; this just guards against pathologically long pasted input.
-  const MAX_SEARCH_QUERY_LEN = 256;
+  /// Upper bound on a search query length sent over IPC. Matches
+  /// `MAX_SEARCH_QUERY_LEN` in commands/search.rs (1024 bytes for ASCII).
+  const MAX_SEARCH_QUERY_LEN = 1024;
 
   let searchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
@@ -866,8 +867,26 @@
     switch (phase) {
       case 'Lookup': return m.search_phase_lookup();
       case 'Fetch': return m.search_phase_fetch();
+      case 'KadNoContacts': return m.search_phase_kad_no_contacts();
+      case 'KadBusy': return m.search_phase_kad_busy();
       default: return null;
     }
+  }
+
+  function queryHasNetworkKeyword(q: string): boolean {
+    // Same 3-byte floor as eD2K keyword indexing (UTF-8), so a 1–2 character
+    // CJK token is still a valid KAD/Ember key.
+    const encoder = new TextEncoder();
+    return q.split(/[\s()[\]{}<>,._\-!?:;\\/"']+/).some((t) => t && encoder.encode(t).length >= 3);
+  }
+
+  function explainBatchFromTab(): { batchFileHashes: string[]; batchFileNames: string[] } {
+    const tab = activeTab;
+    const rows = (tab?.results ?? []).filter((r) => r.file.hash).slice(0, 256);
+    return {
+      batchFileHashes: rows.map((r) => r.file.hash),
+      batchFileNames: rows.map((r) => displayName(r)),
+    };
   }
 
   function spamProfileLabel(profile: string): string {
@@ -1339,7 +1358,10 @@
   // Kad-only: short grace (oneshot ≈ search end). Global/server: TCP/UDP can
   // still stream for ~90s+ after the invoke returns.
   const SEARCH_COMPLETE_GRACE_KAD_MS = 5000;
-  const SEARCH_COMPLETE_GRACE_ED2K_MS = 120_000;
+  // UDP global can run queue+90s (~590s). Re-arming this timer on late
+  // results/progress (below) covers a busy stream; the 10min ceiling covers
+  // a sparse tail if search-complete is dropped.
+  const SEARCH_COMPLETE_GRACE_ED2K_MS = 600_000;
 
   function armSearchCompletionFallback(requestId: number, method: SearchMethod) {
     clearSearchTimeoutForRequest(requestId);
@@ -1357,6 +1379,17 @@
       }, graceMs),
     );
   }
+
+  $effect(() => {
+    for (const tab of $searchTabs) {
+      if (!tab.isSearching) continue;
+      if (!searchInvokeSettled.has(tab.requestId)) continue;
+      void tab.results.length;
+      void tab.progress?.results_so_far;
+      void tab.progress?.phase;
+      untrack(() => armSearchCompletionFallback(tab.requestId, tab.method));
+    }
+  });
 
   function shortenTabLabel(s: string, max = 28): string {
     const t = s.trim() || '—';
@@ -1480,6 +1513,10 @@
       minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
+      addToast('warning', m.search_needs_keyword());
+      return;
+    }
     // Gate by the selected search method — KAD-only needs KAD, server-only
     // needs the eD2K server, Ember-only needs Ember enabled, global needs
     // any of KAD / server / Ember.
@@ -1508,7 +1545,16 @@
       networkAlertOpen = true;
       return;
     }
-    const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    const previousSearching = get(searchTabs).filter((t) => t.isSearching);
+    for (const t of previousSearching) {
+      searchInvokeSettled.add(t.requestId);
+      clearSearchTimeoutForRequest(t.requestId);
+      flushPendingSearchResults(t.requestId);
+    }
+    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    if (stoppedOthers) {
+      addToast('info', m.search_previous_stopped());
+    }
     selectedResultKey = null;
     notes = [];
     clearChecked();
@@ -1532,7 +1578,7 @@
           // oneshot cannot merge into this tab, keep streamed rows, and
           // only show a timeout error when the tab is still empty.
           searchInvokeSettled.add(requestId);
-          clearPendingSearchResults(requestId);
+          flushPendingSearchResults(requestId);
           patchSearchTabByRequestId(requestId, (tab) => {
             if (!tab.isSearching) return tab;
             return {
@@ -1572,6 +1618,7 @@
       // `search-complete` event can't leave the spinner stuck forever.
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
+      flushPendingSearchResults(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
         return;
       }
@@ -1582,6 +1629,7 @@
     } catch (e: unknown) {
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
+      flushPendingSearchResults(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
       const msg = translateError(e, m.search_failed());
       console.error('Search failed:', e);
@@ -1589,7 +1637,7 @@
         ...tab,
         isSearching: false,
         progress: null,
-        error: msg,
+        error: tab.results.length > 0 ? null : msg,
       }));
       forgetSettledRequest(requestId);
     }
@@ -1620,7 +1668,7 @@
     // tab the user just stopped. Results already shown are kept — this is Stop,
     // not Clear.
     searchInvokeSettled.add(stoppedId);
-    clearPendingSearchResults(stoppedId);
+    flushPendingSearchResults(stoppedId);
     patchSearchTabByRequestId(stoppedId, (tab) => ({
       ...tab,
       requestId: newSearchNonce(),
@@ -1682,11 +1730,11 @@
         }
         const explain = await explainSpamResult(
           result.file.hash,
-          result.file.name,
+          displayName(result),
           result.file.size,
           result.source_addresses,
           query,
-          explainOpts(result),
+          { ...explainOpts(result), ...explainBatchFromTab() },
         );
         if (!selectedResult || selectedResult.file.hash !== fileHash || requestId !== notesRequestId) return;
         setSpamCache(key, explain);
@@ -1719,11 +1767,11 @@
     try {
       const explain = await explainSpamResult(
         result.file.hash,
-        result.file.name,
+        displayName(result),
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),
-        explainOpts(result),
+        { ...explainOpts(result), ...explainBatchFromTab() },
       );
       setSpamCache(key, explain);
     } catch (e: unknown) {
@@ -1753,13 +1801,19 @@
     // Clamp to the backend's 0..5 integer contract before publishing.
     const rating = Math.max(0, Math.min(5, Math.round(Number(noteRating) || 0)));
     try {
-      publishMessage = await publishNote(
+      const raw = await publishNote(
         selectedResult.file.hash,
         rating,
         noteComment,
-        selectedResult.file.name,
+        displayName(selectedResult),
         selectedResult.file.size,
       );
+      publishMessage =
+        raw === 'search_note_publish_queued'
+          ? m.search_note_publish_queued()
+          : raw === 'search_note_publish_started'
+            ? m.search_note_publish_started()
+            : raw;
       publishSuccess = true;
       noteComment = '';
       noteRating = 0;
@@ -1930,7 +1984,7 @@
     try {
       await markSpam(
         hash,
-        result.file.name,
+        displayName(result),
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),
@@ -2447,6 +2501,7 @@
     onsubmit={handleSearch}
     recentKey="search-recent-queries-v1"
     historyEnabled={$appSettings?.save_search_history ?? true}
+    maxLength={MAX_SEARCH_QUERY_LEN}
   />
   <select class="type-select" bind:value={searchMethod} title={m.search_method_title()}>
     <option value="global">{m.search_method_global()}</option>
@@ -2466,6 +2521,7 @@
     <div class="syntax-popover" role="note">
       {#if searchMethod !== 'ember'}
         <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
+        <p class="search-syntax-ed2k">{m.search_query_syntax_min_term()}</p>
       {/if}
       {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
         <p class="search-syntax-ember">

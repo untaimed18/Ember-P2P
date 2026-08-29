@@ -2405,6 +2405,30 @@ fn udp_search_leg_should_complete(
     grace_expired || hard_deadline_passed
 }
 
+/// How many 2-second `server_timer` ticks before the TCP search age expires.
+/// Floor 30s (the historic bound); cap 60s so a 600s user timeout does not
+/// leave a silent server leg hanging for minutes.
+fn server_search_age_limit(search_timeout_secs: u64) -> u32 {
+    const TICK_SECS: u64 = 2;
+    let wait_secs = (search_timeout_secs / 10).clamp(30, 60);
+    (wait_secs / TICK_SECS).saturating_sub(1) as u32
+}
+
+#[cfg(test)]
+mod server_search_age_limit_tests {
+    use super::server_search_age_limit;
+
+    #[test]
+    fn tcp_age_scales_between_thirty_and_sixty_seconds() {
+        // Comparison is `age > limit` on 2s ticks, so 14 → 30s, 29 → 60s.
+        assert_eq!(server_search_age_limit(30), 14);
+        assert_eq!(server_search_age_limit(300), 14);
+        assert_eq!(server_search_age_limit(450), 21);
+        assert_eq!(server_search_age_limit(600), 29);
+        assert_eq!(server_search_age_limit(10_000), 29);
+    }
+}
+
 /// Contribute one ed2k result's sources toward `MAX_ED2K_SEARCH_RESULTS`
 /// (eMule spam-caps each result at 5).
 fn ed2k_result_source_contribution(availability: u32) -> u32 {
@@ -2464,14 +2488,17 @@ fn note_ed2k_search_results(
                 .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
         let (new_avail, old_contrib) = match prev {
             Some(p) => {
-                let merged = if sum_incoming {
+                let merged = crate::search::merge::clamp_source_count(if sum_incoming {
                     p.saturating_add(r.availability)
                 } else {
                     p.max(r.availability)
-                };
+                });
                 (merged, ed2k_result_source_contribution(p))
             }
-            None => (r.availability, 0),
+            None => (
+                crate::search::merge::clamp_source_count(r.availability),
+                0,
+            ),
         };
         let new_contrib = ed2k_result_source_contribution(new_avail);
         if !skip_count && new_contrib > old_contrib {
@@ -34723,7 +34750,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 alltime_requests: 0,
                                                 alltime_accepted: 0,
                                                 alltime_transferred: 0,
-                                                complete_sources: sr.complete_source_count,
+                                                complete_sources: crate::search::merge::clamp_source_count(
+                                                    sr.complete_source_count,
+                                                ),
                                                 folder: String::new(),
                                                 shared: false,
                                                 friends_only: false,
@@ -34735,7 +34764,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         peer_name: String::new(),
                                         // Mirror UDP/KAD: missing/0 sources still
                                         // mean the publishing peer is present.
-                                        availability: sr.source_count.max(1),
+                                        availability: crate::search::merge::clamp_source_count(
+                                            sr.source_count.max(1),
+                                        ),
                                         file_type: crate::search::index::infer_file_type(&extension),
                                         source_addresses,
                                         rating: sr.rating,
@@ -35562,16 +35593,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     }
                 }
 
-                // Timeout pending server search after 30 seconds. This arm is
-                // the `server_timer` tick, which runs every 2s — not once per
-                // second — so 30s is 15 ticks and the threshold is 14. An
-                // earlier change raised it from 15 to 29 on the belief that
-                // the cadence was 1 Hz, which doubled the real wait to ~60s
-                // and left a silent server leg holding the search for a full
-                // minute before local results were returned.
+                // Timeout pending server search. This arm is the `server_timer`
+                // tick (every 2s). The wait scales with `search_timeout_secs`
+                // (a tenth, clamped 30–60s): 30s at the default 120s setting
+                // (age > 14), up to 60s when the user raises the overall timeout.
                 if state.pending_server_search.is_some() {
                     state.server_search_age += 1;
-                    if state.server_search_age > 14 {
+                    if state.server_search_age > server_search_age_limit(settings.search_timeout_secs) {
                         if let Some(mut pending) = state.pending_server_search.take() {
                             let request_id = pending.request_id;
                             info!("Server search timed out, returning {} local results", pending.results.len());
@@ -36187,11 +36215,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     };
                                     // Prefer advertised FT_SOURCES; fall back to 1
                                     // so a hit without the tag still ranks as present.
-                                    let availability = if sr.source_count > 0 {
-                                        sr.source_count
-                                    } else {
-                                        1
-                                    };
+                                    let availability = crate::search::merge::clamp_source_count(
+                                        if sr.source_count > 0 {
+                                            sr.source_count
+                                        } else {
+                                            1
+                                        },
+                                    );
                                     SearchResult {
                                         file: FileInfo {
                                             id: hash_hex.clone(),
@@ -36210,7 +36240,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                             alltime_requests: 0,
                                             alltime_accepted: 0,
                                             alltime_transferred: 0,
-                                            complete_sources: sr.complete_source_count,
+                                            complete_sources: crate::search::merge::clamp_source_count(
+                                                sr.complete_source_count,
+                                            ),
                                             folder: String::new(),
                                             shared: false,
                                             friends_only: false,

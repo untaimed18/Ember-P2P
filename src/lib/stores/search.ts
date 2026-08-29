@@ -123,10 +123,14 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
   const hasMedia = Object.values(media).some((v) => v != null && v !== '');
   const existingName = existing.file.name || '';
   const incomingName = incoming.file.name || '';
-  // Keep the first name we saw. Length is entirely attacker-chosen, so
-  // preferring the longer one let any peer replying with a padded name for a
-  // popular hash rename someone else's file, in the list and on disk.
-  const preferredName = existingName || incomingName;
+  // First-seen wins so a padded attacker name cannot rename the row. Exception:
+  // a Local (shared-library) name is the file we actually have — prefer it.
+  const incomingIsLocal = (incoming.result_origin || '').includes('Local');
+  const existingIsLocal = (existing.result_origin || '').includes('Local');
+  const preferredName =
+    incomingIsLocal && !existingIsLocal && incomingName
+      ? incomingName
+      : existingName || incomingName;
   const hash = incoming.file.hash || existing.file.hash || '';
   const override = hash ? spamUserOverrides.get(hash) : undefined;
   const spam_rating = override
@@ -234,7 +238,14 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
     const at = index.get(key);
     if (at === undefined) {
       index.set(key, results.length);
-      results.push(result);
+      results.push({
+        ...result,
+        availability: Math.min(result.availability || 0, MAX_PLAUSIBLE_SOURCES),
+        file: {
+          ...result.file,
+          complete_sources: Math.min(result.file.complete_sources || 0, MAX_PLAUSIBLE_SOURCES),
+        },
+      });
     } else {
       results[at] = mergeResult(results[at], result);
     }
@@ -336,7 +347,7 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
 const MAX_SEARCH_TABS = 20;
 
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
-export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number } {
+export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number; stoppedOthers: boolean } {
   const requestId = newSearchNonce();
   const id = newTabId();
   const tab: SearchTab = {
@@ -352,23 +363,30 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     progress: null,
     error: null,
   };
+  let stoppedOthers = false;
   searchTabs.update((tabs) => {
-    const next = [...tabs, tab];
+    // Capture original ids *before* rotating them: cancel and the pending
+    // buffer are keyed by the in-flight request, not the discarded nonce.
+    const searchingIds = tabs.filter((t) => t.isSearching).map((t) => t.requestId);
+    const next = tabs.map((t) => {
+      if (!t.isSearching) return t;
+      stoppedOthers = true;
+      return { ...t, isSearching: false, progress: null, requestId: newSearchNonce() };
+    });
+    next.push(tab);
     while (next.length > MAX_SEARCH_TABS) {
       const evicted = next.shift();
       if (!evicted) break;
-      // The tab is gone, so nothing will ever consume its buffered batches or
-      // stop its backend search — do both here rather than leave the network
-      // streaming results into a void.
       pendingByRequest.delete(evicted.requestId);
-      if (evicted.isSearching) {
-        void cancelSearch(evicted.requestId).catch(() => { /* best effort */ });
-      }
+    }
+    for (const rid of searchingIds) {
+      pendingByRequest.delete(rid);
+      void cancelSearch(rid).catch(() => { /* best effort */ });
     }
     return next;
   });
   activeSearchTabId.set(id);
-  return { tabId: id, requestId };
+  return { tabId: id, requestId, stoppedOthers };
 }
 
 export function setActiveSearchTab(tabId: string | null) {
@@ -412,6 +430,18 @@ let flushTimeout: ReturnType<typeof setTimeout> | null = null;
  * Results / discard cannot be refilled by a late flush (SF9). */
 export function clearPendingSearchResults(requestId: number) {
   pendingByRequest.delete(requestId);
+}
+
+/** Merge any coalesced `search-results` for this request into its tab now.
+ *  Stop / timeout / starting another search used to delete the buffer, which
+ *  dropped LocalIndex hits that had arrived but not yet painted. */
+export function flushPendingSearchResults(requestId: number) {
+  const incoming = pendingByRequest.get(requestId);
+  pendingByRequest.delete(requestId);
+  if (!incoming || incoming.length === 0) return;
+  searchTabs.update((tabs) =>
+    updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)),
+  );
 }
 
 function validRequestId(raw: unknown): number | null {
