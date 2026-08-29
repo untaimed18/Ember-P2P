@@ -408,6 +408,26 @@
     return nowSecs - mem.last_seen <= PRESENCE_FRESH_SECS;
   }
 
+  /** Advance one roster row's last_seen from a live chat line without waiting
+   *  for the next presence walk. Presence ingest still owns joins and leaves. */
+  function noteMemberHeard(pubkey: string, at: number) {
+    if (!pubkey || at <= 0) return;
+    const wall = Math.floor(Date.now() / 1000);
+    // Gossip may claim up to five minutes ahead of us. The database clamps
+    // that; without the same cap a future stamp keeps the presence dot on
+    // until wall-clock catches up *plus* the freshness window.
+    const heard = Math.min(at, wall);
+    const key = pubkey.toLowerCase();
+    let changed = false;
+    members = members.map((mem) => {
+      if (mem.member_pubkey.toLowerCase() !== key) return mem;
+      if (heard <= mem.last_seen) return mem;
+      changed = true;
+      return { ...mem, last_seen: heard };
+    });
+    if (changed) presenceNow = wall;
+  }
+
   function channelHue(id: string): number {
     let h = 0;
     for (let i = 0; i < Math.min(id.length, 8); i++) {
@@ -442,6 +462,18 @@
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenMembers = fn;
+    });
+    let unlistenChat: UnlistenFn | undefined;
+    listen<{
+      channel_id: string;
+      sender_pubkey?: string;
+      timestamp?: number;
+    }>('ember:channel-message', (event) => {
+      if (event.payload.channel_id !== selectedId) return;
+      noteMemberHeard(event.payload.sender_pubkey ?? '', event.payload.timestamp ?? 0);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenChat = fn;
     });
     let unlistenModeration: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
@@ -512,6 +544,7 @@
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
       unlistenMembers?.();
+      unlistenChat?.();
       unlistenModeration?.();
       unlistenHandoff?.();
       unlistenFound?.();
@@ -996,6 +1029,7 @@
       await claimChannelUsername(usernameDraft.trim());
       usernameDraft = '';
       await loadAppSettings();
+      if (selectedId) void refreshMembers(selectedId);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
     } finally {

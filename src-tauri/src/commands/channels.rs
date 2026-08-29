@@ -412,8 +412,29 @@ async fn persist_channel_username(state: &AppState, username: &str) -> Result<()
     .await
     .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
     .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
-    state.config.write().await.settings = new_settings;
+    state.config.write().await.settings = new_settings.clone();
+    // The network loop keeps its own copy of settings. Without this it keeps
+    // publishing (or skipping) presence under the old handle until the next
+    // Settings save or restart — and an empty handle makes the republish
+    // path return without scanning any room.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::UpdateSettings {
+            settings: new_settings,
+        });
+    apply_channel_username_locally(state, username);
     Ok(())
+}
+
+/// Rename our own roster rows to match a newly chosen Channel username.
+///
+/// Presence republish is *not* kicked from here. Clearing the stamps before
+/// the network loop has swapped its settings copy lets it publish the old
+/// handle into the newly-due slots. The loop does that work when it applies
+/// `UpdateSettings`.
+pub(crate) fn apply_channel_username_locally(state: &AppState, username: &str) {
+    let pk = hex::encode(state.identity.ed25519_public_key);
+    let _ = state.db.rename_self_channel_member(&pk, username);
 }
 
 /// Claim `username` on Rendezvous and return the stored display form.
@@ -551,6 +572,7 @@ async fn record_self_member(
     let nick = nickname.to_string();
     tokio::task::spawn_blocking(move || {
         db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp(), Some(&pk))
+            .map(|_| ())
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?

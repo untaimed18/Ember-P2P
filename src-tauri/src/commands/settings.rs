@@ -1050,6 +1050,8 @@ pub async fn update_settings(
             .await?;
         }
     }
+    let username_changed = settings.channel_username != old_settings.channel_username
+        && !settings.channel_username.is_empty();
 
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
@@ -1155,6 +1157,13 @@ pub async fn update_settings(
     {
         let mut config = state.config.write().await;
         config.settings = settings.clone();
+    }
+
+    if username_changed {
+        crate::commands::channels::apply_channel_username_locally(
+            &state,
+            &settings.channel_username,
+        );
     }
 
     // Keep the synchronous mirror used by the close-event handler in sync

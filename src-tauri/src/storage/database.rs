@@ -211,6 +211,23 @@ pub struct StoredChannelMember {
     pub banned: bool,
     pub moderator: bool,
 }
+
+/// What [`Database::upsert_channel_member`] did to the roster row.
+///
+/// Callers that drive the UI or XOR-neighbor registration need to tell a
+/// no-op republish apart from a join or a last_seen/nick change: treating
+/// every successful write as "someone new" re-registers rendezvous on every
+/// presence walk, and treating none of them as a change leaves the roster
+/// showing whoever was there when the list was last fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelMemberWrite {
+    /// Row already had this last_seen (or newer) and this nickname.
+    Unchanged,
+    /// A new roster row. XOR-neighbors may have changed.
+    Inserted,
+    /// `last_seen` advanced and/or the nickname changed.
+    Updated,
+}
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -5088,7 +5105,7 @@ impl Database {
         nickname: &str,
         last_seen: i64,
         local_pubkey: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ChannelMemberWrite> {
         let now = chrono::Utc::now().timestamp();
         // Signed records can claim a last_seen up to an hour ahead of us
         // (DHT store CLOCK_SKEW). Eviction sorts by last_seen, so an
@@ -5097,14 +5114,15 @@ impl Database {
         let last_seen = last_seen.min(now);
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        let existed: bool = tx
+        let prior: Option<(String, i64)> = tx
             .query_row(
-                "SELECT 1 FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                "SELECT nickname, last_seen FROM channel_members
+                 WHERE channel_id = ?1 AND member_pubkey = ?2",
                 params![channel_id, member_pubkey],
-                |_| Ok(()),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .is_some();
+            .optional()?;
+        let existed = prior.is_some();
         tx.execute(
             "INSERT INTO channel_members (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
              VALUES (?1, ?2, ?3, ?4, 0, 0)
@@ -5162,10 +5180,22 @@ impl Database {
                      WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0",
                     params![channel_id, member_pubkey],
                 )?;
+                tx.commit()?;
+                return Ok(ChannelMemberWrite::Unchanged);
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(match prior {
+            None => ChannelMemberWrite::Inserted,
+            Some((old_nick, old_seen)) => {
+                let nick_changed = !nickname.is_empty() && nickname != old_nick;
+                if last_seen > old_seen || nick_changed {
+                    ChannelMemberWrite::Updated
+                } else {
+                    ChannelMemberWrite::Unchanged
+                }
+            }
+        })
     }
 
     /// Refresh `last_seen` for a pubkey that already has a row. No INSERT:
@@ -5622,6 +5652,35 @@ impl Database {
             params![channel_id, expected, retry_at],
         )?;
         Ok(())
+    }
+
+    /// Make every joined room's presence due on the next scan.
+    ///
+    /// Used when the Channel username changes, so the new handle is announced
+    /// immediately rather than waiting out a republish interval that still
+    /// names the old one.
+    pub fn due_channel_presence_now(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET presence_published_at = 0
+             WHERE in_room = 1 AND deleted = 0 AND successor_id = ''",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Rename our own roster rows across every room we sit in.
+    pub fn rename_self_channel_member(
+        &self,
+        member_pubkey: &str,
+        nickname: &str,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channel_members SET nickname = ?2 WHERE member_pubkey = ?1",
+            params![member_pubkey, nickname],
+        )?;
+        Ok(n)
     }
 
     /// `author_sig` is the author's hex Ed25519 signature over the line, or
@@ -7637,21 +7696,41 @@ mod tests {
         )
         .unwrap();
         let pk = "ee".repeat(32);
-        db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
-            .unwrap();
-        db.upsert_channel_member(&channel_id, &pk, "", 50, None)
-            .unwrap();
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "Ada", 200, None)
+                .unwrap(),
+            ChannelMemberWrite::Inserted
+        );
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "", 50, None)
+                .unwrap(),
+            ChannelMemberWrite::Unchanged,
+            "an older chat timestamp and an empty nick must not count as a change"
+        );
         let members = db.list_channel_members(&channel_id).unwrap();
         assert_eq!(members[0].nickname, "Ada");
         assert_eq!(
             members[0].last_seen, 200,
             "an older chat timestamp must not rewind presence last_seen"
         );
-        db.upsert_channel_member(&channel_id, &pk, "Ada2", 250, None)
-            .unwrap();
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "Ada2", 250, None)
+                .unwrap(),
+            ChannelMemberWrite::Updated
+        );
         let members = db.list_channel_members(&channel_id).unwrap();
         assert_eq!(members[0].nickname, "Ada2");
         assert_eq!(members[0].last_seen, 250);
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "Ada2", 250, None)
+                .unwrap(),
+            ChannelMemberWrite::Unchanged
+        );
+        db.rename_self_channel_member(&pk, "AdaRenamed").unwrap();
+        assert_eq!(
+            db.list_channel_members(&channel_id).unwrap()[0].nickname,
+            "AdaRenamed"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -7863,6 +7942,19 @@ mod tests {
         assert!(!listed[0].deleted);
         let due = db.channels_due_for_presence(i64::MAX, 1).unwrap();
         assert_eq!(due, vec![channel_id.clone()]);
+
+        let now = 1_000_000i64;
+        db.touch_channel_presence(&channel_id, now - 10).unwrap();
+        assert!(
+            db.channels_due_for_presence(now, 60).unwrap().is_empty(),
+            "a stamp inside the republish interval must not look due"
+        );
+        db.due_channel_presence_now().unwrap();
+        assert_eq!(
+            db.channels_due_for_presence(now, 60).unwrap(),
+            vec![channel_id.clone()],
+            "clearing the stamp must make presence due without waiting out the interval"
+        );
 
         assert!(db.set_channel_in_room(&channel_id, false).unwrap());
         let left = db.get_channel(&channel_id).unwrap().unwrap();

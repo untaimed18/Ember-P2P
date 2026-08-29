@@ -28,7 +28,7 @@ use crate::search::index::LocalIndex;
 use crate::sharing::manager::{
     TransferControl, TransferHealthCode, TransferHealthUpdate, TransferManager,
 };
-use crate::storage::database::Database;
+use crate::storage::database::{ChannelMemberWrite, Database};
 use crate::types::*;
 
 use self::ed2k::a4af::A4AFManager;
@@ -12635,15 +12635,27 @@ async fn maybe_publish_channel_presence(
             .start_publish(record, state.ember_dht.routing())
         {
             // Stamped up front so the next scan does not start a second publish
-            // for this room while the first is still in flight...
+            // for this room while the first is still in flight. Our own
+            // last_seen has to move with the announce too: gossip neighbors
+            // and the empty-room poll both read `channel_members.last_seen`,
+            // and that row was otherwise only written on join — so twenty
+            // minutes later we had dropped out of our own roster's "fresh" set
+            // while still sitting in the room.
             let _ = db.touch_channel_presence(&channel_id_hex, now);
-            // ...and handed straight back if the record stored on nobody. The
-            // stamp used to be the end of it, so a pass that placed nothing
-            // still bought a full republish interval of silence — and since
-            // members age out at two intervals, two such passes were enough to
-            // make somebody sitting in the room disappear from every roster and
-            // stop being picked as a gossip neighbor, with nothing on screen to
-            // say why.
+            let _ = db.upsert_channel_member(
+                &channel_id_hex,
+                &hex::encode(identity.ed25519_public_key),
+                &nickname,
+                now,
+                Some(&hex::encode(identity.ed25519_public_key)),
+            );
+            // Handed straight back if the record stored on nobody. The stamp
+            // used to be the end of it, so a pass that placed nothing still
+            // bought a full republish interval of silence — and since members
+            // age out at two intervals, two such passes were enough to make
+            // somebody sitting in the room disappear from every roster and
+            // stop being picked as a gossip neighbor, with nothing on screen
+            // to say why.
             let (tx, rx) = oneshot::channel();
             state.ember_dht_pending_publishes.insert(publish_id, tx);
             let retry_db = db.clone();
@@ -12675,6 +12687,31 @@ async fn maybe_publish_channel_presence(
             }
         });
     }
+}
+
+/// After the loop-owned settings already carry the new Channel username.
+///
+/// Clearing presence stamps from the Tauri command that saved the name raced
+/// the network loop: `maybe_publish_channel_presence` could still be holding
+/// the previous handle, consume the newly-due slots, and stamp a ten-minute
+/// silence under the old name. Doing it here means the next publish — and this
+/// one — reads the username that was just applied.
+async fn publish_presence_under_new_username(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+    old_username: &str,
+) {
+    let new = settings.channel_username.trim();
+    if new.is_empty() || new == old_username.trim() {
+        return;
+    }
+    let pk = hex::encode(identity.ed25519_public_key);
+    let _ = db.rename_self_channel_member(&pk, new);
+    let _ = db.due_channel_presence_now();
+    maybe_publish_channel_presence(socket, state, db, settings, identity).await;
 }
 
 const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
@@ -13981,33 +14018,42 @@ fn ingest_channel_claim_records(
     None
 }
 
+/// What applying a presence FIND_VALUE batch did to this room.
+struct ChannelPresenceIngest {
+    /// A member we did not already hold (not us). XOR-neighbors may have changed.
+    new_neighbors: bool,
+    /// last_seen, nickname, join, or leave actually moved — the roster UI
+    /// has to refresh. Distinct from `new_neighbors`: a republish from
+    /// someone already on the list is not a new XOR-neighbor, but it *is*
+    /// the last_seen the presence dot reads.
+    roster_changed: bool,
+}
+
 fn ingest_channel_presence_records(
     state: &mut NetworkState,
     db: &Database,
     our_pubkey: &[u8; 32],
     channel_id: [u8; 16],
     records: &[Vec<u8>],
-) -> bool {
+) -> ChannelPresenceIngest {
+    let mut outcome = ChannelPresenceIngest {
+        new_neighbors: false,
+        roster_changed: false,
+    };
     if db.chat_locked() {
-        return false;
+        return outcome;
     }
     let channel_id_hex = hex::encode(channel_id);
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
-        return false;
+        return outcome;
     };
     if !ch.in_room_now() {
-        return false;
-    };
+        return outcome;
+    }
     // A private room's presence extra is sealed under the content key, so a
     // member who has not yet picked up the newest epoch is still readable under
     // the one they published with.
     let content_keys = channel_content_keys(db, &ch);
-    let existing: HashSet<String> = db
-        .list_channel_members(&channel_id_hex)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| m.member_pubkey)
-        .collect();
     // Current and previous epoch are two FIND_VALUE walks. Newest-wins has
     // to see both before any row is written, or a prev-epoch live announce
     // re-inserts after the current tombstone and a prev-epoch tombstone
@@ -14033,7 +14079,6 @@ fn ingest_channel_presence_records(
         ember::dht::publish::keep_latest_presence_member(&mut latest, member);
     }
     let our_hex = hex::encode(our_pubkey);
-    let mut changed = false;
     for member in latest.into_values() {
         let pk_hex = hex::encode(member.publisher_key);
         if member.departed {
@@ -14045,7 +14090,14 @@ fn ingest_channel_presence_records(
                 continue;
             }
             match db.remove_channel_member(&channel_id_hex, &pk_hex, member.timestamp) {
-                Ok(_) => {}
+                Ok(true) => {
+                    if member.publisher_key != *our_pubkey {
+                        // The departed member may have been a gossip neighbor.
+                        outcome.new_neighbors = true;
+                        outcome.roster_changed = true;
+                    }
+                }
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(
                         channel_id = %channel_id_hex,
@@ -14056,31 +14108,34 @@ fn ingest_channel_presence_records(
                 }
             }
             state.ember_channel_noise_keys.remove(&member.publisher_key);
-            if existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
-                changed = true;
-            }
             continue;
         }
         let nick = crate::security::sanitize_display_name(&member.nickname);
-        if db
-            .upsert_channel_member(
-                &channel_id_hex,
-                &pk_hex,
-                &nick,
-                member.timestamp,
-                Some(&our_hex),
-            )
-            .is_ok()
-        {
+        if let Ok(write) = db.upsert_channel_member(
+            &channel_id_hex,
+            &pk_hex,
+            &nick,
+            member.timestamp,
+            Some(&our_hex),
+        ) {
             state
                 .ember_channel_noise_keys
                 .insert(member.publisher_key, member.noise_pub);
-            if !existing.contains(&pk_hex) && member.publisher_key != *our_pubkey {
-                changed = true;
+            match write {
+                ChannelMemberWrite::Inserted => {
+                    if member.publisher_key != *our_pubkey {
+                        outcome.new_neighbors = true;
+                    }
+                    outcome.roster_changed = true;
+                }
+                ChannelMemberWrite::Updated => {
+                    outcome.roster_changed = true;
+                }
+                ChannelMemberWrite::Unchanged => {}
             }
         }
     }
-    changed
+    outcome
 }
 
 /// Hold presence blobs until every FIND_VALUE for this room (current and
@@ -15265,13 +15320,22 @@ async fn handle_inbound_channel_gossip(
             if ember::channel::chat_author_joins_gossip_roster(
                 ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
             ) {
-                let _ = db.upsert_channel_member(
+                // First line from someone this device did not already hold: the
+                // roster has to grow, and XOR-neighbors may have changed, so do
+                // not wait for the next presence walk or the friend heartbeat.
+                if let Ok(ChannelMemberWrite::Inserted) = db.upsert_channel_member(
                     &channel_id_hex,
                     &sender_hex,
                     "",
                     now,
                     Some(&hex::encode(state.local_ed25519_pubkey)),
-                );
+                ) {
+                    state.rendezvous_last_register = None;
+                    let _ = app_handle.emit(
+                        "ember:channel-members",
+                        serde_json::json!({ "channel_id": channel_id_hex }),
+                    );
+                }
             } else {
                 // Public rooms do not INSERT strangers from chat (anti-eclipse).
                 // A line from someone already on the roster still refreshes
@@ -23343,6 +23407,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     break;
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
+                    let old_channel_username = settings.channel_username.clone();
                     if apply_network_settings(
                         &mut state,
                         &mut settings,
@@ -23351,6 +23416,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     ) {
                         load_ipfilter_on_enable(&mut state).await;
                     }
+                    publish_presence_under_new_username(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                        &old_channel_username,
+                    )
+                    .await;
                     state
                         .relay_manager
                         .lock()
@@ -24570,6 +24644,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // (obfuscation toggle, USS toggle, max-uploads slider all
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
+                        let old_channel_username = settings.channel_username.clone();
                         if apply_network_settings(
                             &mut state,
                             &mut settings,
@@ -24578,6 +24653,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         ) {
                             load_ipfilter_on_enable(&mut state).await;
                         }
+                        publish_presence_under_new_username(
+                            &udp_socket,
+                            &mut state,
+                            &db,
+                            &settings,
+                            &identity,
+                            &old_channel_username,
+                        )
+                        .await;
                         state
                             .relay_manager
                             .lock()
@@ -40439,14 +40523,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let mut any_new = false;
                     let mut updated_ids = HashSet::new();
                     for (channel_id, records) in pending {
-                        if ingest_channel_presence_records(
+                        let ingest = ingest_channel_presence_records(
                             &mut state,
                             &db,
                             &ed25519_pubkey,
                             channel_id,
                             &records,
-                        ) {
+                        );
+                        if ingest.new_neighbors {
                             any_new = true;
+                        }
+                        if ingest.roster_changed {
                             updated_ids.insert(hex::encode(channel_id));
                         }
                     }
