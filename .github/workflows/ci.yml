@@ -98,8 +98,15 @@ jobs:
       # Runs here rather than in `verify`: that job deliberately installs
       # nothing, and these need the dependency tree plus the compiled Paraglide
       # output that `src/lib` imports.
+      #
+      # `vitest run` directly rather than `npm run test:unit`, because the step
+      # above has already compiled the messages. That script compiles first so
+      # it works standalone on a clean checkout; running it here would rewrite
+      # the ~2700-file message tree a second time while the runner reads it,
+      # which was observed once locally as a module-not-found on a message the
+      # compiler was in the middle of replacing.
       - name: Test frontend
-        run: npm run test:unit
+        run: npx vitest run
 
       - name: Check Rust
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml

@@ -232,6 +232,7 @@
   "chat_link_open_confirm": "開啟連結",
   "chat_slow_mode_wait": "慢速模式 — {seconds} 秒",
   "chat_unread_divider": "新訊息",
+  "chat_mention_list_label": "與輸入內容相符的成員",
   "chat_loading_messages": "正在載入訊息...",
   "chat_failed_to_load": "載入訊息失敗。",
   "chat_live_unavailable": "即時更新不可用——請重試後才會顯示新訊息。",

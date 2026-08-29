@@ -232,6 +232,7 @@
   "chat_link_open_confirm": "Link öffnen",
   "chat_slow_mode_wait": "Langsamer Modus – {seconds}s",
   "chat_unread_divider": "Neue Nachrichten",
+  "chat_mention_list_label": "Mitglieder, die zu deiner Eingabe passen",
   "chat_loading_messages": "Nachrichten werden geladen...",
   "chat_failed_to_load": "Nachrichten konnten nicht geladen werden.",
   "chat_live_unavailable": "Live-Aktualisierungen sind nicht verfügbar — neue Nachrichten erscheinen erst nach einem erneuten Versuch.",

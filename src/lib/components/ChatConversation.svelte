@@ -15,7 +15,13 @@
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
-  import { isAppVisible, linkifyMessage, shortPubkey } from '$lib/utils';
+  import {
+    insertMention,
+    isAppVisible,
+    linkifyMessage,
+    mentionTokenAt,
+    shortPubkey,
+  } from '$lib/utils';
   import { openExternalUrl } from '$lib/api/settings';
   import { toast } from '$lib/stores/toast';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -49,6 +55,11 @@
     /** Own display name, so a message naming us can be picked out. Empty
      *  disables the check rather than matching everything. */
     mentionName?: string;
+    /** Raw handles the composer can complete after `@`. Distinct from
+     *  `memberNames`, which carries display labels — "You", or a
+     *  disambiguated "Ada (a1b2c3)" — that would be wrong to type into a
+     *  message. */
+    mentionCandidates?: string[];
     /** Stored message to scroll to and mark. A fresh object each time, so
      *  asking twice for the same message still moves the transcript. */
     focusRequest?: { id: number } | null;
@@ -69,6 +80,7 @@
     memberNames = {},
     ignoredSenders = [],
     mentionName = '',
+    mentionCandidates = [],
     focusRequest = null,
     onfocusmissing,
   }: Props = $props();
@@ -783,7 +795,113 @@
     }
   }
 
+  /**
+   * Completing `@` in the composer.
+   *
+   * A channel handle is 2–12 ASCII alphanumerics — no spaces, no punctuation
+   * (`sanitize_channel_username`) — so the token under the caret is
+   * unambiguous and the inserted text needs no quoting. `@` has to be at a
+   * word boundary, or an email address would open the list on every keystroke.
+   *
+   * Nothing here changes what a mention *means*: highlighting already matches
+   * a bare handle at a word boundary, and `@` is one, so `@Ada` lights up for
+   * Ada with no protocol change. This is only about being able to write it
+   * without knowing how somebody spells their name.
+   */
+  const MENTION_SUGGESTION_MAX = 6;
+
+  let mentionStart = $state(-1);
+  let mentionQuery = $state('');
+  let mentionIndex = $state(0);
+  let mentionDismissed = $state(false);
+
+  let mentionMatches = $derived.by(() => {
+    if (mentionStart < 0 || mentionDismissed) return [];
+    const query = mentionQuery.toLowerCase();
+    return mentionCandidates
+      .filter((name) => name.toLowerCase().startsWith(query))
+      .slice(0, MENTION_SUGGESTION_MAX);
+  });
+  let mentionOpen = $derived(mentionMatches.length > 0);
+
+  /** Re-read the token under the caret. Cheap enough to run on every keystroke
+   *  and caret move, which is what keeps the list honest after an arrow key or
+   *  a click into the middle of the text. */
+  function refreshMentionToken() {
+    if (!isChannel || !chatInputEl || mentionCandidates.length === 0) {
+      mentionStart = -1;
+      return;
+    }
+    const caret = chatInputEl.selectionStart ?? 0;
+    // Only when there is no selection: with a range selected there is no one
+    // place an insertion would belong.
+    if ((chatInputEl.selectionEnd ?? caret) !== caret) {
+      mentionStart = -1;
+      return;
+    }
+    const token = mentionTokenAt(inputText, caret);
+    if (!token) {
+      mentionStart = -1;
+      mentionQuery = '';
+      mentionDismissed = false;
+      return;
+    }
+    const start = token.start;
+    if (start !== mentionStart) {
+      // A different `@` than the one we were completing, so a previous Escape
+      // does not carry over to it.
+      mentionDismissed = false;
+      mentionIndex = 0;
+    }
+    mentionStart = start;
+    mentionQuery = token.query;
+    if (mentionIndex >= MENTION_SUGGESTION_MAX) mentionIndex = 0;
+  }
+
+  function applyMention(name: string) {
+    if (!chatInputEl || mentionStart < 0) return;
+    const caret = chatInputEl.selectionStart ?? inputText.length;
+    const next = insertMention(inputText, mentionStart, caret, name);
+    inputText = next.text;
+    const nextCaret = next.caret;
+    mentionStart = -1;
+    mentionQuery = '';
+    mentionIndex = 0;
+    // After the value has been written back to the element, or the caret jumps
+    // to the end.
+    tick().then(() => {
+      chatInputEl?.focus();
+      chatInputEl?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
   function handleKeydown(e: KeyboardEvent) {
+    // Ahead of Enter-to-send: while the list is open, Enter picks a name.
+    if (mentionOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        mentionIndex = (mentionIndex + 1) % mentionMatches.length;
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        mentionIndex = (mentionIndex - 1 + mentionMatches.length) % mentionMatches.length;
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        applyMention(mentionMatches[Math.min(mentionIndex, mentionMatches.length - 1)]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        // Only the list, not the page. Without stopping it here the room's own
+        // Escape handler would close the members pane underneath.
+        e.preventDefault();
+        e.stopPropagation();
+        mentionDismissed = true;
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -1142,11 +1260,39 @@
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
     <div class="conv-input-area">
+      {#if mentionOpen}
+        <!-- A listbox the textarea owns rather than a focusable menu: focus has
+             to stay in the composer so typing keeps narrowing the list. -->
+        <ul class="mention-list" role="listbox" aria-label={m.chat_mention_list_label()}>
+          {#each mentionMatches as name, i (name)}
+            <li>
+              <button
+                type="button"
+                class="mention-option"
+                class:active={i === Math.min(mentionIndex, mentionMatches.length - 1)}
+                role="option"
+                aria-selected={i === Math.min(mentionIndex, mentionMatches.length - 1)}
+                onmousedown={(e) => {
+                  // Before blur, or the textarea loses the caret we insert at.
+                  e.preventDefault();
+                  applyMention(name);
+                }}
+              >
+                <bdi dir="auto">{name}</bdi>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
       <textarea
         class="conv-input"
         bind:value={inputText}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
+        oninput={refreshMentionToken}
+        onclick={refreshMentionToken}
+        onkeyup={refreshMentionToken}
+        onblur={() => (mentionStart = -1)}
         placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
         maxlength="4096"
         rows="2"
@@ -1598,6 +1744,44 @@
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
     flex-shrink: 0;
+    /* Anchors the suggestion list, which sits above the composer rather than
+       below it: there is nothing below but the window edge. */
+    position: relative;
+  }
+
+  .mention-list {
+    position: absolute;
+    bottom: calc(100% - 4px);
+    inset-inline-start: 14px;
+    z-index: 5;
+    min-width: 160px;
+    max-width: 260px;
+    margin: 0;
+    padding: 4px;
+    list-style: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+  }
+
+  .mention-option {
+    display: block;
+    width: 100%;
+    padding: 5px 8px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 12px;
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .mention-option:hover,
+  .mention-option.active {
+    background: var(--accent);
+    color: var(--on-accent);
   }
 
   /* Aligned to the bottom of the row so it sits level with the send button

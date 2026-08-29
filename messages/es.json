@@ -232,6 +232,7 @@
   "chat_link_open_confirm": "Abrir enlace",
   "chat_slow_mode_wait": "Modo lento: {seconds} s",
   "chat_unread_divider": "Mensajes nuevos",
+  "chat_mention_list_label": "Miembros que coinciden con lo que escribiste",
   "chat_loading_messages": "Cargando mensajes...",
   "chat_failed_to_load": "No se pudieron cargar los mensajes.",
   "chat_live_unavailable": "Actualizaciones en vivo no disponibles: los mensajes nuevos no aparecerán hasta que reintentes.",

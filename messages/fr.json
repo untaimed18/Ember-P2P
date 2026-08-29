@@ -232,6 +232,7 @@
   "chat_link_open_confirm": "Ouvrir le lien",
   "chat_slow_mode_wait": "Mode lent — {seconds} s",
   "chat_unread_divider": "Nouveaux messages",
+  "chat_mention_list_label": "Membres correspondant à votre saisie",
   "chat_loading_messages": "Chargement des messages...",
   "chat_failed_to_load": "Impossible de charger les messages.",
   "chat_live_unavailable": "Mises à jour en direct indisponibles — les nouveaux messages n'apparaîtront qu'après une nouvelle tentative.",

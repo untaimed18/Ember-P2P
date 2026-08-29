@@ -377,6 +377,55 @@ export function linkifyMessage(text: string): MessageSegment[] {
   return segments;
 }
 
+/** An `@` the caret is currently sitting inside, in composer text. */
+export interface MentionToken {
+  /** Index of the `@` itself. */
+  start: number;
+  /** What has been typed after it, possibly empty. */
+  query: string;
+}
+
+/**
+ * A channel handle is 2–12 ASCII alphanumerics — no spaces, no punctuation
+ * (`sanitize_channel_username` in `commands/channels.rs`) — so the token under
+ * the caret is unambiguous and an inserted name never needs quoting.
+ *
+ * The `@` has to sit at a word boundary, or an email address would open the
+ * suggestion list on every keystroke.
+ */
+const MENTION_TOKEN_RE = /(^|[^\p{L}\p{N}_])@([A-Za-z0-9]{0,12})$/u;
+
+/** The `@` token the caret is inside, or null when it is not inside one. */
+export function mentionTokenAt(text: string, caret: number): MentionToken | null {
+  const before = text.slice(0, Math.max(0, Math.min(caret, text.length)));
+  const match = MENTION_TOKEN_RE.exec(before);
+  if (!match) return null;
+  return { start: before.length - match[2].length - 1, query: match[2] };
+}
+
+/**
+ * Replace the `@` token spanning `[start, caret)` with `@name`, and say where
+ * the caret should land.
+ *
+ * A trailing space unless the next character already is one, so the caret ends
+ * up ready for the rest of the sentence either way rather than glued to the
+ * name or leaving a double space behind.
+ */
+export function insertMention(
+  text: string,
+  start: number,
+  caret: number,
+  name: string,
+): { text: string; caret: number } {
+  const head = text.slice(0, start);
+  const tail = text.slice(caret);
+  const spacer = tail.startsWith(' ') ? '' : ' ';
+  return {
+    text: `${head}@${name}${spacer}${tail}`,
+    caret: head.length + name.length + 1 + spacer.length,
+  };
+}
+
 /** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */
 export async function readFromClipboard(): Promise<string | null> {
   try {

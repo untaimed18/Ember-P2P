@@ -232,6 +232,7 @@
   "chat_link_open_confirm": "Открыть ссылку",
   "chat_slow_mode_wait": "Медленный режим — {seconds} с",
   "chat_unread_divider": "Новые сообщения",
+  "chat_mention_list_label": "Участники, подходящие под введённый текст",
   "chat_loading_messages": "Загрузка сообщений...",
   "chat_failed_to_load": "Не удалось загрузить сообщения.",
   "chat_live_unavailable": "Обновления в реальном времени недоступны — новые сообщения не появятся, пока вы не повторите попытку.",

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   disambiguatedMemberName,
   formatBytes,
+  insertMention,
   linkifyMessage,
+  mentionTokenAt,
   shortPubkey,
   type MessageSegment,
 } from './utils';
@@ -121,6 +123,93 @@ describe('formatBytes', () => {
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(-1)).toBe('0 B');
     expect(formatBytes(Number.NaN)).toBe('0 B');
+  });
+});
+
+describe('mentionTokenAt', () => {
+  /** Caret at the end of `text`, which is where typing leaves it. */
+  function atEnd(text: string) {
+    return mentionTokenAt(text, text.length);
+  }
+
+  it('finds an @ being typed at the start of a message', () => {
+    expect(atEnd('@')).toEqual({ start: 0, query: '' });
+    expect(atEnd('@Ad')).toEqual({ start: 0, query: 'Ad' });
+  });
+
+  it('finds one after a space or punctuation', () => {
+    expect(atEnd('hi @Ad')).toEqual({ start: 3, query: 'Ad' });
+    expect(atEnd('(@Ad')).toEqual({ start: 1, query: 'Ad' });
+    expect(atEnd('line\n@Ad')).toEqual({ start: 5, query: 'Ad' });
+  });
+
+  it('ignores an @ that is not at a word boundary', () => {
+    // Otherwise every email address opens the list mid-word.
+    expect(atEnd('ada@example')).toBeNull();
+    expect(atEnd('ada@')).toBeNull();
+    expect(atEnd('a1@Ad')).toBeNull();
+  });
+
+  it('ends the token at anything a handle cannot contain', () => {
+    expect(atEnd('@Ada ')).toBeNull();
+    expect(atEnd('@Ada, ')).toBeNull();
+    expect(atEnd('@Ada!')).toBeNull();
+  });
+
+  it('stops at the longest handle the backend will accept', () => {
+    // 12 alphanumerics is the cap in `sanitize_channel_username`.
+    expect(atEnd(`@${'a'.repeat(12)}`)).toEqual({ start: 0, query: 'a'.repeat(12) });
+    expect(atEnd(`@${'a'.repeat(13)}`)).toBeNull();
+  });
+
+  it('reads the token the caret is in, not the last one in the text', () => {
+    const text = '@Ada and @Gr';
+    expect(mentionTokenAt(text, 4)).toEqual({ start: 0, query: 'Ada' });
+    expect(mentionTokenAt(text, text.length)).toEqual({ start: 9, query: 'Gr' });
+    // Caret sitting after a completed word is not inside a token.
+    expect(mentionTokenAt(text, 8)).toBeNull();
+  });
+
+  it('handles a caret outside the text without throwing', () => {
+    expect(mentionTokenAt('@Ad', 99)).toEqual({ start: 0, query: 'Ad' });
+    expect(mentionTokenAt('@Ad', -1)).toBeNull();
+  });
+});
+
+describe('insertMention', () => {
+  it('replaces the partial token and leaves the caret past a trailing space', () => {
+    const result = insertMention('hi @Ad', 3, 6, 'Ada');
+    expect(result.text).toBe('hi @Ada ');
+    expect(result.caret).toBe(result.text.length);
+  });
+
+  it('does not add a second space when one already follows', () => {
+    const result = insertMention('hi @Ad there', 3, 6, 'Ada');
+    expect(result.text).toBe('hi @Ada there');
+    // Caret sits on the existing space, ready to keep typing after it.
+    expect(result.text.slice(result.caret)).toBe(' there');
+  });
+
+  it('keeps the text after the caret when completing mid-message', () => {
+    const result = insertMention('hi @Ad, are you there?', 3, 6, 'Ada');
+    expect(result.text).toBe('hi @Ada , are you there?');
+  });
+
+  it('completes a bare @ with nothing typed after it', () => {
+    const result = insertMention('@', 0, 1, 'Ada');
+    expect(result.text).toBe('@Ada ');
+    expect(result.caret).toBe(5);
+  });
+
+  it('round-trips: the inserted name is what the token reader sees', () => {
+    const inserted = insertMention('hi @Ad', 3, 6, 'Ada');
+    // Caret is past the trailing space, so no token is open any more.
+    expect(mentionTokenAt(inserted.text, inserted.caret)).toBeNull();
+    // Back it up onto the name and the whole handle reads back.
+    expect(mentionTokenAt(inserted.text, inserted.caret - 1)).toEqual({
+      start: 3,
+      query: 'Ada',
+    });
   });
 });
 

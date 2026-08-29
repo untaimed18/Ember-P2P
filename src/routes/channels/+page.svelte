@@ -216,6 +216,24 @@
       ? selected.slow_mode_secs
       : 0,
   );
+  /**
+   * Handles the composer can complete after `@`.
+   *
+   * Raw nicknames, not `memberNames`: that map carries display labels — "You",
+   * or a disambiguated "Ada (a1b2c3)" — which are right for the roster and
+   * wrong to type into a message. Self and banned members are left out; you do
+   * not address yourself, and naming someone the room has evicted only invites
+   * a reply that will not arrive.
+   */
+  let mentionCandidates = $derived(
+    [
+      ...new Set(
+        members
+          .filter((mem) => !mem.is_self && !mem.banned && mem.nickname.trim().length > 0)
+          .map((mem) => mem.nickname.trim()),
+      ),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
   let memberNames = $derived(
     Object.fromEntries(
       members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
@@ -2137,6 +2155,7 @@
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMemberKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
+                mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
                 onfocusmissing={() => toast(m.channels_search_too_far())}
               />
