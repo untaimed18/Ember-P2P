@@ -15830,6 +15830,43 @@ fn drop_channel_transfers_for(
     }
 }
 
+/// Hold "no transfer with a banned member" after a room's ban list changes.
+///
+/// The owner's signed snapshot is how a device usually learns of an owner's ban,
+/// and it arrives nowhere near the moderator-gossip path that ends these — so a
+/// download from somebody the owner had just evicted carried on regardless, and
+/// so did an upload of ours to them.
+///
+/// Reads the roster rather than diffing it, because the invariant is about who
+/// is banned now and not about which row moved. Looping the ban list is fine at
+/// this size: it is bounded by `CHANNEL_BAN_LIST_MAX`, the transfer maps hold a
+/// handful of entries, and this only runs when a snapshot actually changed
+/// something.
+fn drop_banned_channel_transfers(
+    state: &mut NetworkState,
+    db: &Database,
+    app_handle: &tauri::AppHandle,
+    channel_id: [u8; 16],
+) {
+    let channel_id_hex = hex::encode(channel_id);
+    // Banned ourselves means none of the room's traffic is ours to carry, in
+    // either direction, and their rows name us as the peer rather than
+    // themselves — so a member-scoped sweep would find nothing.
+    if db
+        .channel_member_is_banned(&channel_id_hex, &hex::encode(state.local_ed25519_pubkey))
+        .unwrap_or(false)
+    {
+        drop_channel_transfers_for(state, app_handle, channel_id, None, "not_allowed");
+        return;
+    }
+    for peer in db
+        .list_banned_channel_pubkeys(&channel_id_hex)
+        .unwrap_or_default()
+    {
+        drop_channel_transfers_for(state, app_handle, channel_id, Some(peer), "not_allowed");
+    }
+}
+
 fn emit_xfer_update(
     app_handle: &tauri::AppHandle,
     xfer_id: &[u8; 16],
@@ -40765,6 +40802,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             );
                         }
                         if ingest_channel_moderation_records(&db, channel_id, &records) {
+                            // The snapshot carries the owner's whole ban list, so
+                            // this is where most bans actually land on a member's
+                            // device — and a ban has to reach the transfer engine
+                            // and not just the roster.
+                            drop_banned_channel_transfers(
+                                &mut state,
+                                &db,
+                                &app_handle,
+                                channel_id,
+                            );
                             let _ = app_handle.emit(
                                 "ember:channel-moderation",
                                 serde_json::json!({ "channel_id": hex::encode(channel_id) }),
