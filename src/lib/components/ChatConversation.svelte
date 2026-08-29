@@ -683,8 +683,17 @@
       // marker has to be a decision made once, not a derived value.
       if (unreadMarkerId === null && !markerResolved) {
         markerResolved = true;
+        // Skipping ignored senders, because the divider is drawn from the same
+        // list the transcript renders. Landing it on a line that is filtered out
+        // meant no divider at all, and `scrollToUnreadMarker` fell back to the
+        // bottom — so a reader whose first unread line came from someone they
+        // ignore lost the marker entirely.
         const firstUnread = messages.find(
-          (message) => message.direction === 'received' && !message.read,
+          (message) =>
+            message.direction === 'received' &&
+            !message.read &&
+            (!message.sender_pubkey ||
+              !ignoredSenders.includes(message.sender_pubkey.toLowerCase())),
         );
         unreadMarkerId = firstUnread?.id ?? null;
       }
@@ -1551,7 +1560,11 @@
                   onclick={() => askOpenLink(seg.href!)}
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           {/if}
-          {#if isChannel && row.msg.msg_id}
+          <!-- Same wire-id test `canEdit` applies. A line copied across a room
+               handoff carries a synthetic id no other member can address, so the
+               backend refuses the reaction and the only thing the buttons could
+               produce is an error. -->
+          {#if isChannel && row.msg.msg_id?.length === 32}
             {@const tally = reactions[row.msg.msg_id]}
             {@const mine = tally?.mine ?? REACTION_NONE}
             <!-- Shown when anyone has reacted, and otherwise revealed on hover of
@@ -2272,6 +2285,17 @@
   .conv-bubble:hover .bubble-reactions,
   .bubble-reactions:focus-within {
     opacity: 1;
+  }
+
+  /* A pointer that cannot hover has no way to reveal any of these, so on a touch
+     screen the edit, remove and reaction controls were unreachable outright.
+     After all three base rules, since none of this adds specificity. */
+  @media (hover: none) {
+    .bubble-remove,
+    .bubble-tools,
+    .bubble-reactions {
+      opacity: 1;
+    }
   }
 
   .reaction-btn {

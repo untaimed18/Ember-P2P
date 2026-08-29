@@ -69,6 +69,7 @@
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
+    takeStashedChannelSelection,
     toggleChannelMute,
     toggleMemberIgnore,
     channelTransfers,
@@ -157,6 +158,12 @@
   /** Guards against a superseded query's reply landing last and showing hits
    *  for text the box no longer contains. */
   let searchGen = 0;
+  /** The same guard for the roster, which is re-fetched from several places at
+   *  once: selection, presence gossip, moderation changes, and handoff. */
+  let membersGen = 0;
+  /** This visit followed a previous one on the same session, so whatever the
+   *  user had open — including the directory — is the selection to keep. */
+  let returningToChannels = false;
   /** Members we have a send action in flight for, so the menu item can't be
    *  double-fired while the file is being hashed. */
   let sendingTo = $state<string[]>([]);
@@ -198,7 +205,9 @@
     const who = memberNames[selected.successor_nominee] || shortId(selected.successor_nominee);
     if (selected.can_claim) return m.channels_owner_inactive_now({ name: who });
     if (selected.moderation_updated_at <= 0) return '';
-    const elapsedDays = (presenceNow / 1000 - selected.moderation_updated_at) / 86400;
+    // `presenceNow` is already unix seconds. Dividing it again put the notice
+    // about twenty thousand days in the future, so the banner never appeared.
+    const elapsedDays = (presenceNow - selected.moderation_updated_at) / 86400;
     const left = Math.ceil(selected.claim_after_days - elapsedDays);
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
@@ -445,6 +454,7 @@
 
   onMount(() => {
     restoreActiveChannelOnEnter();
+    returningToChannels = takeStashedChannelSelection();
     if (typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
       membersOpen = false;
     }
@@ -595,6 +605,10 @@
   async function loadChannels() {
     loading = true;
     error = null;
+    // Consumed here rather than read: a retry after a failed load is a fresh
+    // attempt, and by then opening the newest room is the helpful default again.
+    const returning = returningToChannels;
+    returningToChannels = false;
     try {
       await refreshChannels();
       channelsLoaded = true;
@@ -617,7 +631,13 @@
           editWelcome = ch?.welcome ?? '';
         }
         if (members.length === 0) await refreshMembers(current, true);
-      } else if ($channelsStore.some((c) => c.in_room && !c.deleted) && !deepLinkJoin) {
+      } else if (
+        $channelsStore.some((c) => c.in_room && !c.deleted) &&
+        !deepLinkJoin &&
+        // Not on the way back in. Closing a room to browse the directory is a
+        // choice, and re-opening one over the top of it discarded it.
+        !returning
+      ) {
         const newest = $channelsStore
           .filter((c) => c.in_room && !c.deleted)
           .slice()
@@ -631,25 +651,30 @@
     }
   }
 
-  /** Apply only while `id` is still the open room, so a slow reply from a
-   *  previous selection cannot replace the current roster. */
+  /** Apply only while `id` is still the open room *and* this is still the newest
+   *  request for it, so a slow reply cannot replace the current roster. The room
+   *  check alone was not enough: leaving a room and coming straight back makes
+   *  the stale reply's id match again, and it would land on top of the fresh
+   *  one. Same generation guard the history search uses. */
   async function refreshMembers(id: string, notify = false) {
+    const gen = ++membersGen;
     if (id === selectedId && members.length === 0) {
       membersLoading = true;
       membersError = null;
     }
     try {
       const mems = await listChannelMembers(id);
-      if (id === selectedId) {
+      if (gen === membersGen && id === selectedId) {
         members = mems;
         membersLoading = false;
         membersError = null;
       }
       // Written even when empty: gating on a non-empty roster meant a room
-      // that had emptied kept whatever count it last reported.
+      // that had emptied kept whatever count it last reported. Not generation
+      // gated — it names the room it counted, so a late reply is still true.
       setChannelMemberCount(id, mems.length);
     } catch (e) {
-      if (id === selectedId) {
+      if (gen === membersGen && id === selectedId) {
         membersLoading = false;
         membersError = translateError(e, m.error_operation_failed());
         if (notify) toastError(membersError);
@@ -2098,9 +2123,12 @@
                     </div>
                     <div class="xfer-actions">
                       {#if t.status === 'awaiting'}
+                        <!-- Accepting while banned pulls room traffic we have no
+                             business receiving, and the backend refuses it.
+                             Declining stays open: that is how the offer clears. -->
                         <button
                           type="button"
-                          disabled={busy}
+                          disabled={busy || selectedBanned}
                           onclick={() => handleRespondTransfer(t.xfer_id, true)}
                         >
                           {m.channels_xfer_accept()}
@@ -2286,7 +2314,7 @@
                           <button
                             type="button"
                             role="menuitem"
-                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned}
+                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}</button>
                           <button

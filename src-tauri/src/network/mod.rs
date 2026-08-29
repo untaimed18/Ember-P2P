@@ -10535,11 +10535,16 @@ pub enum NetworkCommand {
     ListChannelTransfers {
         tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
     },
-    /// Drop every transfer tied to a room, because it has just been left.
-    /// Sends no cancel: the room's content key is what those frames travel
-    /// under, and it is gone along with the membership.
+    /// Drop transfers tied to a room, because it has just been left or somebody
+    /// in it has just been banned. Sends no cancel: the room's content key is
+    /// what those frames travel under, and after a leave it is gone along with
+    /// the membership.
+    ///
+    /// `member` of `None` is the whole room; naming one is a ban, where only the
+    /// transfers with that member stop.
     DropChannelTransfers {
         channel_id: [u8; 16],
+        member: Option<[u8; 32]>,
     },
     /// Run one Ember DHT maintenance cycle on demand (dev/harness): refresh
     /// stale buckets, liveness-ping stale contacts, and republish stored
@@ -12454,6 +12459,15 @@ struct NetworkState {
     channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// Private rooms we own where a delegated moderator's ban has landed and the
+    /// content key has not been rotated for it yet.
+    ///
+    /// A moderator cannot rotate: the epoch record is signed by the room
+    /// identity, and only the owner holds its seed. So their ban travelled as a
+    /// label — the evicted member kept the key and carried on reading — until
+    /// the owner happened to ban somebody themselves. Bounded by the number of
+    /// private rooms this device owns.
+    channel_rotate_pending: HashSet<[u8; 16]>,
     /// Last Channel-username refresh against Rendezvous.
     channel_username_refresh_at: i64,
     /// Rendezvous base URL, refreshed from settings on the channel heartbeat.
@@ -13362,6 +13376,29 @@ async fn maybe_publish_owned_channel_records(
         if ident.channel_id != channel_id {
             continue;
         }
+        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        // A delegated moderator's ban has to become an eviction, and only this
+        // device can make it one: an epoch record is signed by the room
+        // identity, whose seed is ours alone. Done here rather than where the
+        // ban is ingested because the snapshot below is the only thing that
+        // tells members a new epoch exists, and the re-seal at the end of this
+        // pass is what hands it to each of them — the three have to travel
+        // together, exactly as `rotate_and_commit` keeps them together for the
+        // owner's own bans.
+        let mut ch = ch;
+        let rotated = if private && state.channel_rotate_pending.contains(&channel_id) {
+            let minted = rotate_owned_channel_key(db, &ch.channel_id, ch.key_epoch);
+            if minted.is_some() {
+                // Re-read: the snapshot's tail and the re-seal both take the
+                // epoch from this row.
+                if let Ok(Some(fresh)) = db.get_channel(&ch.channel_id) {
+                    ch = fresh;
+                }
+            }
+            minted
+        } else {
+            None
+        };
         let mut bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
@@ -13373,7 +13410,6 @@ async fn maybe_publish_owned_channel_records(
         let mods = db
             .list_moderator_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
-        let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
         let record = ember::dht::publish::SignedRecord::channel_moderation(
             &ch.topic,
             &ch.welcome,
@@ -13419,13 +13455,24 @@ async fn maybe_publish_owned_channel_records(
                  state will lapse until the welcome or the ban/moderator lists are shortened",
                 hex::encode(channel_id)
             );
+            undo_owned_rotation(db, &ch.channel_id, rotated);
             continue;
         };
-        if let Some(publish_id) = state
+        let Some(publish_id) = state
             .ember_publish
             .start_publish(record, state.ember_dht.routing())
+        else {
+            undo_owned_rotation(db, &ch.channel_id, rotated);
+            continue;
+        };
         {
             state.channel_moderation_publish_at.insert(channel_id, now);
+            // The ban is now an eviction: the snapshot naming the new epoch is
+            // on its way, and the re-seal at the end of this pass reaches
+            // everyone still entitled to it.
+            if rotated.is_some() {
+                state.channel_rotate_pending.remove(&channel_id);
+            }
             drive_ember_publish(socket, state, publish_id).await;
             started += 1;
             // Everything a room's survival depends on is renewed from here, so
@@ -13528,6 +13575,44 @@ async fn maybe_publish_owned_channel_records(
             if private && ch.key_epoch > 0 {
                 republish_channel_key_epoch(socket, state, db, &ch, &ident, identity, our_pk).await;
             }
+        }
+    }
+}
+
+/// Drop an epoch whose moderation snapshot never went out, so the room keeps
+/// talking under the key its members still hold.
+fn undo_owned_rotation(db: &Database, channel_id_hex: &str, rotated: Option<i64>) {
+    let Some(epoch) = rotated else {
+        return;
+    };
+    if let Err(error) = db.rollback_channel_key_epoch(channel_id_hex, epoch) {
+        tracing::error!(
+            channel_id = %channel_id_hex,
+            %error,
+            "could not roll back epoch {epoch} after its snapshot failed to publish"
+        );
+    }
+}
+
+/// Mint the next content-key epoch for a private room we own.
+///
+/// Returns the new epoch number. The caller has to announce it in the moderation
+/// snapshot and roll it back if that snapshot does not go out: members only ever
+/// fetch an epoch a snapshot has named, so a rotation nobody was told about
+/// leaves the owner sealing traffic under a key the room cannot find.
+fn rotate_owned_channel_key(db: &Database, channel_id_hex: &str, from_epoch: i64) -> Option<i64> {
+    let next = from_epoch.saturating_add(1);
+    let mut secret = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+    match db.insert_channel_key_epoch(channel_id_hex, next, &secret) {
+        Ok(()) => Some(next),
+        Err(error) => {
+            tracing::warn!(
+                channel_id = %channel_id_hex,
+                %error,
+                "could not mint a rotated content key for a moderator's ban"
+            );
+            None
         }
     }
 }
@@ -13876,8 +13961,16 @@ fn ingest_channel_handoff_records(
         if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
             continue;
         }
+        // Version first, timestamp only to break a tie. Either-or let a record
+        // with the *lower* version win on a newer timestamp, and which one that
+        // was depended on the order the DHT happened to return them. That is not
+        // a cosmetic preference: `apply_channel_handoff` has no version guard of
+        // its own and refuses any later handoff naming a different successor, so
+        // picking the stale one here pointed the room at the wrong owner for
+        // good.
         if best.as_ref().is_none_or(|cur| {
-            parsed.version > cur.version || parsed.timestamp > cur.timestamp
+            parsed.version > cur.version
+                || (parsed.version == cur.version && parsed.timestamp > cur.timestamp)
         }) {
             best = Some(parsed);
         }
@@ -15210,12 +15303,41 @@ async fn handle_inbound_channel_gossip(
             return;
         }
         let target_hex = hex::encode(target_pk);
-        let _ = db.apply_channel_ban_action(
-            &channel_id_hex,
-            &target_hex,
-            banned,
-            gossip.timestamp,
-        );
+        let applied = db
+            .apply_channel_ban_action(&channel_id_hex, &target_hex, banned, gossip.timestamp)
+            .unwrap_or(false);
+        if banned {
+            // A moderator cannot rotate the room key — the epoch record is
+            // signed by the room identity, and only the owner holds its seed —
+            // so in a private room we own, their ban was a label the evicted
+            // member could read straight through. Queue it for the owner-record
+            // loop, which holds the seed and publishes the snapshot that has to
+            // announce the new epoch, and bring that pass forward.
+            //
+            // In memory, so a close inside the second before that pass loses the
+            // request; the next ban in the room rotates for both.
+            if applied && ch.is_owner && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE {
+                state.channel_rotate_pending.insert(gossip.channel_id);
+                state
+                    .channel_moderation_publish_at
+                    .remove(&gossip.channel_id);
+            }
+            // Ours to stop as well when we are the one evicted: their entries
+            // name us as the peer, not themselves, so a member-scoped sweep
+            // would find nothing.
+            let scope = if target_pk == state.local_ed25519_pubkey {
+                None
+            } else {
+                Some(target_pk)
+            };
+            drop_channel_transfers_for(
+                state,
+                app_handle,
+                gossip.channel_id,
+                scope,
+                "not_allowed",
+            );
+        }
         let _ = app_handle.emit(
             "ember:channel-moderation",
             serde_json::json!({ "channel_id": channel_id_hex }),
@@ -15647,6 +15769,65 @@ async fn send_xfer_frame(
     }
     let roster = channel_member_pubkeys(db, &channel_id_hex);
     overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+}
+
+/// Drop the transfers tied to one room, optionally only those with one member.
+///
+/// A ban has to reach the transfer engine, not just the roster. Without this an
+/// accepted download kept pulling blocks from somebody the room had just
+/// evicted, a pending offer of theirs stayed answerable, and an upload of ours
+/// kept feeding them — none of it stopping until the stall shed noticed ninety
+/// seconds later, and not even then while blocks were still arriving.
+///
+/// `member` of `None` means every transfer in the room, which is what leaving it
+/// wants.
+fn drop_channel_transfers_for(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    channel_id: [u8; 16],
+    member: Option<[u8; 32]>,
+    status: &str,
+) {
+    let matches = |room: &[u8; 16], peer: &[u8; 32]| {
+        *room == channel_id && member.is_none_or(|wanted| wanted == *peer)
+    };
+    let mut ended: Vec<([u8; 16], [u8; 32], String, u64, &'static str)> = Vec::new();
+    state.xfer_pending.retain(|xfer_id, offer| {
+        if matches(&offer.channel_id, &offer.peer) {
+            ended.push((*xfer_id, offer.peer, offer.name.clone(), offer.size, "receive"));
+            return false;
+        }
+        true
+    });
+    state.xfer_recv.retain(|xfer_id, recv| {
+        if matches(&recv.channel_id, &recv.peer) {
+            // Half a file is not a file.
+            let _ = std::fs::remove_file(&recv.part_path);
+            ended.push((*xfer_id, recv.peer, recv.name.clone(), recv.size, "receive"));
+            return false;
+        }
+        true
+    });
+    state.xfer_send.retain(|xfer_id, send| {
+        if matches(&send.channel_id, &send.peer) {
+            ended.push((*xfer_id, send.peer, send.name.clone(), send.size, "send"));
+            return false;
+        }
+        true
+    });
+    for (xfer_id, peer, name, size, direction) in ended {
+        emit_xfer_update(
+            app_handle,
+            &xfer_id,
+            &channel_id,
+            &peer,
+            direction,
+            &name,
+            size,
+            0,
+            status,
+        );
+    }
 }
 
 fn emit_xfer_update(
@@ -16533,20 +16714,34 @@ async fn reply_channel_history_sync(
         // the original's timestamp so it stands on its own, and serving the
         // superseded text as well would put words back on the wire that their
         // author has already replaced.
-        let plain = if row.edited_at > 0 && !row.edit_sig.is_empty() {
+        //
+        // A revision also needs a *fresh* envelope id, where a plain re-serve
+        // must keep the original's. The two signatures differ on purpose: a
+        // chat signature covers the envelope id, so replaying one under a new
+        // id would not verify — and a peer who already holds that line is right
+        // to drop the repeat. An edit signature covers only the line it
+        // revises, and every peer worth serving already has the original, so
+        // reusing that id here put the revision behind their duplicate filter
+        // and the edit never arrived.
+        let (plain, envelope_id) = if row.edited_at > 0 && !row.edit_sig.is_empty() {
             let Ok(sig_bytes) = hex::decode(&row.edit_sig) else {
                 continue;
             };
             let Ok(edit_sig) = <[u8; 64]>::try_from(sig_bytes) else {
                 continue;
             };
-            ember::channel::encode_channel_chat_edit_presigned(
-                &sender_pk,
-                &msg_id,
-                row.timestamp,
-                row.edited_at,
-                &edit_sig,
-                &row.message,
+            let mut envelope_id = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
+            (
+                ember::channel::encode_channel_chat_edit_presigned(
+                    &sender_pk,
+                    &msg_id,
+                    row.timestamp,
+                    row.edited_at,
+                    &edit_sig,
+                    &row.message,
+                ),
+                envelope_id,
             )
         } else {
             let Ok(sig_bytes) = hex::decode(&row.author_sig) else {
@@ -16555,15 +16750,18 @@ async fn reply_channel_history_sync(
             let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
                 continue;
             };
-            ember::channel::encode_channel_chat_plain_presigned(
-                &sender_pk,
-                &author_sig,
-                &row.message,
+            (
+                ember::channel::encode_channel_chat_plain_presigned(
+                    &sender_pk,
+                    &author_sig,
+                    &row.message,
+                ),
+                msg_id,
             )
         };
         let gossip = ember::channel::ChannelGossip::sealed(
             channel_id,
-            msg_id,
+            envelope_id,
             &key,
             row.timestamp.max(0) as u64,
             &plain,
@@ -16575,7 +16773,7 @@ async fn reply_channel_history_sync(
         served.push(row.msg_id);
     }
     if budget > 0 && !served.is_empty() {
-        reply_channel_reaction_sync(socket, state, db, ch, to, channel_id, &key, since_ts, budget)
+        reply_channel_reaction_sync(socket, state, db, ch, to, channel_id, &key, &served, budget)
             .await;
     }
 }
@@ -16595,12 +16793,11 @@ async fn reply_channel_reaction_sync(
     to: [u8; 32],
     channel_id: [u8; 16],
     key: &[u8; 32],
-    since_ts: i64,
+    served: &[String],
     mut budget: usize,
 ) {
     let want = budget.saturating_mul(ember::channel::CHANNEL_REACTION_MAX_PER_FRAME);
-    let Ok(rows) = db.list_channel_reactions_for_sync(&ch.channel_id, since_ts.max(0), want as i64)
-    else {
+    let Ok(rows) = db.list_channel_reactions_for_sync(&ch.channel_id, served, want as i64) else {
         return;
     };
     let mut batch: Vec<ember::channel::ChannelReaction> = Vec::new();
@@ -21189,6 +21386,8 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_channel_moderation.clear();
     state.channel_moderation_fetch_at.clear();
     state.channel_moderation_publish_at.clear();
+    // Not cleared: the ban that asked for a rotation is on disk, and turning
+    // Ember off is not the owner deciding to let the evicted member back in.
     state.channel_username_refresh_at = 0;
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
@@ -22207,6 +22406,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        channel_rotate_pending: HashSet::new(),
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),

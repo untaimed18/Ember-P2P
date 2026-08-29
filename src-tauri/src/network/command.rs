@@ -2952,6 +2952,49 @@ async fn handle_command_inner(
                 ember::channel::XferReply::Decline
             };
             if accept {
+                // The cap the offer was measured against, re-checked at the
+                // moment it is taken up. An offer only counted itself against
+                // `xfer_pending`, so four queued prompts on top of an already
+                // busy receiver could all be accepted and land as seven
+                // concurrent downloads — each holding an open file handle and a
+                // request window the tick budget was never sized for.
+                if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE {
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_busy",
+                        "Too many transfers are already running",
+                    )));
+                    return;
+                }
+                // Banned since the prompt appeared. The offer path refuses a
+                // banned sender outright, and nothing re-read that decision
+                // afterwards — so a member evicted while their dialog sat on
+                // screen could still be let in by the click that answered it.
+                // Declining stays available either way: that is cleanup.
+                if db
+                    .channel_member_is_banned(
+                        &hex::encode(offer.channel_id),
+                        &hex::encode(offer.peer),
+                    )
+                    .unwrap_or(false)
+                {
+                    state.xfer_pending.remove(&xfer_id);
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &offer.channel_id,
+                        &offer.peer,
+                        "receive",
+                        &offer.name,
+                        offer.size,
+                        0,
+                        "not_allowed",
+                    );
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_no_member",
+                        "That member is not in this room",
+                    )));
+                    return;
+                }
                 // Part files sit beside the ones eD2K downloads use, so a
                 // half-received transfer never appears in the finished folder.
                 let temp_dir = download_folder.join("Temp");
@@ -2993,7 +3036,6 @@ async fn handle_command_inner(
                     ),
                 );
             }
-            state.xfer_pending.remove(&xfer_id);
             let plain = ember::channel::encode_xfer_reply(
                 &offer.key,
                 &state.local_ed25519_pubkey,
@@ -3001,7 +3043,22 @@ async fn handle_command_inner(
                 &xfer_id,
                 reply,
             );
-            send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await;
+            // Rolled back on a reply that never left, exactly as the offer side
+            // does. Marking the transfer active regardless held a receive slot
+            // and an open file for a sender who was never told to start, and the
+            // offer had already been consumed so there was nothing left to
+            // answer — the user's only recourse was to wait out the timeout.
+            if !send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await {
+                if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+                    let _ = std::fs::remove_file(&recv.part_path);
+                }
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_unreachable",
+                    "Could not reach that member right now",
+                )));
+                return;
+            }
+            state.xfer_pending.remove(&xfer_id);
             emit_xfer_update(
                 app_handle,
                 &xfer_id,
@@ -3079,43 +3136,18 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
-        NetworkCommand::DropChannelTransfers { channel_id } => {
-            let mut ended: Vec<([u8; 16], [u8; 32], String, u64, &'static str)> = Vec::new();
-            state.xfer_pending.retain(|xfer_id, offer| {
-                let keep = offer.channel_id != channel_id;
-                if !keep {
-                    ended.push((*xfer_id, offer.peer, offer.name.clone(), offer.size, "receive"));
-                }
-                keep
-            });
-            state.xfer_recv.retain(|xfer_id, recv| {
-                let keep = recv.channel_id != channel_id;
-                if !keep {
-                    let _ = std::fs::remove_file(&recv.part_path);
-                    ended.push((*xfer_id, recv.peer, recv.name.clone(), recv.size, "receive"));
-                }
-                keep
-            });
-            state.xfer_send.retain(|xfer_id, send| {
-                let keep = send.channel_id != channel_id;
-                if !keep {
-                    ended.push((*xfer_id, send.peer, send.name.clone(), send.size, "send"));
-                }
-                keep
-            });
-            for (xfer_id, peer, name, size, direction) in ended {
-                emit_xfer_update(
-                    app_handle,
-                    &xfer_id,
-                    &channel_id,
-                    &peer,
-                    direction,
-                    &name,
-                    size,
-                    0,
-                    "cancelled",
-                );
-            }
+        NetworkCommand::DropChannelTransfers { channel_id, member } => {
+            drop_channel_transfers_for(
+                state,
+                app_handle,
+                channel_id,
+                member,
+                if member.is_some() {
+                    "not_allowed"
+                } else {
+                    "cancelled"
+                },
+            );
         }
 
         NetworkCommand::ListChannelTransfers { tx } => {

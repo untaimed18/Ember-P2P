@@ -5057,10 +5057,16 @@ impl Database {
                          WHERE channel_id = ?1",
                         params![successor_channel_id, old_channel_id, old.topic, old.welcome],
                     )?;
+                    // `ban_revised_at` travels with the row. It is the watermark
+                    // that orders competing ban gossip, so dropping it reset
+                    // every member to "never revised" and let a stale ban or
+                    // unban frame re-decide a question the room had settled.
                     tx.execute(
                         "INSERT OR IGNORE INTO channel_members
-                            (channel_id, member_pubkey, nickname, last_seen, banned, moderator)
-                         SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator
+                            (channel_id, member_pubkey, nickname, last_seen, banned, moderator,
+                             ban_revised_at)
+                         SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator,
+                             ban_revised_at
                          FROM channel_members WHERE channel_id = ?1",
                         params![old_channel_id, successor_channel_id],
                     )?;
@@ -6282,24 +6288,45 @@ impl Database {
     /// Cleared reactions are included, unlike [`Self::channel_message_reactions`]:
     /// a member who missed both the reaction and its removal needs the removal
     /// too, or they would show a reaction its owner has taken back.
+    /// Reactions on the exact lines a catch-up reply just served.
+    ///
+    /// Scoped to those ids, not to the requester's watermark. The watermark
+    /// picks a window, but one reply only ever serves the oldest
+    /// `CHANNEL_HISTORY_SYNC_MAX` lines inside it — so on a room with a real
+    /// backlog the reactions went out for the *newest* messages, which the peer
+    /// had not been given, while the lines it did get arrived bare. Nothing
+    /// retried them either: the watermark advances with the messages, putting
+    /// those reactions outside the next window as well.
     pub fn list_channel_reactions_for_sync(
         &self,
         channel_id: &str,
-        since_ts: i64,
+        msg_ids: &[String],
         limit: i64,
     ) -> anyhow::Result<Vec<(String, String, u8, i64, String)>> {
+        if msg_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let limit = limit.clamp(1, 256);
+        // One reply is capped at `CHANNEL_HISTORY_SYNC_MAX` lines, so this list
+        // is short and needs no chunking.
+        let placeholders: Vec<String> = (3..3 + msg_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT msg_id, member_pubkey, reaction, reacted_at, sig
+             FROM channel_message_reactions
+             WHERE channel_id = ?1 AND sig <> '' AND msg_id IN ({})
+             ORDER BY reacted_at DESC, msg_id, member_pubkey
+             LIMIT ?2",
+            placeholders.join(",")
+        );
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT r.msg_id, r.member_pubkey, r.reaction, r.reacted_at, r.sig
-             FROM channel_message_reactions r
-             JOIN channel_messages m
-                 ON m.channel_id = r.channel_id AND m.msg_id = r.msg_id
-             WHERE r.channel_id = ?1 AND r.sig <> '' AND m.timestamp >= ?2
-             ORDER BY r.reacted_at DESC
-             LIMIT ?3",
-        )?;
-        let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(msg_ids.len() + 2);
+        bound.push(&channel_id);
+        bound.push(&limit);
+        for id in msg_ids {
+            bound.push(id as &dyn rusqlite::ToSql);
+        }
+        let mapped = stmt.query_map(bound.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -9049,6 +9076,145 @@ mod tests {
         let history = db.get_channel_messages(&new_id, 50, None).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].message, "keep me");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A handoff carries the roster's ban watermarks, not just its ban flags.
+    ///
+    /// `ban_revised_at` is what orders competing ban gossip. Copying the rows
+    /// without it reset every member to "never revised", so the first stale
+    /// frame to arrive in the successor room could re-decide a question the
+    /// predecessor had already settled.
+    #[test]
+    fn channel_handoff_carries_the_ban_watermark() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-handoff-bans-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let old = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let old_id = hex::encode(old.channel_id);
+        let new_id = hex::encode(successor.channel_id);
+        let old_pk = hex::encode(old.pubkey);
+        let new_pk = hex::encode(successor.pubkey);
+        let old_seed = old.seed();
+        let villain = "b9".repeat(32);
+
+        db.insert_channel(
+            &old_id,
+            &old_pk,
+            "Lobby",
+            "private",
+            true,
+            Some(&old_seed),
+            Some(&[0x55u8; 32]),
+        )
+        .unwrap();
+        assert!(db
+            .apply_channel_ban_action(&old_id, &villain, true, 500)
+            .unwrap());
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &new_pk, &new_id, 1, true, Some(&successor.seed()))
+            .unwrap());
+        assert!(
+            db.channel_member_is_banned(&new_id, &villain).unwrap(),
+            "the ban itself has to survive the move"
+        );
+        assert!(
+            !db.apply_channel_ban_action(&new_id, &villain, false, 400)
+                .unwrap(),
+            "an unban older than the ban must still be refused in the successor room"
+        );
+        assert!(db.channel_member_is_banned(&new_id, &villain).unwrap());
+        assert!(
+            db.apply_channel_ban_action(&new_id, &villain, false, 600)
+                .unwrap(),
+            "a genuinely newer unban still applies"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A catch-up reply annotates the lines it served and nothing else.
+    ///
+    /// Scoped by message id rather than by the requester's watermark: a reply
+    /// serves the oldest lines in that window, so selecting reactions by
+    /// timestamp sent them for messages the peer had not been given while the
+    /// ones it did get arrived bare.
+    #[test]
+    fn channel_reaction_sync_only_covers_the_lines_it_is_given() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-reaction-sync-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "3c".repeat(16);
+        let me = "1a".repeat(32);
+        let them = "2b".repeat(32);
+        db.insert_channel(&channel_id, &me, "Lobby", "public", true, None, None)
+            .unwrap();
+
+        let older = "aa".repeat(16);
+        let newer = "bb".repeat(16);
+        db.insert_channel_message(
+            &channel_id, &me, "sent", "first", &older, 1_700_000_000, &"11".repeat(64), true,
+        )
+        .unwrap();
+        db.insert_channel_message(
+            &channel_id, &me, "sent", "second", &newer, 1_700_000_900, &"22".repeat(64), true,
+        )
+        .unwrap();
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &older, &them, 1, 1_700_000_100, "aa")
+            .unwrap());
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &newer, &them, 2, 1_700_001_000, "bb")
+            .unwrap());
+
+        let served = db
+            .list_channel_reactions_for_sync(&channel_id, std::slice::from_ref(&older), 32)
+            .unwrap();
+        assert_eq!(served.len(), 1, "only the line named may be annotated");
+        assert_eq!(served[0].0, older);
+        assert_eq!(
+            served[0].2, 1,
+            "and it has to be that line's reaction, not the newest in the room"
+        );
+
+        let both = db
+            .list_channel_reactions_for_sync(&channel_id, &[older, newer], 32)
+            .unwrap();
+        assert_eq!(both.len(), 2);
+
+        assert!(
+            db.list_channel_reactions_for_sync(&channel_id, &[], 32)
+                .unwrap()
+                .is_empty(),
+            "a reply that served no lines has nothing to annotate"
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&path);

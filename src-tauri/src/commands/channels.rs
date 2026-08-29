@@ -20,7 +20,7 @@ use crate::network::ember::dht::publish::{
 };
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
-use crate::storage::database::{StoredChannel, StoredChannelMember};
+use crate::storage::database::{ChannelEditOutcome, StoredChannel, StoredChannelMember};
 
 /// Room names are bounded by what a directory row can show rather than by what
 /// the record could carry: twenty characters fit the list at every width the
@@ -1186,7 +1186,10 @@ pub async fn leave_channel(
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
             let _ = state
                 .network_tx
-                .try_send(NetworkCommand::DropChannelTransfers { channel_id: id });
+                .try_send(NetworkCommand::DropChannelTransfers {
+                    channel_id: id,
+                    member: None,
+                });
         }
     }
     // Same presence key, newer timestamp, CHANNEL_FLAG_DEPARTED. Ingest on
@@ -1320,7 +1323,10 @@ pub async fn delete_owned_channel(
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
             let _ = state
                 .network_tx
-                .try_send(NetworkCommand::DropChannelTransfers { channel_id: id });
+                .try_send(NetworkCommand::DropChannelTransfers {
+                    channel_id: id,
+                    member: None,
+                });
         }
     }
     Ok(())
@@ -1581,7 +1587,7 @@ pub async fn edit_channel_message(
     let text_for_edit = cleaned.clone();
     let sig_hex = hex::encode(edit_sig);
     let original_ts = target.timestamp;
-    tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         db.apply_channel_message_edit(
             &id_for_edit,
             &msg_id_for_edit,
@@ -1596,6 +1602,35 @@ pub async fn edit_channel_message(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_edit_failed", "Failed to save edit", e))?;
+
+    // The storage layer refuses on its own terms, and it is the one holding the
+    // row. Its checks re-run the two clocks and the authorship against what is
+    // actually stored, which is not always what the checks above read: an
+    // inbound revision of the same line can land between them, and two edits in
+    // one second leave the second with nothing newer to say. Treating a refusal
+    // as a save flooded a revision this device never kept, told the room it had
+    // happened, and handed the composer back text that reverted on next read.
+    match outcome {
+        ChannelEditOutcome::Applied(_) | ChannelEditOutcome::Created(_) => {}
+        ChannelEditOutcome::OutsideWindow => {
+            return Err(coded(
+                "channels_edit_window_closed",
+                "This message is too old to edit",
+            ));
+        }
+        ChannelEditOutcome::NotAuthor => {
+            return Err(coded(
+                "channels_edit_not_author",
+                "Only the author can edit a message",
+            ));
+        }
+        ChannelEditOutcome::NotNewer => {
+            return Err(coded(
+                "channels_edit_failed",
+                "A newer version of this message is already stored",
+            ));
+        }
+    }
 
     let plain = channel::encode_channel_chat_edit_presigned(
         &sender_pk,
@@ -1944,16 +1979,12 @@ pub async fn send_channel_message(
         channel::CHANNEL_MSG_TTL_DEFAULT,
         sent_at,
     );
-    state
-        .network_tx
-        .try_send(NetworkCommand::FanoutChannelGossip {
-            body: gossip.encode(),
-        })
-        .map_err(|e| {
-            refund_local_send(&channel_id);
-            coded_ctx("network_busy", "Network busy", e)
-        })?;
-
+    // Stored before it is flooded, which is the order the edit path already
+    // uses. The other way round, a failed insert left the line on every peer's
+    // disk and on none of ours: the user was told the send failed, and the retry
+    // minted a fresh `msg_id` — so the room saw the same sentence twice, with no
+    // duplicate filter able to tell. Refusing to send something we could not
+    // keep makes "failed" mean what it says, and leaves the retry clean.
     let db = state.db.clone();
     let id = channel_id.clone();
     let sender2 = sender.clone();
@@ -1961,7 +1992,7 @@ pub async fn send_channel_message(
     let msg_id_hex = hex::encode(msg_id);
     let author_sig_hex = hex::encode(author_sig);
     let row_id = tokio::task::spawn_blocking(move || {
-        db.insert_channel_message(
+        let row_id = db.insert_channel_message(
             &id,
             &sender2,
             "sent",
@@ -1970,7 +2001,12 @@ pub async fn send_channel_message(
             sent_at,
             &author_sig_hex,
             true,
-        )
+        )?;
+        // We are present: keep our own last_seen in step with the line, so
+        // gossip-neighbor freshness and the empty-room poll do not treat a
+        // talking member as gone until the next DHT announce.
+        let _ = db.touch_channel_member_last_seen(&id, &sender2, sent_at);
+        Ok::<_, anyhow::Error>(row_id)
     })
     .await
     .map_err(|e| {
@@ -1978,13 +2014,25 @@ pub async fn send_channel_message(
         coded_ctx("channels_task_error", "Task error", e)
     })?
     .map_err(|e| {
-        // The line is already on the mesh, so this is not a refund for work not
-        // done — it is for the retry the user is about to make, having been
-        // told the send failed. Charging them twice for one message is the
-        // wrong end of an error they did not cause.
         refund_local_send(&channel_id);
         coded_ctx("channels_send_failed", "Failed to send", e)
     })?;
+
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::FanoutChannelGossip {
+            body: gossip.encode(),
+        })
+    {
+        // Take the row back out. A line nobody was sent is not history, and
+        // leaving it would show the sender a transcript the room does not have —
+        // with no resend, because a channel send never leaves a row to retry.
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        let _ = tokio::task::spawn_blocking(move || db.delete_channel_message(&id, row_id)).await;
+        refund_local_send(&channel_id);
+        return Err(coded_ctx("network_busy", "Network busy", e));
+    }
 
     Ok(ChannelMessageInfo {
         id: row_id,
@@ -2627,22 +2675,100 @@ async fn rotate_and_commit(
     else {
         return Ok(());
     };
-    if let Some(epoch) = rotated {
-        let db = state.db.clone();
-        let id = owned.row.channel_id.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || db.rollback_channel_key_epoch(&id, epoch))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .and_then(|r| r)
-        {
-            tracing::error!(
-                channel_id = %owned.row.channel_id,
-                error = %e,
-                "could not roll back epoch {epoch} after a failed moderation commit"
-            );
-        }
-    }
+    undo_rotation(state, owned, rotated).await;
     Err(error)
+}
+
+/// Take a rotation back off after the snapshot that would have announced it
+/// failed to publish. No-op when nothing was rotated.
+async fn undo_rotation(state: &AppState, owned: &OwnedChannel, rotated: Option<i64>) {
+    let Some(epoch) = rotated else {
+        return;
+    };
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || db.rollback_channel_key_epoch(&id, epoch))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|r| r)
+    {
+        tracing::error!(
+            channel_id = %owned.row.channel_id,
+            error = %e,
+            "could not roll back epoch {epoch} after a failed moderation commit"
+        );
+    }
+}
+
+/// Hand one member the private room's current content key, sealed to them alone.
+///
+/// Both places that mint an epoch record skip banned members, which is the skip
+/// that makes a ban in a private room an eviction rather than a label: rotation
+/// omits them, and so does the owner's periodic re-seal. Lifting the ban is
+/// therefore social only until one of those runs again — the snapshot published
+/// here carries the epoch *number*, not the key. That left the member in a room
+/// that looked joined and refused every send behind `key_behind` for up to
+/// `MODERATION_REPUBLISH_SECS`, which is six hours.
+async fn reseal_current_epoch_to_member(
+    state: &AppState,
+    owned: &OwnedChannel,
+    member_pk: [u8; 32],
+) -> Result<(), String> {
+    // Epoch 0 is the secret the invite carried, which this member already has.
+    if owned.row.visibility != CHANNEL_KIND_PRIVATE || owned.row.key_epoch <= 0 {
+        return Ok(());
+    }
+    if member_pk == state.identity.ed25519_public_key {
+        return Ok(());
+    }
+    let epoch = owned.row.key_epoch;
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let secret = tokio::task::spawn_blocking(move || db.load_channel_key_epochs(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load the room key", e))?
+        .into_iter()
+        .find(|(held, _)| *held == epoch)
+        .map(|(_, secret)| secret);
+    // Retention drops the oldest epochs, so the one the snapshot advertises can
+    // be gone on a device that has rotated many times. Saying nothing is right:
+    // the next rotation reseals to everyone unbanned, this member included.
+    let Some(secret) = secret else {
+        tracing::warn!(
+            channel_id = %owned.row.channel_id,
+            "no stored secret for epoch {epoch}; the unbanned member waits for the next rotation"
+        );
+        return Ok(());
+    };
+    let Some(wrap) = channel::derive_channel_epoch_secret(
+        &state.identity.ed25519_secret_key,
+        &member_pk,
+        &owned.channel_id,
+        epoch,
+    ) else {
+        return Ok(());
+    };
+    let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, epoch, &secret);
+    let record = SignedRecord::channel_key_epoch(
+        owned.channel_id,
+        owned.ident.pubkey,
+        &member_pk,
+        epoch,
+        &sealed,
+        &owned.ident.signing_key,
+    );
+    // Queued rather than awaited, exactly as rotation does: the member re-asks
+    // every minute until they find it, so a slow walk costs nothing but time.
+    if let Err(e) = queue_signed_record(state, record).await {
+        tracing::warn!(
+            channel_id = %owned.row.channel_id,
+            member = %hex::encode(member_pk),
+            error = %e,
+            "could not queue the current room key for an unbanned member"
+        );
+    }
+    Ok(())
 }
 
 /// Mint a fresh content key for a private room without evicting anyone.
@@ -2918,6 +3044,18 @@ async fn apply_local_mod_ban(
         rollback(state, row, target, banned, ts).await?;
         return Err(coded_ctx("network_busy", "Network busy", e));
     }
+    // Only once the ban is both saved and announced. The gossip path tears these
+    // down on the receiving side, but the device that issued the ban never sees
+    // its own frame — so without this the moderator who evicted somebody was the
+    // one member still uploading to them.
+    if banned {
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::DropChannelTransfers {
+                channel_id: channel_id_bytes,
+                member: Some(target),
+            });
+    }
     Ok(())
 }
 
@@ -3034,6 +3172,20 @@ pub async fn ban_channel_member(
         // matters twice over, because the snapshot carries the new epoch number
         // and that is how the remaining members learn to fetch it.
         rotate_and_commit(&state, &owned, &bans, &mods).await?;
+        // The rotation locks them out of what the room sends next, but a
+        // transfer already under way runs on a key pair of its own and would
+        // have carried on delivering.
+        if let Ok(id) = hex::decode(&channel_id)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
+        {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::DropChannelTransfers {
+                    channel_id: id,
+                    member: Some(pk),
+                });
+        }
     } else {
         // The same ceiling the owner path enforces, reported the same way. A
         // moderator's ban travels as gossip and lands in the owner's next
@@ -3091,6 +3243,10 @@ pub async fn unban_channel_member(
             &mods,
         )
         .await?;
+        // Only after the snapshot that drops them from the ban list. The other
+        // order would put the room's key on the wire for somebody every other
+        // member still holds a signed record saying is banned.
+        reseal_current_epoch_to_member(&state, &owned, pk).await?;
     } else {
         apply_local_mod_ban(&state, &row, pk, false).await?;
     }
@@ -3459,17 +3615,26 @@ pub async fn claim_channel_ownership(
     let _snapshot = moderation_lock().lock().await;
     match load_owned_channel(&state, &successor_id_hex).await {
         Ok(owned) => {
-            if let Err(e) = rotate_channel_key(&state, &owned, &[]).await {
-                tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not rotate the claimed room");
-            }
             let bans = load_banned_pubkeys(&state, &successor_id_hex)
                 .await
                 .unwrap_or_default();
             let mods = load_moderator_pubkeys(&state, &successor_id_hex)
                 .await
                 .unwrap_or_default();
-            // Also the first record naming us as owner, which is what lets
-            // members derive the pairwise key at all.
+            // Not `rotate_and_commit`, because the two halves are not equally
+            // optional here: the commit is also the first record naming us as
+            // owner, which is what lets members derive the pairwise key at all.
+            // A room that failed to rotate still works — everyone inherited a
+            // key — so the snapshot goes out either way. What must not survive
+            // is the reverse: a rotation the snapshot never announced leaves us
+            // sealing traffic under an epoch nobody has been told to fetch.
+            let rotated = match rotate_channel_key(&state, &owned, &bans).await {
+                Ok(rotated) => rotated,
+                Err(e) => {
+                    tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not rotate the claimed room");
+                    None
+                }
+            };
             if let Err(e) = commit_channel_moderation(
                 &state,
                 &owned,
@@ -3481,6 +3646,7 @@ pub async fn claim_channel_ownership(
             .await
             {
                 tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
+                undo_rotation(&state, &owned, rotated).await;
             }
         }
         Err(e) => {
