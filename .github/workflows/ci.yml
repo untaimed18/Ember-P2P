@@ -95,6 +95,12 @@ jobs:
       - name: Check frontend
         run: npm run check
 
+      # Runs here rather than in `verify`: that job deliberately installs
+      # nothing, and these need the dependency tree plus the compiled Paraglide
+      # output that `src/lib` imports.
+      - name: Test frontend
+        run: npm run test:unit
+
       - name: Check Rust
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
 

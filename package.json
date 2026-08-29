@@ -13,9 +13,11 @@
     "tauri": "tauri",
     "bump-version": "node scripts/bump-version.mjs",
     "verify:release": "node scripts/verify-release-policy.mjs",
-    "test": "node --test scripts/*.test.mjs",
+    "test": "npm run test:release-policy && npm run test:unit",
     "test:locales": "node --test scripts/locales.test.mjs scripts/error-codes.test.mjs",
     "test:release-policy": "node --test scripts/*.test.mjs",
+    "test:unit": "npm run paraglide:compile && vitest run",
+    "test:unit:watch": "npm run paraglide:compile && vitest",
     "postinstall": "node -e \"const fs=require('fs'),p=require('path'),s=p.join('node_modules','circle-flags','flags'),d=p.join('static','flags');if(!fs.existsSync(s)){process.exit(0);}fs.mkdirSync(d,{recursive:true});fs.readdirSync(s).filter(f=>f.endsWith('.svg')).forEach(f=>fs.copyFileSync(p.join(s,f),p.join(d,f)));console.log('Copied flag SVGs to static/flags/');\""
   },
   "license": "GPL-3.0-only",
@@ -38,6 +40,7 @@
     "svelte": "^5.56.10",
     "svelte-check": "^4.7.6",
     "typescript": "~5.9.3",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
   }
 }
