@@ -10249,6 +10249,17 @@ pub enum NetworkCommand {
     SharedFilesChangedAck {
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Withdraw our Ember DHT publications for files that have stopped being
+    /// offered — unshared, deleted, or dropped from the library with their
+    /// folder. Sent by the command that made the change, because it is the only
+    /// thing that knows which hashes those were: a hash simply missing from the
+    /// index is not evidence of a retraction, since the library scan is paged
+    /// and most of a large library is absent from the index for a while after
+    /// launch. Answers with how many hashes it acted on.
+    UnpublishEmberFiles {
+        file_hashes: Vec<String>,
+        tx: oneshot::Sender<usize>,
+    },
     SetUploadPriorities {
         file_hashes: Vec<String>,
         priority: u8,
@@ -16880,6 +16891,23 @@ fn hydrate_ember_publish_schedule(
     let now_unix = chrono::Utc::now().timestamp();
     let now_inst = std::time::Instant::now();
     for record in known_files.iter_records() {
+        // A stamp says a record was placed once, not that the file is still
+        // offered. known.met outlives unsharing, outlives a friends-only
+        // restriction, and outlives deletion entirely — `delete_shared_file`
+        // drops the index row and leaves the catalog record standing. Hydrating
+        // those lit the Ember badge, and inflated the published-files figure the
+        // Ember page shows, for files nobody could ask us for; the reconcile
+        // that would have pruned the set is skipped on the startup pass because
+        // it runs before known.met is absorbed and therefore is not yet
+        // authoritative.
+        //
+        // Skipping the clocks alongside the badge is the safe direction: a file
+        // that becomes publishable again is then due immediately rather than
+        // waiting out an interval on the strength of records that have since
+        // lapsed.
+        if !record.is_shared || record.friends_only {
+            continue;
+        }
         if record.last_ember_source_publish != 0 {
             source_unix
                 .entry(record.file_hash)
@@ -16915,6 +16943,92 @@ fn hydrate_ember_publish_schedule(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ember_publish_hydration_tests {
+    use super::*;
+    use crate::storage::known_files::KnownFileRecord;
+
+    fn published_record(hash: [u8; 16], is_shared: bool, friends_only: bool) -> KnownFileRecord {
+        let now = chrono::Utc::now().timestamp().max(0) as u32;
+        KnownFileRecord {
+            file_hash: hash,
+            part_hashes: Vec::new(),
+            file_name: "clip.mkv".into(),
+            file_size: 1,
+            file_path: format!("C:/Library/{}.mkv", hex::encode(hash)),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            modified_at: 0,
+            all_time_transferred: 0,
+            all_time_requested: 0,
+            all_time_accepted: 0,
+            upload_priority: 0,
+            last_publish_src: 0,
+            last_shared: 0,
+            is_shared,
+            friends_only,
+            complete_sources: 0,
+            last_ember_source_publish: now,
+            last_ember_keyword_publish: now,
+        }
+    }
+
+    fn hydrate(known: &KnownFileList) -> (HashSet<[u8; 16]>, HashMap<[u8; 16], u32>) {
+        let mut source_at = HashMap::new();
+        let mut source_unix = HashMap::new();
+        let mut keyword_at = HashMap::new();
+        let mut keyword_unix = HashMap::new();
+        let mut published = HashSet::new();
+        hydrate_ember_publish_schedule(
+            known,
+            &mut source_at,
+            &mut source_unix,
+            &mut keyword_at,
+            &mut keyword_unix,
+            &mut published,
+        );
+        (published, source_unix)
+    }
+
+    #[test]
+    fn a_fresh_stamp_on_a_public_share_still_lights_the_badge() {
+        let mut known = KnownFileList::new();
+        known.add_or_update(published_record([0x11; 16], true, false));
+        let (published, source_unix) = hydrate(&known);
+        assert!(published.contains(&[0x11; 16]));
+        assert!(source_unix.contains_key(&[0x11; 16]));
+    }
+
+    #[test]
+    fn a_stamp_left_behind_by_an_unshare_or_a_delete_does_not_light_the_badge() {
+        // Unsharing persists `is_shared = false`; deleting leaves the record
+        // saying `is_shared = true`, which is why the delete path names its
+        // hashes to `UnpublishEmberFiles` instead of relying on this filter.
+        let mut known = KnownFileList::new();
+        known.add_or_update(published_record([0x22; 16], false, false));
+        let (published, source_unix) = hydrate(&known);
+        assert!(
+            published.is_empty(),
+            "an unshared file has no live source record to report"
+        );
+        assert!(
+            source_unix.is_empty(),
+            "and no schedule either, so re-sharing publishes it promptly"
+        );
+    }
+
+    #[test]
+    fn a_friends_only_restriction_survives_a_restart() {
+        let mut known = KnownFileList::new();
+        known.add_or_update(published_record([0x33; 16], true, true));
+        let (published, _) = hydrate(&known);
+        assert!(
+            published.is_empty(),
+            "a restricted file must never be reported as published on the open DHT"
+        );
     }
 }
 
@@ -44903,6 +45017,68 @@ fn prune_expired_ember_published_sources(state: &mut NetworkState) {
             .get(hash)
             .is_none_or(|placed| now.saturating_sub(*placed as u64) < ttl)
     });
+}
+
+/// Withdraw everything we hold for `file_hashes`' Ember publications, because
+/// those files have stopped being publicly listable — unshared, restricted to
+/// friends, or gone from the library altogether.
+///
+/// Takes the whole set at once because every caller is a bulk operation and the
+/// expensive parts here (the resident record store, the queued publish batches)
+/// are whole-collection walks. One walk per file would make unsharing a folder
+/// O(files x store) on the network task.
+///
+/// What this cannot do is recall the replicas already sitting on other nodes.
+/// There is no delete in the DHT wire protocol, so those lapse on their own
+/// TTL (6 h for a source record, 24 h for a keyword record) and the upload path
+/// refuses the file throughout, which makes the residue a stale search hit
+/// rather than a served byte.
+///
+/// Dropping our *own* copies is the part that is not merely tidiness.
+/// [`ember::dht::store::DhtStore::persistable`] carries keyword records across
+/// restarts, and `take_republish_batch` re-pushes whatever the store holds to
+/// the nodes currently closest to each key. So a node that unshared a file and
+/// left its store alone kept answering `FIND_VALUE` for it, and kept seeding
+/// fresh storers with it, for as long as the signed body stayed inside its TTL
+/// — with nothing left in the library to explain where the hit came from.
+///
+/// The persisted stamps go for the same reason in the other direction:
+/// [`hydrate_ember_publish_schedule`] reads them back on the next launch, so
+/// leaving them behind both re-lit the Ember badge for a file that no longer
+/// has a record and held the file out of publishing for the rest of a
+/// republish interval if it was shared again.
+fn retract_ember_publish(
+    state: &mut NetworkState,
+    known_files: &mut KnownFileList,
+    file_hashes: &HashSet<[u8; 16]>,
+) {
+    if file_hashes.is_empty() {
+        return;
+    }
+    state.ember_dht.drop_own_file_records(file_hashes);
+    state.ember_batch_publish.drop_files(file_hashes);
+    let awaiting_buddy: Vec<(ember::dht::EmberNodeId, u32)> = state
+        .ember_pending_proxy_overlay
+        .iter()
+        .filter(|(_, pending)| file_hashes.contains(&pending.reference.file_hash))
+        .map(|(key, _)| *key)
+        .collect();
+    for key in awaiting_buddy {
+        state.ember_pending_proxy_overlay.remove(&key);
+    }
+    for file_hash in file_hashes {
+        for kind in [EmberPublishKind::Keyword, EmberPublishKind::Source] {
+            state.ember_publish_unplaced.remove(&(*file_hash, kind));
+            state.ember_publish_attempts.remove(&(*file_hash, kind));
+        }
+        state.ember_published_sources.remove(file_hash);
+        state.ember_source_publish_at.remove(file_hash);
+        state.ember_source_publish_unix.remove(file_hash);
+        state.ember_keyword_publish_at.remove(file_hash);
+        state.ember_keyword_publish_unix.remove(file_hash);
+        known_files.set_last_ember_source_publish(file_hash, 0);
+        known_files.set_last_ember_keyword_publish(file_hash, 0);
+    }
 }
 
 fn prune_ember_pending_proxy_overlay(state: &mut NetworkState) {

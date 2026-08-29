@@ -1251,10 +1251,24 @@ impl DhtStore {
         total_removed
     }
 
-    /// Remove records `publisher_key` published for `file_hash` (keyword and
-    /// source). Friends-only after a public publish drops our local copies
-    /// immediately; remote replicas still expire on TTL.
-    pub fn drop_publisher_file(&mut self, publisher_key: &[u8; 32], file_hash: &[u8; 16]) -> usize {
+    /// Remove records `publisher_key` published for any of `file_hashes`
+    /// (keyword and source). Unsharing, deleting, or restricting a file to
+    /// friends after a public publish drops our local copies immediately;
+    /// remote replicas still expire on TTL.
+    ///
+    /// Takes a set rather than one hash because the callers are bulk operations
+    /// — unsharing a folder, removing a shared root — and this walks every
+    /// resident record. Per-hash calls made that walk O(files x store), which on
+    /// a full store is tens of millions of iterations on the single task that
+    /// also drives eD2K, KAD, transfers and UI events.
+    pub fn drop_publisher_files(
+        &mut self,
+        publisher_key: &[u8; 32],
+        file_hashes: &HashSet<[u8; 16]>,
+    ) -> usize {
+        if file_hashes.is_empty() {
+            return 0;
+        }
         let mut total_removed = 0;
         let mut freed = 0usize;
         let mut released: Vec<([u8; 32], usize, bool)> = Vec::new();
@@ -1263,7 +1277,7 @@ impl DhtStore {
             let mut dropped: Vec<([u8; 32], usize)> = Vec::new();
             records.retain(|r| {
                 let ours = &r.publisher_key == publisher_key
-                    && file_hash_from_record_data(&r.data) == *file_hash;
+                    && file_hashes.contains(&file_hash_from_record_data(&r.data));
                 if ours {
                     let cost = record_cost(r.data.len());
                     freed += cost;
@@ -2965,6 +2979,110 @@ mod tests {
         assert!(store
             .take_republish_batch(Duration::from_secs(3600), 10, false)
             .is_empty());
+    }
+
+    #[test]
+    fn drop_publisher_files_takes_our_records_for_the_named_files_and_nothing_else() {
+        let mut store = DhtStore::new();
+        let (ours, our_key) = keypair();
+        let (theirs, their_key) = keypair();
+
+        // Two keywords for the file being retracted, one keyword for a file we
+        // still share, and another publisher's record for the retracted file —
+        // which is theirs to withdraw, not ours.
+        // `padded_for` carries the marker byte into the header's file-hash
+        // field and leaves the rest zeroed, so the hash to retract is the same
+        // shape the stored bodies declare.
+        let mut retracted = [0u8; 16];
+        retracted[0] = 0x77;
+        let mut kept = [0u8; 16];
+        kept[0] = 0x88;
+        let key_a = [0xA0u8; 16];
+        let key_b = [0xB0u8; 16];
+        for key in [key_a, key_b] {
+            let body = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD, retracted[0]]);
+            assert!(store.store(key, body.clone(), sign(&ours, &body), our_key, now_ts()));
+        }
+        let kept_body = padded_for(key_a, &[super::super::publish::RECORD_TYPE_KEYWORD, kept[0]]);
+        assert!(store.store(
+            key_a,
+            kept_body.clone(),
+            sign(&ours, &kept_body),
+            our_key,
+            now_ts()
+        ));
+        let foreign = padded_for(key_b, &[super::super::publish::RECORD_TYPE_KEYWORD, retracted[0]]);
+        assert!(store.store(
+            key_b,
+            foreign.clone(),
+            sign(&theirs, &foreign),
+            their_key,
+            now_ts()
+        ));
+        assert_eq!(store.total_records(), 4);
+        let bytes_before = store.byte_len();
+
+        assert_eq!(
+            store.drop_publisher_files(&our_key, &HashSet::from([retracted])),
+            2
+        );
+
+        assert_eq!(store.total_records(), 2);
+        assert!(
+            store.byte_len() < bytes_before,
+            "the byte charge has to follow the records out"
+        );
+        let live_a = store.get_live(&key_a);
+        assert_eq!(live_a.len(), 1);
+        assert_eq!(file_hash_from_record_data(&live_a[0].data)[0], kept[0]);
+        let live_b = store.get_live(&key_b);
+        assert_eq!(live_b.len(), 1, "another publisher's copy is not ours to drop");
+        assert_eq!(live_b[0].publisher_key, their_key);
+    }
+
+    #[test]
+    fn drop_publisher_files_prunes_keys_it_empties() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let key = [0xC0u8; 16];
+        let body = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD, 0x99]);
+        assert!(store.store(key, body.clone(), sign(&sk, &body), pk, now_ts()));
+        assert_eq!(store.key_count(), 1);
+
+        let mut file_hash = [0u8; 16];
+        file_hash[0] = 0x99;
+        let gone = HashSet::from([file_hash]);
+        assert_eq!(store.drop_publisher_files(&pk, &gone), 1);
+        assert_eq!(store.key_count(), 0, "a key holding nothing must not linger");
+        assert_eq!(store.byte_len(), 0);
+        // Retracting a file we never published is a no-op.
+        assert_eq!(store.drop_publisher_files(&pk, &gone), 0);
+        assert_eq!(store.drop_publisher_files(&pk, &HashSet::new()), 0);
+    }
+
+    /// One walk of the store, however many files are being withdrawn: unsharing
+    /// a folder hands this thousands of hashes at once.
+    #[test]
+    fn drop_publisher_files_withdraws_a_bulk_unshare_together() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        for marker in 1u8..=6 {
+            let key = [marker; 16];
+            let body = padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD, marker]);
+            assert!(store.store(key, body.clone(), sign(&sk, &body), pk, now_ts()));
+        }
+        assert_eq!(store.total_records(), 6);
+
+        let gone: HashSet<[u8; 16]> = (1u8..=4)
+            .map(|marker| {
+                let mut hash = [0u8; 16];
+                hash[0] = marker;
+                hash
+            })
+            .collect();
+        assert_eq!(store.drop_publisher_files(&pk, &gone), 4);
+        assert_eq!(store.total_records(), 2);
+        assert_eq!(store.key_count(), 2);
     }
 
     #[test]

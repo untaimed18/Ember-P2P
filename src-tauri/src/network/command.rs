@@ -4793,20 +4793,41 @@ async fn handle_command_inner(
                     return;
                 }
             }
-            for (hash, friends_only) in &parsed {
-                if *friends_only {
-                    state.ember_dht.drop_own_file_records(hash);
-                    state.ember_published_sources.remove(hash);
-                    state.ember_source_publish_unix.remove(hash);
-                    state.ember_keyword_publish_unix.remove(hash);
-                    state.ember_source_publish_at.remove(hash);
-                    state.ember_keyword_publish_at.remove(hash);
-                    let mut sm = source_manager.write().await;
+            let restricted: HashSet<[u8; 16]> = parsed
+                .iter()
+                .filter(|(_, friends_only)| *friends_only)
+                .map(|(hash, _)| *hash)
+                .collect();
+            if !restricted.is_empty() {
+                retract_ember_publish(state, known_files, &restricted);
+                let mut sm = source_manager.write().await;
+                for hash in &restricted {
                     sm.remove_file(hash);
                 }
             }
             sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
             let _ = tx.send(Ok(parsed.len()));
+        }
+
+        NetworkCommand::UnpublishEmberFiles { file_hashes, tx } => {
+            let retracted: HashSet<[u8; 16]> = file_hashes
+                .iter()
+                .filter_map(|hash_hex| parse_ed2k_hash16(hash_hex))
+                .collect();
+            if !retracted.is_empty() {
+                retract_ember_publish(state, known_files, &retracted);
+                // Source exchange answers from this map, so a file we no longer
+                // offer must stop contributing peers to it.
+                let mut sources = source_manager.write().await;
+                for hash in &retracted {
+                    sources.remove_file(hash);
+                }
+                info!(
+                    "Ember: withdrew publications for {} file(s) no longer shared",
+                    retracted.len()
+                );
+            }
+            let _ = tx.send(retracted.len());
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {

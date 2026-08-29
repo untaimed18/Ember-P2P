@@ -2103,6 +2103,48 @@ mod tests {
         );
     }
 
+    /// Retracting a publication has to reach disk, not just the live maps.
+    /// `sync_ember_publish_to_known` only writes the hashes still on the
+    /// republish schedule, so a stamp merely dropped from those maps stayed in
+    /// known.met and hydrated back on the next launch.
+    #[test]
+    fn zeroing_the_ember_publish_stamps_clears_them_on_disk() {
+        let mut kf = KnownFileList::new();
+        let mut r = sample_record();
+        r.last_ember_source_publish = 1_700_000_123;
+        r.last_ember_keyword_publish = 1_700_000_456;
+        let hash = r.file_hash;
+        kf.add_or_update(r);
+
+        kf.set_last_ember_source_publish(&hash, 0);
+        kf.set_last_ember_keyword_publish(&hash, 0);
+        assert!(kf.is_dirty(), "clearing a stamp must schedule a save");
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_known_met_publish_retract_{}_{}.met",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        kf.save(&path).expect("save known.met");
+
+        let loaded = KnownFileList::load(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("known_paths.dat"));
+
+        let record = loaded.find_by_hash(&hash).unwrap();
+        assert_eq!(
+            record.last_ember_source_publish, 0,
+            "a retracted source publish must not survive a restart"
+        );
+        assert_eq!(
+            record.last_ember_keyword_publish, 0,
+            "a retracted keyword publish must not survive a restart"
+        );
+    }
+
     #[test]
     fn last_ember_keyword_publish_roundtrips_through_save_and_load() {
         let mut kf = KnownFileList::new();

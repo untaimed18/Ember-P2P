@@ -186,6 +186,74 @@ async fn reconcile_shared_files(
     .await?
 }
 
+/// Ask the network task to withdraw our Ember DHT publications for files that
+/// have stopped being offered.
+///
+/// Best effort by design: the share state is already committed by the time this
+/// runs, so a saturated command channel must not fail the user's action. The
+/// cost of it not landing is bounded — the records lapse on their own TTL and
+/// the next reconcile darkens the badge.
+async fn unpublish_ember_files(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    file_hashes: Vec<String>,
+) {
+    if file_hashes.is_empty() {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = bounded_send(
+        network_tx,
+        NetworkCommand::UnpublishEmberFiles { file_hashes, tx },
+    )
+    .await
+    {
+        warn!("Failed to withdraw Ember publications (best-effort): {e}");
+        return;
+    }
+    if let Err(e) = await_reply(
+        rx,
+        "sharing_ember_unpublish_failed",
+        "Failed to withdraw Ember publications",
+    )
+    .await
+    {
+        warn!("Ember publication withdrawal was not acknowledged: {e}");
+    }
+}
+
+/// The hashes among `removed` that no surviving index row still offers publicly.
+///
+/// Removing one copy of content shared from two folders is not a retraction:
+/// the other row keeps the file listable, so its Ember records have to stay
+/// exactly where they are.
+///
+/// The survivor has to be *publicly listable*, not merely present. Ember only
+/// publishes `is_public_listable()` files, so a surviving row that is unshared
+/// or friends-only is not offering the content and its hash should be withdrawn
+/// like any other. Testing mere presence would have depended on share state
+/// being uniform across every row of a hash — true today, because every
+/// mutation in `LocalIndex` is content-wide, but enforced in a different module
+/// with nothing tying the two together. This way the decision is answerable from
+/// the rows themselves.
+fn hashes_no_longer_offered(index: &LocalIndex, removed: &[String]) -> Vec<String> {
+    if removed.is_empty() {
+        return Vec::new();
+    }
+    let surviving: HashSet<String> = index
+        .all_files()
+        .iter()
+        .filter(|file| !file.hash.is_empty() && file.is_public_listable())
+        .map(|file| file.hash.to_ascii_lowercase())
+        .collect();
+    let mut seen = HashSet::new();
+    removed
+        .iter()
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| hash.to_ascii_lowercase())
+        .filter(|hash| !surviving.contains(hash) && seen.insert(hash.clone()))
+        .collect()
+}
+
 async fn reconcile_shared_files_best_effort(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
 ) {
@@ -355,8 +423,8 @@ pub(crate) async fn reconcile_shared_folder_roots(
         effective_shared_root_changes(removed_roots, added_roots, &active_roots);
     *state.upload_shared_folders.write().await = active_roots.clone();
 
-    let (removed_row_count, removed_hashes) = if effective_removed_roots.is_empty() {
-        (0, HashSet::new())
+    let (removed_row_count, removed_hashes, unpublish) = if effective_removed_roots.is_empty() {
+        (0, HashSet::new(), Vec::new())
     } else {
         {
             let flags = state.hash_cancel_flags.read().await;
@@ -377,7 +445,9 @@ pub(crate) async fn reconcile_shared_folder_roots(
             .filter_map(|file| fresh_part_hash_key(&file.hash))
             .collect::<HashSet<_>>();
         let hashes = unreferenced_fresh_part_hashes(index.all_files(), &candidates);
-        (removed_files.len(), hashes)
+        let dropped: Vec<String> = removed_files.iter().map(|file| file.hash.clone()).collect();
+        let unpublish = hashes_no_longer_offered(&index, &dropped);
+        (removed_files.len(), hashes, unpublish)
     };
 
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
@@ -398,6 +468,7 @@ pub(crate) async fn reconcile_shared_folder_roots(
     // Do this after local revocation. A saturated or stopped network task may
     // defer publication changes, but must never keep a removed root visible
     // in the local upload/index state.
+    unpublish_ember_files(&state.network_tx, unpublish).await;
     reconcile_shared_files_best_effort(&state.network_tx).await;
 
     if !effective_added_roots.is_empty() {
@@ -634,6 +705,13 @@ async fn persist_share_mutation(
                 format!("{e}; rollback: {rollback_error}"),
             )),
         };
+    }
+    // Past every rollback path, so a retraction is never applied to a file that
+    // ends up still shared. `mutation.hashes` is already the set of hashes whose
+    // share state actually flipped, and unsharing by path flips every copy of
+    // that content, so nothing else in the index can still be offering them.
+    if !shared {
+        unpublish_ember_files(&state.network_tx, mutation.hashes.clone()).await;
     }
     reconcile_shared_files_best_effort(&state.network_tx).await;
     Ok(())
@@ -2318,18 +2396,26 @@ pub async fn remove_shared_folder(
     // accessible while removal waits for its final index cleanup. Once the
     // existing generation yields, remove any rows it raced to add.
     let scan_coordination_guard = state.scan_coordination.lock().await;
-    let removed_hashes = {
+    let (removed_hashes, unpublish) = {
         let mut index = state.local_index.write().await;
         let hashes = fresh_part_hashes_exclusively_under_roots(
             index.all_files(),
             std::slice::from_ref(&canonical_path),
         );
+        let dropped: Vec<String> = index
+            .all_files()
+            .iter()
+            .filter(|file| crate::security::path_matches_dir(&file.path, &canonical_path))
+            .map(|file| file.hash.clone())
+            .collect();
         index.remove_files_by_path_prefix(&canonical_path);
-        hashes
+        let unpublish = hashes_no_longer_offered(&index, &dropped);
+        (hashes, unpublish)
     };
     discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
     drop(scan_coordination_guard);
+    unpublish_ember_files(&state.network_tx, unpublish).await;
 
     // Stop watching the removed folder.
     if let Some(watcher) = state.shared_folder_watcher.as_ref() {
@@ -3637,7 +3723,7 @@ pub async fn delete_shared_file(
     delete_file_with_retry(&canonical, &allowed_dirs, &expected_identity, 6, 250).await?;
 
     let canonical_str = canonical.to_string_lossy().to_string();
-    let (removed, removed_hashes) = {
+    let (removed, removed_hashes, unpublish) = {
         let mut index = state.local_index.write().await;
         let removed = index
             .remove_file_by_path(&canonical_str)
@@ -3648,11 +3734,18 @@ pub async fn delete_shared_file(
             .into_iter()
             .collect::<HashSet<_>>();
         let hashes = unreferenced_fresh_part_hashes(index.all_files(), &hashes);
-        (removed, hashes)
+        let gone: Vec<String> = removed.as_ref().map(|file| file.hash.clone()).into_iter().collect();
+        let unpublish = hashes_no_longer_offered(&index, &gone);
+        (removed, hashes, unpublish)
     };
     discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
+    // The reconcile cannot infer this one. Deleting a file leaves its known.met
+    // record standing and says `is_shared` all the same, so the hash has to be
+    // named here or its Ember records live out their TTL and light the badge
+    // again on the next launch.
+    unpublish_ember_files(&state.network_tx, unpublish).await;
     reconcile_shared_files_best_effort(&state.network_tx).await;
     let _ = app.emit(
         "shared-files-changed",
@@ -3746,9 +3839,10 @@ pub async fn remove_missing_files(
     .await
     .map_err(|e| coded_ctx("sharing_scan_task_failed", "Scan task failed", e))?;
 
-    let (removed, removed_hashes) = {
+    let (removed, removed_hashes, unpublish) = {
         let mut removed = 0u32;
         let mut removed_hashes = HashSet::new();
+        let mut gone = Vec::new();
         let mut index = state.local_index.write().await;
         for path in &really_missing {
             if let Some(file) = index.remove_file_by_path(path) {
@@ -3756,14 +3850,17 @@ pub async fn remove_missing_files(
                 if let Some(hash) = fresh_part_hash_key(&file.hash) {
                     removed_hashes.insert(hash);
                 }
+                gone.push(file.hash);
             }
         }
         let removed_hashes = unreferenced_fresh_part_hashes(index.all_files(), &removed_hashes);
-        (removed, removed_hashes)
+        let unpublish = hashes_no_longer_offered(&index, &gone);
+        (removed, removed_hashes, unpublish)
     };
     if removed > 0 {
         discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        unpublish_ember_files(&state.network_tx, unpublish).await;
         reconcile_shared_files_best_effort(&state.network_tx).await;
         let _ = app.emit(
             "shared-files-changed",
@@ -3975,6 +4072,71 @@ mod tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    #[test]
+    fn a_hash_another_row_still_offers_is_not_retracted() {
+        let hash = "ab".repeat(16);
+        let mut index = LocalIndex::new();
+        // Same content shared from two folders; only one copy is being removed.
+        index.add_file(indexed_file("C:/A/file.bin", &hash));
+        index.add_file(indexed_file("C:/B/file.bin", &hash));
+        index.remove_file_by_path("C:/A/file.bin");
+
+        assert!(
+            hashes_no_longer_offered(&index, std::slice::from_ref(&hash)).is_empty(),
+            "the surviving row keeps the file listable, so its records must stay"
+        );
+
+        index.remove_file_by_path("C:/B/file.bin");
+        assert_eq!(
+            hashes_no_longer_offered(&index, std::slice::from_ref(&hash)),
+            vec![hash]
+        );
+    }
+
+    #[test]
+    fn a_survivor_that_is_not_publicly_listable_does_not_block_retraction() {
+        let unshared = "12".repeat(16);
+        let restricted = "34".repeat(16);
+        let mut index = LocalIndex::new();
+
+        let mut row = indexed_file("C:/A/unshared.bin", &unshared);
+        row.shared = false;
+        index.add_file(row);
+        let mut row = indexed_file("C:/A/restricted.bin", &restricted);
+        row.friends_only = true;
+        index.add_file(row);
+
+        // Neither survivor is on the open network, so neither should be holding
+        // the other copy's Ember records alive.
+        let mut candidates = hashes_no_longer_offered(
+            &index,
+            &[unshared.clone(), restricted.clone()],
+        );
+        candidates.sort();
+        assert_eq!(candidates, vec![unshared, restricted]);
+    }
+
+    #[test]
+    fn retraction_candidates_are_deduplicated_and_case_folded() {
+        let kept = "cd".repeat(16);
+        let gone = "EF".repeat(16);
+        let mut index = LocalIndex::new();
+        index.add_file(indexed_file("C:/A/kept.bin", &kept));
+
+        // Two rows of the same removed content, and an empty hash from a row
+        // that never finished hashing.
+        let removed = vec![
+            gone.clone(),
+            gone.to_ascii_lowercase(),
+            kept.clone(),
+            String::new(),
+        ];
+        assert_eq!(
+            hashes_no_longer_offered(&index, &removed),
+            vec![gone.to_ascii_lowercase()]
+        );
     }
 
     #[tokio::test]
