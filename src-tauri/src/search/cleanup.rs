@@ -255,6 +255,24 @@ fn is_invalid_filename_char(c: char) -> bool {
     matches!(c, '"' | '*' | '<' | '>' | '?' | '|' | '\\' | '/')
 }
 
+/// Drop bracket groups that no longer say anything, and keep the ones that do.
+///
+/// The pass above has already removed every configured cleanup string, and all
+/// of them are advertising (`www.`, `.com`, `sharelive`, `sponsored`, …), so a
+/// bracketed ad such as `[www.sharelive.net]` arrives here already gutted to
+/// `[]`. Clearing those leftovers is the whole job.
+///
+/// It used to keep a group only when it was three characters or fewer, which
+/// deleted the part of a release name that says what the file *is*:
+/// `Grisu Some App v1.2 [PORTABLE].rar` was shown as `Grisu Some App V1.2.rar`,
+/// indistinguishable from the non-portable build beside it, and
+/// `Album [2024] [FLAC].zip` lost both the year and the format. A user
+/// searching for `[PORTABLE]` found the files and could not tell which ones
+/// they were, and the in-results text filter could not find the tag either,
+/// because it matches on this string rather than on the wire name.
+///
+/// So the rule is now about content rather than length: a group survives if
+/// anything alphanumeric is left in it.
 fn strip_brackets(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut depth = 0usize;
@@ -273,7 +291,7 @@ fn strip_brackets(s: &str) -> String {
                 depth -= 1;
                 if depth == 0 {
                     let trimmed = bracket_content.trim();
-                    if trimmed.len() <= 3 && trimmed.chars().all(|c| c.is_alphanumeric()) {
+                    if trimmed.chars().any(char::is_alphanumeric) {
                         result.push('[');
                         result.push_str(trimmed);
                         result.push(']');
@@ -342,6 +360,57 @@ mod tests {
 
     fn default_cleanup() -> Vec<String> {
         parse_cleanup_strings(DEFAULT_CLEANUP_STRINGS)
+    }
+
+    /// A release tag in brackets is part of what the file *is*, and the display
+    /// name is what the results list shows, sorts on, and text-filters against.
+    /// Dropping every group over three characters meant a portable build looked
+    /// exactly like the ordinary one beside it, and searching the results for
+    /// the tag found nothing — which is what a user reported as "Ember hides
+    /// the files with brackets in the name".
+    #[test]
+    fn a_bracketed_release_tag_survives_cleanup() {
+        let cleanup = default_cleanup();
+        for (raw, expected) in [
+            (
+                "Grisu Some App v1.2 [PORTABLE].rar",
+                "Grisu Some App V1.2 [PORTABLE].rar",
+            ),
+            ("[PORTABLE] Grisu Some App.rar", "[PORTABLE] Grisu Some App.rar"),
+            ("Album [2024] [FLAC].zip", "Album [2024] [FLAC].zip"),
+            // Short tags kept before and still kept now.
+            ("Movie [HD].mkv", "Movie [HD].mkv"),
+        ] {
+            assert_eq!(cleanup_filename(raw, &cleanup), expected, "cleaning {raw:?}");
+        }
+    }
+
+    /// The reason the stripping exists: the pass above removes the configured
+    /// advertising strings, and this clears the empty brackets they leave.
+    #[test]
+    fn a_bracketed_advert_is_still_removed() {
+        let cleanup = default_cleanup();
+        for (raw, expected) in [
+            ("[www.sharelive.net] Movie.avi", "Movie.avi"),
+            ("Movie [powered by www.example.com].avi", "Movie [By Example].avi"),
+            // Nothing alphanumeric left to say, so the group goes.
+            ("Movie [ - ].avi", "Movie.avi"),
+            ("Movie [].avi", "Movie.avi"),
+        ] {
+            assert_eq!(cleanup_filename(raw, &cleanup), expected, "cleaning {raw:?}");
+        }
+    }
+
+    /// Brackets are keyword separators on both sides of the wire, so searching
+    /// for a bracketed tag is the same search as the bare word. The query path
+    /// was never the problem; pinning it keeps a future "fix" from moving.
+    #[test]
+    fn a_bracketed_query_searches_the_same_word_as_a_bare_one() {
+        let bracketed = crate::search::query::parse("[PORTABLE]").expect("parses");
+        let bare = crate::search::query::parse("PORTABLE").expect("parses");
+        assert_eq!(bracketed, bare);
+        assert_eq!(bracketed.positive_terms(), vec!["portable".to_string()]);
+        assert!(bracketed.matches("grisu some app v1.2 [portable].rar"));
     }
 
     #[test]

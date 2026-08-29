@@ -2238,8 +2238,13 @@
       return;
     }
     try {
+      // The wire name, not `displayName`. `clean_name` is a label: it
+      // url-decodes, turns dots into spaces and title-cases, so a link built
+      // from it advertises a filename no peer will match — the same reason
+      // Publish Note stopped using it. The backend percent-encodes whatever it
+      // is given, so the raw name is safe to hand over.
       const link = await formatEd2kLink(
-        displayName(result),
+        result.file.name,
         result.file.size,
         result.file.hash,
         result.file.ember_file_hash,
@@ -2265,7 +2270,8 @@
     try {
       const text = await formatEd2kLinks(
         targets.map((r) => ({
-          name: displayName(r),
+          // Wire name, as in `copyResultLink` above.
+          name: r.file.name,
           size: r.file.size,
           hash: r.file.hash,
           emberFileHash: r.file.ember_file_hash || undefined,
