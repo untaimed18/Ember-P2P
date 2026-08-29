@@ -229,6 +229,25 @@ function parseCodedError(raw: string): CodedError | null {
 }
 
 /**
+ * The `code` and `context` of a coded backend error, when it is one.
+ *
+ * {@link translateError} is the right call for anything the user reads. This is
+ * for the few places that have to *act* on a particular failure rather than
+ * report it — the slow-mode countdown needs the seconds the backend put in
+ * `context`, not the sentence built around them.
+ */
+export function codedErrorOf(input: unknown): { code: string; context?: string } | null {
+  const raw = input instanceof Error
+    ? input.message
+    : typeof input === 'string'
+    ? input
+    : '';
+  if (!raw) return null;
+  const parsed = parseCodedError(raw);
+  return parsed ? { code: parsed.code, context: parsed.context } : null;
+}
+
+/**
  * Resolve a backend error `code` to its translated message by
  * looking up the `error_<code>` Paraglide message at runtime.
  *

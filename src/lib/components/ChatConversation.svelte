@@ -14,8 +14,11 @@
   import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
-  import { isAppVisible, shortPubkey } from '$lib/utils';
+  import { codedErrorOf, translateError } from '$lib/i18n';
+  import { isAppVisible, linkifyMessage, shortPubkey } from '$lib/utils';
+  import { openExternalUrl } from '$lib/api/settings';
+  import { toast } from '$lib/stores/toast';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
 
   // The backend rejects chat messages whose UTF-8 encoding exceeds this many
@@ -36,6 +39,9 @@
     youAreBanned?: boolean;
     /** Private room whose content key has rotated past what this device holds. */
     youAreKeyBehind?: boolean;
+    /** The room's wait between messages, or 0 when it is off or this member is
+     *  exempt. Drives the composer countdown; the backend enforces it. */
+    slowModeSecs?: number;
     memberNames?: Record<string, string>;
     /** Senders hidden on this device. Presentational only — their messages are
      *  still received and stored, they just aren't drawn. */
@@ -59,6 +65,7 @@
     hideHeader = false,
     youAreBanned = false,
     youAreKeyBehind = false,
+    slowModeSecs = 0,
     memberNames = {},
     ignoredSenders = [],
     mentionName = '',
@@ -619,6 +626,7 @@
   async function handleSend() {
     const text = inputText.trim();
     if (!text || sending || youAreBanned || youAreKeyBehind || chatDisabled || chatLocked) return;
+    if (slowModeLeft > 0) return;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
     // can be under 4096 chars yet over 4096 bytes and be rejected server-side
@@ -641,6 +649,10 @@
           }
           inputText = '';
           scrollToBottom();
+        }
+        if (slowModeSecs > 0) {
+          nextSendAt = Date.now() + slowModeSecs * 1000;
+          slowModeNow = Date.now();
         }
         clearDraft(key);
         return;
@@ -679,6 +691,18 @@
       clearDraft(h);
     } catch (e: unknown) {
       if (channel) {
+        // The backend carries the seconds still owed in the error's context, so
+        // a refusal starts the same countdown a successful send would — which
+        // covers the cases this side cannot predict, like another device of
+        // ours having posted, or a clock that disagrees.
+        const coded = codedErrorOf(e);
+        if (coded?.code === 'channels_slow_mode') {
+          const remaining = Number(coded.context);
+          if (Number.isFinite(remaining) && remaining > 0) {
+            nextSendAt = Date.now() + remaining * 1000;
+            slowModeNow = Date.now();
+          }
+        }
         if (channel === channelId) sendError = translateError(e, m.chat_failed_to_send());
       } else if (h === friendHash) {
         sendError = translateError(e, m.chat_failed_to_send());
@@ -768,18 +792,25 @@
         ),
   );
 
-  /** Whole-word, case-insensitive match on our own display name. Word bounds
-   *  stop a short nickname lighting up every message that merely contains it. */
-  function mentionsMe(text: string): boolean {
+  /**
+   * Whole-word, case-insensitive match on our own display name. Word bounds
+   * stop a short nickname lighting up every message that merely contains it.
+   *
+   * Compiled once per name rather than once per bubble. It used to be built
+   * inside a function the template called for every rendered row, so a room
+   * scrolled back to the 2000-message cap recompiled the same pattern two
+   * thousand times on every reactive update.
+   */
+  let mentionPattern = $derived.by(() => {
     const name = mentionName.trim();
-    if (!name || !isChannel) return false;
+    if (!name || !isChannel) return null;
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     try {
-      return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)`, 'iu').test(text);
+      return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)`, 'iu');
     } catch {
-      return text.toLowerCase().includes(name.toLowerCase());
+      return null;
     }
-  }
+  });
 
   let rows = $derived.by(() => {
     const messages = visibleMessages;
@@ -801,9 +832,77 @@
         daySeparator: newDay ? dayLabel(msg.timestamp) : null,
         startsRun: newDay || !sameAuthorAsPrev,
         endsRun: !sameAuthorAsNext || !sameDayAsNext,
+        // Both computed once per message here rather than per render in the
+        // template, which is where they used to be.
+        mentionsMe: msg.direction === 'received' && (mentionPattern?.test(msg.message) ?? false),
+        segments: linkifyMessage(msg.message),
       };
     });
   });
+
+  /**
+   * A link the user has clicked but not yet confirmed.
+   *
+   * Confirmed rather than opened straight away because in a room the author of
+   * a link is whoever is in the room. The backend refuses anything but plain
+   * `http`/`https` without credentials or bidi overrides, so this is not the
+   * security boundary — it is so leaving the app for somewhere a stranger
+   * chose is always a decision the user made on purpose.
+   */
+  /**
+   * When this member may next post, in epoch ms, or 0 when they may now.
+   *
+   * Slow mode used to surface only as an error toast *after* a send was
+   * refused, which reads as the app dropping the message. The wait is knowable
+   * ahead of time, so the composer says so and the send button holds still
+   * until it passes. The backend is still the thing that enforces it — this is
+   * only the part that tells the user.
+   */
+  let nextSendAt = $state(0);
+  let slowModeNow = $state(Date.now());
+
+  $effect(() => {
+    if (nextSendAt <= 0) return;
+    // Only ticks while there is something to count down, so an idle room does
+    // no per-second work.
+    const timer = setInterval(() => {
+      slowModeNow = Date.now();
+      if (slowModeNow >= nextSendAt) nextSendAt = 0;
+    }, 250);
+    return () => clearInterval(timer);
+  });
+
+  /** Whole seconds left, rounded up so it never reads 0 while still waiting. */
+  let slowModeLeft = $derived(
+    nextSendAt > slowModeNow ? Math.ceil((nextSendAt - slowModeNow) / 1000) : 0,
+  );
+
+  /** The room changed, so a wait owed to the previous one does not follow. */
+  $effect(() => {
+    conversationKey;
+    untrack(() => {
+      nextSendAt = 0;
+    });
+  });
+
+  let pendingLink = $state('');
+  let linkConfirmOpen = $state(false);
+
+  function askOpenLink(href: string) {
+    pendingLink = href;
+    linkConfirmOpen = true;
+  }
+
+  async function openPendingLink() {
+    const url = pendingLink;
+    pendingLink = '';
+    if (!url) return;
+    try {
+      await openExternalUrl(url);
+    } catch (e) {
+      toast(translateError(e));
+    }
+  }
 
   function formatTime(ts: number): string {
     if (!ts) return '';
@@ -916,7 +1015,7 @@
           class:starts-run={row.startsRun}
           class:ends-run={row.endsRun}
           class:focused={row.msg.id === focusedId}
-          class:mentions-me={row.msg.direction === 'received' && mentionsMe(row.msg.message)}
+          class:mentions-me={row.mentionsMe}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -930,7 +1029,18 @@
               <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
             </div>
           {/if}
-          <div class="bubble-text"><bdi dir="auto">{row.msg.message}</bdi></div>
+          <!--
+            Segments, never markup: each run is a text node, so nothing a
+            member types can become HTML. A link is a `<button>` rather than an
+            `<a href>` so the webview itself has no navigable target — the only
+            way out is the confirmed, scheme-checked backend opener.
+          -->
+          <div class="bubble-text"><bdi dir="auto">{#each row.segments as seg, i (i)}{#if seg.href}<button
+                  type="button"
+                  class="bubble-link"
+                  title={seg.href}
+                  onclick={() => askOpenLink(seg.href!)}
+                >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           <!--
             Once per run, not once per message: within a burst the timestamps
             repeat the same minute and add nothing. Delivery state is per
@@ -989,7 +1099,14 @@
         rows="2"
         disabled={sending}
       ></textarea>
-      <button type="button" class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
+      {#if slowModeLeft > 0}
+        <!-- Polite: it changes every second, and a live region that asserted
+             would talk over everything else in the room. -->
+        <span class="conv-slow-mode" role="status" aria-live="polite">
+          {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
+        </span>
+      {/if}
+      <button type="button" class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending || slowModeLeft > 0} title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
@@ -997,6 +1114,18 @@
     </div>
   {/if}
 </div>
+
+<!-- `isolateMessage` so a link cannot reorder the dialog's own text around it. -->
+<ConfirmDialog
+  bind:open={linkConfirmOpen}
+  title={m.chat_link_open_title()}
+  message={pendingLink}
+  isolateMessage
+  confirmLabel={m.chat_link_open_confirm()}
+  onconfirm={openPendingLink}
+  oncancel={() => (pendingLink = '')}
+  ondismiss={() => (pendingLink = '')}
+/>
 
 <style>
   .conversation {
@@ -1312,6 +1441,34 @@
     white-space: pre-wrap;
   }
 
+  /* A button that has to sit inside wrapping text, so every bit of button
+     chrome is stripped and the line-box geometry left to the paragraph. */
+  .bubble-link {
+    all: unset;
+    display: inline;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    word-break: break-all;
+  }
+
+  .bubble-link:hover,
+  .bubble-link:focus-visible {
+    text-decoration-thickness: 2px;
+  }
+
+  .bubble-link:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
+
+  /* Received bubbles are on the surface colour, so the accent reads as a link.
+     Sent bubbles are already accent-filled, where it would not. */
+  .conv-bubble.received .bubble-link {
+    color: var(--accent);
+  }
+
   .bubble-who {
     font-size: 11px;
     font-weight: 600;
@@ -1365,6 +1522,17 @@
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
     flex-shrink: 0;
+  }
+
+  /* Aligned to the bottom of the row so it sits level with the send button
+     rather than floating against the top of a two-row textarea. */
+  .conv-slow-mode {
+    align-self: flex-end;
+    padding-bottom: 10px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   .conv-input {

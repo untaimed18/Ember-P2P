@@ -209,6 +209,13 @@
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
+  /** Zero for anyone the room exempts, so the composer has one number to read
+   *  rather than a rule to re-derive. */
+  let selectedSlowMode = $derived(
+    selected && !selected.is_owner && !selected.you_are_moderator
+      ? selected.slow_mode_secs
+      : 0,
+  );
   let memberNames = $derived(
     Object.fromEntries(
       members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
@@ -2126,6 +2133,7 @@
                 hideHeader
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
+                slowModeSecs={selectedSlowMode}
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMemberKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}

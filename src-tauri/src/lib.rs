@@ -1884,6 +1884,7 @@ pub fn run() {
             commands::settings::open_ember_website,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,
+            commands::settings::open_external_url,
             commands::settings::get_log_folder_path,
             commands::settings::open_log_folder,
             commands::security::get_security_policy_state,

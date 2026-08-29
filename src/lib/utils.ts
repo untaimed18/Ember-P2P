@@ -285,6 +285,98 @@ export function disambiguatedMemberName(
   return nick;
 }
 
+/** One run of message text, or one link found inside it. */
+export interface MessageSegment {
+  text: string;
+  /** Present when this run is a link. Always equal to `text`. */
+  href?: string;
+}
+
+/**
+ * Longest link offered as clickable. Matches `EXTERNAL_URL_MAX` in
+ * `commands/settings.rs`, so the UI never presents something the backend is
+ * certain to refuse.
+ */
+const LINK_MAX_LEN = 2048;
+
+/** Explicit scheme only. `www.` and bare hostnames are deliberately not
+ *  matched: guessing a scheme for a string somebody typed in a room means
+ *  guessing where they meant to send you. */
+const LINK_RE = /https?:\/\/[^\s<>"'`]+/gi;
+
+/** Bidi controls reorder how a host *reads* without changing where it points,
+ *  so a link carrying one is left as plain text rather than made clickable.
+ *  The backend refuses them too; this is what stops the UI offering it. */
+// eslint-disable-next-line no-misleading-character-class
+const BIDI_CONTROL_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+/**
+ * Trailing punctuation that belongs to the sentence rather than to the link.
+ *
+ * "see https://example.com." should not open a URL ending in a full stop.
+ * Brackets are only given back when they are unbalanced, so a Wikipedia link
+ * like `/wiki/Ember_(disambiguation)` keeps its closing parenthesis.
+ */
+function trimTrailingPunctuation(url: string): string {
+  let end = url.length;
+  const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  while (end > 0) {
+    const ch = url[end - 1];
+    if ('.,;:!?"\u2019\u201d'.includes(ch)) {
+      end -= 1;
+      continue;
+    }
+    const opener = closers[ch];
+    if (opener) {
+      const slice = url.slice(0, end);
+      let opens = 0;
+      let closes = 0;
+      for (const c of slice) {
+        if (c === opener) opens += 1;
+        else if (c === ch) closes += 1;
+      }
+      if (closes > opens) {
+        end -= 1;
+        continue;
+      }
+    }
+    break;
+  }
+  return url.slice(0, end);
+}
+
+/**
+ * Split message text into plain runs and links.
+ *
+ * Returns segments rather than markup on purpose: the caller renders each run
+ * as a text node, so nothing a member types can become HTML. A message with no
+ * links yields a single segment, which is the common case and costs one
+ * regex scan.
+ */
+export function linkifyMessage(text: string): MessageSegment[] {
+  if (!text) return [];
+  const segments: MessageSegment[] = [];
+  let cursor = 0;
+  LINK_RE.lastIndex = 0;
+  for (let match = LINK_RE.exec(text); match !== null; match = LINK_RE.exec(text)) {
+    const raw = trimTrailingPunctuation(match[0]);
+    // Everything trimmed off goes back to the following text run, so no
+    // character is ever dropped from what the sender wrote.
+    LINK_RE.lastIndex = match.index + raw.length;
+    const usable = raw.length <= LINK_MAX_LEN && !BIDI_CONTROL_RE.test(raw);
+    if (!usable) continue;
+    if (match.index > cursor) {
+      segments.push({ text: text.slice(cursor, match.index) });
+    }
+    segments.push({ text: raw, href: raw });
+    cursor = match.index + raw.length;
+  }
+  if (cursor < text.length) {
+    segments.push({ text: text.slice(cursor) });
+  }
+  return segments;
+}
+
 /** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */
 export async function readFromClipboard(): Promise<string | null> {
   try {
