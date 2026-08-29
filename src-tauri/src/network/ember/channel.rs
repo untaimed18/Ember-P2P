@@ -45,6 +45,32 @@ pub const INDEX_SHARD_COUNT: u8 = 16;
 pub const PRESENCE_EPOCH_SECS: i64 = 15 * 60;
 /// Members re-announce presence this often (inside one epoch).
 pub const PRESENCE_REPUBLISH_SECS: i64 = 10 * 60;
+/// How soon to try presence again after a publish that stored nowhere.
+///
+/// The republish stamp used to be written when the publish *started*, so a pass
+/// that placed the record on no node still bought ten minutes of silence.
+/// [`PRESENCE_FRESH_SECS`] is two intervals, so two such passes were enough to
+/// age a member out of every roster they were sitting in — they went on
+/// chatting while everyone else stopped seeing them and stopped picking them as
+/// a gossip neighbor.
+pub const PRESENCE_RETRY_SECS: i64 = 60;
+
+/// Whether a wall-clock schedule is due.
+///
+/// Every periodic channel task compares `i64` wall-clock seconds, and
+/// `saturating_sub` on `i64` saturates toward `i64::MIN` rather than zero — so
+/// a stamp *ahead* of the clock yielded a negative age, which is below every
+/// interval, and the task simply stopped running until real time caught up. An
+/// NTP correction on a fast clock, a VM resume, or someone editing the system
+/// date could stall presence republish for as long as the skew lasted, which is
+/// the same ghost-member failure by a different route.
+///
+/// A stamp in the future is not information, so it is treated as due: at worst
+/// that costs one extra run, and the stamp written afterwards uses the
+/// corrected clock.
+pub fn schedule_due(stamp: i64, now: i64, interval_secs: i64) -> bool {
+    stamp > now || now.saturating_sub(stamp) >= interval_secs
+}
 /// How often a member walks the presence DHT keys for rooms they have joined.
 pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
 /// The same walk for a room we are alone in.
@@ -92,8 +118,50 @@ pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// queue whenever the mesh was busy. Well above any human typing rate, and
 /// still a ceiling, so a send loop cannot become an unbounded flood.
 pub const CHANNEL_GOSSIP_LOCAL_PER_SEC: usize = 32;
-/// Inbound `CHANNEL_MSG` frames accepted from one DHT hop per second.
-pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
+/// Inbound `CHANNEL_MSG` frames admitted from one DHT hop per second, before
+/// anything here knows what they are.
+///
+/// A work bound rather than a policy. All this can do is cap how much
+/// decryption one hop makes us attempt; the limits that actually govern a room
+/// sit past the decrypt and are keyed on the *signed author* instead —
+/// [`author_gossip_allow`] for chat, moderator actions and transfer offers,
+/// [`history_sync_allow`] for catch-up. A hop is not an identity, and a real
+/// flood arrives spread across every neighbor at once, so a tight per-hop
+/// number buys the room nothing and costs it the honest traffic.
+///
+/// Derived from what one well-behaved peer can legitimately have in flight
+/// toward us: everything they will relay for the mesh, plus a full catch-up
+/// reply landing in the same second. Sized below that, this limit punished the
+/// protocol's own behaviour — half of every history-sync reply was refused,
+/// and the neighbor that answered was scored for it.
+pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize =
+    CHANNEL_GOSSIP_OUT_PER_SEC + CHANNEL_HISTORY_SYNC_MAX;
+/// Extra inbound allowance for a hop we have an Ember Transfer running with,
+/// on top of [`CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC`].
+///
+/// Granted only while a transfer with that peer is actually live, so a hop
+/// that has not been invited to send us anything bulky keeps the tight budget.
+/// It has to cover what the far end is allowed to emit: the receiver leaves a
+/// whole [`XFER_WINDOW_BLOCKS`] window outstanding and the sender answers the
+/// lot in one pass at [`XFER_BLOCKS_OUT_PER_SEC`], so a smaller number here
+/// refuses blocks this node asked for by name.
+pub const CHANNEL_XFER_IN_PER_PEER_PER_SEC: usize = XFER_BLOCKS_OUT_PER_SEC;
+
+// The receiver's window, the sender's rate, and this admission bucket are
+// three halves of one agreement, and they were not in agreement: the inbound
+// cap sat at 8/sec while a single window is 64 blocks answered at 192/sec, so
+// the opening burst of every transfer was ~87% refused — and each refusal was
+// scored against the sender as a protocol violation, which banned them for a
+// day before the file had moved a hundred kilobytes.
+const _: () = assert!(
+    CHANNEL_XFER_IN_PER_PEER_PER_SEC >= XFER_WINDOW_BLOCKS,
+    "a transfer peer must be admitted at least a full outstanding window"
+);
+const _: () = assert!(
+    CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC >= CHANNEL_HISTORY_SYNC_MAX,
+    "a catch-up reply must fit the inbound allowance without being shed"
+);
+
 /// Cap on distinct hops tracked in the inbound gossip rate map.
 pub const CHANNEL_GOSSIP_IN_PEER_CAP: usize = 512;
 /// Chat messages accepted from one room member per second, counted against the
@@ -152,6 +220,18 @@ pub const CHANNEL_ORIGIN_RETRY_SECS: u64 = 10 * 60;
 pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
 /// How often members walk the owner-signed handoff key.
 pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
+/// How long an unanswered ownership offer blocks a different one.
+///
+/// The offer is a single gossip flood, retried for at most
+/// [`CHANNEL_ORIGIN_RETRY_SECS`], so a nominee who never comes online in that
+/// window will not answer at all. Nothing cleared the pending mark, and no
+/// command exposed a way to: an owner who offered the room to someone offline
+/// was told "a transfer to another member is already waiting to be accepted"
+/// for every later attempt, forever, with deleting the room as the only way
+/// out. Comfortably past the retry window so a live handoff is never cut
+/// short, and short enough that a lapsed one stops being a life sentence.
+/// Re-offering to the *same* member stays allowed at any age.
+pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -622,9 +702,145 @@ pub fn xor_closest_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize
     ranked.into_iter().map(|(pk, _)| pk).collect()
 }
 
-/// XOR-closest gossip neighbors across joined rooms, for rendezvous
-/// capability registration. Caps both the number of rooms and the degree
-/// so a large join list cannot explode the heartbeat HTTP fan-out.
+/// Members either side of us in ring order that always get a gossip slot.
+///
+/// Two each way rather than one: a single successor and predecessor is enough
+/// for connectivity on paper, but it makes the cycle depend on both of those
+/// two being reachable, and it spends fewer slots on the long-range links than
+/// the rest of the budget can afford. Three each way starts costing reach —
+/// at 256 members it leaves too few buckets covered to cross the id space
+/// inside [`CHANNEL_MSG_TTL_DEFAULT`].
+pub const RING_NEIGHBORS_EACH_WAY: usize = 2;
+
+/// Length of the common prefix of two ids, i.e. the index of the first bit
+/// where they differ. 128 when they are equal.
+fn xor_bucket(distance: &[u8; 16]) -> u32 {
+    for (i, byte) in distance.iter().enumerate() {
+        if *byte != 0 {
+            return i as u32 * 8 + byte.leading_zeros();
+        }
+    }
+    128
+}
+
+fn xor_distance(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (slot, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *slot = x ^ y;
+    }
+    out
+}
+
+/// Deterministic gossip neighbors: ring links for connectivity, long-range
+/// links for reach.
+///
+/// [`xor_closest_neighbors`] cannot do this job alone, and the reason is
+/// structural rather than a matter of tuning. XOR-closest-`k` is
+/// *prefix-closed*: for any set of members sharing an id prefix, every member
+/// of that set is nearer to each other than to any outsider, so once such a
+/// set holds more than `k` members every one of their slots is spent inside it
+/// and no edge ever leaves. Rooms therefore split at the top bits of the id
+/// space — a 256-member room settled into roughly eighteen islands that never
+/// exchanged a line — and nothing repaired it, because the fanout retry only
+/// widens when fewer than `k` neighbors resolve and catch-up draws its
+/// partners from the same closed set.
+///
+/// Two link types fix it, and both are needed:
+///
+/// * **Ring** — the [`RING_NEIGHBORS_EACH_WAY`] members either side of us in
+///   id order, wrapping at the ends. These form a cycle through the whole
+///   roster, so the graph is connected however the ids cluster. They are also
+///   the only links guaranteed to be mutual — our successor's predecessor is
+///   us — which matters because the rendezvous presence capability is
+///   pairwise: an edge the far end does not also choose has nobody publishing
+///   an address under the capability we would look up.
+/// * **Long-range** — the nearest member in each XOR distance bucket,
+///   shallowest bucket (furthest half of the space) first, so every slot past
+///   the ring reaches a different scale. A ring on its own is connected but
+///   has diameter `N / 2r`, which at 256 members is several times
+///   [`CHANNEL_MSG_TTL_DEFAULT`]; these collapse it to a few hops.
+///
+/// Any slots still spare fall back to XOR-closest, which is what small rooms
+/// use for most of their degree.
+///
+/// Derived only from the roster, so a member computes the same set for
+/// themselves that their neighbors compute for them —
+/// [`rendezvous_neighbor_targets`] relies on that to register the capability
+/// the other end will look up.
+pub fn gossip_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize) -> Vec<[u8; 32]> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let self_id = channel_id_from_pubkey(self_pub);
+    // Sorted by id, which is the ring order. Deduped so a roster that lists a
+    // member twice cannot hand the same peer two slots.
+    let mut ring: Vec<([u8; 16], [u8; 32])> = members
+        .iter()
+        .filter(|pk| *pk != self_pub)
+        .map(|pk| (channel_id_from_pubkey(pk), *pk))
+        .collect();
+    ring.sort_unstable();
+    ring.dedup();
+    let n = ring.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut out: Vec<[u8; 32]> = Vec::with_capacity(k);
+    // Where our own id would sit: everything from here on is a successor,
+    // everything before it a predecessor, both wrapping.
+    let pos = ring.partition_point(|(id, _)| *id < self_id);
+    for step in 0..RING_NEIGHBORS_EACH_WAY {
+        for index in [(pos + step) % n, (pos + n - 1 - (step % n)) % n] {
+            let pk = ring[index].1;
+            if out.len() < k && !out.contains(&pk) {
+                out.push(pk);
+            }
+        }
+    }
+
+    // One per bucket, furthest scale first, so the slots left after the ring
+    // are spent crossing the id space rather than crowding around us.
+    if out.len() < k {
+        let mut spread: Vec<(u32, [u8; 16], [u8; 32])> = ring
+            .iter()
+            .map(|(id, pk)| {
+                let distance = xor_distance(&self_id, id);
+                (xor_bucket(&distance), distance, *pk)
+            })
+            .collect();
+        spread.sort_unstable();
+        let mut last_bucket = None;
+        for (bucket, _, pk) in spread {
+            if last_bucket == Some(bucket) {
+                continue;
+            }
+            last_bucket = Some(bucket);
+            if !out.contains(&pk) {
+                out.push(pk);
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+    }
+
+    if out.len() < k {
+        for pk in xor_closest_neighbors(self_pub, members, k) {
+            if !out.contains(&pk) {
+                out.push(pk);
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Gossip neighbors across joined rooms, for rendezvous capability
+/// registration. Caps both the number of rooms and the degree so a large join
+/// list cannot explode the heartbeat HTTP fan-out.
 pub fn rendezvous_neighbor_targets(
     our_pubkey: &[u8; 32],
     members_by_channel: &[([u8; 16], Vec<[u8; 32]>)],
@@ -633,7 +849,7 @@ pub fn rendezvous_neighbor_targets(
 ) -> Vec<([u8; 16], [u8; 32])> {
     let mut out = Vec::new();
     for (channel_id, members) in members_by_channel.iter().take(max_channels) {
-        for pk in xor_closest_neighbors(our_pubkey, members, neighbor_count) {
+        for pk in gossip_neighbors(our_pubkey, members, neighbor_count) {
             out.push((*channel_id, pk));
         }
     }
@@ -1828,10 +2044,17 @@ pub fn history_sync_allow(
     )
 }
 
-/// Drop tracking for authors with no activity inside `window`, so a long
-/// session does not hold a slot for everyone who ever spoke.
-pub fn prune_author_gossip(
-    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+/// Drop rate-window tracking for keys with no activity inside `window`, so a
+/// long session does not hold a slot for everyone who ever spoke.
+///
+/// Generic over the key because all three inbound budgets need it and each is
+/// keyed differently — chat and catch-up by `(room, author)`, hop admission by
+/// node id. The hop map is the one that most needs sweeping: it refuses any
+/// newcomer once [`CHANNEL_GOSSIP_IN_PEER_CAP`] slots are taken, so without a
+/// sweep a long session eventually stops accepting channel traffic from anyone
+/// it has not already spoken to.
+pub fn prune_rate_windows<K: Eq + std::hash::Hash>(
+    seen: &mut HashMap<K, VecDeque<Instant>>,
     now: Instant,
     window: Duration,
 ) {
@@ -2585,21 +2808,25 @@ mod tests {
     }
 
     #[test]
-    fn rendezvous_neighbor_targets_are_xor_closest_and_skip_self() {
+    /// Registration has to name exactly the peers the fanout will dial, or we
+    /// publish an address under a capability nobody looks up and look up one
+    /// nobody published under.
+    fn rendezvous_neighbor_targets_match_the_gossip_set_and_skip_self() {
         let self_pk = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let a = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let b = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let channel_id = [0xab; 16];
-        let closest = xor_closest_neighbors(&self_pk, &[self_pk, a, b], 1);
-        assert_eq!(closest.len(), 1);
-        assert_ne!(closest[0], self_pk);
+        let roster = vec![self_pk, a, b];
+        let picked = gossip_neighbors(&self_pk, &roster, 1);
+        assert_eq!(picked.len(), 1);
+        assert_ne!(picked[0], self_pk);
         let targets = rendezvous_neighbor_targets(
             &self_pk,
-            &[(channel_id, vec![self_pk, a, b])],
+            &[(channel_id, roster)],
             CHANNEL_RENDEZVOUS_MAX_CHANNELS,
             1,
         );
-        assert_eq!(targets, vec![(channel_id, closest[0])]);
+        assert_eq!(targets, vec![(channel_id, picked[0])]);
     }
 
     #[test]
@@ -2743,9 +2970,13 @@ mod tests {
         );
     }
 
+    /// Deliberately past the size where XOR-closest alone comes apart. At 12 —
+    /// what this used to run — a prefix-closed cluster cannot yet reach the
+    /// `CHANNEL_NEIGHBOR_COUNT + 1` members it takes to seal itself off, so the
+    /// old graph passed and the partition went unnoticed until a real room grew.
     #[test]
     fn gossip_mesh_soak_delivers_once_within_ttl() {
-        const N: usize = 12;
+        const N: usize = 64;
         let members: Vec<[u8; 32]> = (0..N)
             .map(|i| {
                 let mut pk = [0u8; 32];
@@ -2758,7 +2989,7 @@ mod tests {
         let neighbors: Vec<Vec<usize>> = members
             .iter()
             .map(|self_pk| {
-                xor_closest_neighbors(self_pk, &members, CHANNEL_NEIGHBOR_COUNT)
+                gossip_neighbors(self_pk, &members, CHANNEL_NEIGHBOR_COUNT)
                     .into_iter()
                     .filter_map(|pk| members.iter().position(|m| *m == pk))
                     .collect()
@@ -2775,7 +3006,8 @@ mod tests {
             assert_eq!(
                 reachable.len(),
                 N,
-                "XOR-{CHANNEL_NEIGHBOR_COUNT} graph on {N} members should be fully reachable from {origin} within TTL"
+                "degree-{CHANNEL_NEIGHBOR_COUNT} gossip graph on {N} members should be fully \
+                 reachable from {origin} within TTL"
             );
             let expected = format!("soak-{origin}");
             let gossip = ChannelGossip::new_plaintext(
@@ -2945,7 +3177,7 @@ mod tests {
         assert!(author_gossip_allow(&mut seen, room, &alice, later));
 
         // Slots are only reclaimed for authors who have actually gone quiet.
-        prune_author_gossip(&mut seen, later, Duration::from_secs(1));
+        prune_rate_windows(&mut seen, later, Duration::from_secs(1));
         assert!(
             seen.contains_key(&(room, alice)),
             "Alice just spoke, so she keeps her slot"
@@ -3084,6 +3316,229 @@ mod tests {
             CHANNEL_GOSSIP_AUTHOR_CAP,
             "and refusing does not grow the map"
         );
+    }
+
+    /// The per-hop budget has to sit above what our own protocol tells the far
+    /// end to send, or it punishes the traffic it asked for. It used to sit at
+    /// 8/sec while a receiver leaves a 64-block window outstanding and the
+    /// sender answers the lot at `XFER_BLOCKS_OUT_PER_SEC`, so the opening
+    /// burst of every transfer was mostly refused — and each refusal was
+    /// scored as a protocol violation, banning the sender for a day well
+    /// before the file had moved.
+    #[test]
+    fn a_transfer_window_fits_the_inbound_allowance_for_that_hop() {
+        let limit = CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC + CHANNEL_XFER_IN_PER_PEER_PER_SEC;
+        assert!(
+            limit >= XFER_BLOCKS_OUT_PER_SEC,
+            "a hop mid-transfer must be admitted at the rate it is allowed to send"
+        );
+        let mut times = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..XFER_WINDOW_BLOCKS {
+            assert!(
+                rate_window_allow(&mut times, now, Duration::from_secs(1), limit),
+                "block {i} of one outstanding window must be admitted"
+            );
+        }
+    }
+
+    /// A neighbor answering a catch-up sends up to `CHANNEL_HISTORY_SYNC_MAX`
+    /// sealed frames back to back, and does so without any transfer running.
+    /// Shedding part of that reply is what left a new joiner with a
+    /// hole-ridden scrollback and a five-minute wait before the next attempt.
+    #[test]
+    fn a_full_catch_up_reply_fits_the_base_inbound_allowance() {
+        let mut times = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..CHANNEL_HISTORY_SYNC_MAX {
+            assert!(
+                rate_window_allow(
+                    &mut times,
+                    now,
+                    Duration::from_secs(1),
+                    CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+                ),
+                "line {i} of one catch-up reply must land without a transfer running"
+            );
+        }
+    }
+
+    /// A full room has to stay one mesh. This is the property XOR-closest
+    /// could not hold: it is prefix-closed, so any cluster of more than
+    /// `CHANNEL_NEIGHBOR_COUNT` members spends every slot inside itself and
+    /// seals off. The second half of the assertion is the reason
+    /// [`gossip_neighbors`] exists at all — if someone ever simplifies it back
+    /// to plain XOR-closest, this fails rather than shipping a room where two
+    /// members cannot hear each other.
+    #[test]
+    fn a_full_room_stays_one_mesh_where_xor_closest_alone_shatters() {
+        const N: usize = CHANNEL_MEMBERS_MAX;
+        let members: Vec<[u8; 32]> = (0..N)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[..2].copy_from_slice(&(i as u16).to_le_bytes());
+                pk[2] = 0x5E;
+                pk
+            })
+            .collect();
+
+        let index_of = |graph: &mut Vec<Vec<usize>>, picks: Vec<[u8; 32]>| {
+            graph.push(
+                picks
+                    .into_iter()
+                    .filter_map(|pk| members.iter().position(|m| *m == pk))
+                    .collect(),
+            );
+        };
+        let mut mesh: Vec<Vec<usize>> = Vec::with_capacity(N);
+        let mut closest_only: Vec<Vec<usize>> = Vec::with_capacity(N);
+        for pk in &members {
+            index_of(
+                &mut mesh,
+                gossip_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT),
+            );
+            index_of(
+                &mut closest_only,
+                xor_closest_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT),
+            );
+        }
+
+        for origin in 0..N {
+            assert_eq!(
+                directed_reach(&mesh, origin, CHANNEL_MSG_TTL_DEFAULT).len(),
+                N,
+                "member {origin} must reach the whole room within TTL"
+            );
+        }
+        let stranded = directed_reach(&closest_only, 0, CHANNEL_MSG_TTL_DEFAULT).len();
+        assert!(
+            stranded < N,
+            "XOR-closest alone is expected to strand most of a {N}-member room \
+             (reached {stranded}); if that is no longer true the ring links can be revisited"
+        );
+    }
+
+    /// Ring links are the half of the degree that has to be mutual: the
+    /// rendezvous presence capability is pairwise, so an edge the far end does
+    /// not also choose has nobody publishing an address under it.
+    #[test]
+    fn ring_links_are_mutual_and_survive_a_duplicated_roster() {
+        let members: Vec<[u8; 32]> = (0..40u8)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[0] = i;
+                pk[1] = 0x7C;
+                pk
+            })
+            .collect();
+        let mut mutual = 0usize;
+        for pk in &members {
+            for peer in gossip_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT) {
+                if gossip_neighbors(&peer, &members, CHANNEL_NEIGHBOR_COUNT).contains(pk) {
+                    mutual += 1;
+                }
+            }
+        }
+        // Every node contributes at least its two ring links back.
+        assert!(
+            mutual >= members.len() * 2 * RING_NEIGHBORS_EACH_WAY,
+            "ring links should always pair up, saw {mutual} mutual edges"
+        );
+
+        // A roster that names someone twice must not hand them two slots.
+        let mut doubled = members.clone();
+        doubled.extend_from_slice(&members);
+        let picks = gossip_neighbors(&members[0], &doubled, CHANNEL_NEIGHBOR_COUNT);
+        let mut unique = picks.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(picks.len(), unique.len(), "a duplicated roster duplicated a slot");
+        assert!(!picks.contains(&members[0]), "never picks self");
+        assert_eq!(
+            picks,
+            gossip_neighbors(&members[0], &members, CHANNEL_NEIGHBOR_COUNT),
+            "selection must not depend on how many times the roster lists someone"
+        );
+    }
+
+    /// Rooms below the degree still have to work, including the two- and
+    /// three-member cases where the ring wraps onto itself.
+    #[test]
+    fn tiny_rooms_pick_everyone_exactly_once() {
+        for size in 1..=CHANNEL_NEIGHBOR_COUNT {
+            let members: Vec<[u8; 32]> = (0..size as u8)
+                .map(|i| {
+                    let mut pk = [0u8; 32];
+                    pk[0] = i;
+                    pk[1] = 0x3B;
+                    pk
+                })
+                .collect();
+            let picks = gossip_neighbors(&members[0], &members, CHANNEL_NEIGHBOR_COUNT);
+            let mut unique = picks.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(picks.len(), unique.len(), "size {size} repeated a member");
+            assert_eq!(
+                picks.len(),
+                size - 1,
+                "size {size} should pick every other member and no more"
+            );
+            assert!(!picks.contains(&members[0]), "size {size} picked self");
+        }
+    }
+
+    /// Every periodic channel task compares wall-clock seconds, and a stamp
+    /// ahead of the clock used to read as a negative age — below every
+    /// interval, so the task stopped running until real time caught up. On the
+    /// presence republish that meant a member sitting in the room aged out of
+    /// everyone else's roster for the length of the skew.
+    #[test]
+    fn a_backwards_clock_jump_does_not_wedge_a_schedule() {
+        let now = 1_700_000_000i64;
+        let interval = 600i64;
+
+        assert!(!schedule_due(now, now, interval), "just ran");
+        assert!(!schedule_due(now - interval + 1, now, interval), "not yet");
+        assert!(schedule_due(now - interval, now, interval), "exactly due");
+        assert!(schedule_due(0, now, interval), "never run is due");
+        assert!(
+            schedule_due(now + 1, now, interval),
+            "a stamp one second ahead is a clock correction, not a recent run"
+        );
+        assert!(
+            schedule_due(now + 86_400, now, interval),
+            "and a day ahead must not stall the task for a day"
+        );
+    }
+
+    /// The hop map refuses unseen hops once full, so it is the budget that
+    /// most needs sweeping. Leaving it out of the sweep turned a long session
+    /// deaf to every peer it had not already spoken to, until a restart.
+    #[test]
+    fn pruning_reclaims_hop_slots_so_a_full_map_admits_newcomers_again() {
+        let mut hops: HashMap<[u8; 16], VecDeque<Instant>> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..CHANNEL_GOSSIP_IN_PEER_CAP {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            hops.entry(id).or_default().push_back(start);
+        }
+        assert_eq!(
+            hops.len(),
+            CHANNEL_GOSSIP_IN_PEER_CAP,
+            "the map is full, which is where an unseen hop starts being refused"
+        );
+
+        // One hop is still talking to us; the rest went quiet two minutes ago.
+        let later = start + Duration::from_secs(120);
+        let mut busy = [0u8; 16];
+        busy[..8].copy_from_slice(&0u64.to_le_bytes());
+        hops.entry(busy).or_default().push_back(later);
+
+        prune_rate_windows(&mut hops, later, Duration::from_secs(60));
+        assert_eq!(hops.len(), 1, "only the hop still sending keeps its slot");
+        assert!(hops.contains_key(&busy));
     }
 
     /// Rotation is only an eviction if the member who was removed cannot open

@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 39;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 40;
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -1787,6 +1787,35 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
             set_version(&tx, 39)?;
+            tx.commit()?;
+        }
+
+        if version < 40 {
+            // The slow-mode clock, moved off the message history.
+            //
+            // It used to be `MAX(timestamp)` over our own sent rows, which the
+            // per-message delete button could remove: send, delete your own
+            // line, send again, with no wait at all. Slow mode is documented as
+            // a guard against a flood of *ordinary* clients, so a bypass
+            // available from the stock UI defeated the whole point of it.
+            //
+            // Seeded from the history that is still there, so an upgrade does
+            // not hand everyone one free message.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "last_sent_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            tx.execute(
+                "UPDATE channels SET last_sent_at = COALESCE((
+                     SELECT MAX(timestamp) FROM channel_messages m
+                     WHERE m.channel_id = channels.channel_id AND m.direction = 'sent'
+                 ), 0)",
+                [],
+            )?;
+            set_version(&tx, 40)?;
             tx.commit()?;
         }
 
@@ -4284,12 +4313,41 @@ impl Database {
 
     /// Owner-only permanent delete on this device: leave the door and keep the
     /// row so the same name is not minted again locally.
+    /// Owner delete: tombstone the row, and purge everything it held.
+    ///
+    /// The `channels` row itself stays, because `deleted` is what
+    /// `refuse_deleted_channel` reads to keep this device from walking back
+    /// into a room it destroyed. Everything else used to stay with it — every
+    /// message, the whole roster, and the retained content keys — with no path
+    /// that could ever remove them, since [`Self::delete_channel`] is only
+    /// reachable through `forget_channel` and that refuses to run on a row we
+    /// own. "Permanently delete this room" left the entire history on disk.
     pub fn tombstone_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
             "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        if n > 0 {
+            tx.execute(
+                "DELETE FROM channel_messages WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.execute(
+                "DELETE FROM channel_members WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.execute(
+                "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.execute(
+                "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+                params![channel_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -4491,6 +4549,40 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The newest content-key epoch in `floor..=wanted` this device does not
+    /// hold, if any.
+    ///
+    /// Chasing only the epoch the owner currently advertises left a hole. A
+    /// member offline across two rotations learns about the newest one and
+    /// never the one in between, so the window of history sealed under the
+    /// intermediate epoch stayed unreadable for good — even while its record
+    /// was still in the DHT and `channel_content_keys` would happily have used
+    /// it. Newest first, because holding the current epoch is what lets the
+    /// member send again; the older ones only restore readability.
+    ///
+    /// Bounded to the retention window, since [`Self::insert_channel_key_epoch`]
+    /// drops anything past it on arrival anyway.
+    pub fn newest_missing_channel_key_epoch(
+        &self,
+        channel_id: &str,
+        floor: i64,
+        wanted: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        if wanted < floor {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        let held: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT epoch FROM channel_key_epochs
+                 WHERE channel_id = ?1 AND epoch >= ?2 AND epoch <= ?3",
+            )?;
+            let rows = stmt.query_map(params![channel_id, floor, wanted], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        Ok((floor..=wanted).rev().find(|epoch| !held.contains(epoch)))
     }
 
     /// Undo a rotation whose moderation snapshot never got committed.
@@ -5054,13 +5146,29 @@ impl Database {
         Ok(out)
     }
 
+    /// Bans a moderation record can actually carry, newest first.
+    ///
+    /// Capped and ordered here rather than at the encoder because both readers
+    /// publish what they get: [`crate::network::ember::dht::publish::encode_moderation_extra`]
+    /// truncates silently past `CHANNEL_BAN_LIST_MAX`, and every recipient
+    /// applies a moderation record as a *full snapshot* — so a room holding
+    /// more bans than the record can carry had the owner's six-hourly
+    /// republish lift the surplus room-wide, while the owner's own commands
+    /// refused to run because their snapshot no longer fit.
+    ///
+    /// `ban_revised_at DESC` so the entries that survive are the most recent
+    /// decisions, tie-broken by pubkey so every device trims identically.
     pub fn list_banned_channel_pubkeys(&self, channel_id: &str) -> anyhow::Result<Vec<[u8; 32]>> {
         let conn = self.conn.lock();
         Self::hex_pubkeys_from_query(
             &conn,
-            "SELECT member_pubkey FROM channel_members
-             WHERE channel_id = ?1 AND banned = 1
-             ORDER BY member_pubkey",
+            &format!(
+                "SELECT member_pubkey FROM channel_members
+                 WHERE channel_id = ?1 AND banned = 1
+                 ORDER BY ban_revised_at DESC, member_pubkey
+                 LIMIT {}",
+                crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX
+            ),
             channel_id,
         )
     }
@@ -5104,6 +5212,31 @@ impl Database {
             .unwrap_or(0);
         if timestamp < snapshot {
             return Ok(false);
+        }
+        // A ban that cannot be published is not a ban, and this is the one path
+        // that could mint them without a ceiling: a delegated moderator's
+        // gossip inserts a row for any pubkey it names, member or not. Past
+        // `CHANNEL_BAN_LIST_MAX` the owner's next republish would lift the
+        // surplus for the whole room, and the rows themselves are exempt from
+        // roster eviction — deliberately, so a ban cannot be laundered by
+        // flooding new identities, but that exemption needs a ceiling to go
+        // with it or one compromised moderator grows every member's database
+        // without bound.
+        //
+        // The target is excluded from the count so re-stating an existing ban
+        // still refreshes `ban_revised_at` at exactly the cap. Unbans are never
+        // refused: they only ever clear a row.
+        if banned {
+            let held: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM channel_members
+                 WHERE channel_id = ?1 AND banned = 1
+                   AND lower(member_pubkey) <> lower(?2)",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )?;
+            if held >= crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX as i64 {
+                return Ok(false);
+            }
         }
         let n = conn.execute(
             "INSERT INTO channel_members
@@ -5274,17 +5407,6 @@ impl Database {
         Ok(true)
     }
 
-    /// Owner-set: seconds a member must wait between messages, 0 to turn the
-    /// limit off.
-    pub fn set_channel_slow_mode(&self, channel_id: &str, secs: u16) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1 AND is_owner = 1",
-            params![channel_id, i64::from(secs)],
-        )?;
-        Ok(n > 0)
-    }
-
     /// Rooms this device owns and has not deleted, which is what the creation
     /// cap counts. Leaving a room you own does not give the slot back: the name
     /// is still claimed and the room is still yours to delete.
@@ -5301,29 +5423,19 @@ impl Database {
     /// Timestamp of the newest message we sent to this room, or 0 if we never
     /// have. Read on the send path to apply the room's slow mode across
     /// restarts, which an in-memory timer would forget.
+    ///
+    /// Held on the room rather than derived from the message history, which the
+    /// per-message delete button can edit — see the v40 migration.
     pub fn last_sent_channel_message_at(&self, channel_id: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        let ts: Option<i64> = conn.query_row(
-            "SELECT MAX(timestamp) FROM channel_messages
-             WHERE channel_id = ?1 AND direction = 'sent'",
-            params![channel_id],
-            |row| row.get(0),
-        )?;
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT last_sent_at FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         Ok(ts.unwrap_or(0))
-    }
-
-    /// Owner-set: may members other than the owner mint invites?
-    pub fn set_channel_invite_policy(
-        &self,
-        channel_id: &str,
-        owner_only: bool,
-    ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "UPDATE channels SET invites_owner_only = ?2 WHERE channel_id = ?1 AND is_owner = 1",
-            params![channel_id, i64::from(owner_only)],
-        )?;
-        Ok(n > 0)
     }
 
     pub fn touch_channel_presence(&self, channel_id: &str, when: i64) -> anyhow::Result<()> {
@@ -5341,17 +5453,40 @@ impl Database {
         interval_secs: i64,
     ) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
+        // `presence_published_at > ?2` catches a stamp written by a clock that
+        // has since been corrected backwards. Without it such a row is never
+        // `<= cutoff` again until real time passes it, and a member who is
+        // sitting in the room ages out of everyone else's roster meanwhile.
         let mut stmt = conn.prepare(
             "SELECT channel_id FROM channels
-             WHERE presence_published_at <= ?1 AND successor_id = ''
-               AND in_room = 1 AND deleted = 0
+             WHERE (presence_published_at <= ?1 OR presence_published_at > ?2)
+               AND successor_id = '' AND in_room = 1 AND deleted = 0
              ORDER BY presence_published_at ASC",
         )?;
         let cutoff = now.saturating_sub(interval_secs);
         let rows = stmt
-            .query_map(params![cutoff], |row| row.get(0))?
+            .query_map(params![cutoff, now], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Hand a presence slot back when the publish stored on nobody.
+    ///
+    /// Conditional on the stamp still being the one this publish wrote, so a
+    /// late failure from an earlier attempt cannot undo a later success.
+    pub fn retry_channel_presence(
+        &self,
+        channel_id: &str,
+        expected: i64,
+        retry_at: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET presence_published_at = ?3
+             WHERE channel_id = ?1 AND presence_published_at = ?2",
+            params![channel_id, expected, retry_at],
+        )?;
+        Ok(())
     }
 
     /// `author_sig` is the author's hex Ed25519 signature over the line, or
@@ -5424,10 +5559,25 @@ impl Database {
             "UPDATE channel_messages SET message = ?1 WHERE id = ?2",
             params![encrypted, new_id],
         )?;
+        // `now` here is the message's own timestamp, which a member chooses and
+        // which catch-up delivers newest-first — so the *oldest* backfilled
+        // line was processed last and won, sinking an active room to the bottom
+        // of a list ordered by `last_active` right after a successful sync. One
+        // member with a wrong clock could park it in 1970.
         tx.execute(
-            "UPDATE channels SET last_active = ?2 WHERE channel_id = ?1",
+            "UPDATE channels SET last_active = MAX(last_active, ?2) WHERE channel_id = ?1",
             params![channel_id, now],
         )?;
+        if direction == "sent" {
+            // The slow-mode clock, stamped in the same transaction as the line
+            // it belongs to and out of reach of `delete_channel_message`.
+            // Monotonic so a handoff copy carrying an older timestamp cannot
+            // rewind it into letting a message straight through.
+            tx.execute(
+                "UPDATE channels SET last_sent_at = MAX(last_sent_at, ?2) WHERE channel_id = ?1",
+                params![channel_id, now],
+            )?;
+        }
         tx.execute(
             "DELETE FROM channel_messages WHERE id IN (
                  SELECT id FROM channel_messages
@@ -7260,6 +7410,289 @@ mod tests {
             db.get_channel(&channel_id).unwrap().unwrap().owner_pubkey,
             owner_hex,
             "a record that says nothing about the owner is not a record saying nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Slow mode is documented as a guard against a flood of *ordinary*
+    /// clients, so a bypass reachable from the stock UI defeats it. The clock
+    /// used to be `MAX(timestamp)` over our own sent rows, and the transcript
+    /// has a delete button on every one of them.
+    #[test]
+    fn the_slow_mode_clock_survives_deleting_your_own_last_message() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-slowclock-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "9e".repeat(16);
+        let me = "1f".repeat(32);
+        db.insert_channel(
+            &channel_id,
+            &"8d".repeat(32),
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+        assert_eq!(
+            db.last_sent_channel_message_at(&channel_id).unwrap(),
+            0,
+            "a room we have never spoken in throttles nobody"
+        );
+
+        let id = db
+            .insert_channel_message(&channel_id, &me, "sent", "first", "s1", 5_000, "", true)
+            .unwrap();
+        assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 5_000);
+
+        db.delete_channel_message(&channel_id, id).unwrap();
+        assert_eq!(
+            db.last_sent_channel_message_at(&channel_id).unwrap(),
+            5_000,
+            "deleting the line must not hand back the slow-mode slot"
+        );
+
+        // A received line is somebody else's and must not move our clock.
+        db.insert_channel_message(&channel_id, &"2a".repeat(32), "received", "hi", "r1", 9_000, "", true)
+            .unwrap();
+        assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 5_000);
+
+        // Monotonic: a handoff copy carrying an older timestamp cannot rewind it.
+        db.insert_channel_message(&channel_id, &me, "sent", "older", "s0", 1_000, "", true)
+            .unwrap();
+        assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 5_000);
+
+        db.insert_channel_message(&channel_id, &me, "sent", "newer", "s2", 7_000, "", true)
+            .unwrap();
+        assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 7_000);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Chasing only the epoch the owner advertises left the one in between
+    /// unfetchable, so a member who slept through two rotations kept a window
+    /// of history they could never read.
+    #[test]
+    fn epoch_backfill_finds_the_gap_a_double_rotation_leaves() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-epochgap-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "6c".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"5b".repeat(32),
+            "Private",
+            "private",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        // Held 4, slept through 5, woke up and took 6.
+        db.insert_channel_key_epoch(&channel_id, 4, &[4u8; 32]).unwrap();
+        db.insert_channel_key_epoch(&channel_id, 6, &[6u8; 32]).unwrap();
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            Some(5),
+            "the gap has to be visible even though the newest epoch is held"
+        );
+
+        db.insert_channel_key_epoch(&channel_id, 5, &[5u8; 32]).unwrap();
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            Some(3),
+            "and then the next one down"
+        );
+        db.insert_channel_key_epoch(&channel_id, 3, &[3u8; 32]).unwrap();
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            None,
+            "nothing left to chase"
+        );
+        // Newest first, because holding the current epoch is what unblocks sending.
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 8).unwrap(),
+            Some(8)
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// "Permanently delete this room" has to actually remove what the room
+    /// held. Only the tombstone row survives, because `refuse_deleted_channel`
+    /// reads it to keep this device from walking back in — everything else used
+    /// to survive with it, unreachably, since `forget_channel` refuses to run
+    /// on a row we own.
+    #[test]
+    fn deleting_an_owned_room_purges_its_contents_and_keeps_the_tombstone() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-tombstone-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "5f".repeat(16);
+        let member = "2e".repeat(32);
+        let join = [0x71u8; 32];
+        db.insert_channel(
+            &channel_id,
+            &"4d".repeat(32),
+            "Lobby",
+            "private",
+            true,
+            Some(&[0x33u8; 32]),
+            Some(&join),
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id, &member, "Them", 100, None)
+            .unwrap();
+        db.insert_channel_message(&channel_id, &member, "received", "private words", "m1", 100, "", true)
+            .unwrap();
+        db.insert_channel_key_epoch(&channel_id, 1, &join).unwrap();
+        assert_eq!(db.get_channel_messages(&channel_id, 10, None).unwrap().len(), 1);
+
+        assert!(db.tombstone_channel(&channel_id).unwrap());
+
+        let row = db.get_channel(&channel_id).unwrap().expect("tombstone row");
+        assert!(row.deleted, "the row has to stay, as the re-entry guard");
+        assert!(!row.in_room_now());
+        assert!(
+            db.get_channel_messages(&channel_id, 10, None)
+                .unwrap()
+                .is_empty(),
+            "every message in a deleted room must be gone"
+        );
+        assert!(
+            db.list_channel_members(&channel_id).unwrap().is_empty(),
+            "the roster of a deleted room must be gone"
+        );
+        assert!(
+            db.load_channel_key_epochs(&channel_id).unwrap().is_empty(),
+            "retained content keys must go with the room they opened"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A delegated moderator's gossip ban is the one path that can mint ban
+    /// rows without the owner in the loop, and it had no ceiling. Past
+    /// `CHANNEL_BAN_LIST_MAX` the moderation record cannot carry them: the
+    /// encoder truncates, every recipient applies the record as a full
+    /// snapshot, and so the owner's six-hourly republish lifted every ban past
+    /// the cap for the whole room. The rows also survive roster eviction by
+    /// design, so without a ceiling they accumulated on every member's disk.
+    #[test]
+    fn gossip_bans_stop_at_the_cap_a_moderation_record_can_carry() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-ban-cap-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "7a".repeat(16);
+        db.insert_channel(
+            &channel_id,
+            &"6b".repeat(32),
+            "Lobby",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .expect("insert channel");
+
+        let cap = crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX;
+        let now = chrono::Utc::now().timestamp();
+        let member = |i: usize| hex::encode([i as u8 + 1; 32]);
+
+        // Fill to the cap, oldest decision first.
+        for i in 0..cap {
+            assert!(
+                db.apply_channel_ban_action(&channel_id, &member(i), true, now - (cap - i) as i64)
+                    .unwrap(),
+                "ban {i} is inside the cap"
+            );
+        }
+        let held = db.list_banned_channel_pubkeys(&channel_id).unwrap();
+        assert_eq!(held.len(), cap);
+
+        // Newest first, so a trim keeps the most recent decisions and every
+        // device trims to the same list.
+        assert_eq!(
+            held.first().copied(),
+            Some([cap as u8; 32]),
+            "the most recently revised ban must sort first"
+        );
+
+        // One past the cap is refused outright rather than stored and then
+        // silently dropped by the encoder.
+        assert!(!db
+            .apply_channel_ban_action(&channel_id, &member(cap), true, now)
+            .unwrap());
+        assert!(!db
+            .channel_member_is_banned(&channel_id, &member(cap))
+            .unwrap());
+
+        // Re-stating a ban already held still refreshes it at exactly the cap.
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &member(0), true, now)
+            .unwrap());
+        assert_eq!(
+            db.list_banned_channel_pubkeys(&channel_id).unwrap().len(),
+            cap
+        );
+
+        // An unban is never refused, and frees the slot for someone else.
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &member(1), false, now)
+            .unwrap());
+        assert!(db
+            .apply_channel_ban_action(&channel_id, &member(cap), true, now)
+            .unwrap());
+        assert_eq!(
+            db.list_banned_channel_pubkeys(&channel_id).unwrap().len(),
+            cap
         );
 
         drop(db);
