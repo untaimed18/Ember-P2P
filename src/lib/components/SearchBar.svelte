@@ -118,6 +118,17 @@
     submit(q);
   }
 
+  /**
+   * Put the caret in the query box.
+   *
+   * Exposed so a page can offer a "focus search" shortcut without reaching into
+   * the DOM for an input this component owns.
+   */
+  export function focusInput() {
+    inputEl?.focus();
+    inputEl?.select();
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (showRecent && recent.length > 0) {
       if (e.key === 'ArrowDown') {
@@ -151,6 +162,17 @@
         removeRecent(recent[activeIndex]);
         return;
       }
+    }
+    // Escape empties the box once the recent list is out of the way (the
+    // branch above consumes the first press while it is open). The clear button
+    // was previously the only way to do it, which is a mouse trip for something
+    // every other search field in the app does from the keyboard.
+    if (e.key === 'Escape' && value !== '') {
+      e.preventDefault();
+      e.stopPropagation();
+      value = '';
+      activeIndex = -1;
+      return;
     }
     if (e.key === 'Enter') {
       // Auto-repeat would open a tab and fire a backend search per repeat,

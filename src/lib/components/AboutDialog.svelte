@@ -13,7 +13,7 @@
 
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { inertBackground } from '$lib/a11y';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
@@ -45,21 +45,7 @@
       close();
       return;
     }
-    if (e.key === 'Tab' && panelEl) {
-      const focusable = panelEl.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
+    trapTabKey(e, panelEl);
   }
 
   function handleOverlayClick(e: MouseEvent) {

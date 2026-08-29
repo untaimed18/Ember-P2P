@@ -16,6 +16,7 @@
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { formatCompactCount } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
 
   let servers: ServerInfo[] = $state([]);
@@ -627,10 +628,8 @@
   });
 
   function formatCount(n: number): string {
-    if (n === 0) return '—';
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-    return n.toLocaleString();
+    if (n === 0) return '\u2014';
+    return formatCompactCount(n);
   }
 
   function handleKeydownAdd(e: KeyboardEvent) {

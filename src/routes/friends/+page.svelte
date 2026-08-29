@@ -9,7 +9,7 @@
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { toastError, toastWarning } from '$lib/stores/toast';
-  import { copyToClipboard } from '$lib/utils';
+  import { copyToClipboard, formatBytes } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import {
@@ -88,16 +88,10 @@
     return f?.nickname || userHash.slice(0, 8) + '\u2026';
   }
 
+  /** Blank for a sizeless offer; otherwise the app-wide byte format, so an
+   *  offer and the transfer it becomes are not measured differently. */
   function formatOfferSize(bytes: number): string {
-    if (!bytes) return '';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+    return bytes ? formatBytes(bytes) : '';
   }
 
   /**

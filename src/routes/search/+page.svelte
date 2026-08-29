@@ -1701,6 +1701,8 @@
    * you could not tell it had opened at all. As a modal it appears where the
    * user is looking, and the background is inert while it is up.
    */
+  /** The query bar, so the `/` shortcut can hand it focus. */
+  let searchBar: SearchBar | undefined = $state();
   let detailsOverlayEl: HTMLDivElement | undefined = $state();
   let detailsModalEl: HTMLDivElement | undefined = $state();
   let detailsCloseBtn: HTMLButtonElement | undefined = $state();
@@ -2562,6 +2564,17 @@
     }
     return;
   }
+  // `/` jumps to the query box, matching the Library page. Ignored while a
+  // field already has focus so it stays a typeable character there, and while a
+  // modifier is held so it cannot shadow a browser or OS shortcut.
+  if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    if (confirmOpen || selectedResult) return;
+    e.preventDefault();
+    searchBar?.focusInput();
+    return;
+  }
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
   // nothing is ticked. Skipped while text is selected or focus is in a field,
   // so the normal copy still works in the query box.
@@ -2582,6 +2595,7 @@
 
 <div class="search-area">
   <SearchBar
+    bind:this={searchBar}
     bind:value={barQuery}
     placeholder={m.search_query_placeholder()}
     onsubmit={handleSearch}

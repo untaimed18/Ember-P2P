@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { toasts, removeToast } from '$lib/stores/toast';
+  import { toasts, removeToast, pauseToastDismiss, resumeToastDismiss } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -13,7 +13,23 @@
   <!-- No live region on the container: each toast is its own `role="alert"`,
        and nesting an assertive region inside a polite one makes the
        announcement behavior ambiguous across screen readers. -->
-  <div class="toast-container" class:dock-open={$chatDockOpen} data-a11y-no-inert>
+  <!-- Hovering or tabbing in holds every countdown; `focusin`/`focusout` cover
+       the keyboard path to the close buttons, which a pointer-only pause would
+       leave racing the timer. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- The pointer handlers are a timing hint, not an affordance: there is
+       nothing here to activate, so a role would advertise an interaction that
+       does not exist. The container is deliberately role-less (see above), and
+       the keyboard equivalent is `focusin`/`focusout` rather than a click. -->
+  <div
+    class="toast-container"
+    class:dock-open={$chatDockOpen}
+    data-a11y-no-inert
+    onmouseenter={pauseToastDismiss}
+    onmouseleave={resumeToastDismiss}
+    onfocusin={pauseToastDismiss}
+    onfocusout={resumeToastDismiss}
+  >
     {#each $toasts as toast (toast.id)}
       <div class="toast toast-{toast.type}" role="alert" transition:fly={flyParams()}>
         <span class="toast-icon" aria-hidden="true">

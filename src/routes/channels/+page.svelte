@@ -1664,7 +1664,7 @@
                          Public/Private badge are gone: the room is identified
                          by its name, and everything else about it is one click
                          away inside. -->
-                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                    <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
                     {#if memberCount !== null}
                       {@const count = memberCount}
                       <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
@@ -1775,9 +1775,9 @@
                 </svg>
               </div>
               <div class="conv-heading">
-                <h3><bdi dir="auto">{selected.name}</bdi></h3>
+                <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
                 {#if selected.topic.trim()}
-                  <p class="topic"><bdi dir="auto">{selected.topic}</bdi></p>
+                  <p class="topic" title={selected.topic}><bdi dir="auto">{selected.topic}</bdi></p>
                 {:else}
                   <p class="topic">{selected.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</p>
                 {/if}
@@ -2215,7 +2215,7 @@
                       {/if}
                     </div>
                     <div class="member-identity">
-                      <span class="member-name">
+                      <span class="member-name" title={roomMemberLabel(mem)}>
                         <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
                       </span>
                       <span class="member-badges">

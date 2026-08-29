@@ -79,6 +79,22 @@ const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(APP_LOCALE, {
   numeric: 'auto',
   style: 'short',
 });
+const COMPACT_COUNT_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+});
+
+/**
+ * Abbreviate a large count for a narrow column ("12.3K").
+ *
+ * Goes through `Intl` rather than appending `K`/`M` by hand: those suffixes are
+ * English, and a German or Russian reader expects "Tsd." and "тыс." for the same
+ * magnitude. Small numbers come back in full, so this is only ever a shortening.
+ */
+export function formatCompactCount(n: number): string {
+  if (!Number.isFinite(n)) return '\u2014';
+  return COMPACT_COUNT_FORMATTER.format(n);
+}
 
 /** Format a unix timestamp as a short date string. */
 export function formatDate(ts: number): string {

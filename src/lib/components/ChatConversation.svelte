@@ -26,6 +26,7 @@
   import { toast } from '$lib/stores/toast';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
 
   // The backend rejects chat messages whose UTF-8 encoding exceeds this many
   // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
@@ -241,6 +242,11 @@
       oldestDbId = null;
       unreadMarkerId = null;
       markerResolved = false;
+      // Scroll position belongs to the conversation being left, not the one
+      // being opened: `loadMessages` lands this one on its own unread marker
+      // or at the bottom.
+      scrolledAway = false;
+      missedWhileAway = false;
       (async () => {
         try {
           const listenerOk = await setupListener(gen, friend, channel);
@@ -301,6 +307,7 @@
           if (event.payload.direction === 'sent' || wasPinned) {
             scrollToBottom();
           }
+          noteMissedMessage(wasPinned, event.payload.direction);
           if (event.payload.direction === 'received' && isAppVisible()) {
             markAsRead();
           }
@@ -351,6 +358,7 @@
           if (event.payload.direction === 'sent' || wasPinned) {
             scrollToBottom();
           }
+          noteMissedMessage(wasPinned, event.payload.direction);
           // Only acknowledge what the user can actually see. A mounted
           // conversation in a minimized window would otherwise mark the
           // message read and suppress its badge, losing it entirely.
@@ -602,6 +610,36 @@
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
   }
 
+  /**
+   * Whether the reader has scrolled away from the newest message, and whether
+   * anything arrived while they were up there.
+   *
+   * Auto-scroll is deliberately suppressed when unpinned — yanking the view
+   * down mid-sentence is worse than missing a line — but that left no way back
+   * and no sign that a line had been missed at all. `missedWhileAway` only
+   * tracks messages from someone else: our own send always scrolls, so it can
+   * never be the thing left unseen.
+   */
+  let scrolledAway = $state(false);
+  let missedWhileAway = $state(false);
+
+  function onMessagesScroll() {
+    const pinned = isPinnedToBottom();
+    scrolledAway = !pinned;
+    if (pinned) missedWhileAway = false;
+  }
+
+  function jumpToLatest() {
+    missedWhileAway = false;
+    scrolledAway = false;
+    scrollToBottom();
+  }
+
+  /** Note an incoming message the reader is not positioned to see. */
+  function noteMissedMessage(wasPinned: boolean, direction: string) {
+    if (!wasPinned && direction === 'received') missedWhileAway = true;
+  }
+
   /** The message a search hit pointed at, marked briefly so the eye can find
    *  it after the jump. */
   let focusedId = $state<number | null>(null);
@@ -683,6 +721,76 @@
   });
 
 
+  /**
+   * Hand `text` to the friend transport and reconcile the optimistic bubble.
+   *
+   * Split out of [`handleSend`] so a resend takes exactly the path a first
+   * attempt does. Throws on transport failure; the caller owns the error copy,
+   * because the composer and a failed bubble report it in different places.
+   */
+  async function deliverToFriend(h: string, text: string) {
+    const result = await sendChatMessage(h, text);
+    // A queued send is not echoed back as an `ember:chat-message`, since
+    // nothing reached the peer. Append it here so the user sees what they
+    // typed, marked as waiting, instead of an apparently-vanished message.
+    if (result.delivery === 'queued' && h === friendHash) {
+      const durableId = result.id ?? --msgIdCounter;
+      const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
+      const existing = messages.findIndex((message) => message.id === durableId);
+      if (existing === -1) {
+        messages = [...messages, {
+          id: durableId,
+          direction: 'sent' as const,
+          message: text,
+          timestamp: Math.floor(Date.now() / 1000),
+          read: true,
+          delivery: alreadyDelivered ? 'delivered' as const : 'queued' as const,
+        }];
+      } else if (alreadyDelivered && messages[existing].delivery === 'queued') {
+        const next = [...messages];
+        next[existing] = { ...next[existing], delivery: 'delivered' };
+        messages = next;
+      }
+      scrollToBottom();
+    }
+  }
+
+  /** Which failed message is being resent, so its button can show progress and
+   *  a double-click cannot send twice. */
+  let resendingId = $state<number | null>(null);
+
+  /**
+   * Send a message the delivery queue gave up on again.
+   *
+   * The failed bubble is dropped rather than revived, because each attempt is a
+   * new row in the backend and reviving would leave the same text on screen
+   * twice. Restored in place if the resend itself fails, so the only copy of
+   * what the user wrote is never the thing we throw away.
+   */
+  async function resendMessage(msg: ConvMessage) {
+    const h = friendHash;
+    if (!h || sending || resendingId !== null) return;
+    if (chatDisabled || chatLocked) return;
+    const at = messages.findIndex((message) => message.id === msg.id);
+    if (at === -1) return;
+    const restore = messages[at];
+    resendingId = msg.id;
+    sendError = null;
+    messages = messages.filter((message) => message.id !== msg.id);
+    try {
+      await deliverToFriend(h, restore.message);
+    } catch (e: unknown) {
+      if (h === friendHash) {
+        const next = [...messages];
+        next.splice(Math.min(at, next.length), 0, restore);
+        messages = next;
+        sendError = translateError(e, m.chat_failed_to_send());
+      }
+    } finally {
+      resendingId = null;
+    }
+  }
+
   async function handleSend() {
     const text = inputText.trim();
     if (!text || sending || youAreBanned || youAreKeyBehind || chatDisabled || chatLocked) return;
@@ -717,30 +825,7 @@
         clearDraft(key);
         return;
       }
-      const result = await sendChatMessage(h, text);
-      // A queued send is not echoed back as an `ember:chat-message`, since
-      // nothing reached the peer. Append it here so the user sees what they
-      // typed, marked as waiting, instead of an apparently-vanished message.
-      if (result.delivery === 'queued' && h === friendHash) {
-        const durableId = result.id ?? --msgIdCounter;
-        const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
-        const existing = messages.findIndex((message) => message.id === durableId);
-        if (existing === -1) {
-          messages = [...messages, {
-            id: durableId,
-            direction: 'sent' as const,
-            message: text,
-            timestamp: Math.floor(Date.now() / 1000),
-            read: true,
-            delivery: alreadyDelivered ? 'delivered' as const : 'queued' as const,
-          }];
-        } else if (alreadyDelivered && messages[existing].delivery === 'queued') {
-          const next = [...messages];
-          next[existing] = { ...next[existing], delivery: 'delivered' };
-          messages = next;
-        }
-        scrollToBottom();
-      }
+      await deliverToFriend(h, text);
       // Only clear the live editor if we're still viewing this friend — on a
       // tab switch the main $effect already stashed/restored drafts, so
       // touching inputText here would wipe the NEW conversation's draft.
@@ -1134,7 +1219,7 @@
   </div>
   {/if}
 
-  <div class="conv-messages" bind:this={messagesContainerEl}>
+  <div class="conv-messages" bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
     {#if liveError && !loading && !loadError}
       <div class="conv-live-error" role="status">
         <span>{m.chat_live_unavailable()}</span>
@@ -1224,6 +1309,20 @@
                 <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
               {:else if failed}
                 <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+                <!-- Only friend messages reach `failed`: a channel send either
+                     lands or throws, and never leaves a row behind to retry. -->
+                {#if !isChannel}
+                  <button
+                    class="bubble-resend"
+                    type="button"
+                    disabled={resendingId !== null || sending || chatDisabled || chatLocked}
+                    onclick={() => resendMessage(row.msg)}
+                    title={m.chat_resend()}
+                    aria-label={m.chat_resend()}
+                  >
+                    {resendingId === row.msg.id ? m.chat_loading_short() : m.chat_resend()}
+                  </button>
+                {/if}
               {/if}
             </div>
           {/if}
@@ -1245,6 +1344,22 @@
     {/if}
     <div bind:this={messagesEnd}></div>
   </div>
+
+  {#if scrolledAway && messages.length > 0 && !loading}
+    <button
+      class="conv-jump"
+      class:has-unseen={missedWhileAway}
+      type="button"
+      onclick={jumpToLatest}
+      title={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+      aria-label={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+    >
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+        <path d="M8 3v9M4.5 8.5 8 12l3.5-3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>{missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
+    </button>
+  {/if}
 
   {#if sendError}
     <div class="conv-error">{sendError}</div>
@@ -1333,6 +1448,11 @@
     flex: 1;
     min-height: 0;
     background: var(--bg-primary);
+    /* Anchors `.conv-jump`, which floats over the transcript rather than
+       occupying a row in the column — a control that pushed the composer down
+       every time the reader scrolled up would move the target they are aiming
+       for. */
+    position: relative;
   }
 
   .conv-header {
@@ -1717,6 +1837,67 @@
   .bubble-delivery.failed {
     color: var(--danger);
     opacity: 1;
+  }
+
+  /* Resend sits inside the timestamp line of its own bubble, so it reads as
+     part of the failure notice rather than a general-purpose action. Always
+     visible (unlike `.bubble-remove`, which is hover-revealed): a message that
+     did not arrive is exactly the case where the remedy should not be hidden. */
+  .bubble-resend {
+    margin-inline-start: 6px;
+    padding: 0 5px;
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--danger);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    cursor: pointer;
+  }
+
+  .bubble-resend:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 16%, transparent);
+  }
+
+  .bubble-resend:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  /* Floats just above the composer. `has-unseen` is the accent case: the
+     difference between "you scrolled up" and "you scrolled up and missed
+     something" is the whole reason this exists, so it is carried by colour and
+     not only by the label. */
+  .conv-jump {
+    position: absolute;
+    inset-inline-end: 18px;
+    bottom: 76px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 22%);
+    cursor: pointer;
+  }
+
+  .conv-jump:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+  }
+
+  .conv-jump.has-unseen {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
   }
 
   .conv-error {

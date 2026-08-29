@@ -1138,16 +1138,31 @@
     return files.filter(f => checkedPaths.has(f.path));
   }
 
+  /**
+   * How far the running bulk action has got, or `null` when none is running.
+   *
+   * A large selection spends seconds inside the IPC loop below, and disabling
+   * the toolbar was the only sign of it — which reads as a hung window rather
+   * than as work in progress. Reported from `runBulkBatches` because every bulk
+   * action funnels through it, so none of them can forget to.
+   */
+  let bulkProgress = $state<{ done: number; total: number } | null>(null);
+
   const BULK_IPC_BATCH_SIZE = 10_000;
   async function runBulkBatches(
     targets: FileInfo[],
     action: (paths: string[]) => Promise<number>,
   ): Promise<number> {
     let changed = 0;
-    for (let start = 0; start < targets.length; start += BULK_IPC_BATCH_SIZE) {
-      changed += await action(
-        targets.slice(start, start + BULK_IPC_BATCH_SIZE).map((file) => file.path),
-      );
+    bulkProgress = { done: 0, total: targets.length };
+    try {
+      for (let start = 0; start < targets.length; start += BULK_IPC_BATCH_SIZE) {
+        const slice = targets.slice(start, start + BULK_IPC_BATCH_SIZE);
+        changed += await action(slice.map((file) => file.path));
+        bulkProgress = { done: Math.min(start + slice.length, targets.length), total: targets.length };
+      }
+    } finally {
+      bulkProgress = null;
     }
     return changed;
   }
@@ -1266,14 +1281,19 @@
       if (!confirmed) return;
       let deleted = 0;
       const failures: string[] = [];
-      for (const f of targets) {
+      // One IPC per file, so this is the slowest bulk action by a wide margin
+      // and the one most in need of saying where it has got to.
+      bulkProgress = { done: 0, total: targets.length };
+      for (const [index, f] of targets.entries()) {
         try {
           await deleteSharedFile(f.path, f.hash || undefined);
           deleted++;
         } catch (e: unknown) {
           failures.push(`${f.name}: ${toErr(e)}`);
         }
+        bulkProgress = { done: index + 1, total: targets.length };
       }
+      bulkProgress = null;
       if (selectedPath && targets.some((f) => f.path === selectedPath)) {
         selectedPath = null;
       }
@@ -1287,7 +1307,10 @@
         toastError(failures[0]);
       }
     } catch (e: unknown) { error = toErr(e); }
-    finally { bulkBusy = false; }
+    finally {
+      bulkProgress = null;
+      bulkBusy = false;
+    }
   }
 
   async function bulkCopyLinks() {
@@ -2902,7 +2925,7 @@
 {/if}
 
 {#if error}
-  <div class="error-banner">
+  <div class="error-banner" role="alert">
     <span>{error}</span>
     <button class="ghost" onclick={() => error = null}>{m.common_dismiss()}</button>
   </div>
@@ -3294,6 +3317,15 @@
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
+        {#if bulkProgress}
+          <span class="bulk-progress" role="status">
+            <span class="spinner"></span>
+            {m.library_bulk_progress({
+              done: bulkProgress.done.toLocaleString(),
+              total: bulkProgress.total.toLocaleString(),
+            })}
+          </span>
+        {/if}
         <button class="tb-btn tb-danger" disabled={bulkBusy} onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
         <button class="tb-btn" onclick={clearChecked} title={m.library_bulk_clear_title()}>{m.common_clear()}</button>
       </div>
@@ -4635,6 +4667,19 @@
   .bulk-spacer {
     flex: 1 1 auto;
     min-width: 8px;
+  }
+  /* Sits with the actions rather than in the status bar: the toolbar is where
+     the click happened and where the disabled buttons are, so it is where the
+     user is already looking for an explanation. */
+  .bulk-progress {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
   .bulk-hidden-note {
     display: inline-flex;

@@ -210,14 +210,14 @@ async fn unpublish_ember_files(
         warn!("Failed to withdraw Ember publications (best-effort): {e}");
         return;
     }
-    if let Err(e) = await_reply(
-        rx,
-        "sharing_ember_unpublish_failed",
-        "Failed to withdraw Ember publications",
-    )
-    .await
-    {
-        warn!("Ember publication withdrawal was not acknowledged: {e}");
+    // Awaited directly rather than through `await_reply`: that mints a coded
+    // error for the frontend to translate, and this reply is only ever logged.
+    // The ack is here to make the ordering explicit — the retraction lands
+    // before the reconcile that follows it — not to be reported.
+    match tokio::time::timeout(crate::commands::errors::CMD_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(count)) => debug!("Ember: withdrew publications for {count} file(s)"),
+        Ok(Err(_)) => warn!("Ember publication withdrawal was dropped by the network task"),
+        Err(_) => warn!("Ember publication withdrawal was not acknowledged in time"),
     }
 }
 
