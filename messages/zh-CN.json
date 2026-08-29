@@ -231,6 +231,7 @@
   "chat_link_open_title": "在浏览器中打开此链接？",
   "chat_link_open_confirm": "打开链接",
   "chat_slow_mode_wait": "慢速模式 — {seconds} 秒",
+  "chat_unread_divider": "新消息",
   "chat_loading_messages": "正在加载消息...",
   "chat_failed_to_load": "加载消息失败。",
   "chat_live_unavailable": "实时更新不可用——请重试后才会显示新消息。",

@@ -159,6 +159,18 @@
   // array (the old `messages.find(m => m.id > 0)`) then returned undefined and
   // wrongly hid "load older" even though the DB still had history.
   let oldestDbId: number | null = null;
+  /**
+   * Row the "new messages" divider sits above, or null when the reader was
+   * already caught up.
+   *
+   * Decided once from the first snapshot of a conversation and then frozen:
+   * `markAsRead` clears the flag in the database within moments of the load, so
+   * a value recomputed after that would find nothing and the divider would
+   * vanish while the reader was still looking at it. `markerResolved` is what
+   * keeps a retry, or a later page of history, from asking the question again.
+   */
+  let unreadMarkerId = $state<number | null>(null);
+  let markerResolved = false;
 
   function fromChannelRow(row: ChannelMessageInfo): ConvMessage {
     return {
@@ -215,6 +227,8 @@
       loadingOlder = false;
       hasMoreHistory = false;
       oldestDbId = null;
+      unreadMarkerId = null;
+      markerResolved = false;
       (async () => {
         try {
           const listenerOk = await setupListener(gen, friend, channel);
@@ -224,8 +238,13 @@
         } finally {
           if (gen === loadGen) loading = false;
         }
+        // After the load, not alongside it. Both are IPC round trips, so
+        // running them together raced: clearing `read` in the database first
+        // meant the snapshot came back with nothing unread and the divider had
+        // nothing to sit above. The badge is still cleared synchronously above,
+        // so this ordering costs the user nothing.
+        if (gen === loadGen) void markAsRead();
       })();
-      markAsRead();
     }
     return () => {
       loadGen++;
@@ -419,7 +438,19 @@
         );
         for (const id of earlyDeliveredInSnapshot) earlyDeliveredIds.delete(id);
       }
-      scrollToBottom();
+      // Where the reader left off, taken from this first snapshot and then left
+      // alone. `markAsRead` runs moments later and clears the flag in the
+      // database, so anything recomputed after that would find nothing — the
+      // marker has to be a decision made once, not a derived value.
+      if (unreadMarkerId === null && !markerResolved) {
+        markerResolved = true;
+        const firstUnread = messages.find(
+          (message) => message.direction === 'received' && !message.read,
+        );
+        unreadMarkerId = firstUnread?.id ?? null;
+      }
+      if (unreadMarkerId !== null) scrollToUnreadMarker();
+      else scrollToBottom();
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
@@ -533,6 +564,23 @@
   function scrollToBottom() {
     requestAnimationFrame(() => {
       messagesEnd?.scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+
+  /**
+   * Land on the first message the reader has not seen rather than at the
+   * bottom.
+   *
+   * Re-entering a busy room used to drop them at the newest line with nothing
+   * saying where they had got to, so catching up meant scrolling up and
+   * guessing. Falls back to the bottom if the marker row is not on screen —
+   * which it will not be if the divider sits above what the first page loaded.
+   */
+  function scrollToUnreadMarker() {
+    requestAnimationFrame(() => {
+      const el = messagesContainerEl?.querySelector<HTMLElement>('.conv-unread-divider');
+      if (el) el.scrollIntoView({ block: 'center' });
+      else messagesEnd?.scrollIntoView();
     });
   }
 
@@ -1005,6 +1053,11 @@
         {#if row.daySeparator}
           <div class="conv-day">{row.daySeparator}</div>
         {/if}
+        {#if row.msg.id === unreadMarkerId}
+          <div class="conv-unread-divider" role="separator" aria-label={m.chat_unread_divider()}>
+            <span>{m.chat_unread_divider()}</span>
+          </div>
+        {/if}
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
         <div
@@ -1334,6 +1387,29 @@
 
   .conv-day:first-child {
     margin-top: 0;
+  }
+
+  /* A full-width rule rather than a centred pill like `.conv-day`: it marks a
+     boundary in the conversation, so it should read as a line across it. */
+  .conv-unread-divider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 2px;
+    color: var(--accent);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .conv-unread-divider::before,
+  .conv-unread-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: color-mix(in srgb, var(--accent) 45%, transparent);
   }
 
   .conv-bubble {

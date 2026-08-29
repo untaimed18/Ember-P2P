@@ -231,6 +231,7 @@
   "chat_link_open_title": "Abrir este link no navegador?",
   "chat_link_open_confirm": "Abrir link",
   "chat_slow_mode_wait": "Modo lento — {seconds}s",
+  "chat_unread_divider": "Mensagens novas",
   "chat_loading_messages": "Carregando mensagens...",
   "chat_failed_to_load": "Falha ao carregar as mensagens.",
   "chat_live_unavailable": "Atualizações ao vivo indisponíveis — novas mensagens só aparecerão após tentar novamente.",
