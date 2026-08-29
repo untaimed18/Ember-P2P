@@ -204,7 +204,6 @@
   "sidebar_friend_requests_title_other": "{count} richieste di amicizia in sospeso",
   "sidebar_friend_offers_title_one": "1 offerta file in sospeso",
   "sidebar_friend_offers_title_other": "{count} offerte file in sospeso",
-  "sidebar_friend_inbox_title": "{requests} richieste, {offers} offerte file",
   "sidebar_active_downloads_one": "1 download attivo",
   "sidebar_active_downloads_other": "{count} download attivi",
   "sidebar_active_uploads_one": "1 upload attivo",

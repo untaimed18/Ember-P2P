@@ -51,7 +51,42 @@ static SAVE_PATH_GUARDS: OnceLock<
 /// Paths whose `.part.met` must not be rewritten. Cancel/remove delete the
 /// sidecar, but a `save_snapshot_async` already in `spawn_blocking` cannot be
 /// aborted and would otherwise recreate the file after cleanup.
-static SUPPRESSED_MET_SAVES: OnceLock<parking_lot::Mutex<HashSet<PathBuf>>> = OnceLock::new();
+///
+/// A tombstone only has to outlive the queued saves for its own path, which
+/// resolve in seconds, so the set is a bounded FIFO rather than a map that
+/// grows by one entry per cancelled or completed download for the process
+/// lifetime (the same reason [`evict_save_path_guard`] exists). Temp sidecars
+/// are named after a per-transfer UUID and never reused, so an evicted
+/// tombstone can never suppress a later, unrelated save.
+static SUPPRESSED_MET_SAVES: OnceLock<parking_lot::Mutex<SuppressedMetSaves>> = OnceLock::new();
+
+/// Retained tombstones. Two orders of magnitude more than the in-flight saves
+/// a single batch cancel (`MAX_BATCH_TRANSFER_IDS`) can leave behind.
+const MAX_SUPPRESSED_MET_SAVES: usize = 4096;
+
+#[derive(Default)]
+struct SuppressedMetSaves {
+    paths: HashSet<PathBuf>,
+    order: std::collections::VecDeque<PathBuf>,
+}
+
+impl SuppressedMetSaves {
+    fn insert(&mut self, path: &Path) {
+        if !self.paths.insert(path.to_path_buf()) {
+            return;
+        }
+        self.order.push_back(path.to_path_buf());
+        while self.order.len() > MAX_SUPPRESSED_MET_SAVES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.paths.remove(&evicted);
+            }
+        }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path)
+    }
+}
 
 fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
     let mut guards = SAVE_PATH_GUARDS
@@ -63,8 +98,8 @@ fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
         .clone()
 }
 
-fn suppressed_met_saves() -> &'static parking_lot::Mutex<HashSet<PathBuf>> {
-    SUPPRESSED_MET_SAVES.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
+fn suppressed_met_saves() -> &'static parking_lot::Mutex<SuppressedMetSaves> {
+    SUPPRESSED_MET_SAVES.get_or_init(|| parking_lot::Mutex::new(SuppressedMetSaves::default()))
 }
 
 fn is_met_save_suppressed(path: &Path) -> bool {
@@ -76,7 +111,7 @@ fn is_met_save_suppressed(path: &Path) -> bool {
 /// wait on a writer that already passed its check. [`suppress_met_saves`]
 /// additionally takes the per-path save lock so cleanup can delete afterward.
 pub fn mark_met_saves_suppressed(met_path: &Path) {
-    suppressed_met_saves().lock().insert(met_path.to_path_buf());
+    suppressed_met_saves().lock().insert(met_path);
 }
 
 /// Block any in-flight or future `.part.met` writer for this path.
@@ -1244,7 +1279,7 @@ impl PartTracker {
 
     pub fn delete_met(&self, allowed_roots: &[String]) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
-        suppressed_met_saves().lock().insert(self.met_path.clone());
+        suppressed_met_saves().lock().insert(&self.met_path);
         let path_guard = save_path_guard(&self.met_path);
         {
             let _guard = path_guard.lock();

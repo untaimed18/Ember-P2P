@@ -145,6 +145,8 @@ impl LocalIndex {
     /// bounded separately (15k tab rows); this only covers files we share.
     pub const LOCAL_SEARCH_MAX: usize = 1000;
 
+    /// Boolean name search with no type/size/extension narrowing.
+    #[cfg(test)]
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
         self.search_with_filters(query, None, None, None, None)
     }
@@ -180,12 +182,10 @@ impl LocalIndex {
             .iter()
             .enumerate()
             .filter_map(|(idx, file)| {
-                let name_lower = file.name.to_lowercase();
-                if let Some(expr) = expr.as_ref() {
-                    if !expr.matches(&name_lower) {
-                        return None;
-                    }
-                }
+                // Filters first: integer and extension compares are far cheaper
+                // than the per-file `to_lowercase` allocation, and a type- or
+                // size-only search (empty `expr`) now scans the whole library,
+                // so the name never has to be lowered for the rows it rejects.
                 if !local_file_matches_filters(
                     file,
                     file_type,
@@ -193,6 +193,14 @@ impl LocalIndex {
                     max_size,
                     file_extension,
                 ) {
+                    return None;
+                }
+                let expr = match expr.as_ref() {
+                    None => return Some((idx, 1u32)),
+                    Some(expr) => expr,
+                };
+                let name_lower = file.name.to_lowercase();
+                if !expr.matches(&name_lower) {
                     return None;
                 }
                 let score = if positive.is_empty() {

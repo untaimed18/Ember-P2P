@@ -204,7 +204,6 @@
   "sidebar_friend_requests_title_other": "{count} demandes d'ami en attente",
   "sidebar_friend_offers_title_one": "1 offre de fichier en attente",
   "sidebar_friend_offers_title_other": "{count} offres de fichiers en attente",
-  "sidebar_friend_inbox_title": "{requests} demandes, {offers} offres de fichiers",
   "sidebar_active_downloads_one": "1 téléchargement actif",
   "sidebar_active_downloads_other": "{count} téléchargements actifs",
   "sidebar_active_uploads_one": "1 envoi actif",

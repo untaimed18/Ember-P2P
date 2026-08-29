@@ -33,6 +33,11 @@ use tokio::sync::{mpsc, oneshot};
 /// grow unbounded.
 const WRITER_QUEUE_CAPACITY: usize = 4096;
 const MAX_WRITER_IO_BYTES: usize = 16 * 1024 * 1024;
+/// How often the discard watchdog re-reads the flag. Only has to beat the
+/// `.part` delete retry budget in `cleanup_partial_files` (6 x 500 ms), so it
+/// is deliberately coarse: this is one tokio timer per active download, not a
+/// thread, and an idle writer must not wake up on a fast tick.
+const DISCARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn validate_range(offset: u64, len: usize) -> io::Result<()> {
     if len > MAX_WRITER_IO_BYTES {
@@ -75,21 +80,22 @@ enum WriteOp {
     /// Causes the worker to drop the file handle and exit cleanly.
     /// Sent by `Inner::Drop` when the last clone goes away.
     Close,
-    /// Cancel/remove: skip remaining queued writes and skip the trailing
-    /// fsync so the `.part` handle is released immediately.
+    /// The `.part` is about to be deleted: skip remaining queued writes and
+    /// skip the trailing fsync so the handle is released immediately.
     Abandon,
 }
 
 struct Inner {
     tx: mpsc::Sender<WriteOp>,
-    /// Set by the transfer's `TransferControl` so a user cancel unblocks the
-    /// writer thread even while it still has queued writes / a trailing fsync.
-    cancel: Option<Arc<AtomicBool>>,
+    /// The transfer's discard flag, set only when its `.part` is about to be
+    /// deleted. A plain cancel (Pause / Stop) deliberately leaves this unset,
+    /// so those paths still get a drained queue and a trailing fsync.
+    discard: Option<Arc<AtomicBool>>,
 }
 
 impl Inner {
     fn should_abandon(&self) -> bool {
-        self.cancel
+        self.discard
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
@@ -101,7 +107,7 @@ impl Drop for Inner {
             let _ = self.tx.try_send(WriteOp::Abandon);
             return;
         }
-        // Do not queue SyncData here: a cancel that loses the race with Drop
+        // Do not queue SyncData here: a discard that loses the race with Drop
         // would fsync a multi-GB `.part` before the handle is released, which
         // is exactly what leaves Temp/{id}.part visible on Windows. Graceful
         // close still fsyncs once in `writer_loop` after draining writes.
@@ -142,14 +148,16 @@ impl PartFileWriter {
     /// so it doesn't compete for slots in the bounded blocking pool with
     /// short-lived tasks like hash verification or `.part.met` saves.
     ///
-    /// `cancel` is the transfer's cancel flag. When set, the worker drops the
-    /// file handle without draining remaining writes or fsyncing, so cancel
-    /// can delete Temp/{id}.part on Windows.
+    /// `discard` is the transfer's discard flag, from
+    /// `TransferControl::discarding_flag`. Once set, the worker drops the file
+    /// handle without draining remaining writes or fsyncing, so Cancel can
+    /// delete Temp/{id}.part on Windows. Pause and Stop keep the `.part` for
+    /// resume and must never set it.
     pub async fn open(
         path: PathBuf,
         mode: OpenMode,
         allowed_roots: Vec<String>,
-        cancel: Option<Arc<AtomicBool>>,
+        discard: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
         // Open on a blocking thread because creating + sizing the file can
         // be slow on cold disks. After this returns the worker thread takes
@@ -163,7 +171,7 @@ impl PartFileWriter {
                 })??;
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
-        let cancel_for_loop = cancel.clone();
+        let discard_for_loop = discard.clone();
 
         std::thread::Builder::new()
             .name(format!(
@@ -172,13 +180,38 @@ impl PartFileWriter {
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
             ))
-            .spawn(move || writer_loop(file, &mut rx, cancel_for_loop))
+            .spawn(move || writer_loop(file, &mut rx, discard_for_loop))
             .map_err(|e| {
                 io::Error::other(format!("spawn writer thread: {e}"))
             })?;
 
+        // The worker parks in `blocking_recv`, so it cannot notice the discard
+        // flag on its own. `Inner::drop` usually delivers `Abandon`, but a
+        // download task still parked in `spawn_blocking` (final verify, MD4)
+        // has not dropped its writer yet, and `abort()` cannot pre-empt it —
+        // exactly the state a Cancel interrupts. This watcher closes that gap
+        // so the `.part` handle is released while the delete is still retrying,
+        // without the worker having to poll on a timer. A `WeakSender` keeps it
+        // from holding the channel open past the worker's own exit.
+        if let Some(flag) = discard.clone() {
+            let weak_tx = tx.downgrade();
+            tokio::spawn(async move {
+                while !flag.load(Ordering::Acquire) {
+                    let Some(tx) = weak_tx.upgrade() else { return };
+                    if tx.is_closed() {
+                        return;
+                    }
+                    drop(tx);
+                    tokio::time::sleep(DISCARD_POLL_INTERVAL).await;
+                }
+                if let Some(tx) = weak_tx.upgrade() {
+                    let _ = tx.try_send(WriteOp::Abandon);
+                }
+            });
+        }
+
         Ok(Self {
-            inner: Arc::new(Inner { tx, cancel }),
+            inner: Arc::new(Inner { tx, discard }),
         })
     }
 
@@ -291,50 +324,24 @@ fn open_file(path: &Path, mode: OpenMode, allowed_roots: &[String]) -> io::Resul
 fn writer_loop(
     mut file: std::fs::File,
     rx: &mut mpsc::Receiver<WriteOp>,
-    cancel: Option<Arc<AtomicBool>>,
+    discard: Option<Arc<AtomicBool>>,
 ) {
-    fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
-        cancel
+    fn discarding(discard: &Option<Arc<AtomicBool>>) -> bool {
+        discard
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
-    fn next_op(
-        rx: &mut mpsc::Receiver<WriteOp>,
-        cancel: &Option<Arc<AtomicBool>>,
-    ) -> Option<WriteOp> {
-        // When a cancel flag is attached, poll it while idle so a user cancel
-        // can drop the `.part` handle even if the tokio download task is still
-        // parked in `spawn_blocking` and has not dropped this writer yet.
-        // `blocking_recv` would hold the file open until that Drop sends
-        // `Abandon`. Without a flag (tests) stay on a blocking recv so an idle
-        // writer does not wake up on a timer.
-        if cancel.is_none() {
-            return rx.blocking_recv();
-        }
-        loop {
-            if cancelled(cancel) {
-                return Some(WriteOp::Abandon);
-            }
-            match rx.try_recv() {
-                Ok(op) => return Some(op),
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-        }
-    }
-
-    let mut abandon = cancelled(&cancel);
+    let mut abandon = discarding(&discard);
     while !abandon {
-        let Some(op) = next_op(rx, &cancel) else {
+        // `blocking_recv` is documented to work outside an async context,
+        // which is exactly the situation here (we're on a `std::thread`). The
+        // discard watchdog spawned in `open` pokes `Abandon` into the queue, so
+        // parking here costs nothing while idle and still releases the handle
+        // promptly on a Cancel.
+        let Some(op) = rx.blocking_recv() else {
             break;
         };
-        if cancelled(&cancel) {
-            abandon = true;
-            break;
-        }
         match op {
             WriteOp::Write { offset, data, ack } => {
                 let res = (|| -> io::Result<()> {
@@ -366,7 +373,9 @@ fn writer_loop(
                 let _ = ack.send(res);
             }
             WriteOp::SyncData { ack } => {
-                if cancelled(&cancel) {
+                // An explicit fsync on a file that is about to be deleted is
+                // pure latency, and it is what holds the handle open.
+                if discarding(&discard) {
                     abandon = true;
                     let _ = ack.send(Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -382,15 +391,13 @@ fn writer_loop(
                 break;
             }
         }
-        if cancelled(&cancel) {
-            abandon = true;
-            break;
-        }
     }
-    // Final best-effort flush so a sudden process exit after the last
-    // queued write doesn't lose data the OS hadn't written yet. Skip it
-    // on cancel: the `.part` is about to be deleted and fsync is what
-    // keeps the handle open on Windows.
+    // Final best-effort flush so a sudden process exit after the last queued
+    // write doesn't lose data the OS hadn't written yet. Skipped only when the
+    // `.part` is being deleted: fsync is what keeps the handle open on Windows.
+    // Pause and Stop keep the file, and their `.part.met` gap list is written
+    // durably, so skipping here would leave resume metadata describing bytes
+    // that a crash could still lose.
     if !abandon {
         let _ = file.sync_data();
     }
@@ -522,10 +529,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_flag_releases_the_file_without_waiting_on_fsync() {
+    async fn discard_flag_releases_the_file_without_waiting_on_fsync() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
         let (path, allowed, base) = approved_temp_file("abandon");
-        let cancel = Arc::new(AtomicBool::new(false));
+        let discard = Arc::new(AtomicBool::new(false));
         let writer = PartFileWriter::open(
             path.clone(),
             OpenMode::CreateOrOpen {
@@ -533,12 +540,12 @@ mod tests {
                 truncate_existing: true,
             },
             allowed,
-            Some(cancel.clone()),
+            Some(discard.clone()),
         )
         .await
         .unwrap();
         writer.write(0, vec![0xCDu8; 64]).await.unwrap();
-        cancel.store(true, Ordering::Release);
+        discard.store(true, Ordering::Release);
         drop(writer);
         for _ in 0..50 {
             if std::fs::remove_file(&path).is_ok() {
@@ -547,6 +554,54 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("cancelled writer did not release {}", path.display());
+        panic!("discarded writer did not release {}", path.display());
+    }
+
+    /// Pause and Stop cancel the transfer control but keep the `.part` and its
+    /// durably-written `.part.met` for resume, so they must NOT set the discard
+    /// flag: queued writes still have to land and be acked, and the trailing
+    /// fsync still has to run. Otherwise the sidecar's gap list names bytes a
+    /// crash could still lose.
+    #[tokio::test]
+    async fn a_writer_whose_transfer_is_only_cancelled_still_drains_and_syncs() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("pause-drain");
+        let control = crate::sharing::manager::TransferControl::new();
+        let writer = PartFileWriter::open(
+            path.clone(),
+            OpenMode::CreateOrOpen {
+                set_len_to: Some(4096),
+                truncate_existing: true,
+            },
+            allowed,
+            Some(control.discarding_flag()),
+        )
+        .await
+        .unwrap();
+
+        // Exactly what Pause and Stop do to the control.
+        control.pause();
+        control.cancel();
+
+        writer
+            .write(0, vec![0xABu8; 64])
+            .await
+            .expect("a paused transfer's writer must still accept queued writes");
+        writer
+            .sync_data()
+            .await
+            .expect("a paused transfer's writer must still fsync");
+        drop(writer);
+
+        for _ in 0..50 {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if bytes[..64] == [0xABu8; 64] {
+                    let _ = std::fs::remove_dir_all(base);
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("paused writer lost its queued bytes for {}", path.display());
     }
 }

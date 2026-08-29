@@ -885,7 +885,11 @@
     const rows = (tab?.results ?? []).filter((r) => r.file.hash).slice(0, 256);
     return {
       batchFileHashes: rows.map((r) => r.file.hash),
-      batchFileNames: rows.map((r) => displayName(r)),
+      // Wire names, not `displayName`. The batch heuristics key on a normalized
+      // filename, and `clean_name` has already collapsed dots/underscores and
+      // title-cased, which would fold genuinely different names onto one key and
+      // invent same-name/many-hashes collisions.
+      batchFileNames: rows.map((r) => r.file.name),
     };
   }
 
@@ -1730,7 +1734,10 @@
         }
         const explain = await explainSpamResult(
           result.file.hash,
-          displayName(result),
+          // The raw name the peer sent, which is what the score in the badge was
+          // computed from. Passing the cleaned display name would re-score a
+          // different string and under-report the reasons being explained.
+          result.file.name,
           result.file.size,
           result.source_addresses,
           query,
@@ -1767,7 +1774,8 @@
     try {
       const explain = await explainSpamResult(
         result.file.hash,
-        displayName(result),
+        // Raw wire name — see the sibling call above.
+        result.file.name,
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),
@@ -1805,7 +1813,10 @@
         selectedResult.file.hash,
         rating,
         noteComment,
-        displayName(selectedResult),
+        // The real filename: this is republished to KAD for other clients, so it
+        // has to be the name the file is actually shared under, not the cleaned
+        // one this UI happens to display.
+        selectedResult.file.name,
         selectedResult.file.size,
       );
       publishMessage =
@@ -1984,7 +1995,9 @@
     try {
       await markSpam(
         hash,
-        displayName(result),
+        // Raw wire name: the stored spam entry is matched against names peers
+        // send, which never arrive pre-cleaned.
+        result.file.name,
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),

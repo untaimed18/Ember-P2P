@@ -3944,7 +3944,7 @@ impl Ed2kDownload {
                     truncate_existing: !resuming,
                 },
                 allowed_roots.clone(),
-                Some(self.control.cancelled_flag()),
+                Some(self.control.discarding_flag()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("open part file: {e}"))?

@@ -24601,11 +24601,34 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let failure_code = ed2k::transfer::classify_failure(error, failure_kind);
                     let failure_summary = failure_code.message();
 
-                    {
-                        let peer_id_str = {
-                            let mgr = transfer_manager.read().await;
-                            mgr.get_transfer(transfer_id).map(|t| t.peer_id.clone()).unwrap_or_default()
-                        };
+                    // Prefer is_user_cancel_error for source-failure classification;
+                    // also honour an already-cancelled control (cancel race).
+                    // `settled_by_user` covers the rest of the same story: Pause
+                    // and Stop cancel the control, which tears the part writer
+                    // down under any in-flight write and surfaces here as a
+                    // source failure. The row is already Paused/Stopped by the
+                    // IPC command, so labelling its source as failed is noise
+                    // about a teardown the user asked for. The status guards
+                    // further down already keep the *transfer* out of Failed;
+                    // this keeps the label off the row too.
+                    let (is_user_cancel, peer_id_str, settled_by_user) = {
+                        let mgr = transfer_manager.read().await;
+                        let t = mgr.get_transfer(transfer_id);
+                        (
+                            ed2k::transfer::is_user_cancel_error(error)
+                                || mgr.is_control_cancelled(transfer_id),
+                            t.map(|t| t.peer_id.clone()).unwrap_or_default(),
+                            t.is_some_and(|t| matches!(
+                                t.status,
+                                TransferStatus::Paused
+                                    | TransferStatus::Stopped
+                                    | TransferStatus::Insufficient
+                                    | TransferStatus::Completed
+                            )),
+                        )
+                    };
+
+                    if !is_user_cancel && !settled_by_user {
                         let _ = app_handle.emit("transfer:source-failed", serde_json::json!({
                             "transfer_id": transfer_id,
                             "source": peer_id_str,
@@ -24656,12 +24679,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // or the Ember BLAKE3 pin missed. That last one is also
                     // transfer-level: the ed2k parts already matched, so
                     // searching more sources cannot change the digest.
-                    // Prefer is_user_cancel_error for source-failure classification;
-                    // also honour an already-cancelled control (cancel race).
-                    let is_user_cancel = ed2k::transfer::is_user_cancel_error(error) || {
-                        let mgr = transfer_manager.read().await;
-                        mgr.is_control_cancelled(transfer_id)
-                    };
+                    // `is_user_cancel` was resolved above, before the
+                    // `transfer:source-failed` emit it also gates.
                     let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
                         || ed2k::transfer::is_disk_full_error(error);
                     let is_ember_pin_fail = ed2k::transfer::is_ember_blake3_mismatch(error)

@@ -204,7 +204,6 @@
   "sidebar_friend_requests_title_other": "{count} ausstehende Freundschaftsanfragen",
   "sidebar_friend_offers_title_one": "1 ausstehendes Dateiangebot",
   "sidebar_friend_offers_title_other": "{count} ausstehende Dateiangebote",
-  "sidebar_friend_inbox_title": "{requests} Anfragen, {offers} Dateiangebote",
   "sidebar_active_downloads_one": "1 aktiver Download",
   "sidebar_active_downloads_other": "{count} aktive Downloads",
   "sidebar_active_uploads_one": "1 aktiver Upload",

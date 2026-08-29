@@ -526,12 +526,22 @@ async fn handle_command_inner(
                         .map(|sources| hex::encode(sources.file_hash))
                 });
 
+            // This handler serves both Stop (`cleanup_ack: None`, keeps the
+            // `.part` and its `.part.met` for resume) and Cancel/Remove, which
+            // delete them. Only the deleting form may discard the part writer's
+            // trailing fsync — see `TransferControl::discard`.
+            let deleting = cleanup_ack.is_some();
+
             // Cancel control first so detached per-source tasks bail before
             // we ACK cleanup / delete .part files (N1).
             {
                 let mgr = transfer_manager.read().await;
                 if let Some(control) = mgr.get_control(&transfer_id) {
-                    control.cancel();
+                    if deleting {
+                        control.discard();
+                    } else {
+                        control.cancel();
+                    }
                 }
             }
 
@@ -560,12 +570,12 @@ async fn handle_command_inner(
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
-            // Capture *before* `cleanup_ack.take()` below. The ack is moved
-            // into the join task when a worker is running, so a later
-            // `cleanup_ack.is_some()` would be false for every live download
-            // and would skip tracker removal + `.part.met` suppression —
-            // in-flight saves then recreate the sidecar after cleanup.
-            let deleting = cleanup_ack.is_some();
+            // `deleting` was captured at the top of this arm, *before*
+            // `cleanup_ack.take()` below. The ack is moved into the join task
+            // when a worker is running, so a later `cleanup_ack.is_some()`
+            // would be false for every live download and would skip tracker
+            // removal + `.part.met` suppression — in-flight saves then recreate
+            // the sidecar after cleanup.
             // Cancel (delete) clears known sources; Stop preserves them for resume.
             if deleting {
                 state.per_file_sources.remove(&transfer_id);
@@ -632,11 +642,11 @@ async fn handle_command_inner(
             } else if let Some(tracker) = cancel_tracker {
                 let allowed = vec![settings.download_folder.clone()];
                 tokio::spawn(async move {
-                    match tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
-                        .await
+                    if let Ok(t) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
+                            .await
                     {
-                        Ok(t) => t.delete_met(&allowed),
-                        Err(_) => {}
+                        t.delete_met(&allowed);
                     }
                 });
             }

@@ -1190,7 +1190,9 @@ pub async fn cancel_transfers_batch(
                 .get_transfer(&transfer_id)
                 .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
             if let Some(control) = manager.get_control(&transfer_id) {
-                control.cancel();
+                // Deletes the `.part` — see `cancel_transfer` for why this is
+                // `discard` rather than `cancel`.
+                control.discard();
             }
             (manager.cancel(&transfer_id), info)
         };
@@ -1596,7 +1598,9 @@ pub async fn cancel_transfer(
             .get_transfer(&transfer_id)
             .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
         if let Some(control) = manager.get_control(&transfer_id) {
-            control.cancel();
+            // Discard, not cancel: this path deletes the `.part`, so the writer
+            // should drop its handle without fsyncing it first.
+            control.discard();
         }
         (manager.cancel(&transfer_id), info)
     };
@@ -1675,7 +1679,9 @@ pub async fn remove_transfer(
     let promoted = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
-            control.cancel();
+            // Remove-from-List deletes the Temp `.part`/`.part.met` too (a
+            // failed download's bytes are relocated first, before cleanup).
+            control.discard();
         }
         manager.remove(&transfer_id)
     };
@@ -2292,6 +2298,13 @@ pub async fn recover_archive(
 }
 
 #[cfg(test)]
+// `await_holding_lock` fires on `test_registry_lock`, held across the awaits on
+// purpose: it serialises tests that swap the process-global approved-root
+// registry, and the window it has to cover is exactly the asynchronous cleanup
+// under test. Dropping it sooner would reintroduce the race it exists to
+// prevent. These are `#[tokio::test]`s on the current-thread runtime, so there
+// is no executor thread for the guard to strand.
+#[allow(clippy::await_holding_lock)]
 mod ipc_lifecycle_tests {
     use super::*;
 

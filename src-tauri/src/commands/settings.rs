@@ -477,10 +477,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
             .take(crate::commands::channels::CHANNEL_USERNAME_MAX)
             .collect();
         settings.channel_username =
-            match crate::commands::channels::sanitize_channel_username(&repaired) {
-                Ok(name) => name,
-                Err(_) => String::new(),
-            };
+            crate::commands::channels::sanitize_channel_username(&repaired).unwrap_or_default();
         changed = true;
     }
 

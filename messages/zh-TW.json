@@ -204,7 +204,6 @@
   "sidebar_friend_requests_title_other": "{count} 個待處理的好友請求",
   "sidebar_friend_offers_title_one": "1 個待處理的檔案贈送",
   "sidebar_friend_offers_title_other": "{count} 個待處理的檔案贈送",
-  "sidebar_friend_inbox_title": "{requests} 個請求，{offers} 個檔案贈送",
   "sidebar_active_downloads_one": "1 個進行中的下載",
   "sidebar_active_downloads_other": "{count} 個進行中的下載",
   "sidebar_active_uploads_one": "1 個進行中的上傳",

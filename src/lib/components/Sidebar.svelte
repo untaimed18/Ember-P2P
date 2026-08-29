@@ -138,6 +138,28 @@
   let pendingFileOfferCount = $derived($fileOffers.length);
   let pendingFriendInboxCount = $derived(pendingFriendRequestCount + pendingFileOfferCount);
 
+  // Composed from the two singular/plural pairs rather than one combined
+  // message, so "1 pending friend request" never renders as "1 requests" in any
+  // locale. Only the categories that actually have something pending appear.
+  function friendInboxTitle(requests: number, offers: number): string {
+    const parts: string[] = [];
+    if (requests > 0) {
+      parts.push(
+        requests === 1
+          ? m.sidebar_friend_requests_title_one()
+          : m.sidebar_friend_requests_title_other({ count: requests }),
+      );
+    }
+    if (offers > 0) {
+      parts.push(
+        offers === 1
+          ? m.sidebar_friend_offers_title_one()
+          : m.sidebar_friend_offers_title_other({ count: offers }),
+      );
+    }
+    return parts.join(' · ');
+  }
+
   // Sum of unread chat messages across all friends. The Chats toggle
   // surfaces this so users can spot new messages from any page —
   // previously the only signal was per-friend badges on /friends,
@@ -361,15 +383,7 @@
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
             <span
               class="nav-badge nav-badge-attention"
-              title={pendingFriendRequestCount > 0 && pendingFileOfferCount > 0
-                ? m.sidebar_friend_inbox_title({ requests: pendingFriendRequestCount, offers: pendingFileOfferCount })
-                : pendingFileOfferCount > 0
-                  ? (pendingFileOfferCount === 1
-                    ? m.sidebar_friend_offers_title_one()
-                    : m.sidebar_friend_offers_title_other({ count: pendingFileOfferCount }))
-                  : (pendingFriendRequestCount === 1
-                    ? m.sidebar_friend_requests_title_one()
-                    : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount }))}
+              title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
             >{pendingFriendInboxCount}</span>
           {/if}
           {#if item.id === 'channels' && totalUnreadChannels > 0}

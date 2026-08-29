@@ -2961,11 +2961,13 @@ mod tests {
     /// chat one — and that budget has to be far below what chat allows.
     #[test]
     fn history_sync_has_a_tighter_budget_than_chat_and_is_per_room() {
-        assert!(
-            CHANNEL_HISTORY_SYNC_PER_MIN < CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
-            "a request answered with {CHANNEL_HISTORY_SYNC_MAX} sealed frames must not be \
-             admitted at the per-second rate plain chat is"
-        );
+        const {
+            assert!(
+                CHANNEL_HISTORY_SYNC_PER_MIN < CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
+                "a request answered with CHANNEL_HISTORY_SYNC_MAX sealed frames must not be \
+                 admitted at the per-second rate plain chat is"
+            );
+        }
 
         let mut seen = HashMap::new();
         let room = [0x01u8; 16];

@@ -204,7 +204,6 @@
   "sidebar_friend_requests_title_other": "{count} ожидающих запросов в друзья",
   "sidebar_friend_offers_title_one": "1 ожидающее предложение файла",
   "sidebar_friend_offers_title_other": "{count} ожидающих предложений файлов",
-  "sidebar_friend_inbox_title": "{requests} запросов, {offers} предложений файлов",
   "sidebar_active_downloads_one": "1 активная загрузка",
   "sidebar_active_downloads_other": "{count} активных загрузок",
   "sidebar_active_uploads_one": "1 активная отдача",

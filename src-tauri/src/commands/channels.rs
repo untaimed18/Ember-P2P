@@ -2528,9 +2528,7 @@ async fn apply_local_mod_ban(
             body: gossip.encode(),
         })
     {
-        if let Err(stuck) = rollback(state, row, target, banned, ts).await {
-            return Err(stuck);
-        }
+        rollback(state, row, target, banned, ts).await?;
         return Err(coded_ctx("network_busy", "Network busy", e));
     }
     Ok(())
@@ -3610,9 +3608,7 @@ pub async fn transfer_channel_ownership(
         version,
     );
     if let Err(e) = enqueue_channel_gossip(&state, &channel_id, join_secret, plain) {
-        if let Err(stuck) = clear_channel_pending_handoff(&state, &channel_id).await {
-            return Err(stuck);
-        }
+        clear_channel_pending_handoff(&state, &channel_id).await?;
         return Err(e);
     }
     Ok(())

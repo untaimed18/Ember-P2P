@@ -3077,15 +3077,23 @@ impl Database {
                 "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), sender_pubkey \
                  FROM friend_requests WHERE sender_hash = ?1",
             )?;
-            stmt.query_row(params![user_hash], |row| {
+            // Only "no such request" may fall through to a one-sided add. A
+            // real query failure has to propagate: swallowing it would silently
+            // downgrade the add to non-mutual *and* leave the request row in
+            // place, so the user gets a friend they cannot browse plus a
+            // pending request they already answered.
+            match stmt.query_row(params![user_hash], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
                     row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
-            })
-            .ok()
+            }) {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
         };
 
         let (stored_nick, mutual, pending_pubkey, pending_ip, pending_port) =
@@ -4025,7 +4033,7 @@ impl Database {
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Self::stored_channel_from_row(row))?
+            .query_map([], Self::stored_channel_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -4046,7 +4054,7 @@ impl Database {
              ORDER BY c.last_active DESC, c.joined_at DESC",
         )?;
         let rows = stmt
-            .query_map([], |row| Self::stored_channel_from_row(row))?
+            .query_map([], Self::stored_channel_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -4157,7 +4165,7 @@ impl Database {
                  FROM channels c WHERE c.channel_id = ?1"
                 ),
                 params![channel_id],
-                |row| Self::stored_channel_from_row(row),
+                Self::stored_channel_from_row,
             )
             .optional()?;
         Ok(row)
