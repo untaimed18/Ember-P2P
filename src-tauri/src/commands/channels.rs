@@ -213,6 +213,37 @@ pub struct ChannelMessageInfo {
     pub message: String,
     pub timestamp: i64,
     pub read: bool,
+    /// When the author last revised this line, or 0 if they never did.
+    pub edited_at: i64,
+    /// Wire identity of the line. Exposed because a reaction arriving live names
+    /// the message this way, and the local row id means nothing to the peer that
+    /// sent it — so the UI needs it to match the two up.
+    pub msg_id: String,
+}
+
+impl From<crate::storage::database::ChannelMessageRow> for ChannelMessageInfo {
+    fn from(row: crate::storage::database::ChannelMessageRow) -> Self {
+        Self {
+            id: row.id,
+            sender_pubkey: row.sender_pubkey,
+            direction: row.direction,
+            message: row.message,
+            timestamp: row.timestamp,
+            read: row.read,
+            edited_at: row.edited_at,
+            msg_id: row.msg_id,
+        }
+    }
+}
+
+/// Reaction tally for one line, as the UI draws it.
+#[derive(serde::Serialize)]
+pub struct ChannelReactionInfo {
+    pub msg_id: String,
+    pub up: u32,
+    pub down: u32,
+    /// This device's own reaction, so the button can show as pressed. 0 is none.
+    pub mine: u8,
 }
 
 #[derive(serde::Serialize)]
@@ -475,6 +506,33 @@ fn parse_channel_id(hex_str: &str) -> Result<String, String> {
         ));
     }
     Ok(canonical)
+}
+
+/// The 16 raw bytes of an already-canonical channel id, for the signing and
+/// framing calls that want them rather than the hex.
+fn channel_id_bytes(canonical: &str) -> Result<[u8; 16], String> {
+    let mut out = [0u8; 16];
+    hex::decode_to_slice(canonical, &mut out)
+        .map_err(|_| coded("channels_not_found", "Channel not found"))?;
+    Ok(out)
+}
+
+/// The 16 raw bytes of a stored message's wire id.
+///
+/// A row copied across a handoff carries a synthetic id (`handoff-<room>-<n>`)
+/// rather than 16 hex bytes, because the original was signed against the old
+/// room and cannot be re-served under the new one. Those lines are therefore not
+/// addressable on the wire, which is exactly why editing or reacting to one has
+/// to fail here rather than flood a frame nobody can match.
+fn parse_msg_id(msg_id: &str) -> Result<[u8; 16], String> {
+    let mut out = [0u8; 16];
+    hex::decode_to_slice(msg_id, &mut out).map_err(|_| {
+        coded(
+            "channels_message_not_addressable",
+            "This message cannot be edited or reacted to",
+        )
+    })?;
+    Ok(out)
 }
 
 /// Write our own row into `channel_members`. Not optional: gossip fanout picks
@@ -1368,19 +1426,7 @@ pub async fn get_channel_messages(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_messages_failed", "Failed to load messages", e))?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(id, sender_pubkey, direction, message, timestamp, read)| ChannelMessageInfo {
-                id,
-                sender_pubkey,
-                direction,
-                message,
-                timestamp,
-                read,
-            },
-        )
-        .collect())
+    Ok(rows.into_iter().map(ChannelMessageInfo::from).collect())
 }
 
 /// Substring search over one room's stored history. Local only — nothing is
@@ -1406,19 +1452,325 @@ pub async fn search_channel_messages(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_messages_failed", "Failed to search messages", e))?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(id, sender_pubkey, direction, message, timestamp, read)| ChannelMessageInfo {
-                id,
-                sender_pubkey,
-                direction,
-                message,
-                timestamp,
-                read,
-            },
+    Ok(rows.into_iter().map(ChannelMessageInfo::from).collect())
+}
+
+/// Revise one of your own lines, within [`channel::CHANNEL_EDIT_WINDOW_SECS`].
+///
+/// The revision is signed and flooded exactly as the original was, so every
+/// member re-checks for themselves that it came from the line's author and
+/// arrived in time — this side's checks are there to give the user a clear
+/// refusal, not because anyone downstream takes our word for it.
+///
+/// The room's slow mode deliberately does not apply. It exists to bound how fast
+/// *new* lines arrive, and a revision replaces one that has already been counted.
+#[tauri::command]
+pub async fn edit_channel_message(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    message_id: i64,
+    message: String,
+) -> Result<ChannelMessageInfo, String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let channel_id_bytes = channel_id_bytes(&channel_id)?;
+    let cleaned = crate::security::sanitize_chat_text(&message);
+    if cleaned.is_empty() || cleaned.len() > MAX_CHANNEL_MESSAGE {
+        return Err(coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        ));
+    }
+    let row = load_joined_channel(&state, &channel_id).await?;
+    // A banned member's revision is dropped by every receiver anyway, so applying
+    // it locally would only show them a room state nobody else has.
+    if self_banned_from(&state, &row, "channels_edit_failed").await? {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
+    if row.visibility == CHANNEL_KIND_PRIVATE && row.key_epoch_wanted > row.key_epoch {
+        return Err(coded(
+            "channels_key_behind",
+            "New messages are locked until this device has the current room key",
+        ));
+    }
+    let sender_pk = state.identity.ed25519_public_key;
+    let sender = hex::encode(sender_pk);
+
+    // Read the line first: only its author may revise it, and the window is
+    // measured from when it was sent.
+    let db = state.db.clone();
+    let id_for_read = channel_id.clone();
+    let target = tokio::task::spawn_blocking(move || {
+        db.channel_message_edit_target(&id_for_read, message_id)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_edit_failed", "Failed to load message", e))?
+    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+
+    if !target.sender_pubkey.eq_ignore_ascii_case(&sender) {
+        return Err(coded(
+            "channels_edit_not_author",
+            "Only the author can edit a message",
+        ));
+    }
+    let edited_at = chrono::Utc::now().timestamp();
+    if !channel::edit_within_window(
+        target.timestamp,
+        edited_at,
+        target.first_seen_at,
+        edited_at,
+    ) {
+        return Err(coded(
+            "channels_edit_window_closed",
+            "This message is too old to edit",
+        ));
+    }
+
+    let join_secret = join_secret_for_channel(&state, &row)
+        .await
+        .ok_or_else(|| {
+            coded(
+                "channels_edit_failed",
+                "This device has no key for this channel",
+            )
+        })?;
+    let msg_id_bytes = parse_msg_id(&target.msg_id)?;
+    let edit_sig = channel::edit_author_signature(
+        &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+        &sender_pk,
+        &channel_id_bytes,
+        &msg_id_bytes,
+        target.timestamp,
+        edited_at,
+        &cleaned,
+    );
+
+    // Local first: a revision the user can see is worth more than one that only
+    // left the host, and the flood below is best-effort by nature.
+    let db = state.db.clone();
+    let id_for_edit = channel_id.clone();
+    let msg_id_for_edit = target.msg_id.clone();
+    let sender_for_edit = sender.clone();
+    let text_for_edit = cleaned.clone();
+    let sig_hex = hex::encode(edit_sig);
+    let original_ts = target.timestamp;
+    tokio::task::spawn_blocking(move || {
+        db.apply_channel_message_edit(
+            &id_for_edit,
+            &msg_id_for_edit,
+            &sender_for_edit,
+            original_ts,
+            edited_at,
+            &text_for_edit,
+            &sig_hex,
+            edited_at,
         )
-        .collect())
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_edit_failed", "Failed to save edit", e))?;
+
+    let plain = channel::encode_channel_chat_edit_presigned(
+        &sender_pk,
+        &msg_id_bytes,
+        target.timestamp,
+        edited_at,
+        &edit_sig,
+        &cleaned,
+    );
+    let mut envelope_id = [0u8; 16];
+    OsRng.fill_bytes(&mut envelope_id);
+    let gossip = channel::ChannelGossip::sealed(
+        channel_id_bytes,
+        envelope_id,
+        &channel::content_key(&join_secret),
+        edited_at.max(0) as u64,
+        &plain,
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        edited_at,
+    );
+    // Best effort past this point: the edit is already on disk here, and a busy
+    // network task must not make the user think it was refused.
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::FanoutChannelGossip {
+            body: gossip.encode(),
+        })
+    {
+        tracing::warn!("Channel edit saved locally but not flooded: {e}");
+    }
+    let _ = app.emit(
+        "ember:channel-message-edited",
+        serde_json::json!({
+            "channel_id": channel_id,
+            "id": message_id,
+            "msg_id": target.msg_id,
+            "message": cleaned,
+            "edited_at": edited_at,
+        }),
+    );
+
+    Ok(ChannelMessageInfo {
+        id: message_id,
+        sender_pubkey: sender,
+        direction: target.direction,
+        message: cleaned,
+        timestamp: target.timestamp,
+        read: true,
+        edited_at,
+        msg_id: target.msg_id,
+    })
+}
+
+/// Set or clear this device's reaction to one line.
+///
+/// `reaction` is [`channel::REACTION_NONE`] to take a reaction back,
+/// [`channel::REACTION_UP`], or [`channel::REACTION_DOWN`]. Clearing is stored
+/// rather than deleted, because the row carries the timestamp that stops a stale
+/// frame reasserting what was withdrawn.
+#[tauri::command]
+pub async fn set_channel_message_reaction(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    message_id: i64,
+    reaction: u8,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let channel_id_bytes = channel_id_bytes(&channel_id)?;
+    if reaction > channel::REACTION_DOWN {
+        return Err(coded(
+            "channels_reaction_invalid",
+            "Unsupported reaction",
+        ));
+    }
+    let row = load_joined_channel(&state, &channel_id).await?;
+    if self_banned_from(&state, &row, "channels_reaction_failed").await? {
+        return Err(coded(
+            "channels_banned",
+            "You are banned from this channel",
+        ));
+    }
+    let db = state.db.clone();
+    let id_for_read = channel_id.clone();
+    let target = tokio::task::spawn_blocking(move || {
+        db.channel_message_edit_target(&id_for_read, message_id)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load message", e))?
+    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+
+    let join_secret = join_secret_for_channel(&state, &row)
+        .await
+        .ok_or_else(|| {
+            coded(
+                "channels_reaction_failed",
+                "This device has no key for this channel",
+            )
+        })?;
+    let member_pk = state.identity.ed25519_public_key;
+    let msg_id_bytes = parse_msg_id(&target.msg_id)?;
+    let reacted_at = chrono::Utc::now().timestamp();
+    let sig = channel::reaction_signature(
+        &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
+        &member_pk,
+        &channel_id_bytes,
+        &msg_id_bytes,
+        reacted_at,
+        reaction,
+    );
+
+    let db = state.db.clone();
+    let id_for_write = channel_id.clone();
+    let msg_id_for_write = target.msg_id.clone();
+    let member_hex = hex::encode(member_pk);
+    let sig_hex = hex::encode(sig);
+    tokio::task::spawn_blocking(move || {
+        db.set_channel_message_reaction(
+            &id_for_write,
+            &msg_id_for_write,
+            &member_hex,
+            reaction,
+            reacted_at,
+            &sig_hex,
+        )
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to save reaction", e))?;
+
+    let plain = channel::encode_channel_reactions(&[channel::ChannelReaction {
+        target_msg_id: msg_id_bytes,
+        member: member_pk,
+        reaction,
+        reacted_at,
+        signature: sig,
+    }]);
+    let mut envelope_id = [0u8; 16];
+    OsRng.fill_bytes(&mut envelope_id);
+    let gossip = channel::ChannelGossip::sealed(
+        channel_id_bytes,
+        envelope_id,
+        &channel::content_key(&join_secret),
+        reacted_at.max(0) as u64,
+        &plain,
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        reacted_at,
+    );
+    if let Err(e) = state
+        .network_tx
+        .try_send(NetworkCommand::FanoutChannelGossip {
+            body: gossip.encode(),
+        })
+    {
+        tracing::warn!("Channel reaction saved locally but not flooded: {e}");
+    }
+    Ok(())
+}
+
+/// Every live reaction tally in a room, so the UI can draw counts in one read
+/// rather than a query per bubble.
+#[tauri::command]
+pub async fn get_channel_reactions(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<Vec<ChannelReactionInfo>, String> {
+    let channel_id = parse_channel_id(&channel_id)?;
+    let mine = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.channel_message_reactions(&channel_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load reactions", e))?;
+    let mut tallies: std::collections::HashMap<String, ChannelReactionInfo> =
+        std::collections::HashMap::new();
+    for (msg_id, member, reaction) in rows {
+        let entry = tallies
+            .entry(msg_id.clone())
+            .or_insert_with(|| ChannelReactionInfo {
+                msg_id,
+                up: 0,
+                down: 0,
+                mine: channel::REACTION_NONE,
+            });
+        match reaction {
+            channel::REACTION_UP => entry.up = entry.up.saturating_add(1),
+            channel::REACTION_DOWN => entry.down = entry.down.saturating_add(1),
+            // A reaction a newer build drew and this one does not. Counted
+            // nowhere rather than lumped in with a thumb it is not.
+            _ => {}
+        }
+        if member.eq_ignore_ascii_case(&mine) {
+            entry.mine = reaction;
+        }
+    }
+    Ok(tallies.into_values().collect())
 }
 
 /// Remove one message from this device. Deliberately does not propagate: the
@@ -1619,6 +1971,8 @@ pub async fn send_channel_message(
         message: cleaned,
         timestamp: sent_at,
         read: true,
+        edited_at: 0,
+        msg_id: hex::encode(msg_id),
     })
 }
 

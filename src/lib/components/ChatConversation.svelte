@@ -11,6 +11,15 @@
   } from '$lib/api/channels';
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
   import { clearChannelUnread } from '$lib/stores/channels';
+  import {
+    editChannelMessage,
+    getChannelReactions,
+    setChannelMessageReaction,
+    REACTION_NONE,
+    REACTION_UP,
+    REACTION_DOWN,
+    type ChannelReactionInfo,
+  } from '$lib/api/channels';
   import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
@@ -68,7 +77,27 @@
     onfocusmissing?: () => void;
   }
 
-  type ConvMessage = ChatMessage & { sender_pubkey?: string };
+  type ConvMessage = ChatMessage & {
+    sender_pubkey?: string;
+    /** Channels only: when the author last revised this line, 0 if never. */
+    edited_at?: number;
+    /** Channels only: the wire id other members address this line by. */
+    msg_id?: string;
+  };
+
+  /**
+   * Mirrors `CHANNEL_EDIT_WINDOW_SECS` in the backend, which is the only place
+   * that decides anything. Duplicated here purely so the Edit affordance is not
+   * offered for a line the backend would refuse.
+   */
+  const EDIT_WINDOW_SECS = 15 * 60;
+  /**
+   * Coarse clock driving the Edit affordance's expiry. Ticks once a minute rather
+   * than being read inline, because reading `Date.now()` inside the render would
+   * never re-evaluate and the button would linger past the window until something
+   * else invalidated the view.
+   */
+  let editClockNow = $state(Date.now());
 
   let {
     friendHash,
@@ -194,7 +223,116 @@
       read: row.read,
       delivery: 'delivered',
       sender_pubkey: row.sender_pubkey,
+      edited_at: row.edited_at,
+      msg_id: row.msg_id,
     };
+  }
+
+  /** Reaction tallies for this room, keyed by wire message id. */
+  let reactions = $state<Record<string, ChannelReactionInfo>>({});
+  /** Which message is open in the inline editor, and the text being typed. */
+  let editingId = $state<number | null>(null);
+  let editDraft = $state('');
+  let editBusy = $state(false);
+  let editError = $state<string | null>(null);
+  let reactionBusy = $state<number | null>(null);
+  let editInputEl: HTMLTextAreaElement | undefined = $state();
+
+  async function refreshReactions() {
+    const channel = channelId;
+    if (!channel) return;
+    try {
+      const rows = await getChannelReactions(channel);
+      if (channel !== channelId) return;
+      reactions = Object.fromEntries(rows.map((row) => [row.msg_id, row]));
+    } catch (e) {
+      // A tally that fails to load leaves the bubbles bare rather than the room
+      // unreadable, so this is not worth an error banner.
+      console.warn('ChatConversation: failed to load reactions', e);
+    }
+  }
+
+  /**
+   * Whether this line is still ours to revise.
+   *
+   * The same window the backend enforces, checked here only so the affordance is
+   * not offered for something that would be refused. A line with no wire id (a
+   * copy carried across a room handoff) is not addressable by other members at
+   * all, so it cannot be edited either.
+   */
+  function canEdit(msg: ConvMessage): boolean {
+    if (!isChannel || msg.direction !== 'sent' || msg.id <= 0) return false;
+    if (!msg.msg_id || msg.msg_id.length !== 32) return false;
+    return editClockNow / 1000 - msg.timestamp <= EDIT_WINDOW_SECS;
+  }
+
+  function startEdit(msg: ConvMessage) {
+    editingId = msg.id;
+    editDraft = msg.message;
+    editError = null;
+  }
+
+  function cancelEdit() {
+    editingId = null;
+    editDraft = '';
+    editError = null;
+  }
+
+  async function commitEdit(msg: ConvMessage) {
+    const channel = channelId;
+    const text = editDraft.trim();
+    if (!channel || editBusy) return;
+    if (!text || text === msg.message) {
+      cancelEdit();
+      return;
+    }
+    editBusy = true;
+    editError = null;
+    try {
+      const updated = await editChannelMessage(channel, msg.id, text);
+      if (channel === channelId) {
+        messages = messages.map((m) =>
+          m.id === msg.id
+            ? { ...m, message: updated.message, edited_at: updated.edited_at }
+            : m,
+        );
+        cancelEdit();
+      }
+    } catch (e: unknown) {
+      if (channel === channelId) editError = translateError(e, m.channels_edit_failed());
+    } finally {
+      editBusy = false;
+    }
+  }
+
+  function onEditKeydown(e: KeyboardEvent, msg: ConvMessage) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelEdit();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void commitEdit(msg);
+    }
+  }
+
+  /** Toggle our reaction: pressing the one we already hold withdraws it. */
+  async function toggleReaction(msg: ConvMessage, reaction: number) {
+    const channel = channelId;
+    if (!channel || !msg.msg_id || reactionBusy !== null) return;
+    const current = reactions[msg.msg_id]?.mine ?? REACTION_NONE;
+    const next = current === reaction ? REACTION_NONE : reaction;
+    reactionBusy = msg.id;
+    try {
+      await setChannelMessageReaction(channel, msg.id, next);
+      if (channel === channelId) await refreshReactions();
+    } catch (e: unknown) {
+      if (channel === channelId) sendError = translateError(e, m.error_operation_failed());
+    } finally {
+      reactionBusy = null;
+    }
   }
 
   function senderLabel(pubkey?: string): string {
@@ -206,6 +344,80 @@
     if (!chatInputEl || youAreBanned || youAreKeyBehind) return;
     const raf = requestAnimationFrame(() => chatInputEl?.focus());
     return () => cancelAnimationFrame(raf);
+  });
+
+  // Select the text once, when the editor opens on a new message.
+  //
+  // Keyed on `editingId` alone and reading nothing else: focusing from anything
+  // that re-runs as the user types would put the caret back and re-select after
+  // every keystroke, which is what an inline attachment on the textarea did.
+  $effect(() => {
+    if (editingId === null) return;
+    const el = editInputEl;
+    if (!el) return;
+    untrack(() => {
+      el.focus();
+      el.select();
+    });
+  });
+
+  // Retires the Edit affordance as the window closes. A minute's granularity on a
+  // fifteen-minute window is close enough, and the backend refuses anything this
+  // clock lets through late.
+  $effect(() => {
+    const timer = setInterval(() => (editClockNow = Date.now()), 60_000);
+    return () => clearInterval(timer);
+  });
+
+  // Edits and reactions from other members. Both arrive as a nudge rather than a
+  // payload to patch in: the edit event carries the new text (it is one line), but
+  // reactions are a tally the backend already counted, so re-reading is both
+  // simpler and correct when several land at once.
+  $effect(() => {
+    if (!isChannel) return;
+    const room = channelId;
+    let disposed = false;
+    const unlisteners: UnlistenFn[] = [];
+    (async () => {
+      try {
+        const offEdit = await listen<{
+          channel_id: string;
+          id: number;
+          msg_id: string;
+          message: string;
+          edited_at: number;
+        }>('ember:channel-message-edited', (event) => {
+          if (event.payload.channel_id !== room) return;
+          messages = messages.map((msg) =>
+            msg.msg_id === event.payload.msg_id || msg.id === event.payload.id
+              ? { ...msg, message: event.payload.message, edited_at: event.payload.edited_at }
+              : msg,
+          );
+          // A line we were editing has been revised under us — most likely from
+          // this account on another device. Drop the stale draft rather than let
+          // it overwrite the newer text.
+          if (editingId !== null && editingId === event.payload.id) cancelEdit();
+        });
+        if (disposed) offEdit();
+        else unlisteners.push(offEdit);
+
+        const offReactions = await listen<{ channel_id: string }>(
+          'ember:channel-reactions',
+          (event) => {
+            if (event.payload.channel_id !== room) return;
+            void refreshReactions();
+          },
+        );
+        if (disposed) offReactions();
+        else unlisteners.push(offReactions);
+      } catch (e) {
+        console.warn('ChatConversation: failed to register edit/reaction listeners', e);
+      }
+    })();
+    return () => {
+      disposed = true;
+      for (const off of unlisteners) off();
+    };
   });
 
   // Whenever the active conversation changes (mounted with new
@@ -247,6 +459,10 @@
       // or at the bottom.
       scrolledAway = false;
       missedWhileAway = false;
+      // Reactions and any half-finished edit belong to the room being left.
+      reactions = {};
+      cancelEdit();
+      if (channel) void refreshReactions();
       (async () => {
         try {
           const listenerOk = await setupListener(gen, friend, channel);
@@ -287,6 +503,7 @@
           direction: string;
           message: string;
           timestamp: number;
+          msg_id?: string;
         }>('ember:channel-message', (event) => {
           if (gen !== loadGen) return;
           if (event.payload.channel_id !== channel) return;
@@ -300,6 +517,8 @@
             read: true,
             delivery: 'delivered',
             sender_pubkey: event.payload.sender_pubkey,
+            edited_at: 0,
+            msg_id: event.payload.msg_id,
           }];
           messages = next.length > MAX_LIVE_MESSAGES
             ? next.slice(next.length - MAX_LIVE_MESSAGES)
@@ -1291,20 +1510,99 @@
             `<a href>` so the webview itself has no navigable target — the only
             way out is the confirmed, scheme-checked backend opener.
           -->
+          {#if editingId === row.msg.id}
+            <!-- Edited in place rather than in the composer at the bottom: that
+                 one owns per-conversation drafts, the slow-mode countdown and
+                 mention autocomplete, all of which would fight an edit. -->
+            <div class="bubble-edit">
+              <textarea
+                class="bubble-edit-input"
+                bind:value={editDraft}
+                onkeydown={(e) => onEditKeydown(e, row.msg)}
+                maxlength="4096"
+                rows="2"
+                disabled={editBusy}
+                aria-label={m.channels_edit_message()}
+                bind:this={editInputEl}
+              ></textarea>
+              {#if editError}
+                <span class="bubble-edit-error" role="alert">{editError}</span>
+              {/if}
+              <div class="bubble-edit-actions">
+                <span class="bubble-edit-hint">{m.channels_edit_hint()}</span>
+                <button type="button" class="bubble-edit-cancel" onclick={cancelEdit} disabled={editBusy}>
+                  {m.common_cancel()}
+                </button>
+                <button
+                  type="button"
+                  class="bubble-edit-save"
+                  onclick={() => commitEdit(row.msg)}
+                  disabled={editBusy || !editDraft.trim()}
+                >
+                  {editBusy ? m.chat_loading_short() : m.common_save()}
+                </button>
+              </div>
+            </div>
+          {:else}
           <div class="bubble-text"><bdi dir="auto">{#each row.segments as seg, i (i)}{#if seg.href}<button
                   type="button"
                   class="bubble-link"
                   title={seg.href}
                   onclick={() => askOpenLink(seg.href!)}
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
+          {/if}
+          {#if isChannel && row.msg.msg_id}
+            {@const tally = reactions[row.msg.msg_id]}
+            {@const mine = tally?.mine ?? REACTION_NONE}
+            <!-- Shown when anyone has reacted, and otherwise revealed on hover of
+                 the bubble like the remove button — a transcript should not be a
+                 wall of buttons, but a count already cast has to stay visible. -->
+            <div class="bubble-reactions" class:has-any={(tally?.up ?? 0) + (tally?.down ?? 0) > 0}>
+              <button
+                type="button"
+                class="reaction-btn"
+                class:active={mine === REACTION_UP}
+                disabled={reactionBusy !== null}
+                onclick={() => toggleReaction(row.msg, REACTION_UP)}
+                title={m.channels_reaction_up()}
+                aria-label={m.channels_reaction_up()}
+                aria-pressed={mine === REACTION_UP}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                  <path d="M5 14V7l3.2-4.5a1.4 1.4 0 0 1 2.4 1.3L9.7 6.5H13a1.3 1.3 0 0 1 1.2 1.7l-1.3 4.6a1.7 1.7 0 0 1-1.6 1.2H5zM2.6 14h2.4V7H2.6z"/>
+                </svg>
+                {#if (tally?.up ?? 0) > 0}<span class="reaction-count">{tally?.up}</span>{/if}
+              </button>
+              <button
+                type="button"
+                class="reaction-btn"
+                class:active={mine === REACTION_DOWN}
+                disabled={reactionBusy !== null}
+                onclick={() => toggleReaction(row.msg, REACTION_DOWN)}
+                title={m.channels_reaction_down()}
+                aria-label={m.channels_reaction_down()}
+                aria-pressed={mine === REACTION_DOWN}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                  <path d="M11 2v7l-3.2 4.5a1.4 1.4 0 0 1-2.4-1.3l.9-2.7H3a1.3 1.3 0 0 1-1.2-1.7l1.3-4.6A1.7 1.7 0 0 1 4.7 2H11zm2.4 0h-2.4v7h2.4z"/>
+                </svg>
+                {#if (tally?.down ?? 0) > 0}<span class="reaction-count">{tally?.down}</span>{/if}
+              </button>
+            </div>
+          {/if}
           <!--
             Once per run, not once per message: within a burst the timestamps
             repeat the same minute and add nothing. Delivery state is per
             message though, so a queued or failed one always shows its own.
           -->
-          {#if row.endsRun || pending || failed}
+          {#if row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0}
             <div class="bubble-time">
               {formatTime(row.msg.timestamp)}
+              {#if (row.msg.edited_at ?? 0) > 0}
+                <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(row.msg.edited_at ?? 0) })}>
+                  {m.channels_edited()}
+                </span>
+              {/if}
               {#if pending}
                 <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
               {:else if failed}
@@ -1329,15 +1627,29 @@
           <!-- Channels only, and only for rows the DB can actually address:
                live bubbles carry negative synthetic ids. -->
           {#if isChannel && row.msg.id > 0}
-            <button
-              class="bubble-remove"
-              disabled={removingMessage === row.msg.id}
-              onclick={() => handleRemoveMessage(row.msg.id)}
-              title={m.channels_remove_local()}
-              aria-label={m.channels_remove_local()}
-            >
-              <IconX size={11} />
-            </button>
+            <div class="bubble-tools">
+              {#if canEdit(row.msg) && editingId !== row.msg.id}
+                <button
+                  class="bubble-edit-btn"
+                  onclick={() => startEdit(row.msg)}
+                  title={m.channels_edit_message()}
+                  aria-label={m.channels_edit_message()}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <path d="M11.5 2.5l2 2L6 12l-3 1 1-3z"/>
+                  </svg>
+                </button>
+              {/if}
+              <button
+                class="bubble-remove"
+                disabled={removingMessage === row.msg.id}
+                onclick={() => handleRemoveMessage(row.msg.id)}
+                title={m.channels_remove_local()}
+                aria-label={m.channels_remove_local()}
+              >
+                <IconX size={11} />
+              </button>
+            </div>
           {/if}
         </div>
       {/each}
@@ -1837,6 +2149,160 @@
   .bubble-delivery.failed {
     color: var(--danger);
     opacity: 1;
+  }
+
+  /* Edit and remove share one hover-revealed cluster so they cannot overlap each
+     other, and so a bubble has one control affordance rather than two competing
+     ones. Same opacity-not-display reveal as `.bubble-remove` had alone: the
+     buttons stay in the tab order, and reveal on focus so a keyboard user can see
+     where they have landed. */
+  .bubble-tools {
+    position: absolute;
+    top: 2px;
+    inset-inline-end: 2px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .conv-bubble:hover .bubble-tools,
+  .bubble-tools:focus-within {
+    opacity: 1;
+  }
+
+  .bubble-edit-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .bubble-edit-btn:hover {
+    background: rgb(0 0 0 / 18%);
+  }
+
+  /* An edit marker belongs with the timestamp, not the text: it is metadata about
+     when the line was last touched, which is exactly what the rest of that row
+     already says. */
+  .bubble-edited {
+    margin-inline-start: 6px;
+    font-style: italic;
+    opacity: 0.85;
+  }
+
+  .bubble-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 220px;
+  }
+
+  .bubble-edit-input {
+    width: 100%;
+    padding: 5px 7px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font: inherit;
+    resize: vertical;
+  }
+
+  .bubble-edit-error {
+    color: var(--danger);
+    font-size: 11px;
+  }
+
+  .bubble-edit-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .bubble-edit-hint {
+    flex: 1 1 auto;
+    font-size: 10px;
+    opacity: 0.7;
+  }
+
+  .bubble-edit-cancel,
+  .bubble-edit-save {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .bubble-edit-save {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .bubble-edit-cancel:disabled,
+  .bubble-edit-save:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  /* Hidden until hover while nobody has reacted, so an untouched transcript stays
+     clean; once a count exists it is content and stays put. */
+  .bubble-reactions {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    margin-top: 3px;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+  }
+
+  .bubble-reactions.has-any,
+  .conv-bubble:hover .bubble-reactions,
+  .bubble-reactions:focus-within {
+    opacity: 1;
+  }
+
+  .reaction-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+
+  .reaction-btn:hover:not(:disabled) {
+    border-color: var(--text-muted);
+  }
+
+  .reaction-btn.active {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
+  .reaction-btn:disabled {
+    cursor: default;
+  }
+
+  .reaction-count {
+    font-weight: 600;
   }
 
   /* Resend sits inside the timestamp line of its own bubble, so it reads as

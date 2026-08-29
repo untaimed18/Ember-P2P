@@ -15170,6 +15170,34 @@ async fn handle_inbound_channel_gossip(
         }
         return;
     }
+    if let Some(edit) = ember::channel::decode_channel_chat_edit(&plain, &gossip.channel_id) {
+        handle_inbound_channel_edit(
+            socket,
+            state,
+            db,
+            app_handle,
+            &gossip,
+            &channel_id_hex,
+            edit,
+            from_id,
+        )
+        .await;
+        return;
+    }
+    if let Some(entries) = ember::channel::decode_channel_reactions(&plain, &gossip.channel_id) {
+        handle_inbound_channel_reactions(
+            socket,
+            state,
+            db,
+            app_handle,
+            &gossip,
+            &channel_id_hex,
+            entries,
+            from_id,
+        )
+        .await;
+        return;
+    }
     let Some((sender_pk, text, author_sig)) = ember::channel::decode_channel_chat_plain(
         &plain,
         &gossip.channel_id,
@@ -15259,6 +15287,11 @@ async fn handle_inbound_channel_gossip(
                     "direction": "received",
                     "message": cleaned,
                     "timestamp": now,
+                    // Carried so a line that arrives live can be reacted to
+                    // straight away. Reactions name a message by its wire id, and
+                    // without this the bubble held no way to be addressed until
+                    // the room was next read from disk.
+                    "msg_id": msg_id_hex,
                 }),
             );
         }
@@ -16218,6 +16251,166 @@ async fn drive_channel_transfers(
     }
 }
 
+/// Apply a member's revision of their own line and pass it on.
+///
+/// Every check that decides whether the revision is legitimate is in
+/// `apply_channel_message_edit`, so this path and a catch-up cannot disagree
+/// about it. Relayed on the same terms as chat: refused for rate or for a banned
+/// author, forwarded otherwise, and forwarded even when *we* refuse to apply it —
+/// our window closing is a fact about this device's clock, not about the frame,
+/// and a neighbour who was away may still legitimately accept it.
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound_channel_edit(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    gossip: &ember::channel::ChannelGossip,
+    channel_id_hex: &str,
+    edit: ember::channel::ChannelChatEdit,
+    from_id: ember::dht::EmberNodeId,
+) {
+    if !channel_author_gossip_ok(state, gossip.channel_id, &edit.sender) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        debug!("Ember channel edit: rate-limited author in {channel_id_hex}");
+        return;
+    }
+    let sender_hex = hex::encode(edit.sender);
+    if db
+        .channel_member_is_banned(channel_id_hex, &sender_hex)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let cleaned = crate::security::sanitize_chat_text(&edit.text);
+    if cleaned.is_empty() || cleaned.len() > 4096 {
+        return;
+    }
+    // Only the text the author signed may be stored, so a body that does not
+    // survive sanitising unchanged is dropped rather than silently altered — a
+    // stored line that differs from its signature could never be re-served.
+    if cleaned != edit.text {
+        debug!("Ember channel edit: body in {channel_id_hex} did not survive sanitising");
+        return;
+    }
+    let target_hex = hex::encode(edit.target_msg_id);
+    let now = chrono::Utc::now().timestamp();
+    match db.apply_channel_message_edit(
+        channel_id_hex,
+        &target_hex,
+        &sender_hex,
+        edit.original_timestamp,
+        edit.edited_at,
+        &cleaned,
+        &hex::encode(edit.signature),
+        now,
+    ) {
+        Ok(crate::storage::database::ChannelEditOutcome::Applied(id))
+        | Ok(crate::storage::database::ChannelEditOutcome::Created(id)) => {
+            let _ = app_handle.emit(
+                "ember:channel-message-edited",
+                serde_json::json!({
+                    "channel_id": channel_id_hex,
+                    "id": id,
+                    "msg_id": target_hex,
+                    "message": cleaned,
+                    "edited_at": edit.edited_at,
+                }),
+            );
+        }
+        Ok(outcome) => {
+            debug!("Ember channel edit in {channel_id_hex} not applied: {outcome:?}");
+        }
+        Err(error) => {
+            debug!("Ember channel edit in {channel_id_hex} failed: {error}");
+        }
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+/// Record a batch of reactions and pass it on.
+///
+/// Rate is charged per *distinct member named in the batch*, not once for the
+/// frame. Charging the frame to a single author would shed a member's own
+/// reactions the moment somebody else's arrived beside them, which a catch-up
+/// reply does by design; charging nothing at all would leave the per-hop budget
+/// as the only bound, and at a full batch per frame that is over a thousand
+/// database writes a second from one peer. Per member, a flood costs the flooder
+/// their own allowance and nobody else's.
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound_channel_reactions(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    gossip: &ember::channel::ChannelGossip,
+    channel_id_hex: &str,
+    entries: Vec<ember::channel::ChannelReaction>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let mut changed = false;
+    // Charged once per member per frame — a batch legitimately carries several of
+    // one member's reactions, and that is one round of work rather than one per
+    // entry. The refused set is what makes the decision stick: keyed only on
+    // "have we charged this member yet", a member who failed the check would have
+    // every *later* entry of theirs in the same batch sail through.
+    let mut allowed: HashSet<[u8; 32]> = HashSet::new();
+    let mut refused: HashSet<[u8; 32]> = HashSet::new();
+    for entry in entries {
+        // A reaction dated in the future would pin itself against every later
+        // claim under the newer-wins rule, which is the same trick
+        // `gossip_timestamp_ok` exists to refuse for envelopes.
+        if !ember::channel::gossip_timestamp_ok(entry.reacted_at, now) {
+            continue;
+        }
+        if refused.contains(&entry.member) {
+            continue;
+        }
+        if !allowed.contains(&entry.member) {
+            if channel_author_gossip_ok(state, gossip.channel_id, &entry.member) {
+                allowed.insert(entry.member);
+            } else {
+                refused.insert(entry.member);
+                debug!("Ember channel reactions: rate-limited member in {channel_id_hex}");
+                continue;
+            }
+        }
+        let member_hex = hex::encode(entry.member);
+        if db
+            .channel_member_is_banned(channel_id_hex, &member_hex)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        match db.set_channel_message_reaction(
+            channel_id_hex,
+            &hex::encode(entry.target_msg_id),
+            &member_hex,
+            entry.reaction,
+            entry.reacted_at,
+            &hex::encode(entry.signature),
+        ) {
+            Ok(true) => changed = true,
+            Ok(false) => {}
+            Err(error) => debug!("Ember channel reaction in {channel_id_hex} failed: {error}"),
+        }
+    }
+    // One event for the batch: the UI re-reads the room's tallies rather than
+    // patching a count per entry, so telling it once per frame is enough.
+    if changed {
+        let _ = app_handle.emit(
+            "ember:channel-reactions",
+            serde_json::json!({ "channel_id": channel_id_hex }),
+        );
+    }
+    if let Some(next) = gossip.decremented_ttl() {
+        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
 async fn reply_channel_history_sync(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -16242,14 +16435,27 @@ async fn reply_channel_history_sync(
     let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
         return;
     };
-    for (msg_id_hex, sender_hex, text, timestamp, author_sig_hex) in rows {
-        let Ok(msg_id_bytes) = hex::decode(&msg_id_hex) else {
+    // Frames, not rows. A reply used to be one frame per line, so the message cap
+    // was the whole budget; now a line may go out as a revision and the room's
+    // reactions ride along behind, and the receiver sheds anything past
+    // `CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC` from one hop. Shedding is self-healing
+    // — the requester's watermark does not advance past what it stored, so the
+    // next round asks again — but spending the budget on lines first and
+    // reactions with what is left is the order that makes a room readable
+    // soonest.
+    let mut budget = ember::channel::CHANNEL_HISTORY_SYNC_FRAME_MAX;
+    let mut served: Vec<String> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if budget == 0 {
+            break;
+        }
+        let Ok(msg_id_bytes) = hex::decode(&row.msg_id) else {
             continue;
         };
         let Ok(msg_id) = <[u8; 16]>::try_from(msg_id_bytes) else {
             continue;
         };
-        let Ok(sender_bytes) = hex::decode(&sender_hex) else {
+        let Ok(sender_bytes) = hex::decode(&row.sender_pubkey) else {
             continue;
         };
         let Ok(sender_pk) = <[u8; 32]>::try_from(sender_bytes) else {
@@ -16258,25 +16464,148 @@ async fn reply_channel_history_sync(
         // Replaying the author's own signature, never one of ours. This loop
         // re-serves lines other members wrote, so signing here would let any
         // node answer a catch-up with a conversation that never happened.
-        let Ok(sig_bytes) = hex::decode(&author_sig_hex) else {
-            continue;
+        //
+        // A revised line goes out as the revision alone. The edit frame carries
+        // the original's timestamp so it stands on its own, and serving the
+        // superseded text as well would put words back on the wire that their
+        // author has already replaced.
+        let plain = if row.edited_at > 0 && !row.edit_sig.is_empty() {
+            let Ok(sig_bytes) = hex::decode(&row.edit_sig) else {
+                continue;
+            };
+            let Ok(edit_sig) = <[u8; 64]>::try_from(sig_bytes) else {
+                continue;
+            };
+            ember::channel::encode_channel_chat_edit_presigned(
+                &sender_pk,
+                &msg_id,
+                row.timestamp,
+                row.edited_at,
+                &edit_sig,
+                &row.message,
+            )
+        } else {
+            let Ok(sig_bytes) = hex::decode(&row.author_sig) else {
+                continue;
+            };
+            let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
+                continue;
+            };
+            ember::channel::encode_channel_chat_plain_presigned(
+                &sender_pk,
+                &author_sig,
+                &row.message,
+            )
         };
-        let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
-            continue;
-        };
-        let plain =
-            ember::channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &text);
         let gossip = ember::channel::ChannelGossip::sealed(
             channel_id,
             msg_id,
             &key,
-            timestamp.max(0) as u64,
+            row.timestamp.max(0) as u64,
             &plain,
             1,
-            timestamp,
+            row.timestamp,
         );
         send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
+        budget -= 1;
+        served.push(row.msg_id);
     }
+    if budget > 0 && !served.is_empty() {
+        reply_channel_reaction_sync(socket, state, db, ch, to, channel_id, &key, since_ts, budget)
+            .await;
+    }
+}
+
+/// Hand a catching-up member the reactions on the lines we just served.
+///
+/// Batched hard, because one datagram per reaction would exhaust the receiver's
+/// per-hop allowance on a busy room before any of them landed. Cleared reactions
+/// travel too: a member who missed both a reaction and its withdrawal needs the
+/// withdrawal, or they show a thumb its owner has taken back.
+#[allow(clippy::too_many_arguments)]
+async fn reply_channel_reaction_sync(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    ch: &crate::storage::database::StoredChannel,
+    to: [u8; 32],
+    channel_id: [u8; 16],
+    key: &[u8; 32],
+    since_ts: i64,
+    mut budget: usize,
+) {
+    let want = budget.saturating_mul(ember::channel::CHANNEL_REACTION_MAX_PER_FRAME);
+    let Ok(rows) = db.list_channel_reactions_for_sync(&ch.channel_id, since_ts.max(0), want as i64)
+    else {
+        return;
+    };
+    let mut batch: Vec<ember::channel::ChannelReaction> = Vec::new();
+    let mut flush_at = ember::channel::CHANNEL_REACTION_MAX_PER_FRAME;
+    for (msg_id_hex, member_hex, reaction, reacted_at, sig_hex) in rows {
+        let Ok(target) = hex::decode(&msg_id_hex).and_then(|b| {
+            <[u8; 16]>::try_from(b).map_err(|_| hex::FromHexError::InvalidStringLength)
+        }) else {
+            continue;
+        };
+        let Ok(member) = hex::decode(&member_hex).and_then(|b| {
+            <[u8; 32]>::try_from(b).map_err(|_| hex::FromHexError::InvalidStringLength)
+        }) else {
+            continue;
+        };
+        let Ok(signature) = hex::decode(&sig_hex).and_then(|b| {
+            <[u8; 64]>::try_from(b).map_err(|_| hex::FromHexError::InvalidStringLength)
+        }) else {
+            continue;
+        };
+        batch.push(ember::channel::ChannelReaction {
+            target_msg_id: target,
+            member,
+            reaction,
+            reacted_at,
+            signature,
+        });
+        if batch.len() >= flush_at {
+            if !send_channel_reaction_batch(socket, state, db, channel_id, to, key, &batch).await {
+                return;
+            }
+            batch.clear();
+            budget -= 1;
+            if budget == 0 {
+                return;
+            }
+            flush_at = ember::channel::CHANNEL_REACTION_MAX_PER_FRAME;
+        }
+    }
+    if !batch.is_empty() && budget > 0 {
+        send_channel_reaction_batch(socket, state, db, channel_id, to, key, &batch).await;
+    }
+}
+
+/// Seal and unicast one reaction batch. Returns whether it went out.
+async fn send_channel_reaction_batch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    to: [u8; 32],
+    key: &[u8; 32],
+    batch: &[ember::channel::ChannelReaction],
+) -> bool {
+    let plain = ember::channel::encode_channel_reactions(batch);
+    let now = chrono::Utc::now().timestamp();
+    let mut envelope_id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
+    let gossip = ember::channel::ChannelGossip::sealed(
+        channel_id,
+        envelope_id,
+        key,
+        now.max(0) as u64,
+        &plain,
+        1,
+        now,
+    );
+    send_channel_gossip_unicast(socket, state, db, channel_id, to, gossip.encode()).await;
+    true
 }
 
 async fn maybe_sync_channel_history(

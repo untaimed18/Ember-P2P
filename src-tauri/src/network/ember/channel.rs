@@ -186,7 +186,31 @@ const _: () = assert!(
 /// Cap on distinct (room, author) pairs tracked for the limit above.
 pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 /// Recent local messages offered to a neighbor that asks for catch-up.
+/// Frames one catch-up reply may send, across lines and reactions together.
+///
+/// Under [`CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC`] so a reply is not partly shed by
+/// its own recipient, with room left for the ordinary relay traffic sharing that
+/// hop's allowance. Lines are served first and reactions take what is left, so a
+/// room becomes readable before it becomes fully annotated.
+pub const CHANNEL_HISTORY_SYNC_FRAME_MAX: usize = 40;
+
 pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
+
+// A reply arrives from one peer, so the whole thing is charged to that hop's
+// bucket. Exceeding it sheds the tail — recoverable, since the requester's
+// watermark does not advance past what it stored, but it costs a round trip and
+// looks to the reader like history arriving in pieces. Compile-time rather than a
+// test: raising either number past the other is a mistake that should not build.
+const _: () = assert!(
+    CHANNEL_HISTORY_SYNC_FRAME_MAX < CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+    "a catch-up reply must fit inside what one hop may send us in a second"
+);
+// And lines alone must not be able to spend the whole budget, or a busy room
+// would never carry its reactions across.
+const _: () = assert!(
+    CHANNEL_HISTORY_SYNC_MAX < CHANNEL_HISTORY_SYNC_FRAME_MAX,
+    "the frame budget must leave room for reactions after the lines"
+);
 /// Catch-up requests answered for one member of one room per minute.
 ///
 /// Far tighter than the chat budget because a sync request is the one frame
@@ -1041,6 +1065,16 @@ const HANDOFF_READY_PLAIN_VERSION: u8 = 17;
 const MOD_SIG_DOMAIN: &[u8] = b"ember-channel-mod-author-v1\0";
 const SYNC_SIG_DOMAIN: &[u8] = b"ember-channel-sync-author-v1\0";
 const HANDOFF_READY_DOMAIN: &[u8] = b"ember-channel-handoff-ready-v1\0";
+/// Revision of a line the author already sent. Signed by the same key the
+/// original was, so "only the author may edit" is something every receiver
+/// checks rather than something the sending client is trusted about.
+const CHAT_EDIT_PLAIN_VERSION: u8 = 19;
+/// One or more reactions to lines in this room. Always a batch — a live
+/// reaction is a batch of one — so catch-up can carry a room's worth of
+/// reactions in a frame or two instead of one datagram each.
+const REACTION_PLAIN_VERSION: u8 = 20;
+const EDIT_SIG_DOMAIN: &[u8] = b"ember-channel-edit-author-v1\0";
+const REACTION_SIG_DOMAIN: &[u8] = b"ember-channel-reaction-author-v1\0";
 const XFER_OFFER_PLAIN_VERSION: u8 = 9;
 const XFER_REPLY_PLAIN_VERSION: u8 = 10;
 const XFER_BLOCK_REQUEST_PLAIN_VERSION: u8 = 11;
@@ -1167,6 +1201,339 @@ pub fn decode_channel_chat_plain(
 /// member used to stick a ban or freeze catch-up for everyone who stored it.
 pub fn gossip_timestamp_ok(timestamp: i64, now: i64) -> bool {
     timestamp > 0 && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+}
+
+/// How long after sending a line its author may still revise it.
+///
+/// Long enough to catch the typo you notice a moment after pressing Enter,
+/// short enough that nobody rewrites what a conversation was replying to. Both
+/// ends of a room enforce it: see [`edit_within_window`] for why the check needs
+/// two clocks rather than one.
+pub const CHANNEL_EDIT_WINDOW_SECS: i64 = 15 * 60;
+
+/// Whether an edit may still be applied to the line it names.
+///
+/// Two clocks, because neither alone is sufficient. `original_timestamp` and
+/// `edited_at` are both author-supplied, so on their own a member could date a
+/// line now, wait a day, and send an "edit" dated a minute after it —
+/// [`gossip_timestamp_ok`] deliberately allows old timestamps, because history
+/// catch-up replays them. `first_seen_at` is this device's own clock when it
+/// first stored the original, which the author cannot influence at all.
+///
+/// Requiring both means a late rewrite fails even when the author lies about
+/// when it happened. The cost is that members can legitimately disagree: one who
+/// was offline and receives the line and its edit together accepts the edit,
+/// while one who has had the line on screen for an hour refuses it. That is
+/// inherent to a room with no arbiter of time, and refusing is the safe side to
+/// err on — a member who rejects an edit keeps showing exactly the words that
+/// were signed to them.
+///
+/// `first_seen_at` of 0 means the row predates the column, so only the
+/// author-claimed gap is checked; a pre-existing row is not worth refusing an
+/// otherwise valid edit over.
+pub fn edit_within_window(
+    original_timestamp: i64,
+    edited_at: i64,
+    first_seen_at: i64,
+    now: i64,
+) -> bool {
+    if edited_at < original_timestamp {
+        return false;
+    }
+    if edited_at.saturating_sub(original_timestamp) > CHANNEL_EDIT_WINDOW_SECS {
+        return false;
+    }
+    if first_seen_at > 0 && now.saturating_sub(first_seen_at) > CHANNEL_EDIT_WINDOW_SECS {
+        return false;
+    }
+    true
+}
+
+/// What an edit's signature covers.
+///
+/// Same reasoning as [`chat_sig_preimage`], with the target in place of the
+/// line's own id: the room stops the edit being replayed into another room, the
+/// target stops it being pointed at another line, the two timestamps stop it
+/// being re-dated past the window, and the author key stops anyone else
+/// claiming it.
+///
+/// `original_timestamp` is carried so the frame stands on its own. A member who
+/// was away can be handed one edit frame instead of the original line followed
+/// by its revision, which halves what a catch-up costs — and, more importantly,
+/// means an edited line does not have to keep its pre-edit text on every
+/// member's disk just so it can be replayed. Editing out something you regret
+/// would be worth very little if the first version were archived everywhere.
+///
+/// Deliberately *not* bound to the edit frame's own envelope `msg_id`, unlike
+/// chat. A re-serve on catch-up has to mint a fresh envelope id for the
+/// receiver's duplicate filter, and binding one would make the stored signature
+/// unusable for that — while buying nothing, because the only replay this
+/// permits is a byte-identical edit, and applying the same revision twice is a
+/// no-op under the newer-wins rule.
+fn edit_sig_preimage(
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    sender_pubkey: &[u8; 32],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EDIT_SIG_DOMAIN.len() + 16 + 16 + 8 + 8 + 32 + text.len());
+    out.extend_from_slice(EDIT_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&original_timestamp.to_le_bytes());
+    out.extend_from_slice(&edited_at.to_le_bytes());
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// The author's signature over a revision of their own line.
+///
+/// Kept beside the stored row for the same reason [`chat_author_signature`] is:
+/// a catch-up has to put byte-identical bytes back on the wire, and only the
+/// author could have produced them.
+pub fn edit_author_signature(
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    text: &str,
+) -> [u8; 64] {
+    crypto::sign(
+        signing_key,
+        &edit_sig_preimage(
+            channel_id,
+            target_msg_id,
+            original_timestamp,
+            edited_at,
+            sender_pubkey,
+            text,
+        ),
+    )
+}
+
+/// `version || sender(32) || target(16) || original_ts(8) || edited_at(8) || signature(64) || text`.
+///
+/// Both timestamps ride in the payload rather than being read from the envelope,
+/// so a catch-up can replay the revision under a fresh envelope timestamp
+/// without invalidating the signature — the same reason the signature does not
+/// bind the envelope id.
+pub fn encode_channel_chat_edit_presigned(
+    sender_pubkey: &[u8; 32],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    signature: &[u8; 64],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 16 + 8 + 8 + 64 + text.len());
+    out.push(CHAT_EDIT_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&original_timestamp.to_le_bytes());
+    out.extend_from_slice(&edited_at.to_le_bytes());
+    out.extend_from_slice(signature);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// A revision and who signed it, or nothing if the signature does not hold.
+///
+/// The caller still has to check that the author matches the *original* line's
+/// author and that the window has not closed — this proves only that whoever
+/// holds `sender_pubkey` asked for this text on this line at this time.
+pub fn decode_channel_chat_edit(bytes: &[u8], channel_id: &[u8; 16]) -> Option<ChannelChatEdit> {
+    const HEAD: usize = 1 + 32 + 16 + 8 + 8 + 64;
+    if bytes.len() < HEAD || bytes[0] != CHAT_EDIT_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut target = [0u8; 16];
+    target.copy_from_slice(&bytes[33..49]);
+    let original_timestamp = i64::from_le_bytes(bytes[49..57].try_into().ok()?);
+    let edited_at = i64::from_le_bytes(bytes[57..65].try_into().ok()?);
+    let sig: [u8; 64] = bytes[65..HEAD].try_into().ok()?;
+    let text = std::str::from_utf8(&bytes[HEAD..]).ok()?.to_string();
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &edit_sig_preimage(
+            channel_id,
+            &target,
+            original_timestamp,
+            edited_at,
+            &sender,
+            &text,
+        ),
+        &sig,
+    ) {
+        return None;
+    }
+    Some(ChannelChatEdit {
+        sender,
+        target_msg_id: target,
+        original_timestamp,
+        edited_at,
+        text,
+        signature: sig,
+    })
+}
+
+/// A verified revision of a chat line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelChatEdit {
+    pub sender: [u8; 32],
+    pub target_msg_id: [u8; 16],
+    /// When the line being revised was originally sent. Carried so the frame can
+    /// stand in for a line the receiver never saw.
+    pub original_timestamp: i64,
+    pub edited_at: i64,
+    pub text: String,
+    pub signature: [u8; 64],
+}
+
+/// Reaction values carried on the wire.
+///
+/// A number rather than a flag pair so a later build can add reactions without
+/// another frame version. An unrecognised value is stored and re-served rather
+/// than dropped, so a room running a newer build does not lose its reactions
+/// every time they pass through this one — this build simply does not draw them.
+pub const REACTION_NONE: u8 = 0;
+pub const REACTION_UP: u8 = 1;
+pub const REACTION_DOWN: u8 = 2;
+
+/// Reactions one frame may carry. 121 bytes each, so a full batch is under 4 KiB
+/// and stays inside the budget a chat line already occupies.
+pub const CHANNEL_REACTION_MAX_PER_FRAME: usize = 32;
+
+/// One member's reaction to one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelReaction {
+    pub target_msg_id: [u8; 16],
+    pub member: [u8; 32],
+    pub reaction: u8,
+    pub reacted_at: i64,
+    pub signature: [u8; 64],
+}
+
+/// What a reaction's signature covers.
+///
+/// `reacted_at` is in the preimage and in each entry rather than being taken
+/// from the envelope, because a batch carries reactions made at different times
+/// under one envelope timestamp. It is also what orders competing reactions from
+/// the same member, so it has to be something they signed.
+fn reaction_sig_preimage(
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    reacted_at: i64,
+    member: &[u8; 32],
+    reaction: u8,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REACTION_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 1);
+    out.extend_from_slice(REACTION_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&reacted_at.to_le_bytes());
+    out.extend_from_slice(member);
+    out.push(reaction);
+    out
+}
+
+pub fn reaction_signature(
+    signing_key: &SigningKey,
+    member: &[u8; 32],
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    reacted_at: i64,
+    reaction: u8,
+) -> [u8; 64] {
+    crypto::sign(
+        signing_key,
+        &reaction_sig_preimage(channel_id, target_msg_id, reacted_at, member, reaction),
+    )
+}
+
+/// `version || count(1) || [target(16) || member(32) || reaction(1) || reacted_at(8) || sig(64)]*`.
+///
+/// Entries past [`CHANNEL_REACTION_MAX_PER_FRAME`] are dropped rather than
+/// splitting here: the caller decides how to page a large room's backlog, and a
+/// silently oversized frame would be refused by every receiver.
+pub fn encode_channel_reactions(entries: &[ChannelReaction]) -> Vec<u8> {
+    let take = entries.len().min(CHANNEL_REACTION_MAX_PER_FRAME);
+    let mut out = Vec::with_capacity(2 + take * REACTION_ENTRY_LEN);
+    out.push(REACTION_PLAIN_VERSION);
+    out.push(take as u8);
+    for entry in &entries[..take] {
+        out.extend_from_slice(&entry.target_msg_id);
+        out.extend_from_slice(&entry.member);
+        out.push(entry.reaction);
+        out.extend_from_slice(&entry.reacted_at.to_le_bytes());
+        out.extend_from_slice(&entry.signature);
+    }
+    out
+}
+
+const REACTION_ENTRY_LEN: usize = 16 + 32 + 1 + 8 + 64;
+
+/// Every entry in a reaction frame whose signature holds.
+///
+/// Entries are verified one at a time and a bad one is skipped rather than
+/// failing the frame: a batch is an aggregate of independent claims by different
+/// members, so one member's forged entry must not discard everyone else's real
+/// ones. Returns `None` only when the frame itself is malformed.
+pub fn decode_channel_reactions(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+) -> Option<Vec<ChannelReaction>> {
+    if bytes.len() < 2 || bytes[0] != REACTION_PLAIN_VERSION {
+        return None;
+    }
+    let count = bytes[1] as usize;
+    if count == 0 || count > CHANNEL_REACTION_MAX_PER_FRAME {
+        return None;
+    }
+    if bytes.len() != 2 + count * REACTION_ENTRY_LEN {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 2 + i * REACTION_ENTRY_LEN;
+        let mut target = [0u8; 16];
+        target.copy_from_slice(&bytes[at..at + 16]);
+        let mut member = [0u8; 32];
+        member.copy_from_slice(&bytes[at + 16..at + 48]);
+        let reaction = bytes[at + 48];
+        let Ok(ts_bytes) = bytes[at + 49..at + 57].try_into() else {
+            continue;
+        };
+        let reacted_at = i64::from_le_bytes(ts_bytes);
+        let Ok(sig) = <[u8; 64]>::try_from(&bytes[at + 57..at + REACTION_ENTRY_LEN]) else {
+            continue;
+        };
+        let Some(author) = crypto::verifying_key_from_bytes(&member) else {
+            continue;
+        };
+        if !crypto::verify(
+            &author,
+            &reaction_sig_preimage(channel_id, &target, reacted_at, &member, reaction),
+            &sig,
+        ) {
+            continue;
+        }
+        out.push(ChannelReaction {
+            target_msg_id: target,
+            member,
+            reaction,
+            reacted_at,
+            signature: sig,
+        });
+    }
+    Some(out)
 }
 
 fn mod_action_preimage(
@@ -2420,6 +2787,172 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let sig = chat_author_signature(sk, &pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, text);
         encode_channel_chat_plain_presigned(&pk, &sig, text)
+    }
+
+    /// A revision of `CHAT_MSG_ID` signed by `sk`, dated `edited_at`.
+    fn edit_frame(sk: &SigningKey, text: &str, edited_at: i64) -> Vec<u8> {
+        let pk = sk.verifying_key().to_bytes();
+        let sig = edit_author_signature(
+            sk,
+            &pk,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            edited_at,
+            text,
+        );
+        encode_channel_chat_edit_presigned(&pk, &CHAT_MSG_ID, CHAT_TS, edited_at, &sig, text)
+    }
+
+    fn reaction_entry(sk: &SigningKey, target: [u8; 16], reaction: u8, at: i64) -> ChannelReaction {
+        let pk = sk.verifying_key().to_bytes();
+        let signature = reaction_signature(sk, &pk, &CHAT_CHANNEL, &target, at, reaction);
+        ChannelReaction {
+            target_msg_id: target,
+            member: pk,
+            reaction,
+            reacted_at: at,
+            signature,
+        }
+    }
+
+    #[test]
+    fn an_edit_round_trips_and_is_bound_to_its_author_room_and_target() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob = SigningKey::generate(&mut rand::rngs::OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+
+        let frame = edit_frame(&alice, "fixed the typo", CHAT_TS + 30);
+        let edit = decode_channel_chat_edit(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(edit.sender, alice_pk);
+        assert_eq!(edit.target_msg_id, CHAT_MSG_ID);
+        assert_eq!(edit.original_timestamp, CHAT_TS);
+        assert_eq!(edit.edited_at, CHAT_TS + 30);
+        assert_eq!(edit.text, "fixed the typo");
+
+        // Re-serving on a catch-up rebuilds the same bytes from the stored
+        // parts, so a member can pass on somebody else's revision without being
+        // able to author one.
+        let replayed = encode_channel_chat_edit_presigned(
+            &edit.sender,
+            &edit.target_msg_id,
+            edit.original_timestamp,
+            edit.edited_at,
+            &edit.signature,
+            &edit.text,
+        );
+        assert_eq!(replayed, frame);
+
+        // Wrong room, and a body claiming an author who did not sign it.
+        assert!(decode_channel_chat_edit(&frame, &[9u8; 16]).is_none());
+        let mut forged = frame.clone();
+        forged[1..33].copy_from_slice(&bob.verifying_key().to_bytes());
+        assert!(
+            decode_channel_chat_edit(&forged, &CHAT_CHANNEL).is_none(),
+            "an edit naming another member must not be attributed to them"
+        );
+
+        // Every signed field is load-bearing: flipping the target, either
+        // timestamp, or the text must all invalidate it.
+        for byte in [33usize, 49, 57, frame.len() - 1] {
+            let mut tampered = frame.clone();
+            tampered[byte] ^= 0xFF;
+            assert!(
+                decode_channel_chat_edit(&tampered, &CHAT_CHANNEL).is_none(),
+                "byte {byte} is inside the signed preimage and must not be malleable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edit_window_needs_both_the_authors_clock_and_our_own() {
+        let sent = 1_000_000i64;
+        let seen = 2_000_000i64;
+
+        // Inside the window on both clocks.
+        assert!(edit_within_window(sent, sent + 60, seen, seen + 60));
+        // The author claims a gap wider than the window.
+        assert!(!edit_within_window(
+            sent,
+            sent + CHANNEL_EDIT_WINDOW_SECS + 1,
+            seen,
+            seen + 60
+        ));
+        // The author claims a tight gap, but we have held the line for a day —
+        // this is the backdating case the second clock exists to refuse.
+        assert!(!edit_within_window(sent, sent + 60, seen, seen + 86_400));
+        // An edit dated before the line it revises is nonsense.
+        assert!(!edit_within_window(sent, sent - 1, seen, seen + 60));
+        // A row from before `first_seen_at` existed is judged on the author's
+        // clock alone rather than refused outright.
+        assert!(edit_within_window(sent, sent + 60, 0, seen + 86_400));
+    }
+
+    #[test]
+    fn a_reaction_batch_verifies_each_entry_independently() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob = SigningKey::generate(&mut rand::rngs::OsRng);
+        let other_target = [7u8; 16];
+
+        let entries = vec![
+            reaction_entry(&alice, CHAT_MSG_ID, REACTION_UP, CHAT_TS + 1),
+            reaction_entry(&bob, CHAT_MSG_ID, REACTION_DOWN, CHAT_TS + 2),
+            // One batch may span several lines, which is what makes a catch-up
+            // affordable.
+            reaction_entry(&alice, other_target, REACTION_UP, CHAT_TS + 3),
+        ];
+        let frame = encode_channel_reactions(&entries);
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, entries);
+
+        // A forged entry is dropped on its own; the genuine ones beside it
+        // survive, because a batch is a bundle of independent claims.
+        let mut tampered = frame.clone();
+        let second = 2 + REACTION_ENTRY_LEN;
+        tampered[second + 48] = REACTION_UP;
+        let decoded = decode_channel_reactions(&tampered, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded.len(), 2, "only the edited entry should be discarded");
+        assert!(decoded.iter().all(|e| e.member != bob.verifying_key().to_bytes()));
+
+        // Wrong room invalidates the whole batch, entry by entry.
+        assert!(decode_channel_reactions(&frame, &[9u8; 16])
+            .unwrap()
+            .is_empty());
+
+        // A malformed frame is refused rather than partially read.
+        assert!(decode_channel_reactions(&frame[..frame.len() - 1], &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_reactions(&[REACTION_PLAIN_VERSION, 0], &CHAT_CHANNEL).is_none());
+    }
+
+    #[test]
+    fn a_reaction_value_this_build_does_not_draw_still_survives_a_round_trip() {
+        // Forward compatibility: a newer build's reaction has to reach the rest
+        // of the room through this one, or a mixed-version room loses reactions
+        // every time one passes through an older peer.
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let future = reaction_entry(&alice, CHAT_MSG_ID, 200, CHAT_TS + 1);
+        let frame = encode_channel_reactions(std::slice::from_ref(&future));
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, vec![future]);
+    }
+
+    #[test]
+    fn a_reaction_batch_refuses_more_than_one_frame_holds() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entries: Vec<ChannelReaction> = (0..CHANNEL_REACTION_MAX_PER_FRAME + 5)
+            .map(|i| {
+                let mut target = [0u8; 16];
+                target[0] = i as u8;
+                reaction_entry(&alice, target, REACTION_UP, CHAT_TS + i as i64)
+            })
+            .collect();
+        let frame = encode_channel_reactions(&entries);
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(
+            decoded.len(),
+            CHANNEL_REACTION_MAX_PER_FRAME,
+            "the encoder must clamp rather than emit a frame no receiver accepts"
+        );
     }
 
     #[test]

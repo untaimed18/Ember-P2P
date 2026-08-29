@@ -26,7 +26,79 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 40;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 41;
+
+/// One row of a room's history as the UI needs it.
+///
+/// A struct rather than the tuple this used to be: it had six fields and was
+/// about to gain two more, and a positional `(i64, String, String, String, i64,
+/// bool, i64, String)` at three call sites is a silent mismatch waiting to
+/// happen.
+#[derive(Debug, Clone)]
+pub struct ChannelMessageRow {
+    pub id: i64,
+    pub sender_pubkey: String,
+    pub direction: String,
+    pub message: String,
+    pub timestamp: i64,
+    pub read: bool,
+    /// 0 when the line has never been revised.
+    pub edited_at: i64,
+    /// Wire identity, needed to address reactions and revisions across devices.
+    pub msg_id: String,
+}
+
+/// One line as it goes back on the wire for a member catching up.
+///
+/// An edited row is re-served as the *revision*, not as the original followed by
+/// it: the edit frame carries the original's timestamp so it stands alone, which
+/// halves the frames a catch-up costs and means the pre-edit text does not have
+/// to be kept anywhere.
+#[derive(Debug, Clone)]
+pub struct ChannelSyncRow {
+    pub msg_id: String,
+    pub sender_pubkey: String,
+    pub message: String,
+    pub timestamp: i64,
+    /// The author's signature over the line as first sent. Empty for a row this
+    /// device only ever saw as a revision.
+    pub author_sig: String,
+    pub edited_at: i64,
+    /// The author's signature over the revision. Empty if never revised.
+    pub edit_sig: String,
+}
+
+/// What a caller needs to know before revising or reacting to a stored line.
+#[derive(Debug, Clone)]
+pub struct ChannelEditTarget {
+    pub msg_id: String,
+    pub sender_pubkey: String,
+    pub direction: String,
+    pub timestamp: i64,
+    pub first_seen_at: i64,
+}
+
+/// What a verified edit frame did to our copy of the line it names.
+///
+/// The refusals are values rather than errors because none of them is a fault:
+/// they are the ordinary outcomes of a room with no arbiter of time or order,
+/// and the caller logs them at debug and moves on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelEditOutcome {
+    /// Applied to a line we already held. Carries the local row id so the UI can
+    /// be told which bubble changed.
+    Applied(i64),
+    /// The line was not here, so the frame's own copy of it was stored. This is
+    /// the catch-up path: a member who was away is handed the revision instead of
+    /// the original followed by it.
+    Created(i64),
+    /// Signed by somebody other than the line's author.
+    NotAuthor,
+    /// The 15-minute window had closed on at least one of the two clocks.
+    OutsideWindow,
+    /// We already hold this revision or a later one.
+    NotNewer,
+}
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
 /// flag is the durable "has ever been cryptographically verified" anchor.
@@ -1816,6 +1888,61 @@ impl Database {
                 [],
             )?;
             set_version(&tx, 40)?;
+            tx.commit()?;
+        }
+
+        if version < 41 {
+            // Message revisions and reactions.
+            //
+            // `edited_at` of 0 means never revised, which is every row an
+            // upgrade inherits. `edit_sig` keeps the author's signature over the
+            // revision so a catch-up can replay it without this device being
+            // able to author one, exactly as `author_sig` does for the original.
+            //
+            // `first_seen_at` is this device's own clock when the row first
+            // landed, and is the half of the edit window an author cannot lie
+            // about. Existing rows get 0, which
+            // `channel::edit_within_window` reads as "judge this on the author's
+            // clock alone" rather than refusing every edit to a line that
+            // predates the upgrade.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "edited_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "edit_sig",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channel_messages",
+                "first_seen_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            // One row per (line, member): a member holds one reaction at a time,
+            // and changing it replaces rather than accumulates. `reacted_at`
+            // orders competing claims the way `ban_revised_at` does for
+            // moderation, so a stale frame arriving late cannot undo a newer
+            // one. `sig` is kept so the entry can be re-served on a catch-up.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_message_reactions (
+                    channel_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    member_pubkey TEXT NOT NULL,
+                    reaction INTEGER NOT NULL,
+                    reacted_at INTEGER NOT NULL,
+                    sig TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (channel_id, msg_id, member_pubkey)
+                );
+                CREATE INDEX IF NOT EXISTS idx_channel_reactions_msg
+                    ON channel_message_reactions(channel_id, msg_id);",
+            )?;
+            set_version(&tx, 41)?;
             tx.commit()?;
         }
 
@@ -4335,6 +4462,10 @@ impl Database {
                 params![channel_id],
             )?;
             tx.execute(
+                "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.execute(
                 "DELETE FROM channel_members WHERE channel_id = ?1",
                 params![channel_id],
             )?;
@@ -4400,6 +4531,10 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM channel_messages WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
             params![channel_id],
         )?;
         // Any half-finished handoff goes with the room. Left behind it is an
@@ -4924,8 +5059,8 @@ impl Database {
             }
         };
         let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
-        for (id, sender, direction, message, timestamp, read) in history.into_iter().rev() {
-            let msg_id = format!("handoff-{old_channel_id}-{id}");
+        for row in history.into_iter().rev() {
+            let msg_id = format!("handoff-{old_channel_id}-{}", row.id);
             // No signature travels with a handoff copy. The author signed the
             // line against the *old* room's id, so the original does not verify
             // under the successor's, and re-signing here is the forgery the
@@ -4933,13 +5068,13 @@ impl Database {
             // is not re-served to anyone else.
             let _ = self.insert_channel_message(
                 successor_channel_id,
-                &sender,
-                &direction,
-                &message,
+                &row.sender_pubkey,
+                &row.direction,
+                &row.message,
                 &msg_id,
-                timestamp,
+                row.timestamp,
                 "",
-                read,
+                row.read,
             );
         }
         let _ = self.clear_handoff_pending(old_channel_id);
@@ -5524,8 +5659,8 @@ impl Database {
             chrono::Utc::now().timestamp()
         };
         tx.execute(
-            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO channel_messages (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 channel_id,
                 sender_pubkey,
@@ -5534,7 +5669,11 @@ impl Database {
                 now,
                 if read { 1 } else { 0 },
                 msg_id,
-                author_sig
+                author_sig,
+                // Our clock, not the author's: this is what closes the edit
+                // window against a backdated revision, so it must not be
+                // something the sender can choose.
+                chrono::Utc::now().timestamp()
             ],
         )?;
         if tx.changes() == 0 {
@@ -5587,6 +5726,19 @@ impl Database {
              )",
             params![channel_id, MAX_MESSAGES_PER_CHANNEL],
         )?;
+        // Reactions belong to a line, and nothing else deletes them — so without
+        // this they outlive the history they annotate and grow without bound in a
+        // busy room. Only swept when the prune above actually removed something,
+        // because this runs on every insert.
+        if tx.changes() > 0 {
+            tx.execute(
+                "DELETE FROM channel_message_reactions
+                 WHERE channel_id = ?1 AND msg_id NOT IN (
+                     SELECT msg_id FROM channel_messages WHERE channel_id = ?1
+                 )",
+                params![channel_id],
+            )?;
+        }
         tx.commit()?;
         Ok(new_id)
     }
@@ -5603,15 +5755,15 @@ impl Database {
         channel_id: &str,
         needle: &str,
         limit: i64,
-    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
+    ) -> anyhow::Result<Vec<ChannelMessageRow>> {
         let needle = needle.trim().to_lowercase();
         if needle.is_empty() || limit <= 0 {
             return Ok(Vec::new());
         }
-        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+        let rows: Vec<(i64, String, String, String, i64, bool, i64, String)> = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, sender_pubkey, direction, message, timestamp, read
+                "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id
                  FROM channel_messages WHERE channel_id = ?1
                  ORDER BY id DESC",
             )?;
@@ -5623,6 +5775,8 @@ impl Database {
                     row.get(3)?,
                     row.get(4)?,
                     row.get::<_, i64>(5)? != 0,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
@@ -5633,7 +5787,7 @@ impl Database {
             return Ok(Vec::new());
         };
         let mut hits = Vec::new();
-        for (id, sender, direction, stored, timestamp, read) in rows {
+        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id) in rows {
             if hits.len() as i64 >= limit {
                 break;
             }
@@ -5643,7 +5797,16 @@ impl Database {
                 continue;
             };
             if message.to_lowercase().contains(&needle) {
-                hits.push((id, sender, direction, message, timestamp, read));
+                hits.push(ChannelMessageRow {
+                    id,
+                    sender_pubkey: sender,
+                    direction,
+                    message,
+                    timestamp,
+                    read,
+                    edited_at,
+                    msg_id,
+                });
             }
         }
         Ok(hits)
@@ -5653,10 +5816,22 @@ impl Database {
     /// member holds is untouched, and nothing is gossiped.
     pub fn delete_channel_message(&self, channel_id: &str, id: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        // Ahead of the message, while its `msg_id` is still resolvable. Forgetting
+        // a line on this device forgets what was voted on it too — leaving the
+        // reactions behind would keep a count alive for a bubble that is gone.
+        tx.execute(
+            "DELETE FROM channel_message_reactions
+             WHERE channel_id = ?1
+               AND msg_id = (SELECT msg_id FROM channel_messages
+                             WHERE channel_id = ?1 AND id = ?2)",
+            params![channel_id, id],
+        )?;
+        let n = tx.execute(
             "DELETE FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
             params![channel_id, id],
         )?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -5665,78 +5840,79 @@ impl Database {
         channel_id: &str,
         limit: i64,
         before_id: Option<i64>,
-    ) -> anyhow::Result<Vec<(i64, String, String, String, i64, bool)>> {
-        let rows: Vec<(i64, String, String, String, i64, bool)> = {
+    ) -> anyhow::Result<Vec<ChannelMessageRow>> {
+        let rows: Vec<(i64, String, String, String, i64, bool, i64, String)> = {
             let conn = self.conn.lock();
+            let read_row = |row: &rusqlite::Row<'_>| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            };
             if let Some(bid) = before_id {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id
                      FROM channel_messages WHERE channel_id = ?1 AND id < ?2
                      ORDER BY id DESC LIMIT ?3",
                 )?;
-                let mapped = stmt.query_map(params![channel_id, bid, limit], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                    ))
-                })?;
+                let mapped = stmt.query_map(params![channel_id, bid, limit], read_row)?;
                 mapped.collect::<Result<Vec<_>, _>>()?
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, sender_pubkey, direction, message, timestamp, read
+                    "SELECT id, sender_pubkey, direction, message, timestamp, read, edited_at, msg_id
                      FROM channel_messages WHERE channel_id = ?1
                      ORDER BY id DESC LIMIT ?2",
                 )?;
-                let mapped = stmt.query_map(params![channel_id, limit], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                    ))
-                })?;
+                let mapped = stmt.query_map(params![channel_id, limit], read_row)?;
                 mapped.collect::<Result<Vec<_>, _>>()?
             }
         };
         let Some(chat_key) = self.chat_key.as_deref() else {
             return Ok(rows
                 .into_iter()
-                .map(|(id, sender, direction, _, timestamp, read)| {
-                    (
-                        id,
-                        sender,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                    )
-                })
+                .map(
+                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id)| {
+                        ChannelMessageRow {
+                            id,
+                            sender_pubkey: sender,
+                            direction,
+                            message: CHAT_UNAVAILABLE_TEXT.to_string(),
+                            timestamp,
+                            read,
+                            edited_at,
+                            msg_id,
+                        }
+                    },
+                )
                 .collect());
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, sender, direction, stored, timestamp, read) in rows {
-            match Self::decrypt_channel_message_body(
+        for (id, sender, direction, stored, timestamp, read, edited_at, msg_id) in rows {
+            let message = match Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
-                Ok(message) => messages.push((id, sender, direction, message, timestamp, read)),
+                Ok(message) => message,
                 Err(error) => {
                     tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
-                    messages.push((
-                        id,
-                        sender,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                    ));
+                    CHAT_UNAVAILABLE_TEXT.to_string()
                 }
-            }
+            };
+            messages.push(ChannelMessageRow {
+                id,
+                sender_pubkey: sender,
+                direction,
+                message,
+                timestamp,
+                read,
+                edited_at,
+                msg_id,
+            });
         }
         Ok(messages)
     }
@@ -5772,14 +5948,22 @@ impl Database {
         channel_id: &str,
         since_ts: i64,
         limit: i64,
-    ) -> anyhow::Result<Vec<(String, String, String, i64, String)>> {
+    ) -> anyhow::Result<Vec<ChannelSyncRow>> {
         let limit = limit.clamp(1, 64);
-        let rows: Vec<(i64, String, String, String, String, i64, String)> = {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, String, String, String, i64, String, i64, String)> = {
             let conn = self.conn.lock();
+            // Either signature makes a row re-servable: the author's over the
+            // line as first sent, or theirs over the revision that replaced it. A
+            // row carrying neither predates signed chat, or is a handoff copy
+            // signed against a room that no longer exists, and cannot be proved
+            // to anyone.
             let mut stmt = conn.prepare(
-                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig
+                "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig,
+                        edited_at, edit_sig
                  FROM channel_messages
-                 WHERE channel_id = ?1 AND timestamp >= ?2 AND author_sig <> ''
+                 WHERE channel_id = ?1 AND timestamp >= ?2
+                   AND (author_sig <> '' OR edit_sig <> '')
                  ORDER BY timestamp DESC, id DESC
                  LIMIT ?3",
             )?;
@@ -5792,6 +5976,8 @@ impl Database {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
@@ -5800,14 +5986,270 @@ impl Database {
             return Ok(Vec::new());
         };
         let mut out = Vec::with_capacity(rows.len());
-        for (id, msg_id, sender, direction, stored, timestamp, author_sig) in rows {
+        for (id, msg_id, sender, direction, stored, timestamp, author_sig, edited_at, edit_sig) in
+            rows
+        {
             if let Ok(message) = Self::decrypt_channel_message_body(
                 chat_key, id, channel_id, &direction, timestamp, &stored,
             ) {
-                out.push((msg_id, sender, message, timestamp, author_sig));
+                out.push(ChannelSyncRow {
+                    msg_id,
+                    sender_pubkey: sender,
+                    message,
+                    timestamp,
+                    author_sig,
+                    edited_at,
+                    edit_sig,
+                });
             }
         }
         Ok(out)
+    }
+
+    /// The few fields deciding whether a local edit or reaction is allowed.
+    ///
+    /// Kept separate from [`Self::get_channel_messages`] so the command path does
+    /// not decrypt and page a whole room to answer a question about one line.
+    pub fn channel_message_edit_target(
+        &self,
+        channel_id: &str,
+        id: i64,
+    ) -> anyhow::Result<Option<ChannelEditTarget>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT msg_id, sender_pubkey, direction, timestamp, first_seen_at
+                 FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
+                params![channel_id, id],
+                |row| {
+                    Ok(ChannelEditTarget {
+                        msg_id: row.get(0)?,
+                        sender_pubkey: row.get(1)?,
+                        direction: row.get(2)?,
+                        timestamp: row.get(3)?,
+                        first_seen_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Apply an author's revision of one of their own lines.
+    ///
+    /// Every check that decides whether a revision is legitimate lives here
+    /// rather than in the caller, so the network path and a catch-up cannot
+    /// diverge on it:
+    ///
+    /// * the editor must be the key that authored the line — a signature proves
+    ///   who asked, not that they were entitled to;
+    /// * the window must still be open on both clocks
+    ///   ([`crate::network::ember::channel::edit_within_window`]);
+    /// * and a revision must be newer than the one we already applied, so a
+    ///   frame that arrives late over a slower path cannot undo a newer one.
+    ///
+    /// The pre-edit text is overwritten, not archived. Editing out something you
+    /// regret would be worth little if the first version stayed on every
+    /// member's disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_channel_message_edit(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        editor_pubkey: &str,
+        original_timestamp: i64,
+        edited_at: i64,
+        text: &str,
+        edit_sig: &str,
+        now: i64,
+    ) -> anyhow::Result<ChannelEditOutcome> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<(i64, String, String, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT id, sender_pubkey, direction, timestamp, edited_at, first_seen_at
+                 FROM channel_messages WHERE channel_id = ?1 AND msg_id = ?2",
+                params![channel_id, msg_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let (id, direction, row_timestamp, created) = match existing {
+            Some((id, sender, direction, timestamp, prior_edit, first_seen_at)) => {
+                if !sender.eq_ignore_ascii_case(editor_pubkey) {
+                    return Ok(ChannelEditOutcome::NotAuthor);
+                }
+                if edited_at <= prior_edit {
+                    return Ok(ChannelEditOutcome::NotNewer);
+                }
+                if !crate::network::ember::channel::edit_within_window(
+                    timestamp,
+                    edited_at,
+                    first_seen_at,
+                    now,
+                ) {
+                    return Ok(ChannelEditOutcome::OutsideWindow);
+                }
+                (id, direction, timestamp, false)
+            }
+            None => {
+                // Catch-up: judged on the author's clock alone, because a line we
+                // never held has no first-seen time to check against. Stored as
+                // `received`, since a revision only reaches us from elsewhere.
+                if !crate::network::ember::channel::edit_within_window(
+                    original_timestamp,
+                    edited_at,
+                    0,
+                    now,
+                ) {
+                    return Ok(ChannelEditOutcome::OutsideWindow);
+                }
+                tx.execute(
+                    "INSERT INTO channel_messages
+                        (channel_id, sender_pubkey, direction, message, timestamp, read, msg_id, author_sig, first_seen_at)
+                     VALUES (?1, ?2, 'received', ?3, ?4, 0, ?5, '', ?6)",
+                    params![
+                        channel_id,
+                        editor_pubkey,
+                        CHAT_CIPHERTEXT_PREFIX,
+                        original_timestamp,
+                        msg_id,
+                        now
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                (id, "received".to_string(), original_timestamp, true)
+            }
+        };
+
+        let encrypted = Self::encrypt_channel_message_body(
+            self.require_chat_key()?,
+            id,
+            channel_id,
+            &direction,
+            row_timestamp,
+            text,
+        )?;
+        tx.execute(
+            "UPDATE channel_messages SET message = ?1, edited_at = ?2, edit_sig = ?3 WHERE id = ?4",
+            params![encrypted, edited_at, edit_sig, id],
+        )?;
+        tx.commit()?;
+        Ok(if created {
+            ChannelEditOutcome::Created(id)
+        } else {
+            ChannelEditOutcome::Applied(id)
+        })
+    }
+
+    /// Record one member's reaction to one line, newest claim winning.
+    ///
+    /// Returns whether anything changed, so a caller can skip telling the UI
+    /// about a frame that only repeated what we already had — reactions arrive
+    /// several times over in a gossip mesh.
+    ///
+    /// Deliberately does not require the line to be present. A reaction can
+    /// legitimately arrive before the message it points at (different paths,
+    /// different hop counts), and dropping it would lose it for good; kept this
+    /// way the count is simply right the moment the line lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_channel_message_reaction(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        member_pubkey: &str,
+        reaction: u8,
+        reacted_at: i64,
+        sig: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT INTO channel_message_reactions
+                 (channel_id, msg_id, member_pubkey, reaction, reacted_at, sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(channel_id, msg_id, member_pubkey) DO UPDATE SET
+                 reaction = excluded.reaction,
+                 reacted_at = excluded.reacted_at,
+                 sig = excluded.sig
+             WHERE channel_message_reactions.reacted_at < excluded.reacted_at",
+            params![
+                channel_id,
+                msg_id,
+                member_pubkey.to_ascii_lowercase(),
+                reaction as i64,
+                reacted_at,
+                sig
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every live reaction in a room, keyed by the line it belongs to.
+    ///
+    /// `REACTION_NONE` rows are dropped here rather than deleted on receipt: a
+    /// cleared reaction has to stay on disk to carry its `reacted_at`, or a stale
+    /// frame reasserting the old one would win the newer-wins comparison against
+    /// a missing row.
+    pub fn channel_message_reactions(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Vec<(String, String, u8)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, member_pubkey, reaction FROM channel_message_reactions
+             WHERE channel_id = ?1 AND reaction <> 0",
+        )?;
+        let mapped = stmt.query_map(params![channel_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u8,
+            ))
+        })?;
+        Ok(mapped.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Reactions worth handing to a member catching up, newest first.
+    ///
+    /// Cleared reactions are included, unlike [`Self::channel_message_reactions`]:
+    /// a member who missed both the reaction and its removal needs the removal
+    /// too, or they would show a reaction its owner has taken back.
+    pub fn list_channel_reactions_for_sync(
+        &self,
+        channel_id: &str,
+        since_ts: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, String, u8, i64, String)>> {
+        let limit = limit.clamp(1, 256);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT r.msg_id, r.member_pubkey, r.reaction, r.reacted_at, r.sig
+             FROM channel_message_reactions r
+             JOIN channel_messages m
+                 ON m.channel_id = r.channel_id AND m.msg_id = r.msg_id
+             WHERE r.channel_id = ?1 AND r.sig <> '' AND m.timestamp >= ?2
+             ORDER BY r.reacted_at DESC
+             LIMIT ?3",
+        )?;
+        let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u8,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        Ok(mapped.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn latest_channel_message_timestamp(&self, channel_id: &str) -> anyhow::Result<i64> {
@@ -6938,9 +7380,9 @@ mod tests {
             .unwrap();
         let msgs = db.get_channel_messages(&channel_id, 50, None).unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].0, id);
-        assert_eq!(msgs[0].3, "hello room");
-        assert_eq!(msgs[0].4, 1_700_000_000);
+        assert_eq!(msgs[0].id, id);
+        assert_eq!(msgs[0].message, "hello room");
+        assert_eq!(msgs[0].timestamp, 1_700_000_000);
         let newer_id = "bb".repeat(16);
         db.insert_channel_message(
             &channel_id,
@@ -6958,7 +7400,7 @@ mod tests {
             .unwrap();
         assert_eq!(sync.len(), 2);
         assert_eq!(
-            sync[0].0, newer_id,
+            sync[0].msg_id, newer_id,
             "catch-up with since=0 must offer newest first, not oldest"
         );
 
@@ -6972,6 +7414,197 @@ mod tests {
         assert!(
             db.list_channel_members(&channel_id).unwrap().is_empty(),
             "no member is preserved when the caller keeps nobody"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_channel_edit_needs_the_author_the_window_and_a_newer_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-edit-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "ab".repeat(16);
+        let author = "cd".repeat(32);
+        let other = "ef".repeat(32);
+        db.insert_channel(&channel_id, &author, "Lobby", "public", true, None, None)
+            .unwrap();
+        let msg_id = "aa".repeat(16);
+        let sent = chrono::Utc::now().timestamp();
+        let id = db
+            .insert_channel_message(
+                &channel_id,
+                &author,
+                "sent",
+                "orignal typo",
+                &msg_id,
+                sent,
+                &"11".repeat(64),
+                true,
+            )
+            .unwrap();
+
+        // Somebody else's signature over the same line is not authority to change
+        // it, however valid the signature itself was.
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &other, sent, sent + 5, "hijacked", "22", sent + 5
+            )
+            .unwrap(),
+            ChannelEditOutcome::NotAuthor
+        );
+
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &author, sent, sent + 30, "original typo", "33", sent + 30
+            )
+            .unwrap(),
+            ChannelEditOutcome::Applied(id)
+        );
+        let rows = db.get_channel_messages(&channel_id, 10, None).unwrap();
+        assert_eq!(rows[0].message, "original typo");
+        assert_eq!(rows[0].edited_at, sent + 30);
+
+        // A revision we already have, or an older one arriving late over a slower
+        // path, must not undo the newer text.
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id, &msg_id, &author, sent, sent + 10, "stale", "44", sent + 40
+            )
+            .unwrap(),
+            ChannelEditOutcome::NotNewer
+        );
+        assert_eq!(
+            db.get_channel_messages(&channel_id, 10, None).unwrap()[0].message,
+            "original typo"
+        );
+
+        // Past the window on our own clock, which is the half the author cannot
+        // lie about: `first_seen_at` was stamped when the row landed.
+        assert_eq!(
+            db.apply_channel_message_edit(
+                &channel_id,
+                &msg_id,
+                &author,
+                sent,
+                sent + 60,
+                "too late",
+                "55",
+                sent + 86_400,
+            )
+            .unwrap(),
+            ChannelEditOutcome::OutsideWindow
+        );
+
+        // A revision for a line this device never held stands on its own, which is
+        // how a member who was away receives it.
+        let unseen = "bb".repeat(16);
+        let created = db
+            .apply_channel_message_edit(
+                &channel_id, &unseen, &other, sent, sent + 20, "caught up", "66", sent + 20,
+            )
+            .unwrap();
+        assert!(matches!(created, ChannelEditOutcome::Created(_)));
+        let sync = db.list_channel_messages_for_sync(&channel_id, 0, 32).unwrap();
+        assert!(
+            sync.iter().any(|row| row.msg_id == unseen && !row.edit_sig.is_empty()),
+            "a row known only as a revision must still be re-servable"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn channel_reactions_are_newest_wins_and_do_not_outlive_their_message() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-reactions-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "ab".repeat(16);
+        let me = "cd".repeat(32);
+        let them = "ef".repeat(32);
+        db.insert_channel(&channel_id, &me, "Lobby", "public", true, None, None)
+            .unwrap();
+        let msg_id = "aa".repeat(16);
+        let id = db
+            .insert_channel_message(
+                &channel_id,
+                &me,
+                "sent",
+                "worth a vote",
+                &msg_id,
+                1_700_000_000,
+                &"11".repeat(64),
+                true,
+            )
+            .unwrap();
+
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &msg_id, &me, 1, 10, "aa")
+            .unwrap());
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &msg_id, &them, 2, 11, "bb")
+            .unwrap());
+        let tally = db.channel_message_reactions(&channel_id).unwrap();
+        assert_eq!(tally.len(), 2);
+
+        // One row per member: changing your mind replaces rather than accumulates.
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &msg_id, &me, 2, 20, "cc")
+            .unwrap());
+        let tally = db.channel_message_reactions(&channel_id).unwrap();
+        assert_eq!(tally.len(), 2);
+        assert!(tally.iter().all(|(_, _, reaction)| *reaction == 2));
+
+        // A stale frame arriving late must not undo the newer claim.
+        assert!(!db
+            .set_channel_message_reaction(&channel_id, &msg_id, &me, 1, 15, "dd")
+            .unwrap());
+        assert!(db
+            .channel_message_reactions(&channel_id)
+            .unwrap()
+            .iter()
+            .all(|(_, _, reaction)| *reaction == 2));
+
+        // Withdrawn reactions stay on disk to carry their timestamp, but stop
+        // being counted.
+        assert!(db
+            .set_channel_message_reaction(&channel_id, &msg_id, &them, 0, 30, "ee")
+            .unwrap());
+        assert_eq!(db.channel_message_reactions(&channel_id).unwrap().len(), 1);
+        assert!(
+            !db.set_channel_message_reaction(&channel_id, &msg_id, &them, 2, 25, "ff")
+                .unwrap(),
+            "a withdrawal must not be undone by an older frame reasserting the reaction"
+        );
+
+        // Forgetting the line forgets what was voted on it, or the rows outlive
+        // every bubble that could show them.
+        assert!(db.delete_channel_message(&channel_id, id).unwrap());
+        assert!(
+            db.channel_message_reactions(&channel_id).unwrap().is_empty(),
+            "reactions must not survive the message they belong to"
         );
 
         drop(db);
@@ -7758,7 +8391,7 @@ mod tests {
         );
         let copied = db.get_channel_messages(&successor_id, 10, None).unwrap();
         assert!(
-            copied[0].5,
+            copied[0].read,
             "a read received line must stay read on the successor"
         );
         assert_eq!(
@@ -8323,7 +8956,7 @@ mod tests {
         assert_eq!(new_row.predecessor_id, old_id);
         let history = db.get_channel_messages(&new_id, 50, None).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].3, "keep me");
+        assert_eq!(history[0].message, "keep me");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
