@@ -2093,7 +2093,7 @@
   "settings_friend_chat_disabled": "Desactivar chat con amigos",
   "settings_friend_chat_disabled_hint": "Ignorar los mensajes de chat y las ofertas de archivo no solicitadas de los amigos. Tampoco podrás enviar mensajes.",
   "settings_friend_browse_disabled": "Desactivar exploración de amigos",
-  "settings_friend_browse_disabled_hint": "No responder a las solicitudes de exploración de carpetas compartidas de los amigos. Tu lista de archivos compartidos permanece privada y tampoco podrás explorar las carpetas compartidas de tus amigos.",
+  "settings_friend_browse_disabled_hint": "Los amigos no recibirán tu lista de archivos compartidos. Aún puedes explorar las suyas si ellos lo permiten.",
   "settings_channel_file_offers": "Quién puede enviarte archivos en los canales",
   "settings_channel_file_offers_hint": "Solo controla quién puede pedirlo. Tú siempre decides si aceptas, y no se descarga nada hasta entonces.",
   "settings_channel_file_offers_everyone": "Cualquiera del canal",

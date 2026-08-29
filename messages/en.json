@@ -2096,7 +2096,7 @@
   "settings_friend_chat_disabled": "Disable Friend Chat",
   "settings_friend_chat_disabled_hint": "Ignore incoming chat messages and unsolicited file offers from friends. You won't be able to send messages either.",
   "settings_friend_browse_disabled": "Disable Friend Browse",
-  "settings_friend_browse_disabled_hint": "Don't respond to browse-shares requests from friends. Your shared file list stays private, and you won't be able to browse friends' shares either.",
+  "settings_friend_browse_disabled_hint": "Friends will not receive your shared file list. You can still browse theirs if they allow it.",
   "settings_channel_file_offers": "Who can send you files in channels",
   "settings_channel_file_offers_hint": "Only controls who may ask. You always choose whether to accept, and nothing is downloaded until you do.",
   "settings_channel_file_offers_everyone": "Anyone in the channel",

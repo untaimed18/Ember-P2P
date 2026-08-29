@@ -2093,7 +2093,7 @@
   "settings_friend_chat_disabled": "Désactiver le chat avec les amis",
   "settings_friend_chat_disabled_hint": "Ignore les messages de chat et les offres de fichiers non sollicitées des amis. Vous ne pourrez pas non plus envoyer de messages.",
   "settings_friend_browse_disabled": "Désactiver l'exploration des amis",
-  "settings_friend_browse_disabled_hint": "Ne répond pas aux demandes d'exploration des partages envoyées par les amis. Votre liste de fichiers partagés reste privée, et vous ne pourrez pas non plus parcourir les partages de vos amis.",
+  "settings_friend_browse_disabled_hint": "Les amis ne recevront pas votre liste de fichiers partagés. Vous pourrez toujours parcourir les leurs s'ils l'autorisent.",
   "settings_channel_file_offers": "Qui peut vous envoyer des fichiers dans les salons",
   "settings_channel_file_offers_hint": "Ne contrôle que qui peut le demander. C'est toujours vous qui acceptez, et rien n'est téléchargé avant.",
   "settings_channel_file_offers_everyone": "Tout le monde dans le salon",

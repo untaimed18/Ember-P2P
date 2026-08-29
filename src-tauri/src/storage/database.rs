@@ -3787,8 +3787,7 @@ impl Database {
                     row.get::<_, i64>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         drop(conn);
         // Decrypt outside the statement borrow, mirroring `get_chat_messages`.
@@ -3888,8 +3887,7 @@ impl Database {
                 .query_map(params![CHAT_QUEUED, cutoff], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
-                .filter_map(|r| r.ok())
-                .collect();
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
         if expired.is_empty() {
@@ -4003,8 +4001,7 @@ impl Database {
         )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 

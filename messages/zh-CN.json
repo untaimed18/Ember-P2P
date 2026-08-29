@@ -2093,7 +2093,7 @@
   "settings_friend_chat_disabled": "禁用好友聊天",
   "settings_friend_chat_disabled_hint": "忽略来自好友的入站聊天消息和未经请求的文件赠送。你也无法发送消息。",
   "settings_friend_browse_disabled": "禁用好友浏览",
-  "settings_friend_browse_disabled_hint": "不响应来自好友的浏览共享请求。你的共享文件列表保持私密，你也无法浏览好友的共享。",
+  "settings_friend_browse_disabled_hint": "好友将无法看到你的共享文件列表。若对方允许，你仍可浏览他们的共享。",
   "settings_channel_file_offers": "谁可以在频道中给你发文件",
   "settings_channel_file_offers_hint": "仅控制谁可以询问。是否接收始终由你决定，在此之前不会下载任何内容。",
   "settings_channel_file_offers_everyone": "频道中的任何人",

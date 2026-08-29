@@ -5806,15 +5806,17 @@ async fn handle_command_inner(
             request_id,
             tx,
         } => {
-            if settings.friend_browse_disabled {
-                let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
-            } else if !friend_hashes.read().await.contains(&friend_eh) {
+            if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only browse friends".into()));
             } else if !mutual_friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err(
                     "Browse is only available after both of you have accepted the friendship".into(),
                 ));
             } else {
+                // `friend_browse_disabled` only refuses *inbound* listing
+                // (answered with an empty BROWSE_RES). Outbound browse is
+                // still allowed: hiding our share list is not the same as
+                // opting out of looking at theirs.
                 // See the identical `filter(|h| h.is_fresh())` in
                 // `SendChatMessage` above: reusing a stale session here
                 // would queue the browse request into a channel whose

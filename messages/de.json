@@ -2096,7 +2096,7 @@
   "settings_friend_chat_disabled": "Freundeschat deaktivieren",
   "settings_friend_chat_disabled_hint": "Eingehende Chatnachrichten und unaufgeforderte Dateiangebote von Freunden ignorieren. Sie können dann ebenfalls keine Nachrichten senden.",
   "settings_friend_browse_disabled": "Durchsuchen bei Freunden deaktivieren",
-  "settings_friend_browse_disabled_hint": "Nicht auf Anfragen von Freunden zum Durchsuchen Ihrer Freigaben antworten. Ihre Liste freigegebener Dateien bleibt privat, und Sie können die Freigaben Ihrer Freunde ebenfalls nicht durchsuchen.",
+  "settings_friend_browse_disabled_hint": "Freunde erhalten Ihre Liste freigegebener Dateien nicht. Sie können deren Freigaben weiterhin durchsuchen, wenn sie das zulassen.",
   "settings_channel_file_offers": "Wer dir in Kanälen Dateien senden darf",
   "settings_channel_file_offers_hint": "Legt nur fest, wer fragen darf. Du entscheidest immer selbst, ob du annimmst, und vorher wird nichts heruntergeladen.",
   "settings_channel_file_offers_everyone": "Alle im Kanal",

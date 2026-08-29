@@ -32,7 +32,6 @@
   import IconX from '$lib/components/IconX.svelte';
 
   let friends: FriendInfo[] = $state([]);
-  let browseDisabled = $derived($appSettings?.friend_browse_disabled === true);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
@@ -237,7 +236,6 @@
   }
 
   function openBrowse(f: FriendInfo) {
-    if (browseDisabled) return;
     browseFriendHash = f.user_hash;
     browseFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
     browseFriendIp = f.last_ip || '';
@@ -1285,10 +1283,8 @@
                 type="button"
                 role="menuitem"
                 onclick={(e) => { closeCardMenu(e.currentTarget); openBrowse(f); }}
-                disabled={!f.mutual || !isOnline || browseDisabled}
-                title={browseDisabled
-                  ? m.settings_friend_browse_disabled()
-                  : !f.mutual
+                disabled={!f.mutual || !isOnline}
+                title={!f.mutual
                   ? m.friends_action_waiting_accept()
                   : isOnline
                     ? m.friends_action_browse_files()
