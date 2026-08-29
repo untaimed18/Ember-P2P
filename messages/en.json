@@ -1401,6 +1401,7 @@
   "search_file_details": "File Details",
   "search_close_details_aria": "Close file details",
   "search_detail_name": "Name:",
+  "search_detail_original_name": "Original name:",
   "search_detail_size": "Size:",
   "search_detail_hash": "Hash:",
   "search_detail_sources": "Sources:",

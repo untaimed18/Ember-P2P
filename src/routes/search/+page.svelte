@@ -1928,9 +1928,14 @@
       const extraSources = primaryAddr
         ? networkAddresses.filter((addr) => addr !== primaryAddr)
         : networkAddresses.slice();
+      // The wire name, not `displayName`. This becomes the name on disk, and
+      // the completed folder is a shared folder by default — so the cleaned
+      // label would be republished to the network, title-cased and with its
+      // dots turned to spaces, under a name no peer searching for the original
+      // would match. `start_download` sanitizes it for the filesystem.
       const res = await startDownload(
         result.file.hash,
-        displayName(result),
+        result.file.name,
         result.file.size,
         peerIp,
         peerPort,
@@ -2358,9 +2363,10 @@
           const extraSources = primaryAddr
             ? networkAddrs.filter((addr) => addr !== primaryAddr)
             : networkAddrs.slice();
+          // Wire name, as in the single-row download above.
           const res = await startDownload(
             result.file.hash,
-            displayName(result),
+            result.file.name,
             result.file.size,
             peerIp,
             peerPort,
@@ -3234,6 +3240,16 @@
         </div>
         <div class="panel-body">
           <div class="detail-row"><strong>{m.search_detail_name()}</strong> <bdi dir="auto">{displayName(selectedResult)}</bdi></div>
+          <!-- Cleanup is lossy by design — it drops advertising and tidies
+               separators — so the name it produces is a label. Shown only when
+               the two actually differ, which keeps it off most rows, and this
+               is the name the file downloads and reshares under. -->
+          {#if selectedResult.file.name && selectedResult.file.name !== displayName(selectedResult)}
+            <div class="detail-row">
+              <strong>{m.search_detail_original_name()}</strong>
+              <bdi dir="auto">{selectedResult.file.name}</bdi>
+            </div>
+          {/if}
           <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
           <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
           <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>

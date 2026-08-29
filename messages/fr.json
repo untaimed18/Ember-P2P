@@ -1401,6 +1401,7 @@
   "search_file_details": "Détails du fichier",
   "search_close_details_aria": "Fermer les détails du fichier",
   "search_detail_name": "Nom :",
+  "search_detail_original_name": "Nom d'origine :",
   "search_detail_size": "Taille :",
   "search_detail_hash": "Hash :",
   "search_detail_sources": "Sources :",

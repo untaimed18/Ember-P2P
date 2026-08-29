@@ -1401,6 +1401,7 @@
   "search_file_details": "檔案詳情",
   "search_close_details_aria": "關閉檔案詳情",
   "search_detail_name": "名稱：",
+  "search_detail_original_name": "原始名稱：",
   "search_detail_size": "大小：",
   "search_detail_hash": "Hash：",
   "search_detail_sources": "源：",

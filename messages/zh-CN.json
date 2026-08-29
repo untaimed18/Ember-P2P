@@ -1401,6 +1401,7 @@
   "search_file_details": "文件详情",
   "search_close_details_aria": "关闭文件详情",
   "search_detail_name": "名称：",
+  "search_detail_original_name": "原始名称：",
   "search_detail_size": "大小：",
   "search_detail_hash": "Hash：",
   "search_detail_sources": "源：",

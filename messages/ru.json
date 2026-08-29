@@ -1401,6 +1401,7 @@
   "search_file_details": "Сведения о файле",
   "search_close_details_aria": "Закрыть сведения о файле",
   "search_detail_name": "Имя:",
+  "search_detail_original_name": "Исходное имя:",
   "search_detail_size": "Размер:",
   "search_detail_hash": "Хеш:",
   "search_detail_sources": "Источники:",
