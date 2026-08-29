@@ -77,7 +77,9 @@
   // surface a warning that the message will be queued and may reach
   // a peer that hasn't been re-authenticated since this session
   // opened.
-  let isOnline = $derived(!isChannel && friendHash ? $onlineFriends.has(friendHash) : false);
+  let isOnline = $derived(
+    !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
+  );
 
   // The user can disable chat entirely in Settings; when off, the backend
   // drops inbound and refuses outbound chat, so reflect that in the UI rather
@@ -277,7 +279,7 @@
     try {
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
-        if (event.payload.user_hash === hash) {
+        if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
           // message. Compare the content tuple against the recent tail (a
@@ -317,7 +319,6 @@
           if (event.payload.direction === 'received' && isAppVisible()) {
             markAsRead();
           }
-        }
       });
     } catch (e) {
       console.warn('ChatConversation: failed to register chat listener', e);
@@ -333,7 +334,7 @@
         'ember:chat-delivery',
         (event) => {
           if (gen !== loadGen) return;
-          if (event.payload.user_hash !== hash) return;
+          if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
           // `failed` arrives when the backend's age sweep abandons a queued
           // message; without it the bubble reads "queued" for the whole
           // session even though the row on disk has already given up.

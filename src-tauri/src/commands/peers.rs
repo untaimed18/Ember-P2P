@@ -324,12 +324,18 @@ pub async fn add_friend(
         db.add_friend(&db_hash, &db_nick, friend_pubkey.as_ref())
     })
     .await;
-    match db_result
-        .as_ref()
-        .map_err(|e| e.to_string())
-        .and_then(|r| r.as_ref().map_err(|e| e.to_string()))
-    {
-        Err(e) => {
+    let became_mutual = match db_result {
+        Ok(Ok(None)) => {
+            if newly_inserted {
+                state.friend_hashes.write().await.remove(&hash);
+            }
+            return Err(coded(
+                "peers_identity_blocked",
+                "That identity is blocked. Unblock it first to add them as a friend.",
+            ));
+        }
+        Ok(Ok(Some(mutual))) => mutual,
+        Ok(Err(e)) => {
             if newly_inserted {
                 state.friend_hashes.write().await.remove(&hash);
             }
@@ -339,19 +345,33 @@ pub async fn add_friend(
                 e,
             ));
         }
-        // Blocked between this command's own check and the insert. Reported as
-        // the block it is rather than as a save failure, which is what the user
-        // has to act on.
-        Ok(false) => {
+        Err(e) => {
             if newly_inserted {
                 state.friend_hashes.write().await.remove(&hash);
             }
-            return Err(coded(
-                "peers_identity_blocked",
-                "That identity is blocked. Unblock it first to add them as a friend.",
-            ));
+            return Err(coded_ctx("peers_task_error", "Task error", e));
         }
-        Ok(true) => {}
+    };
+
+    if became_mutual {
+        state.mutual_friend_hashes.write().await.insert(hash);
+        {
+            let db = state.db.clone();
+            let db_hash = canonical.clone();
+            let blocked = tokio::task::spawn_blocking(move || db.is_friend_blocked(&db_hash))
+                .await
+                .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+                .map_err(|e| {
+                    coded_ctx("peers_failed_block_lookup", "Failed to check blocks", e)
+                })?;
+            if blocked {
+                tear_down_friend(&state, hash).await?;
+                return Err(coded(
+                    "peers_identity_blocked",
+                    "That identity is blocked. Unblock it first to add them as a friend.",
+                ));
+            }
+        }
     }
 
     // Friend is already persisted to the DB above; the network task
@@ -411,20 +431,29 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
     // centrally cleared too.
     crate::network::ed2k::upload::revoke_all_secure_sessions(hash);
     let (tx, rx) = tokio::sync::oneshot::channel();
-    bounded_send(
+    if let Err(e) = bounded_send(
         &state.network_tx,
         NetworkCommand::FriendRemoved {
             ember_hash: hash,
             tx,
         },
     )
-    .await?;
-    await_reply(
+    .await
+    {
+        tracing::warn!(
+            "Friend removed from DB, but live network teardown was not queued: {e}"
+        );
+        return Ok(());
+    }
+    if let Err(e) = await_reply(
         rx,
         "peers_friend_removal_not_acknowledged",
         "Friend was removed, but live network teardown was not acknowledged",
     )
-    .await?;
+    .await
+    {
+        tracing::warn!("Friend removed from DB, but live network teardown was not acknowledged: {e}");
+    }
     Ok(())
 }
 
@@ -1121,6 +1150,12 @@ pub async fn browse_friend(
     let hash = parse_user_hash(&canonical)?;
     if !state.friend_hashes.read().await.contains(&hash) {
         return Err(coded("peers_not_friend", "Can only browse friends"));
+    }
+    if !state.mutual_friend_hashes.read().await.contains(&hash) {
+        return Err(coded(
+            "peers_not_mutual",
+            "Browse is only available after both of you have accepted the friendship",
+        ));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(

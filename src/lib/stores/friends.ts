@@ -259,7 +259,8 @@ export async function initFriendsStore() {
             const idx = cur.findIndex((r) => r.sender_hash === sender_hash);
             const newRow: FriendRequestInfo = {
               sender_hash,
-              sender_nickname: nickname || '',
+              sender_nickname:
+                nickname || (idx >= 0 ? cur[idx].sender_nickname : ''),
               received_at: Math.floor(Date.now() / 1000),
               // "verified once, always verified" mirrors the backend
               // `MAX(verified, excluded.verified)` upsert in
@@ -366,9 +367,14 @@ export async function initFriendsStore() {
     // increment. Take the max per friend so we neither lose a bump that the
     // DB snapshot hasn't captured yet nor double-count one it already has.
     unreadCounts.update((cur) => {
-      const next = new Map<string, number>(counts);
+      const next = new Map<string, number>();
+      for (const [hash, n] of counts) {
+        const key = hash.toLowerCase();
+        next.set(key, Math.max(next.get(key) ?? 0, n));
+      }
       for (const [hash, n] of cur) {
-        next.set(hash, Math.max(next.get(hash) ?? 0, n));
+        const key = hash.toLowerCase();
+        next.set(key, Math.max(next.get(key) ?? 0, n));
       }
       return next;
     });
@@ -398,14 +404,20 @@ export async function initFriendsStore() {
   try {
     const online = await getOnlineFriends();
     if (myEpoch !== storeEpoch) return;
-    onlineFriends.update((s) => new Set([...s, ...online]));
+    onlineFriends.update((s) => new Set([...s, ...online.map((h) => h.toLowerCase())]));
   } catch (e) {
     noteFriendsSeedFailure('getOnlineFriends', e);
   }
 }
 
 export function clearUnread(friendHash: string) {
-  unreadCounts.update((m) => { const next = new Map(m); next.delete(friendHash); return next; });
+  const hash = friendHash.toLowerCase();
+  unreadCounts.update((m) => {
+    const next = new Map(m);
+    next.delete(hash);
+    next.delete(friendHash);
+    return next;
+  });
 }
 
 /**
@@ -460,5 +472,13 @@ export function cleanupFriendsStore() {
 export function clearFileOffer(userHash: string, fileHash: string) {
   fileOffers.update((offers) =>
     offers.filter((o) => !(o.user_hash === userHash && o.file_hash === fileHash)),
+  );
+}
+
+/** Drop every pending offer from an identity that was removed or blocked. */
+export function clearFileOffersForFriend(userHash: string) {
+  const hash = userHash.toLowerCase();
+  fileOffers.update((offers) =>
+    offers.filter((o) => o.user_hash.toLowerCase() !== hash),
   );
 }

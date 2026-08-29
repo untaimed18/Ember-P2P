@@ -64,7 +64,11 @@
   );
 
   $effect(() => {
-    if (open && friendHash) {
+    // Capture outside the `if` so cleanup can cancel the in-flight
+    // request even after `open` has already gone false (the previous
+    // `hash` lived inside the branch and was out of scope on close).
+    const hash = friendHash;
+    if (open && hash) {
       // Capture the generation BEFORE awaiting so we can detect a
       // close/re-open race: if the user closes the dialog (or
       // switches friend) while `setupListener` is still awaiting,
@@ -73,7 +77,6 @@
       // closed dialog could still fire IPC and corrupt the next
       // session's state.
       const gen = ++listenerGen;
-      const hash = friendHash;
       // Clear previous session synchronously so reopen never paints
       // the prior friend's file list (or allows downloads from it)
       // while listeners are still being registered.
@@ -103,8 +106,8 @@
       })();
     }
     return () => {
-      if (expectedRequestId && friendHash) {
-        void cancelBrowseFriend(friendHash, expectedRequestId).catch((e) =>
+      if (expectedRequestId && hash) {
+        void cancelBrowseFriend(hash, expectedRequestId).catch((e) =>
           console.error('Failed to cancel friend browse:', e),
         );
       }

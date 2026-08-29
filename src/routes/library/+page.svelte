@@ -3653,7 +3653,7 @@
               {:else}
                 {#each sendableFriends as friend (friend.user_hash)}
                   <button class="ctx-item" role="menuitem" onclick={() => ctxAction('send_to_friend', friend.user_hash)}>
-                    <bdi>{friend.nickname}</bdi>
+                    <bdi dir="auto">{friend.nickname}</bdi>
                   </button>
                 {/each}
               {/if}

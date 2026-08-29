@@ -5810,6 +5810,10 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
             } else if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only browse friends".into()));
+            } else if !mutual_friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err(
+                    "Browse is only available after both of you have accepted the friendship".into(),
+                ));
             } else {
                 // See the identical `filter(|h| h.is_fresh())` in
                 // `SendChatMessage` above: reusing a stale session here

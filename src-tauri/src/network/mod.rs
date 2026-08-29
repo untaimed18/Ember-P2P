@@ -25016,6 +25016,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 if let DownloadEvent::EmberFriendRequest {
                     ember_hash,
+                    pubkey,
                     nickname,
                     peer_ip,
                     peer_port,
@@ -25035,7 +25036,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &mutual_friend_hashes,
                         settings.friend_require_approval,
                         ember_hash,
-                        None,
+                        pubkey,
                         &nickname,
                         &peer_ip,
                         peer_port,
@@ -26239,6 +26240,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         let _ = app_handle.emit("ember:browse-request", serde_json::json!({
                             "user_hash": hash_hex,
                         }));
+                    } else {
+                        // Complete the requester's wait. Dropping the packet
+                        // left their UI spinning until the 30s browse timeout
+                        // — the same "no files" answer they would get from an
+                        // empty library, without leaking whether we refused
+                        // for policy or had nothing to show.
+                        let res_payload = if supports_ebr1 {
+                            ed2k::multi_source::encode_browse_response_v1(std::iter::empty())
+                        } else {
+                            ed2k::multi_source::encode_browse_response_legacy(std::iter::empty())
+                        };
+                        let mut packet = Vec::with_capacity(6 + res_payload.len());
+                        packet.push(OP_EMULEPROT);
+                        let size = (1 + res_payload.len()) as u32;
+                        packet.extend_from_slice(&size.to_le_bytes());
+                        packet.push(ed2k::messages::OP_EMBER_BROWSE_RES);
+                        packet.extend_from_slice(&res_payload);
+                        if let Err(e) = send_browse_response_to_origin(reply_tx, packet) {
+                            tracing::debug!(
+                                "Browse refusal to {} on session {} dropped: {e}",
+                                hex::encode(browse_eh),
+                                session_id,
+                            );
+                        }
                     }
                 }
 

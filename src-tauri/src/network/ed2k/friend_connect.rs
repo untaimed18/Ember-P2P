@@ -349,6 +349,7 @@ pub async fn run_friend_session_over_transport(
     let session_ember_session_handle = ember_session_handle.clone();
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
+    let session_listen_port = listen_port;
     let mut session_shutdown = ember_session_handle.subscribe_shutdown();
     let session_our_ed25519_secret = our_sk;
     let session_peer_ember_pubkey = peer_pk;
@@ -521,7 +522,7 @@ pub async fn run_friend_session_over_transport(
                                             pubkey: Some(peer_pk),
                                             nickname: nick,
                                             peer_ip: addr.ip().to_string(),
-                                            peer_port: addr.port(),
+                                            peer_port: session_listen_port,
                                             verified: ember_hash_binding_verified,
                                         },
                                     }).await;

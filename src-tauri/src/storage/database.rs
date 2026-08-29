@@ -3044,13 +3044,19 @@ impl Database {
         Ok(())
     }
 
-    /// `Ok(false)` means the identity is blocked and nothing was written.
+    /// Persist a friend the user added by code.
+    ///
+    /// `Ok(None)` — blocked, nothing written.
+    /// `Ok(Some(mutual))` — row written. `mutual` is true when a matching
+    /// `friend_requests` row existed and was consumed (same grant as
+    /// `accept_friend_request`), so pasting someone's code after they already
+    /// asked is not left as a one-sided friend plus a leftover request.
     pub fn add_friend(
         &self,
         user_hash: &str,
         nickname: &str,
         ed25519_pubkey: Option<&[u8; 32]>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<bool>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
@@ -3058,27 +3064,75 @@ impl Database {
         // it here closes the window where a block commits in between and
         // leaves the identity listed as a friend and blocked at once.
         //
-        // `Ok(false)` rather than an error, matching `add_friend_request`: the
+        // `Ok(None)` rather than an error, matching `add_friend_request`: the
         // caller needs to tell "blocked" from a genuine save failure so it can
         // name the right reason. Bailing here surfaced the race as "Failed to
         // save friend: identity is blocked".
         if Self::blocked_in(&tx, user_hash)? {
-            return Ok(false);
+            return Ok(None);
         }
+
+        let pending: Option<(String, String, u16, Option<Vec<u8>>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), sender_pubkey \
+                 FROM friend_requests WHERE sender_hash = ?1",
+            )?;
+            stmt.query_row(params![user_hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })
+            .ok()
+        };
+
+        let (stored_nick, mutual, pending_pubkey, pending_ip, pending_port) =
+            if let Some((req_nick, ip, port, pk)) = pending {
+                let nick = if nickname.is_empty() {
+                    req_nick
+                } else {
+                    nickname.to_string()
+                };
+                (nick, true, pk, ip, port)
+            } else {
+                (
+                    nickname.to_string(),
+                    false,
+                    None,
+                    String::new(),
+                    0u16,
+                )
+            };
+        let pubkey = ed25519_pubkey
+            .map(|key| key.as_slice())
+            .or(pending_pubkey.as_deref());
+
         tx.execute(
-            "INSERT INTO friends (user_hash, nickname, added_at, ed25519_pubkey) \
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname,
-             ed25519_pubkey = COALESCE(excluded.ed25519_pubkey, friends.ed25519_pubkey)",
-            params![
-                user_hash,
-                nickname,
-                now,
-                ed25519_pubkey.map(|key| key.as_slice())
-            ],
+            "INSERT INTO friends (user_hash, nickname, added_at, mutual, ed25519_pubkey) \
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_hash) DO UPDATE SET \
+                 nickname = CASE WHEN excluded.nickname != '' \
+                     THEN excluded.nickname ELSE friends.nickname END, \
+                 mutual = MAX(friends.mutual, excluded.mutual), \
+                 ed25519_pubkey = COALESCE(excluded.ed25519_pubkey, friends.ed25519_pubkey)",
+            params![user_hash, stored_nick, now, if mutual { 1i64 } else { 0 }, pubkey],
         )?;
+        if mutual && !pending_ip.is_empty() && pending_port > 0 {
+            tx.execute(
+                "UPDATE friends SET last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
+                params![user_hash, pending_ip, pending_port as i64, now],
+            )?;
+        }
+        if mutual {
+            tx.execute(
+                "DELETE FROM friend_requests WHERE sender_hash = ?1",
+                params![user_hash],
+            )?;
+        }
         tx.commit()?;
-        Ok(true)
+        Ok(Some(mutual))
     }
 
     pub fn get_friend_public_keys(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 32])>> {
@@ -3232,8 +3286,7 @@ impl Database {
                     row.get::<_, i64>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -3249,8 +3302,7 @@ impl Database {
                     row.get::<_, i64>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -3329,8 +3381,7 @@ impl Database {
                     row.get::<_, i64>(6)? != 0,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -3460,8 +3511,7 @@ impl Database {
                     row.get::<_, i64>(5)? != 0,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -3798,8 +3848,7 @@ impl Database {
             .query_map(params![CHAT_QUEUED], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -6162,17 +6211,58 @@ mod tests {
         let db = friends_only_db();
         db.block_friend("11").expect("block");
 
-        // `Ok(false)`, not an error: the caller has to tell a block from a
+        // `Ok(None)`, not an error: the caller has to tell a block from a
         // genuine save failure so it can name the reason the user must act on.
         assert!(
-            !db.add_friend("11", "Mallory", None).expect("no db error"),
+            db.add_friend("11", "Mallory", None)
+                .expect("no db error")
+                .is_none(),
             "a blocked identity must be refused, not written"
         );
         assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friends"), 0);
-        assert!(
+        assert_eq!(
             db.add_friend("22", "Friend", None).expect("no db error"),
+            Some(false),
             "an unblocked identity must still be added"
         );
+    }
+
+    /// Pasting a friend code after that peer already queued a request must
+    /// consume the request and grant mutual — otherwise the UI shows a
+    /// one-sided friend plus a leftover request, and rejecting the request
+    /// leaves chat/browse locked.
+    #[test]
+    fn adding_a_friend_who_already_requested_becomes_mutual() {
+        let db = friends_only_db();
+        db.add_friend_request("aa", None, "Alice", "1.2.3.4", 4662, true)
+            .expect("queue request");
+
+        assert_eq!(
+            db.add_friend("aa", "Ally", None).expect("add"),
+            Some(true),
+            "a pending request must promote the new friend to mutual"
+        );
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests"),
+            0,
+            "the request row must be consumed"
+        );
+        let friends = db.get_friends_full().expect("list");
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].1, "Ally");
+        assert_eq!(friends[0].3, "1.2.3.4");
+        assert_eq!(friends[0].4, 4662);
+        assert!(friends[0].6, "mutual flag");
+    }
+
+    #[test]
+    fn adding_without_a_nickname_keeps_the_request_name() {
+        let db = friends_only_db();
+        db.add_friend_request("bb", None, "Bob", "5.6.7.8", 4662, false)
+            .expect("queue request");
+        assert_eq!(db.add_friend("bb", "", None).expect("add"), Some(true));
+        let friends = db.get_friends_full().expect("list");
+        assert_eq!(friends[0].1, "Bob");
     }
 
     /// Auto-confirm promotes a one-sided friend to mutual without prompting,
