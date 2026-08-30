@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 43;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 44;
 
 /// One row of a room's history as the UI needs it.
 ///
@@ -248,6 +248,11 @@ pub const CHAT_FAILED: i64 = 2;
 /// to someone who never returns is retried on every reconnect forever and
 /// counted as unsent for the life of the database.
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+/// How long an undelivered friend-request withdrawal keeps being retried. Same
+/// ceiling as the chat outbox, for the same reason: the row holds the address of
+/// someone the user has removed, so it must not be kept indefinitely on the
+/// chance that they eventually reappear.
+const RETRACTION_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
@@ -2070,6 +2075,32 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 44 {
+            // Friend requests we have withdrawn but not yet told the recipient
+            // about.
+            //
+            // Cancelling was purely local: the request kept sitting on their
+            // Friends page with no way to take it back. Telling them needs an
+            // address, and removing a friend deletes the row that holds it, so
+            // the address is copied here at the moment of removal.
+            //
+            // Only the hash and last address: the Noise handshake learns the
+            // peer's key and checks it against the hash, so storing the key
+            // would keep more about someone the user just removed than the
+            // delivery actually needs.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS friend_request_retractions (
+                    user_hash TEXT PRIMARY KEY,
+                    last_ip TEXT NOT NULL DEFAULT '',
+                    last_port INTEGER NOT NULL DEFAULT 0,
+                    queued_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 44)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -3419,6 +3450,12 @@ impl Database {
                 params![user_hash],
             )?;
         }
+        // Adding them again countermands an undelivered withdrawal. Leaving it
+        // queued would let the courier retract the request this add just sent.
+        tx.execute(
+            "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
         tx.commit()?;
         Ok(Some(mutual))
     }
@@ -3467,9 +3504,41 @@ impl Database {
         Ok(keys)
     }
 
-    pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
+    /// Remove a friend. Returns true when the removal left a friend request to
+    /// withdraw, so the caller can try to tell the peer.
+    ///
+    /// A one-sided friend is a request the peer has not answered yet, and
+    /// cancelling used to be purely local — their prompt stayed on screen with
+    /// no way to take it back. The address is copied into the retraction queue
+    /// here because the `friends` row that holds it is about to be deleted, and
+    /// nothing else remembers where that peer lives.
+    pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // A mutual friend consumed their request when they accepted it, so
+        // there is nothing queued on their side to withdraw.
+        let pending: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT COALESCE(last_ip, ''), COALESCE(last_port, 0) FROM friends \
+                 WHERE user_hash = ?1 AND mutual = 0",
+                params![user_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((last_ip, last_port)) = pending.as_ref() {
+            tx.execute(
+                "INSERT INTO friend_request_retractions (user_hash, last_ip, last_port, queued_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(user_hash) DO UPDATE SET last_ip = excluded.last_ip, \
+                     last_port = excluded.last_port",
+                params![
+                    user_hash,
+                    last_ip,
+                    last_port,
+                    chrono::Utc::now().timestamp()
+                ],
+            )?;
+        }
         tx.execute(
             "DELETE FROM chat_messages WHERE friend_hash = ?1",
             params![user_hash],
@@ -3483,7 +3552,54 @@ impl Database {
             params![user_hash],
         )?;
         tx.commit()?;
+        Ok(pending.is_some())
+    }
+
+    /// Friend requests withdrawn but not yet delivered, as
+    /// `(user_hash, last_ip, last_port)`.
+    pub fn pending_friend_request_retractions(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, u16)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_hash, last_ip, last_port FROM friend_request_retractions \
+             ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget a queued retraction — delivered, or no longer wanted because the
+    /// user added or blocked that identity in the meantime.
+    pub fn clear_friend_request_retraction(&self, user_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
+            params![user_hash],
+        )?;
         Ok(())
+    }
+
+    /// Drop retractions we have failed to deliver for
+    /// [`RETRACTION_QUEUE_MAX_AGE_SECS`]. Matches the chat outbox rather than
+    /// retrying forever: a peer absent this long has most likely abandoned the
+    /// identity, and the queue is the last thing holding their address.
+    pub fn expire_stale_friend_request_retractions(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now().timestamp() - RETRACTION_QUEUE_MAX_AGE_SECS;
+        let removed = conn.execute(
+            "DELETE FROM friend_request_retractions WHERE queued_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed)
     }
 
     /// End a friendship and record that the user wants no further contact.
@@ -3533,6 +3649,13 @@ impl Database {
         )?;
         tx.execute(
             "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![user_hash],
+        )?;
+        // Blocking means no further contact in either direction, so a queued
+        // withdrawal must not keep dialling them. Their copy of the request
+        // becomes moot anyway: accepting it cannot reach us through the block.
+        tx.execute(
+            "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
             params![user_hash],
         )?;
         tx.commit()?;
@@ -3799,8 +3922,25 @@ impl Database {
         &self,
     ) -> anyhow::Result<Vec<(String, String, i64, String, u16, bool)>> {
         let conn = self.conn.lock();
+        // Clear leftovers from the old path, which queued a reciprocal accept
+        // even though the user had already added that peer. Best-effort: the
+        // SELECT below filters them out either way, so a failed write here
+        // must not take down the whole list.
+        if let Err(e) = conn.execute(
+            "DELETE FROM friend_requests WHERE EXISTS (
+                SELECT 1 FROM friends WHERE friends.user_hash = friend_requests.sender_hash
+            )",
+            [],
+        ) {
+            warn!("Could not clear friend requests from already-added peers: {e}");
+        }
+        // Adding someone is the approval, so their request is never something
+        // to ask about again — filtered here rather than trusting the DELETE.
         let mut stmt = conn.prepare(
-            "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), COALESCE(verified, 0) FROM friend_requests ORDER BY received_at DESC"
+            "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), COALESCE(verified, 0) \
+             FROM friend_requests \
+             WHERE NOT EXISTS (SELECT 1 FROM friends WHERE friends.user_hash = friend_requests.sender_hash) \
+             ORDER BY received_at DESC"
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -3933,11 +4073,11 @@ impl Database {
 
     /// Promote an existing friend to mutual and refresh their last-known
     /// address. Used by the auto-confirm path: an inbound friend request from
-    /// a peer we already added, when the user has turned off "require
-    /// approval". Unlike `accept_friend_request` this does not touch the
-    /// `friend_requests` table (no queued row exists in that flow). Returns
-    /// the number of friend rows updated — 0 means the peer wasn't actually in
-    /// the friend list, so the caller should fall back to queuing.
+    /// a peer we already added (that add was the approval). Also consumes any
+    /// leftover `friend_requests` row for that hash (the old double-approval
+    /// path queued those). Returns the number of friend rows updated — 0
+    /// means the peer wasn't actually in the friend list, so the caller
+    /// should fall back to queuing.
     pub fn set_friend_mutual(
         &self,
         user_hash: &str,
@@ -3945,14 +4085,15 @@ impl Database {
         port: u16,
         ed25519_pubkey: Option<&[u8; 32]>,
     ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
         // Promotion to mutual is the widest grant there is — it opens browse
         // and friends-only serving — so the block test rides along in the
         // UPDATE itself. A blocked identity matches no row, and the caller's
         // "nothing was updated" path already declines to grant anything.
         let updated = if !ip.is_empty() && port > 0 {
-            conn.execute(
+            tx.execute(
                 "UPDATE friends SET mutual = 1, last_ip = ?2, last_port = ?3, last_seen = ?4,
                  ed25519_pubkey = COALESCE(?5, ed25519_pubkey) WHERE user_hash = ?1
                  AND NOT EXISTS (SELECT 1 FROM friend_blocks WHERE user_hash = ?1)",
@@ -3965,13 +4106,20 @@ impl Database {
                 ],
             )?
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE friends SET mutual = 1,
                  ed25519_pubkey = COALESCE(?2, ed25519_pubkey) WHERE user_hash = ?1
                  AND NOT EXISTS (SELECT 1 FROM friend_blocks WHERE user_hash = ?1)",
                 params![user_hash, ed25519_pubkey.map(|key| key.as_slice())],
             )?
         };
+        if updated > 0 {
+            tx.execute(
+                "DELETE FROM friend_requests WHERE sender_hash = ?1",
+                params![user_hash],
+            )?;
+        }
+        tx.commit()?;
         Ok(updated)
     }
 
@@ -6929,6 +7077,12 @@ mod tests {
                 user_hash TEXT PRIMARY KEY,
                 nickname TEXT NOT NULL DEFAULT '',
                 blocked_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE friend_request_retractions (
+                user_hash TEXT PRIMARY KEY,
+                last_ip TEXT NOT NULL DEFAULT '',
+                last_port INTEGER NOT NULL DEFAULT 0,
+                queued_at INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -7320,6 +7474,195 @@ mod tests {
             row_count(&db, "SELECT COUNT(*) FROM friends WHERE mutual = 1"),
             0
         );
+    }
+
+    /// Auto-confirm used to leave the queued request in place, so the
+    /// initiator still saw an Accept prompt after the friendship completed.
+    #[test]
+    fn promoting_a_friend_consumes_a_leftover_request() {
+        let db = friends_only_db();
+        db.add_friend("22", "Friend", None).expect("add");
+        db.add_friend_request("22", None, "Friend", "1.2.3.4", 4662, true)
+            .expect("queue leftover");
+
+        let updated = db
+            .set_friend_mutual("22", "1.2.3.4", 4662, None)
+            .expect("promote");
+
+        assert_eq!(updated, 1);
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests"),
+            0,
+            "leftover request must be consumed"
+        );
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friends WHERE mutual = 1"),
+            1
+        );
+    }
+
+    /// Requests already queued by the old double-approval path must not
+    /// reappear the next time the Friends page loads.
+    #[test]
+    fn listing_requests_drops_rows_from_people_already_added() {
+        let db = friends_only_db();
+        db.add_friend("22", "Friend", None).expect("add");
+        db.add_friend_request("22", None, "Friend", "1.2.3.4", 4662, true)
+            .expect("leftover");
+        db.add_friend_request("aa", None, "Alice", "5.6.7.8", 4662, true)
+            .expect("stranger");
+
+        let rows = db.get_friend_requests().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "aa");
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests"),
+            1,
+            "known-friend leftover must be deleted, stranger kept"
+        );
+    }
+
+    /// Cancelling used to be purely local, leaving the request on the
+    /// recipient's screen. The address has to be captured here because the row
+    /// holding it is deleted in the same transaction.
+    #[test]
+    fn removing_a_friend_who_never_accepted_queues_a_withdrawal() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, nickname, last_ip, last_port, mutual) \
+                 VALUES ('22', 'Pending', '1.2.3.4', 4662, 0)",
+                [],
+            )
+            .expect("seed one-sided friend");
+
+        assert!(db.remove_friend("22").expect("remove"), "a withdrawal is owed");
+        let queued = db.pending_friend_request_retractions().expect("list");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "22");
+        assert_eq!(
+            (queued[0].1.as_str(), queued[0].2),
+            ("1.2.3.4", 4662),
+            "the address must survive the friend row it came from"
+        );
+    }
+
+    /// A mutual friend consumed their request when they accepted it, so there
+    /// is nothing queued on their side to take back. Dialling them to withdraw
+    /// a request that no longer exists would be pure noise.
+    #[test]
+    fn removing_a_mutual_friend_queues_no_withdrawal() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, nickname, last_ip, last_port, mutual) \
+                 VALUES ('33', 'Friend', '1.2.3.4', 4662, 1)",
+                [],
+            )
+            .expect("seed mutual friend");
+
+        assert!(!db.remove_friend("33").expect("remove"));
+        assert!(db
+            .pending_friend_request_retractions()
+            .expect("list")
+            .is_empty());
+    }
+
+    /// Adding them again countermands the withdrawal. Left queued, the courier
+    /// would retract the request the new add just sent.
+    #[test]
+    fn re_adding_cancels_an_undelivered_withdrawal() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, last_ip, last_port, mutual) \
+                 VALUES ('44', '1.2.3.4', 4662, 0)",
+                [],
+            )
+            .expect("seed");
+        assert!(db.remove_friend("44").expect("remove"));
+
+        db.add_friend("44", "Second Thoughts", None).expect("re-add");
+
+        assert!(
+            db.pending_friend_request_retractions()
+                .expect("list")
+                .is_empty(),
+            "the queued withdrawal must not outlive the re-add"
+        );
+    }
+
+    /// Blocking ends contact in both directions, so a queued withdrawal must
+    /// stop dialling them.
+    #[test]
+    fn blocking_cancels_an_undelivered_withdrawal() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friends (user_hash, last_ip, last_port, mutual) \
+                 VALUES ('55', '1.2.3.4', 4662, 0)",
+                [],
+            )
+            .expect("seed");
+        assert!(db.remove_friend("55").expect("remove"));
+
+        db.block_friend("55").expect("block");
+
+        assert!(db
+            .pending_friend_request_retractions()
+            .expect("list")
+            .is_empty());
+    }
+
+    /// The queue is the last thing holding the address of someone the user
+    /// removed, so it has to stop retrying eventually.
+    #[test]
+    fn an_undeliverable_withdrawal_is_given_up_on() {
+        let db = friends_only_db();
+        let stale = chrono::Utc::now().timestamp() - (RETRACTION_QUEUE_MAX_AGE_SECS + 60);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_request_retractions (user_hash, last_ip, last_port, queued_at) \
+                 VALUES ('66', '1.2.3.4', 4662, ?1)",
+                params![stale],
+            )
+            .expect("seed stale");
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_request_retractions (user_hash, last_ip, last_port, queued_at) \
+                 VALUES ('77', '5.6.7.8', 4662, ?1)",
+                params![chrono::Utc::now().timestamp()],
+            )
+            .expect("seed fresh");
+
+        assert_eq!(db.expire_stale_friend_request_retractions().expect("sweep"), 1);
+        let left = db.pending_friend_request_retractions().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "77", "only the over-age row goes");
+    }
+
+    /// Acting on a withdrawal may only ever clear a queued request. If it
+    /// reached `friends` it would be a way to remove yourself from someone
+    /// else's friend list, and an accept that arrived first would be undone.
+    #[test]
+    fn a_withdrawal_cannot_undo_a_friendship() {
+        let db = friends_only_db();
+        db.add_friend_request("88", None, "Alice", "1.2.3.4", 4662, true)
+            .expect("queue request");
+        db.accept_friend_request("88").expect("accept");
+
+        // What the inbound withdrawal handler does, arriving too late.
+        db.remove_friend_request("88").expect("withdraw");
+
+        let friends = db.get_friends_full().expect("list");
+        assert_eq!(friends.len(), 1, "the friendship must survive");
+        assert!(friends[0].6, "and stay mutual");
     }
 
     /// Blocking twice must not erase the name. By the second call the friend

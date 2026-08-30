@@ -1545,6 +1545,12 @@ pub enum UploadEventKind {
         peer_port: u16,
         verified: bool,
     },
+    /// The peer is withdrawing a friend request it sent us and we have not
+    /// answered. Only ever clears a queued request — never a friendship — so an
+    /// accept that beat it to the punch simply makes this a no-op.
+    EmberFriendRetract {
+        ember_hash: [u8; 16],
+    },
     /// An Ember friend was seen on an incoming connection (EmuleInfo exchange completed).
     FriendSeen {
         ember_hash: [u8; 16],
@@ -10212,6 +10218,35 @@ impl UploadHandler {
                             Ok(_) => {}
                             Err(e) => debug!("Failed to parse Ember exchange from {peer_addr}: {e}"),
                         }
+                    }
+                }
+
+                // Withdrawal of a request we have not answered. Deliberately
+                // ahead of the general `OP_EMBER_EXT` arm below, which requires
+                // friend privileges: the sender of a *pending* request is by
+                // definition someone we have not added, so that arm would never
+                // fire for them.
+                //
+                // Gated on proof of possession alone, exactly as the friend
+                // request itself is. Binding would not be enough here: a peer
+                // that replayed a public (pubkey, ember_hash) pair could
+                // suppress requests it never sent.
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if secure_v2_authenticated
+                        && matches!(
+                            super::messages::parse_ember_ext(&payload),
+                            Some((super::messages::EMBER_EXT_FRIEND_RETRACT, _))
+                        ) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        debug!("Peer {peer_addr} withdrew its friend request ({})", hex::encode(eh));
+                        let _ = self
+                            .upload_event_tx
+                            .send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberFriendRetract { ember_hash: eh },
+                            })
+                            .await;
                     }
                 }
 

@@ -409,10 +409,26 @@ pub async fn remove_friend(
 
     let db = state.db.clone();
     let db_hash = canonical;
-    tokio::task::spawn_blocking(move || db.remove_friend(&db_hash))
+    let owes_retraction = tokio::task::spawn_blocking(move || db.remove_friend(&db_hash))
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_remove_friend", "Failed to remove friend", e))?;
+
+    // They never accepted, so a request of ours is still sitting on their
+    // Friends page. Ask the network task to withdraw it before the teardown
+    // below revokes the session it could have used. Dropping this on a full
+    // channel is safe: the queued row is what guarantees delivery, and the
+    // retry sweep picks it up.
+    if owes_retraction {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::RetractFriendRequest { ember_hash: hash })
+        {
+            tracing::debug!(
+                "Friend-request withdrawal deferred to the retry sweep (channel full): {e}"
+            );
+        }
+    }
 
     tear_down_friend(&state, hash).await
 }

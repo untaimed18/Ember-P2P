@@ -6240,6 +6240,69 @@ async fn handle_command_inner(
             let _ = tx.send(());
         }
 
+        NetworkCommand::RetractFriendRequest {
+            ember_hash: retract_hash,
+        } => {
+            // The queued row is the authority on whether a withdrawal is owed
+            // and where the peer was last seen. `remove_friend` wrote it in the
+            // same transaction that deleted the friend, so by the time this
+            // runs the address here is the only copy left.
+            let db_lookup = db.clone();
+            let queued = tokio::task::spawn_blocking(move || {
+                db_lookup.pending_friend_request_retractions()
+            })
+            .await
+            .ok()
+            .and_then(|rows| rows.ok())
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|(hash, ..)| hash == &hex::encode(retract_hash))
+            });
+            let Some((hash_hex, last_ip, last_port)) = queued else {
+                debug!(
+                    "No friend-request withdrawal owed to {}",
+                    hex::encode(retract_hash)
+                );
+                return;
+            };
+
+            let stored = last_ip
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .filter(|_| last_port > 0)
+                .map(|ip| std::net::SocketAddr::new(ip, last_port));
+            // A dedicated dial even when a session to them is still listed.
+            // Handing the packet to that session's writer queue only proves the
+            // queue accepted it, and removal revokes those sockets in the same
+            // breath — so the one moment the shortcut applies is the moment the
+            // write is least likely to reach the wire, and clearing the row on
+            // the strength of it would lose the withdrawal for good. The courier
+            // writes and flushes before anything is cleared.
+            //
+            // Same delivery path the retry sweep uses, so cancelling gets the
+            // rendezvous fallback too rather than only the stored address. The
+            // row stays queued if this attempt fails.
+            tokio::spawn(crate::network::deliver_friend_request_retraction(
+                db.clone(),
+                settings.rendezvous_url.clone(),
+                hash_hex,
+                retract_hash,
+                stored,
+                state.user_hash,
+                ember_hash,
+                settings.nickname.clone(),
+                state
+                    .external_ip
+                    .map(|eip| u32::from_le_bytes(eip.octets()))
+                    .unwrap_or(0),
+                advertised_tcp_port(state),
+                advertised_udp_port(state),
+                settings.friend_session_encryption,
+                ed25519_pubkey,
+                ed25519_secret_key,
+            ));
+        }
+
         NetworkCommand::FindFriendAndConnect {
             ember_hash: target_hash,
         } => {

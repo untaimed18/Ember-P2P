@@ -5835,15 +5835,14 @@ async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Res
 /// (pubkey, ember_hash) pair.
 ///
 /// It only drives the DB row + UI verification badge for queued strangers.
-/// Auto-promotion of an already-added (non-mutual) friend when the user
-/// disabled approval still requires `verified` (Ed25519 PoP) so
-/// a hash-spoofing peer cannot force mutual status.
+/// Auto-promotion of an already-added (non-mutual) friend still requires
+/// `verified` (Ed25519 PoP) so a hash-spoofing peer cannot force mutual
+/// status. Adding them *was* the approval; their accept must not ask again.
 async fn process_inbound_friend_request(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     online_friends: &mut HashMap<[u8; 16], i64>,
     mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
-    require_approval: bool,
     req_hash: [u8; 16],
     peer_pubkey: Option<[u8; 32]>,
     nickname: &str,
@@ -5856,6 +5855,7 @@ async fn process_inbound_friend_request(
         AlreadyMutual,
         Promoted,
         PromotionSkipped,
+        IgnoredUnverifiedReciprocal,
         Queued,
         Failed(String),
     }
@@ -5896,16 +5896,22 @@ async fn process_inbound_friend_request(
             })
             .unwrap_or((false, false));
         if already_mutual {
+            // Leftover queue rows from the old double-approval path.
+            let _ = db_q.remove_friend_request(&h_q);
             FriendRequestDbOutcome::AlreadyMutual
-        } else if is_friend && !require_approval && verified {
-            // Auto-confirm only after Ed25519 PoP (or equivalent verified
-            // binding). An unverified reciprocal request still queues so a
-            // spoofed hash cannot promote a listed friend to mutual.
+        } else if is_friend && verified {
+            // Reciprocal of an add we initiated: that add was the approval.
+            // Still require Ed25519 PoP so a spoofed hash cannot promote a
+            // listed friend to mutual.
             match db_q.set_friend_mutual(&h_q, &ip_q, peer_port, peer_pubkey_q.as_ref()) {
                 Ok(n) if n > 0 => FriendRequestDbOutcome::Promoted,
                 Ok(_) => FriendRequestDbOutcome::PromotionSkipped,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
+        } else if is_friend {
+            // Already added, but this session has no PoP — do not auto-promote
+            // and do not ask again. A later verified session completes it.
+            FriendRequestDbOutcome::IgnoredUnverifiedReciprocal
         } else {
             match db_q.add_friend_request(
                 &h_q,
@@ -5938,12 +5944,12 @@ async fn process_inbound_friend_request(
             );
         }
         FriendRequestDbOutcome::Promoted => {
-            // Auto-confirm: the user already added this peer and disabled "require
-            // approval", so a reciprocal request upgrades the friendship to mutual
-            // without prompting. Strangers (not already in our list) still fall
-            // through to the approval queue — we never auto-add an unknown peer.
+            // Auto-confirm: the user already added this peer, so a reciprocal
+            // request upgrades the friendship to mutual without prompting.
+            // Strangers (not already in our list) still fall through to the
+            // approval queue — we never auto-add an unknown peer.
             info!(
-                "Auto-confirming friend {} (already added; approval not required)",
+                "Auto-confirming friend {} (already added; their accept completes it)",
                 hash_hex
             );
             // The DB row is now mutual, so grant browse / friends-only access
@@ -5981,10 +5987,27 @@ async fn process_inbound_friend_request(
                     "user_hash": hash_hex,
                 }),
             );
+            // Separate from `friend-confirmed`, which every rediscovery sweep
+            // emits for an already-live session: this fires only on the
+            // promotion itself, so the notice can't repeat every few minutes.
+            // Without it the accept the user was waiting for is silent.
+            let _ = app_handle.emit(
+                "ember:friend-auto-confirmed",
+                serde_json::json!({
+                    "user_hash": hash_hex,
+                    "nickname": nickname,
+                }),
+            );
         }
         FriendRequestDbOutcome::PromotionSkipped => {
             debug!(
                 "Friend {} promotion skipped because no DB row changed",
+                hash_hex
+            );
+        }
+        FriendRequestDbOutcome::IgnoredUnverifiedReciprocal => {
+            debug!(
+                "Ignoring unverified reciprocal friend request from {} (already added; waiting for PoP)",
                 hash_hex
             );
         }
@@ -6001,6 +6024,109 @@ async fn process_inbound_friend_request(
         }
         FriendRequestDbOutcome::Failed(e) => {
             warn!("Failed to persist inbound friend request from {hash_hex}: {e}");
+        }
+    }
+}
+
+/// Deliver one queued friend-request withdrawal, clearing its row once it lands.
+///
+/// The stored address is where the peer answered when the request itself was
+/// delivered, so it is worth trying first and costs nothing when it still holds.
+/// The rendezvous fallback is what makes the queue worth keeping though: a peer
+/// on a dynamic address, or one we never had an address for, would otherwise sit
+/// in the queue until it expired and keep the withdrawn request on their screen
+/// for good. The lookup is keyed by identity alone and does not consult the
+/// friend list, which matters because by now they are not a friend.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_friend_request_retraction(
+    db: Arc<Database>,
+    rendezvous_url: String,
+    hash_hex: String,
+    target: [u8; 16],
+    stored: Option<SocketAddr>,
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
+) {
+    let mut already_tried: Option<SocketAddr> = None;
+    for use_rendezvous in [false, true] {
+        let addr = if use_rendezvous {
+            match rendezvous::lookup(
+                &rendezvous_url,
+                &our_ember_hash,
+                &ed25519_pubkey,
+                &ed25519_secret_key,
+                &target,
+            )
+            .await
+            {
+                Ok(Some((ip, port))) => Some(SocketAddr::new(ip.into(), port)),
+                Ok(None) => {
+                    debug!("Rendezvous has no address for {hash_hex} to withdraw at");
+                    None
+                }
+                Err(e) => {
+                    debug!("Rendezvous lookup for withdrawal to {hash_hex} failed: {e}");
+                    None
+                }
+            }
+        } else {
+            stored
+        };
+        let Some(addr) = addr else { continue };
+        // The rendezvous commonly reports exactly the address we just failed on.
+        if already_tried == Some(addr) {
+            continue;
+        }
+        already_tried = Some(addr);
+        // Re-read the row rather than trusting the one we were handed. Adding
+        // that identity back clears the queue, and a dial started before the
+        // re-add would otherwise land afterwards and retract the request the
+        // new add had just sent.
+        let db_check = db.clone();
+        let still_owed = tokio::task::spawn_blocking(move || {
+            db_check.pending_friend_request_retractions()
+        })
+        .await
+        .ok()
+        .and_then(|rows| rows.ok())
+        .map(|rows| rows.iter().any(|(hash, ..)| hash == &hash_hex))
+        .unwrap_or(false);
+        if !still_owed {
+            debug!("Withdrawal to {hash_hex} was countermanded before it was sent");
+            return;
+        }
+        match ed2k::friend_connect::send_friend_request_retraction(
+            addr,
+            target,
+            our_user_hash,
+            our_ember_hash,
+            our_nickname.clone(),
+            our_client_id,
+            tcp_port,
+            udp_port,
+            obfuscate,
+            Some(ed25519_pubkey),
+            Some(ed25519_secret_key),
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    db.clear_friend_request_retraction(&hash_hex)
+                })
+                .await;
+                return;
+            }
+            Err(e) => {
+                debug!("Withdrawal to {hash_hex} at {addr} did not land: {e}");
+            }
         }
     }
 }
@@ -10340,6 +10466,12 @@ pub enum NetworkCommand {
     FriendRemoved {
         ember_hash: [u8; 16],
         tx: oneshot::Sender<()>,
+    },
+    /// Withdraw a friend request the user has just cancelled. Fire-and-forget:
+    /// the row in `friend_request_retractions` is what guarantees delivery, so
+    /// the UI never waits on the peer being reachable this second.
+    RetractFriendRequest {
+        ember_hash: [u8; 16],
     },
     FindFriendAndConnect {
         ember_hash: [u8; 16],
@@ -23372,7 +23504,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     /// How often the queued-chat expiry sweep runs. The age ceiling it enforces
     /// is measured in days, so this only has to be small relative to that.
-    const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        const CHAT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    /// Withdrawal dials started per sweep. Cancelling a batch of requests at
+    /// once should not turn one tick into a burst of connects to peers that are
+    /// probably still offline; the rest are picked up on the next tick.
+    const MAX_RETRACTION_RETRIES_PER_SWEEP: usize = 4;
     // `None` so the first cleanup tick sweeps, clearing anything left queued by
     // a previous run before the user has a chance to look at it.
     let mut last_chat_expiry_sweep: Option<std::time::Instant> = None;
@@ -26162,14 +26298,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // upload) are how Add Friend on the uploads pane
                     // delivers `OP_EMBER_FRIEND_REQ` when the peer is
                     // firewalled and FindFriendAndConnect cannot dial
-                    // back. `verified` is PoP/Noise; unverified rows
-                    // still queue for approval with the unverified badge.
+                    // back. `verified` is PoP/Noise; unverified *strangers*
+                    // still queue with the unverified badge. Reciprocal
+                    // accepts from someone we already added auto-confirm
+                    // when verified and are ignored when not.
                     process_inbound_friend_request(
                         &db,
                         &app_handle,
                         &mut state.online_friends,
                         &mutual_friend_hashes,
-                        settings.friend_require_approval,
                         ember_hash,
                         pubkey,
                         &nickname,
@@ -27172,7 +27309,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &app_handle,
                         &mut state.online_friends,
                         &mutual_friend_hashes,
-                        settings.friend_require_approval,
                         req_hash,
                         pubkey,
                         nickname,
@@ -27181,6 +27317,34 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         verified,
                     )
                     .await;
+                }
+
+                if let UploadEventKind::EmberFriendRetract { ember_hash: retract_hash } = event.kind {
+                    let hash_hex = hex::encode(retract_hash);
+                    // Only the queued request goes. Reaching into `friends`
+                    // here would turn a withdrawal into a way to remove
+                    // yourself from someone else's friend list, and if they
+                    // accepted a moment ago there is simply no row left to
+                    // delete.
+                    let db_retract = db.clone();
+                    let h_retract = hash_hex.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_retract.remove_friend_request(&h_retract)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            info!("Cleared withdrawn friend request from {hash_hex}");
+                            let _ = app_handle.emit(
+                                "ember:friend-request-withdrawn",
+                                serde_json::json!({
+                                    "sender_hash": hash_hex,
+                                }),
+                            );
+                        }
+                        Ok(Err(e)) => warn!("Failed to clear withdrawn request from {hash_hex}: {e}"),
+                        Err(e) => warn!("Withdrawn-request task failed for {hash_hex}: {e}"),
+                    }
                 }
 
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
@@ -32426,6 +32590,77 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         Ok(Ok(expired)) => emit_chat_delivery_failed(&app_handle, &expired),
                         Ok(Err(e)) => debug!("Queued-chat expiry sweep failed: {e}"),
                         Err(e) => debug!("Queued-chat expiry sweep panicked: {e}"),
+                    }
+
+                    // Same cadence, same reason: the ceiling is in days, and a
+                    // withdrawal nobody can deliver is holding the address of
+                    // someone the user removed.
+                    let db_retract = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_retract.expire_stale_friend_request_retractions()
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(dropped)) => debug!(
+                            "Gave up on {dropped} undelivered friend-request withdrawal(s)"
+                        ),
+                        Ok(Err(e)) => debug!("Withdrawal expiry sweep failed: {e}"),
+                        Err(e) => debug!("Withdrawal expiry sweep panicked: {e}"),
+                    }
+                }
+
+                // Retry withdrawals whose peer was unreachable when the user
+                // cancelled. Without this the request stays on their Friends
+                // page for good simply because they happened to be offline at
+                // that moment, which is the whole point of persisting the row.
+                {
+                    let db_pending = db.clone();
+                    let pending = tokio::task::spawn_blocking(move || {
+                        db_pending.pending_friend_request_retractions()
+                    })
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.ok())
+                    .unwrap_or_default();
+                    // Parse before taking, not after: a row whose hash will not
+                    // decode used to consume one of the attempt slots and starve
+                    // the deliverable rows behind it for as long as it sat there.
+                    // A missing address is no longer disqualifying, because the
+                    // rendezvous fallback can still find them.
+                    let deliverable = pending.into_iter().filter_map(|(hash_hex, ip, port)| {
+                        let target = hex::decode(&hash_hex)
+                            .ok()
+                            .and_then(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())?;
+                        let stored = ip
+                            .parse::<std::net::IpAddr>()
+                            .ok()
+                            .filter(|_| port > 0)
+                            .map(|ip| SocketAddr::new(ip, port));
+                        Some((hash_hex, target, stored))
+                    });
+                    for (hash_hex, target, stored) in
+                        deliverable.take(MAX_RETRACTION_RETRIES_PER_SWEEP)
+                    {
+                        tokio::spawn(deliver_friend_request_retraction(
+                            db.clone(),
+                            settings.rendezvous_url.clone(),
+                            hash_hex,
+                            target,
+                            stored,
+                            state.user_hash,
+                            ember_hash,
+                            settings.nickname.clone(),
+                            state
+                                .external_ip
+                                .map(|eip| u32::from_le_bytes(eip.octets()))
+                                .unwrap_or(0),
+                            advertised_tcp_port(&state),
+                            advertised_udp_port(&state),
+                            settings.friend_session_encryption,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
+                        ));
                     }
                 }
 
@@ -52083,7 +52318,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberFileOffer { .. }
         | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
-        | UploadEventKind::EmberFriendRequest { .. } => {
+        | UploadEventKind::EmberFriendRequest { .. }
+        | UploadEventKind::EmberFriendRetract { .. } => {
             // Handled directly in the network event loop.
         }
     }

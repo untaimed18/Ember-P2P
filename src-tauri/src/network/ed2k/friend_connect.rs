@@ -28,6 +28,12 @@ pub struct FriendSessionHandle {
     pub session_id: u64,
 }
 
+/// Bounds on the withdrawal courier. Shorter than a friend dial's 15s: nothing
+/// waits on the result, an unreachable peer is retried on the next sweep, and
+/// these attempts run in bursts when several requests are cancelled at once.
+const RETRACTION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const RETRACTION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Establishes a persistent outbound friend session. Performs the full
 /// Hello/EmuleInfo handshake, sends a friend request, then runs a
 /// bidirectional select loop: reading incoming packets from the TCP stream
@@ -89,6 +95,128 @@ pub async fn open_and_run_friend_session(
         ed25519_secret_key,
     )
     .await
+}
+
+/// Tell `expected_ember_hash` that a friend request we sent is withdrawn, over
+/// a connection that exists for nothing else.
+///
+/// Deliberately not a friend session. By the time this runs the peer has been
+/// removed, so [`open_and_run_friend_session`] would refuse the dial on the
+/// membership guard below — and loosening that guard to let a withdrawal
+/// through would open the friend-session path to non-friends for the sake of a
+/// single packet. Instead this completes the same Noise IK handshake, writes one
+/// packet and hangs up: no `ember_sessions` entry, no read loop, no keepalive,
+/// so the peer is granted nothing by having answered.
+///
+/// The handshake is still what makes it safe in the other direction: the
+/// recipient only acts on a withdrawal whose sender proved possession of the
+/// identity that sent the request.
+///
+/// The eD2K greeting is not optional padding. A listener drops the connection
+/// outright if the first inner frame is anything other than `OP_HELLO`, so the
+/// withdrawal has to follow the same greeting every other dial sends — and the
+/// `OP_HELLOANSWER` is read before writing it, because that answer is the proof
+/// the peer accepted the greeting and is now dispatching frames.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_friend_request_retraction(
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let our_pk =
+        ed25519_pubkey.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+    let our_sk =
+        ed25519_secret_key.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
+
+    let stream = tokio::time::timeout(RETRACTION_DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
+    super::multi_source::tune_peer_stream(&stream);
+    let (raw_r, raw_w) = stream.into_split();
+
+    // `initiate` refuses any peer whose authenticated static key does not match
+    // `expected_ember_hash`, so a stale address cannot make us announce a
+    // withdrawal to whoever happens to answer on it now.
+    let secure = tokio::time::timeout(
+        RETRACTION_HANDSHAKE_TIMEOUT,
+        secure_stream::initiate(
+            Box::new(raw_r),
+            Box::new(raw_w),
+            our_ember_hash,
+            expected_ember_hash,
+            our_pk,
+            our_sk,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("secure handshake timeout"))??;
+
+    let mut reader = tokio::io::BufReader::new(secure.reader);
+    let mut writer = tokio::io::BufWriter::new(secure.writer);
+
+    let hello_options = HelloOptions {
+        udp_port,
+        kad_port: udp_port,
+        supports_crypt_layer: obfuscate,
+        requests_crypt_layer: obfuscate,
+        requires_crypt_layer: false,
+        supports_direct_udp_callback:
+            crate::network::kad::firewall::advertised_direct_udp_callback(),
+        supports_captcha: false,
+        server_ip: 0,
+        server_port: 0,
+        kad_version: 0x09,
+    };
+    let hello_payload = build_hello_with_buddy_opts(
+        &our_user_hash,
+        our_client_id,
+        tcp_port,
+        &our_nickname,
+        None,
+        &hello_options,
+    );
+    write_packet(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload)
+        .await
+        .context("failed to greet the peer we are withdrawing from")?;
+
+    let (proto, opcode, _) = read_packet_with_timeout(&mut reader, 10)
+        .await
+        .context("waiting for HelloAnswer before withdrawing")?;
+    if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
+        anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+    }
+
+    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), None);
+    write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload)
+        .await
+        .context("failed to complete the eMule greeting")?;
+
+    write_packet(
+        &mut writer,
+        OP_EMULEPROT,
+        OP_EMBER_EXT,
+        &build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]),
+    )
+    .await
+    .context("failed to send friend-request withdrawal")?;
+
+    // Leave no half-open socket behind: this connection has said everything it
+    // was opened to say.
+    let _ = writer.shutdown().await;
+    info!(
+        "Withdrew friend request at {} ({})",
+        addr,
+        crate::security::short_hash(&expected_ember_hash)
+    );
+    Ok(())
 }
 
 /// Like [`open_and_run_friend_session`] but drives the full Ember
@@ -500,16 +628,16 @@ pub async fn run_friend_session_over_transport(
                                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                                     let nick =
                                         crate::security::normalize_inbound_friend_nickname(&payload);
-                                    // `verified` is the session-scoped
-                                    // `ember_hash_binding_verified`
-                                    // flag set during session setup.
-                                    // For Ember-to-Ember sessions
-                                    // this folds in the result of
-                                    // `perform_ember_auth` (a real
-                                    // Ed25519 proof of possession);
-                                    // for peers that didn't advertise
-                                    // a pubkey it falls back to the
-                                    // offline BLAKE3 binding check.
+                                    // Always true on this path, and a real
+                                    // proof of possession rather than the
+                                    // replayable binding check: the session
+                                    // exists only because `secure_stream::
+                                    // initiate` authenticated the responder's
+                                    // Noise IK static key against the key
+                                    // bound to `expected_ember_hash`. The
+                                    // recipient promotes an already-added
+                                    // friend to mutual on this flag, so it
+                                    // must not weaken to binding-only.
                                     debug!(
                                         "Received friend request on outbound friend session from {} (nickname_chars={}, verified={ember_hash_binding_verified})",
                                         addr,
@@ -617,6 +745,23 @@ pub async fn run_friend_session_over_transport(
                                                     },
                                                 }).await;
                                             }
+                                        }
+                                        Some((super::messages::EMBER_EXT_FRIEND_RETRACT, _)) => {
+                                            // They are taking back a request we
+                                            // have not answered. The session
+                                            // itself is the proof of possession
+                                            // this needs, and the handler only
+                                            // ever clears a queued request.
+                                            debug!(
+                                                "Friend {} withdrew its friend request",
+                                                crate::security::short_hash(&peer_ember_hash)
+                                            );
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendRetract {
+                                                    ember_hash: peer_ember_hash,
+                                                },
+                                            }).await;
                                         }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
@@ -2304,6 +2449,169 @@ mod tests {
             }
             _ => panic!("expected panic to be distinguishable in the combined error"),
         }
+    }
+
+    /// A listener drops the connection when the first inner frame is not
+    /// `OP_HELLO`, so a withdrawal that skipped the eD2K greeting was accepted
+    /// by the socket and silently discarded — the recipient kept the request on
+    /// screen and nothing reported a failure. This pins the whole sequence, and
+    /// asserts the withdrawal is an empty-bodied `OP_EMBER_EXT` sub-type rather
+    /// than a second friend request.
+    #[tokio::test]
+    async fn withdrawal_greets_the_peer_before_announcing_itself() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        // A real socket: the courier dials for itself, so there is no transport
+        // to inject.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut server_r, server_w) = tokio::io::split(stream);
+            let first = server_r.read_u8().await.expect("discriminator");
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .expect("secure accept");
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.expect("greeting");
+            assert_eq!(
+                (proto, opcode),
+                (OP_EDONKEYHEADER, OP_HELLO),
+                "a listener refuses anything but Hello first"
+            );
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .expect("hello answer");
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.expect("emule info");
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+
+            let (proto, opcode, payload) =
+                read_packet_inner(&mut server_r).await.expect("withdrawal");
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_EXT));
+            assert_eq!(
+                parse_ember_ext(&payload),
+                Some((EMBER_EXT_FRIEND_RETRACT, &[][..])),
+                "the withdrawal carries its sub-type and nothing else"
+            );
+        });
+
+        send_friend_request_retraction(
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        )
+        .await
+        .expect("withdrawal must reach a well-behaved peer");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+            .await
+            .expect("mock peer must not hang")
+            .expect("mock peer must not panic");
+    }
+
+    /// A stale address may now answer for somebody else. Announcing a
+    /// withdrawal to whoever picks up would tell an unrelated peer about a
+    /// friend request they were never part of.
+    #[tokio::test]
+    async fn withdrawal_refuses_a_peer_with_the_wrong_identity() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let squatter_sk = SigningKey::generate(&mut OsRng);
+        let squatter_pk_bytes = squatter_sk.verifying_key().to_bytes();
+        let squatter_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&squatter_sk.verifying_key());
+        let intended_hash = [0x5A; 16];
+        assert_ne!(squatter_ember_hash, intended_hash);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut server_r, server_w) = tokio::io::split(stream);
+            let first = server_r.read_u8().await.expect("discriminator");
+            // Whether this completes does not matter: the dialer must refuse
+            // the identity either way.
+            let _ = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                squatter_ember_hash,
+                squatter_pk_bytes,
+                squatter_sk.to_bytes(),
+            )
+            .await;
+        });
+
+        let result = send_friend_request_retraction(
+            addr,
+            intended_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a withdrawal must not be announced to an identity we did not ask for"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer).await;
     }
 
     /// Regression guard for the "online_friends not updated on successful

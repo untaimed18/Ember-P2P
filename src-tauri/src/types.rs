@@ -1217,7 +1217,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub settings_revision: u64,
 
-    /// Require approval before granting friend-slot priority to new friend requests
+    /// Retained so existing `config.json` still deserializes. Unsolicited
+    /// friend requests always queue for approval; a verified reciprocal from
+    /// someone already on the friends list always auto-confirms — adding them
+    /// was the approval. The inbound handler does not read this flag.
     #[serde(default = "default_true")]
     pub friend_require_approval: bool,
     /// Disable incoming chat messages from friends

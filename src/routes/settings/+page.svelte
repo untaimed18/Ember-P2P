@@ -2501,12 +2501,11 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field toggle-row">
+          <div class="field">
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_friend_require_approval()}</span>
               <span class="hint">{m.settings_friend_require_approval_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">

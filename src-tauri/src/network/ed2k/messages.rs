@@ -161,6 +161,13 @@ pub const OP_EMBER_EXT: u8 = 0xFF;
 /// sender is a courier rather than an authority.
 pub const EMBER_EXT_RELAY_OFFER: u8 = 0x01;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is withdrawing a friend request the
+/// recipient has not answered yet, so it stops sitting on their Friends page
+/// once the sender changes their mind. Carries no body — the only thing it has
+/// to say is who sent it, and that is the authenticated session identity.
+/// Acting on it may only ever delete a queued request, never a friendship.
+pub const EMBER_EXT_FRIEND_RETRACT: u8 = 0x02;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -2859,6 +2866,33 @@ mod tests {
             Some((EMBER_EXT_RELAY_OFFER, &[][..]))
         );
         assert_eq!(parse_ember_ext(&[]), None);
+    }
+
+    /// The retraction carries no body, so it is the case the "body-less
+    /// sub-type is legal" rule above exists to serve. A dispatcher that
+    /// confused it for a malformed envelope would silently leave withdrawn
+    /// requests on the recipient's screen.
+    #[test]
+    fn ember_ext_friend_retract_survives_an_empty_body() {
+        let payload = build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]);
+        assert_eq!(
+            parse_ember_ext(&payload),
+            Some((EMBER_EXT_FRIEND_RETRACT, &[][..]))
+        );
+    }
+
+    /// Sub-types dispatch off one byte with no length or type tag around it, so
+    /// a duplicate would silently route one message into the other's handler.
+    #[test]
+    fn ember_ext_sub_types_are_distinct() {
+        let sub_types = [EMBER_EXT_RELAY_OFFER, EMBER_EXT_FRIEND_RETRACT];
+        let mut seen = std::collections::HashSet::new();
+        for sub_type in sub_types {
+            assert!(
+                seen.insert(sub_type),
+                "duplicate OP_EMBER_EXT sub-type {sub_type:#04x}"
+            );
+        }
     }
 
     /// Every opcode we send under `OP_EMULEPROT` must stay distinct — from each

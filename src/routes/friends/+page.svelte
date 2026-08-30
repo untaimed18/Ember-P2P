@@ -48,6 +48,9 @@
 
   let confirmRemoveOpen = $state(false);
   let pendingRemove: FriendInfo | null = $state(null);
+  /** Display copy for the remove/withdraw dialog. Outlives `pendingRemove` so
+   *  the text stays put while the dialog animates out. */
+  let removeDialog: { name: string; mutual: boolean } = $state({ name: '', mutual: true });
 
   let confirmBlockOpen = $state(false);
   /** Either a friend or a stranger from the approval queue — blocking works
@@ -643,6 +646,13 @@
 
   function confirmRemoveFriend(f: FriendInfo) {
     pendingRemove = f;
+    // Held separately because `handleRemove` clears `pendingRemove` before the
+    // dialog finishes its outro, which would blank the name and flip the copy
+    // back to the established-friend wording mid-animation.
+    removeDialog = {
+      name: f.nickname || f.user_hash.slice(0, 8) + '\u2026',
+      mutual: f.mutual,
+    };
     confirmRemoveOpen = true;
   }
 
@@ -663,7 +673,12 @@
       // the user's friend list and silently fail to send.
       removeChatForFriend(f.user_hash);
       clearFileOffersForFriend(f.user_hash);
-      flash(m.friends_removed({ name: f.nickname || f.user_hash.slice(0, 8) + '\u2026' }));
+      const shown = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
+      flash(
+        f.mutual
+          ? m.friends_removed({ name: shown })
+          : m.friends_request_withdrawn({ name: shown }),
+      );
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
@@ -782,11 +797,16 @@
 
 </script>
 
+<!-- Someone who never accepted has no upload priority to lose and is not
+     really a friend being removed, so the established-friend wording would
+     describe a consequence that does not exist. -->
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
-  title={m.friends_confirm_remove_title()}
-  message={m.friends_confirm_remove_message({ name: pendingRemove ? (pendingRemove.nickname || pendingRemove.user_hash.slice(0, 8) + '\u2026') : '' })}
-  confirmLabel={m.common_remove()}
+  title={removeDialog.mutual ? m.friends_confirm_remove_title() : m.friends_confirm_withdraw_title()}
+  message={removeDialog.mutual
+    ? m.friends_confirm_remove_message({ name: removeDialog.name })
+    : m.friends_confirm_withdraw_message({ name: removeDialog.name })}
+  confirmLabel={removeDialog.mutual ? m.common_remove() : m.friends_withdraw_title()}
   danger={true}
   onconfirm={handleRemove}
 />
@@ -1321,8 +1341,10 @@
                 role="menuitem"
                 class="menu-item-danger"
                 onclick={(e) => { closeCardMenu(e.currentTarget); confirmRemoveFriend(f); }}
-                aria-label={m.friends_remove_aria({ name: shortName })}
-              >{m.friends_remove_title()}</button>
+                aria-label={f.mutual
+                  ? m.friends_remove_aria({ name: shortName })
+                  : m.friends_withdraw_aria({ name: shortName })}
+              >{f.mutual ? m.friends_remove_title() : m.friends_withdraw_title()}</button>
               <button
                 type="button"
                 role="menuitem"
