@@ -15164,9 +15164,9 @@ async fn handle_inbound_channel_gossip(
             );
             return;
         };
-        if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(body) {
+        if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(&key, body) {
             apply_xfer_block_data(
-                socket, state, db, app_handle, xfer_id, sender, offset, data,
+                socket, state, db, app_handle, xfer_id, sender, offset, &data,
             )
             .await;
         } else if let Some((_, _, _, offset, count)) =

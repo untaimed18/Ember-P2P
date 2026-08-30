@@ -1078,9 +1078,14 @@ const REACTION_SIG_DOMAIN: &[u8] = b"ember-channel-reaction-author-v1\0";
 const XFER_OFFER_PLAIN_VERSION: u8 = 9;
 const XFER_REPLY_PLAIN_VERSION: u8 = 10;
 const XFER_BLOCK_REQUEST_PLAIN_VERSION: u8 = 11;
-const XFER_BLOCK_DATA_PLAIN_VERSION: u8 = 12;
+// 12 was a block whose payload travelled in the clear, authenticated pairwise
+// but encrypted only by the gossip envelope around it -- which is sealed with
+// the *room's* content key. Retired rather than reused: a build still sending
+// them must be refused, not misread.
 const XFER_CANCEL_PLAIN_VERSION: u8 = 13;
 const XFER_DONE_PLAIN_VERSION: u8 = 14;
+/// A block whose payload is encrypted to the recipient alone.
+const XFER_BLOCK_DATA_SEALED_VERSION: u8 = 21;
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
@@ -1826,6 +1831,35 @@ pub fn derive_xfer_key(
     crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)
 }
 
+const XFER_BLOCK_STREAM_DOMAIN: &[u8] = b"ember-channel-xfer-block-v1\0";
+
+/// XOR a block's payload with a keystream only the two ends can produce.
+///
+/// Symmetric, so one function both seals and opens. Keyed BLAKE3 in XOF mode is
+/// a PRF, so `(xfer_id, offset)` selects an independent stream per block with no
+/// nonce on the wire — which is what lets a sealed frame be exactly the size the
+/// cleartext one was, and keeps the unfragmented-datagram budget as it was.
+///
+/// A retransmitted block reuses its stream, which is harmless: it carries the
+/// same file bytes. The case that is not harmless is a file edited underneath a
+/// transfer already in flight, where the same offset would carry two different
+/// plaintexts under one stream and an observer holding both frames learns their
+/// XOR. Such a transfer already fails the root hash it was offered under, and
+/// the alternative — a per-block nonce — costs headroom this frame does not
+/// have.
+fn xfer_block_stream_xor(key: &[u8; 32], xfer_id: &[u8; 16], offset: u64, data: &mut [u8]) {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(XFER_BLOCK_STREAM_DOMAIN);
+    hasher.update(xfer_id);
+    hasher.update(&offset.to_le_bytes());
+    let mut stream = [0u8; XFER_BLOCK_SIZE];
+    let stream = &mut stream[..data.len().min(XFER_BLOCK_SIZE)];
+    hasher.finalize_xof().fill(stream);
+    for (byte, pad) in data.iter_mut().zip(stream.iter()) {
+        *byte ^= *pad;
+    }
+}
+
 fn xfer_tag(key: &[u8; 32], body: &[u8]) -> [u8; XFER_MAC_LEN] {
     let full = blake3::keyed_hash(key, body);
     let mut tag = [0u8; XFER_MAC_LEN];
@@ -1852,7 +1886,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
         XFER_OFFER_PLAIN_VERSION
             | XFER_REPLY_PLAIN_VERSION
             | XFER_BLOCK_REQUEST_PLAIN_VERSION
-            | XFER_BLOCK_DATA_PLAIN_VERSION
+            | XFER_BLOCK_DATA_SEALED_VERSION
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
     ) {
@@ -2036,7 +2070,18 @@ pub fn decode_xfer_block_request(
     Some((sender, target, xfer_id, offset, count))
 }
 
-/// `hdr || offset(8) || data || tag(16)`.
+/// `hdr || offset(8) || sealed(data) || tag(16)`.
+///
+/// The payload is encrypted to the recipient, not merely authenticated to them.
+/// The gossip envelope carrying it is sealed with the *room's* content key,
+/// which every member holds — and which, for a public room, is derived straight
+/// from the channel pubkey that sits in the public index and in every invite. So
+/// a block "sent to one member" was readable by every member of a private room,
+/// and by any stranger who could find a public one, while the UI presented it as
+/// a file going to one person.
+///
+/// Same length on the wire as the cleartext frame it replaces, so the
+/// unfragmented-datagram budget is unchanged.
 ///
 /// Block data is authenticated like everything else rather than leaning on
 /// the whole-file hash at the end. That check would catch injected bytes, but
@@ -2057,30 +2102,39 @@ pub fn encode_xfer_block_data(
     let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + data.len() + XFER_MAC_LEN);
     put_xfer_header(
         &mut out,
-        XFER_BLOCK_DATA_PLAIN_VERSION,
+        XFER_BLOCK_DATA_SEALED_VERSION,
         sender,
         target,
         xfer_id,
     );
     out.extend_from_slice(&offset.to_le_bytes());
+    let payload = out.len();
     out.extend_from_slice(data);
+    xfer_block_stream_xor(key, xfer_id, offset, &mut out[payload..]);
+    // Encrypt then MAC: the tag still covers the header, the offset and now the
+    // ciphertext, so sender, target, transfer and position stay bound exactly as
+    // they were.
     append_xfer_tag(key, &mut out);
     Some(out)
 }
 
+/// Open a block. Call only on a frame [`xfer_verify`] has already accepted —
+/// decrypting first would be decrypting whatever a stranger sent.
 pub fn decode_xfer_block_data(
+    key: &[u8; 32],
     bytes: &[u8],
-) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, &[u8])> {
-    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_BLOCK_DATA_PLAIN_VERSION)?;
+) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, Vec<u8>)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_BLOCK_DATA_SEALED_VERSION)?;
     let rest = bytes.get(XFER_HEADER_LEN..)?;
     if rest.len() < 8 + 1 {
         return None;
     }
     let offset = u64::from_le_bytes(rest[..8].try_into().ok()?);
-    let data = &rest[8..];
-    if data.len() > XFER_BLOCK_SIZE {
+    if rest.len() - 8 > XFER_BLOCK_SIZE {
         return None;
     }
+    let mut data = rest[8..].to_vec();
+    xfer_block_stream_xor(key, &xfer_id, offset, &mut data);
     Some((sender, target, xfer_id, offset, data))
 }
 
@@ -4383,9 +4437,33 @@ mod tests {
         let data = vec![9u8; XFER_BLOCK_SIZE];
         let frame = encode_xfer_block_data(&K, &s, &t, &id, 1024, &data).unwrap();
         let body = opened(&frame);
-        let (gs, gt, gid, offset, got) = decode_xfer_block_data(&body).unwrap();
+        let (gs, gt, gid, offset, got) = decode_xfer_block_data(&K, &body).unwrap();
         assert_eq!((gs, gt, gid, offset), (s, t, id, 1024));
-        assert_eq!(got, &data[..]);
+        assert_eq!(got, data);
+
+        // The payload has to be unreadable to anyone but the recipient. Only the
+        // gossip envelope used to cover it, and that is sealed with the room's
+        // content key -- which every member holds, and which a public room
+        // derives from a pubkey anyone can look up.
+        let on_wire = &body[XFER_HEADER_LEN + 8..body.len()];
+        assert_ne!(
+            on_wire, &data[..],
+            "a block's bytes must not travel in the clear inside the room envelope"
+        );
+        assert_eq!(
+            frame.len(),
+            XFER_HEADER_LEN + 8 + data.len() + XFER_MAC_LEN,
+            "sealing must not grow the frame, or the unfragmented budget moves"
+        );
+
+        // Somebody else's pairwise key opens nothing, even though the room key
+        // got them this far.
+        let (_, _, _, _, wrong) = decode_xfer_block_data(&[0xAAu8; 32], &body).unwrap();
+        assert_ne!(wrong, data);
+
+        // Per offset, so two blocks of identical bytes do not share a keystream.
+        let other = encode_xfer_block_data(&K, &s, &t, &id, 2048, &data).unwrap();
+        assert_ne!(opened(&other), body);
 
         assert!(encode_xfer_block_data(&K, &s, &t, &id, 0, &[]).is_none());
         assert!(
@@ -4489,7 +4567,7 @@ mod tests {
         assert!(decode_xfer_cancel(&body).is_none());
         assert!(decode_xfer_offer(&body).is_none());
         assert!(decode_xfer_block_request(&body).is_none());
-        assert!(decode_xfer_block_data(&body).is_none());
+        assert!(decode_xfer_block_data(&K, &body).is_none());
         assert!(decode_xfer_done(&body).is_none());
         // And the retired attachment versions are not mistaken for transfers,
         // nor picked up by the dispatcher's peek.
