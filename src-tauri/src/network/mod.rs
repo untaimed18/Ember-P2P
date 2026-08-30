@@ -12459,15 +12459,6 @@ struct NetworkState {
     channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     channel_moderation_publish_at: HashMap<[u8; 16], i64>,
-    /// Private rooms we own where a delegated moderator's ban has landed and the
-    /// content key has not been rotated for it yet.
-    ///
-    /// A moderator cannot rotate: the epoch record is signed by the room
-    /// identity, and only the owner holds its seed. So their ban travelled as a
-    /// label — the evicted member kept the key and carried on reading — until
-    /// the owner happened to ban somebody themselves. Bounded by the number of
-    /// private rooms this device owns.
-    channel_rotate_pending: HashSet<[u8; 16]>,
     /// Last Channel-username refresh against Rendezvous.
     channel_username_refresh_at: i64,
     /// Rendezvous base URL, refreshed from settings on the channel heartbeat.
@@ -12726,6 +12717,102 @@ async fn publish_presence_under_new_username(
     let _ = db.rename_self_channel_member(&pk, new);
     let _ = db.due_channel_presence_now();
     maybe_publish_channel_presence(socket, state, db, settings, identity).await;
+}
+
+/// Publish the tombstones for rooms we have left, and retry the ones that fail.
+///
+/// Leaving used to be a single fire-and-forget STORE from the Tauri command, so
+/// a leave attempted with no route to the storing nodes left us on every other
+/// member's roster until we aged out — and nothing noticed or tried again.
+///
+/// Each attempt mints its own record, which carries a fresh timestamp: a
+/// tombstone only removes a member whose `last_seen` is no newer than it, so it
+/// has to be newer than the live announcement it replaces. Rejoining clears the
+/// marker, which is what stops a late retry deleting the row we just re-earned.
+async fn publish_channel_departures(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(due) = db.channels_due_for_departure(now) else {
+        return;
+    };
+    let nickname = settings.channel_username.trim().to_string();
+    let signing = ed25519_dalek::SigningKey::from_bytes(&identity.ed25519_secret_key);
+    for channel_id_hex in due.into_iter().take(2) {
+        let Some(ch) = db.get_channel(&channel_id_hex).ok().flatten() else {
+            let _ = db.clear_channel_departure(&channel_id_hex);
+            continue;
+        };
+        let Ok(cid) = hex::decode(&ch.channel_id)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
+        else {
+            let _ = db.clear_channel_departure(&channel_id_hex);
+            continue;
+        };
+        let Ok(cpk) = hex::decode(&ch.pubkey)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 32]>::try_from(b).map_err(|_| ()))
+        else {
+            let _ = db.clear_channel_departure(&channel_id_hex);
+            continue;
+        };
+        // The epoch the room is on now, not the one we left under: the presence
+        // key is derived from it, and members are only looking at the current
+        // one.
+        let Some(join_secret) = current_channel_join_secret(db, &ch) else {
+            let _ = db.clear_channel_departure(&channel_id_hex);
+            continue;
+        };
+        let record = ember::dht::publish::SignedRecord::channel_presence_departure(
+            &nickname,
+            cid,
+            cpk,
+            &join_secret,
+            ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+            ember::channel::presence_epoch(now),
+            &identity.noise_public_key,
+            &signing,
+        );
+        // Re-checked against the room's state as it is *now*, not as the list
+        // above found it. This loop yields between rooms, so a rejoin can land
+        // mid-pass — and a departure published after walking back in tells every
+        // member to drop the roster row we just re-earned. The claim also moves
+        // the stamp forward, so no second publish starts for this room while
+        // this one is in flight.
+        let retry_at = now + ember::channel::PRESENCE_RETRY_SECS;
+        if !db
+            .claim_channel_departure(&channel_id_hex, retry_at)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        else {
+            continue;
+        };
+        // Cleared only once a node says it stored the record. Clearing on the
+        // attempt is the bug this whole function exists to fix, one layer up.
+        let (tx, rx) = oneshot::channel();
+        state.ember_dht_pending_publishes.insert(publish_id, tx);
+        let retry_db = db.clone();
+        let retry_id = channel_id_hex.clone();
+        tokio::spawn(async move {
+            if rx.await.is_ok_and(|result| result.stored_on > 0) {
+                let _ = retry_db.clear_channel_departure(&retry_id);
+            }
+        });
+        drive_ember_publish(socket, state, publish_id).await;
+    }
 }
 
 const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
@@ -13386,7 +13473,7 @@ async fn maybe_publish_owned_channel_records(
         // together, exactly as `rotate_and_commit` keeps them together for the
         // owner's own bans.
         let mut ch = ch;
-        let rotated = if private && state.channel_rotate_pending.contains(&channel_id) {
+        let rotated = if private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false) {
             let minted = rotate_owned_channel_key(db, &ch.channel_id, ch.key_epoch);
             if minted.is_some() {
                 // Re-read: the snapshot's tail and the re-seal both take the
@@ -13471,7 +13558,7 @@ async fn maybe_publish_owned_channel_records(
             // on its way, and the re-seal at the end of this pass reaches
             // everyone still entitled to it.
             if rotated.is_some() {
-                state.channel_rotate_pending.remove(&channel_id);
+                let _ = db.clear_channel_rotate_pending(&ch.channel_id);
             }
             drive_ember_publish(socket, state, publish_id).await;
             started += 1;
@@ -15314,10 +15401,10 @@ async fn handle_inbound_channel_gossip(
             // loop, which holds the seed and publishes the snapshot that has to
             // announce the new epoch, and bring that pass forward.
             //
-            // In memory, so a close inside the second before that pass loses the
-            // request; the next ban in the room rotates for both.
+            // On disk, so closing the app before that pass runs postpones the
+            // rotation rather than losing it.
             if applied && ch.is_owner && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE {
-                state.channel_rotate_pending.insert(gossip.channel_id);
+                let _ = db.mark_channel_rotate_pending(&channel_id_hex);
                 state
                     .channel_moderation_publish_at
                     .remove(&gossip.channel_id);
@@ -21423,8 +21510,6 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_pending_channel_moderation.clear();
     state.channel_moderation_fetch_at.clear();
     state.channel_moderation_publish_at.clear();
-    // Not cleared: the ban that asked for a rotation is on disk, and turning
-    // Ember off is not the owner deciding to let the evicted member back in.
     state.channel_username_refresh_at = 0;
     state.ember_channel_noise_keys.clear();
     state.channel_neighbor_lookup_at.clear();
@@ -22443,7 +22528,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
-        channel_rotate_pending: HashSet::new(),
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
@@ -40891,6 +40975,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
                     maybe_publish_channel_presence(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &settings,
+                        &identity,
+                    )
+                    .await;
+                    publish_channel_departures(
                         &udp_socket,
                         &mut state,
                         &db,

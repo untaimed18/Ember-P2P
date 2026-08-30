@@ -50,6 +50,7 @@
     type ChannelMessageInfo,
     type ChannelTransferInfo,
     type GatheredChannelInfo,
+    type GatheredChannelBatch,
   } from '$lib/api/channels';
   import { addFriend } from '$lib/api/friends';
   import {
@@ -92,6 +93,10 @@
   /** True for any Discover walk, including the 60s refresh. The Find button
    *  uses `discovering` so a background walk does not lock the control. */
   let gatherInFlight = $state(false);
+  /** Which walk the shard events arriving now belong to. Random rather than a
+   *  counter: a previous visit's walk can still be emitting after this page has
+   *  remounted, and a counter would have restarted at the same number. */
+  let gatherWalk = '';
   let pendingNotifyEmpty = $state(false);
   let discovered: GatheredChannelInfo[] = $state([]);
   let copyingInvite = $state(false);
@@ -437,6 +442,13 @@
     if (changed) presenceNow = wall;
   }
 
+  function newGatherWalk(): string {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+    return `w-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  }
+
   function channelHue(id: string): number {
     let h = 0;
     for (let i = 0; i < Math.min(id.length, 8); i++) {
@@ -525,9 +537,12 @@
     // order the DHT returns them, so the list grows as the walk proceeds instead
     // of appearing all at once when the slowest shard gives up.
     let unlistenFound: UnlistenFn | undefined;
-    listen<GatheredChannelInfo[]>('ember:channels-found', (event) => {
-      if (!gatherInFlight) return;
-      const batch = event.payload ?? [];
+    listen<GatheredChannelBatch>('ember:channels-found', (event) => {
+      // The walk that asked, not merely "a walk is running". Shards from the
+      // previous browse can still land after this one has started, and merging
+      // them showed rooms as freshly found that were a minute stale.
+      if (!gatherInFlight || event.payload?.walk !== gatherWalk) return;
+      const batch = event.payload.channels ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
       for (const item of batch) {
@@ -925,6 +940,7 @@
       return;
     }
     gatherInFlight = true;
+    gatherWalk = newGatherWalk();
     if (notifyEmpty || pendingNotifyEmpty) discovering = true;
     let found: GatheredChannelInfo[] | null = null;
     let err: unknown = null;
@@ -936,7 +952,7 @@
           // A cold cache is the normal first run, not a failure to report.
         }
       }
-      const result = await gatherChannels();
+      const result = await gatherChannels(gatherWalk);
       const prior = new Map(discovered.map((item) => [item.channel_id, item]));
       discovered = result.map((item) =>
         withKnownMemberCount(item, prior.get(item.channel_id)),

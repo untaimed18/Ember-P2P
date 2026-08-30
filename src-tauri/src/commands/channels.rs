@@ -1162,17 +1162,9 @@ pub async fn leave_channel(
 ) -> Result<(), String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
-    let db = state.db.clone();
-    let row_id = channel_id.clone();
-    let row = tokio::task::spawn_blocking(move || db.get_channel(&row_id))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
-    let Some(row) = row else {
-        return Err(coded("channels_not_found", "Channel not found"));
-    };
-    let join_secret = join_secret_for_channel(&state, &row).await;
-    let username = state.config.read().await.settings.channel_username.clone();
+    // Straight to the write. The room used to be read first for the key and the
+    // visibility the tombstone was built from, and `set_channel_in_room` reports
+    // a missing row on its own, so the read is only a second chance to race.
     let db = state.db.clone();
     let leave_id = channel_id.clone();
     let left = tokio::task::spawn_blocking(move || db.set_channel_in_room(&leave_id, false))
@@ -1196,34 +1188,15 @@ pub async fn leave_channel(
     // this build drops the member; the store TTL is short. Not a new wire
     // type — flags already lived in file_size — so older peers treat this as
     // a last announce until it expires.
-    if let Some(join_secret) = join_secret {
-        if let (Ok(id_bytes), Ok(pk_bytes)) = (hex::decode(&row.channel_id), hex::decode(&row.pubkey))
-        {
-            if let (Ok(cid), Ok(cpk)) = (
-                <[u8; 16]>::try_from(id_bytes.as_slice()),
-                <[u8; 32]>::try_from(pk_bytes.as_slice()),
-            ) {
-                let nick = username.trim();
-                let record = SignedRecord::channel_presence_departure(
-                    nick,
-                    cid,
-                    cpk,
-                    &join_secret,
-                    row.visibility == CHANNEL_KIND_PRIVATE,
-                    channel::presence_epoch(chrono::Utc::now().timestamp()),
-                    &state.identity.noise_public_key,
-                    &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-                );
-                if let Err(e) = queue_signed_record(&state, record).await {
-                    tracing::warn!(
-                        channel_id = %channel_id,
-                        error = %e,
-                        "left the room but the presence tombstone did not publish"
-                    );
-                }
-            }
-        }
-    }
+    //
+    // Recorded as owed rather than published here. This was one fire-and-forget
+    // STORE, so a leave attempted with no route to the storing nodes left us on
+    // every other roster until we aged out twenty minutes later — with nothing
+    // that could notice or try again. The network loop owns the retry, exactly
+    // as it does for a live announcement, and clears the marker once one lands.
+    let _ = state
+        .db
+        .mark_channel_departure_due(&channel_id, chrono::Utc::now().timestamp());
     Ok(())
 }
 
@@ -3841,6 +3814,24 @@ fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// One shard's worth of listings, tagged with the walk that asked for them.
+#[derive(Clone, serde::Serialize)]
+struct GatheredChannelBatch<'a> {
+    /// Echoed straight back from the caller.
+    ///
+    /// Shards from a finished walk can still be in the air when the next one
+    /// starts, and the page had no way to tell them apart — it merged them into
+    /// the new walk's results as though they had just been found. The caller
+    /// names its own walk because the events begin arriving before this command
+    /// returns, so nothing the return value carries could identify them in time.
+    walk: &'a str,
+    channels: &'a [GatheredChannelInfo],
+}
+
+/// Longest walk token echoed back. Local IPC, so this is hygiene rather than a
+/// boundary: a token is a generated id, and a long one is a mistake either way.
+const GATHER_WALK_MAX: usize = 64;
+
 /// Walk the 16 public-index shards and return unique channel listings.
 ///
 /// Each shard is emitted on `ember:channels-found` the moment it lands, so a
@@ -3852,8 +3843,20 @@ fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
 pub async fn gather_channels(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    walk: String,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     use futures::StreamExt;
+
+    let walk: String = walk.chars().take(GATHER_WALK_MAX).collect();
+    let emit = |channels: &[GatheredChannelInfo]| {
+        let _ = app.emit(
+            "ember:channels-found",
+            GatheredChannelBatch {
+                walk: &walk,
+                channels,
+            },
+        );
+    };
 
     require_ember(&state).await?;
     let db = state.db.clone();
@@ -3931,7 +3934,7 @@ pub async fn gather_channels(
         });
     }
     if !out.is_empty() {
-        let _ = app.emit("ember:channels-found", &out);
+        emit(&out);
     }
 
     while let Some(shard) = walks.next().await {
@@ -3943,7 +3946,7 @@ pub async fn gather_channels(
         if found.is_empty() {
             continue;
         }
-        let _ = app.emit("ember:channels-found", &found);
+        emit(&found);
         out.extend(found);
     }
 
@@ -3962,7 +3965,7 @@ pub async fn gather_channels(
                     item.member_count = Some(*count);
                 }
             }
-            let _ = app.emit("ember:channels-found", &out);
+            emit(&out);
         }
     }
 

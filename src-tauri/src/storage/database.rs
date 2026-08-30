@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 41;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 42;
 
 /// One row of a room's history as the UI needs it.
 ///
@@ -1960,6 +1960,38 @@ impl Database {
                     ON channel_message_reactions(channel_id, msg_id);",
             )?;
             set_version(&tx, 41)?;
+            tx.commit()?;
+        }
+
+        if version < 42 {
+            // Room work that has to outlive the process that decided to do it.
+            //
+            // Both of these were in-memory intentions, and both were lost by
+            // closing the app in the wrong second. `rotate_pending` is set when a
+            // delegated moderator's ban lands in a private room we own: only the
+            // owner can mint an epoch record, so their ban is a label until we
+            // rotate for them, and dropping the request meant it stayed one until
+            // the next ban. `departure_due_at` is the presence tombstone that
+            // says we left, which was published once and never retried — a
+            // failed STORE left us on every other roster until we aged out.
+            //
+            // Both live on `channels` rather than in a work queue: they are
+            // per-room facts with no ordering between them, and the loop that
+            // acts on each already walks that table.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "rotate_pending",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "departure_due_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 42)?;
             tx.commit()?;
         }
 
@@ -4448,8 +4480,13 @@ impl Database {
     /// Walk in or out without dropping secrets or history.
     pub fn set_channel_in_room(&self, channel_id: &str, in_room: bool) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
+        // Walking back in cancels any leave tombstone still waiting to publish.
+        // Sending one afterwards would tell the room to drop the roster row we
+        // had just re-earned.
         let n = conn.execute(
-            "UPDATE channels SET in_room = ?2 WHERE channel_id = ?1 AND deleted = 0",
+            "UPDATE channels SET in_room = ?2,
+                departure_due_at = CASE WHEN ?2 = 1 THEN 0 ELSE departure_due_at END
+             WHERE channel_id = ?1 AND deleted = 0",
             params![channel_id, if in_room { 1 } else { 0 }],
         )?;
         Ok(n > 0)
@@ -5673,6 +5710,122 @@ impl Database {
             [],
         )?;
         Ok(())
+    }
+
+    /// Record that a private room we own owes a key rotation.
+    ///
+    /// Written when a delegated moderator's ban lands. Only the owner can mint an
+    /// epoch record, so until this is acted on their ban is a label the evicted
+    /// member reads straight through — and holding the intention in memory meant
+    /// closing the app in the wrong second turned it into one permanently.
+    pub fn mark_channel_rotate_pending(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET rotate_pending = 1
+             WHERE channel_id = ?1 AND is_owner = 1 AND visibility = 'private'",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear it, once the snapshot announcing the new epoch is on its way.
+    pub fn clear_channel_rotate_pending(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET rotate_pending = 0 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Rooms still owing the presence tombstone that says we left.
+    ///
+    /// `departure_due_at` is when to try next, not when we left: a tombstone has
+    /// to be *newer* than the live announcement it replaces, so each attempt
+    /// mints its own timestamp. What makes that safe is the `in_room = 0` test
+    /// here plus the clear on rejoining — publishing a departure after walking
+    /// back in would delete the row we had just re-earned.
+    ///
+    /// Retried until it lands. A tombstone that never published leaves us on
+    /// every other roster until we age out, and one publish attempt per room per
+    /// presence interval is nothing next to that; the set is only rooms left
+    /// while the network was unreachable, and it empties as soon as one is.
+    pub fn channels_due_for_departure(&self, now: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id FROM channels
+             WHERE departure_due_at > 0 AND in_room = 0 AND deleted = 0
+               AND departure_due_at <= ?1
+             ORDER BY departure_due_at",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Owe a leave tombstone for this room, next attempted at `at`.
+    ///
+    /// Only while we are actually out of the room, so nothing can arm this
+    /// against a room we are sitting in.
+    pub fn mark_channel_departure_due(&self, channel_id: &str, at: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET departure_due_at = ?2
+             WHERE channel_id = ?1 AND in_room = 0",
+            params![channel_id, at.max(1)],
+        )?;
+        Ok(())
+    }
+
+    /// Take the next attempt at a room's leave tombstone, reserving it.
+    ///
+    /// One statement, because the check and the reservation cannot be allowed to
+    /// come apart. The publisher works from a list it gathered earlier and yields
+    /// to the runtime between rooms, so a rejoin can land in the middle of a pass
+    /// — and publishing a departure after walking back in tells every member to
+    /// drop the roster row we just re-earned. `in_room = 0` is part of the write
+    /// rather than something read beforehand.
+    ///
+    /// Returns whether this caller now owns the attempt. The stamp moves to
+    /// `next_attempt` either way, so a publish that fails to start is retried on
+    /// the ordinary interval instead of spinning.
+    pub fn claim_channel_departure(
+        &self,
+        channel_id: &str,
+        next_attempt: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE channels SET departure_due_at = ?2
+             WHERE channel_id = ?1 AND in_room = 0 AND deleted = 0
+               AND departure_due_at > 0",
+            params![channel_id, next_attempt.max(1)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Stop owing it — the STORE landed, or we are back in the room.
+    pub fn clear_channel_departure(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE channels SET departure_due_at = 0 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a room we own owes a rotation for a moderator's ban.
+    pub fn channel_rotate_is_pending(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let pending: Option<i64> = conn
+            .query_row(
+                "SELECT rotate_pending FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(pending.unwrap_or(0) != 0)
     }
 
     /// Rename our own roster rows across every room we sit in.
@@ -9076,6 +9229,69 @@ mod tests {
         let history = db.get_channel_messages(&new_id, 50, None).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].message, "keep me");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Walking back into a room cancels the tombstone that said we left.
+    ///
+    /// The publisher gathers a list and yields between rooms, so a rejoin can
+    /// land mid-pass. Publishing the departure anyway would tell every member to
+    /// drop the roster row we had just re-earned, which is why the claim tests
+    /// `in_room` as part of its own write rather than trusting the list.
+    #[test]
+    fn a_rejoin_cancels_the_leave_tombstone_even_mid_pass() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-departure-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        let channel_id = "7d".repeat(16);
+        db.insert_channel(&channel_id, &"1f".repeat(32), "Lobby", "public", false, None, None)
+            .unwrap();
+        assert!(db.set_channel_in_room(&channel_id, false).unwrap());
+        db.mark_channel_departure_due(&channel_id, 100).unwrap();
+        assert_eq!(db.channels_due_for_departure(200).unwrap(), vec![channel_id.clone()]);
+
+        // Not yet due is not the same as not owed.
+        assert!(db.channels_due_for_departure(50).unwrap().is_empty());
+
+        // The claim reserves it and pushes the next attempt out, so a second
+        // pass cannot start a duplicate publish while the first is in flight.
+        assert!(db.claim_channel_departure(&channel_id, 900).unwrap());
+        assert!(db.channels_due_for_departure(200).unwrap().is_empty());
+        assert_eq!(db.channels_due_for_departure(900).unwrap(), vec![channel_id.clone()]);
+
+        // Rejoining drops the marker, and the claim then refuses -- which is the
+        // race: the publisher already had this room on its list.
+        assert!(db.set_channel_in_room(&channel_id, true).unwrap());
+        assert!(db.channels_due_for_departure(i64::MAX).unwrap().is_empty());
+        assert!(
+            !db.claim_channel_departure(&channel_id, 1_000).unwrap(),
+            "a departure must not be publishable for a room we are back inside"
+        );
+        db.mark_channel_departure_due(&channel_id, 100).unwrap();
+        assert!(
+            db.channels_due_for_departure(i64::MAX).unwrap().is_empty(),
+            "nor arm-able while we are in the room"
+        );
+
+        // Leaving again owes a fresh one, and a stored record clears it.
+        assert!(db.set_channel_in_room(&channel_id, false).unwrap());
+        db.mark_channel_departure_due(&channel_id, 100).unwrap();
+        assert!(db.claim_channel_departure(&channel_id, 900).unwrap());
+        db.clear_channel_departure(&channel_id).unwrap();
+        assert!(db.channels_due_for_departure(i64::MAX).unwrap().is_empty());
+        assert!(!db.claim_channel_departure(&channel_id, 1_000).unwrap());
 
         drop(db);
         let _ = std::fs::remove_file(&path);
