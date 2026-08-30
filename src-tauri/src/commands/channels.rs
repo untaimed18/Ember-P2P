@@ -242,6 +242,7 @@ pub struct ChannelReactionInfo {
     pub msg_id: String,
     pub up: u32,
     pub down: u32,
+    pub heart: u32,
     /// This device's own reaction, so the button can show as pressed. 0 is none.
     pub mine: u8,
 }
@@ -1660,9 +1661,10 @@ pub async fn edit_channel_message(
 /// Set or clear this device's reaction to one line.
 ///
 /// `reaction` is [`channel::REACTION_NONE`] to take a reaction back,
-/// [`channel::REACTION_UP`], or [`channel::REACTION_DOWN`]. Clearing is stored
-/// rather than deleted, because the row carries the timestamp that stops a stale
-/// frame reasserting what was withdrawn.
+/// [`channel::REACTION_UP`], [`channel::REACTION_DOWN`], or
+/// [`channel::REACTION_HEART`]. Clearing is stored rather than deleted, because
+/// the row carries the timestamp that stops a stale frame reasserting what was
+/// withdrawn.
 #[tauri::command]
 pub async fn set_channel_message_reaction(
     state: tauri::State<'_, AppState>,
@@ -1673,7 +1675,7 @@ pub async fn set_channel_message_reaction(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let channel_id_bytes = channel_id_bytes(&channel_id)?;
-    if reaction > channel::REACTION_DOWN {
+    if reaction > channel::REACTION_HEART {
         return Err(coded(
             "channels_reaction_invalid",
             "Unsupported reaction",
@@ -1705,6 +1707,16 @@ pub async fn set_channel_message_reaction(
             )
         })?;
     let member_pk = state.identity.ed25519_public_key;
+    if reaction != channel::REACTION_NONE
+        && target
+            .sender_pubkey
+            .eq_ignore_ascii_case(&hex::encode(member_pk))
+    {
+        return Err(coded(
+            "channels_reaction_own",
+            "You cannot react to your own message",
+        ));
+    }
     let msg_id_bytes = parse_msg_id(&target.msg_id)?;
     let reacted_at = chrono::Utc::now().timestamp();
     let sig = channel::reaction_signature(
@@ -1787,13 +1799,15 @@ pub async fn get_channel_reactions(
                 msg_id,
                 up: 0,
                 down: 0,
+                heart: 0,
                 mine: channel::REACTION_NONE,
             });
         match reaction {
             channel::REACTION_UP => entry.up = entry.up.saturating_add(1),
             channel::REACTION_DOWN => entry.down = entry.down.saturating_add(1),
+            channel::REACTION_HEART => entry.heart = entry.heart.saturating_add(1),
             // A reaction a newer build drew and this one does not. Counted
-            // nowhere rather than lumped in with a thumb it is not.
+            // nowhere rather than lumped in with a mark it is not.
             _ => {}
         }
         if member.eq_ignore_ascii_case(&mine) {

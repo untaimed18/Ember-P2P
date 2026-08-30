@@ -18,6 +18,7 @@
     REACTION_NONE,
     REACTION_UP,
     REACTION_DOWN,
+    REACTION_HEART,
     type ChannelReactionInfo,
   } from '$lib/api/channels';
   import { appSettings } from '$lib/stores/settings';
@@ -236,6 +237,13 @@
   let editBusy = $state(false);
   let editError = $state<string | null>(null);
   let reactionBusy = $state<number | null>(null);
+  /** Brief feedback on only the chip the user just changed. */
+  let reactionPulse = $state<{
+    msgId: string;
+    kind: number;
+    action: 'add' | 'remove';
+  } | null>(null);
+  let reactionPulseTimer: ReturnType<typeof setTimeout> | null = null;
   let editInputEl: HTMLTextAreaElement | undefined = $state();
 
   async function refreshReactions() {
@@ -322,9 +330,20 @@
   async function toggleReaction(msg: ConvMessage, reaction: number) {
     const channel = channelId;
     if (!channel || !msg.msg_id || reactionBusy !== null) return;
+    if (msg.direction === 'sent') return;
     const current = reactions[msg.msg_id]?.mine ?? REACTION_NONE;
     const next = current === reaction ? REACTION_NONE : reaction;
     reactionBusy = msg.id;
+    reactionPulse = {
+      msgId: msg.msg_id,
+      kind: reaction,
+      action: next === REACTION_NONE ? 'remove' : 'add',
+    };
+    if (reactionPulseTimer) clearTimeout(reactionPulseTimer);
+    reactionPulseTimer = setTimeout(() => {
+      reactionPulse = null;
+      reactionPulseTimer = null;
+    }, 560);
     try {
       await setChannelMessageReaction(channel, msg.id, next);
       if (channel === channelId) await refreshReactions();
@@ -1399,10 +1418,39 @@
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
+    if (reactionPulseTimer) { clearTimeout(reactionPulseTimer); reactionPulseTimer = null; }
   });
 </script>
 
-<div class="conversation">
+{#snippet messageTimestamp(msg: ConvMessage, pending: boolean, failed: boolean)}
+  <div class="bubble-time">
+    {formatTime(msg.timestamp)}
+    {#if (msg.edited_at ?? 0) > 0}
+      <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
+        {m.channels_edited()}
+      </span>
+    {/if}
+    {#if pending}
+      <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+    {:else if failed}
+      <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+      {#if !isChannel}
+        <button
+          class="bubble-resend"
+          type="button"
+          disabled={resendingId !== null || sending || chatDisabled || chatLocked}
+          onclick={() => resendMessage(msg)}
+          title={m.chat_resend()}
+          aria-label={m.chat_resend()}
+        >
+          {resendingId === msg.id ? m.chat_loading_short() : m.chat_resend()}
+        </button>
+      {/if}
+    {/if}
+  </div>
+{/snippet}
+
+<div class="conversation" class:channel={isChannel}>
   {#if !hideHeader}
   <div class="conv-header">
     <div class="conv-header-info">
@@ -1492,6 +1540,17 @@
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
         <div
+          class="conv-msg"
+          class:sent={row.msg.direction === 'sent'}
+          class:received={row.msg.direction === 'received'}
+          class:starts-run={row.startsRun}
+        >
+        {#if isChannel}
+          <div class="bubble-who">
+            <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
+          </div>
+        {/if}
+        <div
           class="conv-bubble"
           data-msg-id={row.msg.id}
           class:sent={row.msg.direction === 'sent'}
@@ -1508,11 +1567,6 @@
             style spoofing class). The text is still rendered exactly as
             written; only its bidi influence is scoped to this element.
           -->
-          {#if isChannel && row.startsRun && row.msg.direction === 'received'}
-            <div class="bubble-who">
-              <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
-            </div>
-          {/if}
           <!--
             Segments, never markup: each run is a text node, so nothing a
             member types can become HTML. A link is a `<button>` rather than an
@@ -1560,82 +1614,8 @@
                   onclick={() => askOpenLink(seg.href!)}
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           {/if}
-          <!-- Same wire-id test `canEdit` applies. A line copied across a room
-               handoff carries a synthetic id no other member can address, so the
-               backend refuses the reaction and the only thing the buttons could
-               produce is an error. -->
-          {#if isChannel && row.msg.msg_id?.length === 32}
-            {@const tally = reactions[row.msg.msg_id]}
-            {@const mine = tally?.mine ?? REACTION_NONE}
-            <!-- Shown when anyone has reacted, and otherwise revealed on hover of
-                 the bubble like the remove button — a transcript should not be a
-                 wall of buttons, but a count already cast has to stay visible. -->
-            <div class="bubble-reactions" class:has-any={(tally?.up ?? 0) + (tally?.down ?? 0) > 0}>
-              <button
-                type="button"
-                class="reaction-btn"
-                class:active={mine === REACTION_UP}
-                disabled={reactionBusy !== null}
-                onclick={() => toggleReaction(row.msg, REACTION_UP)}
-                title={m.channels_reaction_up()}
-                aria-label={m.channels_reaction_up()}
-                aria-pressed={mine === REACTION_UP}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
-                  <path d="M5 14V7l3.2-4.5a1.4 1.4 0 0 1 2.4 1.3L9.7 6.5H13a1.3 1.3 0 0 1 1.2 1.7l-1.3 4.6a1.7 1.7 0 0 1-1.6 1.2H5zM2.6 14h2.4V7H2.6z"/>
-                </svg>
-                {#if (tally?.up ?? 0) > 0}<span class="reaction-count">{tally?.up}</span>{/if}
-              </button>
-              <button
-                type="button"
-                class="reaction-btn"
-                class:active={mine === REACTION_DOWN}
-                disabled={reactionBusy !== null}
-                onclick={() => toggleReaction(row.msg, REACTION_DOWN)}
-                title={m.channels_reaction_down()}
-                aria-label={m.channels_reaction_down()}
-                aria-pressed={mine === REACTION_DOWN}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
-                  <path d="M11 2v7l-3.2 4.5a1.4 1.4 0 0 1-2.4-1.3l.9-2.7H3a1.3 1.3 0 0 1-1.2-1.7l1.3-4.6A1.7 1.7 0 0 1 4.7 2H11zm2.4 0h-2.4v7h2.4z"/>
-                </svg>
-                {#if (tally?.down ?? 0) > 0}<span class="reaction-count">{tally?.down}</span>{/if}
-              </button>
-            </div>
-          {/if}
-          <!--
-            Once per run, not once per message: within a burst the timestamps
-            repeat the same minute and add nothing. Delivery state is per
-            message though, so a queued or failed one always shows its own.
-          -->
-          {#if row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0}
-            <div class="bubble-time">
-              {formatTime(row.msg.timestamp)}
-              {#if (row.msg.edited_at ?? 0) > 0}
-                <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(row.msg.edited_at ?? 0) })}>
-                  {m.channels_edited()}
-                </span>
-              {/if}
-              {#if pending}
-                <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
-              {:else if failed}
-                <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
-                <!-- Only friend messages reach `failed`: a channel send either
-                     lands or throws, and never leaves a row behind to retry. -->
-                {#if !isChannel}
-                  <button
-                    class="bubble-resend"
-                    type="button"
-                    disabled={resendingId !== null || sending || chatDisabled || chatLocked}
-                    onclick={() => resendMessage(row.msg)}
-                    title={m.chat_resend()}
-                    aria-label={m.chat_resend()}
-                  >
-                    {resendingId === row.msg.id ? m.chat_loading_short() : m.chat_resend()}
-                  </button>
-                {/if}
-              {/if}
-            </div>
+          {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
+            {@render messageTimestamp(row.msg, pending, failed)}
           {/if}
           <!-- Channels only, and only for rows the DB can actually address:
                live bubbles carry negative synthetic ids. -->
@@ -1664,6 +1644,82 @@
               </button>
             </div>
           {/if}
+          {#if isChannel}
+            <div class="bubble-meta">
+              {#if row.msg.msg_id?.length === 32}
+                {@const tally = reactions[row.msg.msg_id]}
+                {@const mine = tally?.mine ?? REACTION_NONE}
+                {@const hasAny = (tally?.up ?? 0) + (tally?.down ?? 0) + (tally?.heart ?? 0) > 0}
+                {@const ownMessage = row.msg.direction === 'sent'}
+                {#if !ownMessage || hasAny}
+                <div class="bubble-reactions" class:has-any={hasAny} class:readonly={ownMessage}>
+                  {#if !ownMessage || (tally?.heart ?? 0) > 0}
+                  <button
+                    type="button"
+                    class="reaction-btn heart"
+                    class:active={mine === REACTION_HEART}
+                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_HEART && reactionPulse?.action === 'add'}
+                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_HEART && reactionPulse?.action === 'remove'}
+                    disabled={ownMessage || reactionBusy !== null}
+                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_HEART); }}
+                    title={m.channels_reaction_heart()}
+                    aria-label={m.channels_reaction_heart()}
+                    aria-pressed={mine === REACTION_HEART}
+                    tabindex={ownMessage ? -1 : undefined}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                      <path d="M8 13.4S2.6 10.1 2.6 6.7A3.05 3.05 0 0 1 8 4.05a3.05 3.05 0 0 1 5.4 2.65C13.4 10.1 8 13.4 8 13.4z"/>
+                    </svg>
+                    {#if (tally?.heart ?? 0) > 0}<span class="reaction-count">{tally?.heart}</span>{/if}
+                  </button>
+                  {/if}
+                  {#if !ownMessage || (tally?.up ?? 0) > 0}
+                  <button
+                    type="button"
+                    class="reaction-btn"
+                    class:active={mine === REACTION_UP}
+                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_UP && reactionPulse?.action === 'add'}
+                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_UP && reactionPulse?.action === 'remove'}
+                    disabled={ownMessage || reactionBusy !== null}
+                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_UP); }}
+                    title={m.channels_reaction_up()}
+                    aria-label={m.channels_reaction_up()}
+                    aria-pressed={mine === REACTION_UP}
+                    tabindex={ownMessage ? -1 : undefined}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                      <path d="M5 14V7l3.2-4.5a1.4 1.4 0 0 1 2.4 1.3L9.7 6.5H13a1.3 1.3 0 0 1 1.2 1.7l-1.3 4.6a1.7 1.7 0 0 1-1.6 1.2H5zM2.6 14h2.4V7H2.6z"/>
+                    </svg>
+                    {#if (tally?.up ?? 0) > 0}<span class="reaction-count">{tally?.up}</span>{/if}
+                  </button>
+                  {/if}
+                  {#if !ownMessage || (tally?.down ?? 0) > 0}
+                  <button
+                    type="button"
+                    class="reaction-btn"
+                    class:active={mine === REACTION_DOWN}
+                    class:pulse-add={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_DOWN && reactionPulse?.action === 'add'}
+                    class:pulse-remove={!ownMessage && reactionPulse?.msgId === row.msg.msg_id && reactionPulse?.kind === REACTION_DOWN && reactionPulse?.action === 'remove'}
+                    disabled={ownMessage || reactionBusy !== null}
+                    onclick={() => { if (!ownMessage) void toggleReaction(row.msg, REACTION_DOWN); }}
+                    title={m.channels_reaction_down()}
+                    aria-label={m.channels_reaction_down()}
+                    aria-pressed={mine === REACTION_DOWN}
+                    tabindex={ownMessage ? -1 : undefined}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                      <path d="M11 2v7l-3.2 4.5a1.4 1.4 0 0 1-2.4-1.3l.9-2.7H3a1.3 1.3 0 0 1-1.2-1.7l1.3-4.6A1.7 1.7 0 0 1 4.7 2H11zm2.4 0h-2.4v7h2.4z"/>
+                    </svg>
+                    {#if (tally?.down ?? 0) > 0}<span class="reaction-count">{tally?.down}</span>{/if}
+                  </button>
+                  {/if}
+                </div>
+                {/if}
+              {/if}
+              {@render messageTimestamp(row.msg, pending, failed)}
+            </div>
+          {/if}
+        </div>
         </div>
       {/each}
     {/if}
@@ -1780,6 +1836,18 @@
     position: relative;
   }
 
+  /* Nested well: a step darker than the page canvas so white received
+     bubbles and the compose field have something to sit on. */
+  .conversation.channel {
+    background: var(--bg-tertiary);
+    --reaction-gold: #ffd34a;
+    --reaction-heart: #ff4f5c;
+  }
+
+  :global([data-theme="dark"]) .conversation.channel {
+    background: var(--bg-secondary);
+  }
+
   .conv-header {
     display: flex;
     align-items: center;
@@ -1871,9 +1939,13 @@
     padding: 16px;
     display: flex;
     flex-direction: column;
-    /* Tight by default; `.starts-run` reopens the gap where the speaker
-       changes, so spacing carries meaning instead of being uniform. */
     gap: 2px;
+  }
+
+  .conversation.channel .conv-messages {
+    /* Six pixels keeps separate messages readable; `.starts-run` adds another
+       six where the speaker changes, preserving visible conversation groups. */
+    gap: 6px;
   }
 
   .conv-loading,
@@ -1980,6 +2052,11 @@
     margin-top: 0;
   }
 
+  .conversation.channel .conv-day {
+    background: var(--bg-surface);
+    border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  }
+
   /* A full-width rule rather than a centred pill like `.conv-day`: it marks a
      boundary in the conversation, so it should read as a line across it. */
   .conv-unread-divider {
@@ -2013,6 +2090,41 @@
     overflow-wrap: anywhere;
     /* Anchors the hover-revealed remove control. */
     position: relative;
+  }
+
+  /* A column so the sender name can sit above the bubble instead of inside
+     it, and so sent/received alignment applies to the name + bubble as one. */
+  .conv-msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 80%;
+    min-width: 0;
+  }
+
+  .conv-msg.sent { align-self: flex-end; align-items: flex-end; }
+  .conv-msg.received { align-self: flex-start; align-items: flex-start; }
+
+  .conv-msg .conv-bubble {
+    max-width: 100%;
+  }
+
+  .conversation.channel .conv-msg {
+    position: relative;
+    max-width: min(720px, 72%);
+    min-width: min(156px, 72%);
+  }
+
+  .conversation.channel .conv-bubble {
+    width: 100%;
+    padding: 24px 12px 8px;
+    line-height: 1.4;
+    border-radius: 8px;
+    box-shadow: none;
+  }
+
+  .conversation.channel .conv-msg.received .conv-bubble,
+  .conversation.channel .conv-msg.sent .conv-bubble {
+    border-top-left-radius: 8px;
   }
 
   /* Consecutive messages from one author read as a single block: the gap only
@@ -2057,12 +2169,24 @@
     background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
 
-  .conv-bubble.starts-run:not(:first-child) {
+  .conversation.channel .conv-bubble.mentions-me {
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
+    padding-inline-start: 10px;
+  }
+
+  :global([data-theme="dark"]) .conversation.channel .conv-bubble.mentions-me {
+    background: color-mix(in srgb, var(--accent) 16%, var(--bg-tertiary));
+  }
+
+  .conv-msg.starts-run:not(:first-child) {
     margin-top: 8px;
   }
 
+  .conversation.channel .conv-msg.starts-run:not(:first-child) {
+    margin-top: 6px;
+  }
+
   .conv-bubble.sent {
-    align-self: flex-end;
     background: var(--accent);
     color: var(--on-accent);
   }
@@ -2080,9 +2204,51 @@
   }
 
   .conv-bubble.received {
-    align-self: flex-start;
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .conversation.channel .conv-bubble.sent {
+    background:
+      linear-gradient(
+        165deg,
+        color-mix(in srgb, #fff 14%, var(--accent)) 0%,
+        var(--accent) 46%
+      );
+    box-shadow: 0 1px 3px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+
+  .conversation.channel .conv-bubble.received {
+    background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  }
+
+  :global([data-theme="dark"]) .conversation.channel .conv-bubble.received {
+    background: var(--bg-tertiary);
+  }
+
+  .conversation.channel .conv-bubble.sent:not(.starts-run) {
+    border-top-right-radius: 4px;
+  }
+
+  .conversation.channel .conv-bubble.sent:not(.ends-run) {
+    border-bottom-right-radius: 4px;
+  }
+
+  .conversation.channel .conv-bubble.sent.ends-run {
+    border-bottom-right-radius: 8px;
+  }
+
+  .conversation.channel .conv-bubble.received:not(.starts-run) {
+    border-top-left-radius: 8px;
+  }
+
+  .conversation.channel .conv-bubble.received:not(.ends-run) {
+    border-bottom-left-radius: 4px;
+  }
+
+  .conversation.channel .conv-bubble.received.ends-run {
+    border-bottom-left-radius: 8px;
   }
 
   .conv-bubble.received:not(.starts-run) {
@@ -2143,11 +2309,73 @@
     margin-bottom: 2px;
   }
 
+  .conversation.channel .bubble-who {
+    opacity: 1;
+    position: absolute;
+    z-index: 1;
+    top: 0;
+    inset-inline-start: 0;
+    display: inline-flex;
+    max-width: calc(100% - 16px);
+    margin: 0;
+    padding: 3px 9px 3px 8px;
+    border-radius: 8px 6px 8px 0;
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+    color: var(--text-accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    line-height: 1.2;
+  }
+
+  .conversation.channel .conv-msg.received .bubble-who {
+    top: -1px;
+    inset-inline-start: -1px;
+  }
+
+  .conversation.channel .conv-msg.sent .bubble-who {
+    background: var(--on-accent);
+    border-color: color-mix(in srgb, var(--on-accent) 55%, var(--accent));
+    color: var(--accent);
+    box-shadow:
+      -1px -1px 0 var(--on-accent),
+      0 1px 2px color-mix(in srgb, #000 12%, transparent);
+  }
+
+  .conversation.channel .bubble-who bdi {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .bubble-time {
     font-size: 10px;
-    opacity: 0.65;
-    margin-top: 4px;
-    text-align: right;
+    color: var(--text-muted);
+    padding: 0 2px;
+    line-height: 1.2;
+    flex-shrink: 0;
+  }
+
+  .conversation.channel .conv-bubble.sent .bubble-time,
+  .conversation.channel .conv-bubble.sent .bubble-edited {
+    color: color-mix(in srgb, var(--on-accent) 88%, transparent);
+  }
+
+  .bubble-meta {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 14px;
+    margin-top: 10px;
+    min-height: 16px;
+    position: relative;
+  }
+
+  /* Internal footer: reactions stay by the near edge and time sits opposite. */
+  .conversation.channel .bubble-time {
+    margin-inline-start: auto;
   }
 
   /* Sits inside the timestamp line so a queued message reads as "sent at X,
@@ -2178,6 +2406,51 @@
     gap: 2px;
     opacity: 0;
     transition: opacity var(--transition-fast);
+  }
+
+  /* Channel rooms park the cluster on the top edge, half outside the fill,
+     so it doesn't eat into a compact bubble. Hover still works: the buttons
+     are descendants of the bubble even when they paint outside it. */
+  .conversation.channel .bubble-tools {
+    top: -8px;
+    inset-inline-end: 2px;
+    transform: none;
+    z-index: 3;
+    gap: 3px;
+  }
+
+  .conversation.channel .bubble-remove {
+    position: static;
+  }
+
+  .conversation.channel .bubble-edit-btn,
+  .conversation.channel .bubble-remove {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--bg-primary);
+    color: var(--text-muted);
+    box-shadow: none;
+    border: 1px solid var(--border);
+  }
+
+  /* Match the Channels beta badge: rose identifies this secondary action
+     without giving a local-only delete the weight of a danger-red button. */
+  .conversation.channel .bubble-remove {
+    color: var(--ember-color);
+    background: color-mix(in srgb, var(--ember-color) 14%, var(--bg-primary));
+    border-color: color-mix(in srgb, var(--ember-color) 28%, var(--border));
+  }
+
+  .conversation.channel .bubble-remove:hover {
+    color: var(--ember-color);
+    background: color-mix(in srgb, var(--ember-color) 22%, var(--bg-primary));
+    border-color: color-mix(in srgb, var(--ember-color) 45%, var(--border));
+  }
+
+  .conversation.channel .bubble-edit-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
   .conv-bubble:hover .bubble-tools,
@@ -2261,7 +2534,7 @@
   .bubble-edit-save {
     border-color: var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .bubble-edit-cancel:disabled,
@@ -2281,10 +2554,44 @@
     transition: opacity var(--transition-fast);
   }
 
+  /* Reactions live in the internal footer. Keeping them in flow guarantees
+     clear space from both the message and the timestamp. */
+  .conversation.channel .bubble-reactions {
+    margin: 0;
+    flex-shrink: 0;
+    pointer-events: none;
+  }
+
+  /* Hover-only controls do not make every untouched bubble taller. They use
+     the footer's reserved near edge; a real tally returns to normal flow. */
+  .conversation.channel .bubble-reactions:not(.has-any) {
+    position: absolute;
+    inset-inline-start: 0;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+
+  .conversation.channel .conv-bubble.sent .bubble-reactions:not(.has-any) {
+    inset-inline-start: auto;
+    inset-inline-end: 0;
+  }
+
+  .conversation.channel .bubble-reactions.has-any {
+    position: static;
+    transform: none;
+    pointer-events: auto;
+  }
+
   .bubble-reactions.has-any,
-  .conv-bubble:hover .bubble-reactions,
+  .conv-msg:hover .bubble-reactions,
   .bubble-reactions:focus-within {
     opacity: 1;
+  }
+
+  .conversation.channel .bubble-reactions.has-any,
+  .conversation.channel .conv-msg:hover .bubble-reactions,
+  .conversation.channel .bubble-reactions:focus-within {
+    pointer-events: auto;
   }
 
   /* A pointer that cannot hover has no way to reveal any of these, so on a touch
@@ -2295,25 +2602,69 @@
     .bubble-tools,
     .bubble-reactions {
       opacity: 1;
+      pointer-events: auto;
     }
   }
 
   .reaction-btn {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
-    padding: 1px 5px;
-    border: 1px solid var(--border);
+    gap: 4px;
+    min-width: 26px;
+    height: 24px;
+    padding: 2px 5px;
+    border: 1px solid transparent;
     border-radius: 999px;
     background: transparent;
-    color: inherit;
-    font-size: 10px;
+    color: var(--reaction-gold);
+    font-size: 11px;
     font-variant-numeric: tabular-nums;
     cursor: pointer;
+    transition:
+      background var(--transition-fast) ease,
+      color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease,
+      transform 0.16s ease;
+  }
+
+  .conversation.channel .reaction-btn {
+    background:
+      linear-gradient(180deg, color-mix(in srgb, #fff 22%, transparent), transparent 58%);
+    color: var(--reaction-gold);
+    border-color: color-mix(in srgb, var(--reaction-gold) 20%, transparent);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 28%, transparent);
+  }
+
+  .conversation.channel .reaction-btn svg {
+    fill: var(--reaction-gold);
+    stroke: color-mix(in srgb, var(--reaction-gold) 62%, #8a5600);
+    filter:
+      drop-shadow(0 0.5px 0 color-mix(in srgb, #fff 78%, transparent))
+      drop-shadow(0 1px 1.1px color-mix(in srgb, #000 26%, transparent));
   }
 
   .reaction-btn:hover:not(:disabled) {
-    border-color: var(--text-muted);
+    transform: translateY(-1px);
+  }
+
+  .conversation.channel .reaction-btn:hover:not(:disabled) {
+    color: var(--reaction-gold);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
+      color-mix(in srgb, var(--reaction-gold) 20%, transparent);
+    border-color: color-mix(in srgb, var(--reaction-gold) 48%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, #fff 55%, transparent),
+      0 1px 3px color-mix(in srgb, var(--reaction-gold) 28%, transparent);
+  }
+
+  .reaction-btn:active:not(:disabled) {
+    transform: scale(0.94);
+  }
+
+  .reaction-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .reaction-btn.active {
@@ -2321,12 +2672,106 @@
     background: color-mix(in srgb, var(--accent) 22%, transparent);
   }
 
+  .conversation.channel .reaction-btn.active {
+    color: var(--reaction-gold);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, #fff 36%, transparent), transparent 46%),
+      color-mix(in srgb, var(--reaction-gold) 24%, transparent);
+    border-color: color-mix(in srgb, var(--reaction-gold) 55%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, #fff 50%, transparent),
+      0 1px 4px color-mix(in srgb, var(--reaction-gold) 32%, transparent);
+  }
+
+  .conversation.channel .reaction-btn.heart {
+    color: var(--reaction-heart);
+    border-color: color-mix(in srgb, var(--reaction-heart) 20%, transparent);
+  }
+
+  .conversation.channel .reaction-btn.heart svg {
+    fill: var(--reaction-heart);
+    stroke: color-mix(in srgb, var(--reaction-heart) 68%, #7a121c);
+  }
+
+  .conversation.channel .reaction-btn.heart:hover:not(:disabled) {
+    color: var(--reaction-heart);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
+      color-mix(in srgb, var(--reaction-heart) 20%, transparent);
+    border-color: color-mix(in srgb, var(--reaction-heart) 48%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, #fff 55%, transparent),
+      0 1px 3px color-mix(in srgb, var(--reaction-heart) 28%, transparent);
+  }
+
+  .conversation.channel .reaction-btn.heart.active {
+    color: var(--reaction-heart);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, #fff 36%, transparent), transparent 46%),
+      color-mix(in srgb, var(--reaction-heart) 24%, transparent);
+    border-color: color-mix(in srgb, var(--reaction-heart) 55%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, #fff 50%, transparent),
+      0 1px 4px color-mix(in srgb, var(--reaction-heart) 32%, transparent);
+  }
+
+  .conversation.channel .reaction-btn.heart .reaction-count {
+    color: color-mix(in srgb, var(--reaction-heart) 65%, var(--text-primary));
+  }
+
+  .conversation.channel .reaction-btn.pulse-add {
+    animation: reaction-pop 0.36s ease;
+  }
+
+  .conversation.channel .reaction-btn.pulse-remove {
+    animation: reaction-release 0.32s ease;
+  }
+
+  .conversation.channel .reaction-btn.heart.pulse-add {
+    animation: reaction-heartbeat 0.52s ease;
+  }
+
+  .conversation.channel .reaction-btn.heart.pulse-remove {
+    animation: reaction-heartbeat-out 0.4s ease;
+  }
+
+  @keyframes reaction-pop {
+    0% { transform: scale(1); }
+    35% { transform: scale(1.16); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes reaction-release {
+    0% { transform: scale(1); opacity: 1; }
+    45% { transform: scale(0.84); opacity: 0.48; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  @keyframes reaction-heartbeat {
+    0% { transform: scale(1); }
+    18% { transform: scale(1.28); }
+    34% { transform: scale(1.04); }
+    52% { transform: scale(1.2); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes reaction-heartbeat-out {
+    0% { transform: scale(1); opacity: 1; }
+    28% { transform: scale(1.12); opacity: 0.85; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
   .reaction-btn:disabled {
     cursor: default;
   }
 
+  .conversation.channel .bubble-reactions.readonly .reaction-btn {
+    pointer-events: none;
+  }
+
   .reaction-count {
     font-weight: 600;
+    color: color-mix(in srgb, var(--reaction-gold) 65%, var(--text-primary));
   }
 
   /* Resend sits inside the timestamp line of its own bubble, so it reads as
@@ -2387,7 +2832,7 @@
   .conv-jump.has-unseen {
     border-color: var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
   }
 
   .conv-error {
@@ -2420,6 +2865,20 @@
     position: relative;
   }
 
+  .conversation.channel .conv-input-area,
+  .conversation.channel .conv-disabled {
+    background: var(--bg-tertiary);
+  }
+
+  :global([data-theme="dark"]) .conversation.channel .conv-input-area,
+  :global([data-theme="dark"]) .conversation.channel .conv-disabled {
+    background: var(--bg-secondary);
+  }
+
+  .conversation.channel .conv-input-area {
+    box-shadow: var(--shadow-up-sm);
+  }
+
   .mention-list {
     position: absolute;
     bottom: calc(100% - 4px);
@@ -2433,6 +2892,11 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--bg-surface);
+  }
+
+  .conversation.channel .mention-list {
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-md);
   }
 
   .mention-option {
@@ -2480,6 +2944,11 @@
     line-height: 1.4;
     min-height: 40px;
     max-height: 120px;
+  }
+
+  .conversation.channel .conv-input {
+    background: var(--bg-input);
+    box-shadow: var(--shadow-sm);
   }
 
   .conv-input:focus {

@@ -72,12 +72,14 @@ export interface ChannelMessageInfo {
 export const REACTION_NONE = 0;
 export const REACTION_UP = 1;
 export const REACTION_DOWN = 2;
+export const REACTION_HEART = 3;
 
 /** Reaction tally for one line, counted by the backend. */
 export interface ChannelReactionInfo {
   msg_id: string;
   up: number;
   down: number;
+  heart: number;
   /** This device's own reaction, so its button can show as pressed. 0 is none. */
   mine: number;
 }

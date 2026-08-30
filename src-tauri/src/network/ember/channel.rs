@@ -1411,6 +1411,7 @@ pub struct ChannelChatEdit {
 pub const REACTION_NONE: u8 = 0;
 pub const REACTION_UP: u8 = 1;
 pub const REACTION_DOWN: u8 = 2;
+pub const REACTION_HEART: u8 = 3;
 
 /// Reactions one frame may carry. 121 bytes each, so a full batch is under 4 KiB
 /// and stays inside the budget a chat line already occupies.
