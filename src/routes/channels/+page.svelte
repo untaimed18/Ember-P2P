@@ -1017,16 +1017,20 @@
     const id = forgetTargetId;
     if (!id || forgettingIds.includes(id)) return;
     forgettingIds = [...forgettingIds, id];
-    // Hide first and keep it hidden even if the row will not delete. A public
-    // room is still listed after we drop our copy of it, so this is the half
-    // that actually takes it off the list; the delete below is what clears the
-    // saved messages.
+    // Hide first: a public room is still listed after we drop our copy of it,
+    // so this is the half that actually takes it off the list; the delete
+    // below is what clears the saved messages. The hide must stick after a
+    // successful delete even if the following refresh throws — otherwise
+    // Discover would resurrect the room.
     hideChannel(id);
     forgetChannelMute(id);
+    let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
+      deleted = true;
       await refreshChannels();
     } catch (e) {
+      if (!deleted) unhideChannel(id);
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       forgettingIds = forgettingIds.filter((each) => each !== id);
@@ -1149,7 +1153,13 @@
   let rotateOpen = $state(false);
   let rotatingKey = $state(false);
   let savingInvitePolicy = $state(false);
+  let inviteOwnerOnly = $state(false);
   let savingSlowMode = $state(false);
+
+  $effect(() => {
+    if (savingInvitePolicy) return;
+    inviteOwnerOnly = selected?.invites_owner_only ?? false;
+  });
 
   function slowModeLabel(secs: number): string {
     if (secs <= 0) return m.channels_slow_mode_off();
@@ -1179,8 +1189,8 @@
     try {
       replaceChannel(await setChannelInvitePolicy(id, ownerOnly));
     } catch (e) {
+      inviteOwnerOnly = !ownerOnly;
       toastError(translateError(e, m.error_operation_failed()));
-      // The switch is bound to the row, so a refresh is what puts it back.
       await refreshChannels().catch(() => {});
     } finally {
       savingInvitePolicy = false;
@@ -1988,7 +1998,7 @@
                 <p class="succession-title">{m.channels_invite_policy_title()}</p>
                 <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
                 <ToggleSwitch
-                  checked={selected.invites_owner_only}
+                  bind:checked={inviteOwnerOnly}
                   label={m.channels_invite_policy_label()}
                   disabled={savingInvitePolicy}
                   onchange={(v) => void handleInvitePolicy(v)}

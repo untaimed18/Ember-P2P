@@ -749,7 +749,9 @@ pub async fn register(
     }
 }
 
-/// Authenticated identity lookup. The unauthenticated GET oracle is gone.
+/// Authenticated v4 identity lookup. Falls back to the unauthenticated GET
+/// `/v3/identity/{id}` oracle when protocol negotiation yields LegacyV3 — that
+/// route still exists for old clients during rollout.
 pub(crate) async fn fetch_identity_pubkey_authenticated(
     base_url: &str,
     target_ember_hash: &[u8; 16],

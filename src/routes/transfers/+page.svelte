@@ -1356,6 +1356,10 @@
         entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
         entry.lastTransferred = t.transferred;
         entry.lastTime = now;
+      } else if (bytesThisPeriod < 0) {
+        entry.ewma = 0;
+        entry.lastTransferred = t.transferred;
+        entry.lastTime = now;
       } else if (now - entry.lastTime > SPEED_STALE_MS) {
         entry.ewma = 0;
       }
@@ -1371,6 +1375,10 @@
     // local EWMA — which lingers for up to SPEED_STALE_MS (12 s) after bytes
     // stop moving — can't keep painting a stale speed on a row the user just
     // paused or stopped (or one that finished/failed).
+    //
+    // Searching / verifying / hashing are deliberately not here: they are in
+    // `SPEED_DECAY_APPLIES`, so the backend decays their rate towards zero
+    // rather than dropping it, and the row is meant to show that fade.
     if (t.status === 'paused' || t.status === 'stopped' || t.status === 'completed' || t.status === 'failed') {
       return 0;
     }
@@ -3488,7 +3496,7 @@
                 {:else if column.key === 'transferred'}
                   <td class="num-cell">{formatSize(t.transferred)}</td>
                 {:else if column.key === 'completed_size'}
-                  <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
+                  <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                 {:else if column.key === 'speed'}
                   {@const spd = liveSpeed(t)}
                   <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
@@ -3665,7 +3673,7 @@
                   {:else if column.key === 'transferred'}
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'completed_size'}
-                    <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
+                    <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                   {:else if column.key === 'speed'}
                     <td class="num-cell">{'\u2014'}</td>
                   {:else if column.key === 'progress'}

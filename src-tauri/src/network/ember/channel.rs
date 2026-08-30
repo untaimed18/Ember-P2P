@@ -223,11 +223,20 @@ const _: () = assert!(
 pub const CHANNEL_HISTORY_SYNC_PER_MIN: usize = 2;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
-/// Catch-up asks for messages in this window behind our newest timestamp so a
-/// hole behind the frontier can still be filled. Combined with
-/// `ORDER BY timestamp DESC`, a new joiner (watermark 0) receives the newest
-/// [`CHANNEL_HISTORY_SYNC_MAX`] lines rather than the oldest.
-pub const CHANNEL_HISTORY_SYNC_LOOKBACK_SECS: i64 = 6 * 60 * 60;
+/// How a catch-up reply is ordered, which decides whether a gap can close.
+///
+/// A requester's watermark is the newest timestamp it holds, so a reply served
+/// newest-first advances that watermark past everything still missing behind
+/// it: the same [`CHANNEL_HISTORY_SYNC_MAX`] lines come back every round and a
+/// wider gap never closes. Serving oldest-first walks the gap forward, one
+/// batch per round, and makes the shed-tail note above true — the watermark
+/// stops at the last line actually stored.
+///
+/// A cold room (watermark 0) is the exception: there is no gap to walk, and the
+/// useful 32 lines are the newest ones rather than the room's oldest history.
+pub fn channel_sync_serves_oldest_first(since_ts: i64) -> bool {
+    since_ts > 0
+}
 /// Gossip timestamps further ahead of local time than this are refused.
 ///
 /// The envelope timestamp is authenticated under the room key, so a member

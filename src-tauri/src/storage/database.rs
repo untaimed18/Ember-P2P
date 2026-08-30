@@ -26,7 +26,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 42;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 43;
 
 /// One row of a room's history as the UI needs it.
 ///
@@ -98,6 +98,8 @@ pub enum ChannelEditOutcome {
     OutsideWindow,
     /// We already hold this revision or a later one.
     NotNewer,
+    /// This device deleted the line, so its revision is not stored either.
+    Forgotten,
 }
 
 /// One row of the eD2K `credits` table, in `load_credits` order. The trailing
@@ -447,27 +449,21 @@ impl Database {
                 // Losing this file must never silently rotate the key while
                 // encrypted rows still exist. That would make valid history
                 // look corrupt and could encourage destructive recovery.
-                let has_chat_table: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                         WHERE type='table' AND name='chat_messages')",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(false);
-                let has_encrypted_rows = has_chat_table
-                    && conn
-                        .query_row(
-                            // Case-sensitive GLOB, matching `starts_with`
-                            // elsewhere: under LIKE a plaintext body beginning
-                            // `embrchat1:` counts as ciphertext and seals chat
-                            // permanently instead of minting a fresh key.
-                            "SELECT EXISTS(SELECT 1 FROM chat_messages \
-                             WHERE message GLOB 'EMBRCHAT1:*' LIMIT 1)",
-                            [],
-                            |row| row.get::<_, bool>(0),
-                        )
-                        .unwrap_or(false);
+                let has_encrypted_rows = match Self::database_holds_chat_ciphertext(conn) {
+                    Ok(found) => found,
+                    Err(e) => {
+                        // A query that cannot answer is not evidence of absence.
+                        // Rotating on a failed probe is the one outcome that
+                        // cannot be undone, so an unanswerable database seals.
+                        warn!(
+                            "Chat history is locked: the key is missing at {} and whether \
+                             encrypted rows exist could not be established ({e}). Nothing \
+                             has been rotated or deleted.",
+                            key_path.display()
+                        );
+                        return Ok(None);
+                    }
+                };
                 if has_encrypted_rows {
                     // Lock rather than rotate. Writing a new key here would make
                     // the existing history permanently unreadable even if the
@@ -498,6 +494,60 @@ impl Database {
                 Ok(None)
             }
         }
+    }
+
+    /// Every column sealed with the chat key, as `(table, ciphertext predicate)`.
+    ///
+    /// Direct messages are only one of them. A profile that never opened a DM
+    /// still has room history, join secrets, epoch keys and a parked handoff
+    /// seed under this key, and treating `chat_messages` as the whole story
+    /// rotates all of that away.
+    ///
+    /// Both prefixes are matched with case-sensitive GLOB, matching
+    /// `starts_with` elsewhere: under LIKE a plaintext body beginning
+    /// `embrchat1:` would count as ciphertext and seal chat permanently instead
+    /// of minting a fresh key.
+    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 5] = [
+        ("chat_messages", "message GLOB 'EMBRCHAT1:*'"),
+        ("channel_messages", "message GLOB 'EMBRCHAT1:*'"),
+        (
+            "channels",
+            "join_secret GLOB 'EMBRCSEC1:*' OR owner_seed GLOB 'EMBRCSEC1:*'",
+        ),
+        ("channel_key_epochs", "secret_enc GLOB 'EMBRCSEC1:*'"),
+        ("channel_handoff_pending", "owner_seed GLOB 'EMBRCSEC1:*'"),
+    ];
+
+    /// Whether anything in the database is still sealed under the chat key.
+    ///
+    /// Errors propagate rather than reading as `false`: the caller may only mint
+    /// a replacement key once absence has actually been established.
+    fn database_holds_chat_ciphertext(conn: &Connection) -> rusqlite::Result<bool> {
+        for (table, predicate) in Self::CHAT_KEYED_COLUMNS {
+            // A table missing from an older schema cannot hold ciphertext, and
+            // naming it in a prepared statement would fail before the predicate
+            // ever ran.
+            let table_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                continue;
+            }
+            // Interpolated from `CHAT_KEYED_COLUMNS` only: compile-time literals,
+            // never anything a caller or peer supplied.
+            let found: bool = conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate} LIMIT 1)"),
+                [],
+                |row| row.get(0),
+            )?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether chat history is sealed because its key could not be recovered.
@@ -1995,6 +2045,31 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 43 {
+            // Lines this device has been told to forget.
+            //
+            // Deleting a message only removed the row, and the dedup gate on the
+            // ingest path is "do we hold this msg_id" — so the next gossip
+            // replay or catch-up that carried the line inserted it again and it
+            // reappeared. Remembering the id is what makes "remove on this
+            // device" survive the room still holding a copy.
+            //
+            // Deliberately not gossiped: the protocol has no redaction, and
+            // publishing an id we want gone would only tell the room what to
+            // look at.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_message_tombstones (
+                    channel_id TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, msg_id)
+                );",
+            )?;
+            set_version(&tx, 43)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -3361,21 +3436,35 @@ impl Database {
                 Ok((hash_hex, pubkey))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(hash_hex, pubkey)| {
-                let hash_bytes = hex::decode(&hash_hex)?;
-                let hash: [u8; 16] = hash_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid friend hash in database"))?;
-                let pubkey: [u8; 32] = pubkey
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid friend public key in database"))?;
-                if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash) {
-                    anyhow::bail!("friend public key does not match stored friend hash");
-                }
-                Ok((hash, pubkey))
-            })
-            .collect()
+        // One unusable row must not take the list down with it. A friend request
+        // can be accepted while carrying a public key that does not bind to the
+        // sender's hash, and returning `Err` here left the only caller — which
+        // recovers with `unwrap_or_default` — advertising presence for nobody.
+        // A key we cannot trust is a friend we cannot advertise to, not a reason
+        // to stop advertising to the rest.
+        let mut keys = Vec::with_capacity(rows.len());
+        for (hash_hex, pubkey) in rows {
+            let hash = hex::decode(&hash_hex)
+                .ok()
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok());
+            let Some(hash) = hash else {
+                warn!("Skipping friend with an unusable stored hash: {hash_hex}");
+                continue;
+            };
+            let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
+                warn!("Skipping friend {hash_hex} with an unusable stored public key");
+                continue;
+            };
+            if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash) {
+                warn!(
+                    "Skipping friend {hash_hex}: the stored public key does not match the \
+                     friend hash, so presence advertised under it would be unreachable"
+                );
+                continue;
+            }
+            keys.push((hash, pubkey));
+        }
+        Ok(keys)
     }
 
     pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
@@ -6030,11 +6119,72 @@ impl Database {
         Ok(hits)
     }
 
+    /// Tombstoned `msg_id`s kept per room.
+    ///
+    /// Bounded for the same reason history is: an unbounded local table is a
+    /// slow leak. Past this the oldest deletions are forgotten, and a line that
+    /// old is no longer being replayed by anyone.
+    const CHANNEL_TOMBSTONES_PER_CHANNEL: i64 = 5_000;
+
+    /// Whether this device has been told to forget `msg_id`.
+    ///
+    /// The ingest dedup gate asks "do we hold this line", which a deletion
+    /// answers no to, so without this the next replay puts it straight back.
+    pub fn channel_message_forgotten(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::channel_message_forgotten_locked(&conn, channel_id, msg_id)
+    }
+
+    fn channel_message_forgotten_locked(
+        conn: &Connection,
+        channel_id: &str,
+        msg_id: &str,
+    ) -> anyhow::Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_message_tombstones \
+             WHERE channel_id = ?1 AND msg_id = ?2",
+            params![channel_id, msg_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Forget one message on this device. Local only: the copy every other
     /// member holds is untouched, and nothing is gossiped.
     pub fn delete_channel_message(&self, channel_id: &str, id: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // Before the row goes, while its `msg_id` is still readable. Without the
+        // tombstone the delete is undone by the next gossip replay or catch-up
+        // that carries the line.
+        let msg_id: Option<String> = tx
+            .query_row(
+                "SELECT msg_id FROM channel_messages WHERE channel_id = ?1 AND id = ?2",
+                params![channel_id, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(msg_id) = msg_id.filter(|msg_id| !msg_id.is_empty()) {
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_message_tombstones
+                    (channel_id, msg_id, deleted_at)
+                 VALUES (?1, ?2, ?3)",
+                params![channel_id, msg_id, chrono::Utc::now().timestamp()],
+            )?;
+            tx.execute(
+                "DELETE FROM channel_message_tombstones
+                 WHERE channel_id = ?1 AND msg_id NOT IN (
+                     SELECT msg_id FROM channel_message_tombstones
+                     WHERE channel_id = ?1
+                     ORDER BY deleted_at DESC, rowid DESC LIMIT ?2
+                 )",
+                params![channel_id, Self::CHANNEL_TOMBSTONES_PER_CHANNEL],
+            )?;
+        }
         // Ahead of the message, while its `msg_id` is still resolvable. Forgetting
         // a line on this device forgets what was voted on it too — leaving the
         // reactions behind would keep a count alive for a bubble that is gone.
@@ -6154,8 +6304,14 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Recent decrypted messages for neighbor history catch-up.
-    /// Returns `(msg_id, sender_pubkey, body, timestamp, author_sig)` newest-first.
+    /// Decrypted messages for neighbor history catch-up.
+    ///
+    /// Ordered by [`channel_sync_serves_oldest_first`]: oldest-first above the
+    /// requester's watermark so their gap walks forward, newest-first for a cold
+    /// room that has no gap to walk.
+    ///
+    /// [`channel_sync_serves_oldest_first`]:
+    ///     crate::network::ember::channel::channel_sync_serves_oldest_first
     ///
     /// Rows with no stored signature are skipped: a re-serve has to replay the
     /// author's own signature, and this node cannot produce one on their behalf.
@@ -6168,23 +6324,53 @@ impl Database {
         limit: i64,
     ) -> anyhow::Result<Vec<ChannelSyncRow>> {
         let limit = limit.clamp(1, 64);
+        let oldest_first =
+            crate::network::ember::channel::channel_sync_serves_oldest_first(since_ts);
         #[allow(clippy::type_complexity)]
         let rows: Vec<(i64, String, String, String, String, i64, String, i64, String)> = {
             let conn = self.conn.lock();
+            // A watermark is a timestamp, so a whole page sitting on the
+            // watermark's own second is a page the requester cannot advance
+            // past: it already holds that second, and the next round would ask
+            // the same question and get the same rows back. Step over the second
+            // instead. It costs the same-second lines the requester has not got
+            // — the ones it is most likely to hold already, since its watermark
+            // is that second — and it is what guarantees the walk terminates.
+            let since_ts = if oldest_first {
+                let saturated: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM channel_messages
+                     WHERE channel_id = ?1 AND timestamp = ?2
+                       AND (author_sig <> '' OR edit_sig <> '')",
+                    params![channel_id, since_ts],
+                    |row| row.get(0),
+                )?;
+                if saturated >= limit {
+                    since_ts.saturating_add(1)
+                } else {
+                    since_ts
+                }
+            } else {
+                since_ts
+            };
             // Either signature makes a row re-servable: the author's over the
             // line as first sent, or theirs over the revision that replaced it. A
             // row carrying neither predates signed chat, or is a handoff copy
             // signed against a room that no longer exists, and cannot be proved
             // to anyone.
-            let mut stmt = conn.prepare(
+            let order = if oldest_first {
+                "ORDER BY timestamp ASC, id ASC"
+            } else {
+                "ORDER BY timestamp DESC, id DESC"
+            };
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, msg_id, sender_pubkey, direction, message, timestamp, author_sig,
                         edited_at, edit_sig
                  FROM channel_messages
                  WHERE channel_id = ?1 AND timestamp >= ?2
                    AND (author_sig <> '' OR edit_sig <> '')
-                 ORDER BY timestamp DESC, id DESC
-                 LIMIT ?3",
-            )?;
+                 {order}
+                 LIMIT ?3"
+            ))?;
             let mapped = stmt.query_map(params![channel_id, since_ts, limit], |row| {
                 Ok((
                     row.get(0)?,
@@ -6320,6 +6506,12 @@ impl Database {
                 (id, direction, timestamp, false)
             }
             None => {
+                // Absent because this device deleted it, not because it was
+                // never here. Storing the revision would put the line back under
+                // the very id the user asked to forget.
+                if Self::channel_message_forgotten_locked(&tx, channel_id, msg_id)? {
+                    return Ok(ChannelEditOutcome::Forgotten);
+                }
                 // Catch-up: judged on the author's clock alone, because a line we
                 // never held has no first-seen time to check against. Stored as
                 // `received`, since a revision only reaches us from elsewhere.
@@ -9848,6 +10040,247 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].2, "keep-me");
         drop(recovered_db);
+
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The rotation guard used to look only at `chat_messages`, so a profile
+    /// that had only ever used rooms — no direct messages at all — read as
+    /// "nothing encrypted here" and had its key replaced. That is unrecoverable:
+    /// room history, join secrets and epoch keys are sealed under the same key,
+    /// and the replacement is written to disk.
+    #[test]
+    fn a_channels_only_profile_locks_rather_than_rotating_a_missing_chat_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-channels-only-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let channel_id = "ab".repeat(16);
+        let pubkey = "cd".repeat(32);
+
+        let db = Database::open_at(&path).unwrap();
+        db.insert_channel(
+            &channel_id,
+            &pubkey,
+            "room",
+            crate::network::ember::channel::CHANNEL_KIND_PRIVATE,
+            true,
+            Some(&[0x11u8; 32]),
+            Some(&[0x22u8; 32]),
+        )
+        .unwrap();
+        let row_id = db
+            .insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "received",
+                "room-history",
+                &"ef".repeat(16),
+                4242,
+                "",
+                false,
+            )
+            .unwrap();
+        let key_before = **db.chat_key.as_ref().expect("test db has a chat key");
+        // Nothing in the direct-message table: the case the old guard missed.
+        let dm_rows: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM chat_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dm_rows, 0);
+        drop(db);
+
+        let key_path = dir.join(CHAT_KEY_FILE);
+        let stored_key = std::fs::read(&key_path).unwrap();
+        std::fs::remove_file(&key_path).unwrap();
+
+        let locked = Database::open_at(&path).expect("a missing chat key must not fail the open");
+        assert!(
+            locked.chat_locked(),
+            "a room-only profile must seal, not mint a replacement key"
+        );
+        assert!(
+            !key_path.exists(),
+            "no key may be written while ciphertext is still on disk"
+        );
+        drop(locked);
+
+        // Restoring the original key still recovers everything, which is the
+        // whole point of refusing to rotate.
+        std::fs::write(&key_path, &stored_key).unwrap();
+        let recovered = Database::open_at(&path).expect("reopen");
+        assert!(!recovered.chat_locked());
+        assert_eq!(
+            **recovered.chat_key.as_ref().expect("key"),
+            key_before,
+            "the original key must be the one in use again"
+        );
+        let history = recovered.get_channel_messages(&channel_id, 10, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, row_id);
+        assert_eq!(history[0].message, "room-history");
+        drop(recovered);
+
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// "Remove from this device" was undone by the next gossip replay or
+    /// catch-up that carried the line, because the ingest gate only asked
+    /// whether the row was present.
+    #[test]
+    fn a_deleted_channel_message_stays_deleted_when_it_is_offered_again() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-channel-tombstone-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let channel_id = "ab".repeat(16);
+        let pubkey = "cd".repeat(32);
+        let msg_id = "ef".repeat(16);
+
+        let db = Database::open_at(&path).unwrap();
+        db.insert_channel(
+            &channel_id,
+            &pubkey,
+            "room",
+            crate::network::ember::channel::CHANNEL_KIND_PUBLIC,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let row_id = db
+            .insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "received",
+                "forget me",
+                &msg_id,
+                4242,
+                "",
+                false,
+            )
+            .unwrap();
+        assert!(!db.channel_message_forgotten(&channel_id, &msg_id).unwrap());
+
+        assert!(db.delete_channel_message(&channel_id, row_id).unwrap());
+        assert!(
+            db.channel_message_forgotten(&channel_id, &msg_id).unwrap(),
+            "the id has to be remembered or the line comes back"
+        );
+        assert!(!db.channel_message_exists(&channel_id, &msg_id).unwrap());
+
+        // A revision arriving for a line we deleted must not recreate it either.
+        let now = chrono::Utc::now().timestamp();
+        let outcome = db
+            .apply_channel_message_edit(
+                &channel_id,
+                &msg_id,
+                &pubkey,
+                now,
+                now,
+                "revised",
+                &"11".repeat(64),
+                now,
+            )
+            .unwrap();
+        assert_eq!(outcome, ChannelEditOutcome::Forgotten);
+        assert!(!db.channel_message_exists(&channel_id, &msg_id).unwrap());
+        drop(db);
+
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A watermark is the newest timestamp held, so a reply served newest-first
+    /// advances it past everything still missing underneath: the same batch came
+    /// back every round and a gap wider than one batch never closed. Above a
+    /// watermark the reply has to walk forward; a cold room still wants the
+    /// newest lines, because it has no gap to walk.
+    #[test]
+    fn catch_up_walks_forward_above_a_watermark_and_serves_newest_to_a_cold_room() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-channel-syncorder-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let channel_id = "ab".repeat(16);
+        let pubkey = "cd".repeat(32);
+
+        let db = Database::open_at(&path).unwrap();
+        db.insert_channel(
+            &channel_id,
+            &pubkey,
+            "room",
+            crate::network::ember::channel::CHANNEL_KIND_PUBLIC,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        for (index, ts) in [1_000i64, 2_000, 3_000].into_iter().enumerate() {
+            db.insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "received",
+                &format!("line {ts}"),
+                &format!("{:02x}", index).repeat(16),
+                ts,
+                &"11".repeat(64),
+                false,
+            )
+            .unwrap();
+        }
+
+        let cold = db.list_channel_messages_for_sync(&channel_id, 0, 2).unwrap();
+        assert_eq!(
+            cold.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![3_000, 2_000],
+            "a cold room is answered with the newest lines"
+        );
+
+        let gap = db
+            .list_channel_messages_for_sync(&channel_id, 1_000, 2)
+            .unwrap();
+        assert_eq!(
+            gap.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![1_000, 2_000],
+            "above a watermark the reply must start at the watermark and walk forward"
+        );
+
+        // A whole page on the watermark's own second cannot move the requester,
+        // so the walk has to step over it or it never terminates.
+        for extra in 0..3 {
+            db.insert_channel_message(
+                &channel_id,
+                &pubkey,
+                "received",
+                "same second",
+                &format!("{:02x}", 0x40 + extra).repeat(16),
+                1_000,
+                &"11".repeat(64),
+                false,
+            )
+            .unwrap();
+        }
+        let stepped = db
+            .list_channel_messages_for_sync(&channel_id, 1_000, 2)
+            .unwrap();
+        assert!(
+            stepped.iter().all(|row| row.timestamp > 1_000),
+            "a saturated watermark second must be stepped over, not served again"
+        );
+        drop(db);
 
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);

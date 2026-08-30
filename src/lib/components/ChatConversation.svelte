@@ -33,7 +33,7 @@
     shortPubkey,
   } from '$lib/utils';
   import { openExternalUrl } from '$lib/api/settings';
-  import { toast } from '$lib/stores/toast';
+  import { toast, toastError } from '$lib/stores/toast';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
@@ -523,6 +523,9 @@
           message: string;
           timestamp: number;
           msg_id?: string;
+          // Set when the line first reached us as a revision, which is how
+          // catch-up serves one that was edited before we ever saw it.
+          edited_at?: number;
         }>('ember:channel-message', (event) => {
           if (gen !== loadGen) return;
           if (event.payload.channel_id !== channel) return;
@@ -536,15 +539,10 @@
             read: true,
             delivery: 'delivered',
             sender_pubkey: event.payload.sender_pubkey,
-            edited_at: 0,
+            edited_at: event.payload.edited_at ?? 0,
             msg_id: event.payload.msg_id,
           }];
-          messages = next.length > MAX_LIVE_MESSAGES
-            ? next.slice(next.length - MAX_LIVE_MESSAGES)
-            : next;
-          if (event.payload.direction === 'sent' || wasPinned) {
-            scrollToBottom();
-          }
+          commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
           noteMissedMessage(wasPinned, event.payload.direction);
           if (event.payload.direction === 'received' && isAppVisible()) {
             markAsRead();
@@ -590,12 +588,7 @@
             read: true,
             delivery: 'delivered' as const,
           }];
-          messages = next.length > MAX_LIVE_MESSAGES
-            ? next.slice(next.length - MAX_LIVE_MESSAGES)
-            : next;
-          if (event.payload.direction === 'sent' || wasPinned) {
-            scrollToBottom();
-          }
+          commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
           noteMissedMessage(wasPinned, event.payload.direction);
           // Only acknowledge what the user can actually see. A mounted
           // conversation in a minimized window would otherwise mark the
@@ -857,6 +850,23 @@
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
   }
 
+  function commitLiveMessages(next: ConvMessage[], pinToBottom: boolean): void {
+    const trimmed = next.length > MAX_LIVE_MESSAGES;
+    const el = messagesContainerEl;
+    const prevScrollHeight = trimmed && !pinToBottom ? (el?.scrollHeight ?? 0) : 0;
+    const prevScrollTop = trimmed && !pinToBottom ? (el?.scrollTop ?? 0) : 0;
+    messages = trimmed ? next.slice(next.length - MAX_LIVE_MESSAGES) : next;
+    if (pinToBottom) {
+      scrollToBottom();
+    } else if (trimmed) {
+      requestAnimationFrame(() => {
+        if (!messagesContainerEl) return;
+        messagesContainerEl.scrollTop =
+          prevScrollTop + (messagesContainerEl.scrollHeight - prevScrollHeight);
+      });
+    }
+  }
+
   /**
    * Whether the reader has scrolled away from the newest message, and whether
    * anything arrived while they were up there.
@@ -1051,6 +1061,7 @@
       return;
     }
     const channel = channelId;
+    const waitSecs = slowModeSecs;
     const h = friendHash;
     const key = conversationKey;
     sending = true;
@@ -1064,10 +1075,10 @@
           }
           inputText = '';
           scrollToBottom();
-        }
-        if (slowModeSecs > 0) {
-          nextSendAt = Date.now() + slowModeSecs * 1000;
-          slowModeNow = Date.now();
+          if (waitSecs > 0) {
+            nextSendAt = Date.now() + waitSecs * 1000;
+            slowModeNow = Date.now();
+          }
         }
         clearDraft(key);
         return;
@@ -1082,6 +1093,7 @@
       // clear it explicitly; `clearDraft` is a no-op when there's no entry.
       clearDraft(h);
     } catch (e: unknown) {
+      const failed = translateError(e, m.chat_failed_to_send());
       if (channel) {
         // The backend carries the seconds still owed in the error's context, so
         // a refusal starts the same countdown a successful send would — which
@@ -1090,14 +1102,17 @@
         const coded = codedErrorOf(e);
         if (coded?.code === 'channels_slow_mode') {
           const remaining = Number(coded.context);
-          if (Number.isFinite(remaining) && remaining > 0) {
+          if (Number.isFinite(remaining) && remaining > 0 && channel === channelId) {
             nextSendAt = Date.now() + remaining * 1000;
             slowModeNow = Date.now();
           }
         }
-        if (channel === channelId) sendError = translateError(e, m.chat_failed_to_send());
+        if (channel === channelId) sendError = failed;
+        else toastError(failed);
       } else if (h === friendHash) {
-        sendError = translateError(e, m.chat_failed_to_send());
+        sendError = failed;
+      } else {
+        toastError(failed);
       }
     } finally {
       // `sending` is the editor's state, not tied to a friend — always release

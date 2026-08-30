@@ -81,6 +81,11 @@ pub struct BuddyManager {
     state: BuddyState,
     buddy_id: Option<KadId>,
     buddy_addr: Option<SocketAddr>,
+    /// The buddy's Kad UDP port, learned from the source address of its
+    /// `FindBuddyRes`. `buddy_addr` holds the *TCP* port we dial for the relay
+    /// connection; a callback request has to reach the buddy's UDP socket
+    /// instead, and the two are not related by any fixed offset.
+    buddy_udp_port: Option<u16>,
     last_find_attempt: i64,
     find_attempt_count: u32,
 
@@ -114,6 +119,7 @@ impl BuddyManager {
             state: BuddyState::NoBuddy,
             buddy_id: None,
             buddy_addr: None,
+            buddy_udp_port: None,
             last_find_attempt: 0,
             find_attempt_count: 0,
             buddy_writer: None,
@@ -131,6 +137,7 @@ impl BuddyManager {
         self.state = BuddyState::NoBuddy;
         self.buddy_id = None;
         self.buddy_addr = None;
+        self.buddy_udp_port = None;
         self.last_find_attempt = 0;
         self.find_attempt_count = 0;
         if let Some(h) = self.buddy_reader_handle.take() {
@@ -188,6 +195,13 @@ impl BuddyManager {
                 None
             }
         })
+    }
+
+    /// The buddy's Kad UDP port, for the `TAG_SERVERPORT` we publish on
+    /// firewalled source records. A searcher sends `KADEMLIA_CALLBACK_REQ`
+    /// there, so publishing anything else strands every callback.
+    pub fn buddy_udp_port(&self) -> Option<u16> {
+        self.buddy_udp_port.filter(|port| *port != 0)
     }
 
     pub fn find_buddy_target(&self) -> KadId {
@@ -419,6 +433,7 @@ impl BuddyManager {
         buddy_id: KadId,
         buddy_ip: Ipv4Addr,
         buddy_port: u16,
+        buddy_udp_port: u16,
         writer: BuddyWriteStream,
         reader_handle: tokio::task::JoinHandle<()>,
     ) {
@@ -427,6 +442,7 @@ impl BuddyManager {
         }
         self.buddy_id = Some(buddy_id);
         self.buddy_addr = Some(SocketAddr::new(buddy_ip.into(), buddy_port));
+        self.buddy_udp_port = Some(buddy_udp_port);
         self.buddy_writer = Some(writer);
         self.buddy_reader_handle = Some(reader_handle);
         self.state = BuddyState::Connected;
@@ -644,6 +660,7 @@ impl BuddyManager {
         self.buddy_writer = None;
         self.buddy_id = None;
         self.buddy_addr = None;
+        self.buddy_udp_port = None;
         self.state = BuddyState::NoBuddy;
         // `.await` the real lock rather than `try_lock()`: the previous
         // best-effort skip meant that if the upload listener's

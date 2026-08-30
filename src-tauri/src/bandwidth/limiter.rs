@@ -81,6 +81,47 @@ impl BandwidthLimiter {
         true
     }
 
+    /// Take up to `max_bytes` of upload allowance without waiting, returning how
+    /// much was taken.
+    ///
+    /// For callers that cannot park on [`acquire_upload`]: the network event loop
+    /// drives Ember channel transfers between polls of every other socket, so
+    /// blocking there for tokens would stall KAD, IPC and the DHT along with it.
+    /// A partial take is honest — the caller accumulates allowance across ticks
+    /// and sends once it has enough — which is what keeps a cap smaller than one
+    /// frame from either overshooting or deadlocking.
+    ///
+    /// Unlimited (0) is reported as fully granted and still counted.
+    pub fn try_take_upload(&self, max_bytes: u64) -> u64 {
+        if max_bytes == 0 {
+            return 0;
+        }
+        if self.max_upload_rate.load(Ordering::Relaxed) == 0 {
+            self.total_uploaded.fetch_add(max_bytes, Ordering::Relaxed);
+            return max_bytes;
+        }
+        loop {
+            let current = self.upload_tokens.load(Ordering::Acquire);
+            if current == 0 {
+                return 0;
+            }
+            let take = max_bytes.min(current);
+            if self
+                .upload_tokens
+                .compare_exchange_weak(
+                    current,
+                    current - take,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.total_uploaded.fetch_add(take, Ordering::Relaxed);
+                return take;
+            }
+        }
+    }
+
     /// Acquire download bandwidth. Returns `false` if the refill task has died
     /// and tokens cannot be obtained without bypassing the cap.
     pub async fn acquire_download(&self, bytes: u64) -> bool {

@@ -5828,16 +5828,15 @@ async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Res
 /// policy can't drift between the two ingress paths (it previously lived as two
 /// hand-maintained copies, which is how earlier divergences crept in).
 ///
-/// `verified` carries the strongest identity signal the emitting session had:
-///   - multi-source download: the offline BLAKE3 binding check (advertised
-///     pubkey matches advertised ember_hash); the full challenge-response can't
-///     safely run inline in that loop because the uploader's proactive SecIdent
-///     / EPX traffic queues ahead of its CHALLENGE response.
-///   - friend-connect / upload sessions: full Ed25519 PoP over a fresh nonce.
+/// `verified` is Ed25519 proof-of-possession on the emitting session
+/// (`ember_auth_verified` / `secure_v2_authenticated`), including the
+/// multi-source download path. Binding the advertised pubkey to ember_hash is
+/// logged separately and is not enough: that check is replayable from a public
+/// (pubkey, ember_hash) pair.
 ///
 /// It only drives the DB row + UI verification badge for queued strangers.
 /// Auto-promotion of an already-added (non-mutual) friend when the user
-/// disabled approval still requires `verified` (Ed25519 PoP / binding) so
+/// disabled approval still requires `verified` (Ed25519 PoP) so
 /// a hash-spoofing peer cannot force mutual status.
 async fn process_inbound_friend_request(
     db: &Arc<Database>,
@@ -11838,11 +11837,15 @@ struct NetworkState {
     /// Event receiver for the client we're serving as buddy for
     serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Background buddy outgoing connect+handshake task
+    /// Yields `(buddy_id, ip, tcp_port, udp_port, …)`; the UDP port is the
+    /// source port of the `FindBuddyRes` and is what firewalled source records
+    /// have to advertise for callbacks.
     pending_outgoing_buddy: Option<
         tokio::task::JoinHandle<
             Option<(
                 KadId,
                 std::net::Ipv4Addr,
+                u16,
                 u16,
                 mpsc::Receiver<BuddyEvent>,
                 BuddyWriteStream,
@@ -12492,6 +12495,9 @@ struct NetworkState {
     /// Data-block send budget. Separate from the chat one on purpose — see
     /// [`xfer_block_rate_ok`].
     xfer_block_times: VecDeque<std::time::Instant>,
+    /// Upload allowance taken from the limiter but not yet spent on a block.
+    /// See [`xfer_upload_allowance_ok`].
+    xfer_upload_credit: u64,
     /// Mirror of `channel_file_offers`, so an inbound offer can be judged
     /// without reaching back into the settings the command loop owns.
     xfer_offer_policy: String,
@@ -15495,9 +15501,15 @@ async fn handle_inbound_channel_gossip(
         return;
     }
     let msg_id_hex = hex::encode(gossip.msg_id);
+    // Either we already hold the line, or we held it and were told to forget it.
+    // Both mean do not store it again; both still pass it on, because forgetting
+    // a line here is a local decision and not a claim about the room.
     if db
         .channel_message_exists(&channel_id_hex, &msg_id_hex)
         .unwrap_or(false)
+        || db
+            .channel_message_forgotten(&channel_id_hex, &msg_id_hex)
+            .unwrap_or(false)
     {
         if let Some(next) = gossip.decremented_ttl() {
             fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
@@ -15807,6 +15819,28 @@ fn xfer_block_rate_ok(state: &mut NetworkState) -> bool {
     )
 }
 
+/// Whether the user's upload cap has `bytes` to spare for a transfer block.
+///
+/// Takes what the limiter will give without waiting and banks it, spending only
+/// once a whole block is covered. Under an unlimited cap the limiter grants
+/// everything, so this is a straight pass-through; under a cap smaller than one
+/// block it fills up over several ticks instead of never being satisfiable.
+fn xfer_upload_allowance_ok(
+    state: &mut NetworkState,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
+    bytes: u64,
+) -> bool {
+    if state.xfer_upload_credit < bytes {
+        let wanted = bytes - state.xfer_upload_credit;
+        state.xfer_upload_credit += bandwidth_limiter.try_take_upload(wanted);
+    }
+    if state.xfer_upload_credit < bytes {
+        return false;
+    }
+    state.xfer_upload_credit -= bytes;
+    true
+}
+
 /// Seal one transfer frame and send it to a single member.
 ///
 /// Direct Noise session first, then the channel WebSocket relay, then the
@@ -16029,6 +16063,21 @@ async fn apply_xfer_offer(
     }
     let name = crate::security::sanitize_filename(&offer.name);
     if name.is_empty() {
+        return;
+    }
+    // First offer under a transfer id wins. The pairwise key is derived from the
+    // id and not from the name, size or root, so the same sender could send a
+    // second valid offer under an id already on screen: the prompt would then
+    // describe one file while Accept fetched whichever one landed last, and a
+    // reused id could park a pending offer beside a transfer already running.
+    if state.xfer_pending.contains_key(&offer.xfer_id)
+        || state.xfer_recv.contains_key(&offer.xfer_id)
+        || state.xfer_send.contains_key(&offer.xfer_id)
+    {
+        debug!(
+            "Ember channel xfer: ignoring a repeated offer for transfer {}",
+            hex::encode(offer.xfer_id)
+        );
         return;
     }
 
@@ -16415,6 +16464,7 @@ async fn drive_channel_transfers(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if state.xfer_send.is_empty() && state.xfer_recv.is_empty() && state.xfer_pending.is_empty() {
         return;
@@ -16484,6 +16534,21 @@ async fn drive_channel_transfers(
             }
             let offset = block * ember::channel::XFER_BLOCK_SIZE as u64;
             let want = ((size - offset) as usize).min(ember::channel::XFER_BLOCK_SIZE);
+            // Room transfers spend the user's upload cap like eD2K uploads do.
+            // Only the protocol's own block-rate window used to bound them, so a
+            // configured limit did nothing here and an attachment could saturate
+            // a connection the user had explicitly throttled.
+            //
+            // Allowance is accumulated rather than waited for: this runs on the
+            // network event loop, so parking on the limiter would stall KAD, IPC
+            // and the DHT with it. Carrying the shortfall between ticks is also
+            // what lets a cap below one frame pace instead of deadlock.
+            if !xfer_upload_allowance_ok(state, bandwidth_limiter, want as u64) {
+                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                    send.enqueue(block, 1);
+                }
+                break 'sending;
+            }
             let read = state
                 .xfer_send
                 .get_mut(&xfer_id)
@@ -16674,8 +16739,7 @@ async fn handle_inbound_channel_edit(
         &hex::encode(edit.signature),
         now,
     ) {
-        Ok(crate::storage::database::ChannelEditOutcome::Applied(id))
-        | Ok(crate::storage::database::ChannelEditOutcome::Created(id)) => {
+        Ok(crate::storage::database::ChannelEditOutcome::Applied(id)) => {
             let _ = app_handle.emit(
                 "ember:channel-message-edited",
                 serde_json::json!({
@@ -16683,6 +16747,28 @@ async fn handle_inbound_channel_edit(
                     "id": id,
                     "msg_id": target_hex,
                     "message": cleaned,
+                    "edited_at": edit.edited_at,
+                }),
+            );
+        }
+        Ok(crate::storage::database::ChannelEditOutcome::Created(id)) => {
+            // Catch-up serves a revised line as the revision alone, so this is
+            // the first time the room has seen it at all. An edit event only
+            // patches a bubble that is already on screen, which left the row
+            // stored-but-invisible until the conversation was next remounted —
+            // and stored unread, so the sidebar could light up for the room the
+            // user was looking at. It is a new line here, so announce it as one
+            // and let the live path append it and settle its unread state.
+            let _ = app_handle.emit(
+                "ember:channel-message",
+                serde_json::json!({
+                    "id": id,
+                    "channel_id": channel_id_hex,
+                    "sender_pubkey": sender_hex,
+                    "direction": "received",
+                    "message": cleaned,
+                    "timestamp": edit.original_timestamp,
+                    "msg_id": target_hex,
                     "edited_at": edit.edited_at,
                 }),
             );
@@ -16791,13 +16877,18 @@ async fn reply_channel_history_sync(
     let Some(key) = channel_content_key(db, ch) else {
         return;
     };
-    let Ok(rows) = db.list_channel_messages_for_sync(
+    let Ok(mut rows) = db.list_channel_messages_for_sync(
         &ch.channel_id,
         since_ts.max(0),
         ember::channel::CHANNEL_HISTORY_SYNC_MAX as i64,
     ) else {
         return;
     };
+    // Serve in author order whichever way the rows were selected. A cold room is
+    // answered with the *newest* lines, and sending those newest-first would give
+    // the requester row ids that run backwards against their timestamps — the
+    // transcript is paged by id, so its first screen would come out reversed.
+    rows.sort_by_key(|row| (row.timestamp, row.msg_id.clone()));
     let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
         return;
     };
@@ -17064,13 +17155,13 @@ async fn maybe_sync_channel_history(
             .latest_channel_message_timestamp(&ch.channel_id)
             .unwrap_or(0)
             .min(wall);
-        let since = if latest <= 0 {
-            0
-        } else {
-            latest
-                .saturating_sub(ember::channel::CHANNEL_HISTORY_SYNC_LOOKBACK_SECS)
-                .max(0)
-        };
+        // Ask from the frontier, not from a window behind it. Asking for the
+        // last six hours got the same newest 32 lines back every round: the
+        // watermark is `MAX(timestamp)`, so storing that batch advanced it past
+        // everything still missing underneath, and a gap wider than 32 lines
+        // was never recoverable. A responder serves oldest-first for any
+        // non-zero watermark, so each round now walks the hole forward instead.
+        let since = latest.max(0);
         let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
         for pk in due {
             if sent >= 4 {
@@ -21523,6 +21614,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.xfer_recv.clear();
     state.xfer_pending.clear();
     state.xfer_block_times.clear();
+    state.xfer_upload_credit = 0;
     state.ember_channel_epoch_searches.clear();
     state.ember_pending_channel_epoch.clear();
     state.channel_epoch_fetch_at.clear();
@@ -22543,6 +22635,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_recv: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_block_times: VecDeque::new(),
+        xfer_upload_credit: 0,
         xfer_offer_policy: settings.channel_file_offers.clone(),
         xfer_friend_hashes: friend_hashes.clone(),
         ember_channel_epoch_searches: HashMap::new(),
@@ -24142,6 +24235,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // hash before the event loop can drain IPC.
                         let expected = transfer.file_hash.clone();
                         let expected_aich = transfer.expected_aich.clone();
+                        // The Ember content pin is persisted on the transfer, so
+                        // a crash is no reason to finish a pinned download
+                        // without it: MD4 alone is what the pin exists to
+                        // distrust, and completing here also lets the digest of
+                        // whatever is on disk be written back to `known.met` as
+                        // this file's official Ember hash.
+                        let expected_ember = transfer.ember_file_hash.clone();
+                        let ember_pinned = expected_ember.is_some();
                         let verify_path = final_path.clone();
                         let allowed_root = dl_folder.clone();
                         let tid = transfer.id.clone();
@@ -24156,7 +24257,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             mgr.register_control(&tid, control);
                         }
                         let handle = tokio::spawn(async move {
-                            let hash_matches = tokio::task::spawn_blocking(move || {
+                            // `Ok(())` verified, `Err(msg)` mismatched, and the
+                            // outer `None` means the file could not be read at
+                            // all. Which check failed decides whether this is
+                            // worth retrying, so the reason travels with it.
+                            let verdict = tokio::task::spawn_blocking(move || {
                                 let verified_path =
                                     crate::security::filesystem::verify_existing_path(
                                         &verify_path,
@@ -24165,7 +24270,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     .ok()?;
                                 let md4 = ed2k::hash::ed2k_hash_file(&verified_path).ok()?;
                                 if !md4.eq_ignore_ascii_case(&expected) {
-                                    return Some(false);
+                                    return Some(Err("Restored final file hash mismatch".to_string()));
                                 }
                                 if let Some(expected_aich) = expected_aich {
                                     let actual = ed2k::aich::AICHRecoveryHashSet::build_from_file(
@@ -24173,44 +24278,61 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     )
                                     .ok()
                                     .map(|set| hex::encode(set.root_hash))?;
-                                    return Some(actual.eq_ignore_ascii_case(&expected_aich));
+                                    if !actual.eq_ignore_ascii_case(&expected_aich) {
+                                        return Some(Err(format!(
+                                            "Expected AICH hash mismatch (expected {expected_aich}, got {actual})"
+                                        )));
+                                    }
                                 }
-                                Some(true)
+                                if let Some(expected_ember) = expected_ember {
+                                    let actual =
+                                        ember::crypto::blake3_hash_file_path(&verified_path)
+                                            .ok()
+                                            .map(hex::encode)?;
+                                    if !actual.eq_ignore_ascii_case(&expected_ember) {
+                                        // Reopening parts cannot turn these bytes
+                                        // into the content the pin names, so use
+                                        // the message the live path uses and let
+                                        // it be classified as permanent.
+                                        return Some(Err(
+                                            ed2k::transfer::EMBER_BLAKE3_MISMATCH_MSG.to_string(),
+                                        ));
+                                    }
+                                }
+                                Some(Ok(()))
                             })
                             .await
                             .ok()
                             .flatten()
-                            .unwrap_or(false);
-                            if hash_matches {
-                                let _ = tx
-                                    .send(DownloadEvent::Completed {
-                                        transfer_id: tid,
-                                        final_path: Some(
-                                            final_path.to_string_lossy().into_owned(),
-                                        ),
-                                        part_hashes: Vec::new(),
-                                        // This crash-recovery path only
-                                        // re-checks ed2k/AICH, never Ember's
-                                        // content BLAKE3 (see `hash_matches`
-                                        // above) — never claim a check that
-                                        // did not run.
-                                        ember_verified: false,
-                                    })
-                                    .await;
-                            } else {
-                                warn!(
-                                    "Restored download {} final file hash mismatch; marking failed for retry",
-                                    tid
-                                );
-                                let _ = tx
-                                    .send(DownloadEvent::Failed {
-                                        transfer_id: tid,
-                                        error: "Restored final file hash mismatch".into(),
-                                        failure_kind: ed2k::transfer::classify_error(
-                                            "hash mismatch",
-                                        ),
-                                    })
-                                    .await;
+                            .unwrap_or_else(|| {
+                                Err("Restored final file could not be read".to_string())
+                            });
+                            match verdict {
+                                Ok(()) => {
+                                    let _ = tx
+                                        .send(DownloadEvent::Completed {
+                                            transfer_id: tid,
+                                            final_path: Some(
+                                                final_path.to_string_lossy().into_owned(),
+                                            ),
+                                            part_hashes: Vec::new(),
+                                            ember_verified: ember_pinned,
+                                        })
+                                        .await;
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "Restored download {tid} failed re-verification: {error}"
+                                    );
+                                    let failure_kind = ed2k::transfer::classify_error(&error);
+                                    let _ = tx
+                                        .send(DownloadEvent::Failed {
+                                            transfer_id: tid,
+                                            error,
+                                            failure_kind,
+                                        })
+                                        .await;
+                                }
                             }
                         });
                         state.download_handles.insert(tid_handle, handle);
@@ -24233,6 +24355,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let file_name = transfer.file_name.clone();
                             let file_size = transfer.total_size;
                             let expected_aich = transfer.expected_aich.clone();
+                            let expected_ember = transfer.ember_file_hash.clone();
+                            let ember_pinned = expected_ember.is_some();
                             let dl_dir = PathBuf::from(&dl_folder);
                             let tx = dl_event_tx.clone();
                             let dl_tid = tid.clone();
@@ -24257,6 +24381,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                     &file_name,
                                     file_size,
                                     expected_aich.as_deref(),
+                                    expected_ember.as_deref(),
                                     &dl_dir,
                                 )
                                 .await;
@@ -24272,9 +24397,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                                 // re-checks the whole-file ed2k hash,
                                                 // not a per-part hashset.
                                                 part_hashes: Vec::new(),
-                                                // Same path — no Ember content
-                                                // BLAKE3 re-check either.
-                                                ember_verified: false,
+                                                ember_verified: ember_pinned,
                                             })
                                             .await;
                                     }
@@ -32867,7 +32990,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // because the eMule network is disconnected. Returns straight
                 // away when nothing is in flight.
                 if settings.ember_native_enabled {
-                    drive_channel_transfers(&udp_socket, &mut state, &db, &app_handle).await;
+                    drive_channel_transfers(
+                        &udp_socket,
+                        &mut state,
+                        &db,
+                        &app_handle,
+                        &bandwidth_limiter,
+                    )
+                    .await;
                 }
                 if state.stats.status == NetworkStatus::Disconnected { return; }
                 let now_bt = chrono::Utc::now().timestamp();
@@ -37874,6 +38004,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Buddy pong received");
                     }
                     Some(BuddyEvent::Callback { file_hash, dest_ip, dest_port }) => {
+                        // `OP_CALLBACK` carries the file id in CUInt128 order,
+                        // the way the requester wrote it into
+                        // `KADEMLIA_CALLBACK_REQ` and the way a relaying buddy
+                        // forwards it. eMule's `ListenSocket` does
+                        // `ToByteArray` before looking the file up; without the
+                        // matching swap here the bytes never equal a pending
+                        // download's ed2k hash and the source registers under a
+                        // hash nothing else uses.
+                        let file_hash = kad::publish::kad_id_to_md4_bytes(&KadId(file_hash));
                         info!("Buddy callback: connect to {dest_ip}:{dest_port} for file {}", hex::encode(file_hash));
 
                         // eMule parity (KAD buddy OP_CALLBACK -> TryToConnect -> serve): a peer
@@ -38189,10 +38328,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } => {
                 state.pending_outgoing_buddy = None;
                 match result {
-                    Ok(Some((buddy_id, buddy_ip, buddy_port, rx, writer, reader_handle))) => {
+                    Ok(Some((buddy_id, buddy_ip, buddy_port, buddy_udp_port, rx, writer, reader_handle))) => {
                         state.buddy_event_rx = Some(rx);
                         state.buddy_manager.install_buddy_connection(
-                            buddy_id, buddy_ip, buddy_port,
+                            buddy_id, buddy_ip, buddy_port, buddy_udp_port,
                             writer, reader_handle,
                         );
                         // `CT_EMULE_BUDDYIP` (Hello tag 0xFC) follows the same
@@ -43090,11 +43229,21 @@ fn update_publish_manager_state(state: &mut NetworkState) {
             // The parse side (`extract_kad_sources` for TAG_SERVERIP) mirrors
             // this with `.to_le_bytes()`; the two must stay in sync.
             state.publish_manager.buddy_ip = u32::from_le_bytes(ip.octets());
-            let buddy_udp = state
-                .routing_table
-                .get_contact(&buddy)
-                .map(|c| c.udp_port)
-                .unwrap_or_else(|| tcp_port.saturating_add(3));
+            // The port a searcher sends `KADEMLIA_CALLBACK_REQ` to, which is
+            // the buddy's Kad UDP socket — recorded from its `FindBuddyRes`,
+            // the way eMule's `Search.cpp` publishes `GetBuddy()->GetUDPPort()`.
+            //
+            // This used to look the buddy up in the routing table by
+            // `buddy_manager.buddy_id()`, which is the FindBuddy *search
+            // target* `NOT(local_kad_id)` rather than the buddy's node ID, so
+            // the lookup could never hit and every publish fell through to the
+            // guess below. That guess was also `tcp + 3`, an eDonkey-era
+            // 4662/4665 convention; the eMule pair is 4662/4672.
+            let buddy_udp = state.buddy_manager.buddy_udp_port().unwrap_or_else(|| {
+                tcp_port.saturating_add(
+                    kad::types::DEFAULT_UDP_PORT - kad::types::DEFAULT_TCP_PORT,
+                )
+            });
             state.publish_manager.buddy_port = buddy_udp;
         }
     } else {
@@ -47302,10 +47451,22 @@ async fn handle_ember_dht_message(
         // Prefer the peer's cryptographic identity for the STORE budget when
         // we already know it, so several genuine peers behind one NAT do not
         // share (and exhaust) a single allowance.
+        //
+        // Which identity is decided by the Noise session, not by the address
+        // alone. `contact_at` falls back to an unverified gossip entry, and
+        // gossip names both an address and a node ID: a peer could have a
+        // victim announced at its own address and then have its STORE traffic —
+        // including frames that never pass signature verification — charged to
+        // the victim's allowance, so the victim's real publishes were refused
+        // here. Requiring a contact we have actually heard from *and* whose
+        // static key matches this session ties the budget to the peer that
+        // encrypted the frame. Anyone else falls back to the address budget,
+        // which is where an unproven sender belongs.
         let sender = state
             .ember_dht
             .routing()
             .contact_at(from)
+            .filter(|c| c.is_verified() && c.noise_pub == remote_noise_pub)
             .map(|c| c.node_id.0);
         state
             .ember_dht_protection
@@ -50901,6 +51062,10 @@ async fn handle_udp_packet_inner(
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
+                // eMule's `Process_KADEMLIA_FINDBUDDY_RES` takes the buddy's
+                // Kad UDP port from the datagram it arrived on, and nothing
+                // later in the handshake carries it. Capture it here or lose it.
+                let buddy_udp_port = from.port();
                 let allow_obfuscation = settings.obfuscation_enabled;
                 let mut mgr_clone = BuddyManager::new(
                     *state.buddy_manager.local_id(),
@@ -50920,7 +51085,7 @@ async fn handle_udp_packet_inner(
                             connect_options,
                             allow_obfuscation,
                         )
-                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, rx, writer, reader_handle))
+                        .await.map(|(rx, writer, reader_handle)| (buddy_id, buddy_ip, peer_tcp_port, buddy_udp_port, rx, writer, reader_handle))
                 }));
             }
         }
@@ -50977,6 +51142,7 @@ async fn reverify_complete_part_file(
     file_name: &str,
     file_size: u64,
     expected_aich: Option<&str>,
+    expected_ember: Option<&str>,
     download_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let part_path = download_dir
@@ -50986,7 +51152,8 @@ async fn reverify_complete_part_file(
     let verify_path = part_path.clone();
     let verify_root = download_dir.to_path_buf();
     let expected_aich_owned = expected_aich.map(str::to_string);
-    let (computed_hash, verified_identity, computed_aich) =
+    let ember_wanted = expected_ember.is_some();
+    let (computed_hash, verified_identity, computed_aich, computed_ember) =
         tokio::task::spawn_blocking(move || {
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
             let (_, mut file) =
@@ -51000,7 +51167,16 @@ async fn reverify_complete_part_file(
             } else {
                 None
             };
-            Ok::<_, anyhow::Error>((hash, identity, aich))
+            // Hashed off the same handle the identity check covers, like the
+            // other two, so all three describe the file that is about to move.
+            let ember = if ember_wanted {
+                Some(hex::encode(ember::crypto::blake3_hash_open_file(
+                    &mut file,
+                )?))
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((hash, identity, aich, ember))
         })
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
@@ -51015,6 +51191,17 @@ async fn reverify_complete_part_file(
             anyhow::bail!(
                 "Expected AICH hash mismatch — .part preserved for retry (expected {expected_aich}, got {actual})"
             );
+        }
+    }
+    // The pin exists because a matching MD4 is not proof of the right content,
+    // so a crash mid-verify is no reason to skip it. Reported with the same
+    // message the live path uses, which classifies as permanent: no amount of
+    // re-downloading turns these bytes into the content the pin names.
+    if let Some(expected_ember) = expected_ember {
+        let actual = computed_ember
+            .ok_or_else(|| anyhow::anyhow!("Ember content verification did not produce a digest"))?;
+        if !actual.eq_ignore_ascii_case(expected_ember) {
+            anyhow::bail!("{}", ed2k::transfer::EMBER_BLAKE3_MISMATCH_MSG);
         }
     }
 

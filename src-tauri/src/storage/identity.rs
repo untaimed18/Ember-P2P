@@ -346,6 +346,32 @@ impl NodeIdentity {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Absent is not the same as never existed. The marker is written
+                // right after identity.json and only ever beside a stored
+                // identity, and a backup still parked here means the restore
+                // above failed rather than that there was nothing to restore.
+                // Either way this profile has had an identity, so minting is the
+                // silent reset every other arm of this match refuses — and worse
+                // here, because `atomic_write` retries the restore and would
+                // overwrite a recovered file with the new keypair.
+                let parked = crate::security::interrupted_replace_backup_exists(&path);
+                if parked || protected_marker.exists() {
+                    let evidence = if parked {
+                        "a parked identity.json.ember-replace-bak that could not be restored"
+                    } else {
+                        "identity.protected"
+                    };
+                    anyhow::bail!(
+                        "Identity file at {} is missing, but this installation has stored an \
+                         identity before ({}). Refusing to generate a new identity automatically \
+                         because this would permanently reset your KAD ID, user hash, friend \
+                         relationships, and upload credits. To recover, restore identity.json \
+                         from a backup; to reset deliberately, delete identity.json, \
+                         identity.protected, and identity.json.ember-replace-bak together.",
+                        path.display(),
+                        evidence
+                    );
+                }
                 let id = Self::generate()?;
                 let data = Zeroizing::new(serde_json::to_vec_pretty(&id)?);
                 let protected = Zeroizing::new(crate::storage::secret_store::protect(&data)?);
@@ -397,6 +423,58 @@ mod tests {
         std::fs::write(dir.join("identity.protected"), PROTECTION_MARKER).unwrap();
         let error = NodeIdentity::load_or_create(&dir).unwrap_err().to_string();
         assert!(error.contains("downgrade"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The marker is only ever written beside a stored identity, so a marker
+    /// with no `identity.json` means the file went missing rather than that this
+    /// is a first run. Minting here reset the KAD ID, user hash, Ember identity,
+    /// friendships and credits — silently, which is what every other arm of
+    /// `load_or_create` exists to refuse.
+    #[test]
+    fn a_missing_identity_beside_a_marker_refuses_to_mint() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-identity-missing-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.protected"), PROTECTION_MARKER).unwrap();
+
+        let error = NodeIdentity::load_or_create(&dir).unwrap_err().to_string();
+        assert!(
+            error.contains("Refusing to generate a new identity"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !dir.join("identity.json").exists(),
+            "a refusal must not leave a freshly minted identity behind"
+        );
+
+        // Consenting to a reset is deleting both, and that still works.
+        std::fs::remove_file(dir.join("identity.protected")).unwrap();
+        NodeIdentity::load_or_create(&dir).expect("a genuine first run still mints");
+        assert!(dir.join("identity.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The other half of the same guard: a backup still parked after the restore
+    /// attempt means the restore failed, so the identity exists and is merely
+    /// unreachable. Whether it is still there is the only evidence that
+    /// distinguishes that from a first run.
+    #[test]
+    fn a_parked_replace_backup_is_visible_to_the_mint_guard() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-identity-parked-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.json");
+        assert!(!crate::security::interrupted_replace_backup_exists(&path));
+
+        std::fs::write(dir.join("identity.json.ember-replace-bak"), b"parked").unwrap();
+        assert!(crate::security::interrupted_replace_backup_exists(&path));
         let _ = std::fs::remove_dir_all(dir);
     }
 

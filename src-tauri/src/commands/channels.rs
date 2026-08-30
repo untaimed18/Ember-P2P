@@ -1604,6 +1604,14 @@ pub async fn edit_channel_message(
                 "A newer version of this message is already stored",
             ));
         }
+        // Only reachable if the line was removed from this device between the
+        // lookup above and the write. Storing the revision would bring it back.
+        ChannelEditOutcome::Forgotten => {
+            return Err(coded(
+                "channels_edit_failed",
+                "This message is no longer on this device",
+            ));
+        }
     }
 
     let plain = channel::encode_channel_chat_edit_presigned(

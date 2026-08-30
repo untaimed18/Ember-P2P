@@ -5413,11 +5413,19 @@ async fn handle_command_inner(
                                 return Err("Expected AICH hash mismatch; preview blocked".into());
                             }
                         }
+                        // The contiguous verified run from the start of the file,
+                        // and nothing past the first gap. Copying every verified
+                        // part instead sized the preview to the last one and left
+                        // the holes between as zeros: with preview priority
+                        // fetching the first and last parts first, the player got
+                        // a full-length file whose middle was silence, and read
+                        // its duration off that. A short prefix is what
+                        // `can_preview` actually promises.
                         let verified_ranges: Vec<ed2k::preview::FilledRange> =
                             verified_complete_parts
                                 .iter()
+                                .take_while(|verified| **verified)
                                 .enumerate()
-                                .filter(|(_, verified)| **verified)
                                 .map(|(index, _)| {
                                     let start = index as u64 * part_size;
                                     ed2k::preview::FilledRange {
@@ -5437,7 +5445,10 @@ async fn handle_command_inner(
                         ed2k::preview::launch_preview(&preview_path)
                             .map_err(|e| format!("Failed to launch preview: {e}"))?;
 
-                        Ok(format!("Preview launched: {}", preview_path.display()))
+                        // The full path is PII (username, folder layout) and the
+                        // launcher logs the basename for the same reason. Nothing
+                        // reads this string, so it carries no path.
+                        Ok("Preview launched".to_string())
                     })
                     .await
                     .map_err(|e| format!("Preview task panicked: {e}"))?

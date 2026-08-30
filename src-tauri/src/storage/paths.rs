@@ -30,6 +30,9 @@ use tauri::Manager;
 /// logs). When set to a non-empty path, the directory is created on
 /// demand and used in place of the Tauri / ProjectDirs default.
 pub const EMBER_DATA_DIR_ENV: &str = "EMBER_DATA_DIR";
+/// The SQLite database inside the data directory, which owns `-wal`/`-shm`
+/// sidecars that must never be paired with a different generation of it.
+const DATABASE_FILE_NAME: &str = "ember.db";
 static MIGRATION_COPY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read the env override, returning `None` if the variable is unset or
@@ -128,7 +131,53 @@ fn migrate_legacy_app_data(legacy: &Path, canonical: &Path) -> std::io::Result<(
         );
         return Ok(());
     }
+    park_orphaned_sqlite_sidecars(legacy, canonical)?;
     copy_missing_entries(legacy, canonical)
+}
+
+/// Move aside WAL/SHM sidecars left behind by a database that is no longer
+/// there, before a legacy `ember.db` is copied into its place.
+///
+/// SQLite identifies a WAL by a salt in the database header. A sidecar from a
+/// different generation of the file is not merely ignored: it reads as
+/// corruption, and the recovery path for corruption is to back the database up
+/// and start an empty one. Parking rather than deleting keeps the frames on
+/// disk in case they turn out to be the newer copy.
+///
+/// Runs before the copy walk rather than inside it, because `read_dir` order is
+/// not defined: parking on encountering `ember.db` could otherwise park a
+/// sidecar the same migration had already copied.
+fn park_orphaned_sqlite_sidecars(legacy: &Path, canonical: &Path) -> std::io::Result<()> {
+    let db_dst = canonical.join(DATABASE_FILE_NAME);
+    // A destination database that is present stays authoritative and keeps its
+    // own sidecars; one the legacy tree cannot replace has nothing to orphan.
+    if db_dst.exists() || !legacy.join(DATABASE_FILE_NAME).is_file() {
+        return Ok(());
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_dst.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if !sidecar.exists() {
+            continue;
+        }
+        let backup = migration_backup_path(&sidecar);
+        std::fs::rename(&sidecar, &backup).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "could not park orphaned {} before migrating a legacy database: {error}",
+                    sidecar.display()
+                ),
+            )
+        })?;
+        tracing::warn!(
+            "Parked orphaned {} at {} before migrating a legacy database into its place",
+            sidecar.display(),
+            backup.display()
+        );
+    }
+    Ok(())
 }
 
 fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
@@ -158,15 +207,15 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
             } else if meta.is_dir() && dst_meta.is_dir() {
                 copy_missing_entries(&src, &dst)?;
             } else if meta.is_file() && dst_meta.is_file() {
-                let source_is_newer = meta
-                    .modified()
-                    .ok()
-                    .zip(dst_meta.modified().ok())
-                    .is_some_and(|(source, target)| source > target);
-                // Freshness, not size, decides which nonempty copy wins. A
-                // newer compacted DB/config is legitimately smaller than its
-                // stale canonical predecessor and must still migrate.
-                if meta.len() > 0 && (dst_meta.len() == 0 || source_is_newer) {
+                // Only an empty destination may be replaced. This migration
+                // re-runs on every launch, so a freshness comparison made the
+                // legacy tree authoritative forever: anything that bumped an
+                // old `identity.json`, `chat-history.key` or `ember.db` mtime
+                // (a stale build still writing there, a restored backup, a sync
+                // client rehydrating the folder) would overwrite live secrets,
+                // and because the walk is per file it could pair a replaced
+                // database with the canonical WAL of a different one.
+                if meta.len() > 0 && dst_meta.len() == 0 {
                     replace_stale_migration_file(&src, &dst, meta.len())?;
                 }
             }
@@ -182,7 +231,8 @@ fn copy_missing_entries(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {
+/// An unused `.pre-migration.bak` name beside `dst`.
+fn migration_backup_path(dst: &Path) -> PathBuf {
     let seq = MIGRATION_COPY_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let file_name = dst
@@ -198,6 +248,11 @@ fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> st
             ".{file_name}.{pid}.{seq}.{collision}.pre-migration.bak"
         ));
     }
+    backup
+}
+
+fn replace_stale_migration_file(src: &Path, dst: &Path, expected_len: u64) -> std::io::Result<()> {
+    let backup = migration_backup_path(dst);
     std::fs::rename(dst, &backup)?;
     match copy_file_atomically(src, dst, expected_len) {
         Ok(()) => {
@@ -400,6 +455,116 @@ mod tests {
             b"canonical"
         );
         assert_eq!(std::fs::read(canonical.join("ember.db")).unwrap(), b"db");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// This migration re-runs on every launch, so "newer wins" would make the
+    /// legacy tree authoritative for the life of the profile: anything that
+    /// touched an old identity or key file there would overwrite the live one.
+    #[test]
+    fn newer_legacy_file_does_not_replace_live_canonical_file() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-paths-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy");
+        let canonical = root.join("canonical");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("identity.json"), b"live").unwrap();
+        // Written second, so it is unambiguously the newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(legacy.join("identity.json"), b"stale-but-newer").unwrap();
+
+        copy_missing_entries(&legacy, &canonical).unwrap();
+
+        assert_eq!(
+            std::fs::read(canonical.join("identity.json")).unwrap(),
+            b"live",
+            "a newer legacy mtime must not overwrite live key material"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A WAL from a database that is no longer there reads as corruption, and
+    /// the recovery path for corruption starts an empty database. Migrating a
+    /// legacy `ember.db` next to one would trade the user's history for a
+    /// fresh profile.
+    #[test]
+    fn migrating_a_database_parks_orphaned_sidecars() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-paths-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy");
+        let canonical = root.join("canonical");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(legacy.join("ember.db"), b"legacy-db").unwrap();
+        std::fs::write(canonical.join("ember.db-wal"), b"orphan-wal").unwrap();
+
+        park_orphaned_sqlite_sidecars(&legacy, &canonical).unwrap();
+        copy_missing_entries(&legacy, &canonical).unwrap();
+
+        assert_eq!(
+            std::fs::read(canonical.join("ember.db")).unwrap(),
+            b"legacy-db"
+        );
+        assert!(
+            !canonical.join("ember.db-wal").exists(),
+            "the orphaned WAL must not stay beside a different database"
+        );
+        let parked: Vec<_> = std::fs::read_dir(&canonical)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".pre-migration.bak"))
+            .collect();
+        assert_eq!(parked.len(), 1, "the WAL must be preserved, not deleted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The parking pass must not touch sidecars belonging to the database it is
+    /// migrating. `read_dir` order is undefined, so doing this inside the copy
+    /// walk could park a WAL the same migration had just written.
+    #[test]
+    fn migrating_a_database_keeps_its_own_sidecars() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-paths-trio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy");
+        let canonical = root.join("canonical");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(legacy.join("ember.db"), b"legacy-db").unwrap();
+        std::fs::write(legacy.join("ember.db-wal"), b"legacy-wal").unwrap();
+        std::fs::write(legacy.join("ember.db-shm"), b"legacy-shm").unwrap();
+
+        park_orphaned_sqlite_sidecars(&legacy, &canonical).unwrap();
+        copy_missing_entries(&legacy, &canonical).unwrap();
+
+        assert_eq!(
+            std::fs::read(canonical.join("ember.db-wal")).unwrap(),
+            b"legacy-wal",
+            "the migrated database must keep the WAL it came with"
+        );
+        assert_eq!(
+            std::fs::read(canonical.join("ember.db-shm")).unwrap(),
+            b"legacy-shm"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

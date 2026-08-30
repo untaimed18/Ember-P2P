@@ -304,8 +304,10 @@ function scheduleXferClear(xferId: string, epoch: number): void {
   );
 }
 
-function toastXferOffer(channelId: string): void {
-  if (get(activeChannelId) === channelId) return;
+function toastXferOffer(channelId: string, peerPubkey?: string): void {
+  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  if (get(mutedChannels).includes(channelId)) return;
+  if (peerPubkey && get(ignoredMemberKeys).includes(peerPubkey.toLowerCase())) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
   toast(
     room
@@ -416,7 +418,7 @@ export function clearChannelUnread(channelId: string): void {
 }
 
 export function bumpChannelUnread(channelId: string): void {
-  if (get(activeChannelId) === channelId) return;
+  if (isAppVisible() && get(activeChannelId) === channelId) return;
   unreadRevision++;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
@@ -525,7 +527,7 @@ export async function initChannelsStore() {
             status: 'awaiting',
           },
         }));
-        toastXferOffer(channelId);
+        toastXferOffer(channelId, p.peer_pubkey);
       }),
     );
     registered.push(

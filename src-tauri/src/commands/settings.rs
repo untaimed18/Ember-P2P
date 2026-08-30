@@ -1075,6 +1075,14 @@ pub async fn update_settings(
 
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
+    // The network loop reads UPnP once, at startup, to decide whether to map
+    // ports, renew the lease and tear the mapping down on exit. Reporting this
+    // as applied claimed a live change that never happened: disabling left the
+    // mappings and their renewals running, and enabling did nothing at all.
+    // Restarting is what actually honours the new value, and it is also what
+    // removes the existing mapping, because shutdown tears down on the value it
+    // started with.
+    let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
 
     let save_data = {
         let config = state.config.read().await;
@@ -1237,7 +1245,7 @@ pub async fn update_settings(
         });
     }
 
-    let outcome = if port_changed {
+    let outcome = if port_changed || upnp_changed {
         SettingsUpdateOutcome::RestartRequired
     } else {
         SettingsUpdateOutcome::Applied
