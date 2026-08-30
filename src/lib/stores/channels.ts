@@ -9,9 +9,16 @@ export const channels = writable<ChannelInfo[]>([]);
 export const activeChannelId = writable<string | null>(null);
 
 let lastOpenedChannelId: string | null = null;
+/** Whether a stash has happened at all, which is not the same as having stashed
+ *  a room. Browsing the directory is a selection too, and treating its `null` as
+ *  "nothing stashed" let the page's own load step re-open the newest joined room
+ *  on the way back — so leaving Channels from the directory and returning landed
+ *  the user in a conversation they had deliberately closed. */
+let channelSelectionStashed = false;
 
 export function stashActiveChannelOnLeave(): void {
   lastOpenedChannelId = get(activeChannelId);
+  channelSelectionStashed = true;
   activeChannelId.set(null);
 }
 
@@ -19,6 +26,15 @@ export function restoreActiveChannelOnEnter(): void {
   if (get(activeChannelId) == null && lastOpenedChannelId) {
     activeChannelId.set(lastOpenedChannelId);
   }
+}
+
+/** True when the page should leave the selection alone rather than picking a
+ *  room for the user. Consumed once: a later visit with no stash of its own is
+ *  a fresh arrival, which is exactly when opening the newest room is helpful. */
+export function takeStashedChannelSelection(): boolean {
+  const stashed = channelSelectionStashed;
+  channelSelectionStashed = false;
+  return stashed;
 }
 
 const CHANNEL_ID_RE = /^[0-9a-f]{32}$/i;
@@ -239,6 +255,9 @@ export function forgetChannelMute(channelId: string): void {
 let initialized = false;
 let storeEpoch = 0;
 let unlisteners: UnlistenFn[] = [];
+/** Bumped by every local unread mutation, so `refreshChannels` can tell whether
+ *  the snapshot it awaited is still the newest word on the subject. */
+let unreadRevision = 0;
 
 /**
  * Ember Transfers this session, keyed by transfer id.
@@ -285,8 +304,10 @@ function scheduleXferClear(xferId: string, epoch: number): void {
   );
 }
 
-function toastXferOffer(channelId: string): void {
-  if (get(activeChannelId) === channelId) return;
+function toastXferOffer(channelId: string, peerPubkey?: string): void {
+  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  if (get(mutedChannels).includes(channelId)) return;
+  if (peerPubkey && get(ignoredMemberKeys).includes(peerPubkey.toLowerCase())) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
   toast(
     room
@@ -312,8 +333,25 @@ export async function mergeChannelTransfers(): Promise<void> {
 }
 
 export async function refreshChannels(): Promise<void> {
+  const revision = unreadRevision;
   const list = await listChannels();
-  channels.set(list);
+  // The database is authoritative for unread, but only as of the moment it was
+  // read. A message arriving — or the user opening a room — while this call was
+  // in flight moves the count *after* that snapshot was taken, and a plain
+  // `set` then rolled it back: the badge dropped the new line, or came back on
+  // a room being read. Keep whatever the local mutation left when one happened.
+  if (revision === unreadRevision) {
+    channels.set(list);
+  } else {
+    channels.update((cur) => {
+      const local = new Map(cur.map((channel) => [channel.channel_id, channel.unread]));
+      return list.map((channel) =>
+        local.has(channel.channel_id)
+          ? { ...channel, unread: local.get(channel.channel_id) as number }
+          : channel,
+      );
+    });
+  }
   const keep = new Set(list.filter((channel) => !channel.deleted).map((channel) => channel.channel_id));
   mutedChannels.update((ids) => {
     const next = ids.filter((id) => keep.has(id));
@@ -363,6 +401,7 @@ export function setChannelMemberCount(channelId: string, count: number): void {
 }
 
 export function clearChannelUnread(channelId: string): void {
+  unreadRevision++;
   channels.update((list) => {
     // Hand back the same array when there is nothing to clear. Allocating a
     // fresh one regardless re-invalidated every `$channels` reader, and
@@ -379,7 +418,8 @@ export function clearChannelUnread(channelId: string): void {
 }
 
 export function bumpChannelUnread(channelId: string): void {
-  if (get(activeChannelId) === channelId) return;
+  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  unreadRevision++;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {
       return list;
@@ -402,9 +442,14 @@ function previewText(raw: unknown): string {
   return text.length > 80 ? `${text.slice(0, 77)}…` : text;
 }
 
-function maybeToastChannelMessage(channelId: string, message: string) {
+function maybeToastChannelMessage(channelId: string, message: string, senderPubkey?: string) {
   if (isAppVisible() && get(activeChannelId) === channelId) return;
   if (get(mutedChannels).includes(channelId)) return;
+  // Ignoring somebody is presentational, and a toast quoting them is the least
+  // ignorable presentation there is: it interrupts whatever page the user is on
+  // with the text they asked not to see. The unread count still moves, which is
+  // the documented half of the bargain.
+  if (senderPubkey && get(ignoredMemberKeys).includes(senderPubkey.toLowerCase())) return;
   const now = Date.now();
   const prev = lastToastAt.get(channelId) ?? 0;
   if (now - prev < TOAST_GAP_MS) return;
@@ -428,6 +473,7 @@ export async function initChannelsStore() {
         channel_id: string;
         direction?: string;
         message?: string;
+        sender_pubkey?: string;
       }>('ember:channel-message', (event) => {
         const channelId = validChannelId(event.payload?.channel_id);
         if (!channelId) return;
@@ -435,13 +481,19 @@ export async function initChannelsStore() {
           return;
         }
         if (!get(channels).some((channel) => channel.channel_id === channelId)) {
-          refreshChannels()
-            .then(() => bumpChannelUnread(channelId))
-            .catch(() => {});
+          // No bump afterwards. The row is missing because this is the first
+          // line from a room that only just appeared, and the count the fetch
+          // brings back is read from the database — which already holds the
+          // message that triggered this event. Adding one more counted it twice.
+          refreshChannels().catch(() => {});
         } else {
           bumpChannelUnread(channelId);
         }
-        maybeToastChannelMessage(channelId, event.payload.message ?? '');
+        maybeToastChannelMessage(
+          channelId,
+          event.payload.message ?? '',
+          event.payload.sender_pubkey,
+        );
       }),
     );
     registered.push(
@@ -475,7 +527,7 @@ export async function initChannelsStore() {
             status: 'awaiting',
           },
         }));
-        toastXferOffer(channelId);
+        toastXferOffer(channelId, p.peer_pubkey);
       }),
     );
     registered.push(

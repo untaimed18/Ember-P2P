@@ -10257,7 +10257,10 @@ impl UploadHandler {
                                 pubkey: hello_caps.ember_pubkey,
                                 nickname: nick,
                                 peer_ip: peer_addr.ip().to_string(),
-                                peer_port: peer_addr.port(),
+                                peer_port: crate::network::ed2k::advertised_listen_port(
+                                    hello_caps.tcp_port,
+                                    peer_addr.port(),
+                                ),
                                 verified,
                             },
                         }).await;

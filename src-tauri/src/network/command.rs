@@ -321,6 +321,7 @@ async fn handle_command_inner(
             }
 
             // --- KAD search ---
+            let mut kad_skip_phase: Option<&'static str> = None;
             let kad_started = 'kad: {
                 if !run_kad {
                     break 'kad false;
@@ -330,9 +331,11 @@ async fn handle_command_inner(
                 // before any side effects — so future logic drift degrades to a
                 // skipped KAD search instead of panicking the whole network task.
                 let Some(query_expr) = query_expr.clone() else {
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
                 let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
                 let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
@@ -348,6 +351,7 @@ async fn handle_command_inner(
 
                 if closest.is_empty() {
                     info!("KAD search: no closest contacts in routing table");
+                    kad_skip_phase = Some("KadNoContacts");
                     break 'kad false;
                 }
 
@@ -361,6 +365,7 @@ async fn handle_command_inner(
 
                 if sid == SearchId(0) {
                     info!("KAD search: rejected (too many active searches)");
+                    kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 }
                 // eMule GetSearchPacket (Kad): for AND-only trees, strip the
@@ -400,6 +405,18 @@ async fn handle_command_inner(
                 );
                 true
             };
+
+            if let Some(phase) = kad_skip_phase {
+                let _ = app_handle.emit(
+                    "search-progress",
+                    SearchProgressEvent {
+                        request_id,
+                        nodes_contacted: 0,
+                        results_so_far: 0,
+                        phase: phase.to_string(),
+                    },
+                );
+            }
 
             // --- Ember DHT keyword search (slice 10 + multi-keyword wire) ---
             // Streaming-only: it never touches the invoke oneshot (`tx`); its
@@ -509,12 +526,22 @@ async fn handle_command_inner(
                         .map(|sources| hex::encode(sources.file_hash))
                 });
 
+            // This handler serves both Stop (`cleanup_ack: None`, keeps the
+            // `.part` and its `.part.met` for resume) and Cancel/Remove, which
+            // delete them. Only the deleting form may discard the part writer's
+            // trailing fsync — see `TransferControl::discard`.
+            let deleting = cleanup_ack.is_some();
+
             // Cancel control first so detached per-source tasks bail before
             // we ACK cleanup / delete .part files (N1).
             {
                 let mgr = transfer_manager.read().await;
                 if let Some(control) = mgr.get_control(&transfer_id) {
-                    control.cancel();
+                    if deleting {
+                        control.discard();
+                    } else {
+                        control.cancel();
+                    }
                 }
             }
 
@@ -543,15 +570,30 @@ async fn handle_command_inner(
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
+            // `deleting` was captured at the top of this arm, *before*
+            // `cleanup_ack.take()` below. The ack is moved into the join task
+            // when a worker is running, so a later `cleanup_ack.is_some()`
+            // would be false for every live download and would skip tracker
+            // removal + `.part.met` suppression — in-flight saves then recreate
+            // the sidecar after cleanup.
             // Cancel (delete) clears known sources; Stop preserves them for resume.
-            if cleanup_ack.is_some() {
+            if deleting {
                 state.per_file_sources.remove(&transfer_id);
+                let met_path = PathBuf::from(&settings.download_folder)
+                    .join("Temp")
+                    .join(format!("{transfer_id}.part.met"));
+                ed2k::part_tracker::mark_met_saves_suppressed(&met_path);
             }
+            let cancel_tracker = if deleting {
+                state.tracker_registry.lock().remove(&transfer_id)
+            } else {
+                None
+            };
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 // Stop path: preserve .part.met for resume. Snapshot the
                 // tracker `Arc` here (a cheap registry lookup) so the save can
                 // run off-loop with the rest of the teardown.
-                let stop_tracker = if cleanup_ack.is_none() {
+                let stop_tracker = if !deleting {
                     state.tracker_registry.lock().get(&transfer_id).cloned()
                 } else {
                     None
@@ -574,18 +616,39 @@ async fn handle_command_inner(
                 // in-memory state with no such dependency.
                 let ack = cleanup_ack.take();
                 let tid = transfer_id.clone();
+                let delete_roots = deleting.then(|| vec![settings.download_folder.clone()]);
                 tokio::spawn(async move {
                     if let Some(tracker) = stop_tracker {
                         save_part_tracker_snapshot(tracker, &tid, "cancel/stop").await;
                     }
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                    if let (Some(tracker), Some(allowed)) = (cancel_tracker, delete_roots) {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tracker.read(),
+                        )
+                        .await
+                        {
+                            Ok(t) => t.delete_met(&allowed),
+                            Err(_) => warn!(
+                                "Timed out acquiring tracker lock to delete .part.met for {tid}"
+                            ),
+                        }
+                    }
                     if let Some(tx) = ack {
                         let _ = tx.send(());
                     }
                 });
-            }
-            if cleanup_ack.is_some() {
-                state.tracker_registry.lock().remove(&transfer_id);
+            } else if let Some(tracker) = cancel_tracker {
+                let allowed = vec![settings.download_folder.clone()];
+                tokio::spawn(async move {
+                    if let Ok(t) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
+                            .await
+                    {
+                        t.delete_met(&allowed);
+                    }
+                });
             }
 
             // Remove partial download from KAD source publish. `cancel_hash`
@@ -2889,6 +2952,49 @@ async fn handle_command_inner(
                 ember::channel::XferReply::Decline
             };
             if accept {
+                // The cap the offer was measured against, re-checked at the
+                // moment it is taken up. An offer only counted itself against
+                // `xfer_pending`, so four queued prompts on top of an already
+                // busy receiver could all be accepted and land as seven
+                // concurrent downloads — each holding an open file handle and a
+                // request window the tick budget was never sized for.
+                if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE {
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_busy",
+                        "Too many transfers are already running",
+                    )));
+                    return;
+                }
+                // Banned since the prompt appeared. The offer path refuses a
+                // banned sender outright, and nothing re-read that decision
+                // afterwards — so a member evicted while their dialog sat on
+                // screen could still be let in by the click that answered it.
+                // Declining stays available either way: that is cleanup.
+                if db
+                    .channel_member_is_banned(
+                        &hex::encode(offer.channel_id),
+                        &hex::encode(offer.peer),
+                    )
+                    .unwrap_or(false)
+                {
+                    state.xfer_pending.remove(&xfer_id);
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &offer.channel_id,
+                        &offer.peer,
+                        "receive",
+                        &offer.name,
+                        offer.size,
+                        0,
+                        "not_allowed",
+                    );
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_no_member",
+                        "That member is not in this room",
+                    )));
+                    return;
+                }
                 // Part files sit beside the ones eD2K downloads use, so a
                 // half-received transfer never appears in the finished folder.
                 let temp_dir = download_folder.join("Temp");
@@ -2930,7 +3036,6 @@ async fn handle_command_inner(
                     ),
                 );
             }
-            state.xfer_pending.remove(&xfer_id);
             let plain = ember::channel::encode_xfer_reply(
                 &offer.key,
                 &state.local_ed25519_pubkey,
@@ -2938,7 +3043,22 @@ async fn handle_command_inner(
                 &xfer_id,
                 reply,
             );
-            send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await;
+            // Rolled back on a reply that never left, exactly as the offer side
+            // does. Marking the transfer active regardless held a receive slot
+            // and an open file for a sender who was never told to start, and the
+            // offer had already been consumed so there was nothing left to
+            // answer — the user's only recourse was to wait out the timeout.
+            if !send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await {
+                if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+                    let _ = std::fs::remove_file(&recv.part_path);
+                }
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_unreachable",
+                    "Could not reach that member right now",
+                )));
+                return;
+            }
+            state.xfer_pending.remove(&xfer_id);
             emit_xfer_update(
                 app_handle,
                 &xfer_id,
@@ -3016,43 +3136,18 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
-        NetworkCommand::DropChannelTransfers { channel_id } => {
-            let mut ended: Vec<([u8; 16], [u8; 32], String, u64, &'static str)> = Vec::new();
-            state.xfer_pending.retain(|xfer_id, offer| {
-                let keep = offer.channel_id != channel_id;
-                if !keep {
-                    ended.push((*xfer_id, offer.peer, offer.name.clone(), offer.size, "receive"));
-                }
-                keep
-            });
-            state.xfer_recv.retain(|xfer_id, recv| {
-                let keep = recv.channel_id != channel_id;
-                if !keep {
-                    let _ = std::fs::remove_file(&recv.part_path);
-                    ended.push((*xfer_id, recv.peer, recv.name.clone(), recv.size, "receive"));
-                }
-                keep
-            });
-            state.xfer_send.retain(|xfer_id, send| {
-                let keep = send.channel_id != channel_id;
-                if !keep {
-                    ended.push((*xfer_id, send.peer, send.name.clone(), send.size, "send"));
-                }
-                keep
-            });
-            for (xfer_id, peer, name, size, direction) in ended {
-                emit_xfer_update(
-                    app_handle,
-                    &xfer_id,
-                    &channel_id,
-                    &peer,
-                    direction,
-                    &name,
-                    size,
-                    0,
-                    "cancelled",
-                );
-            }
+        NetworkCommand::DropChannelTransfers { channel_id, member } => {
+            drop_channel_transfers_for(
+                state,
+                app_handle,
+                channel_id,
+                member,
+                if member.is_some() {
+                    "not_allowed"
+                } else {
+                    "cancelled"
+                },
+            );
         }
 
         NetworkCommand::ListChannelTransfers { tx } => {
@@ -4730,20 +4825,41 @@ async fn handle_command_inner(
                     return;
                 }
             }
-            for (hash, friends_only) in &parsed {
-                if *friends_only {
-                    state.ember_dht.drop_own_file_records(hash);
-                    state.ember_published_sources.remove(hash);
-                    state.ember_source_publish_unix.remove(hash);
-                    state.ember_keyword_publish_unix.remove(hash);
-                    state.ember_source_publish_at.remove(hash);
-                    state.ember_keyword_publish_at.remove(hash);
-                    let mut sm = source_manager.write().await;
+            let restricted: HashSet<[u8; 16]> = parsed
+                .iter()
+                .filter(|(_, friends_only)| *friends_only)
+                .map(|(hash, _)| *hash)
+                .collect();
+            if !restricted.is_empty() {
+                retract_ember_publish(state, known_files, &restricted);
+                let mut sm = source_manager.write().await;
+                for hash in &restricted {
                     sm.remove_file(hash);
                 }
             }
             sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
             let _ = tx.send(Ok(parsed.len()));
+        }
+
+        NetworkCommand::UnpublishEmberFiles { file_hashes, tx } => {
+            let retracted: HashSet<[u8; 16]> = file_hashes
+                .iter()
+                .filter_map(|hash_hex| parse_ed2k_hash16(hash_hex))
+                .collect();
+            if !retracted.is_empty() {
+                retract_ember_publish(state, known_files, &retracted);
+                // Source exchange answers from this map, so a file we no longer
+                // offer must stop contributing peers to it.
+                let mut sources = source_manager.write().await;
+                for hash in &retracted {
+                    sources.remove_file(hash);
+                }
+                info!(
+                    "Ember: withdrew publications for {} file(s) no longer shared",
+                    retracted.len()
+                );
+            }
+            let _ = tx.send(retracted.len());
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
@@ -5297,11 +5413,19 @@ async fn handle_command_inner(
                                 return Err("Expected AICH hash mismatch; preview blocked".into());
                             }
                         }
+                        // The contiguous verified run from the start of the file,
+                        // and nothing past the first gap. Copying every verified
+                        // part instead sized the preview to the last one and left
+                        // the holes between as zeros: with preview priority
+                        // fetching the first and last parts first, the player got
+                        // a full-length file whose middle was silence, and read
+                        // its duration off that. A short prefix is what
+                        // `can_preview` actually promises.
                         let verified_ranges: Vec<ed2k::preview::FilledRange> =
                             verified_complete_parts
                                 .iter()
+                                .take_while(|verified| **verified)
                                 .enumerate()
-                                .filter(|(_, verified)| **verified)
                                 .map(|(index, _)| {
                                     let start = index as u64 * part_size;
                                     ed2k::preview::FilledRange {
@@ -5321,7 +5445,10 @@ async fn handle_command_inner(
                         ed2k::preview::launch_preview(&preview_path)
                             .map_err(|e| format!("Failed to launch preview: {e}"))?;
 
-                        Ok(format!("Preview launched: {}", preview_path.display()))
+                        // The full path is PII (username, folder layout) and the
+                        // launcher logs the basename for the same reason. Nothing
+                        // reads this string, so it carries no path.
+                        Ok("Preview launched".to_string())
                     })
                     .await
                     .map_err(|e| format!("Preview task panicked: {e}"))?
@@ -5753,11 +5880,17 @@ async fn handle_command_inner(
             request_id,
             tx,
         } => {
-            if settings.friend_browse_disabled {
-                let _ = tx.send(Err("Browse is disabled in Friends settings".into()));
-            } else if !friend_hashes.read().await.contains(&friend_eh) {
+            if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only browse friends".into()));
+            } else if !mutual_friend_hashes.read().await.contains(&friend_eh) {
+                let _ = tx.send(Err(
+                    "Browse is only available after both of you have accepted the friendship".into(),
+                ));
             } else {
+                // `friend_browse_disabled` only refuses *inbound* listing
+                // (answered with an empty BROWSE_RES). Outbound browse is
+                // still allowed: hiding our share list is not the same as
+                // opting out of looking at theirs.
                 // See the identical `filter(|h| h.is_fresh())` in
                 // `SendChatMessage` above: reusing a stale session here
                 // would queue the browse request into a channel whose

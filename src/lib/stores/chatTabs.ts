@@ -58,9 +58,10 @@ function loadPersisted(): PersistedState {
           typeof (t as ChatTab).hash === 'string' &&
           typeof (t as ChatTab).name === 'string',
       )
-      .map((t) => ({ hash: t.hash, name: t.name }))
+      .map((t) => ({ hash: t.hash.toLowerCase(), name: t.name }))
       .slice(-MAX_CHAT_TABS);
-    const activeRaw = typeof obj.activeHash === 'string' ? obj.activeHash : null;
+    const activeRaw =
+      typeof obj.activeHash === 'string' ? obj.activeHash.toLowerCase() : null;
     const activeHash =
       activeRaw && tabs.some((t) => t.hash === activeRaw)
         ? activeRaw
@@ -170,23 +171,24 @@ export function clearDraft(hash: string) {
  * subsequent reorders are an explicit user action only.
  */
 export function openChat(hash: string, name: string) {
+  const key = hash.toLowerCase();
   chatTabs.update((tabs) => {
-    const idx = tabs.findIndex((t) => t.hash === hash);
+    const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
     if (idx === -1) {
-      const next = [...tabs, { hash, name }];
+      const next = [...tabs, { hash: key, name }];
       if (next.length <= MAX_CHAT_TABS) return next;
       const evicted = next.shift();
       if (evicted) chatDrafts.delete(evicted.hash);
       return next;
     }
-    if (tabs[idx].name !== name) {
+    if (tabs[idx].name !== name || tabs[idx].hash !== key) {
       const next = tabs.slice();
-      next[idx] = { hash, name };
+      next[idx] = { hash: key, name };
       return next;
     }
     return tabs;
   });
-  activeChatTab.set(hash);
+  activeChatTab.set(key);
   chatDockOpen.set(true);
 }
 
@@ -196,8 +198,9 @@ export function openChat(hash: string, name: string) {
  * collapses the dock — there's nothing left to show.
  */
 export function closeTab(hash: string) {
+  const key = hash.toLowerCase();
   const tabs = get(chatTabs);
-  const idx = tabs.findIndex((t) => t.hash === hash);
+  const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
   if (idx === -1) return;
   const next = tabs.slice();
   next.splice(idx, 1);
@@ -206,9 +209,10 @@ export function closeTab(hash: string) {
   // map can't briefly hold a draft for a hash whose tab is gone —
   // the next `getDraft` for the same hash always sees an empty
   // string until the user types something new.
+  chatDrafts.delete(key);
   chatDrafts.delete(hash);
 
-  if (get(activeChatTab) === hash) {
+  if (get(activeChatTab)?.toLowerCase() === key) {
     const neighbor = next[idx - 1]?.hash ?? next[idx]?.hash ?? null;
     activeChatTab.set(neighbor);
     if (neighbor === null) chatDockOpen.set(false);
@@ -217,8 +221,10 @@ export function closeTab(hash: string) {
 
 /** Activate an existing tab (no-op if it isn't open) and reveal the dock. */
 export function setActiveTab(hash: string) {
-  if (get(chatTabs).some((t) => t.hash === hash)) {
-    activeChatTab.set(hash);
+  const key = hash.toLowerCase();
+  const tab = get(chatTabs).find((t) => t.hash.toLowerCase() === key);
+  if (tab) {
+    activeChatTab.set(tab.hash);
     chatDockOpen.set(true);
   }
 }
@@ -261,7 +267,21 @@ export function cycleTab(direction: 1 | -1) {
  * would be misleading). Called from the friend-removal flow.
  */
 export function removeChatForFriend(hash: string) {
-  closeTab(hash);
+  closeTab(hash.toLowerCase());
+}
+
+/** Drop persisted tabs whose identities are no longer friends. */
+export function retainChatTabs(friendHashes: Iterable<string>) {
+  const allow = new Set([...friendHashes].map((h) => h.toLowerCase()));
+  const tabs = get(chatTabs);
+  const next = tabs.filter((t) => allow.has(t.hash.toLowerCase()));
+  if (next.length === tabs.length) return;
+  chatTabs.set(next);
+  const active = get(activeChatTab);
+  if (active && !next.some((t) => t.hash.toLowerCase() === active.toLowerCase())) {
+    activeChatTab.set(next[0]?.hash ?? null);
+    if (next.length === 0) chatDockOpen.set(false);
+  }
 }
 
 /**
@@ -271,11 +291,12 @@ export function removeChatForFriend(hash: string) {
  * stay stuck on the old nickname after a rename.
  */
 export function renameTab(hash: string, newName: string) {
+  const key = hash.toLowerCase();
   chatTabs.update((tabs) => {
-    const idx = tabs.findIndex((t) => t.hash === hash);
+    const idx = tabs.findIndex((t) => t.hash.toLowerCase() === key);
     if (idx === -1 || tabs[idx].name === newName) return tabs;
     const next = tabs.slice();
-    next[idx] = { hash, name: newName };
+    next[idx] = { hash: tabs[idx].hash, name: newName };
     return next;
   });
 }

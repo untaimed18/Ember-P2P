@@ -3,13 +3,13 @@
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
-  import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab } from '$lib/stores/chatTabs';
+  import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab, retainChatTabs } from '$lib/stores/chatTabs';
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { toastError, toastWarning } from '$lib/stores/toast';
-  import { copyToClipboard } from '$lib/utils';
+  import { copyToClipboard, formatBytes } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import {
@@ -25,13 +25,14 @@
     endFriendRequestMutation,
     fileOffers as fileOffersStore,
     clearFileOffer,
+    clearFileOffersForFriend,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
   import IconX from '$lib/components/IconX.svelte';
 
   let friends: FriendInfo[] = $state([]);
-  let browseDisabled = $derived($appSettings?.friend_browse_disabled === true);
+  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
@@ -69,6 +70,10 @@
   let onlineFriends: Set<string> = $derived($onlineFriendsStore);
   let unreadCounts: Map<string, number> = $derived($unreadCountsStore);
 
+  function isFriendOnline(hash: string): boolean {
+    return onlineFriends.has(hash.toLowerCase());
+  }
+
   let friendRequests: FriendRequestInfo[] = $derived($friendRequestsStore);
   let pendingOffers = $derived($fileOffersStore);
   /** Offer currently being accepted, so its buttons can be disabled. */
@@ -79,20 +84,14 @@
   }
 
   function friendLabel(userHash: string): string {
-    const f = friends.find(x => x.user_hash === userHash);
+    const f = friends.find(x => x.user_hash.toLowerCase() === userHash.toLowerCase());
     return f?.nickname || userHash.slice(0, 8) + '\u2026';
   }
 
+  /** Blank for a sizeless offer; otherwise the app-wide byte format, so an
+   *  offer and the transfer it becomes are not measured differently. */
   function formatOfferSize(bytes: number): string {
-    if (!bytes) return '';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+    return bytes ? formatBytes(bytes) : '';
   }
 
   /**
@@ -201,8 +200,8 @@
       );
     }
     return list.slice().sort((a, b) => {
-      const aOn = onlineFriends.has(a.user_hash) ? 0 : 1;
-      const bOn = onlineFriends.has(b.user_hash) ? 0 : 1;
+      const aOn = isFriendOnline(a.user_hash) ? 0 : 1;
+      const bOn = isFriendOnline(b.user_hash) ? 0 : 1;
       if (aOn !== bOn) return aOn - bOn;
       const aName = (a.nickname || a.user_hash).toLowerCase();
       const bName = (b.nickname || b.user_hash).toLowerCase();
@@ -210,14 +209,15 @@
     });
   });
 
-  let onlineFiltered = $derived(filtered.filter(f => onlineFriends.has(f.user_hash)));
-  let offlineFiltered = $derived(filtered.filter(f => !onlineFriends.has(f.user_hash)));
+  let onlineFiltered = $derived(filtered.filter(f => isFriendOnline(f.user_hash)));
+  let offlineFiltered = $derived(filtered.filter(f => !isFriendOnline(f.user_hash)));
   // Count only friends that are online — `onlineFriends` (the raw store set)
   // can momentarily hold a hash that isn't in the current friend list, which
   // would inflate the header count.
-  let onlineFriendCount = $derived(friends.filter(f => onlineFriends.has(f.user_hash)).length);
+  let onlineFriendCount = $derived(friends.filter(f => isFriendOnline(f.user_hash)).length);
 
   function openChat(f: FriendInfo) {
+    if (chatDisabled) return;
     // Delegate to the global multi-conversation dock. It opens the
     // dock if not already visible, adds (or focuses) a tab for this
     // friend, and lets the user keep chatting while navigating to
@@ -230,7 +230,6 @@
   }
 
   function openBrowse(f: FriendInfo) {
-    if (browseDisabled) return;
     browseFriendHash = f.user_hash;
     browseFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
     browseFriendIp = f.last_ip || '';
@@ -253,7 +252,7 @@
   }
 
   function friendPresence(f: FriendInfo): 'online' | 'offline' {
-    return onlineFriends.has(f.user_hash) ? 'online' : 'offline';
+    return isFriendOnline(f.user_hash) ? 'online' : 'offline';
   }
 
   async function reloadFriendRequests() {
@@ -511,6 +510,7 @@
       const list = await getFriends();
       if (destroyed || seq !== loadFriendsSeq) return;
       friends = list;
+      retainChatTabs(list.map((f) => f.user_hash));
     } catch (e: unknown) {
       if (destroyed || seq !== loadFriendsSeq) return;
       error = toErr(e);
@@ -545,6 +545,7 @@
     // runs, so the two cannot be dispatched against the same identity at once.
     processingRequests.add(target.user_hash);
     processingRequests = new Set(processingRequests);
+    beginFriendRequestMutation();
     let reportedOk = false;
     // Held rather than assigned to `error` straight away: the reload below
     // calls `loadFriends`, which clears `error` as its own first act, so a
@@ -567,7 +568,7 @@
       // leave an open chat tab and an online marker for someone who is in
       // fact blocked. A failure earlier than the write leaves no row, and
       // this correctly does nothing.
-      if (reportedOk || blocked.some(b => b.user_hash === target.user_hash)) {
+      if (reportedOk || blocked.some(b => b.user_hash.toLowerCase() === target.user_hash.toLowerCase())) {
         // Blocking subsumes removal, so the same cleanup applies: online
         // marker, unread badge, in-flight search, chat tab, pending request.
         onlineFriendsStore.update(s => { const next = new Set(s); next.delete(target.user_hash); return next; });
@@ -575,7 +576,9 @@
         clearFriendSearch(target.user_hash);
         removeChatForFriend(target.user_hash);
         friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== target.user_hash));
+        clearFileOffersForFriend(target.user_hash);
       }
+      endFriendRequestMutation();
       processingRequests.delete(target.user_hash);
       processingRequests = new Set(processingRequests);
     }
@@ -618,13 +621,18 @@
       addError = m.friends_validation_already_friend();
       return;
     }
+    if (blocked.some((b) => b.user_hash.toLowerCase() === canonicalHash)) {
+      addError = m.friends_validation_blocked();
+      return;
+    }
     adding = true;
     try {
       await addFriend(hash, nick || undefined);
-      flash(m.friends_added({ name: nick || hash.slice(0, 8) + '\u2026' }));
+      flash(m.friends_added({ name: nick || (canonicalHash ?? hash).slice(0, 8) + '\u2026' }));
       newHash = '';
       newNickname = '';
       showAddForm = false;
+      await reloadFriendRequests();
       await loadFriends();
     } catch (e: unknown) {
       addError = toErr(e);
@@ -654,6 +662,7 @@
       // open would show a session for someone who is no longer in
       // the user's friend list and silently fail to send.
       removeChatForFriend(f.user_hash);
+      clearFileOffersForFriend(f.user_hash);
       flash(m.friends_removed({ name: f.nickname || f.user_hash.slice(0, 8) + '\u2026' }));
       await loadFriends();
     } catch (e: unknown) {
@@ -974,12 +983,12 @@
             </div>
             <div class="request-actions">
               <button
-                class="req-accept"
+                class="request-accept"
                 disabled={acceptingOffer !== null}
                 onclick={() => acceptOffer(offer)}
               >{m.friends_offer_download()}</button>
               <button
-                class="req-reject"
+                class="request-reject"
                 disabled={acceptingOffer !== null}
                 onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
               >{m.common_dismiss()}</button>
@@ -1171,7 +1180,7 @@
     -->
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
       {@const presence = friendPresence(f)}
-      {@const unread = unreadCounts.get(f.user_hash) ?? 0}
+      {@const unread = unreadCounts.get(f.user_hash.toLowerCase()) ?? 0}
       {@const searching = searchingFriends.has(f.user_hash) || reconnectingFriends.has(f.user_hash)}
       {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
       {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
@@ -1243,8 +1252,10 @@
             class="chat-btn"
             class:has-unread={unread > 0}
             onclick={() => openChat(f)}
-            disabled={!f.mutual}
-            title={f.mutual ? (isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()) : m.friends_action_waiting_accept()}
+            disabled={chatDisabled}
+            title={chatDisabled
+              ? m.settings_friend_chat_disabled()
+              : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 3h12v8H5l-3 3z"/>
@@ -1266,10 +1277,8 @@
                 type="button"
                 role="menuitem"
                 onclick={(e) => { closeCardMenu(e.currentTarget); openBrowse(f); }}
-                disabled={!f.mutual || !isOnline || browseDisabled}
-                title={browseDisabled
-                  ? m.settings_friend_browse_disabled()
-                  : !f.mutual
+                disabled={!f.mutual || !isOnline}
+                title={!f.mutual
                   ? m.friends_action_waiting_accept()
                   : isOnline
                     ? m.friends_action_browse_files()

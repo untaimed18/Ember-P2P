@@ -31,6 +31,11 @@ pub fn set_global_preview_priority(enabled: bool) {
 
 pub struct TransferControl {
     cancelled: AtomicBool,
+    /// Set only when this transfer's `.part` is about to be deleted (Cancel /
+    /// Remove from List), never on Pause or Stop. Handed to the part-file
+    /// writer so it can drop its handle without the trailing fsync — see
+    /// [`TransferControl::discard`].
+    discarding: Arc<AtomicBool>,
     paused: AtomicBool,
     cancel_notify: tokio::sync::Notify,
     pause_notify: tokio::sync::Notify,
@@ -58,6 +63,7 @@ impl TransferControl {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
+            discarding: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
             cancel_notify: tokio::sync::Notify::new(),
             pause_notify: tokio::sync::Notify::new(),
@@ -87,6 +93,24 @@ impl TransferControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cancel *and* mark this transfer's `.part` as about to be deleted.
+    ///
+    /// Only for Cancel and Remove-from-List. Pause and Stop must use
+    /// [`TransferControl::cancel`]: they keep the `.part` and its `.part.met`
+    /// for resume, so the writer still has to drain its queue and fsync.
+    /// Discarding skips both, which is what lets Windows delete the file
+    /// instead of failing on a handle held open by a multi-GB fsync.
+    pub fn discard(&self) {
+        self.discarding.store(true, Ordering::Release);
+        self.cancel();
+    }
+
+    /// Clone of the discard flag for the part-file writer, which runs on a
+    /// std thread and cannot await `wait_cancelled`.
+    pub fn discarding_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.discarding)
     }
 
     /// Resolves as soon as the control is cancelled. Used by network tasks

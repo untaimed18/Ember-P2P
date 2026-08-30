@@ -2,7 +2,7 @@
   import * as m from '$lib/paraglide/messages';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { inertBackground } from '$lib/a11y';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
   // Defaults route through the translated catalog so callers that
   // omit `title`/`confirmLabel`/`cancelLabel` get a localized
   // dialog. Svelte 5 evaluates destructuring defaults at instance
@@ -97,21 +97,7 @@
       handleConfirm();
       return;
     }
-    if (e.key === 'Tab' && dialogEl) {
-      const focusable = dialogEl.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
+    trapTabKey(e, dialogEl);
   }
 
   function handleOverlayClick(e: MouseEvent) {

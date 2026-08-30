@@ -1095,11 +1095,12 @@ impl EmberDht {
         )
     }
 
-    /// Drop keyword and source records we ourselves published for `file_hash`.
-    /// Used when a file is restricted to friends after it already went out.
-    pub fn drop_own_file_records(&mut self, file_hash: &[u8; 16]) -> usize {
+    /// Drop keyword and source records we ourselves published for any of
+    /// `file_hashes`. Used when files stop being publicly listable — unshared,
+    /// deleted, or restricted to friends after they already went out.
+    pub fn drop_own_file_records(&mut self, file_hashes: &HashSet<[u8; 16]>) -> usize {
         let publisher = self.signing_key.verifying_key().to_bytes();
-        self.store.drop_publisher_file(&publisher, file_hash)
+        self.store.drop_publisher_files(&publisher, file_hashes)
     }
 
     /// Remember that we just `PROXY_STORE`d for `publisher`, so a later

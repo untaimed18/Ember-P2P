@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -47,6 +48,46 @@ static SAVE_PATH_GUARDS: OnceLock<
     parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>,
 > = OnceLock::new();
 
+/// Paths whose `.part.met` must not be rewritten. Cancel/remove delete the
+/// sidecar, but a `save_snapshot_async` already in `spawn_blocking` cannot be
+/// aborted and would otherwise recreate the file after cleanup.
+///
+/// A tombstone only has to outlive the queued saves for its own path, which
+/// resolve in seconds, so the set is a bounded FIFO rather than a map that
+/// grows by one entry per cancelled or completed download for the process
+/// lifetime (the same reason [`evict_save_path_guard`] exists). Temp sidecars
+/// are named after a per-transfer UUID and never reused, so an evicted
+/// tombstone can never suppress a later, unrelated save.
+static SUPPRESSED_MET_SAVES: OnceLock<parking_lot::Mutex<SuppressedMetSaves>> = OnceLock::new();
+
+/// Retained tombstones. Two orders of magnitude more than the in-flight saves
+/// a single batch cancel (`MAX_BATCH_TRANSFER_IDS`) can leave behind.
+const MAX_SUPPRESSED_MET_SAVES: usize = 4096;
+
+#[derive(Default)]
+struct SuppressedMetSaves {
+    paths: HashSet<PathBuf>,
+    order: std::collections::VecDeque<PathBuf>,
+}
+
+impl SuppressedMetSaves {
+    fn insert(&mut self, path: &Path) {
+        if !self.paths.insert(path.to_path_buf()) {
+            return;
+        }
+        self.order.push_back(path.to_path_buf());
+        while self.order.len() > MAX_SUPPRESSED_MET_SAVES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.paths.remove(&evicted);
+            }
+        }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path)
+    }
+}
+
 fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
     let mut guards = SAVE_PATH_GUARDS
         .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -55,6 +96,33 @@ fn save_path_guard(path: &Path) -> Arc<parking_lot::Mutex<()>> {
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
         .clone()
+}
+
+fn suppressed_met_saves() -> &'static parking_lot::Mutex<SuppressedMetSaves> {
+    SUPPRESSED_MET_SAVES.get_or_init(|| parking_lot::Mutex::new(SuppressedMetSaves::default()))
+}
+
+fn is_met_save_suppressed(path: &Path) -> bool {
+    suppressed_met_saves().lock().contains(path)
+}
+
+/// Mark this sidecar so in-flight `save_snapshot_async` tasks bail instead of
+/// recreating it after cancel. Cheap enough for the network loop: it does not
+/// wait on a writer that already passed its check. [`suppress_met_saves`]
+/// additionally takes the per-path save lock so cleanup can delete afterward.
+pub fn mark_met_saves_suppressed(met_path: &Path) {
+    suppressed_met_saves().lock().insert(met_path);
+}
+
+/// Block any in-flight or future `.part.met` writer for this path.
+///
+/// Call this *before* deleting the sidecar on cancel. Taking the per-path
+/// save lock afterward waits out a writer that already passed its
+/// suppression check, so cleanup can then remove the file it just wrote.
+pub fn suppress_met_saves(met_path: &Path) {
+    mark_met_saves_suppressed(met_path);
+    let path_guard = save_path_guard(met_path);
+    drop(path_guard.lock());
 }
 
 /// Drop the per-path guard once its `.part.met` is deleted, or the map grows
@@ -609,6 +677,9 @@ impl PartTracker {
 
     pub fn save(&self) {
         tracing::trace!("Saving part tracker: {} gaps", self.gap_list().len());
+        if is_met_save_suppressed(&self.met_path) {
+            return;
+        }
         if let Err(e) = self.save_emule_format() {
             tracing::warn!("Failed to save part.met: {e}");
         }
@@ -647,6 +718,9 @@ impl PartTracker {
 
     /// Save in eMule-compatible .part.met format.
     fn save_emule_format(&self) -> anyhow::Result<()> {
+        if is_met_save_suppressed(&self.met_path) {
+            return Ok(());
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(512);
         {
             let mut cur = std::io::Cursor::new(&mut buf);
@@ -1205,6 +1279,7 @@ impl PartTracker {
 
     pub fn delete_met(&self, allowed_roots: &[String]) {
         self.save_generation.fetch_add(1, Ordering::AcqRel);
+        suppressed_met_saves().lock().insert(&self.met_path);
         let path_guard = save_path_guard(&self.met_path);
         {
             let _guard = path_guard.lock();
@@ -1236,6 +1311,9 @@ impl SaveSnapshot {
     /// Output bytes are byte-identical to `PartTracker::save_emule_format`
     /// so eMule clients can read our `.part.met` on resume.
     pub fn write_to_disk(&self) -> anyhow::Result<()> {
+        if is_met_save_suppressed(&self.met_path) {
+            return Ok(());
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(512);
         {
             let mut cur = std::io::Cursor::new(&mut buf);
@@ -1325,6 +1403,9 @@ pub async fn save_snapshot_async(snap: SaveSnapshot) {
     if let Err(join_err) = tokio::task::spawn_blocking(move || {
         let path_guard = save_path_guard(&snap.met_path);
         let _write_guard = path_guard.lock();
+        if is_met_save_suppressed(&snap.met_path) {
+            return;
+        }
         if snap.save_generation.load(Ordering::Acquire) != snap.generation {
             return;
         }
@@ -2034,5 +2115,29 @@ mod tests {
         assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16]]);
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// Cancel deletes `.part.met` while a `spawn_blocking` save may still be
+    /// running. Without a path-level tombstone that save recreates the sidecar
+    /// after cleanup, which is the lingering `.part.met` after cancel.
+    #[test]
+    fn suppress_met_saves_drops_a_queued_snapshot() {
+        let part_path = temp_part_path("cancel-tombstone");
+        let met_path = part_path.with_extension("part.met");
+        let mut tracker = PartTracker::new(100, &part_path);
+        tracker.set_file_hash([0xAB; 16]);
+        tracker.fill_range(0, 40);
+        let snap = tracker.snapshot_for_save();
+        assert!(!met_path.exists());
+
+        suppress_met_saves(&met_path);
+        snap.write_to_disk().unwrap();
+        tracker.save();
+        assert!(
+            !met_path.exists(),
+            "a cancelled download must not recreate .part.met after suppress"
+        );
+
+        let _ = std::fs::remove_file(&met_path);
     }
 }

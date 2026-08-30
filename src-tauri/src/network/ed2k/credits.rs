@@ -408,7 +408,24 @@ impl CreditManager {
         // corrupt paths below do.
         let existing = match std::fs::read(&key_path) {
             Ok(raw) => Some(raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The recover above restores a parked backup whenever the
+                // destination is absent, so one still sitting here means that
+                // restore failed. The keypair exists and is only unreachable,
+                // which is the unreadable case below rather than a first run.
+                if crate::security::interrupted_replace_backup_exists(&key_path) {
+                    tracing::error!(
+                        "cryptkey.dat is missing but an interrupted replace parked a copy that \
+                         could not be restored; leaving SecIdent disabled this session and NOT \
+                         regenerating (restore cryptkey.dat.ember-replace-bak to recover the \
+                         keypair and the credits peers hold against it)"
+                    );
+                    self.crypto_available = false;
+                    self.crypto_unreadable = true;
+                    return;
+                }
+                None
+            }
             Err(e) => {
                 tracing::error!(
                     "cryptkey.dat exists but could not be read ({e}); leaving SecIdent \

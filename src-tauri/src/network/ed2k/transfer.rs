@@ -543,6 +543,7 @@ pub enum DownloadEvent {
     /// Incoming friend request from an Ember peer on a download connection.
     EmberFriendRequest {
         ember_hash: [u8; 16],
+        pubkey: Option<[u8; 32]>,
         nickname: String,
         peer_ip: String,
         peer_port: u16,
@@ -2257,9 +2258,13 @@ impl Ed2kDownload {
                         let _ = event_tx
                             .send(DownloadEvent::EmberFriendRequest {
                                 ember_hash: eh,
+                                pubkey: peer_ember_pubkey,
                                 nickname: nick,
                                 peer_ip: self.source_addr.ip().to_string(),
-                                peer_port: self.source_addr.port(),
+                                peer_port: super::advertised_listen_port(
+                                    initial_caps.tcp_port,
+                                    self.source_addr.port(),
+                                ),
                                 verified,
                             })
                             .await;
@@ -2968,9 +2973,13 @@ impl Ed2kDownload {
                         let _ = event_tx
                             .send(DownloadEvent::EmberFriendRequest {
                                 ember_hash: eh,
+                                pubkey: peer_ember_pubkey,
                                 nickname: nick,
                                 peer_ip: self.source_addr.ip().to_string(),
-                                peer_port: self.source_addr.port(),
+                                peer_port: super::advertised_listen_port(
+                                    initial_caps.tcp_port,
+                                    self.source_addr.port(),
+                                ),
                                 verified,
                             })
                             .await;
@@ -3935,6 +3944,7 @@ impl Ed2kDownload {
                     truncate_existing: !resuming,
                 },
                 allowed_roots.clone(),
+                Some(self.control.discarding_flag()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
@@ -4840,9 +4850,13 @@ impl Ed2kDownload {
                                 let _ = event_tx
                                     .send(DownloadEvent::EmberFriendRequest {
                                         ember_hash: eh,
+                                        pubkey: peer_ember_pubkey,
                                         nickname: nick,
                                         peer_ip: self.source_addr.ip().to_string(),
-                                        peer_port: self.source_addr.port(),
+                                        peer_port: super::advertised_listen_port(
+                                            initial_caps.tcp_port,
+                                            self.source_addr.port(),
+                                        ),
                                         verified,
                                     })
                                     .await;

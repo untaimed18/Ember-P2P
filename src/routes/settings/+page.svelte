@@ -45,7 +45,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatSize, shortPubkey } from '$lib/utils';
+  import { formatSize, formatSpeed, shortPubkey } from '$lib/utils';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
@@ -458,11 +458,6 @@
     settings.max_download_speed = speedResult.recommended_download_limit;
   }
 
-  function formatSpeed(bytesPerSec: number): string {
-    if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-    if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-    return `${bytesPerSec} B/s`;
-  }
   let downloadingFilter = $state(false);
   let filterResult: string | null = $state(null);
   let filterResultWarning = $state(false);

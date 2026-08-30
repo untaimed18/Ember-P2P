@@ -14,7 +14,7 @@
 //! `maybe_publish_ember_sources`). Those need the live state and stay in the
 //! parent module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ember;
 use super::EMBER_SEARCH_QUEUED_QUERY_TIMEOUT;
@@ -437,6 +437,33 @@ impl EmberBatchPublisher {
         dropped
     }
 
+    /// Drop queued records for any of `file_hashes`, returning how many were
+    /// removed.
+    ///
+    /// A file retracted between selection and flush would otherwise still be
+    /// published: the tick that picked it up has already signed its records, and
+    /// the flush re-checks nothing about the file. Batches already handed to the
+    /// transport are past recall and are left alone — their acks resolve against
+    /// a schedule the retraction has cleared, so they place nothing.
+    ///
+    /// Set-at-a-time for the same reason as
+    /// [`ember::dht::store::DhtStore::drop_publisher_files`]: the callers are
+    /// bulk unshare and folder removal, and this walks every queued record.
+    pub(crate) fn drop_files(&mut self, file_hashes: &HashSet<[u8; 16]>) -> usize {
+        if file_hashes.is_empty() {
+            return 0;
+        }
+        let mut dropped = 0usize;
+        self.queued.retain(|_, (_, records)| {
+            let before = records.len();
+            records.retain(|queued| !file_hashes.contains(&queued.reference.file_hash));
+            dropped += before - records.len();
+            !records.is_empty()
+        });
+        self.queued_count = self.queued_count.saturating_sub(dropped);
+        dropped
+    }
+
     /// Records this peer may still be sent this minute.
     pub(crate) fn record_allowance(
         &mut self,
@@ -484,5 +511,125 @@ impl EmberBatchPublisher {
         self.queued_count = 0;
         self.in_flight.clear();
         self.sent_window.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact(id: u8) -> ember::dht::EmberContact {
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, id);
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([id; 16]),
+            addr: std::net::SocketAddr::from((ip, 4672u16)),
+            noise_pub: [id; 32],
+            ed25519_pub: [id; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        }
+    }
+
+    fn reference(file: u8, kind: EmberPublishKind, key: u8) -> EmberRecordRef {
+        EmberRecordRef {
+            file_hash: [file; 16],
+            kind,
+            key: [key; 16],
+        }
+    }
+
+    fn record(key: u8) -> ember::dht::messages::BatchedRecord {
+        ember::dht::messages::BatchedRecord {
+            key: [key; 16],
+            record: vec![0x01; 64],
+            record_signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn drop_file_removes_only_that_file_and_keeps_the_count_honest() {
+        let mut publisher = EmberBatchPublisher::default();
+        let targets = [contact(1), contact(2)];
+        assert!(publisher.enqueue(
+            &targets,
+            reference(0xAA, EmberPublishKind::Keyword, 0x11),
+            record(0x11)
+        ));
+        assert!(publisher.enqueue(
+            &targets,
+            reference(0xAA, EmberPublishKind::Source, 0x22),
+            record(0x22)
+        ));
+        assert!(publisher.enqueue(
+            &targets,
+            reference(0xBB, EmberPublishKind::Keyword, 0x33),
+            record(0x33)
+        ));
+        assert_eq!(publisher.queued_count, 6);
+
+        // Both kinds go, across every destination the fan-out reached.
+        assert_eq!(publisher.drop_files(&HashSet::from([[0xAA; 16]])), 4);
+        assert_eq!(publisher.queued_count, 2);
+        assert!(publisher
+            .queued
+            .values()
+            .flat_map(|(_, records)| records)
+            .all(|queued| queued.reference.file_hash == [0xBB; 16]));
+
+        // The surviving file is still outstanding, so a refusal from one replica
+        // must not retire it.
+        assert!(publisher.record_still_outstanding(reference(
+            0xBB,
+            EmberPublishKind::Keyword,
+            0x33
+        )));
+        assert!(!publisher.record_still_outstanding(reference(
+            0xAA,
+            EmberPublishKind::Keyword,
+            0x11
+        )));
+    }
+
+    #[test]
+    fn drop_files_prunes_destinations_left_empty() {
+        let mut publisher = EmberBatchPublisher::default();
+        assert!(publisher.enqueue(
+            &[contact(7)],
+            reference(0xCC, EmberPublishKind::Source, 0x44),
+            record(0x44)
+        ));
+        assert_eq!(publisher.drop_files(&HashSet::from([[0xCC; 16]])), 1);
+        assert!(
+            publisher.queued.is_empty(),
+            "a destination holding nothing must not stay in the map"
+        );
+        assert_eq!(publisher.queued_count, 0);
+        // Retracting a file we never queued is a no-op, not an underflow.
+        assert_eq!(publisher.drop_files(&HashSet::from([[0xCC; 16]])), 0);
+        assert_eq!(publisher.queued_count, 0);
+        assert_eq!(publisher.drop_files(&HashSet::new()), 0);
+    }
+
+    #[test]
+    fn drop_files_clears_a_whole_bulk_unshare_in_one_pass() {
+        let mut publisher = EmberBatchPublisher::default();
+        let targets = [contact(3), contact(4)];
+        for file in 0u8..8 {
+            assert!(publisher.enqueue(
+                &targets,
+                reference(file, EmberPublishKind::Keyword, file),
+                record(file)
+            ));
+        }
+        assert_eq!(publisher.queued_count, 16);
+
+        let gone: HashSet<[u8; 16]> = (0u8..6).map(|file| [file; 16]).collect();
+        assert_eq!(publisher.drop_files(&gone), 12);
+        assert_eq!(publisher.queued_count, 4);
+        assert!(publisher
+            .queued
+            .values()
+            .flat_map(|(_, records)| records)
+            .all(|queued| !gone.contains(&queued.reference.file_hash)));
     }
 }

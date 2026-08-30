@@ -1223,7 +1223,7 @@ pub struct AppSettings {
     /// Disable incoming chat messages from friends
     #[serde(default)]
     pub friend_chat_disabled: bool,
-    /// Disable browse-shares responses to friends
+    /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
     /// Maximum number of friends allowed (1–500, default 200)

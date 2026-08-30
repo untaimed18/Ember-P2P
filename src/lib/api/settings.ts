@@ -147,3 +147,16 @@ export type EmberShareTarget =
 export async function openEmberShare(target: EmberShareTarget, text: string): Promise<void> {
   return invoke('open_ember_share', { target, text });
 }
+
+/**
+ * Open a link found in a message, in the default browser.
+ *
+ * Unlike every other opener here this one takes a URL, because the URL is
+ * whatever somebody typed into a room. The backend allows only `http` and
+ * `https` and refuses embedded credentials, control characters and bidi
+ * overrides; callers are still expected to confirm the destination with the
+ * user first, because a link and where it goes are different things.
+ */
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke('open_external_url', { url });
+}

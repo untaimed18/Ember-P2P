@@ -13,6 +13,7 @@
     appendSearchResults,
     clearPendingSearchResults,
     closeSearchTab,
+    flushPendingSearchResults,
     newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
@@ -30,6 +31,10 @@
   import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import IconX from '$lib/components/IconX.svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
   import {
     translateError,
@@ -45,9 +50,9 @@
    * is already in `searchTimeouts`. */
   const searchInvokeSettled = new Set<number>();
 
-  /// Upper bound on a search query length sent over IPC. ed2k keywords are
-  /// short; this just guards against pathologically long pasted input.
-  const MAX_SEARCH_QUERY_LEN = 256;
+  /// Upper bound on a search query length sent over IPC. Matches
+  /// `MAX_SEARCH_QUERY_LEN` in commands/search.rs (1024 bytes for ASCII).
+  const MAX_SEARCH_QUERY_LEN = 1024;
 
   let searchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
@@ -866,8 +871,30 @@
     switch (phase) {
       case 'Lookup': return m.search_phase_lookup();
       case 'Fetch': return m.search_phase_fetch();
+      case 'KadNoContacts': return m.search_phase_kad_no_contacts();
+      case 'KadBusy': return m.search_phase_kad_busy();
       default: return null;
     }
+  }
+
+  function queryHasNetworkKeyword(q: string): boolean {
+    // Same 3-byte floor as eD2K keyword indexing (UTF-8), so a 1–2 character
+    // CJK token is still a valid KAD/Ember key.
+    const encoder = new TextEncoder();
+    return q.split(/[\s()[\]{}<>,._\-!?:;\\/"']+/).some((t) => t && encoder.encode(t).length >= 3);
+  }
+
+  function explainBatchFromTab(): { batchFileHashes: string[]; batchFileNames: string[] } {
+    const tab = activeTab;
+    const rows = (tab?.results ?? []).filter((r) => r.file.hash).slice(0, 256);
+    return {
+      batchFileHashes: rows.map((r) => r.file.hash),
+      // Wire names, not `displayName`. The batch heuristics key on a normalized
+      // filename, and `clean_name` has already collapsed dots/underscores and
+      // title-cased, which would fold genuinely different names onto one key and
+      // invent same-name/many-hashes collisions.
+      batchFileNames: rows.map((r) => r.file.name),
+    };
   }
 
   function spamProfileLabel(profile: string): string {
@@ -1339,7 +1366,10 @@
   // Kad-only: short grace (oneshot ≈ search end). Global/server: TCP/UDP can
   // still stream for ~90s+ after the invoke returns.
   const SEARCH_COMPLETE_GRACE_KAD_MS = 5000;
-  const SEARCH_COMPLETE_GRACE_ED2K_MS = 120_000;
+  // UDP global can run queue+90s (~590s). Re-arming this timer on late
+  // results/progress (below) covers a busy stream; the 10min ceiling covers
+  // a sparse tail if search-complete is dropped.
+  const SEARCH_COMPLETE_GRACE_ED2K_MS = 600_000;
 
   function armSearchCompletionFallback(requestId: number, method: SearchMethod) {
     clearSearchTimeoutForRequest(requestId);
@@ -1357,6 +1387,17 @@
       }, graceMs),
     );
   }
+
+  $effect(() => {
+    for (const tab of $searchTabs) {
+      if (!tab.isSearching) continue;
+      if (!searchInvokeSettled.has(tab.requestId)) continue;
+      void tab.results.length;
+      void tab.progress?.results_so_far;
+      void tab.progress?.phase;
+      untrack(() => armSearchCompletionFallback(tab.requestId, tab.method));
+    }
+  });
 
   function shortenTabLabel(s: string, max = 28): string {
     const t = s.trim() || '—';
@@ -1480,6 +1521,10 @@
       minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
     };
     if (!q && !hasSearchFilters(searchFilterSnapshot, searchFileType || undefined)) return;
+    if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
+      addToast('warning', m.search_needs_keyword());
+      return;
+    }
     // Gate by the selected search method — KAD-only needs KAD, server-only
     // needs the eD2K server, Ember-only needs Ember enabled, global needs
     // any of KAD / server / Ember.
@@ -1508,7 +1553,16 @@
       networkAlertOpen = true;
       return;
     }
-    const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    const previousSearching = get(searchTabs).filter((t) => t.isSearching);
+    for (const t of previousSearching) {
+      searchInvokeSettled.add(t.requestId);
+      clearSearchTimeoutForRequest(t.requestId);
+      flushPendingSearchResults(t.requestId);
+    }
+    const { requestId, stoppedOthers } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
+    if (stoppedOthers) {
+      addToast('info', m.search_previous_stopped());
+    }
     selectedResultKey = null;
     notes = [];
     clearChecked();
@@ -1532,7 +1586,7 @@
           // oneshot cannot merge into this tab, keep streamed rows, and
           // only show a timeout error when the tab is still empty.
           searchInvokeSettled.add(requestId);
-          clearPendingSearchResults(requestId);
+          flushPendingSearchResults(requestId);
           patchSearchTabByRequestId(requestId, (tab) => {
             if (!tab.isSearching) return tab;
             return {
@@ -1572,6 +1626,7 @@
       // `search-complete` event can't leave the spinner stuck forever.
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
+      flushPendingSearchResults(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
         return;
       }
@@ -1582,6 +1637,7 @@
     } catch (e: unknown) {
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
+      flushPendingSearchResults(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
       const msg = translateError(e, m.search_failed());
       console.error('Search failed:', e);
@@ -1589,7 +1645,7 @@
         ...tab,
         isSearching: false,
         progress: null,
-        error: msg,
+        error: tab.results.length > 0 ? null : msg,
       }));
       forgetSettledRequest(requestId);
     }
@@ -1620,7 +1676,7 @@
     // tab the user just stopped. Results already shown are kept — this is Stop,
     // not Clear.
     searchInvokeSettled.add(stoppedId);
-    clearPendingSearchResults(stoppedId);
+    flushPendingSearchResults(stoppedId);
     patchSearchTabByRequestId(stoppedId, (tab) => ({
       ...tab,
       requestId: newSearchNonce(),
@@ -1636,7 +1692,66 @@
     searchTabs.update((tabs) => tabs.map((tab) => (tab.id === id ? { ...tab, error: null } : tab)));
   }
 
+  /**
+   * The details dialog.
+   *
+   * It used to be a pane pinned under the results table, which put it below
+   * however many rows the search had returned — so opening it from a row near
+   * the top scrolled the thing you were reading off screen, and on a long list
+   * you could not tell it had opened at all. As a modal it appears where the
+   * user is looking, and the background is inert while it is up.
+   */
+  /** The query bar, so the `/` shortcut can hand it focus. */
+  let searchBar: SearchBar | undefined = $state();
+  let detailsOverlayEl: HTMLDivElement | undefined = $state();
+  let detailsModalEl: HTMLDivElement | undefined = $state();
+  let detailsCloseBtn: HTMLButtonElement | undefined = $state();
+  let detailsReturnFocusEl: HTMLElement | null = null;
+
+  function closeFileDetails() {
+    selectedResultKey = null;
+    notesRequestId += 1;
+    loadingNotes = false;
+    spamExplainLoading = false;
+    spamExplainError = null;
+  }
+
+  $effect(() => {
+    if (!detailsOverlayEl) return;
+    return inertBackground(detailsOverlayEl);
+  });
+
+  // Focus the dialog on open, and hand focus back to whatever opened it on
+  // close — usually the filename button in the row, which is where the user
+  // was.
+  $effect(() => {
+    if (!selectedResultKey) return;
+    const raf = requestAnimationFrame(() => detailsCloseBtn?.focus());
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = detailsReturnFocusEl;
+      detailsReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  function handleDetailsKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      // Stopped here so the page-level handler does not also act on it; that
+      // one stays as the fallback for when focus is somehow outside.
+      e.preventDefault();
+      e.stopPropagation();
+      closeFileDetails();
+      return;
+    }
+    trapTabKey(e, detailsModalEl);
+  }
+
   async function showFileDetails(result: SearchResult) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    detailsReturnFocusEl = active instanceof HTMLElement && active !== document.body ? active : null;
     selectedResultKey = resultKey(result);
     loadingNotes = true;
     spamExplainLoading = true;
@@ -1682,11 +1797,14 @@
         }
         const explain = await explainSpamResult(
           result.file.hash,
+          // The raw name the peer sent, which is what the score in the badge was
+          // computed from. Passing the cleaned display name would re-score a
+          // different string and under-report the reasons being explained.
           result.file.name,
           result.file.size,
           result.source_addresses,
           query,
-          explainOpts(result),
+          { ...explainOpts(result), ...explainBatchFromTab() },
         );
         if (!selectedResult || selectedResult.file.hash !== fileHash || requestId !== notesRequestId) return;
         setSpamCache(key, explain);
@@ -1719,11 +1837,12 @@
     try {
       const explain = await explainSpamResult(
         result.file.hash,
+        // Raw wire name — see the sibling call above.
         result.file.name,
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),
-        explainOpts(result),
+        { ...explainOpts(result), ...explainBatchFromTab() },
       );
       setSpamCache(key, explain);
     } catch (e: unknown) {
@@ -1753,13 +1872,22 @@
     // Clamp to the backend's 0..5 integer contract before publishing.
     const rating = Math.max(0, Math.min(5, Math.round(Number(noteRating) || 0)));
     try {
-      publishMessage = await publishNote(
+      const raw = await publishNote(
         selectedResult.file.hash,
         rating,
         noteComment,
+        // The real filename: this is republished to KAD for other clients, so it
+        // has to be the name the file is actually shared under, not the cleaned
+        // one this UI happens to display.
         selectedResult.file.name,
         selectedResult.file.size,
       );
+      publishMessage =
+        raw === 'search_note_publish_queued'
+          ? m.search_note_publish_queued()
+          : raw === 'search_note_publish_started'
+            ? m.search_note_publish_started()
+            : raw;
       publishSuccess = true;
       noteComment = '';
       noteRating = 0;
@@ -1863,9 +1991,14 @@
       const extraSources = primaryAddr
         ? networkAddresses.filter((addr) => addr !== primaryAddr)
         : networkAddresses.slice();
+      // The wire name, not `displayName`. This becomes the name on disk, and
+      // the completed folder is a shared folder by default — so the cleaned
+      // label would be republished to the network, title-cased and with its
+      // dots turned to spaces, under a name no peer searching for the original
+      // would match. `start_download` sanitizes it for the filesystem.
       const res = await startDownload(
         result.file.hash,
-        displayName(result),
+        result.file.name,
         result.file.size,
         peerIp,
         peerPort,
@@ -1930,6 +2063,8 @@
     try {
       await markSpam(
         hash,
+        // Raw wire name: the stored spam entry is matched against names peers
+        // send, which never arrive pre-cleaned.
         result.file.name,
         result.file.size,
         result.source_addresses,
@@ -2171,8 +2306,13 @@
       return;
     }
     try {
+      // The wire name, not `displayName`. `clean_name` is a label: it
+      // url-decodes, turns dots into spaces and title-cases, so a link built
+      // from it advertises a filename no peer will match — the same reason
+      // Publish Note stopped using it. The backend percent-encodes whatever it
+      // is given, so the raw name is safe to hand over.
       const link = await formatEd2kLink(
-        displayName(result),
+        result.file.name,
         result.file.size,
         result.file.hash,
         result.file.ember_file_hash,
@@ -2198,7 +2338,8 @@
     try {
       const text = await formatEd2kLinks(
         targets.map((r) => ({
-          name: displayName(r),
+          // Wire name, as in `copyResultLink` above.
+          name: r.file.name,
           size: r.file.size,
           hash: r.file.hash,
           emberFileHash: r.file.ember_file_hash || undefined,
@@ -2285,9 +2426,10 @@
           const extraSources = primaryAddr
             ? networkAddrs.filter((addr) => addr !== primaryAddr)
             : networkAddrs.slice();
+          // Wire name, as in the single-row download above.
           const res = await startDownload(
             result.file.hash,
-            displayName(result),
+            result.file.name,
             result.file.size,
             peerIp,
             peerPort,
@@ -2422,6 +2564,17 @@
     }
     return;
   }
+  // `/` jumps to the query box, matching the Library page. Ignored while a
+  // field already has focus so it stays a typeable character there, and while a
+  // modifier is held so it cannot shadow a browser or OS shortcut.
+  if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    if (confirmOpen || selectedResult) return;
+    e.preventDefault();
+    searchBar?.focusInput();
+    return;
+  }
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
   // nothing is ticked. Skipped while text is selected or focus is in a field,
   // so the normal copy still works in the query box.
@@ -2442,11 +2595,13 @@
 
 <div class="search-area">
   <SearchBar
+    bind:this={searchBar}
     bind:value={barQuery}
     placeholder={m.search_query_placeholder()}
     onsubmit={handleSearch}
     recentKey="search-recent-queries-v1"
     historyEnabled={$appSettings?.save_search_history ?? true}
+    maxLength={MAX_SEARCH_QUERY_LEN}
   />
   <select class="type-select" bind:value={searchMethod} title={m.search_method_title()}>
     <option value="global">{m.search_method_global()}</option>
@@ -2466,6 +2621,7 @@
     <div class="syntax-popover" role="note">
       {#if searchMethod !== 'ember'}
         <p class="search-syntax-ed2k">{m.search_query_syntax_hint()}</p>
+        <p class="search-syntax-ed2k">{m.search_query_syntax_min_term()}</p>
       {/if}
       {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
         <p class="search-syntax-ember">
@@ -3147,90 +3303,140 @@
       </div>
     {/if}
     {#if selectedResult}
-      <div class="file-details-panel scroll-shadows">
-        <div class="panel-header">
-          <h3>{m.search_file_details()}</h3>
-          <button type="button" class="panel-close" title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
-            <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-              <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
-              <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
-            </svg>
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="modal-overlay"
+        bind:this={detailsOverlayEl}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="file-details-title"
+        tabindex="-1"
+        onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
+        onkeydown={handleDetailsKeydown}
+        transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+      >
+        <div
+          class="modal-content file-details-modal"
+          bind:this={detailsModalEl}
+          transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+        >
+        <div class="modal-header">
+          <span id="file-details-title" class="modal-title">{m.search_file_details()}</span>
+          <button type="button" class="modal-close" bind:this={detailsCloseBtn} title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={closeFileDetails}>
+            <IconX size={15} />
           </button>
         </div>
-        <div class="panel-body">
-          <div class="detail-row"><strong>{m.search_detail_name()}</strong> <bdi dir="auto">{displayName(selectedResult)}</bdi></div>
-          <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
-          <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
-          <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>
-          {#if selectedResult.media}
-            {#if selectedResult.media.duration}
-              <div class="detail-row"><strong>{m.search_detail_duration()}</strong> {formatMediaLength(selectedResult.media.duration)}</div>
-            {/if}
-            {#if selectedResult.media.bitrate}
-              <div class="detail-row"><strong>{m.search_detail_bitrate()}</strong> {m.search_bitrate_value({ kbps: selectedResult.media.bitrate })}</div>
-            {/if}
-            {#if selectedResult.media.codec}
-              <div class="detail-row"><strong>{m.search_detail_codec()}</strong> <bdi dir="auto">{selectedResult.media.codec}</bdi></div>
-            {/if}
-            {#if selectedResult.media.artist}
-              <div class="detail-row"><strong>{m.search_detail_artist()}</strong> <bdi dir="auto">{selectedResult.media.artist}</bdi></div>
-            {/if}
-            {#if selectedResult.media.album}
-              <div class="detail-row"><strong>{m.search_detail_album()}</strong> <bdi dir="auto">{selectedResult.media.album}</bdi></div>
-            {/if}
-            {#if selectedResult.media.title}
-              <div class="detail-row"><strong>{m.search_detail_title()}</strong> <bdi dir="auto">{selectedResult.media.title}</bdi></div>
-            {/if}
-          {/if}
-          <div class="detail-row">
-            <strong>{m.search_detail_spam_score()}</strong>
-            {#if spamExplainLoading}
-              {m.search_evaluating()}
-            {:else if selectedSpam}
-              {selectedSpam.score}/{selectedSpam.threshold}
-              {#if selectedSpam.is_spam}
-                <span class="spam-chip">{m.search_spam_flagged({ profile: selectedSpam.profile })}</span>
-              {:else}
-                <span class="ham-chip">{m.search_spam_not_flagged({ profile: selectedSpam.profile })}</span>
-              {/if}
-            {:else}
-              {selectedResult.spam_rating}
+        <div class="modal-body">
+          <!-- The filename is what the dialog is about, so it leads rather than
+               sitting in the grid as one row among ten. -->
+          <div class="detail-hero">
+            <span class="sr-only">{m.search_detail_name()}</span>
+            <bdi class="detail-hero-name" dir="auto">{displayName(selectedResult)}</bdi>
+            <!-- Cleanup is lossy by design — it drops advertising and tidies
+                 separators — so the name it produces is a label. Shown only when
+                 the two actually differ, which keeps it off most files, and this
+                 is the name the file downloads and reshares under. -->
+            {#if selectedResult.file.name && selectedResult.file.name !== displayName(selectedResult)}
+              <span class="detail-hero-original">
+                {m.search_detail_original_name()}
+                <bdi dir="auto">{selectedResult.file.name}</bdi>
+              </span>
             {/if}
           </div>
-          {#if spamExplainError}
-            <div class="detail-row"><span class="error-msg">{spamExplainError}</span></div>
-          {:else if selectedSpam}
+
+          <dl class="detail-grid">
+            <dt>{m.search_detail_size()}</dt>
+            <dd>{formatSize(selectedResult.file.size)}</dd>
+            <dt>{m.search_detail_hash()}</dt>
+            <dd><code>{selectedResult.file.hash}</code></dd>
+            <dt>{m.search_detail_sources()}</dt>
+            <dd>{selectedResult.availability}</dd>
+            {#if selectedResult.result_origin}
+              <dt>{m.search_hit_origin()}</dt>
+              <dd>{originLabel(selectedResult.result_origin)}</dd>
+            {/if}
+          </dl>
+
+          {#if selectedResult.media}
+            <dl class="detail-grid">
+              {#if selectedResult.media.duration}
+                <dt>{m.search_detail_duration()}</dt>
+                <dd>{formatMediaLength(selectedResult.media.duration)}</dd>
+              {/if}
+              {#if selectedResult.media.bitrate}
+                <dt>{m.search_detail_bitrate()}</dt>
+                <dd>{m.search_bitrate_value({ kbps: selectedResult.media.bitrate })}</dd>
+              {/if}
+              {#if selectedResult.media.codec}
+                <dt>{m.search_detail_codec()}</dt>
+                <dd><bdi dir="auto">{selectedResult.media.codec}</bdi></dd>
+              {/if}
+              {#if selectedResult.media.artist}
+                <dt>{m.search_detail_artist()}</dt>
+                <dd><bdi dir="auto">{selectedResult.media.artist}</bdi></dd>
+              {/if}
+              {#if selectedResult.media.album}
+                <dt>{m.search_detail_album()}</dt>
+                <dd><bdi dir="auto">{selectedResult.media.album}</bdi></dd>
+              {/if}
+              {#if selectedResult.media.title}
+                <dt>{m.search_detail_title()}</dt>
+                <dd><bdi dir="auto">{selectedResult.media.title}</bdi></dd>
+              {/if}
+            </dl>
+          {/if}
+          <div class="detail-section">
             <div class="detail-row">
-              <strong>{m.search_spam_signals()}</strong>
-              <ul class="spam-reasons">
-                {#each spamSignals(selectedSpam) as reason}
-                  <li>{reason}</li>
-                {/each}
-              </ul>
+              <strong>{m.search_detail_spam_score()}</strong>
+              {#if spamExplainLoading}
+                {m.search_evaluating()}
+              {:else if selectedSpam}
+                {selectedSpam.score}/{selectedSpam.threshold}
+                {#if selectedSpam.is_spam}
+                  <span class="spam-chip">{m.search_spam_flagged({ profile: selectedSpam.profile })}</span>
+                {:else}
+                  <span class="ham-chip">{m.search_spam_not_flagged({ profile: selectedSpam.profile })}</span>
+                {/if}
+              {:else}
+                {selectedResult.spam_rating}
+              {/if}
             </div>
-          {/if}
-          {#if selectedResult.result_origin}
-            <div class="detail-row"><strong>{m.search_hit_origin()}</strong> {originLabel(selectedResult.result_origin)}</div>
-          {/if}
-          {#if selectedDlTransfer}
-            <div class="detail-section-dl">
-              <h4>{m.search_download_status()}</h4>
+            {#if spamExplainError}
+              <div class="detail-row"><span class="error-msg">{spamExplainError}</span></div>
+            {:else if selectedSpam}
               <div class="detail-row">
-                <strong>{m.search_status_label()}</strong>
-                <span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span>
+                <strong>{m.search_spam_signals()}</strong>
+                <ul class="spam-reasons">
+                  {#each spamSignals(selectedSpam) as reason}
+                    <li>{reason}</li>
+                  {/each}
+                </ul>
               </div>
-              {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
-                <div class="detail-row"><strong>{m.search_progress_label()}</strong> {m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</div>
-              {/if}
-              {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
-                <div class="detail-row"><strong>{m.search_speed_label()}</strong> {selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</div>
-              {/if}
-              {#if selectedDlTransfer.sources > 0}
-                <div class="detail-row"><strong>{m.search_sources_label()}</strong> {m.search_sources_value({ active: selectedDlTransfer.active_sources || 0, total: selectedDlTransfer.sources })}</div>
-              {/if}
-              {#if selectedDlTransfer.failure_reason || selectedDlTransfer.failure_code}
-                <div class="detail-row"><strong>{m.search_error_label()}</strong> <span class="error-msg">{transferFailureReasonText(selectedDlTransfer.failure_reason, selectedDlTransfer.failure_code)}</span></div>
-              {/if}
+            {/if}
+          </div>
+          {#if selectedDlTransfer}
+            <div class="detail-section">
+              <h4>{m.search_download_status()}</h4>
+              <dl class="detail-grid">
+                <dt>{m.search_status_label()}</dt>
+                <dd><span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
+                {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
+                  <dt>{m.search_progress_label()}</dt>
+                  <dd>{m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</dd>
+                {/if}
+                {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
+                  <dt>{m.search_speed_label()}</dt>
+                  <dd>{selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</dd>
+                {/if}
+                {#if selectedDlTransfer.sources > 0}
+                  <dt>{m.search_sources_label()}</dt>
+                  <dd>{m.search_sources_value({ active: selectedDlTransfer.active_sources || 0, total: selectedDlTransfer.sources })}</dd>
+                {/if}
+                {#if selectedDlTransfer.failure_reason || selectedDlTransfer.failure_code}
+                  <dt>{m.search_error_label()}</dt>
+                  <dd><span class="error-msg">{transferFailureReasonText(selectedDlTransfer.failure_reason, selectedDlTransfer.failure_code)}</span></dd>
+                {/if}
+              </dl>
             </div>
           {/if}
 
@@ -3271,6 +3477,10 @@
               {/if}
             </div>
           </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+        </div>
         </div>
       </div>
     {/if}
@@ -4261,28 +4471,50 @@
     font-size: 13px;
   }
 
-  .file-details-panel {
-    border-top: 1px solid var(--border);
-    background: var(--bg-secondary);
-    max-height: 320px;
-    overflow-y: auto;
-  }
-
-  .panel-header {
+  /* --- File details modal --- */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--overlay-bg);
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-surface);
+    justify-content: center;
+    padding: 24px;
   }
 
-  .panel-header h3 {
-    margin: 0;
+  .modal-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow:
+      inset 0 1px 0 var(--surface-highlight),
+      var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .file-details-modal {
+    width: min(620px, 100%);
+    max-height: min(680px, calc(100vh - 48px));
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .modal-title {
+    font-weight: 600;
     font-size: 14px;
   }
 
-  .panel-close {
+  .modal-close {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4296,16 +4528,82 @@
     color: var(--text-secondary);
     cursor: pointer;
     line-height: 1;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
 
-  .panel-close:hover {
+  .modal-close:hover {
     color: var(--danger);
     border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
     background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
-  .panel-body {
-    padding: 14px 20px;
+  .modal-body {
+    padding: 16px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  /* The filename leads the dialog: it is the one thing the reader came to
+     check, and release names are long enough to need the full width. */
+  .detail-hero {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .detail-hero-name {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .detail-hero-original {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  /* Two columns rather than inline label-then-value: the values line up, so
+     the eye can run down them instead of hunting along each row. */
+  .detail-grid {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 4px 12px;
+    margin: 0 0 12px;
+    font-size: 13px;
+  }
+
+  .detail-grid dt {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .detail-grid dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .detail-grid code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    /* A 32-char hash is the one value worth selecting by hand. */
+    user-select: all;
   }
 
   .detail-row {
@@ -4313,20 +4611,14 @@
     margin-bottom: 6px;
   }
 
-  .detail-row code {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
-  .detail-section-dl {
-    margin-top: 8px;
-    padding-top: 6px;
+  .detail-section {
+    margin-bottom: 12px;
+    padding-top: 12px;
     border-top: 1px solid var(--border);
   }
 
-  .detail-section-dl h4 {
-    margin: 0 0 6px;
+  .detail-section h4 {
+    margin: 0 0 8px;
   }
 
   .spam-chip,
@@ -4730,8 +5022,34 @@
       gap: 8px;
     }
 
-    .file-details-panel {
-      max-height: min(280px, 36vh);
+    /* Full-bleed on a narrow window: a centred card with margins wastes the
+       width release names need. */
+    .modal-overlay {
+      padding: 0;
+      align-items: stretch;
+    }
+
+    .file-details-modal {
+      width: 100%;
+      max-height: 100vh;
+      border: none;
+      border-radius: 0;
+    }
+
+    .detail-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0 0;
+    }
+
+    .detail-grid dt {
+      margin-top: 6px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .modal-overlay,
+    .modal-content {
+      animation: none;
     }
   }
 </style>

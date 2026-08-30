@@ -2060,6 +2060,7 @@ impl MultiSourceDownload {
             part_path.clone(),
             super::write_coordinator::OpenMode::OpenExisting,
             allowed_roots.clone(),
+            Some(self.control.discarding_flag()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
@@ -5389,9 +5390,13 @@ async fn download_parts_from_source(
                     let _ = etx
                         .send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
+                            pubkey: hello_caps.ember_pubkey,
                             nickname: nick,
                             peer_ip: addr.ip().to_string(),
-                            peer_port: addr.port(),
+                            peer_port: super::advertised_listen_port(
+                                hello_caps.tcp_port,
+                                addr.port(),
+                            ),
                             verified,
                         })
                         .await;
@@ -6110,9 +6115,13 @@ async fn download_parts_from_source(
                 let _ = etx
                     .send(DownloadEvent::EmberFriendRequest {
                         ember_hash: eh,
+                        pubkey: hello_caps.ember_pubkey,
                         nickname: nick,
                         peer_ip: addr.ip().to_string(),
-                        peer_port: addr.port(),
+                        peer_port: super::advertised_listen_port(
+                            hello_caps.tcp_port,
+                            addr.port(),
+                        ),
                         verified,
                     })
                     .await;
@@ -7047,6 +7056,7 @@ async fn download_parts_from_source(
             part_path.to_path_buf(),
             super::write_coordinator::OpenMode::OpenExisting,
             allowed,
+            Some(control.discarding_flag()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
@@ -8612,9 +8622,13 @@ async fn download_parts_from_source(
                             let _ = etx
                                 .send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,
+                                    pubkey: hello_caps.ember_pubkey,
                                     nickname: nick,
                                     peer_ip: addr.ip().to_string(),
-                                    peer_port: addr.port(),
+                                    peer_port: super::advertised_listen_port(
+                                        hello_caps.tcp_port,
+                                        addr.port(),
+                                    ),
                                     verified,
                                 })
                                 .await;

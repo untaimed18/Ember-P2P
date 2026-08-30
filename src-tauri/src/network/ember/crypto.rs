@@ -120,8 +120,18 @@ impl Blake3FileHasher {
 /// Streaming BLAKE3 of a file on disk (slice 18). Returns hex for storage
 /// on `FileInfo` / `known.met`.
 pub fn blake3_hash_file_path(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
-    use std::io::Read;
     let mut file = std::fs::File::open(path)?;
+    blake3_hash_open_file(&mut file)
+}
+
+/// Streaming BLAKE3 of a file that is already open, from the start.
+///
+/// The completion paths verify against a handle whose identity has already been
+/// checked, so reopening by path there would hand the check a different file
+/// than the one being finalised.
+pub fn blake3_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<[u8; 32]> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Blake3FileHasher::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {

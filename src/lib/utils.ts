@@ -79,6 +79,22 @@ const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(APP_LOCALE, {
   numeric: 'auto',
   style: 'short',
 });
+const COMPACT_COUNT_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+});
+
+/**
+ * Abbreviate a large count for a narrow column ("12.3K").
+ *
+ * Goes through `Intl` rather than appending `K`/`M` by hand: those suffixes are
+ * English, and a German or Russian reader expects "Tsd." and "тыс." for the same
+ * magnitude. Small numbers come back in full, so this is only ever a shortening.
+ */
+export function formatCompactCount(n: number): string {
+  if (!Number.isFinite(n)) return '\u2014';
+  return COMPACT_COUNT_FORMATTER.format(n);
+}
 
 /** Format a unix timestamp as a short date string. */
 export function formatDate(ts: number): string {
@@ -283,6 +299,147 @@ export function disambiguatedMemberName(
     }
   }
   return nick;
+}
+
+/** One run of message text, or one link found inside it. */
+export interface MessageSegment {
+  text: string;
+  /** Present when this run is a link. Always equal to `text`. */
+  href?: string;
+}
+
+/**
+ * Longest link offered as clickable. Matches `EXTERNAL_URL_MAX` in
+ * `commands/settings.rs`, so the UI never presents something the backend is
+ * certain to refuse.
+ */
+const LINK_MAX_LEN = 2048;
+
+/** Explicit scheme only. `www.` and bare hostnames are deliberately not
+ *  matched: guessing a scheme for a string somebody typed in a room means
+ *  guessing where they meant to send you. */
+const LINK_RE = /https?:\/\/[^\s<>"'`]+/gi;
+
+/** Bidi controls reorder how a host *reads* without changing where it points,
+ *  so a link carrying one is left as plain text rather than made clickable.
+ *  The backend refuses them too; this is what stops the UI offering it. */
+// eslint-disable-next-line no-misleading-character-class
+const BIDI_CONTROL_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+/**
+ * Trailing punctuation that belongs to the sentence rather than to the link.
+ *
+ * "see https://example.com." should not open a URL ending in a full stop.
+ * Brackets are only given back when they are unbalanced, so a Wikipedia link
+ * like `/wiki/Ember_(disambiguation)` keeps its closing parenthesis.
+ */
+function trimTrailingPunctuation(url: string): string {
+  let end = url.length;
+  const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  while (end > 0) {
+    const ch = url[end - 1];
+    if ('.,;:!?"\u2019\u201d'.includes(ch)) {
+      end -= 1;
+      continue;
+    }
+    const opener = closers[ch];
+    if (opener) {
+      const slice = url.slice(0, end);
+      let opens = 0;
+      let closes = 0;
+      for (const c of slice) {
+        if (c === opener) opens += 1;
+        else if (c === ch) closes += 1;
+      }
+      if (closes > opens) {
+        end -= 1;
+        continue;
+      }
+    }
+    break;
+  }
+  return url.slice(0, end);
+}
+
+/**
+ * Split message text into plain runs and links.
+ *
+ * Returns segments rather than markup on purpose: the caller renders each run
+ * as a text node, so nothing a member types can become HTML. A message with no
+ * links yields a single segment, which is the common case and costs one
+ * regex scan.
+ */
+export function linkifyMessage(text: string): MessageSegment[] {
+  if (!text) return [];
+  const segments: MessageSegment[] = [];
+  let cursor = 0;
+  LINK_RE.lastIndex = 0;
+  for (let match = LINK_RE.exec(text); match !== null; match = LINK_RE.exec(text)) {
+    const raw = trimTrailingPunctuation(match[0]);
+    // Everything trimmed off goes back to the following text run, so no
+    // character is ever dropped from what the sender wrote.
+    LINK_RE.lastIndex = match.index + raw.length;
+    const usable = raw.length <= LINK_MAX_LEN && !BIDI_CONTROL_RE.test(raw);
+    if (!usable) continue;
+    if (match.index > cursor) {
+      segments.push({ text: text.slice(cursor, match.index) });
+    }
+    segments.push({ text: raw, href: raw });
+    cursor = match.index + raw.length;
+  }
+  if (cursor < text.length) {
+    segments.push({ text: text.slice(cursor) });
+  }
+  return segments;
+}
+
+/** An `@` the caret is currently sitting inside, in composer text. */
+export interface MentionToken {
+  /** Index of the `@` itself. */
+  start: number;
+  /** What has been typed after it, possibly empty. */
+  query: string;
+}
+
+/**
+ * A channel handle is 2–12 ASCII alphanumerics — no spaces, no punctuation
+ * (`sanitize_channel_username` in `commands/channels.rs`) — so the token under
+ * the caret is unambiguous and an inserted name never needs quoting.
+ *
+ * The `@` has to sit at a word boundary, or an email address would open the
+ * suggestion list on every keystroke.
+ */
+const MENTION_TOKEN_RE = /(^|[^\p{L}\p{N}_])@([A-Za-z0-9]{0,12})$/u;
+
+/** The `@` token the caret is inside, or null when it is not inside one. */
+export function mentionTokenAt(text: string, caret: number): MentionToken | null {
+  const before = text.slice(0, Math.max(0, Math.min(caret, text.length)));
+  const match = MENTION_TOKEN_RE.exec(before);
+  if (!match) return null;
+  return { start: before.length - match[2].length - 1, query: match[2] };
+}
+
+/**
+ * Replace the `@` token spanning `[start, caret)` with `@name`, and say where
+ * the caret should land.
+ *
+ * A trailing space unless the next character already is one, so the caret ends
+ * up ready for the rest of the sentence either way rather than glued to the
+ * name or leaving a double space behind.
+ */
+export function insertMention(
+  text: string,
+  start: number,
+  caret: number,
+  name: string,
+): { text: string; caret: number } {
+  const head = text.slice(0, start);
+  const tail = text.slice(caret);
+  const spacer = tail.startsWith(' ') ? '' : ' ';
+  return {
+    text: `${head}@${name}${spacer}${tail}`,
+    caret: head.length + name.length + 1 + spacer.length,
+  };
 }
 
 /** Read text from the clipboard with a DOM fallback for WebView2 / denied permissions. */

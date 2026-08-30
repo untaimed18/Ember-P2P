@@ -50,6 +50,7 @@
     type ChannelMessageInfo,
     type ChannelTransferInfo,
     type GatheredChannelInfo,
+    type GatheredChannelBatch,
   } from '$lib/api/channels';
   import { addFriend } from '$lib/api/friends';
   import {
@@ -69,6 +70,7 @@
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
+    takeStashedChannelSelection,
     toggleChannelMute,
     toggleMemberIgnore,
     channelTransfers,
@@ -91,6 +93,10 @@
   /** True for any Discover walk, including the 60s refresh. The Find button
    *  uses `discovering` so a background walk does not lock the control. */
   let gatherInFlight = $state(false);
+  /** Which walk the shard events arriving now belong to. Random rather than a
+   *  counter: a previous visit's walk can still be emitting after this page has
+   *  remounted, and a counter would have restarted at the same number. */
+  let gatherWalk = '';
   let pendingNotifyEmpty = $state(false);
   let discovered: GatheredChannelInfo[] = $state([]);
   let copyingInvite = $state(false);
@@ -157,6 +163,12 @@
   /** Guards against a superseded query's reply landing last and showing hits
    *  for text the box no longer contains. */
   let searchGen = 0;
+  /** The same guard for the roster, which is re-fetched from several places at
+   *  once: selection, presence gossip, moderation changes, and handoff. */
+  let membersGen = 0;
+  /** This visit followed a previous one on the same session, so whatever the
+   *  user had open — including the directory — is the selection to keep. */
+  let returningToChannels = false;
   /** Members we have a send action in flight for, so the menu item can't be
    *  double-fired while the file is being hashed. */
   let sendingTo = $state<string[]>([]);
@@ -198,7 +210,9 @@
     const who = memberNames[selected.successor_nominee] || shortId(selected.successor_nominee);
     if (selected.can_claim) return m.channels_owner_inactive_now({ name: who });
     if (selected.moderation_updated_at <= 0) return '';
-    const elapsedDays = (presenceNow / 1000 - selected.moderation_updated_at) / 86400;
+    // `presenceNow` is already unix seconds. Dividing it again put the notice
+    // about twenty thousand days in the future, so the banner never appeared.
+    const elapsedDays = (presenceNow - selected.moderation_updated_at) / 86400;
     const left = Math.ceil(selected.claim_after_days - elapsedDays);
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
@@ -209,6 +223,31 @@
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
+  /** Zero for anyone the room exempts, so the composer has one number to read
+   *  rather than a rule to re-derive. */
+  let selectedSlowMode = $derived(
+    selected && !selected.is_owner && !selected.you_are_moderator
+      ? selected.slow_mode_secs
+      : 0,
+  );
+  /**
+   * Handles the composer can complete after `@`.
+   *
+   * Raw nicknames, not `memberNames`: that map carries display labels — "You",
+   * or a disambiguated "Ada (a1b2c3)" — which are right for the roster and
+   * wrong to type into a message. Self and banned members are left out; you do
+   * not address yourself, and naming someone the room has evicted only invites
+   * a reply that will not arrive.
+   */
+  let mentionCandidates = $derived(
+    [
+      ...new Set(
+        members
+          .filter((mem) => !mem.is_self && !mem.banned && mem.nickname.trim().length > 0)
+          .map((mem) => mem.nickname.trim()),
+      ),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
   let memberNames = $derived(
     Object.fromEntries(
       members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
@@ -383,12 +422,31 @@
     return nowSecs - mem.last_seen <= PRESENCE_FRESH_SECS;
   }
 
-  function channelHue(id: string): number {
-    let h = 0;
-    for (let i = 0; i < Math.min(id.length, 8); i++) {
-      h = (h * 33 + id.charCodeAt(i)) % 360;
+  /** Advance one roster row's last_seen from a live chat line without waiting
+   *  for the next presence walk. Presence ingest still owns joins and leaves. */
+  function noteMemberHeard(pubkey: string, at: number) {
+    if (!pubkey || at <= 0) return;
+    const wall = Math.floor(Date.now() / 1000);
+    // Gossip may claim up to five minutes ahead of us. The database clamps
+    // that; without the same cap a future stamp keeps the presence dot on
+    // until wall-clock catches up *plus* the freshness window.
+    const heard = Math.min(at, wall);
+    const key = pubkey.toLowerCase();
+    let changed = false;
+    members = members.map((mem) => {
+      if (mem.member_pubkey.toLowerCase() !== key) return mem;
+      if (heard <= mem.last_seen) return mem;
+      changed = true;
+      return { ...mem, last_seen: heard };
+    });
+    if (changed) presenceNow = wall;
+  }
+
+  function newGatherWalk(): string {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
     }
-    return h;
+    return `w-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   }
 
   function toggleCompose(mode: 'create' | 'join') {
@@ -400,6 +458,7 @@
 
   onMount(() => {
     restoreActiveChannelOnEnter();
+    returningToChannels = takeStashedChannelSelection();
     if (typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
       membersOpen = false;
     }
@@ -417,6 +476,18 @@
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenMembers = fn;
+    });
+    let unlistenChat: UnlistenFn | undefined;
+    listen<{
+      channel_id: string;
+      sender_pubkey?: string;
+      timestamp?: number;
+    }>('ember:channel-message', (event) => {
+      if (event.payload.channel_id !== selectedId) return;
+      noteMemberHeard(event.payload.sender_pubkey ?? '', event.payload.timestamp ?? 0);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenChat = fn;
     });
     let unlistenModeration: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
@@ -458,9 +529,12 @@
     // order the DHT returns them, so the list grows as the walk proceeds instead
     // of appearing all at once when the slowest shard gives up.
     let unlistenFound: UnlistenFn | undefined;
-    listen<GatheredChannelInfo[]>('ember:channels-found', (event) => {
-      if (!gatherInFlight) return;
-      const batch = event.payload ?? [];
+    listen<GatheredChannelBatch>('ember:channels-found', (event) => {
+      // The walk that asked, not merely "a walk is running". Shards from the
+      // previous browse can still land after this one has started, and merging
+      // them showed rooms as freshly found that were a minute stale.
+      if (!gatherInFlight || event.payload?.walk !== gatherWalk) return;
+      const batch = event.payload.channels ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
       for (const item of batch) {
@@ -487,6 +561,7 @@
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
       unlistenMembers?.();
+      unlistenChat?.();
       unlistenModeration?.();
       unlistenHandoff?.();
       unlistenFound?.();
@@ -537,6 +612,10 @@
   async function loadChannels() {
     loading = true;
     error = null;
+    // Consumed here rather than read: a retry after a failed load is a fresh
+    // attempt, and by then opening the newest room is the helpful default again.
+    const returning = returningToChannels;
+    returningToChannels = false;
     try {
       await refreshChannels();
       channelsLoaded = true;
@@ -559,7 +638,13 @@
           editWelcome = ch?.welcome ?? '';
         }
         if (members.length === 0) await refreshMembers(current, true);
-      } else if ($channelsStore.some((c) => c.in_room && !c.deleted) && !deepLinkJoin) {
+      } else if (
+        $channelsStore.some((c) => c.in_room && !c.deleted) &&
+        !deepLinkJoin &&
+        // Not on the way back in. Closing a room to browse the directory is a
+        // choice, and re-opening one over the top of it discarded it.
+        !returning
+      ) {
         const newest = $channelsStore
           .filter((c) => c.in_room && !c.deleted)
           .slice()
@@ -573,25 +658,30 @@
     }
   }
 
-  /** Apply only while `id` is still the open room, so a slow reply from a
-   *  previous selection cannot replace the current roster. */
+  /** Apply only while `id` is still the open room *and* this is still the newest
+   *  request for it, so a slow reply cannot replace the current roster. The room
+   *  check alone was not enough: leaving a room and coming straight back makes
+   *  the stale reply's id match again, and it would land on top of the fresh
+   *  one. Same generation guard the history search uses. */
   async function refreshMembers(id: string, notify = false) {
+    const gen = ++membersGen;
     if (id === selectedId && members.length === 0) {
       membersLoading = true;
       membersError = null;
     }
     try {
       const mems = await listChannelMembers(id);
-      if (id === selectedId) {
+      if (gen === membersGen && id === selectedId) {
         members = mems;
         membersLoading = false;
         membersError = null;
       }
       // Written even when empty: gating on a non-empty roster meant a room
-      // that had emptied kept whatever count it last reported.
+      // that had emptied kept whatever count it last reported. Not generation
+      // gated — it names the room it counted, so a late reply is still true.
       setChannelMemberCount(id, mems.length);
     } catch (e) {
-      if (id === selectedId) {
+      if (gen === membersGen && id === selectedId) {
         membersLoading = false;
         membersError = translateError(e, m.error_operation_failed());
         if (notify) toastError(membersError);
@@ -842,6 +932,7 @@
       return;
     }
     gatherInFlight = true;
+    gatherWalk = newGatherWalk();
     if (notifyEmpty || pendingNotifyEmpty) discovering = true;
     let found: GatheredChannelInfo[] | null = null;
     let err: unknown = null;
@@ -853,7 +944,7 @@
           // A cold cache is the normal first run, not a failure to report.
         }
       }
-      const result = await gatherChannels();
+      const result = await gatherChannels(gatherWalk);
       const prior = new Map(discovered.map((item) => [item.channel_id, item]));
       discovered = result.map((item) =>
         withKnownMemberCount(item, prior.get(item.channel_id)),
@@ -926,16 +1017,20 @@
     const id = forgetTargetId;
     if (!id || forgettingIds.includes(id)) return;
     forgettingIds = [...forgettingIds, id];
-    // Hide first and keep it hidden even if the row will not delete. A public
-    // room is still listed after we drop our copy of it, so this is the half
-    // that actually takes it off the list; the delete below is what clears the
-    // saved messages.
+    // Hide first: a public room is still listed after we drop our copy of it,
+    // so this is the half that actually takes it off the list; the delete
+    // below is what clears the saved messages. The hide must stick after a
+    // successful delete even if the following refresh throws — otherwise
+    // Discover would resurrect the room.
     hideChannel(id);
     forgetChannelMute(id);
+    let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
+      deleted = true;
       await refreshChannels();
     } catch (e) {
+      if (!deleted) unhideChannel(id);
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       forgettingIds = forgettingIds.filter((each) => each !== id);
@@ -971,6 +1066,7 @@
       await claimChannelUsername(usernameDraft.trim());
       usernameDraft = '';
       await loadAppSettings();
+      if (selectedId) void refreshMembers(selectedId);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
     } finally {
@@ -1057,7 +1153,13 @@
   let rotateOpen = $state(false);
   let rotatingKey = $state(false);
   let savingInvitePolicy = $state(false);
+  let inviteOwnerOnly = $state(false);
   let savingSlowMode = $state(false);
+
+  $effect(() => {
+    if (savingInvitePolicy) return;
+    inviteOwnerOnly = selected?.invites_owner_only ?? false;
+  });
 
   function slowModeLabel(secs: number): string {
     if (secs <= 0) return m.channels_slow_mode_off();
@@ -1087,8 +1189,8 @@
     try {
       replaceChannel(await setChannelInvitePolicy(id, ownerOnly));
     } catch (e) {
+      inviteOwnerOnly = !ownerOnly;
       toastError(translateError(e, m.error_operation_failed()));
-      // The switch is bound to the row, so a refresh is what puts it back.
       await refreshChannels().catch(() => {});
     } finally {
       savingInvitePolicy = false;
@@ -1236,26 +1338,6 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       addingFriend = addingFriend.filter((k) => k !== pk);
-    }
-  }
-
-  let copyingMemberId = $state(false);
-
-  async function handleCopyMemberId(mem: ChannelMemberInfo) {
-    if (copyingMemberId) return;
-    copyingMemberId = true;
-    try {
-      await copyMemberIdInner(mem);
-    } finally {
-      copyingMemberId = false;
-    }
-  }
-
-  async function copyMemberIdInner(mem: ChannelMemberInfo) {
-    if (await copyToClipboard(mem.member_pubkey)) {
-      toastSuccess(m.channels_member_id_copied());
-    } else {
-      toastError(m.kad_clipboard_unavailable());
     }
   }
 
@@ -1556,6 +1638,7 @@
     {:else}
       <div
         class="workspace"
+        class:has-members={!!selected}
         class:members-open={membersOpen && !!selected}
         class:list-collapsed={listCollapsed && !!selected}
       >
@@ -1620,11 +1703,10 @@
                     <div
                       class="chan-avatar"
                       class:private={ch.visibility === 'private'}
-                      style="--chan-hue: {channelHue(ch.channel_id)}"
                       aria-hidden="true"
                     >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M4 7h16M4 12h10M4 17h16"/>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
                       </svg>
                       {#if ch.visibility === 'private'}
                         <span class="lock-dot">
@@ -1639,7 +1721,7 @@
                          Public/Private badge are gone: the room is identified
                          by its name, and everything else about it is one click
                          away inside. -->
-                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                    <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
                     {#if memberCount !== null}
                       {@const count = memberCount}
                       <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
@@ -1742,17 +1824,27 @@
               <div
                 class="chan-avatar sm"
                 class:private={selected.visibility === 'private'}
-                style="--chan-hue: {channelHue(selected.channel_id)}"
                 aria-hidden="true"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h16M4 12h10M4 17h16"/>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
                 </svg>
+                {#if selected.visibility === 'private'}
+                  <span class="lock-dot">
+                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
+                      <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
+                    </svg>
+                  </span>
+                {/if}
               </div>
               <div class="conv-heading">
-                <h3><bdi dir="auto">{selected.name}</bdi></h3>
+                <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
                 {#if selected.topic.trim()}
-                  <p class="topic"><bdi dir="auto">{selected.topic}</bdi></p>
+                  <p class="topic has-topic" title={selected.topic}>
+                    <span class="topic-mark" aria-hidden="true">#</span>
+                    <bdi dir="auto">{selected.topic}</bdi>
+                  </p>
                 {:else}
                   <p class="topic">{selected.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</p>
                 {/if}
@@ -1906,7 +1998,7 @@
                 <p class="succession-title">{m.channels_invite_policy_title()}</p>
                 <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
                 <ToggleSwitch
-                  checked={selected.invites_owner_only}
+                  bind:checked={inviteOwnerOnly}
                   label={m.channels_invite_policy_label()}
                   disabled={savingInvitePolicy}
                   onchange={(v) => void handleInvitePolicy(v)}
@@ -2039,9 +2131,12 @@
                     </div>
                     <div class="xfer-actions">
                       {#if t.status === 'awaiting'}
+                        <!-- Accepting while banned pulls room traffic we have no
+                             business receiving, and the backend refuses it.
+                             Declining stays open: that is how the offer clears. -->
                         <button
                           type="button"
-                          disabled={busy}
+                          disabled={busy || selectedBanned}
                           onclick={() => handleRespondTransfer(t.xfer_id, true)}
                         >
                           {m.channels_xfer_accept()}
@@ -2126,9 +2221,11 @@
                 hideHeader
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
+                slowModeSecs={selectedSlowMode}
                 memberNames={memberNames}
                 ignoredSenders={$ignoredMemberKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
+                mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
                 onfocusmissing={() => toast(m.channels_search_too_far())}
               />
@@ -2136,14 +2233,17 @@
           {/if}
         </section>
 
-        {#if selected && membersOpen}
+        {#if selected}
+          <div class="members-slot">
           <button
             class="members-backdrop"
             type="button"
             onclick={() => (membersOpen = false)}
             aria-label={m.channels_hide_members()}
+            tabindex={membersOpen ? 0 : -1}
+            inert={!membersOpen}
           ></button>
-          <aside class="members-pane">
+          <aside class="members-pane" aria-hidden={!membersOpen} inert={!membersOpen}>
             <div class="members-header">
               <span class="members-label">{m.channels_members()}</span>
               <!-- Only once the roster is in hand. Falling back to the stored
@@ -2188,7 +2288,7 @@
                       {/if}
                     </div>
                     <div class="member-identity">
-                      <span class="member-name">
+                      <span class="member-name" title={roomMemberLabel(mem)}>
                         <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
                       </span>
                       <span class="member-badges">
@@ -2225,7 +2325,7 @@
                           <button
                             type="button"
                             role="menuitem"
-                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned}
+                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}</button>
                           <button
@@ -2234,11 +2334,6 @@
                             disabled={addingFriend.includes(mem.member_pubkey)}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
                           >{m.channels_add_friend()}</button>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            onclick={(e) => { closeCardMenu(e.currentTarget); handleCopyMemberId(mem); }}
-                          >{m.channels_copy_member_id()}</button>
                           <button
                             type="button"
                             role="menuitem"
@@ -2298,6 +2393,7 @@
               </ul>
             {/if}
           </aside>
+          </div>
         {/if}
       </div>
     {/if}
@@ -2387,8 +2483,8 @@
   }
 
   .header-actions .ghost.active-toggle {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
   }
 
   .add-btn.primary {
@@ -2568,12 +2664,22 @@
     transition: grid-template-columns var(--transition-slow) ease;
   }
 
+  /* Keep a zero-width members track while a room is open so the roster can
+     ease in and out instead of popping. The list stays 312px either way. */
+  .workspace.has-members {
+    grid-template-columns: 312px minmax(0, 1fr) 0;
+  }
+
   .workspace.members-open {
     grid-template-columns: 312px minmax(0, 1fr) 228px;
   }
 
   .workspace.list-collapsed {
     grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .workspace.list-collapsed.has-members {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
   }
 
   .workspace.list-collapsed.members-open {
@@ -2584,6 +2690,16 @@
      back over it — otherwise the chat sits 10px right of everything above it. */
   .workspace.list-collapsed > .conversation-pane {
     margin-left: -10px;
+  }
+
+  .workspace.has-members:not(.members-open) > .conversation-pane {
+    margin-right: -10px;
+  }
+
+  .conversation-pane {
+    transition:
+      margin-left var(--transition-slow) ease,
+      margin-right var(--transition-slow) ease;
   }
 
   .list-pane {
@@ -2610,6 +2726,39 @@
     flex-direction: column;
     overflow: hidden;
   }
+
+  .members-pane {
+    transition:
+      opacity var(--transition-slow) ease,
+      border-color var(--transition-slow) ease;
+  }
+
+  .workspace.has-members:not(.members-open) .members-pane {
+    opacity: 0;
+    border-color: transparent;
+    pointer-events: none;
+  }
+
+  .members-slot {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .members-slot > .members-pane {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* The room is a nested well, not a third white card. List and members stay
+     `--bg-secondary`; the transcript uses `--bg-tertiary` so white bubbles
+     and the composer have a gray field to sit on. */
+  .conversation-pane { background: var(--bg-tertiary); }
+
+  :global([data-theme="dark"]) .conversation-pane { background: var(--bg-secondary); }
 
   .list-pane { padding: 8px; }
 
@@ -2656,7 +2805,8 @@
     padding: 0;
   }
 
-  .search-clear:hover {
+  .search-clear:hover,
+  .search-clear:focus-visible {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
@@ -2688,6 +2838,7 @@
     border-radius: var(--radius-md);
     /* Anchors the joining sweep below. */
     position: relative;
+    transition: background-color var(--transition-fast) ease;
   }
 
   .chan-row-main {
@@ -2878,34 +3029,46 @@
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
   }
 
-  /* Sized to a one-line row. At 34px it was set by a two-line card and now
-     towers over the single line of text it sits beside. */
+  .chan-row.active::before {
+    content: '';
+    position: absolute;
+    inset-block: 7px;
+    inset-inline-start: 0;
+    width: 2px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+  }
+
+  .chan-row.active .chan-name {
+    color: var(--text-accent);
+  }
+
+  /* Filled accent with a white hash, in the list and the header. A wash
+     disappears against both the room card and the surface bar. */
   .chan-avatar {
     width: 30px;
     height: 30px;
     flex-shrink: 0;
-    border-radius: 50%;
-    background: hsl(var(--chan-hue, 210) 38% 42%);
-    color: #fff;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: var(--on-accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 72%, var(--border));
     display: flex;
     align-items: center;
     justify-content: center;
     position: relative;
   }
 
-  .chan-avatar svg { width: 15px; height: 15px; }
+  .chan-avatar svg { width: 14px; height: 15px; }
   .chan-avatar.sm { width: 28px; height: 28px; }
-  .chan-avatar.sm svg { width: 13px; height: 13px; }
-  .chan-avatar.private {
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, #000 20%, transparent);
-  }
+  .chan-avatar.sm svg { width: 13px; height: 14px; }
 
   /* The only thing on the row that says a room is private, now that the badge
      under the name is gone. */
   .lock-dot {
     position: absolute;
-    bottom: -1px;
-    right: -1px;
+    bottom: -2px;
+    right: -2px;
     width: 13px;
     height: 13px;
     border-radius: 50%;
@@ -2949,8 +3112,6 @@
     color: var(--text-secondary);
   }
 
-  .conversation-pane { background: var(--bg-primary); }
-
   /* Walking into a room hands it the whole workspace: the list collapses to
      nothing and the conversation takes its place. Without this the room lands
      in a single frame while the columns are still sliding, which reads as a
@@ -2970,6 +3131,8 @@
     animation: room-in var(--transition-slow) ease both;
   }
 
+  /* A midpoint between the white panel and the deeper transcript well. It
+     remains distinct in both themes without returning to a white slab. */
   .conv-header {
     display: flex;
     align-items: center;
@@ -2977,26 +3140,65 @@
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
+    box-shadow: var(--shadow-sm);
+    position: relative;
+    z-index: 1;
     flex-shrink: 0;
     flex-wrap: wrap;
   }
 
-  .conv-heading { flex: 1; min-width: 0; }
+  .conv-heading {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+  }
   .conv-heading h3 {
     margin: 0;
     font-size: 14px;
+    font-weight: 650;
+    line-height: 1.2;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .topic {
-    margin: 2px 0 0;
+    margin: 0;
     font-size: 12px;
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .topic.has-topic {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    min-width: 0;
+    padding: 3px 9px 3px 8px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  .topic.has-topic bdi {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topic-mark {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 1;
+    flex-shrink: 0;
   }
 
   .conv-actions {
@@ -3081,13 +3283,24 @@
     align-items: center;
     justify-content: center;
     padding: 0;
+    transition:
+      background-color var(--transition-fast) ease,
+      color var(--transition-fast) ease,
+      transform var(--transition-fast) ease;
   }
 
   .icon-btn:hover,
-  .icon-btn.on {
+  .icon-btn:focus-visible {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
+
+  .icon-btn.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+
+  .icon-btn:active { transform: scale(0.94); }
 
   .icon-btn svg { width: 16px; height: 16px; }
 
@@ -3227,8 +3440,8 @@
 
   .welcome-banner {
     padding: 8px 14px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-surface);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
     font-size: 12px;
     color: var(--text-secondary);
     line-height: 1.45;
@@ -3238,6 +3451,10 @@
   }
 
   .welcome-banner p { margin: 0; }
+
+  :global([data-theme="dark"]) .welcome-banner {
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+  }
 
   .moderation-form {
     display: flex;
@@ -3349,6 +3566,7 @@
     gap: 8px;
     padding: 10px 12px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
     flex-shrink: 0;
   }
 
@@ -3393,6 +3611,15 @@
     gap: 8px;
     padding: 6px 8px;
     border-radius: var(--radius-md);
+    transition: background-color var(--transition-fast) ease;
+  }
+
+  .member-list li:hover {
+    background: var(--bg-hover);
+  }
+
+  .member-list li:focus-within {
+    background: var(--bg-hover);
   }
 
   .member-list li.banned { opacity: 0.65; }
@@ -3407,13 +3634,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    position: relative;
   }
 
   .member-avatar svg { width: 14px; height: 14px; }
-
-  .member-avatar {
-    position: relative;
-  }
 
   .member-avatar.present {
     color: var(--success);
@@ -3450,6 +3674,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 13px;
+    font-weight: 500;
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -3497,6 +3722,11 @@
   .card-more[open] > summary {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  .card-more > summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
 
   .card-more-menu {
@@ -3563,7 +3793,7 @@
 
   .empty-sub {
     font-size: 12px;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     max-width: 360px;
     margin: 0 auto;
     line-height: 1.5;
@@ -3586,14 +3816,32 @@
   .danger { color: var(--danger); }
 
   @media (max-width: 1200px) {
+    .workspace,
+    .workspace.has-members,
     .workspace.members-open {
       grid-template-columns: 312px minmax(0, 1fr);
     }
 
     /* The members pane floats over the chat at this width, so a collapsed list
        leaves just the conversation. */
+    .workspace.list-collapsed,
+    .workspace.list-collapsed.has-members,
     .workspace.list-collapsed.members-open {
       grid-template-columns: 0 minmax(0, 1fr);
+    }
+
+    .workspace.has-members:not(.members-open) > .conversation-pane {
+      margin-right: 0;
+    }
+
+    .members-slot {
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      overflow: visible;
+      pointer-events: none;
+      grid-column: 1 / -1;
+      grid-row: 1;
     }
 
     .members-backdrop {
@@ -3605,6 +3853,14 @@
       padding: 0;
       background: color-mix(in srgb, #000 28%, transparent);
       cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity var(--transition-slow) ease;
+    }
+
+    .workspace.members-open .members-backdrop {
+      opacity: 1;
+      pointer-events: auto;
     }
 
     .members-pane {
@@ -3615,13 +3871,28 @@
       width: min(280px, 90%);
       z-index: 5;
       box-shadow: var(--shadow-panel-left);
+      transform: translateX(12px);
+      opacity: 0;
+      pointer-events: none;
+      transition:
+        transform var(--transition-slow) ease,
+        opacity var(--transition-slow) ease,
+        border-color var(--transition-slow) ease;
+    }
+
+    .workspace.members-open .members-pane {
+      transform: none;
+      opacity: 1;
+      pointer-events: auto;
     }
   }
 
   @media (max-width: 980px) {
     .workspace,
+    .workspace.has-members,
     .workspace.members-open,
     .workspace.list-collapsed,
+    .workspace.list-collapsed.has-members,
     .workspace.list-collapsed.members-open {
       grid-template-columns: 1fr;
     }
@@ -3629,7 +3900,9 @@
     /* One pane at a time here, swapped by `hidden-when-chat`, so the collapse
        has nothing to do and its offset would only misalign the chat. */
     .workspace.list-collapsed > .conversation-pane { margin-left: 0; }
+    .workspace.has-members:not(.members-open) > .conversation-pane { margin-right: 0; }
     .list-toggle { display: none; }
+    .conv-actions-sep { display: none; }
 
     .back-btn {
       display: inline-flex;
@@ -3646,7 +3919,8 @@
       flex-shrink: 0;
     }
 
-    .back-btn:hover { background: var(--bg-hover); }
+    .back-btn:hover,
+    .back-btn:focus-visible { background: var(--bg-hover); }
     .back-btn svg { width: 16px; height: 16px; }
 
     .list-pane.hidden-when-chat { display: none; }

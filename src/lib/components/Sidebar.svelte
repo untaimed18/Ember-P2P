@@ -5,7 +5,7 @@
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import ShareEmberDialog from '$lib/components/ShareEmberDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
-  import { friendRequests } from '$lib/stores/friends';
+  import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import { totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
@@ -135,6 +135,30 @@
   // page. Uses the same friends store the Friends page consumes, so
   // the badge clears the moment the request is accepted/rejected.
   let pendingFriendRequestCount = $derived($friendRequests.length);
+  let pendingFileOfferCount = $derived($fileOffers.length);
+  let pendingFriendInboxCount = $derived(pendingFriendRequestCount + pendingFileOfferCount);
+
+  // Composed from the two singular/plural pairs rather than one combined
+  // message, so "1 pending friend request" never renders as "1 requests" in any
+  // locale. Only the categories that actually have something pending appear.
+  function friendInboxTitle(requests: number, offers: number): string {
+    const parts: string[] = [];
+    if (requests > 0) {
+      parts.push(
+        requests === 1
+          ? m.sidebar_friend_requests_title_one()
+          : m.sidebar_friend_requests_title_other({ count: requests }),
+      );
+    }
+    if (offers > 0) {
+      parts.push(
+        offers === 1
+          ? m.sidebar_friend_offers_title_one()
+          : m.sidebar_friend_offers_title_other({ count: offers }),
+      );
+    }
+    return parts.join(' · ');
+  }
 
   // Sum of unread chat messages across all friends. The Chats toggle
   // surfaces this so users can spot new messages from any page —
@@ -356,13 +380,11 @@
               title={`${downloadsTitle(activeDownloadCount)} · ${uploadsTitle(activeUploadCount)}`}
             >{activeTransferCount}</span>
           {/if}
-          {#if item.id === 'friends' && pendingFriendRequestCount > 0}
+          {#if item.id === 'friends' && pendingFriendInboxCount > 0}
             <span
               class="nav-badge nav-badge-attention"
-              title={pendingFriendRequestCount === 1
-                ? m.sidebar_friend_requests_title_one()
-                : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
-            >{pendingFriendRequestCount}</span>
+              title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
+            >{pendingFriendInboxCount}</span>
           {/if}
           {#if item.id === 'channels' && totalUnreadChannels > 0}
             <span

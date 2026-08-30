@@ -10,7 +10,7 @@
   import * as m from '$lib/paraglide/messages';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { inertBackground } from '$lib/a11y';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
 
   let {
     open = $bindable(false),
@@ -66,21 +66,7 @@
       handleCancel();
       return;
     }
-    if (e.key === 'Tab' && dialogEl) {
-      const focusable = dialogEl.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      );
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
+    trapTabKey(e, dialogEl);
   }
 
   function handleOverlayClick(e: MouseEvent) {

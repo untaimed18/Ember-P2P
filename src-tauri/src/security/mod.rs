@@ -1123,18 +1123,23 @@ pub fn restrict_file_permissions(path: &Path) {
     }
 }
 
-/// Write data to `final_path` atomically: a unique temp file in the same
-/// directory is created, fsynced, then renamed to the destination. On Unix
-/// the parent directory is also fsynced so the rename survives crashes.
-/// When `restrict` is true the temp file is created with 0600 on Unix or
-/// has `restrict_file_permissions` applied on Windows before the rename,
-/// so the final file is never world-readable between creation and chmod.
 /// Where [`atomic_write`]'s Windows replace-fallback parks the existing
 /// destination while it publishes the replacement.
 fn interrupted_replace_backup_path(final_path: &Path) -> std::path::PathBuf {
     let mut name = final_path.file_name().unwrap_or_default().to_os_string();
     name.push(".ember-replace-bak");
     final_path.with_file_name(name)
+}
+
+/// Whether an interrupted atomic replace is still parked beside `final_path`.
+///
+/// [`recover_interrupted_replace`] restores such a backup whenever the
+/// destination is absent, so one that is *still* parked after that call means
+/// the restore itself failed. The file exists; it is merely unreachable right
+/// now. Callers that would otherwise read absence as "first run" must not
+/// mistake that for a fresh profile.
+pub fn interrupted_replace_backup_exists(final_path: &Path) -> bool {
+    interrupted_replace_backup_path(final_path).exists()
 }
 
 /// Restore a destination that a crash left parked by the replace-fallback.
@@ -1170,6 +1175,12 @@ pub fn recover_interrupted_replace(final_path: &Path) {
     }
 }
 
+/// Write data to `final_path` atomically: a unique temp file in the same
+/// directory is created, fsynced, then renamed to the destination. On Unix
+/// the parent directory is also fsynced so the rename survives crashes.
+/// When `restrict` is true the temp file is created with 0600 on Unix or
+/// has `restrict_file_permissions` applied on Windows before the rename,
+/// so the final file is never world-readable between creation and chmod.
 pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::Result<()> {
     use std::io::Write;
 

@@ -133,7 +133,7 @@ const MAX_SOURCE_ADDRS: usize = 500;
 const MAX_PLAUSIBLE_SOURCES: u32 = u16::MAX as u32;
 
 #[inline]
-fn clamp_source_count(count: u32) -> u32 {
+pub fn clamp_source_count(count: u32) -> u32 {
     count.min(MAX_PLAUSIBLE_SOURCES)
 }
 
@@ -360,6 +360,13 @@ mod tests {
         assert_eq!(combine_origin(ORIGIN_EMBER, ""), "Ember");
         assert_eq!(combine_origin("", ORIGIN_EMBER), "Ember");
         assert_eq!(combine_origin(ORIGIN_EMBER, ORIGIN_EMBER), "Ember");
+    }
+
+    #[test]
+    fn clamp_source_count_caps_at_u16_max() {
+        assert_eq!(clamp_source_count(0), 0);
+        assert_eq!(clamp_source_count(MAX_PLAUSIBLE_SOURCES), MAX_PLAUSIBLE_SOURCES);
+        assert_eq!(clamp_source_count(u32::MAX), MAX_PLAUSIBLE_SOURCES);
     }
 
     fn sample(hash: &str, avail: u32, origin: &str) -> SearchResult {

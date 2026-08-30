@@ -477,10 +477,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
             .take(crate::commands::channels::CHANNEL_USERNAME_MAX)
             .collect();
         settings.channel_username =
-            match crate::commands::channels::sanitize_channel_username(&repaired) {
-                Ok(name) => name,
-                Err(_) => String::new(),
-            };
+            crate::commands::channels::sanitize_channel_username(&repaired).unwrap_or_default();
         changed = true;
     }
 
@@ -1053,6 +1050,8 @@ pub async fn update_settings(
             .await?;
         }
     }
+    let username_changed = settings.channel_username != old_settings.channel_username
+        && !settings.channel_username.is_empty();
 
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
@@ -1076,6 +1075,14 @@ pub async fn update_settings(
 
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
+    // The network loop reads UPnP once, at startup, to decide whether to map
+    // ports, renew the lease and tear the mapping down on exit. Reporting this
+    // as applied claimed a live change that never happened: disabling left the
+    // mappings and their renewals running, and enabling did nothing at all.
+    // Restarting is what actually honours the new value, and it is also what
+    // removes the existing mapping, because shutdown tears down on the value it
+    // started with.
+    let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
 
     let save_data = {
         let config = state.config.read().await;
@@ -1160,6 +1167,13 @@ pub async fn update_settings(
         config.settings = settings.clone();
     }
 
+    if username_changed {
+        crate::commands::channels::apply_channel_username_locally(
+            &state,
+            &settings.channel_username,
+        );
+    }
+
     // Keep the synchronous mirror used by the close-event handler in sync
     // with the canonical config so that a behavior change made here takes
     // effect on the very next title-bar X click without restarting.
@@ -1231,7 +1245,7 @@ pub async fn update_settings(
         });
     }
 
-    let outcome = if port_changed {
+    let outcome = if port_changed || upnp_changed {
         SettingsUpdateOutcome::RestartRequired
     } else {
         SettingsUpdateOutcome::Applied
@@ -1741,6 +1755,87 @@ pub fn get_ember_website_url() -> String {
     EMBER_WEBSITE_URL.to_string()
 }
 
+/// Longest link this will hand to the browser. Well past any real URL, and
+/// short enough that a wall of text pasted into a room is not one.
+const EXTERNAL_URL_MAX: usize = 2048;
+
+/// Explicit directional formatting and isolate characters (Unicode Cf).
+const fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Validate a link that came from message text before anything opens it.
+///
+/// Every other opener in this file refuses to take a URL from the renderer at
+/// all — the site is a constant and a share target is a name. This one has to,
+/// because a link in a room is written by whoever is in the room, and that is
+/// the least trusted string in the application. So the rule is an allowlist of
+/// exactly two schemes rather than a denylist of bad ones: `opener::open`
+/// hands anything else to the shell, and on Windows that includes `file:`,
+/// `ms-msdt:` and every other registered protocol handler, which turns a chat
+/// line into local code execution.
+///
+/// Beyond the scheme: a host has to be present (`http:///etc/passwd` parses
+/// but names nobody), embedded credentials are refused because `https://
+/// trusted.example@evil.test` reads as the trusted host to a human, and any
+/// control character or whitespace is refused because those are what smuggle a
+/// second argument or a newline past a shell.
+fn validate_external_url(raw: &str) -> Result<String, String> {
+    let invalid = || {
+        coded(
+            "settings_open_link_invalid",
+            "That link cannot be opened safely",
+        )
+    };
+    if raw.is_empty() || raw.len() > EXTERNAL_URL_MAX {
+        return Err(invalid());
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(invalid());
+    }
+    // Bidi controls are not `is_control` — they are category Cf, not Cc — and
+    // they are the ones that matter here: an override inside a link reorders
+    // how the host *reads* without changing where it points, so the user
+    // confirms one domain and visits another.
+    if raw.chars().any(is_bidi_control) {
+        return Err(invalid());
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| invalid())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid());
+    }
+    if !parsed.has_host() || parsed.host_str().is_none_or(str::is_empty) {
+        return Err(invalid());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid());
+    }
+    // Re-serialised rather than echoed back: what opens is then exactly what
+    // the parser understood, not the original bytes around it.
+    Ok(parsed.to_string())
+}
+
+/// Open a link found in a message, in the default browser.
+///
+/// The renderer asks the user to confirm the destination first — the text of a
+/// link and where it points are different strings, and in a room full of
+/// strangers they will sometimes disagree on purpose. This end does not rely
+/// on that: see [`validate_external_url`].
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    let safe = validate_external_url(&url)?;
+    opener::open(&safe).map_err(|e| {
+        coded_ctx(
+            "settings_open_link_failed",
+            "Failed to open the link",
+            e,
+        )
+    })
+}
+
 /// Where `ember.log` and its rotated copies live.
 ///
 /// Resolved here rather than taken from the renderer, so neither this nor
@@ -1860,6 +1955,65 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link in a room is written by whoever is in the room. `opener::open`
+    /// hands whatever it is given to the shell, so the scheme check is the
+    /// whole defence — on Windows a `file:` or `ms-msdt:` link would otherwise
+    /// turn a chat line into local code execution.
+    #[test]
+    fn only_plain_web_links_from_message_text_are_openable() {
+        assert_eq!(
+            validate_external_url("https://example.com/a?b=c#d").unwrap(),
+            "https://example.com/a?b=c#d"
+        );
+        assert!(validate_external_url("http://example.com").is_ok());
+
+        for hostile in [
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-msdt:/id PCWDiagnostic",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox",
+            "smb://attacker.test/share",
+            "ftp://example.com",
+            // No host to speak of.
+            "https://",
+            // Reads as the trusted host right up to the `@`.
+            "https://accounts.google.com@evil.test/",
+            "https://user:pw@evil.test/",
+            // Whitespace and control bytes are how a second argument or a
+            // newline gets smuggled past a shell.
+            "https://example.com/ two",
+            "https://example.com/\nX",
+            "https://example.com/\u{0}",
+            // Reads as `https://gnp.example.com` with the override applied,
+            // while pointing at `moc.elpmaxe.png`.
+            "https://\u{202E}gnp.elpmaxe.moc\u{202C}/x",
+            "https://example.com/\u{200F}",
+            "",
+        ] {
+            assert!(
+                validate_external_url(hostile).is_err(),
+                "{hostile} must not be openable"
+            );
+        }
+
+        let too_long = format!("https://example.com/{}", "a".repeat(EXTERNAL_URL_MAX));
+        assert!(validate_external_url(&too_long).is_err());
+
+        // Scheme comparison is on the parsed scheme, so case cannot dodge it.
+        assert!(validate_external_url("HTTPS://example.com").is_ok());
+        assert!(validate_external_url("FILE:///etc/passwd").is_err());
+
+        // Three slashes is not an empty host. WHATWG skips the extra one for a
+        // special scheme, so this is an ordinary request to a host called
+        // `etc` rather than a path traversal — pinned so it does not get
+        // "fixed" into the refusal list on the strength of how it reads.
+        assert_eq!(
+            validate_external_url("http:///etc/passwd").unwrap(),
+            "http://etc/passwd"
+        );
+    }
 
     #[test]
     fn ember_share_intents_stay_on_allowlisted_hosts_and_the_official_site() {

@@ -141,20 +141,64 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Cap on local-library hits returned for one query. Network search is
+    /// bounded separately (15k tab rows); this only covers files we share.
+    pub const LOCAL_SEARCH_MAX: usize = 1000;
+
+    /// Boolean name search with no type/size/extension narrowing.
+    #[cfg(test)]
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
+        self.search_with_filters(query, None, None, None, None)
+    }
+
+    /// Boolean name search, plus optional type/size/extension filters.
+    ///
+    /// An empty / unparseable query still scans when a filter is present so
+    /// type- or size-only searches can list matching shared files.
+    pub fn search_with_filters(
+        &self,
+        query: &str,
+        file_type: Option<&str>,
+        min_size: Option<u64>,
+        max_size: Option<u64>,
+        file_extension: Option<&str>,
+    ) -> Vec<SearchResult> {
         // Same boolean grammar as KAD/server (`AND`/`OR`/`NOT`/`-`/quotes).
-        // Token-OR against name_tokens disagreed with network filtering for
-        // the same typed query (e.g. `foo OR bar`, `foo -bar`).
-        let Some(expr) = crate::search::query::parse(query) else {
+        let expr = crate::search::query::parse(query);
+        let has_filters = file_type.is_some_and(|t| !t.is_empty())
+            || file_extension.is_some_and(|e| !e.trim_start_matches('.').is_empty())
+            || min_size.is_some_and(|v| v > 0)
+            || max_size.is_some_and(|v| v > 0);
+        if expr.is_none() && !has_filters {
             return Vec::new();
-        };
-        let positive = expr.positive_terms();
+        }
+        let positive = expr
+            .as_ref()
+            .map(|e| e.positive_terms())
+            .unwrap_or_default();
 
         let mut results: Vec<(usize, u32)> = self
             .files
             .iter()
             .enumerate()
             .filter_map(|(idx, file)| {
+                // Filters first: integer and extension compares are far cheaper
+                // than the per-file `to_lowercase` allocation, and a type- or
+                // size-only search (empty `expr`) now scans the whole library,
+                // so the name never has to be lowered for the rows it rejects.
+                if !local_file_matches_filters(
+                    file,
+                    file_type,
+                    min_size,
+                    max_size,
+                    file_extension,
+                ) {
+                    return None;
+                }
+                let expr = match expr.as_ref() {
+                    None => return Some((idx, 1u32)),
+                    Some(expr) => expr,
+                };
                 let name_lower = file.name.to_lowercase();
                 if !expr.matches(&name_lower) {
                     return None;
@@ -175,27 +219,8 @@ impl LocalIndex {
 
         results
             .into_iter()
-            .take(100)
-            .filter_map(|(idx, _score)| {
-                self.files.get(idx).map(|file| SearchResult {
-                    file: file.clone(),
-                    peer_id: "local".to_string(),
-                    peer_name: "You".to_string(),
-                    availability: 1,
-                    file_type: infer_file_type(&file.extension),
-                    source_addresses: vec!["local".to_string()],
-                    rating: None,
-                    comment: None,
-                    media: None,
-                    spam_rating: 0,
-                    is_spam: false,
-                    clean_name: String::new(),
-                    result_origin: ORIGIN_LOCAL.to_string(),
-                    origin_server_ip: None,
-                    spam_reasons: Vec::new(),
-                    spam_reason_details: Vec::new(),
-                })
-            })
+            .take(Self::LOCAL_SEARCH_MAX)
+            .filter_map(|(idx, _score)| self.files.get(idx).map(file_to_local_result))
             .collect()
     }
 
@@ -1105,8 +1130,69 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Categorize a file by its extension, matching eMule's g_aED2KFileTypes table
-/// from otherfunctions.cpp. Modern formats (webm, opus, svg, etc.) that postdate
-/// eMule are included in the appropriate category.
+fn local_file_matches_filters(
+    file: &FileInfo,
+    file_type: Option<&str>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_extension: Option<&str>,
+) -> bool {
+    if let Some(min) = min_size {
+        if min > 0 && file.size < min {
+            return false;
+        }
+    }
+    if let Some(max) = max_size {
+        if max > 0 && file.size > max {
+            return false;
+        }
+    }
+    if let Some(ext) = file_extension {
+        let want = ext.trim_start_matches('.').to_lowercase();
+        if !want.is_empty() {
+            let got = file.extension.trim_start_matches('.').to_lowercase();
+            if got != want {
+                return false;
+            }
+        }
+    }
+    if let Some(ft) = file_type {
+        if !ft.is_empty() {
+            let inferred = infer_file_type(&file.extension);
+            if inferred != ft {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn file_to_local_result(file: &FileInfo) -> SearchResult {
+    SearchResult {
+        file: file.clone(),
+        peer_id: "local".to_string(),
+        peer_name: "You".to_string(),
+        availability: 1,
+        file_type: infer_file_type(&file.extension),
+        source_addresses: vec!["local".to_string()],
+        rating: None,
+        comment: None,
+        media: None,
+        spam_rating: 0,
+        is_spam: false,
+        clean_name: String::new(),
+        result_origin: ORIGIN_LOCAL.to_string(),
+        origin_server_ip: None,
+        spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
+    }
+}
+
+/// Map a filename extension to the eMule `FT_FILETYPE` search string
+/// (`Audio`, `Video`, `Image`, `Pro`, `Doc`, `Arc`, `Iso`, `EmuleCollection`).
+/// Mirrors eMule `GetED2KFileTypeSearchTerm` / `otherfunctions.cpp`. Modern
+/// formats (webm, opus, svg, etc.) that postdate eMule are included in the
+/// appropriate category.
 pub fn infer_file_type(extension: &str) -> String {
     match extension.to_lowercase().as_str() {
         // Audio -- eMule ED2KFT_AUDIO + modern additions (opus)
@@ -1673,5 +1759,38 @@ mod local_index_tests {
         assert!(index
             .get_by_path("/library/parent/other/pending.bin")
             .is_none());
+    }
+
+    #[test]
+    fn type_only_search_lists_matching_shared_files() {
+        let mut index = LocalIndex::new();
+        let mut song = file("A/track.mp3", &"1".repeat(32), true, "normal");
+        song.extension = "mp3".to_string();
+        song.size = 5_000;
+        let mut movie = file("A/film.mkv", &"2".repeat(32), true, "normal");
+        movie.extension = "mkv".to_string();
+        movie.size = 50_000;
+        index.add_files(vec![song, movie]);
+
+        let audio = index.search_with_filters("", Some("Audio"), None, None, None);
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].file.name, "track.mp3");
+
+        let sized = index.search_with_filters("", None, Some(10_000), None, None);
+        assert_eq!(sized.len(), 1);
+        assert_eq!(sized[0].file.name, "film.mkv");
+    }
+
+    #[test]
+    fn empty_query_without_filters_returns_nothing() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file(
+            "A/track.mp3",
+            &"1".repeat(32),
+            true,
+            "normal",
+        )]);
+        assert!(index.search("").is_empty());
+        assert!(index.search("  ").is_empty());
     }
 }

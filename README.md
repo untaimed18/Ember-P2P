@@ -43,7 +43,7 @@ Ember frames ride the KAD UDP socket (4672 by default) and are told apart by a t
 | Contacts per response | 20 |
 | Contact liveness | 600s timeout, evicted after 3 consecutive unanswered queries |
 | Subnet diversity | 3 per subnet per bucket; global cap scales with table occupancy |
-| Wire version | 2 (`EMBER_DHT_VERSION`, `EMBER_DHT_MIN_VERSION`) |
+| Wire version | 4 (`EMBER_DHT_VERSION`, `EMBER_DHT_MIN_VERSION`) |
 | Persisted contacts | 200 (`nodes_ember.dat`) |
 
 Frames are Ed25519-signed, and a contact counts as verified only once it has answered directly — gossip from `FOUND_NODE` / `PEER_LIST` and entries read back from disk are leads until they reply. The version byte is checked against a *range* rather than a single value, so an incompatible peer is refused cleanly at the version instead of accumulating malformed-frame counters that read like packet loss. A future change that only adds to the format can lower the minimum instead of raising both.
@@ -52,7 +52,7 @@ Frames are Ed25519-signed, and a contact counts as verified only once it has ans
 
 There is no bootstrap server and no bundled address list. A cold node gets in through the following, in rough order of who arrives first:
 
-1. **The KAD rendezvous key** — Ember nodes advertise themselves under one fixed KAD key as an ordinary source record carrying their Noise pubkey tag; a node with a near-empty table runs a plain source lookup there. Re-advertised every 5 hours (matching KAD's source TTL) and only while the node is reachable and already publishing something, so a leecher never generates publish traffic purely to list itself. Lookups are spaced 10 minutes apart and stop once the table reaches one k-bucket.
+1. **The KAD rendezvous key** — Ember nodes advertise themselves under one fixed KAD key as an ordinary source record carrying their Noise pubkey tag; a node with a near-empty table runs a plain source lookup there. Re-advertised every 5 hours (matching KAD's source TTL) while the node is reachable enough to be a useful first contact. Deliberately not gated on sharing anything: this key is the only way a cold node joins, and requiring a library excluded every downloader — a large share of exactly the reachable, long-running nodes that make good first contacts. A firewalled node that cannot be reached directly is still left out. Lookups are spaced 10 minutes apart and stop once the table reaches one k-bucket.
 2. **The KAD bridge** — Ember peers noticed in ordinary KAD traffic get DHT-pinged so their signed `PONG` folds them into the routing table. Rate-capped per maintenance cycle and quiet above a contact threshold.
 3. **eD2K client-to-client sessions** — Peers that advertise the Ember capability bit over a normal eD2K transfer are cached with their UDP port and bridged in, via Noise_XX when no static key is known. This is the path for a client running with no KAD at all.
 4. **DHT gossip and `nodes_ember.dat`** — `FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`, plus up to 200 persisted contacts, once the node has been online before.
@@ -180,7 +180,7 @@ The key must BLAKE3-bind to the hash or the code is rejected at parse time (`ver
 
 ### Discovery
 
-Discovery runs through a lightweight **rendezvous server** ([`rendezvous-server/`](rendezvous-server/)). Ember registers presence under 32-byte *capabilities* derived from the friend relationship rather than under a raw Friend ID, and every register and lookup is Ed25519-signed by the identity that owns it, so an entry cannot be spoofed with a stolen hash alone. Pairwise capabilities rotate on a 15-minute epoch (`PAIRWISE_CAPABILITY_EPOCH_SECS`) and server-side entries expire 5 minutes after the last heartbeat (`ENTRY_TTL`), so nothing stored there is a long-lived identifier. Adding or accepting a friend forces a presence refresh instead of waiting out the normal heartbeat interval.
+Discovery runs through a lightweight **rendezvous server** ([`rendezvous-server/`](rendezvous-server/)). Ember registers presence under 32-byte *capabilities* rather than a raw Friend ID, and every register and lookup is Ed25519-signed by the identity that owns it, so an entry cannot be spoofed with a stolen hash alone. Pairwise capabilities are derived from the friend relationship and ACL-gated to that peer; a separate intro capability (`open_intro`) is derived from the owner's public key plus an epoch, so anyone who already knows the Friend ID / public key can resolve it while it is advertised. Pairwise capabilities rotate on a 15-minute epoch (`PAIRWISE_CAPABILITY_EPOCH_SECS`) and server-side entries expire 5 minutes after the last heartbeat (`ENTRY_TTL`), so nothing stored there is a long-lived identifier. Adding or accepting a friend forces a presence refresh instead of waiting out the normal heartbeat interval.
 
 Between Ember peers, the Ember Hash and its public key are exchanged over the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake. The legacy EmuleInfo tag harvest (`ET_EMBER_HASH`, `0x56`) has been removed — nothing is learned from ordinary eMule metadata any more.
 

@@ -826,6 +826,17 @@
   let uploadQueueFailCount = 0;
   let knownClientsFailCount = 0;
   const LOAD_GIVE_UP_AFTER = 3;
+  /**
+   * Whether the settle above was a give-up rather than a real answer.
+   *
+   * Settling stops the permanent spinner, but on its own it made the table
+   * assert something it does not know: the empty state says "nobody is waiting
+   * in your queue" when what happened is that nothing could be read. Polling
+   * continues either way, so this only changes the copy shown in the meantime —
+   * and clears the moment a request succeeds.
+   */
+  let uploadQueueLoadFailed = $state(false);
+  let knownClientsLoadFailed = $state(false);
 
   async function refreshUploadQueue() {
     const gen = ++uploadQueueGen;
@@ -835,6 +846,7 @@
       uploadQueueClients = data;
       uploadQueueLoaded = true;
       uploadQueueFailCount = 0;
+      uploadQueueLoadFailed = false;
     } catch (e) {
       // Network task may be momentarily busy (try_send full). Leave the
       // last good snapshot in place rather than flashing the table empty.
@@ -842,6 +854,7 @@
       if (!mounted || gen !== uploadQueueGen) return;
       if (!uploadQueueLoaded && ++uploadQueueFailCount >= LOAD_GIVE_UP_AFTER) {
         uploadQueueLoaded = true;
+        uploadQueueLoadFailed = true;
       }
     }
   }
@@ -853,6 +866,7 @@
       knownClients = data;
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
+      knownClientsLoadFailed = false;
       // Force-refresh Trust badges so manual bans / score changes appear
       // without leaving the tab — but only for a bounded slice.
       //
@@ -882,6 +896,7 @@
       if (!mounted || gen !== knownClientsGen) return;
       if (!knownClientsLoaded && ++knownClientsFailCount >= LOAD_GIVE_UP_AFTER) {
         knownClientsLoaded = true;
+        knownClientsLoadFailed = true;
       }
     }
   }
@@ -1341,6 +1356,10 @@
         entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
         entry.lastTransferred = t.transferred;
         entry.lastTime = now;
+      } else if (bytesThisPeriod < 0) {
+        entry.ewma = 0;
+        entry.lastTransferred = t.transferred;
+        entry.lastTime = now;
       } else if (now - entry.lastTime > SPEED_STALE_MS) {
         entry.ewma = 0;
       }
@@ -1356,6 +1375,10 @@
     // local EWMA — which lingers for up to SPEED_STALE_MS (12 s) after bytes
     // stop moving — can't keep painting a stale speed on a row the user just
     // paused or stopped (or one that finished/failed).
+    //
+    // Searching / verifying / hashing are deliberately not here: they are in
+    // `SPEED_DECAY_APPLIES`, so the backend decays their rate towards zero
+    // rather than dropping it, and the row is meant to show that fade.
     if (t.status === 'paused' || t.status === 'stopped' || t.status === 'completed' || t.status === 'failed') {
       return 0;
     }
@@ -3473,7 +3496,7 @@
                 {:else if column.key === 'transferred'}
                   <td class="num-cell">{formatSize(t.transferred)}</td>
                 {:else if column.key === 'completed_size'}
-                  <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
+                  <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                 {:else if column.key === 'speed'}
                   {@const spd = liveSpeed(t)}
                   <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
@@ -3650,7 +3673,7 @@
                   {:else if column.key === 'transferred'}
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'completed_size'}
-                    <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
+                    <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                   {:else if column.key === 'speed'}
                     <td class="num-cell">{'\u2014'}</td>
                   {:else if column.key === 'progress'}
@@ -4045,6 +4068,7 @@
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                   </svg>
                   <p class="empty-cell-title">{m.transfers_empty_no_upload_matches()}</p>
+                  <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
                 </div>
               </td></tr>
             {/if}
@@ -4125,7 +4149,12 @@
             {/each}
             {#if uploadQueueClients.length === 0}
               <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
-                {#if uploadQueueLoaded}
+                {#if uploadQueueLoadFailed}
+                  <div class="empty-cell-body">
+                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
+                  </div>
+                {:else if uploadQueueLoaded}
                   <div class="empty-cell-body">
                     <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="12" cy="12" r="10"></circle>
@@ -4342,6 +4371,11 @@
                   <div class="empty-cell-body">
                     <div class="spinner"></div>
                     <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
+                  </div>
+                {:else if knownClientsLoadFailed && knownLedger.length === 0}
+                  <div class="empty-cell-body">
+                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
                   </div>
                 {:else if knownLedger.length === 0}
                   <div class="empty-cell-body">

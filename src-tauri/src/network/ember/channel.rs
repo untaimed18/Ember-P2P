@@ -45,6 +45,32 @@ pub const INDEX_SHARD_COUNT: u8 = 16;
 pub const PRESENCE_EPOCH_SECS: i64 = 15 * 60;
 /// Members re-announce presence this often (inside one epoch).
 pub const PRESENCE_REPUBLISH_SECS: i64 = 10 * 60;
+/// How soon to try presence again after a publish that stored nowhere.
+///
+/// The republish stamp used to be written when the publish *started*, so a pass
+/// that placed the record on no node still bought ten minutes of silence.
+/// [`PRESENCE_FRESH_SECS`] is two intervals, so two such passes were enough to
+/// age a member out of every roster they were sitting in — they went on
+/// chatting while everyone else stopped seeing them and stopped picking them as
+/// a gossip neighbor.
+pub const PRESENCE_RETRY_SECS: i64 = 60;
+
+/// Whether a wall-clock schedule is due.
+///
+/// Every periodic channel task compares `i64` wall-clock seconds, and
+/// `saturating_sub` on `i64` saturates toward `i64::MIN` rather than zero — so
+/// a stamp *ahead* of the clock yielded a negative age, which is below every
+/// interval, and the task simply stopped running until real time caught up. An
+/// NTP correction on a fast clock, a VM resume, or someone editing the system
+/// date could stall presence republish for as long as the skew lasted, which is
+/// the same ghost-member failure by a different route.
+///
+/// A stamp in the future is not information, so it is treated as due: at worst
+/// that costs one extra run, and the stamp written afterwards uses the
+/// corrected clock.
+pub fn schedule_due(stamp: i64, now: i64, interval_secs: i64) -> bool {
+    stamp > now || now.saturating_sub(stamp) >= interval_secs
+}
 /// How often a member walks the presence DHT keys for rooms they have joined.
 pub const PRESENCE_FETCH_SECS: i64 = 5 * 60;
 /// The same walk for a room we are alone in.
@@ -92,8 +118,50 @@ pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// queue whenever the mesh was busy. Well above any human typing rate, and
 /// still a ceiling, so a send loop cannot become an unbounded flood.
 pub const CHANNEL_GOSSIP_LOCAL_PER_SEC: usize = 32;
-/// Inbound `CHANNEL_MSG` frames accepted from one DHT hop per second.
-pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize = 8;
+/// Inbound `CHANNEL_MSG` frames admitted from one DHT hop per second, before
+/// anything here knows what they are.
+///
+/// A work bound rather than a policy. All this can do is cap how much
+/// decryption one hop makes us attempt; the limits that actually govern a room
+/// sit past the decrypt and are keyed on the *signed author* instead —
+/// [`author_gossip_allow`] for chat, moderator actions and transfer offers,
+/// [`history_sync_allow`] for catch-up. A hop is not an identity, and a real
+/// flood arrives spread across every neighbor at once, so a tight per-hop
+/// number buys the room nothing and costs it the honest traffic.
+///
+/// Derived from what one well-behaved peer can legitimately have in flight
+/// toward us: everything they will relay for the mesh, plus a full catch-up
+/// reply landing in the same second. Sized below that, this limit punished the
+/// protocol's own behaviour — half of every history-sync reply was refused,
+/// and the neighbor that answered was scored for it.
+pub const CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC: usize =
+    CHANNEL_GOSSIP_OUT_PER_SEC + CHANNEL_HISTORY_SYNC_MAX;
+/// Extra inbound allowance for a hop we have an Ember Transfer running with,
+/// on top of [`CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC`].
+///
+/// Granted only while a transfer with that peer is actually live, so a hop
+/// that has not been invited to send us anything bulky keeps the tight budget.
+/// It has to cover what the far end is allowed to emit: the receiver leaves a
+/// whole [`XFER_WINDOW_BLOCKS`] window outstanding and the sender answers the
+/// lot in one pass at [`XFER_BLOCKS_OUT_PER_SEC`], so a smaller number here
+/// refuses blocks this node asked for by name.
+pub const CHANNEL_XFER_IN_PER_PEER_PER_SEC: usize = XFER_BLOCKS_OUT_PER_SEC;
+
+// The receiver's window, the sender's rate, and this admission bucket are
+// three halves of one agreement, and they were not in agreement: the inbound
+// cap sat at 8/sec while a single window is 64 blocks answered at 192/sec, so
+// the opening burst of every transfer was ~87% refused — and each refusal was
+// scored against the sender as a protocol violation, which banned them for a
+// day before the file had moved a hundred kilobytes.
+const _: () = assert!(
+    CHANNEL_XFER_IN_PER_PEER_PER_SEC >= XFER_WINDOW_BLOCKS,
+    "a transfer peer must be admitted at least a full outstanding window"
+);
+const _: () = assert!(
+    CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC >= CHANNEL_HISTORY_SYNC_MAX,
+    "a catch-up reply must fit the inbound allowance without being shed"
+);
+
 /// Cap on distinct hops tracked in the inbound gossip rate map.
 pub const CHANNEL_GOSSIP_IN_PEER_CAP: usize = 512;
 /// Chat messages accepted from one room member per second, counted against the
@@ -118,7 +186,31 @@ const _: () = assert!(
 /// Cap on distinct (room, author) pairs tracked for the limit above.
 pub const CHANNEL_GOSSIP_AUTHOR_CAP: usize = 1024;
 /// Recent local messages offered to a neighbor that asks for catch-up.
+/// Frames one catch-up reply may send, across lines and reactions together.
+///
+/// Under [`CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC`] so a reply is not partly shed by
+/// its own recipient, with room left for the ordinary relay traffic sharing that
+/// hop's allowance. Lines are served first and reactions take what is left, so a
+/// room becomes readable before it becomes fully annotated.
+pub const CHANNEL_HISTORY_SYNC_FRAME_MAX: usize = 40;
+
 pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
+
+// A reply arrives from one peer, so the whole thing is charged to that hop's
+// bucket. Exceeding it sheds the tail — recoverable, since the requester's
+// watermark does not advance past what it stored, but it costs a round trip and
+// looks to the reader like history arriving in pieces. Compile-time rather than a
+// test: raising either number past the other is a mistake that should not build.
+const _: () = assert!(
+    CHANNEL_HISTORY_SYNC_FRAME_MAX < CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+    "a catch-up reply must fit inside what one hop may send us in a second"
+);
+// And lines alone must not be able to spend the whole budget, or a busy room
+// would never carry its reactions across.
+const _: () = assert!(
+    CHANNEL_HISTORY_SYNC_MAX < CHANNEL_HISTORY_SYNC_FRAME_MAX,
+    "the frame budget must leave room for reactions after the lines"
+);
 /// Catch-up requests answered for one member of one room per minute.
 ///
 /// Far tighter than the chat budget because a sync request is the one frame
@@ -131,11 +223,20 @@ pub const CHANNEL_HISTORY_SYNC_MAX: usize = 32;
 pub const CHANNEL_HISTORY_SYNC_PER_MIN: usize = 2;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
-/// Catch-up asks for messages in this window behind our newest timestamp so a
-/// hole behind the frontier can still be filled. Combined with
-/// `ORDER BY timestamp DESC`, a new joiner (watermark 0) receives the newest
-/// [`CHANNEL_HISTORY_SYNC_MAX`] lines rather than the oldest.
-pub const CHANNEL_HISTORY_SYNC_LOOKBACK_SECS: i64 = 6 * 60 * 60;
+/// How a catch-up reply is ordered, which decides whether a gap can close.
+///
+/// A requester's watermark is the newest timestamp it holds, so a reply served
+/// newest-first advances that watermark past everything still missing behind
+/// it: the same [`CHANNEL_HISTORY_SYNC_MAX`] lines come back every round and a
+/// wider gap never closes. Serving oldest-first walks the gap forward, one
+/// batch per round, and makes the shed-tail note above true — the watermark
+/// stops at the last line actually stored.
+///
+/// A cold room (watermark 0) is the exception: there is no gap to walk, and the
+/// useful 32 lines are the newest ones rather than the room's oldest history.
+pub fn channel_sync_serves_oldest_first(since_ts: i64) -> bool {
+    since_ts > 0
+}
 /// Gossip timestamps further ahead of local time than this are refused.
 ///
 /// The envelope timestamp is authenticated under the room key, so a member
@@ -152,6 +253,18 @@ pub const CHANNEL_ORIGIN_RETRY_SECS: u64 = 10 * 60;
 pub const CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS: u64 = 30;
 /// How often members walk the owner-signed handoff key.
 pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
+/// How long an unanswered ownership offer blocks a different one.
+///
+/// The offer is a single gossip flood, retried for at most
+/// [`CHANNEL_ORIGIN_RETRY_SECS`], so a nominee who never comes online in that
+/// window will not answer at all. Nothing cleared the pending mark, and no
+/// command exposed a way to: an owner who offered the room to someone offline
+/// was told "a transfer to another member is already waiting to be accepted"
+/// for every later attempt, forever, with deleting the room as the only way
+/// out. Comfortably past the retry window so a live handoff is never cut
+/// short, and short enough that a lapsed one stops being a life sentence.
+/// Re-offering to the *same* member stays allowed at any age.
+pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -622,9 +735,145 @@ pub fn xor_closest_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize
     ranked.into_iter().map(|(pk, _)| pk).collect()
 }
 
-/// XOR-closest gossip neighbors across joined rooms, for rendezvous
-/// capability registration. Caps both the number of rooms and the degree
-/// so a large join list cannot explode the heartbeat HTTP fan-out.
+/// Members either side of us in ring order that always get a gossip slot.
+///
+/// Two each way rather than one: a single successor and predecessor is enough
+/// for connectivity on paper, but it makes the cycle depend on both of those
+/// two being reachable, and it spends fewer slots on the long-range links than
+/// the rest of the budget can afford. Three each way starts costing reach —
+/// at 256 members it leaves too few buckets covered to cross the id space
+/// inside [`CHANNEL_MSG_TTL_DEFAULT`].
+pub const RING_NEIGHBORS_EACH_WAY: usize = 2;
+
+/// Length of the common prefix of two ids, i.e. the index of the first bit
+/// where they differ. 128 when they are equal.
+fn xor_bucket(distance: &[u8; 16]) -> u32 {
+    for (i, byte) in distance.iter().enumerate() {
+        if *byte != 0 {
+            return i as u32 * 8 + byte.leading_zeros();
+        }
+    }
+    128
+}
+
+fn xor_distance(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (slot, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *slot = x ^ y;
+    }
+    out
+}
+
+/// Deterministic gossip neighbors: ring links for connectivity, long-range
+/// links for reach.
+///
+/// [`xor_closest_neighbors`] cannot do this job alone, and the reason is
+/// structural rather than a matter of tuning. XOR-closest-`k` is
+/// *prefix-closed*: for any set of members sharing an id prefix, every member
+/// of that set is nearer to each other than to any outsider, so once such a
+/// set holds more than `k` members every one of their slots is spent inside it
+/// and no edge ever leaves. Rooms therefore split at the top bits of the id
+/// space — a 256-member room settled into roughly eighteen islands that never
+/// exchanged a line — and nothing repaired it, because the fanout retry only
+/// widens when fewer than `k` neighbors resolve and catch-up draws its
+/// partners from the same closed set.
+///
+/// Two link types fix it, and both are needed:
+///
+/// * **Ring** — the [`RING_NEIGHBORS_EACH_WAY`] members either side of us in
+///   id order, wrapping at the ends. These form a cycle through the whole
+///   roster, so the graph is connected however the ids cluster. They are also
+///   the only links guaranteed to be mutual — our successor's predecessor is
+///   us — which matters because the rendezvous presence capability is
+///   pairwise: an edge the far end does not also choose has nobody publishing
+///   an address under the capability we would look up.
+/// * **Long-range** — the nearest member in each XOR distance bucket,
+///   shallowest bucket (furthest half of the space) first, so every slot past
+///   the ring reaches a different scale. A ring on its own is connected but
+///   has diameter `N / 2r`, which at 256 members is several times
+///   [`CHANNEL_MSG_TTL_DEFAULT`]; these collapse it to a few hops.
+///
+/// Any slots still spare fall back to XOR-closest, which is what small rooms
+/// use for most of their degree.
+///
+/// Derived only from the roster, so a member computes the same set for
+/// themselves that their neighbors compute for them —
+/// [`rendezvous_neighbor_targets`] relies on that to register the capability
+/// the other end will look up.
+pub fn gossip_neighbors(self_pub: &[u8; 32], members: &[[u8; 32]], k: usize) -> Vec<[u8; 32]> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let self_id = channel_id_from_pubkey(self_pub);
+    // Sorted by id, which is the ring order. Deduped so a roster that lists a
+    // member twice cannot hand the same peer two slots.
+    let mut ring: Vec<([u8; 16], [u8; 32])> = members
+        .iter()
+        .filter(|pk| *pk != self_pub)
+        .map(|pk| (channel_id_from_pubkey(pk), *pk))
+        .collect();
+    ring.sort_unstable();
+    ring.dedup();
+    let n = ring.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut out: Vec<[u8; 32]> = Vec::with_capacity(k);
+    // Where our own id would sit: everything from here on is a successor,
+    // everything before it a predecessor, both wrapping.
+    let pos = ring.partition_point(|(id, _)| *id < self_id);
+    for step in 0..RING_NEIGHBORS_EACH_WAY {
+        for index in [(pos + step) % n, (pos + n - 1 - (step % n)) % n] {
+            let pk = ring[index].1;
+            if out.len() < k && !out.contains(&pk) {
+                out.push(pk);
+            }
+        }
+    }
+
+    // One per bucket, furthest scale first, so the slots left after the ring
+    // are spent crossing the id space rather than crowding around us.
+    if out.len() < k {
+        let mut spread: Vec<(u32, [u8; 16], [u8; 32])> = ring
+            .iter()
+            .map(|(id, pk)| {
+                let distance = xor_distance(&self_id, id);
+                (xor_bucket(&distance), distance, *pk)
+            })
+            .collect();
+        spread.sort_unstable();
+        let mut last_bucket = None;
+        for (bucket, _, pk) in spread {
+            if last_bucket == Some(bucket) {
+                continue;
+            }
+            last_bucket = Some(bucket);
+            if !out.contains(&pk) {
+                out.push(pk);
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+    }
+
+    if out.len() < k {
+        for pk in xor_closest_neighbors(self_pub, members, k) {
+            if !out.contains(&pk) {
+                out.push(pk);
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Gossip neighbors across joined rooms, for rendezvous capability
+/// registration. Caps both the number of rooms and the degree so a large join
+/// list cannot explode the heartbeat HTTP fan-out.
 pub fn rendezvous_neighbor_targets(
     our_pubkey: &[u8; 32],
     members_by_channel: &[([u8; 16], Vec<[u8; 32]>)],
@@ -633,7 +882,7 @@ pub fn rendezvous_neighbor_targets(
 ) -> Vec<([u8; 16], [u8; 32])> {
     let mut out = Vec::new();
     for (channel_id, members) in members_by_channel.iter().take(max_channels) {
-        for pk in xor_closest_neighbors(our_pubkey, members, neighbor_count) {
+        for pk in gossip_neighbors(our_pubkey, members, neighbor_count) {
             out.push((*channel_id, pk));
         }
     }
@@ -825,12 +1074,27 @@ const HANDOFF_READY_PLAIN_VERSION: u8 = 17;
 const MOD_SIG_DOMAIN: &[u8] = b"ember-channel-mod-author-v1\0";
 const SYNC_SIG_DOMAIN: &[u8] = b"ember-channel-sync-author-v1\0";
 const HANDOFF_READY_DOMAIN: &[u8] = b"ember-channel-handoff-ready-v1\0";
+/// Revision of a line the author already sent. Signed by the same key the
+/// original was, so "only the author may edit" is something every receiver
+/// checks rather than something the sending client is trusted about.
+const CHAT_EDIT_PLAIN_VERSION: u8 = 19;
+/// One or more reactions to lines in this room. Always a batch — a live
+/// reaction is a batch of one — so catch-up can carry a room's worth of
+/// reactions in a frame or two instead of one datagram each.
+const REACTION_PLAIN_VERSION: u8 = 20;
+const EDIT_SIG_DOMAIN: &[u8] = b"ember-channel-edit-author-v1\0";
+const REACTION_SIG_DOMAIN: &[u8] = b"ember-channel-reaction-author-v1\0";
 const XFER_OFFER_PLAIN_VERSION: u8 = 9;
 const XFER_REPLY_PLAIN_VERSION: u8 = 10;
 const XFER_BLOCK_REQUEST_PLAIN_VERSION: u8 = 11;
-const XFER_BLOCK_DATA_PLAIN_VERSION: u8 = 12;
+// 12 was a block whose payload travelled in the clear, authenticated pairwise
+// but encrypted only by the gossip envelope around it -- which is sealed with
+// the *room's* content key. Retired rather than reused: a build still sending
+// them must be refused, not misread.
 const XFER_CANCEL_PLAIN_VERSION: u8 = 13;
 const XFER_DONE_PLAIN_VERSION: u8 = 14;
+/// A block whose payload is encrypted to the recipient alone.
+const XFER_BLOCK_DATA_SEALED_VERSION: u8 = 21;
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
@@ -951,6 +1215,340 @@ pub fn decode_channel_chat_plain(
 /// member used to stick a ban or freeze catch-up for everyone who stored it.
 pub fn gossip_timestamp_ok(timestamp: i64, now: i64) -> bool {
     timestamp > 0 && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+}
+
+/// How long after sending a line its author may still revise it.
+///
+/// Long enough to catch the typo you notice a moment after pressing Enter,
+/// short enough that nobody rewrites what a conversation was replying to. Both
+/// ends of a room enforce it: see [`edit_within_window`] for why the check needs
+/// two clocks rather than one.
+pub const CHANNEL_EDIT_WINDOW_SECS: i64 = 15 * 60;
+
+/// Whether an edit may still be applied to the line it names.
+///
+/// Two clocks, because neither alone is sufficient. `original_timestamp` and
+/// `edited_at` are both author-supplied, so on their own a member could date a
+/// line now, wait a day, and send an "edit" dated a minute after it —
+/// [`gossip_timestamp_ok`] deliberately allows old timestamps, because history
+/// catch-up replays them. `first_seen_at` is this device's own clock when it
+/// first stored the original, which the author cannot influence at all.
+///
+/// Requiring both means a late rewrite fails even when the author lies about
+/// when it happened. The cost is that members can legitimately disagree: one who
+/// was offline and receives the line and its edit together accepts the edit,
+/// while one who has had the line on screen for an hour refuses it. That is
+/// inherent to a room with no arbiter of time, and refusing is the safe side to
+/// err on — a member who rejects an edit keeps showing exactly the words that
+/// were signed to them.
+///
+/// `first_seen_at` of 0 means the row predates the column, so only the
+/// author-claimed gap is checked; a pre-existing row is not worth refusing an
+/// otherwise valid edit over.
+pub fn edit_within_window(
+    original_timestamp: i64,
+    edited_at: i64,
+    first_seen_at: i64,
+    now: i64,
+) -> bool {
+    if edited_at < original_timestamp {
+        return false;
+    }
+    if edited_at.saturating_sub(original_timestamp) > CHANNEL_EDIT_WINDOW_SECS {
+        return false;
+    }
+    if first_seen_at > 0 && now.saturating_sub(first_seen_at) > CHANNEL_EDIT_WINDOW_SECS {
+        return false;
+    }
+    true
+}
+
+/// What an edit's signature covers.
+///
+/// Same reasoning as [`chat_sig_preimage`], with the target in place of the
+/// line's own id: the room stops the edit being replayed into another room, the
+/// target stops it being pointed at another line, the two timestamps stop it
+/// being re-dated past the window, and the author key stops anyone else
+/// claiming it.
+///
+/// `original_timestamp` is carried so the frame stands on its own. A member who
+/// was away can be handed one edit frame instead of the original line followed
+/// by its revision, which halves what a catch-up costs — and, more importantly,
+/// means an edited line does not have to keep its pre-edit text on every
+/// member's disk just so it can be replayed. Editing out something you regret
+/// would be worth very little if the first version were archived everywhere.
+///
+/// Deliberately *not* bound to the edit frame's own envelope `msg_id`, unlike
+/// chat. A re-serve on catch-up has to mint a fresh envelope id for the
+/// receiver's duplicate filter, and binding one would make the stored signature
+/// unusable for that — while buying nothing, because the only replay this
+/// permits is a byte-identical edit, and applying the same revision twice is a
+/// no-op under the newer-wins rule.
+fn edit_sig_preimage(
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    sender_pubkey: &[u8; 32],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EDIT_SIG_DOMAIN.len() + 16 + 16 + 8 + 8 + 32 + text.len());
+    out.extend_from_slice(EDIT_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&original_timestamp.to_le_bytes());
+    out.extend_from_slice(&edited_at.to_le_bytes());
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// The author's signature over a revision of their own line.
+///
+/// Kept beside the stored row for the same reason [`chat_author_signature`] is:
+/// a catch-up has to put byte-identical bytes back on the wire, and only the
+/// author could have produced them.
+pub fn edit_author_signature(
+    signing_key: &SigningKey,
+    sender_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    text: &str,
+) -> [u8; 64] {
+    crypto::sign(
+        signing_key,
+        &edit_sig_preimage(
+            channel_id,
+            target_msg_id,
+            original_timestamp,
+            edited_at,
+            sender_pubkey,
+            text,
+        ),
+    )
+}
+
+/// `version || sender(32) || target(16) || original_ts(8) || edited_at(8) || signature(64) || text`.
+///
+/// Both timestamps ride in the payload rather than being read from the envelope,
+/// so a catch-up can replay the revision under a fresh envelope timestamp
+/// without invalidating the signature — the same reason the signature does not
+/// bind the envelope id.
+pub fn encode_channel_chat_edit_presigned(
+    sender_pubkey: &[u8; 32],
+    target_msg_id: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    signature: &[u8; 64],
+    text: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 16 + 8 + 8 + 64 + text.len());
+    out.push(CHAT_EDIT_PLAIN_VERSION);
+    out.extend_from_slice(sender_pubkey);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&original_timestamp.to_le_bytes());
+    out.extend_from_slice(&edited_at.to_le_bytes());
+    out.extend_from_slice(signature);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// A revision and who signed it, or nothing if the signature does not hold.
+///
+/// The caller still has to check that the author matches the *original* line's
+/// author and that the window has not closed — this proves only that whoever
+/// holds `sender_pubkey` asked for this text on this line at this time.
+pub fn decode_channel_chat_edit(bytes: &[u8], channel_id: &[u8; 16]) -> Option<ChannelChatEdit> {
+    const HEAD: usize = 1 + 32 + 16 + 8 + 8 + 64;
+    if bytes.len() < HEAD || bytes[0] != CHAT_EDIT_PLAIN_VERSION {
+        return None;
+    }
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[1..33]);
+    let mut target = [0u8; 16];
+    target.copy_from_slice(&bytes[33..49]);
+    let original_timestamp = i64::from_le_bytes(bytes[49..57].try_into().ok()?);
+    let edited_at = i64::from_le_bytes(bytes[57..65].try_into().ok()?);
+    let sig: [u8; 64] = bytes[65..HEAD].try_into().ok()?;
+    let text = std::str::from_utf8(&bytes[HEAD..]).ok()?.to_string();
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &edit_sig_preimage(
+            channel_id,
+            &target,
+            original_timestamp,
+            edited_at,
+            &sender,
+            &text,
+        ),
+        &sig,
+    ) {
+        return None;
+    }
+    Some(ChannelChatEdit {
+        sender,
+        target_msg_id: target,
+        original_timestamp,
+        edited_at,
+        text,
+        signature: sig,
+    })
+}
+
+/// A verified revision of a chat line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelChatEdit {
+    pub sender: [u8; 32],
+    pub target_msg_id: [u8; 16],
+    /// When the line being revised was originally sent. Carried so the frame can
+    /// stand in for a line the receiver never saw.
+    pub original_timestamp: i64,
+    pub edited_at: i64,
+    pub text: String,
+    pub signature: [u8; 64],
+}
+
+/// Reaction values carried on the wire.
+///
+/// A number rather than a flag pair so a later build can add reactions without
+/// another frame version. An unrecognised value is stored and re-served rather
+/// than dropped, so a room running a newer build does not lose its reactions
+/// every time they pass through this one — this build simply does not draw them.
+pub const REACTION_NONE: u8 = 0;
+pub const REACTION_UP: u8 = 1;
+pub const REACTION_DOWN: u8 = 2;
+pub const REACTION_HEART: u8 = 3;
+
+/// Reactions one frame may carry. 121 bytes each, so a full batch is under 4 KiB
+/// and stays inside the budget a chat line already occupies.
+pub const CHANNEL_REACTION_MAX_PER_FRAME: usize = 32;
+
+/// One member's reaction to one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelReaction {
+    pub target_msg_id: [u8; 16],
+    pub member: [u8; 32],
+    pub reaction: u8,
+    pub reacted_at: i64,
+    pub signature: [u8; 64],
+}
+
+/// What a reaction's signature covers.
+///
+/// `reacted_at` is in the preimage and in each entry rather than being taken
+/// from the envelope, because a batch carries reactions made at different times
+/// under one envelope timestamp. It is also what orders competing reactions from
+/// the same member, so it has to be something they signed.
+fn reaction_sig_preimage(
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    reacted_at: i64,
+    member: &[u8; 32],
+    reaction: u8,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REACTION_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 1);
+    out.extend_from_slice(REACTION_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(target_msg_id);
+    out.extend_from_slice(&reacted_at.to_le_bytes());
+    out.extend_from_slice(member);
+    out.push(reaction);
+    out
+}
+
+pub fn reaction_signature(
+    signing_key: &SigningKey,
+    member: &[u8; 32],
+    channel_id: &[u8; 16],
+    target_msg_id: &[u8; 16],
+    reacted_at: i64,
+    reaction: u8,
+) -> [u8; 64] {
+    crypto::sign(
+        signing_key,
+        &reaction_sig_preimage(channel_id, target_msg_id, reacted_at, member, reaction),
+    )
+}
+
+/// `version || count(1) || [target(16) || member(32) || reaction(1) || reacted_at(8) || sig(64)]*`.
+///
+/// Entries past [`CHANNEL_REACTION_MAX_PER_FRAME`] are dropped rather than
+/// splitting here: the caller decides how to page a large room's backlog, and a
+/// silently oversized frame would be refused by every receiver.
+pub fn encode_channel_reactions(entries: &[ChannelReaction]) -> Vec<u8> {
+    let take = entries.len().min(CHANNEL_REACTION_MAX_PER_FRAME);
+    let mut out = Vec::with_capacity(2 + take * REACTION_ENTRY_LEN);
+    out.push(REACTION_PLAIN_VERSION);
+    out.push(take as u8);
+    for entry in &entries[..take] {
+        out.extend_from_slice(&entry.target_msg_id);
+        out.extend_from_slice(&entry.member);
+        out.push(entry.reaction);
+        out.extend_from_slice(&entry.reacted_at.to_le_bytes());
+        out.extend_from_slice(&entry.signature);
+    }
+    out
+}
+
+const REACTION_ENTRY_LEN: usize = 16 + 32 + 1 + 8 + 64;
+
+/// Every entry in a reaction frame whose signature holds.
+///
+/// Entries are verified one at a time and a bad one is skipped rather than
+/// failing the frame: a batch is an aggregate of independent claims by different
+/// members, so one member's forged entry must not discard everyone else's real
+/// ones. Returns `None` only when the frame itself is malformed.
+pub fn decode_channel_reactions(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+) -> Option<Vec<ChannelReaction>> {
+    if bytes.len() < 2 || bytes[0] != REACTION_PLAIN_VERSION {
+        return None;
+    }
+    let count = bytes[1] as usize;
+    if count == 0 || count > CHANNEL_REACTION_MAX_PER_FRAME {
+        return None;
+    }
+    if bytes.len() != 2 + count * REACTION_ENTRY_LEN {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 2 + i * REACTION_ENTRY_LEN;
+        let mut target = [0u8; 16];
+        target.copy_from_slice(&bytes[at..at + 16]);
+        let mut member = [0u8; 32];
+        member.copy_from_slice(&bytes[at + 16..at + 48]);
+        let reaction = bytes[at + 48];
+        let Ok(ts_bytes) = bytes[at + 49..at + 57].try_into() else {
+            continue;
+        };
+        let reacted_at = i64::from_le_bytes(ts_bytes);
+        let Ok(sig) = <[u8; 64]>::try_from(&bytes[at + 57..at + REACTION_ENTRY_LEN]) else {
+            continue;
+        };
+        let Some(author) = crypto::verifying_key_from_bytes(&member) else {
+            continue;
+        };
+        if !crypto::verify(
+            &author,
+            &reaction_sig_preimage(channel_id, &target, reacted_at, &member, reaction),
+            &sig,
+        ) {
+            continue;
+        }
+        out.push(ChannelReaction {
+            target_msg_id: target,
+            member,
+            reaction,
+            reacted_at,
+            signature: sig,
+        });
+    }
+    Some(out)
 }
 
 fn mod_action_preimage(
@@ -1243,6 +1841,35 @@ pub fn derive_xfer_key(
     crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)
 }
 
+const XFER_BLOCK_STREAM_DOMAIN: &[u8] = b"ember-channel-xfer-block-v1\0";
+
+/// XOR a block's payload with a keystream only the two ends can produce.
+///
+/// Symmetric, so one function both seals and opens. Keyed BLAKE3 in XOF mode is
+/// a PRF, so `(xfer_id, offset)` selects an independent stream per block with no
+/// nonce on the wire — which is what lets a sealed frame be exactly the size the
+/// cleartext one was, and keeps the unfragmented-datagram budget as it was.
+///
+/// A retransmitted block reuses its stream, which is harmless: it carries the
+/// same file bytes. The case that is not harmless is a file edited underneath a
+/// transfer already in flight, where the same offset would carry two different
+/// plaintexts under one stream and an observer holding both frames learns their
+/// XOR. Such a transfer already fails the root hash it was offered under, and
+/// the alternative — a per-block nonce — costs headroom this frame does not
+/// have.
+fn xfer_block_stream_xor(key: &[u8; 32], xfer_id: &[u8; 16], offset: u64, data: &mut [u8]) {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(XFER_BLOCK_STREAM_DOMAIN);
+    hasher.update(xfer_id);
+    hasher.update(&offset.to_le_bytes());
+    let mut stream = [0u8; XFER_BLOCK_SIZE];
+    let stream = &mut stream[..data.len().min(XFER_BLOCK_SIZE)];
+    hasher.finalize_xof().fill(stream);
+    for (byte, pad) in data.iter_mut().zip(stream.iter()) {
+        *byte ^= *pad;
+    }
+}
+
 fn xfer_tag(key: &[u8; 32], body: &[u8]) -> [u8; XFER_MAC_LEN] {
     let full = blake3::keyed_hash(key, body);
     let mut tag = [0u8; XFER_MAC_LEN];
@@ -1269,7 +1896,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
         XFER_OFFER_PLAIN_VERSION
             | XFER_REPLY_PLAIN_VERSION
             | XFER_BLOCK_REQUEST_PLAIN_VERSION
-            | XFER_BLOCK_DATA_PLAIN_VERSION
+            | XFER_BLOCK_DATA_SEALED_VERSION
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
     ) {
@@ -1453,7 +2080,18 @@ pub fn decode_xfer_block_request(
     Some((sender, target, xfer_id, offset, count))
 }
 
-/// `hdr || offset(8) || data || tag(16)`.
+/// `hdr || offset(8) || sealed(data) || tag(16)`.
+///
+/// The payload is encrypted to the recipient, not merely authenticated to them.
+/// The gossip envelope carrying it is sealed with the *room's* content key,
+/// which every member holds — and which, for a public room, is derived straight
+/// from the channel pubkey that sits in the public index and in every invite. So
+/// a block "sent to one member" was readable by every member of a private room,
+/// and by any stranger who could find a public one, while the UI presented it as
+/// a file going to one person.
+///
+/// Same length on the wire as the cleartext frame it replaces, so the
+/// unfragmented-datagram budget is unchanged.
 ///
 /// Block data is authenticated like everything else rather than leaning on
 /// the whole-file hash at the end. That check would catch injected bytes, but
@@ -1474,30 +2112,39 @@ pub fn encode_xfer_block_data(
     let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + data.len() + XFER_MAC_LEN);
     put_xfer_header(
         &mut out,
-        XFER_BLOCK_DATA_PLAIN_VERSION,
+        XFER_BLOCK_DATA_SEALED_VERSION,
         sender,
         target,
         xfer_id,
     );
     out.extend_from_slice(&offset.to_le_bytes());
+    let payload = out.len();
     out.extend_from_slice(data);
+    xfer_block_stream_xor(key, xfer_id, offset, &mut out[payload..]);
+    // Encrypt then MAC: the tag still covers the header, the offset and now the
+    // ciphertext, so sender, target, transfer and position stay bound exactly as
+    // they were.
     append_xfer_tag(key, &mut out);
     Some(out)
 }
 
+/// Open a block. Call only on a frame [`xfer_verify`] has already accepted —
+/// decrypting first would be decrypting whatever a stranger sent.
 pub fn decode_xfer_block_data(
+    key: &[u8; 32],
     bytes: &[u8],
-) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, &[u8])> {
-    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_BLOCK_DATA_PLAIN_VERSION)?;
+) -> Option<([u8; 32], [u8; 32], [u8; 16], u64, Vec<u8>)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_BLOCK_DATA_SEALED_VERSION)?;
     let rest = bytes.get(XFER_HEADER_LEN..)?;
     if rest.len() < 8 + 1 {
         return None;
     }
     let offset = u64::from_le_bytes(rest[..8].try_into().ok()?);
-    let data = &rest[8..];
-    if data.len() > XFER_BLOCK_SIZE {
+    if rest.len() - 8 > XFER_BLOCK_SIZE {
         return None;
     }
+    let mut data = rest[8..].to_vec();
+    xfer_block_stream_xor(key, &xfer_id, offset, &mut data);
     Some((sender, target, xfer_id, offset, data))
 }
 
@@ -1828,10 +2475,17 @@ pub fn history_sync_allow(
     )
 }
 
-/// Drop tracking for authors with no activity inside `window`, so a long
-/// session does not hold a slot for everyone who ever spoke.
-pub fn prune_author_gossip(
-    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+/// Drop rate-window tracking for keys with no activity inside `window`, so a
+/// long session does not hold a slot for everyone who ever spoke.
+///
+/// Generic over the key because all three inbound budgets need it and each is
+/// keyed differently — chat and catch-up by `(room, author)`, hop admission by
+/// node id. The hop map is the one that most needs sweeping: it refuses any
+/// newcomer once [`CHANNEL_GOSSIP_IN_PEER_CAP`] slots are taken, so without a
+/// sweep a long session eventually stops accepting channel traffic from anyone
+/// it has not already spoken to.
+pub fn prune_rate_windows<K: Eq + std::hash::Hash>(
+    seen: &mut HashMap<K, VecDeque<Instant>>,
     now: Instant,
     window: Duration,
 ) {
@@ -2197,6 +2851,172 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let sig = chat_author_signature(sk, &pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, text);
         encode_channel_chat_plain_presigned(&pk, &sig, text)
+    }
+
+    /// A revision of `CHAT_MSG_ID` signed by `sk`, dated `edited_at`.
+    fn edit_frame(sk: &SigningKey, text: &str, edited_at: i64) -> Vec<u8> {
+        let pk = sk.verifying_key().to_bytes();
+        let sig = edit_author_signature(
+            sk,
+            &pk,
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            edited_at,
+            text,
+        );
+        encode_channel_chat_edit_presigned(&pk, &CHAT_MSG_ID, CHAT_TS, edited_at, &sig, text)
+    }
+
+    fn reaction_entry(sk: &SigningKey, target: [u8; 16], reaction: u8, at: i64) -> ChannelReaction {
+        let pk = sk.verifying_key().to_bytes();
+        let signature = reaction_signature(sk, &pk, &CHAT_CHANNEL, &target, at, reaction);
+        ChannelReaction {
+            target_msg_id: target,
+            member: pk,
+            reaction,
+            reacted_at: at,
+            signature,
+        }
+    }
+
+    #[test]
+    fn an_edit_round_trips_and_is_bound_to_its_author_room_and_target() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob = SigningKey::generate(&mut rand::rngs::OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+
+        let frame = edit_frame(&alice, "fixed the typo", CHAT_TS + 30);
+        let edit = decode_channel_chat_edit(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(edit.sender, alice_pk);
+        assert_eq!(edit.target_msg_id, CHAT_MSG_ID);
+        assert_eq!(edit.original_timestamp, CHAT_TS);
+        assert_eq!(edit.edited_at, CHAT_TS + 30);
+        assert_eq!(edit.text, "fixed the typo");
+
+        // Re-serving on a catch-up rebuilds the same bytes from the stored
+        // parts, so a member can pass on somebody else's revision without being
+        // able to author one.
+        let replayed = encode_channel_chat_edit_presigned(
+            &edit.sender,
+            &edit.target_msg_id,
+            edit.original_timestamp,
+            edit.edited_at,
+            &edit.signature,
+            &edit.text,
+        );
+        assert_eq!(replayed, frame);
+
+        // Wrong room, and a body claiming an author who did not sign it.
+        assert!(decode_channel_chat_edit(&frame, &[9u8; 16]).is_none());
+        let mut forged = frame.clone();
+        forged[1..33].copy_from_slice(&bob.verifying_key().to_bytes());
+        assert!(
+            decode_channel_chat_edit(&forged, &CHAT_CHANNEL).is_none(),
+            "an edit naming another member must not be attributed to them"
+        );
+
+        // Every signed field is load-bearing: flipping the target, either
+        // timestamp, or the text must all invalidate it.
+        for byte in [33usize, 49, 57, frame.len() - 1] {
+            let mut tampered = frame.clone();
+            tampered[byte] ^= 0xFF;
+            assert!(
+                decode_channel_chat_edit(&tampered, &CHAT_CHANNEL).is_none(),
+                "byte {byte} is inside the signed preimage and must not be malleable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edit_window_needs_both_the_authors_clock_and_our_own() {
+        let sent = 1_000_000i64;
+        let seen = 2_000_000i64;
+
+        // Inside the window on both clocks.
+        assert!(edit_within_window(sent, sent + 60, seen, seen + 60));
+        // The author claims a gap wider than the window.
+        assert!(!edit_within_window(
+            sent,
+            sent + CHANNEL_EDIT_WINDOW_SECS + 1,
+            seen,
+            seen + 60
+        ));
+        // The author claims a tight gap, but we have held the line for a day —
+        // this is the backdating case the second clock exists to refuse.
+        assert!(!edit_within_window(sent, sent + 60, seen, seen + 86_400));
+        // An edit dated before the line it revises is nonsense.
+        assert!(!edit_within_window(sent, sent - 1, seen, seen + 60));
+        // A row from before `first_seen_at` existed is judged on the author's
+        // clock alone rather than refused outright.
+        assert!(edit_within_window(sent, sent + 60, 0, seen + 86_400));
+    }
+
+    #[test]
+    fn a_reaction_batch_verifies_each_entry_independently() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob = SigningKey::generate(&mut rand::rngs::OsRng);
+        let other_target = [7u8; 16];
+
+        let entries = vec![
+            reaction_entry(&alice, CHAT_MSG_ID, REACTION_UP, CHAT_TS + 1),
+            reaction_entry(&bob, CHAT_MSG_ID, REACTION_DOWN, CHAT_TS + 2),
+            // One batch may span several lines, which is what makes a catch-up
+            // affordable.
+            reaction_entry(&alice, other_target, REACTION_UP, CHAT_TS + 3),
+        ];
+        let frame = encode_channel_reactions(&entries);
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, entries);
+
+        // A forged entry is dropped on its own; the genuine ones beside it
+        // survive, because a batch is a bundle of independent claims.
+        let mut tampered = frame.clone();
+        let second = 2 + REACTION_ENTRY_LEN;
+        tampered[second + 48] = REACTION_UP;
+        let decoded = decode_channel_reactions(&tampered, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded.len(), 2, "only the edited entry should be discarded");
+        assert!(decoded.iter().all(|e| e.member != bob.verifying_key().to_bytes()));
+
+        // Wrong room invalidates the whole batch, entry by entry.
+        assert!(decode_channel_reactions(&frame, &[9u8; 16])
+            .unwrap()
+            .is_empty());
+
+        // A malformed frame is refused rather than partially read.
+        assert!(decode_channel_reactions(&frame[..frame.len() - 1], &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_reactions(&[REACTION_PLAIN_VERSION, 0], &CHAT_CHANNEL).is_none());
+    }
+
+    #[test]
+    fn a_reaction_value_this_build_does_not_draw_still_survives_a_round_trip() {
+        // Forward compatibility: a newer build's reaction has to reach the rest
+        // of the room through this one, or a mixed-version room loses reactions
+        // every time one passes through an older peer.
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let future = reaction_entry(&alice, CHAT_MSG_ID, 200, CHAT_TS + 1);
+        let frame = encode_channel_reactions(std::slice::from_ref(&future));
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, vec![future]);
+    }
+
+    #[test]
+    fn a_reaction_batch_refuses_more_than_one_frame_holds() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entries: Vec<ChannelReaction> = (0..CHANNEL_REACTION_MAX_PER_FRAME + 5)
+            .map(|i| {
+                let mut target = [0u8; 16];
+                target[0] = i as u8;
+                reaction_entry(&alice, target, REACTION_UP, CHAT_TS + i as i64)
+            })
+            .collect();
+        let frame = encode_channel_reactions(&entries);
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(
+            decoded.len(),
+            CHANNEL_REACTION_MAX_PER_FRAME,
+            "the encoder must clamp rather than emit a frame no receiver accepts"
+        );
     }
 
     #[test]
@@ -2585,21 +3405,25 @@ mod tests {
     }
 
     #[test]
-    fn rendezvous_neighbor_targets_are_xor_closest_and_skip_self() {
+    /// Registration has to name exactly the peers the fanout will dial, or we
+    /// publish an address under a capability nobody looks up and look up one
+    /// nobody published under.
+    fn rendezvous_neighbor_targets_match_the_gossip_set_and_skip_self() {
         let self_pk = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let a = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let b = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let channel_id = [0xab; 16];
-        let closest = xor_closest_neighbors(&self_pk, &[self_pk, a, b], 1);
-        assert_eq!(closest.len(), 1);
-        assert_ne!(closest[0], self_pk);
+        let roster = vec![self_pk, a, b];
+        let picked = gossip_neighbors(&self_pk, &roster, 1);
+        assert_eq!(picked.len(), 1);
+        assert_ne!(picked[0], self_pk);
         let targets = rendezvous_neighbor_targets(
             &self_pk,
-            &[(channel_id, vec![self_pk, a, b])],
+            &[(channel_id, roster)],
             CHANNEL_RENDEZVOUS_MAX_CHANNELS,
             1,
         );
-        assert_eq!(targets, vec![(channel_id, closest[0])]);
+        assert_eq!(targets, vec![(channel_id, picked[0])]);
     }
 
     #[test]
@@ -2743,9 +3567,13 @@ mod tests {
         );
     }
 
+    /// Deliberately past the size where XOR-closest alone comes apart. At 12 —
+    /// what this used to run — a prefix-closed cluster cannot yet reach the
+    /// `CHANNEL_NEIGHBOR_COUNT + 1` members it takes to seal itself off, so the
+    /// old graph passed and the partition went unnoticed until a real room grew.
     #[test]
     fn gossip_mesh_soak_delivers_once_within_ttl() {
-        const N: usize = 12;
+        const N: usize = 64;
         let members: Vec<[u8; 32]> = (0..N)
             .map(|i| {
                 let mut pk = [0u8; 32];
@@ -2758,7 +3586,7 @@ mod tests {
         let neighbors: Vec<Vec<usize>> = members
             .iter()
             .map(|self_pk| {
-                xor_closest_neighbors(self_pk, &members, CHANNEL_NEIGHBOR_COUNT)
+                gossip_neighbors(self_pk, &members, CHANNEL_NEIGHBOR_COUNT)
                     .into_iter()
                     .filter_map(|pk| members.iter().position(|m| *m == pk))
                     .collect()
@@ -2775,7 +3603,8 @@ mod tests {
             assert_eq!(
                 reachable.len(),
                 N,
-                "XOR-{CHANNEL_NEIGHBOR_COUNT} graph on {N} members should be fully reachable from {origin} within TTL"
+                "degree-{CHANNEL_NEIGHBOR_COUNT} gossip graph on {N} members should be fully \
+                 reachable from {origin} within TTL"
             );
             let expected = format!("soak-{origin}");
             let gossip = ChannelGossip::new_plaintext(
@@ -2945,7 +3774,7 @@ mod tests {
         assert!(author_gossip_allow(&mut seen, room, &alice, later));
 
         // Slots are only reclaimed for authors who have actually gone quiet.
-        prune_author_gossip(&mut seen, later, Duration::from_secs(1));
+        prune_rate_windows(&mut seen, later, Duration::from_secs(1));
         assert!(
             seen.contains_key(&(room, alice)),
             "Alice just spoke, so she keeps her slot"
@@ -2961,11 +3790,13 @@ mod tests {
     /// chat one — and that budget has to be far below what chat allows.
     #[test]
     fn history_sync_has_a_tighter_budget_than_chat_and_is_per_room() {
-        assert!(
-            CHANNEL_HISTORY_SYNC_PER_MIN < CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
-            "a request answered with {CHANNEL_HISTORY_SYNC_MAX} sealed frames must not be \
-             admitted at the per-second rate plain chat is"
-        );
+        const {
+            assert!(
+                CHANNEL_HISTORY_SYNC_PER_MIN < CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC,
+                "a request answered with CHANNEL_HISTORY_SYNC_MAX sealed frames must not be \
+                 admitted at the per-second rate plain chat is"
+            );
+        }
 
         let mut seen = HashMap::new();
         let room = [0x01u8; 16];
@@ -3082,6 +3913,229 @@ mod tests {
             CHANNEL_GOSSIP_AUTHOR_CAP,
             "and refusing does not grow the map"
         );
+    }
+
+    /// The per-hop budget has to sit above what our own protocol tells the far
+    /// end to send, or it punishes the traffic it asked for. It used to sit at
+    /// 8/sec while a receiver leaves a 64-block window outstanding and the
+    /// sender answers the lot at `XFER_BLOCKS_OUT_PER_SEC`, so the opening
+    /// burst of every transfer was mostly refused — and each refusal was
+    /// scored as a protocol violation, banning the sender for a day well
+    /// before the file had moved.
+    #[test]
+    fn a_transfer_window_fits_the_inbound_allowance_for_that_hop() {
+        let limit = CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC + CHANNEL_XFER_IN_PER_PEER_PER_SEC;
+        assert!(
+            limit >= XFER_BLOCKS_OUT_PER_SEC,
+            "a hop mid-transfer must be admitted at the rate it is allowed to send"
+        );
+        let mut times = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..XFER_WINDOW_BLOCKS {
+            assert!(
+                rate_window_allow(&mut times, now, Duration::from_secs(1), limit),
+                "block {i} of one outstanding window must be admitted"
+            );
+        }
+    }
+
+    /// A neighbor answering a catch-up sends up to `CHANNEL_HISTORY_SYNC_MAX`
+    /// sealed frames back to back, and does so without any transfer running.
+    /// Shedding part of that reply is what left a new joiner with a
+    /// hole-ridden scrollback and a five-minute wait before the next attempt.
+    #[test]
+    fn a_full_catch_up_reply_fits_the_base_inbound_allowance() {
+        let mut times = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..CHANNEL_HISTORY_SYNC_MAX {
+            assert!(
+                rate_window_allow(
+                    &mut times,
+                    now,
+                    Duration::from_secs(1),
+                    CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC,
+                ),
+                "line {i} of one catch-up reply must land without a transfer running"
+            );
+        }
+    }
+
+    /// A full room has to stay one mesh. This is the property XOR-closest
+    /// could not hold: it is prefix-closed, so any cluster of more than
+    /// `CHANNEL_NEIGHBOR_COUNT` members spends every slot inside itself and
+    /// seals off. The second half of the assertion is the reason
+    /// [`gossip_neighbors`] exists at all — if someone ever simplifies it back
+    /// to plain XOR-closest, this fails rather than shipping a room where two
+    /// members cannot hear each other.
+    #[test]
+    fn a_full_room_stays_one_mesh_where_xor_closest_alone_shatters() {
+        const N: usize = CHANNEL_MEMBERS_MAX;
+        let members: Vec<[u8; 32]> = (0..N)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[..2].copy_from_slice(&(i as u16).to_le_bytes());
+                pk[2] = 0x5E;
+                pk
+            })
+            .collect();
+
+        let index_of = |graph: &mut Vec<Vec<usize>>, picks: Vec<[u8; 32]>| {
+            graph.push(
+                picks
+                    .into_iter()
+                    .filter_map(|pk| members.iter().position(|m| *m == pk))
+                    .collect(),
+            );
+        };
+        let mut mesh: Vec<Vec<usize>> = Vec::with_capacity(N);
+        let mut closest_only: Vec<Vec<usize>> = Vec::with_capacity(N);
+        for pk in &members {
+            index_of(
+                &mut mesh,
+                gossip_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT),
+            );
+            index_of(
+                &mut closest_only,
+                xor_closest_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT),
+            );
+        }
+
+        for origin in 0..N {
+            assert_eq!(
+                directed_reach(&mesh, origin, CHANNEL_MSG_TTL_DEFAULT).len(),
+                N,
+                "member {origin} must reach the whole room within TTL"
+            );
+        }
+        let stranded = directed_reach(&closest_only, 0, CHANNEL_MSG_TTL_DEFAULT).len();
+        assert!(
+            stranded < N,
+            "XOR-closest alone is expected to strand most of a {N}-member room \
+             (reached {stranded}); if that is no longer true the ring links can be revisited"
+        );
+    }
+
+    /// Ring links are the half of the degree that has to be mutual: the
+    /// rendezvous presence capability is pairwise, so an edge the far end does
+    /// not also choose has nobody publishing an address under it.
+    #[test]
+    fn ring_links_are_mutual_and_survive_a_duplicated_roster() {
+        let members: Vec<[u8; 32]> = (0..40u8)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[0] = i;
+                pk[1] = 0x7C;
+                pk
+            })
+            .collect();
+        let mut mutual = 0usize;
+        for pk in &members {
+            for peer in gossip_neighbors(pk, &members, CHANNEL_NEIGHBOR_COUNT) {
+                if gossip_neighbors(&peer, &members, CHANNEL_NEIGHBOR_COUNT).contains(pk) {
+                    mutual += 1;
+                }
+            }
+        }
+        // Every node contributes at least its two ring links back.
+        assert!(
+            mutual >= members.len() * 2 * RING_NEIGHBORS_EACH_WAY,
+            "ring links should always pair up, saw {mutual} mutual edges"
+        );
+
+        // A roster that names someone twice must not hand them two slots.
+        let mut doubled = members.clone();
+        doubled.extend_from_slice(&members);
+        let picks = gossip_neighbors(&members[0], &doubled, CHANNEL_NEIGHBOR_COUNT);
+        let mut unique = picks.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(picks.len(), unique.len(), "a duplicated roster duplicated a slot");
+        assert!(!picks.contains(&members[0]), "never picks self");
+        assert_eq!(
+            picks,
+            gossip_neighbors(&members[0], &members, CHANNEL_NEIGHBOR_COUNT),
+            "selection must not depend on how many times the roster lists someone"
+        );
+    }
+
+    /// Rooms below the degree still have to work, including the two- and
+    /// three-member cases where the ring wraps onto itself.
+    #[test]
+    fn tiny_rooms_pick_everyone_exactly_once() {
+        for size in 1..=CHANNEL_NEIGHBOR_COUNT {
+            let members: Vec<[u8; 32]> = (0..size as u8)
+                .map(|i| {
+                    let mut pk = [0u8; 32];
+                    pk[0] = i;
+                    pk[1] = 0x3B;
+                    pk
+                })
+                .collect();
+            let picks = gossip_neighbors(&members[0], &members, CHANNEL_NEIGHBOR_COUNT);
+            let mut unique = picks.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(picks.len(), unique.len(), "size {size} repeated a member");
+            assert_eq!(
+                picks.len(),
+                size - 1,
+                "size {size} should pick every other member and no more"
+            );
+            assert!(!picks.contains(&members[0]), "size {size} picked self");
+        }
+    }
+
+    /// Every periodic channel task compares wall-clock seconds, and a stamp
+    /// ahead of the clock used to read as a negative age — below every
+    /// interval, so the task stopped running until real time caught up. On the
+    /// presence republish that meant a member sitting in the room aged out of
+    /// everyone else's roster for the length of the skew.
+    #[test]
+    fn a_backwards_clock_jump_does_not_wedge_a_schedule() {
+        let now = 1_700_000_000i64;
+        let interval = 600i64;
+
+        assert!(!schedule_due(now, now, interval), "just ran");
+        assert!(!schedule_due(now - interval + 1, now, interval), "not yet");
+        assert!(schedule_due(now - interval, now, interval), "exactly due");
+        assert!(schedule_due(0, now, interval), "never run is due");
+        assert!(
+            schedule_due(now + 1, now, interval),
+            "a stamp one second ahead is a clock correction, not a recent run"
+        );
+        assert!(
+            schedule_due(now + 86_400, now, interval),
+            "and a day ahead must not stall the task for a day"
+        );
+    }
+
+    /// The hop map refuses unseen hops once full, so it is the budget that
+    /// most needs sweeping. Leaving it out of the sweep turned a long session
+    /// deaf to every peer it had not already spoken to, until a restart.
+    #[test]
+    fn pruning_reclaims_hop_slots_so_a_full_map_admits_newcomers_again() {
+        let mut hops: HashMap<[u8; 16], VecDeque<Instant>> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..CHANNEL_GOSSIP_IN_PEER_CAP {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            hops.entry(id).or_default().push_back(start);
+        }
+        assert_eq!(
+            hops.len(),
+            CHANNEL_GOSSIP_IN_PEER_CAP,
+            "the map is full, which is where an unseen hop starts being refused"
+        );
+
+        // One hop is still talking to us; the rest went quiet two minutes ago.
+        let later = start + Duration::from_secs(120);
+        let mut busy = [0u8; 16];
+        busy[..8].copy_from_slice(&0u64.to_le_bytes());
+        hops.entry(busy).or_default().push_back(later);
+
+        prune_rate_windows(&mut hops, later, Duration::from_secs(60));
+        assert_eq!(hops.len(), 1, "only the hop still sending keeps its slot");
+        assert!(hops.contains_key(&busy));
     }
 
     /// Rotation is only an eviction if the member who was removed cannot open
@@ -3393,9 +4447,33 @@ mod tests {
         let data = vec![9u8; XFER_BLOCK_SIZE];
         let frame = encode_xfer_block_data(&K, &s, &t, &id, 1024, &data).unwrap();
         let body = opened(&frame);
-        let (gs, gt, gid, offset, got) = decode_xfer_block_data(&body).unwrap();
+        let (gs, gt, gid, offset, got) = decode_xfer_block_data(&K, &body).unwrap();
         assert_eq!((gs, gt, gid, offset), (s, t, id, 1024));
-        assert_eq!(got, &data[..]);
+        assert_eq!(got, data);
+
+        // The payload has to be unreadable to anyone but the recipient. Only the
+        // gossip envelope used to cover it, and that is sealed with the room's
+        // content key -- which every member holds, and which a public room
+        // derives from a pubkey anyone can look up.
+        let on_wire = &body[XFER_HEADER_LEN + 8..body.len()];
+        assert_ne!(
+            on_wire, &data[..],
+            "a block's bytes must not travel in the clear inside the room envelope"
+        );
+        assert_eq!(
+            frame.len(),
+            XFER_HEADER_LEN + 8 + data.len() + XFER_MAC_LEN,
+            "sealing must not grow the frame, or the unfragmented budget moves"
+        );
+
+        // Somebody else's pairwise key opens nothing, even though the room key
+        // got them this far.
+        let (_, _, _, _, wrong) = decode_xfer_block_data(&[0xAAu8; 32], &body).unwrap();
+        assert_ne!(wrong, data);
+
+        // Per offset, so two blocks of identical bytes do not share a keystream.
+        let other = encode_xfer_block_data(&K, &s, &t, &id, 2048, &data).unwrap();
+        assert_ne!(opened(&other), body);
 
         assert!(encode_xfer_block_data(&K, &s, &t, &id, 0, &[]).is_none());
         assert!(
@@ -3499,7 +4577,7 @@ mod tests {
         assert!(decode_xfer_cancel(&body).is_none());
         assert!(decode_xfer_offer(&body).is_none());
         assert!(decode_xfer_block_request(&body).is_none());
-        assert!(decode_xfer_block_data(&body).is_none());
+        assert!(decode_xfer_block_data(&K, &body).is_none());
         assert!(decode_xfer_done(&body).is_none());
         // And the retired attachment versions are not mistaken for transfers,
         // nor picked up by the dispatcher's peek.

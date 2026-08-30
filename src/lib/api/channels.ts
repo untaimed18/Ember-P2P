@@ -58,6 +58,30 @@ export interface ChannelMessageInfo {
   message: string;
   timestamp: number;
   read: boolean;
+  /** When the author last revised this line, or 0 if they never did. */
+  edited_at: number;
+  /**
+   * Wire identity of the line, shared by every member. Reactions and edits
+   * arriving from the network name a message this way — the local row id is
+   * meaningless to the peer that sent it — so the UI needs this to match them up.
+   */
+  msg_id: string;
+}
+
+/** Wire values for a reaction. `None` withdraws one. */
+export const REACTION_NONE = 0;
+export const REACTION_UP = 1;
+export const REACTION_DOWN = 2;
+export const REACTION_HEART = 3;
+
+/** Reaction tally for one line, counted by the backend. */
+export interface ChannelReactionInfo {
+  msg_id: string;
+  up: number;
+  down: number;
+  heart: number;
+  /** This device's own reaction, so its button can show as pressed. 0 is none. */
+  mine: number;
 }
 
 export interface ChannelInviteInfo {
@@ -179,11 +203,56 @@ export async function deleteChannelMessage(
   return invoke('delete_channel_message', { channelId, messageId });
 }
 
+/**
+ * Revise one of your own messages. Unlike deleting, this *does* propagate: the
+ * revision is signed and flooded, and every member checks for themselves that it
+ * came from the line's author and arrived inside the edit window.
+ *
+ * Members who were offline get it on their next catch-up. One who has had the
+ * original on screen past the window will keep showing what they were sent —
+ * there is no arbiter of time in a room, so refusing is the safe side.
+ */
+export async function editChannelMessage(
+  channelId: string,
+  messageId: number,
+  message: string,
+): Promise<ChannelMessageInfo> {
+  return invoke('edit_channel_message', { channelId, messageId, message });
+}
+
+/** Set or withdraw this device's reaction to a message. */
+export async function setChannelMessageReaction(
+  channelId: string,
+  messageId: number,
+  reaction: number,
+): Promise<void> {
+  return invoke('set_channel_message_reaction', { channelId, messageId, reaction });
+}
+
+/** Every live reaction tally in a room, in one read rather than one per bubble. */
+export async function getChannelReactions(
+  channelId: string,
+): Promise<ChannelReactionInfo[]> {
+  return invoke('get_channel_reactions', { channelId });
+}
+
 /** Walk the public index. Each shard is also emitted on `ember:channels-found`
  *  as it lands, so a caller can fill the list in rather than wait for the
- *  slowest walk; the resolved value is still the complete set. */
-export async function gatherChannels(): Promise<GatheredChannelInfo[]> {
-  return invoke('gather_channels');
+ *  slowest walk; the resolved value is still the complete set.
+ *
+ *  `walk` is echoed on every one of those events. Shards from a finished walk
+ *  can still arrive after the next one has started, and without a token there is
+ *  nothing to tell them apart — they merged into the newer walk's results as
+ *  though just found. The caller names the walk because the events begin before
+ *  this promise settles. */
+export async function gatherChannels(walk: string): Promise<GatheredChannelInfo[]> {
+  return invoke('gather_channels', { walk });
+}
+
+/** One `ember:channels-found` payload. */
+export interface GatheredChannelBatch {
+  walk: string;
+  channels: GatheredChannelInfo[];
 }
 
 /** What the last walk found, from the local cache and without touching the

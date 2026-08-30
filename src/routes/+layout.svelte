@@ -14,6 +14,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
@@ -231,6 +232,13 @@
       (stores[i].essential ? fatal : degraded).push(outcome.reason);
     }
     if (fatal.length > 0) throw fatal[0];
+    try {
+      const { getFriends } = await import('$lib/api/friends');
+      const list = await getFriends();
+      retainChatTabs(list.map((f) => f.user_hash));
+    } catch (e) {
+      console.warn('friends: chat-tab reconcile failed', e);
+    }
     return degraded;
   }
 
