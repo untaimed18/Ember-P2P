@@ -951,6 +951,7 @@
     <a href="#channels-start" class="toc-link toc-child">Getting Started</a>
     <a href="#channels-public" class="toc-link toc-child">Public vs Private</a>
     <a href="#channels-owner" class="toc-link toc-child">Running a Room</a>
+    <a href="#channels-messages" class="toc-link toc-child">Messages</a>
     <a href="#channels-files" class="toc-link toc-child">Sending Files</a>
     <a href="#channels-limits" class="toc-link toc-child">What to Expect</a>
   </div>
@@ -1142,7 +1143,7 @@
       </li>
       <li>
         <strong>Add Friends (optional)</strong><br>
-        <span style="color: var(--text-secondary)">Open the Friends page, share your <strong>Friend Code</strong>, and add theirs. Once mutual and online, you get end-to-end encrypted chat, remote file browsing, and priority upload slots. See <a href="#friends">Friends</a>.</span>
+        <span style="color: var(--text-secondary)">Open the Friends page, share your <strong>Friend Code</strong>, and add theirs. Adding somebody already gives them priority in your upload queue; once the two of you are mutual and online you also get end-to-end encrypted chat, remote file browsing, and friends-only shares. See <a href="#friends">Friends</a>.</span>
       </li>
       <li>
         <strong>Join a Channel (optional)</strong><br>
@@ -1197,7 +1198,7 @@
       <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>v2 Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
       <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. The chat UI shows an <strong>Encrypted</strong> badge; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
-      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, and send a file to one member at a time. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
+      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
       <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
     </ul>
 
@@ -1247,7 +1248,7 @@
     <ol class="steps-list">
       <li>
         <strong>The KAD rendezvous key</strong><br>
-        <span style="color: var(--text-secondary)">Ember nodes advertise themselves under one fixed KAD key, as an ordinary source record carrying their Noise public key. A node with a near-empty routing table simply runs a source lookup there. Nodes re-advertise every 5 hours, and only while reachable and already publishing something, so a node that shares nothing never generates publish traffic just to list itself.</span>
+        <span style="color: var(--text-secondary)">Ember nodes advertise themselves under one fixed KAD key, as an ordinary source record carrying their Noise public key. A node with a near-empty routing table simply runs a source lookup there. Nodes re-advertise every 5 hours, while they are reachable enough to be a useful first contact. Sharing a library is not required &mdash; a node that can answer a DHT ping is worth listing whether or not it publishes anything &mdash; but a firewalled node that cannot be reached directly is left out.</span>
       </li>
       <li>
         <strong>The KAD bridge</strong><br>
@@ -1321,7 +1322,7 @@
       <li><strong>Status</strong> &mdash; Off, Connecting, Connected, or No peers found. There is nothing to switch: the overlay reports what it is doing, it does not ask you to start it.</li>
       <li><strong>Peers and Published files</strong> &mdash; How many nodes you are in touch with, and how many of your shared files are findable.</li>
       <li><strong>Health checklist</strong> &mdash; Whether you are on the network, whether people can reach you <strong>directly</strong> or through a <strong>relay</strong>, and whether your shares are published.</li>
-      <li><strong>Technical details</strong> &mdash; Collapsed by default: your node ID and public keys, around twenty protocol counters (search hits and misses, store acks and failures, average replication, buddy publishes and forwards, malformed frames, observed address votes, EPX exchange stats, storage rejections), plus live tables of contacts, in-flight searches, and the keys this node is serving to others.</li>
+      <li><strong>Technical details</strong> &mdash; Collapsed by default: your node ID and public keys, the protocol counters (search hits and misses, store acks and failures, truncated and withheld answers, average replication, buddy publishes and forwards, malformed frames, version mismatches, observed address votes, EPX exchange stats, storage rejections), plus live tables of contacts, in-flight searches, and the keys this node is serving to others.</li>
     </ul>
 
     <h3 id="ember-limits">Current limits</h3>
@@ -1330,9 +1331,9 @@
       <li><strong>Bootstrap depends on eMule</strong> &mdash; A first run with KAD off and no servers cannot join, as described above.</li>
       <li><strong>Version mismatches are silent</strong> &mdash; Incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never appear in each other&rsquo;s routing tables.</li>
       <li><strong>Multi-keyword recall is approximate</strong> &mdash; See the note above.</li>
-      <li><strong>A busy keyword shows only a slice of what is out there</strong> &mdash; Each peer answers a keyword query with about as many records as fit in one packet, roughly five, and there is no way yet to ask it for the next page, so recall under a common word is bounded by how many peers the search walks. The same ceiling applies to publishing: one person may hold at most 45 entries under any single word across the whole network, so if you share 200 files that share a common word, not all of them are findable under it. 1.5.3 adds counters for how often this is actually biting, which is what decides whether we spend a protocol change on it.</li>
+      <li><strong>A busy keyword is answered a page at a time</strong> &mdash; One packet still only carries about five records, but a searcher can ask the same peer for the next page, up to eight follow-ups each, so recall under a common word is bounded by how many peers the search walks and how deep it pages rather than by one datagram. Publishing has its own ceiling: a key holds 1000 records and any one publisher at most 150 of them, matching KAD&rsquo;s numbers, so if you share far more than 150 files under one common word not all of them are findable under it. The Ember page counts how often an answer was truncated or records were withheld.</li>
       <li><strong>Gossip is unverified until it answers</strong> &mdash; A peer another node told us about is a lead, not a fact, until it replies directly. The Ember page, status bar, and Search readiness wait for a verified answer before calling the overlay connected, so a table full of gossip does not look like a successful join. Admission caps bound the damage, but there is no reputation scoring on gossip itself.</li>
-      <li><strong>Content still moves over eD2K</strong> &mdash; The native Ember transfer path is written but not switched on, so the eMule wire is still doing the actual file transfer.</li>
+      <li><strong>Library content still moves over eD2K</strong> &mdash; Ember finds the source; the bytes travel the eMule wire. The exception is a file sent between two members of a channel, which goes over the overlay itself (accept-first, up to 100 MB). Putting ordinary downloads on the same footing is the largest remaining piece.</li>
       <li><strong>Some paths are not yet exercised end to end</strong> &mdash; Notably publishing while firewalled through a buddy relay, and a cold join from an empty contact file with no KAD.</li>
     </ul>
   </section>
@@ -1345,7 +1346,7 @@
 
     <p>EPX is an Ember-exclusive extension to the eMule protocol that accelerates source discovery between Ember peers. It makes downloads faster whenever multiple Ember clients are present on the network.</p>
 
-    <p>EPX and the <a href="#ember">Ember Network</a> are separate things that are easy to confuse. EPX is an extra opcode on the <em>eMule</em> wire, exchanged with Ember peers you are already transferring with. The Ember Network is a whole overlay of its own, with its own DHT and its own encrypted transport. Both work independently: EPX still helps with the Ember Network switched off.</p>
+    <p>EPX and the <a href="#ember">Ember Network</a> are separate things that are easy to confuse. EPX is an extra opcode on the <em>eMule</em> wire, exchanged with Ember peers you are already transferring with. The Ember Network is a whole overlay of its own, with its own DHT and its own encrypted transport. Both work independently: EPX helps with any Ember peer you are transferring with, whether or not that peer is in your Ember DHT routing table. (The overlay itself is always on in this build; there is no switch to turn it off.)</p>
 
     <h3>How it works</h3>
     <p>When two Ember clients connect (during a download or upload), they exchange compact lists of the files they are currently downloading along with the sources they know about for each file. If the receiving peer is downloading one of those files, it immediately gains new sources it may not have found through KAD or ED2K peer exchange alone.</p>
@@ -1390,11 +1391,12 @@ peer_count    (u16 LE)
       <tbody>
         <tr><td>Max files per packet</td><td>200</td></tr>
         <tr><td>Max sources per file</td><td>100</td></tr>
-        <tr><td>Max payload size</td><td>64 KB</td></tr>
+        <tr><td>Max payload size</td><td>64 KB (TCP)</td></tr>
         <tr><td>Max packets per TCP connection</td><td>3</td></tr>
         <tr><td>Max total sources per event</td><td>2,000</td></tr>
       </tbody>
     </table>
+    <p>The 64 KB ceiling is the TCP path, which streams. UDP EPX has to fit inside a single Noise datagram, so it is packed to a much smaller budget &mdash; the same files and sources, just fewer of them per reply.</p>
 
     <h3 id="epx-compat">Backward Compatibility</h3>
     <p>Non-Ember eMule clients silently ignore the <code>0xF0</code> opcode &mdash; it causes no errors, disconnects, or side effects. EPX is only sent to confirmed Ember peers, and the extension uses a dedicated capability bit so it can never be accidentally triggered.</p>
@@ -1427,7 +1429,7 @@ peer_count    (u16 LE)
       <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.</li>
       <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline.</li>
       <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session (and optional Ember peer relay) when ordinary HighID or callback paths are unavailable&mdash;useful when both sides are behind difficult NAT.</li>
-      <li><strong>Priority Upload Slots</strong> &mdash; Mutual friends automatically receive priority in your upload queue, giving them faster access to your shared files.</li>
+      <li><strong>Priority Upload Slots</strong> &mdash; Anyone you have added as a friend gets priority in your upload queue on an authenticated Ember friend session, giving them faster access to your shared files. This one is deliberately one-sided: it costs you only queue position, so it does not wait on them adding you back. Friends-only shares and remote browse do.</li>
       <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Existing mutual friendships with that identity are removed when you block.</li>
       <li><strong>Optional Peer Relaying</strong> &mdash; <strong>Relay for other peers</strong> (Settings &gt; Network) lets peers who cannot reach each other directly route through you, which is what makes LowID&harr;LowID transfers work behind strict NATs when attestations allow. It spends your upload bandwidth on people you are not trading with, so you can turn it off.</li>
       <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your identity is registered and discoverable, and warns when presence registration failed so friends may not find you.</li>
@@ -1506,12 +1508,21 @@ peer_count    (u16 LE)
 
     <p>Every member, owner or not, can <strong>mute</strong> a room so it stops raising notifications, and <strong>ignore</strong> a member so their messages are hidden. Both are private to your device and are listed under Settings &gt; Channels, where you can undo them.</p>
 
+    <h3 id="channels-messages">Messages</h3>
+    <ul>
+      <li><strong>Edit your own message</strong> for 15 minutes after sending it. Every receiver checks the author&rsquo;s signature and both clocks itself, so &ldquo;only the author may edit&rdquo; is not something the sending client is trusted about. Members who were away are handed the corrected line rather than the original followed by a revision.</li>
+      <li><strong>React</strong> with a thumb up, a thumb down or a heart. One reaction per person per message, and changing yours replaces it.</li>
+      <li><strong>Remove a message from this device.</strong> Local only &mdash; the protocol has no way to unsend, so every other member keeps their copy. What it does guarantee is that the line stays gone here, including when another member replays it later.</li>
+      <li><strong>Mention a member</strong> by typing <code>@</code>, which completes handles from the room&rsquo;s member list.</li>
+    </ul>
+    <p>Edits and reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated.</p>
+
     <h3 id="channels-files">Sending files</h3>
-    <p>You can send a file to one member of a room at a time, up to <strong>100 MB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room. If both of you are firewalled the transfer needs a relay, and may not start at all.</p>
+    <p>You can send a file to one member of a room at a time, up to <strong>100 MB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload. If both of you are firewalled the transfer needs a relay, and may not start at all.</p>
 
     <h3 id="channels-limits">What to expect</h3>
     <div class="callout-warn callout">
-      <p><strong>Rooms have no forward secrecy.</strong> Everyone in a room shares one key. Someone who captures the traffic today and later obtains that key can read what was said. Rotating a private room&rsquo;s key protects future messages, not past ones.</p>
+      <p><strong>Room chat has no forward secrecy.</strong> Everyone in a room shares one key. Someone who captures the traffic today and later obtains that key can read what was said. Rotating a private room&rsquo;s key protects future messages, not past ones. File transfers are the exception: each one is sealed to the member you sent it to with a key only the two of you can derive, so the rest of the room cannot read the bytes even though they can see the traffic.</p>
     </div>
     <ul>
       <li><strong>Moderation is local.</strong> A ban stops honest clients from showing that member and stops them being served. It is not a network-level eviction, and someone running a modified client can ignore it.</li>
@@ -1604,7 +1615,7 @@ peer_count    (u16 LE)
     <h3>Disadvantages of a Low ID</h3>
     <ul>
       <li><strong>Peer Routing</strong> &mdash; Since your IP is not directly reachable, all requests must be routed through the server, increasing overhead.</li>
-      <li><strong>Reduced Sources</strong> &mdash; Two Low ID clients cannot connect to each other, leading to fewer available sources.</li>
+      <li><strong>Reduced Sources</strong> &mdash; On the ordinary eD2K path, two Low ID clients cannot connect to each other, so you see fewer sources. Ember can route around some of those cases through a peer relay, and mutual friends can use a Noise session without either side holding a High ID, but neither is a substitute for opening the port.</li>
       <li><strong>Lost Messages</strong> &mdash; On busy servers, messages can get lost, causing missed queue progression and slower downloads.</li>
     </ul>
 
@@ -1635,7 +1646,7 @@ peer_count    (u16 LE)
         <tr><th>Layer</th><th>Technology</th></tr>
       </thead>
       <tbody>
-        <tr><td>Frontend</td><td>Svelte 5 + TypeScript + Vite</td></tr>
+        <tr><td>Frontend</td><td>SvelteKit (Svelte 5) + TypeScript + Vite</td></tr>
         <tr><td>App Shell</td><td>Tauri v2</td></tr>
         <tr><td>Backend</td><td>Rust (2021 edition)</td></tr>
         <tr><td>Database</td><td>SQLite via rusqlite</td></tr>
@@ -1659,7 +1670,7 @@ peer_count    (u16 LE)
     <h3>Prerequisites</h3>
     <ul>
       <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.94+)</li>
-      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (18+)</li>
+      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (20.19+, 22.12+, or 24+)</li>
       <li><strong>Windows:</strong> Visual Studio Build Tools with C++ workload</li>
     </ul>
 
@@ -1672,7 +1683,7 @@ npm run tauri dev
 
 # Build for production
 npm run tauri build</code></pre>
-    <p>The production build produces NSIS and MSI installers in <code>src-tauri/target/release/bundle/</code>.</p>
+    <p>On Windows the production build produces NSIS and MSI installers in <code>src-tauri/target/release/bundle/</code>. A Linux build from the same tree produces a <code>.deb</code> and an AppImage locally, but official releases and in-app updates are Windows-only.</p>
 
     <h3>Project Structure</h3>
     <table class="doc-table">
@@ -1680,7 +1691,7 @@ npm run tauri build</code></pre>
         <tr><th>Directory</th><th>Description</th></tr>
       </thead>
       <tbody>
-        <tr><td><code>src/</code></td><td>Svelte frontend (components, stores, views)</td></tr>
+        <tr><td><code>src/</code></td><td>SvelteKit frontend (routes, components, stores)</td></tr>
         <tr><td><code>src-tauri/src/</code></td><td>Rust backend (protocol stack, networking, storage)</td></tr>
         <tr><td><code>src-tauri/Cargo.toml</code></td><td>Rust dependencies</td></tr>
         <tr><td><code>docs/</code></td><td>This documentation site</td></tr>
@@ -1825,6 +1836,102 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release for Windows, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-6-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.1" target="_blank" rel="noopener">Ember v1.6.1</a><span class="release-badge upcoming">Upcoming</span></h3>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.6.1" target="_blank" rel="noopener"><code>v1.6.1</code></a></p>
+      <div class="release-notes">
+        <p>Mostly repairs. Four of them lost or exposed something a user cannot get back: a file sent to one person in a room was readable by the whole room, and three separate paths could throw away your identity or your message history without saying so.</p>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Channels</h5>
+        <ul>
+          <li><strong>Edit your own message for fifteen minutes,</strong> so a typo does not sit in the room forever. Every receiver checks the author&rsquo;s signature and two clocks rather than trusting the sending client, and a member who was away is handed the corrected line rather than the original followed by a revision</li>
+          <li><strong>React to a message</strong> with a thumb up, a thumb down or a heart, so agreement no longer has to be written as a reply. Reactions travel as a batch, so a room you have been away from does not spend a packet on each one</li>
+          <li><strong>Names on every message and a proper room surface,</strong> rather than a handle only on the first line of a run</li>
+          <li><strong>Type <code>@</code> to complete a member&rsquo;s handle,</strong> so addressing somebody no longer means knowing how they spell it</li>
+          <li><strong>A marker for where you left off,</strong> and re-entering a busy room lands you on it instead of at the newest line</li>
+          <li><strong>A way back to the newest message</strong> when you have scrolled up, and a resend on a message that never left, so reading history no longer means silently missing lines and a failed send no longer means retyping it</li>
+          <li><strong>Links in a room are clickable</strong> behind a confirmation and a scheme check, and slow mode counts down in the composer rather than only refusing the send</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>File details open as a dialog</strong> rather than a pane pinned under the results, so opening one no longer scrolls the row you were reading off the bottom of the window</li>
+          <li><strong>Your own library appears immediately</strong> when you search, instead of waiting on the network round trip &mdash; and stopping the search no longer hides it</li>
+        </ul>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.6.1 and 1.6.0 see each other on the overlay normally. This is not the hard break 1.6.0 was; anything older than 1.6.0 is still invisible to both</li>
+          <li><strong>Channel file transfers only work between 1.6.1 peers.</strong> The old block format put the payload in reach of the whole room, so it is refused rather than reinterpreted. Offers and downloads between a 1.6.1 and a 1.6.0 client will not complete until both sides update</li>
+          <li><strong>Message edits and reactions only reach members who are also on 1.6.1.</strong> A 1.6.0 client does not recognise them and drops them rather than passing them on, so in a mixed room they travel only as far as the updated members can carry them between themselves. The message being edited is unaffected; older members simply keep showing the words it was sent with</li>
+          <li><strong>Turning UPnP on or off now asks for a restart</strong> instead of reporting a change the running app had not made. The setting is read once at startup, and restarting is also what removes an existing port mapping</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Security and your data</h5>
+        <ul>
+          <li><strong>A file sent to one member of a room was encrypted to the room, not to them.</strong> The blocks only ever travelled inside the gossip envelope, and that is sealed with the room&rsquo;s content key &mdash; which every member holds, and which a public room derives straight from the address in its own listing. So sending somebody a file put the bytes in reach of every member of a private room, and of any stranger who could find a public one, while the app said it was going to one person. Blocks are now encrypted to the recipient alone</li>
+          <li><strong>A profile that had only ever used rooms could have its message key replaced.</strong> The check that refuses to rotate a lost key only looked at direct messages, so a room-only profile read as having nothing encrypted &mdash; and a new key was generated and written over it, taking room history, private-room invites and room key history with it. Chat now locks and waits for the key to come back instead, and a check that cannot answer counts as a reason to stop rather than permission to continue</li>
+          <li><strong>A missing identity file could hand you a brand-new identity.</strong> If <code>identity.json</code> went missing while the marker beside it remained &mdash; which is what antivirus quarantining one encrypted file looks like &mdash; Ember generated a fresh keypair, resetting your KAD ID, user hash, Ember identity, friendships and upload credits. It now refuses and tells you what to restore</li>
+          <li><strong>An old data folder could overwrite the one in use.</strong> The one-time migration from Ember&rsquo;s previous data location ran on every launch, and a stale copy with a newer timestamp replaced the live file &mdash; identity, message key, or the database itself, which could be left paired with the wrong write-ahead log and then rebuilt empty. It now only fills in what is missing</li>
+          <li><strong>A download that was interrupted while verifying could finish unverified.</strong> Recovering from a crash re-checked the eD2K hash but skipped the stronger content hash a link can pin, which is the check that exists because the eD2K hash alone can be forged. Both are checked now, and a mismatch is final rather than retried forever</li>
+          <li><strong>Transfers with a member who has just been banned now stop.</strong> They ended when a moderator&rsquo;s message named somebody, but not when the owner&rsquo;s room settings did &mdash; which is how a device usually learns of an owner&rsquo;s ban, so a download from somebody who had just been evicted carried on, and so did an upload to them</li>
+          <li><strong>A stranger can no longer have their uploads charged to somebody else.</strong> The publishing allowance on the Ember DHT was tracked by network address, and an address can be claimed by anyone who mentions it &mdash; so one peer&rsquo;s traffic could exhaust another&rsquo;s allowance and get that person&rsquo;s own files refused</li>
+        </ul>
+
+        <h5>Channels</h5>
+        <ul>
+          <li><strong>Missed messages actually arrive now.</strong> Asking the room for history you missed was answered with the newest thirty-two lines every time, and storing them moved your place past everything still missing underneath &mdash; so a gap wider than thirty-two lines could never close, and those messages were gone from that device for good. Catch-up now works forward from the newest line you hold</li>
+          <li><strong>An edit made while you were away reaches you,</strong> and is drawn when it does. The revision used to be sent under the same identifier as the message it replaced, which is exactly the identifier every peer worth sending it to had already filed away, so it died in their duplicate filter &mdash; and if it did arrive for a line you had never seen, it was stored without ever being shown until the room was reopened</li>
+          <li><strong>Removing a message from this device keeps it removed.</strong> The next copy that came round the room put it straight back</li>
+          <li><strong>Members stop fading to offline while they are sitting in the room,</strong> and a newly claimed handle reaches the room instead of waiting out a republish interval</li>
+          <li><strong>A message reaches the whole room</strong> rather than the members nearest it in address space, and answering a catch-up or a file transfer no longer looks like flooding to the peer you are answering</li>
+          <li><strong>A muted room stays quiet.</strong> It still interrupted whatever page you were on to announce an incoming file, and it did the same for a member you had ignored</li>
+          <li><strong>Unread counts move while the window is hidden.</strong> With a room open behind a minimised window nothing counted, and coming back cleared it, so messages that arrived while you were away left no trace</li>
+          <li><strong>Room file transfers respect your upload limit.</strong> They were bounded only by the protocol&rsquo;s own pacing, so a configured limit did nothing for them and they went uncounted in the transfer statistics</li>
+          <li><strong>A repeated file offer cannot swap the file behind Accept.</strong> A second offer reusing the same transfer identifier replaced the first, so the prompt could describe one file while Accept fetched another</li>
+          <li><strong>Room settings survive closing the app.</strong> A pending key rotation and the notice that you had left a room were held in memory and lost by quitting at the wrong moment</li>
+          <li><strong>A failed send says so</strong> &mdash; including when you have already moved to another conversation, where it previously appeared nowhere at all &mdash; and no longer costs you a turn under slow mode or reverts your text on the next read. An owner-only invite switch that fails to save now goes back to what the room actually says, and removing a room from this device no longer hides it when the removal failed</li>
+        </ul>
+
+        <h5>Search, transfers and library</h5>
+        <ul>
+          <li><strong>A search result can no longer have its verified hash or its size overwritten</strong> by a later, less trustworthy sighting of the same file. Both are handed to the download when you click, so a size could arrive as zero and start a zero-byte transfer, and a content hash from a single anonymous claim could replace the one your own library knew was right</li>
+          <li><strong>Firewalled Ember users can be reached again.</strong> A LowID node published the wrong port for the peer relaying its callbacks, so eMule clients called back to a dead port: the source appeared in search results and then never connected</li>
+          <li><strong>Preview plays what has actually downloaded.</strong> It assembled every verified piece into a full-length file and left the gaps between them as silence, which players read as the real duration</li>
+          <li><strong>Names keep their bracketed tags,</strong> so <code>[PORTABLE]</code> and friends are no longer deleted from every filename before you see it, and a file is downloaded, reshared and published under the name it was actually shared as rather than the tidied label in the results list</li>
+          <li><strong>Unsharing or deleting a file withdraws it from the Ember DHT</strong> instead of leaving your own copies answering searches for it until they age out, which is what kept the published count above the shared count after every launch</li>
+          <li><strong>Cancelling a download cleans up after itself</strong> rather than leaving <code>.part</code> files behind in Temp, and Pause and Stop no longer skip the flush that makes a paused download resumable</li>
+          <li><strong>The Completed column and the speed reading tell the truth after a failed hash check,</strong> where they previously showed the bytes and the rate from before the download rewound</li>
+        </ul>
+
+        <h5>Friends</h5>
+        <ul>
+          <li><strong>One unusable friend entry no longer hides you from all of them.</strong> A single stored key that did not match its own identity made the whole list fail, and the failure was swallowed, so presence was advertised for nobody</li>
+          <li><strong>Pasting a friend code from somebody who has already asked accepts their request</strong> rather than creating a second one, remove and block still succeed once the entry is gone, and Ember advertises the port it actually listens on</li>
+          <li><strong>Disable Friend Browse no longer locks your own Browse button</strong> &mdash; hiding your share list is not the same as opting out of looking at theirs</li>
+        </ul>
+
+        <h5>Everywhere else</h5>
+        <ul>
+          <li><strong>Reading a long conversation is no longer interrupted by new messages arriving,</strong> which used to jump the view and drop the line you were reading once the room hit its display limit</li>
+          <li><strong>The Transfers queue and Known Clients tabs report a failure to load</strong> instead of showing an empty list, a bulk library action shows how far it has got, and a toast holds its countdown while it is being read</li>
+          <li><strong>The Friends setting describing the Verified badge now matches what earns one.</strong> It claimed an ordinary file transfer could earn it through an identity check that is in fact replayable; only proof of possession on the session counts</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.6.0...v1.6.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.6.0...v1.6.1</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-0">
       <div class="release-header">
