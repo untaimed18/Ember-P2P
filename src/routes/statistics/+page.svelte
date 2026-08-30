@@ -693,8 +693,7 @@
   .oh-srcex  { background: var(--warning); }
   .oh-freq   { background: var(--stat-ratio); }
   .oh-epx    { background: var(--ember-color); }
-  .oh-ember-dht { background: #00838f; }
-  :global([data-theme="dark"]) .oh-ember-dht { background: #4db6ac; }
+  .oh-ember-dht { background: var(--ember-dht-color); }
   .oh-empty {
     text-align: center;
     color: var(--text-muted);

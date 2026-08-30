@@ -5080,7 +5080,7 @@
   .tab-btn.active {
     background: linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--bg-secondary) 84%, var(--accent-dim)),
+      color-mix(in srgb, var(--bg-secondary) 88%, var(--accent)),
       var(--bg-primary)
     );
     border-color: var(--border);

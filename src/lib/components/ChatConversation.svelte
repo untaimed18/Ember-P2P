@@ -2488,7 +2488,7 @@
   }
 
   .bubble-edit-btn:hover {
-    background: rgb(0 0 0 / 18%);
+    background: color-mix(in srgb, currentColor 16%, transparent);
   }
 
   /* An edit marker belongs with the timestamp, not the text: it is metadata about

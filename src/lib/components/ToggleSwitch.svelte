@@ -91,7 +91,7 @@
     width: 18px;
     height: 18px;
     border-radius: 50%;
-    background: var(--bg-secondary);
+    background: var(--toggle-knob);
     box-shadow: var(--shadow-sm);
     transition: transform 0.2s ease;
   }

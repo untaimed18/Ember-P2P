@@ -449,7 +449,7 @@
 
   .dock-tab-close:hover {
     background: var(--danger);
-    color: #ffffff;
+    color: var(--on-danger);
   }
 
   .dock-new,

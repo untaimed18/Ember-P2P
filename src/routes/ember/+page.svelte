@@ -1243,9 +1243,9 @@
   }
 
   .banner-error {
-    background: color-mix(in srgb, var(--error, #e06a5f) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--error, #e06a5f) 35%, transparent);
-    color: var(--error, #e06a5f);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
   }
 
   .banner-warn {

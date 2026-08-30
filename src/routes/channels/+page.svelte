@@ -3858,6 +3858,10 @@
       transition: opacity var(--transition-slow) ease;
     }
 
+    :global([data-theme="dark"]) .members-backdrop {
+      background: var(--overlay-bg);
+    }
+
     .workspace.members-open .members-backdrop {
       opacity: 1;
       pointer-events: auto;

@@ -1121,7 +1121,7 @@
     transition: opacity 0.15s, background 0.12s, border-color 0.12s, color 0.12s;
   }
   .btn-remove:hover {
-    color: #ffffff;
+    color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
     opacity: 1;

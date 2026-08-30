@@ -348,7 +348,7 @@
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--accent-dim) 35%, transparent);
+    background: var(--accent-fill);
     color: var(--text-accent);
     font-size: 13px;
     font-weight: 700;

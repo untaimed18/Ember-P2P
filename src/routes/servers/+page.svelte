@@ -1172,7 +1172,7 @@
   }
 
   .server-remove:hover {
-    color: #ffffff;
+    color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
   }
@@ -1236,7 +1236,7 @@
   }
 
   .server-table tbody tr.selected {
-    background: color-mix(in srgb, var(--accent-dim) 72%, transparent);
+    background: var(--accent-fill);
   }
 
   .server-table tbody tr.connected td {

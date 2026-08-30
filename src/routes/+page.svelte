@@ -1844,7 +1844,7 @@
   }
 
   .cancel-btn:hover {
-    color: #ffffff;
+    color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
   }

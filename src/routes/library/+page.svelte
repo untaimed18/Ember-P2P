@@ -4155,7 +4155,7 @@
   }
   .tree-btn.tree-unshare:hover,
   .tree-btn.tree-unshare:focus-visible {
-    color: #ffffff;
+    color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
   }
@@ -4166,7 +4166,7 @@
   }
   .tree-btn.tree-remove:hover,
   .tree-btn.tree-remove:focus-visible {
-    color: #ffffff;
+    color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
   }
@@ -4586,7 +4586,7 @@
     background: var(--bg-hover);
   }
   .dupes-toggle.active {
-    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    background: var(--accent-fill);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
     color: var(--text-primary);
     font-weight: 600;
@@ -4616,7 +4616,7 @@
   /* --- Bulk action bar --- */
   .bulk-action-bar {
     border-top: 1px solid var(--border);
-    background: color-mix(in srgb, var(--accent-dim) 22%, var(--bg-secondary));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
     box-shadow: var(--shadow-up-sm);
     padding: 8px 14px;
     display: flex;
@@ -4826,7 +4826,7 @@
   .shared-status.is-shared {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 40%, transparent);
+    background: var(--accent-fill);
   }
   .activity-stats {
     display: grid;
@@ -5296,7 +5296,7 @@
   .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
   .format-option:has(input[type="radio"]:checked) {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
+    background: var(--accent-fill);
   }
   .format-label {
     display: flex;

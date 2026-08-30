@@ -3630,7 +3630,7 @@
   .search-tab.active .search-tab-meta {
     color: var(--text-accent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 58%, transparent);
+    background: var(--accent-fill);
   }
 
   .search-tab-spinner {
@@ -3660,7 +3660,7 @@
   }
 
   .search-tab.active .search-tab-actions {
-    background: color-mix(in srgb, var(--accent-dim) 28%, transparent);
+    background: var(--accent-fill);
   }
 
   .search-tab-action {
@@ -3705,7 +3705,7 @@
 
   .search-tab-close:hover,
   .search-tab-close:focus-visible {
-    color: #ffffff;
+    color: var(--on-danger);
     background: var(--danger);
     outline-color: var(--danger);
   }
@@ -4068,7 +4068,7 @@
     align-items: center;
     gap: 10px;
     padding: 8px 20px;
-    background: color-mix(in srgb, var(--accent-dim) 30%, var(--bg-secondary));
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
   }
 
@@ -4117,7 +4117,7 @@
   }
 
   :global(tr.row-checked td) {
-    background: color-mix(in srgb, var(--accent-dim) 25%, transparent) !important;
+    background: var(--accent-fill) !important;
   }
 
   .col-check {
@@ -4385,7 +4385,7 @@
   }
 
   .source-count.high-sources {
-    background: var(--accent-dim);
+    background: var(--accent-fill);
     color: var(--text-accent);
   }
 
@@ -4806,7 +4806,7 @@
 
   .filter-toggle:has(input:checked) {
     border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
-    background: color-mix(in srgb, var(--accent-dim) 38%, transparent);
+    background: var(--accent-fill);
     color: var(--text-primary);
   }
 
