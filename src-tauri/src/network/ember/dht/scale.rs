@@ -31,7 +31,12 @@ const BOOTSTRAP_CONTACTS: usize = K_BUCKET_SIZE / 2;
 const ESTABLISHED_CONTACTS: usize = K_BUCKET_SIZE * 4;
 
 /// How permissive the DHT's abuse limits currently are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered by strictness, so `Established > Small > Bootstrap`. Variant order
+/// is load-bearing: [`super::routing::RoutingTable::enforce_scale_quotas`]
+/// compares tiers to decide whether the limits have tightened since it last
+/// pruned the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NetworkScale {
     /// Nearly empty table: accept almost anything so we can get connected.
     Bootstrap,

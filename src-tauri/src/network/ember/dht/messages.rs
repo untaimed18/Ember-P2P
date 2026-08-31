@@ -1468,6 +1468,15 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
                 anyhow::bail!("FIND_VALUE empty");
             }
             let count = data[0] as usize;
+            if count == 0 {
+                // A lookup for nothing. The engine reads `keys[0]` as the key to
+                // serve and had no target to fall back on but its own id, so an
+                // empty request was answered with our closest contacts to
+                // ourselves — a `FIND_NODE` under another name, and one no
+                // builder here can produce. Malformed at the decoder is where
+                // that belongs.
+                anyhow::bail!("FIND_VALUE carries no keys");
+            }
             if count > MAX_FIND_VALUE_KEYS {
                 anyhow::bail!("FIND_VALUE keys count {count} exceeds max {MAX_FIND_VALUE_KEYS}");
             }
@@ -2401,6 +2410,25 @@ mod tests {
         assert!(
             decode_payload(MSG_FIND_VALUE, &full[..full.len() - 2]).is_err(),
             "an absent position must not decode as zero"
+        );
+    }
+
+    /// A lookup for nothing. No builder here can produce one, and the engine
+    /// reads `keys[0]` as the key to serve — with nothing to fall back on but
+    /// its own id, so an empty request was answered with our closest contacts
+    /// to ourselves. That is a `FIND_NODE` wearing another opcode, and it
+    /// belongs in the decoder's refusals with every other malformed frame.
+    #[test]
+    fn a_find_value_with_no_keys_is_refused() {
+        let (_, id) = test_keypair();
+        let one_key = encode_payload(&build_find_value(id, 1, vec![[0xA1; 16]], 0).payload);
+        assert!(decode_payload(MSG_FIND_VALUE, &one_key).is_ok());
+
+        // The same frame with its key run removed: count 0, then the position.
+        let empty = [0u8, 0u8, 0u8];
+        assert!(
+            decode_payload(MSG_FIND_VALUE, &empty).is_err(),
+            "a keyless FIND_VALUE must not decode"
         );
     }
 

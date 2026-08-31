@@ -75,6 +75,13 @@ const MAX_PROXY_FORWARDS_PER_SENDER: usize = 24;
 const CALLBACK_CLIENT_TTL: Duration = Duration::from_secs(6 * 3600);
 /// Bound on remembered `PROXY_STORE` publishers we will callback-relay for.
 const MAX_CALLBACK_CLIENTS: usize = 256;
+/// Files remembered per callback client, against [`CallbackClient::files`].
+///
+/// One firewalled publisher proxies a tick's worth of source records through a
+/// single buddy, so this has to cover a publish round rather than a single
+/// file; past it the least recently proxied file is forgotten and its searchers
+/// fall back to the park path, exactly as they would once the record expired.
+const MAX_CALLBACK_FILES_PER_CLIENT: usize = 64;
 /// `CALLBACK_REQ`s we will bounce per searcher per minute.
 const MAX_CALLBACK_FORWARDS_PER_SENDER: usize = 8;
 const MAX_CALLBACK_FORWARDS_IN_FLIGHT: usize = 32;
@@ -301,6 +308,22 @@ struct CallbackClient {
     addr: SocketAddr,
     noise_pub: [u8; 32],
     last_seen: Instant,
+    /// Files we actually proxied for this publisher, and the token its signed
+    /// trailer named for each. A `CALLBACK_REQ` is bounced only when it matches
+    /// an entry here.
+    ///
+    /// Without it the only question asked was whether the publisher had ever
+    /// used us, so any peer holding a Noise session could name a file we never
+    /// carried — or a token we never published — and still have us wake the
+    /// publisher with a frame it was always going to refuse. The token is the
+    /// publisher's own secret (`callback_token`), so we cannot derive it; we
+    /// can only remember the one it asked us to relay, which is exactly what
+    /// the searcher copies out of the record.
+    ///
+    /// Keyed by file hash, holding that file's token and when we last proxied
+    /// it, so the per-client cap can drop the stalest file rather than an
+    /// arbitrary one.
+    files: HashMap<[u8; 16], ([u8; 16], Instant)>,
 }
 
 /// What happened to one record offered to the local store.
@@ -661,14 +684,29 @@ impl EmberDht {
     /// publisher cannot name us without having asked, and cannot name us at an
     /// endpoint we did not choose.
     ///
-    /// A trailer with no endorsement falls back to the older rule: identity is
-    /// the Noise static, not the eD2K/STUN `(ip, udp)` self-view, because a
-    /// pre-endorsement publisher writes the buddy's *observed* Ember UDP
-    /// `contact.addr`, which can differ from ours when HighID TCP and the UDP
-    /// mapping are not the same endpoint. Requiring byte-equality of those
-    /// rejected honest LowID `PROXY_STORE` and, with overlay STORE skipped
-    /// until ACK, blocked firewalled source publish entirely. Naming another
-    /// node's key was, and is, refused.
+    /// An endorsement is now required, where a trailer naming only our Noise
+    /// static used to be enough.
+    ///
+    /// That fallback existed for publishers whose build predated the
+    /// endorsement, and it was never real consent: the Noise static is on every
+    /// signed frame we send, so anyone who had ever heard from us could name us
+    /// without asking. What it bought them was a replica, a fan-out to twenty
+    /// k-closest nodes, and a `callback_clients` slot.
+    ///
+    /// It buys the honest case nothing any more, which is what makes removing
+    /// it free rather than a trade. The endorsement trailer landed before
+    /// [`super::EMBER_DHT_VERSION`] went to 4, so every peer that can complete a
+    /// frame exchange with us also speaks endorsements — and no v4 searcher will
+    /// dial an unendorsed record regardless, because
+    /// [`super::publish::DiscoveredSource::takes_callback`] requires
+    /// `has_identity()`. Proxying one therefore produced a record nobody could
+    /// use, at our expense.
+    ///
+    /// A publisher pairing with us for the first time sends
+    /// `BUDDY_ENDORSE_REQ` on the same tick as its first `PROXY_STORE`, so that
+    /// first proxy is refused here. It costs one publish tick: answering the
+    /// endorsement is not gated on the proxy budget, and absorbing it
+    /// reschedules the publisher's source set, which then arrives endorsed.
     fn trailer_names_us(&self, contact: Option<&SourceContact>, publisher: EmberNodeId, now: i64) -> bool {
         let Some(sc) = contact else {
             return false;
@@ -679,11 +717,8 @@ impl EmberDht {
         if !self.advertises_buddy_endpoint() || !buddy.is_routable() {
             return false;
         }
-        if buddy.has_identity() {
-            return buddy.ed25519_pub == self.signing_key.verifying_key().to_bytes()
-                && buddy.endorsement_covers(&publisher.0, now);
-        }
-        buddy.noise_pub == self.local_noise_pub
+        buddy.ed25519_pub == self.signing_key.verifying_key().to_bytes()
+            && buddy.endorsement_covers(&publisher.0, now)
     }
 
     /// Our 128-bit DHT node ID.
@@ -801,6 +836,12 @@ impl EmberDht {
     /// [`RoutingTable::promote_cached_contacts`].
     pub fn promote_cached_contacts(&mut self) -> usize {
         self.routing.promote_cached_contacts()
+    }
+
+    /// Demote residents a tightened diversity tier would no longer admit. See
+    /// [`RoutingTable::enforce_scale_quotas`].
+    pub fn enforce_scale_quotas(&mut self) -> usize {
+        self.routing.enforce_scale_quotas()
     }
 
     /// Insert a contact directly (manual harness seeding). Returns
@@ -1071,27 +1112,46 @@ impl EmberDht {
         record: &SignedRecord,
         now: Instant,
     ) -> bool {
-        if !self.store_proxy_replica(record) {
+        if !self.store_proxy_replica(record, from) {
             return false;
         }
         if !self.accept_proxy_forward(publisher, now) {
             return false;
         }
-        self.remember_callback_client(publisher, from, remote_noise_pub, now);
+        self.remember_callback_client(
+            publisher,
+            from,
+            remote_noise_pub,
+            record.file_hash,
+            record.source_contact.and_then(|sc| sc.callback_token),
+            now,
+        );
         true
     }
 
     /// Named-buddy replica: skip the k-closest proximity gate. We accepted
     /// `PROXY_STORE` because the trailer named us, so FIND_VALUE walking this
     /// node must not answer FOUND_NODE.
-    pub fn store_proxy_replica(&mut self, record: &SignedRecord) -> bool {
+    ///
+    /// Attributed to the sender exactly as the overlay `STORE_RECORD` path
+    /// attributes one. Every record that reaches here is a firewalled source,
+    /// which is the case whose declared address nothing verifies — so filing it
+    /// unattributed let the per-IP source cap count the address in the body,
+    /// and one publisher varying an invented address per record could take
+    /// every source slot on the key it asked us to hold.
+    pub fn store_proxy_replica(&mut self, record: &SignedRecord, from: SocketAddr) -> bool {
         self.sync_store_scale();
-        self.store.store(
+        let attributed_ip = match from.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        };
+        self.store.store_attributed(
             record.keyword_hash,
             record.data.clone(),
             record.signature,
             record.publisher_key,
             record.timestamp,
+            attributed_ip,
         )
     }
 
@@ -1103,13 +1163,21 @@ impl EmberDht {
         self.store.drop_publisher_files(&publisher, file_hashes)
     }
 
-    /// Remember that we just `PROXY_STORE`d for `publisher`, so a later
-    /// `CALLBACK_REQ` naming them can be bounced to `addr`.
+    /// Remember that we just `PROXY_STORE`d `file_hash` for `publisher`, so a
+    /// later `CALLBACK_REQ` naming that file can be bounced to `addr`.
+    ///
+    /// `token` is the one the publisher wrote into the record's signed trailer.
+    /// A record without one is a pre-token (v1) trailer, which
+    /// [`super::publish::DiscoveredSource::takes_callback`] already refuses to
+    /// dial, so there is no bounce to authorise and nothing is remembered for
+    /// that file.
     fn remember_callback_client(
         &mut self,
         publisher: EmberNodeId,
         addr: SocketAddr,
         noise_pub: [u8; 32],
+        file_hash: [u8; 16],
+        token: Option<[u8; 16]>,
         now: Instant,
     ) {
         self.callback_clients
@@ -1126,14 +1194,64 @@ impl EmberDht {
                 self.callback_clients.remove(&oldest);
             }
         }
-        self.callback_clients.insert(
-            publisher,
-            CallbackClient {
+        // Updated in place rather than replaced: the entry carries every file
+        // this publisher has proxied through us, and a fan-out is one
+        // `PROXY_STORE` per file, so overwriting it would leave only the last
+        // record of a tick bounceable.
+        let client = self
+            .callback_clients
+            .entry(publisher)
+            .or_insert_with(|| CallbackClient {
                 addr,
                 noise_pub,
                 last_seen: now,
-            },
-        );
+                files: HashMap::new(),
+            });
+        client.addr = addr;
+        client.noise_pub = noise_pub;
+        client.last_seen = now;
+        let Some(token) = token.filter(|t| *t != [0u8; 16]) else {
+            return;
+        };
+        if client.files.len() >= MAX_CALLBACK_FILES_PER_CLIENT
+            && !client.files.contains_key(&file_hash)
+        {
+            if let Some(stalest) = client
+                .files
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(hash, _)| *hash)
+            {
+                client.files.remove(&stalest);
+            }
+        }
+        client.files.insert(file_hash, (token, now));
+    }
+
+    /// Whether a `CALLBACK_REQ` naming `publisher` and `file_hash` is one we
+    /// agreed to relay, and where to send it if so.
+    ///
+    /// The token is checked because it is the only part of the request that a
+    /// searcher cannot have invented: it lives in the publisher's signed
+    /// trailer, so echoing it proves the sender actually read a record we
+    /// proxied. Matching on the publisher alone let any peer with a session
+    /// spend our forward budget on frames the publisher would refuse.
+    fn callback_relay_target(
+        &self,
+        publisher: EmberNodeId,
+        file_hash: [u8; 16],
+        token: [u8; 16],
+        now: Instant,
+    ) -> Option<(SocketAddr, [u8; 32])> {
+        if token == [0u8; 16] {
+            return None;
+        }
+        let client = self.callback_clients.get(&publisher)?;
+        if now.saturating_duration_since(client.last_seen) >= CALLBACK_CLIENT_TTL {
+            return None;
+        }
+        let (expected, _) = client.files.get(&file_hash)?;
+        (*expected == token).then_some((client.addr, client.noise_pub))
     }
 
     /// Remember that we sent `PROXY_STORE` `request_id` to `buddy`. A later
@@ -2229,14 +2347,15 @@ impl EmberDht {
                 // Searcher's IP comes from the datagram, never the payload:
                 // a claimed address would let anyone aim the publisher at a
                 // third party. The token is copied through so the publisher
-                // can bind connect-back to a file it asked us to proxy.
+                // can bind connect-back to a file it asked us to proxy — and
+                // checked here first, against the file this publisher actually
+                // asked us to relay, so the bounce itself cannot be spent on a
+                // file or token we never carried.
                 let now = Instant::now();
                 if let std::net::IpAddr::V4(searcher_ip) = from.ip() {
                     if Self::callback_dest_ok(searcher_ip, searcher_tcp_port) {
-                        let client = self.callback_clients.get(&publisher_id).and_then(|c| {
-                            (now.saturating_duration_since(c.last_seen) < CALLBACK_CLIENT_TTL)
-                                .then_some((c.addr, c.noise_pub))
-                        });
+                        let client =
+                            self.callback_relay_target(publisher_id, file_hash, callback_token, now);
                         if let Some((dest, noise)) = client {
                             if self.accept_callback_forward(msg.sender_id, now) {
                                 let rid = self.next_request_id();
@@ -4539,12 +4658,15 @@ mod tests {
         assert!(on_buddy.responses.is_empty());
     }
 
-    /// A publisher from before endorsements existed writes the buddy's
-    /// *observed* address, which can differ from the buddy's own view of
-    /// itself. That trailer is still accepted on the Noise static alone, so the
-    /// upgrade does not strand honest older peers.
+    /// Naming our Noise static used to be consent enough, for publishers whose
+    /// build predated the endorsement. It was never much of a check — that key
+    /// is on every signed frame we send — and under wire v4 it protects nobody:
+    /// the endorsement shipped before v4, so a peer that can reach us at all
+    /// speaks it, and no v4 searcher dials an unendorsed record anyway. All the
+    /// fallback could still do was spend a replica, a twenty-node fan-out and a
+    /// callback slot on a record nobody would use.
     #[test]
-    fn proxy_store_accepts_an_unendorsed_trailer_naming_our_noise() {
+    fn proxy_store_refuses_a_trailer_that_carries_no_endorsement() {
         let mut publisher = dht(80);
         let mut buddy = dht(81);
         let pub_noise = publisher.local_noise_pub;
@@ -4552,11 +4674,11 @@ mod tests {
 
         let mut contact = firewalled_contact_at(80);
         contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
-        // Observed Ember UDP (10.x) ≠ advertised STUN/HighID (8.8.8.81).
+        // Correct Noise static, no identity key and so no endorsement.
         contact.buddy = Some(SourceBuddy {
             ip: std::net::Ipv4Addr::new(8, 8, 4, 81),
             udp_port: 4672,
-            noise_pub: [81; 32],
+            noise_pub: buddy.local_noise_pub,
             ed25519_pub: [0u8; 32],
             endorsed_until: 0,
             endorsement: [0u8; 64],
@@ -4569,8 +4691,25 @@ mod tests {
         );
         let on_buddy = buddy.handle_message(&frame, pub_addr, pub_noise, 2000);
         assert!(
-            on_buddy.proxy_store_forward.is_some(),
-            "honest pre-endorsement publish must survive HighID-IP ≠ Ember-UDP-addr"
+            on_buddy.proxy_store_forward.is_none(),
+            "knowing our public Noise key is not permission to publish through us"
+        );
+
+        // The same publisher, once we have endorsed an endpoint for it, is
+        // accepted — so this is a consent requirement and not a closed door.
+        let endorsed = firewalled_for_buddy(80, &mut publisher, &mut buddy, 2000);
+        let record = publisher.build_source_record([3u8; 16], [0u8; 32], 42, "nat.mkv", endorsed);
+        let (_rid, frame) = publisher.build_proxy_store(
+            record.keyword_hash,
+            record.data.clone(),
+            record.signature,
+        );
+        assert!(
+            buddy
+                .handle_message(&frame, pub_addr, pub_noise, 2001)
+                .proxy_store_forward
+                .is_some(),
+            "an endorsement we signed is what makes the same publisher welcome"
         );
     }
 
@@ -4721,16 +4860,22 @@ mod tests {
         let pub_addr = addr(90, 4672);
         let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
 
-        let contact = firewalled_for_buddy(90, &mut publisher, &mut buddy, 2000);
-        let record = publisher.build_source_record([9u8; 16], [0u8; 32], 1, "fw.mkv", contact);
+        let file_hash = [9u8; 16];
+        let token = publisher.callback_token(&file_hash);
+        // The trailer carries the token whenever it names a buddy, exactly as
+        // the publish path writes it — the buddy authorises a bounce against
+        // this value, so a fixture without one is not a record production
+        // could emit.
+        let contact = SourceContact {
+            callback_token: Some(token),
+            ..firewalled_for_buddy(90, &mut publisher, &mut buddy, 2000)
+        };
+        let record = publisher.build_source_record(file_hash, [0u8; 32], 1, "fw.mkv", contact);
         let (proxy_rid, proxy) =
             publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(commit_inbound_proxy(
             &mut buddy, &proxy, pub_addr, pub_noise, 2000
         ));
-
-        let file_hash = [9u8; 16];
-        let token = publisher.callback_token(&file_hash);
         let (_rid, req) = searcher.build_callback_req(
             publisher.local_id(),
             file_hash,
@@ -4761,6 +4906,200 @@ mod tests {
         assert_eq!(connect.dest_port, 4662);
         assert_eq!(connect.file_hash, file_hash);
         assert_eq!(connect.user_hash, Some([0x11u8; 16]));
+    }
+
+    /// Being in `callback_clients` was once the whole test, so any peer holding
+    /// a Noise session could name a publisher that had used us and have us wake
+    /// it for a file we never carried, or with a token we never published. The
+    /// publisher refuses those, so the cost lands entirely on the relay: our
+    /// forward budget, and a frame at a peer that was always going to drop it.
+    #[test]
+    fn a_bounce_is_refused_for_a_file_or_token_we_never_proxied() {
+        let mut publisher = dht(130);
+        let mut buddy = dht(131);
+        let mut searcher = dht(132);
+        let pub_noise = publisher.local_noise_pub;
+        let searcher_noise = searcher.local_noise_pub;
+        let pub_addr = addr(130, 4672);
+        let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
+
+        let proxied = [9u8; 16];
+        let token = publisher.callback_token(&proxied);
+        let contact = SourceContact {
+            callback_token: Some(token),
+            ..firewalled_for_buddy(130, &mut publisher, &mut buddy, 2000)
+        };
+        let record = publisher.build_source_record(proxied, [0u8; 32], 1, "fw.mkv", contact);
+        let (_rid, proxy) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(commit_inbound_proxy(
+            &mut buddy, &proxy, pub_addr, pub_noise, 2000
+        ));
+
+        // A file this publisher never asked us to carry.
+        let (_rid, other_file) = searcher.build_callback_req(
+            publisher.local_id(),
+            [0xEEu8; 16],
+            4662,
+            0,
+            [0x11u8; 16],
+            publisher.callback_token(&[0xEEu8; 16]),
+        );
+        assert!(
+            buddy
+                .handle_message(&other_file, searcher_addr, searcher_noise, 2001)
+                .callback_forward
+                .is_none(),
+            "only files this publisher proxied through us are bounceable"
+        );
+
+        // The right file, with a token that was never in its trailer. A
+        // searcher can only have read the real one out of the record.
+        let (_rid, bad_token) = searcher.build_callback_req(
+            publisher.local_id(),
+            proxied,
+            4662,
+            0,
+            [0x11u8; 16],
+            [0x77u8; 16],
+        );
+        assert!(
+            buddy
+                .handle_message(&bad_token, searcher_addr, searcher_noise, 2002)
+                .callback_forward
+                .is_none(),
+            "the token proves the sender actually read the record we proxied"
+        );
+
+        // A zero token is the pre-token trailer, which no searcher dials.
+        let (_rid, zero_token) =
+            searcher.build_callback_req(publisher.local_id(), proxied, 4662, 0, [0u8; 16], [0u8; 16]);
+        assert!(
+            buddy
+                .handle_message(&zero_token, searcher_addr, searcher_noise, 2003)
+                .callback_forward
+                .is_none()
+        );
+
+        // And the real request still works, so none of the above is a blanket
+        // refusal.
+        let (_rid, good) = searcher.build_callback_req(
+            publisher.local_id(),
+            proxied,
+            4662,
+            0,
+            [0x11u8; 16],
+            token,
+        );
+        assert!(buddy
+            .handle_message(&good, searcher_addr, searcher_noise, 2004)
+            .callback_forward
+            .is_some());
+    }
+
+    /// A fan-out is one `PROXY_STORE` per file, so the client entry has to
+    /// accumulate them. Replacing it wholesale left only the last record of a
+    /// publish tick bounceable.
+    #[test]
+    fn every_file_of_a_publish_tick_stays_bounceable() {
+        let mut publisher = dht(133);
+        let mut buddy = dht(134);
+        let mut searcher = dht(135);
+        let pub_noise = publisher.local_noise_pub;
+        let searcher_noise = searcher.local_noise_pub;
+        let pub_addr = addr(133, 4672);
+        let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
+        let base = firewalled_for_buddy(133, &mut publisher, &mut buddy, 2000);
+
+        let files: Vec<[u8; 16]> = (1..=3u8).map(|i| [i; 16]).collect();
+        for file_hash in &files {
+            let contact = SourceContact {
+                callback_token: Some(publisher.callback_token(file_hash)),
+                ..base
+            };
+            let record = publisher.build_source_record(*file_hash, [0u8; 32], 1, "fw.mkv", contact);
+            let (_rid, proxy) = publisher.build_proxy_store(
+                record.keyword_hash,
+                record.data.clone(),
+                record.signature,
+            );
+            assert!(commit_inbound_proxy(
+                &mut buddy, &proxy, pub_addr, pub_noise, 2000
+            ));
+        }
+
+        for file_hash in &files {
+            let (_rid, req) = searcher.build_callback_req(
+                publisher.local_id(),
+                *file_hash,
+                4662,
+                0,
+                [0x11u8; 16],
+                publisher.callback_token(file_hash),
+            );
+            assert!(
+                buddy
+                    .handle_message(&req, searcher_addr, searcher_noise, 2001)
+                    .callback_forward
+                    .is_some(),
+                "every file of the tick has to stay bounceable, not just the last"
+            );
+        }
+    }
+
+    /// The overlay `STORE_RECORD` path attributes a firewalled source to the
+    /// peer that sent it, because nothing verifies the address the record
+    /// declares. The buddy's own replica took the same records and filed them
+    /// unattributed, so the per-IP source cap counted the *claimed* address and
+    /// one publisher varying it per record could take the whole key it had just
+    /// asked us to hold.
+    #[test]
+    fn a_proxy_replica_is_attributed_to_the_publisher_that_sent_it() {
+        let mut buddy = dht(137);
+        let file_hash = [0x5Au8; 16];
+        let key = source_key(&file_hash);
+
+        // Records under a source key dedupe on `(publisher, file)`, so crowding
+        // one takes a keypair per record — which is what the per-IP cap is for,
+        // and what makes it the only thing standing between one host and the
+        // whole key. Each identity declares a different invented address; all of
+        // them arrive from the same peer.
+        let attacker = addr(136, 4672);
+        let sybils = 12u8;
+        for i in 1..=sybils {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[0xC0 + i; 32]);
+            let contact = SourceContact {
+                ip: Ipv4Addr::new(203, 0, 113, i),
+                flags: SOURCE_FLAG_FIREWALLED,
+                ..source_contact_at(i)
+            };
+            let record =
+                SignedRecord::source(file_hash, [0u8; 32], 1, "fw.mkv", contact, &sk);
+            buddy.store_proxy_replica(&record, attacker);
+        }
+
+        let held = buddy.local_records(&key, &[]).len();
+        let loosest = super::super::scale::NetworkScale::Bootstrap.max_sources_per_ip();
+        assert!(
+            held <= loosest,
+            "the sender's own address is what the cap has to count: {held} of \
+             {sybils} resident against an allowance of {loosest}"
+        );
+
+        // Not a per-key freeze: another host publishing the same file still gets
+        // its own allowance.
+        let honest = ed25519_dalek::SigningKey::from_bytes(&[0x0F; 32]);
+        let contact = SourceContact {
+            ip: Ipv4Addr::new(198, 51, 100, 4),
+            flags: SOURCE_FLAG_FIREWALLED,
+            ..source_contact_at(9)
+        };
+        let record =
+            SignedRecord::source(file_hash, [0u8; 32], 1, "fw.mkv", contact, &honest);
+        assert!(
+            buddy.store_proxy_replica(&record, addr(200, 4672)),
+            "a different host's replica must still be accepted"
+        );
     }
 
     #[test]

@@ -4208,119 +4208,36 @@ mod friend_transfer_tests {
         assert!(ember_tcp_firewalled_from(true, FirewallStatus::Unknown));
     }
 
-    /// The compatibility trailer for a network that has not upgraded: the
-    /// buddy's observed address, carrying no endorsement. It must still be a
-    /// routable IPv4 endpoint, and it must never satisfy the dial gate — that
-    /// combination is what makes publishing it safe to do and safe to receive.
+    /// A buddy that never endorsed the endpoint is not a callback destination.
+    ///
+    /// This used to be half of a pair: the other test pinned the compatibility
+    /// trailer we published for peers too old to endorse. That trailer is gone —
+    /// it shipped before wire v4, so every peer that can still reach us speaks
+    /// endorsements, and a current build parks the source either way. What
+    /// remains is the dial gate, which is the half that still has to hold: an
+    /// unendorsed buddy can arrive from anywhere, and must never be dialled.
     #[test]
-    fn the_unendorsed_fallback_trailer_is_routable_but_never_dialled() {
-        use std::net::{IpAddr, SocketAddr};
-        let ok = ember::dht::EmberContact {
-            node_id: ember::dht::EmberNodeId([1u8; 16]),
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 4672),
-            noise_pub: [0x11; 32],
-            ed25519_pub: [0x22; 32],
-            last_seen: 1,
-            failed_queries: 0,
-        };
-        let buddy = ember_unendorsed_source_buddy(&ok).expect("a routable contact is nameable");
-        assert_eq!(buddy.ip, Ipv4Addr::new(8, 8, 4, 4));
-        assert_eq!(buddy.udp_port, 4672);
-        assert_eq!(buddy.noise_pub, ok.noise_pub);
-        assert!(
-            !buddy.has_identity(),
-            "the fallback carries no key, so no searcher on this build will dial it"
-        );
-
+    fn an_unendorsed_buddy_is_never_dialled() {
         let src = ember::dht::publish::DiscoveredSource {
             ip: Ipv4Addr::new(10, 0, 0, 9),
             tcp_port: 4662,
             udp_port: 4672,
             flags: ember::SOURCE_FLAG_FIREWALLED,
             user_hash: Some([0xCCu8; 16]),
-            buddy: Some(buddy),
+            buddy: Some(ember::dht::publish::SourceBuddy {
+                ip: Ipv4Addr::new(8, 8, 4, 4),
+                udp_port: 4672,
+                noise_pub: [0x11; 32],
+                ed25519_pub: [0u8; 32],
+                endorsed_until: 0,
+                endorsement: [0u8; 64],
+            }),
             callback_token: Some([0xDDu8; 16]),
             publisher_id: [0xAAu8; 16],
         };
-        assert!(!ember_source_uses_callback(&src, false, false, true, 1_000));
-
-        for (why, addr) in [
-            ("LAN", SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4672)),
-            (
-                "TEST-NET",
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 4672),
-            ),
-            (
-                "port 0",
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 0),
-            ),
-            (
-                "IPv6",
-                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 4672),
-            ),
-        ] {
-            let mut c = ok.clone();
-            c.addr = addr;
-            assert!(
-                ember_unendorsed_source_buddy(&c).is_none(),
-                "{why} is not a callback destination even in compatibility mode"
-            );
-        }
-    }
-
-    /// The compatibility publish and the endorsement request go out on the same
-    /// tick, so the endorsement arrives while those records are still queued for
-    /// `PROXY_STORE_ACK`. Letting them land pins the file for
-    /// `EMBER_SOURCE_REPUBLISH`, so the fallback would keep a usable endorsement
-    /// off the wire for two hours. This is the predicate that picks them out.
-    #[test]
-    fn a_queued_record_is_recognised_as_carrying_the_compatibility_trailer() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
-        let base = ember::dht::publish::SourceContact {
-            ip: Ipv4Addr::new(10, 0, 0, 9),
-            tcp_port: 4662,
-            udp_port: 4672,
-            flags: ember::SOURCE_FLAG_FIREWALLED,
-            noise_pub: [0x33; 32],
-            user_hash: Some([0xCCu8; 16]),
-            callback_token: Some([0xDDu8; 16]),
-            buddy: None,
-        };
-        let unendorsed = ember::dht::publish::SourceBuddy {
-            ip: Ipv4Addr::new(8, 8, 4, 4),
-            udp_port: 4672,
-            noise_pub: [0xB1; 32],
-            ed25519_pub: [0u8; 32],
-            endorsed_until: 0,
-            endorsement: [0u8; 64],
-        };
-        let endorsed = ember::dht::publish::SourceBuddy {
-            ed25519_pub: [0xB2; 32],
-            endorsed_until: 4_000_000_000,
-            endorsement: [0xB3; 64],
-            ..unendorsed
-        };
-        let record = |buddy| {
-            ember::dht::publish::SignedRecord::source(
-                [0xAA; 16],
-                [0xBB; 32],
-                1,
-                "f.iso",
-                ember::dht::publish::SourceContact { buddy, ..base },
-                &sk,
-            )
-        };
-
-        assert!(ember_record_names_unendorsed_buddy(&record(Some(
-            unendorsed
-        ))));
         assert!(
-            !ember_record_names_unendorsed_buddy(&record(Some(endorsed))),
-            "an endorsed record is already what we want on the wire"
-        );
-        assert!(
-            !ember_record_names_unendorsed_buddy(&record(None)),
-            "a record naming no buddy cannot be reissued endorsed"
+            !ember_source_uses_callback(&src, false, false, true, 1_000),
+            "no identity key means no endorsement to check, so the source parks"
         );
     }
 
@@ -12458,10 +12375,16 @@ struct NetworkState {
     /// Pending Ember DHT `FIND_NODE` requests awaiting a `FOUND_NODE`,
     /// keyed by `request_id`. The waiter receives the contacts the peer
     /// returned. Bounded by `MAX_EMBER_PENDING_PINGS`.
+    /// The destination is kept alongside the waiter so an answer has to come
+    /// from the peer the query went to, the way `ember_dht_pending_pings`
+    /// already requires. Request ids come from one guessable counter, so
+    /// matching on the id alone let any peer holding a session answer somebody
+    /// else's query with its own contact list.
     ember_dht_pending_finds: HashMap<
         u32,
         (
             std::time::Instant,
+            SocketAddr,
             oneshot::Sender<Vec<EmberDhtContactInfo>>,
         ),
     >,
@@ -12509,15 +12432,6 @@ struct NetworkState {
     /// elapsed, mirroring KAD's per-file source-publish schedule but driven
     /// independently of KAD connectivity so it works on a KAD-less network.
     ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
-    /// Whether any live source record of ours names a buddy that did not endorse
-    /// the endpoint — the compatibility trailer taken when no candidate had
-    /// answered `BUDDY_ENDORSE_REQ` yet.
-    ///
-    /// A latch, not a gauge: it survives the tick that set it so
-    /// [`ember_endorsement_supersedes_unendorsed_sources`] can retire those
-    /// records the moment an endorsement arrives, and is cleared there so an
-    /// unsolicited endorsement cannot force repeated republishing.
-    ember_source_published_unendorsed: bool,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     ember_source_publish_unix: HashMap<[u8; 16], u32>,
@@ -22432,9 +22346,6 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_source_publish_unix.clear();
     state.ember_keyword_publish_at.clear();
     state.ember_keyword_publish_unix.clear();
-    // Nothing of ours is live any more, so there is no compatibility trailer
-    // left for an endorsement to supersede.
-    state.ember_source_published_unendorsed = false;
     // Library badges must go dark with the feature: the records we placed
     // will age out of the network and we are no longer republishing them.
     state.ember_published_sources.clear();
@@ -23393,7 +23304,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
-        ember_source_published_unendorsed: false,
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_keyword_publish_unix: HashMap::new(),
@@ -46642,36 +46552,6 @@ fn ember_named_source_buddy(
     buddy.is_routable().then_some(buddy)
 }
 
-/// The pre-endorsement trailer: the buddy's *observed* address, vouched for by
-/// nobody but us.
-///
-/// Only used when no candidate has endorsed an endpoint for us — a network
-/// still on builds that do not answer `BUDDY_ENDORSE_REQ`. No current-build
-/// searcher will dial this (`SourceBuddy::endorsement_covers` refuses it, which
-/// is the entire point), but an older one will, exactly as it does today. The
-/// alternative is publishing no firewalled source record at all, which takes a
-/// LowID seeder off the network for peers that could still reach it.
-///
-/// This is honest rather than merely permitted: we name a verified contact we
-/// are really talking to. It gives an attacker nothing, because forging a
-/// *victim's* trailer never needed our cooperation.
-fn ember_unendorsed_source_buddy(
-    contact: &ember::dht::EmberContact,
-) -> Option<ember::dht::publish::SourceBuddy> {
-    let std::net::IpAddr::V4(ip) = contact.addr.ip() else {
-        return None;
-    };
-    let buddy = ember::dht::publish::SourceBuddy {
-        ip,
-        udp_port: contact.addr.port(),
-        noise_pub: contact.noise_pub,
-        ed25519_pub: [0u8; 32],
-        endorsed_until: 0,
-        endorsement: [0u8; 64],
-    };
-    buddy.is_routable().then_some(buddy)
-}
-
 /// Whether consume should `CALLBACK_REQ` this source. Unusable, unendorsed,
 /// uncorroborated or locally blocked buddies fall through to the firewalled park
 /// path instead of being dropped.
@@ -46771,58 +46651,6 @@ fn pending_download_has_parked_ember_sources(state: &NetworkState, transfer_id: 
             )
         })
     })
-}
-
-/// Whether a source record names a buddy that never endorsed the endpoint —
-/// the compatibility trailer, which no current-build searcher will dial.
-///
-/// A record with no buddy at all is not a candidate: it is either a HighID
-/// record or a firewalled one nobody can proxy, and re-publishing it endorsed
-/// is not possible.
-fn ember_record_names_unendorsed_buddy(record: &ember::dht::publish::SignedRecord) -> bool {
-    record
-        .source_contact
-        .and_then(|sc| sc.buddy)
-        .is_some_and(|b| !b.has_identity())
-}
-
-/// A buddy has just endorsed an endpoint for us, so retire every source record
-/// we published with the compatibility trailer and publish them again endorsed.
-///
-/// Without this, the fallback wins the race with its own fix. The endorsement
-/// request and the compatibility publish go out on the same tick, so the reply
-/// arrives while those records are still queued for `PROXY_STORE_ACK`. Letting
-/// them land would set `ember_source_publish_at`, and
-/// [`ember_publish_staleness`] would then refuse to reselect the file until
-/// `EMBER_SOURCE_REPUBLISH` elapsed — two hours of publishing a trailer no
-/// current-build searcher will act on, while holding a usable endorsement.
-///
-/// Latched on `ember_source_published_unendorsed` so this is one-shot. Any real
-/// DHT node can send us a valid unsolicited self-endorsement, and without the
-/// latch each one would force a full source republish.
-fn ember_endorsement_supersedes_unendorsed_sources(state: &mut NetworkState) {
-    if !state.ember_source_published_unendorsed {
-        return;
-    }
-    state.ember_source_published_unendorsed = false;
-    let queued: Vec<(ember::dht::EmberNodeId, u32, EmberRecordRef)> = state
-        .ember_pending_proxy_overlay
-        .iter()
-        .filter(|(_, pending)| ember_record_names_unendorsed_buddy(&pending.record))
-        .map(|(k, pending)| (k.0, k.1, pending.reference))
-        .collect();
-    let dropped = queued.len();
-    for (buddy, rid, reference) in queued {
-        state.ember_pending_proxy_overlay.remove(&(buddy, rid));
-        untrack_ember_record_pending(state.publish_schedule(), reference);
-    }
-    // Everything already placed is stale for the same reason, so let the next
-    // tick reselect it. Republishing stays paced by `ember_source_files_per_tick`.
-    state.ember_source_publish_at.clear();
-    debug!(
-        "Ember DHT: endorsement received, dropped {dropped} unendorsed source record(s) \
-         and rescheduled source publish"
-    );
 }
 
 /// Drop publish-set entries whose source record has outlived
@@ -47001,7 +46829,6 @@ async fn maybe_publish_ember_sources(
     state.ember_diagnostics.ember_dht_firewalled_publishing = false;
     state.ember_diagnostics.ember_dht_udp_unreachable = false;
     state.ember_diagnostics.ember_dht_waiting_buddy = false;
-    state.ember_diagnostics.ember_dht_buddy_unendorsed_publish = false;
 
     // TTL-expire source records still held for a buddy ACK, genuinely before
     // anything can return early. It needs no peers, no external IP and no TCP
@@ -47084,21 +46911,26 @@ async fn maybe_publish_ember_sources(
             match named {
                 Some(named) => Some(named),
                 None => {
-                    // Nobody has endorsed an endpoint for us yet. Ask the best
-                    // candidates, and meanwhile fall back to the trailer older
-                    // builds have always published so a LowID seeder is not
-                    // simply absent for the peers that can still use it.
+                    // Nobody has endorsed an endpoint for us yet, so there is
+                    // no buddy we may name. This used to fall back to the
+                    // pre-endorsement trailer, which named a verified contact's
+                    // observed address on nobody's authority but ours.
+                    //
+                    // That trailer has no consumer left. It shipped before wire
+                    // v4, so every peer that can still exchange frames with us
+                    // speaks endorsements, and a current-build searcher refuses
+                    // to dial an unendorsed buddy — the record was published,
+                    // proxied, replicated twenty ways and then parked by
+                    // everyone who found it. Publishing nothing this tick and
+                    // asking again is strictly cheaper, and the ask below is
+                    // answered in one round trip by any peer that could have
+                    // served as the buddy anyway.
+                    //
+                    // Nothing is stamped for a file we skip, so it stays due and
+                    // the next tick retries it; `ember_dht_waiting_buddy` is
+                    // what surfaces the wait.
                     ask_ember_buddy_endorsements(socket, state, &c).await;
-                    let fallback = c.iter().find_map(|contact| {
-                        ember_unendorsed_source_buddy(contact).map(|b| (contact.clone(), b))
-                    });
-                    state.ember_diagnostics.ember_dht_buddy_unendorsed_publish =
-                        fallback.is_some();
-                    // Latch it for `ember_endorsement_supersedes_unendorsed_sources`,
-                    // which is what stops these records pinning the file for
-                    // `EMBER_SOURCE_REPUBLISH` once an endorsement lands.
-                    state.ember_source_published_unendorsed |= fallback.is_some();
-                    fallback
+                    None
                 }
             }
         } else {
@@ -47884,6 +47716,25 @@ async fn run_ember_maintenance(
             .ember_diagnostics
             .ember_dht_contacts_evicted
             .saturating_add(purged as u32);
+    }
+
+    // 0b1) The other direction: residents a tier we have since grown into
+    //      would not admit today. Admission has always tightened as the table
+    //      fills, but nothing re-read a contact once it held a slot, so a peer
+    //      admitted under the cold-start allowance kept its share of a bucket
+    //      for the life of the process however crowded its /24 turned out to
+    //      be. Runs before the promotion below so the slots it frees are
+    //      available to the cache in the same tick.
+    let demoted = state.ember_dht.enforce_scale_quotas();
+    if demoted > 0 {
+        // Not `ember_dht_contacts_evicted`: these peers answered us and are
+        // still held in a replacement cache, so counting them as evictions made
+        // a table reclaiming its cold-start allowance read exactly like peers
+        // going dark.
+        state.ember_diagnostics.ember_dht_contacts_demoted = state
+            .ember_diagnostics
+            .ember_dht_contacts_demoted
+            .saturating_add(demoted as u32);
     }
 
     // Leads parked while the IP filter could not be consulted, plus any the
@@ -48766,10 +48617,6 @@ async fn handle_ember_dht_message(
         flush_ember_proxy_overlay_ack(socket, state, sender, rid).await;
     }
 
-    if inbound.buddy_endorsed {
-        ember_endorsement_supersedes_unendorsed_sources(state);
-    }
-
     // Encrypt and send any signed DHT replies (e.g. the PONG answering
     // a PING, the FOUND_NODE answering a FIND_NODE, or the STORE_ACK /
     // FOUND_VALUE answering a STORE / FIND_VALUE) back over the
@@ -48902,7 +48749,20 @@ async fn handle_ember_dht_message(
     // the contacts into the routing table. Unmatched request_ids are
     // unsolicited and ignored.
     if let Some((rid, contacts)) = inbound.found_node {
-        if let Some((_sent_at, tx)) = state.ember_dht_pending_finds.remove(&rid) {
+        // Bound to the address the query went to, like the PONG path above. A
+        // wrong-sender answer is put back rather than consumed, so the peer we
+        // actually asked can still resolve its own waiter.
+        let harness_waiter = match state.ember_dht_pending_finds.remove(&rid) {
+            Some((_sent_at, dest, tx)) if dest == from => Some(tx),
+            Some((sent_at, dest, tx)) => {
+                state
+                    .ember_dht_pending_finds
+                    .insert(rid, (sent_at, dest, tx));
+                None
+            }
+            None => None,
+        };
+        if let Some(tx) = harness_waiter {
             let local_id = state.ember_dht.local_id();
             let infos = contacts
                 .iter()

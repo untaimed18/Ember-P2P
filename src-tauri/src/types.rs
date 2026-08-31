@@ -734,10 +734,21 @@ pub struct EmberDiagnostics {
     /// Maintenance liveness `PING`s sent to stale contacts this session.
     #[serde(default)]
     pub ember_dht_liveness_pings_sent: u32,
-    /// Contacts evicted after failing repeated liveness pings this
-    /// session.
+    /// Contacts dropped from the routing table this session because they
+    /// stopped answering — repeated liveness-ping failures and the staleness
+    /// purge. Genuinely gone: nothing remembers them but the bootstrap cache.
     #[serde(default)]
     pub ember_dht_contacts_evicted: u32,
+    /// Contacts moved out of a bucket into its replacement cache this session
+    /// because the diversity limits tightened as the table grew.
+    ///
+    /// Counted apart from [`Self::ember_dht_contacts_evicted`] because it means
+    /// something quite different: these peers answered, are still remembered,
+    /// and can be promoted back if a slot frees up. Sharing one counter made a
+    /// healthy table reclaiming a cold-start allowance look identical to peers
+    /// going dark.
+    #[serde(default)]
+    pub ember_dht_contacts_demoted: u32,
     /// Stored records re-published (replicated) to the closest nodes by
     /// the maintenance loop this session.
     #[serde(default)]
@@ -780,12 +791,6 @@ pub struct EmberDiagnostics {
     /// True when firewalled with no HighID buddy yet — source STORE is skipped.
     #[serde(default)]
     pub ember_dht_waiting_buddy: bool,
-    /// True when firewalled publishing fell back to a buddy trailer no
-    /// candidate has endorsed, because none answered `BUDDY_ENDORSE_REQ`.
-    /// Records still go out, but only builds older than this one will act on
-    /// the callback path — current builds park the source instead.
-    #[serde(default)]
-    pub ember_dht_buddy_unendorsed_publish: bool,
     /// Slice 15: true when Ember is on but we have no external IPv4 to put
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]

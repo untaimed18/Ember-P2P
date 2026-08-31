@@ -2584,7 +2584,7 @@ async fn handle_command_inner(
             let (contacts_tx, contacts_rx) = oneshot::channel();
             state
                 .ember_dht_pending_finds
-                .insert(request_id, (std::time::Instant::now(), contacts_tx));
+                .insert(request_id, (std::time::Instant::now(), addr, contacts_tx));
 
             let _ = tx.send(Ok(EmberDhtFindPending { contacts_rx }));
         }

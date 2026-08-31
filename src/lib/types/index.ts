@@ -392,6 +392,8 @@ export interface EmberDiagnostics {
   ember_dht_refreshes: number;
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
+  /** Contacts moved to a replacement cache because the diversity limits tightened. */
+  ember_dht_contacts_demoted?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
@@ -413,8 +415,6 @@ export interface EmberDiagnostics {
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy?: boolean;
-  /** Firewalled publishing fell back to an unendorsed buddy trailer (older peers only). */
-  ember_dht_buddy_unendorsed_publish?: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */

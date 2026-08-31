@@ -146,6 +146,25 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
+### 5. `store_attributed` binds the key but not the author or the date
+
+`DhtStore::restore` takes all three of key, `publisher_key` and `created_at`
+out of the record's own signed body. `store_attributed` takes only the key,
+and trusts the caller for the other two — `verify_record_signature` verifies
+under the key it is *handed*, not the one at `data[73..105]`, so a body naming
+a different author still verifies there while failing for every reader.
+
+Not reachable from the wire, and not a live bug: `accept_record` passes what
+`SignedRecord::from_wire` parsed out of the same bytes, `restore` re-derives
+them, and the proxy replica reads them off its own `SignedRecord`. It is on
+this list because the invariant is one the callers happen to keep rather than
+one the store enforces, and the next caller has no way to know that.
+
+Closing it means the store deriving both from the body, which every synthetic
+fixture in `store.rs`'s tests would then have to carry — roughly 120 call
+sites that currently zero those fields and pass real values beside them. That
+churn, not the change itself, is what has kept it open.
+
 ---
 
 ## Known limits (document for users / release notes)
@@ -164,6 +183,19 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
   (same as Kademlia). Admission is bounded by the diversity caps in
   [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), but there is
   no reputation scoring on gossip itself.
+- The diversity caps now apply to *residents* as well as to admission.
+  `RoutingTable::enforce_scale_quotas` runs on the maintenance tick and
+  demotes over-quota contacts to their bucket's replacement cache once the
+  table has grown a margin past the tier boundary (13 verified for `Small`,
+  100 for `Established`, against admission's 10 and 80). Before it, a peer
+  admitted under the cold-start allowance held its share of a bucket for the
+  life of the process — a contact that answers liveness pings is never stale,
+  never faults out, and is never displaced — and bucket occupancy is
+  geometric, so that share sat in the bucket deciding most of what
+  `find_closest` serves. The margin and the one-way ratchet on the enforced
+  tier are what stop a table on a boundary demoting and re-admitting the same
+  contacts. Demotion is not eviction: the cache is where a contact the caps
+  turn away already waits, and promotion brings it back if a slot frees up.
 - Download content transfer is still eD2K c2c (see item 1 above).
 - BLAKE3 verify runs when an expected digest is available (search hit, DHT
   source record, known.met / library). Deep links without a digest still
@@ -315,6 +347,33 @@ keyword search runs earlier in the same sweep than both the streaming step and
 the emit step, and it removes the search from `ember_keyword_searches`. That
 ordering is what stops a reaped search from being streamed after its
 `search-complete`, and it is not obvious from either site alone.
+
+### 4a. The pre-endorsement buddy trailer — retired
+
+Naming a buddy used to be possible two ways: with the buddy's signed
+endorsement, or — for publishers whose build predated it — by naming the
+buddy's Noise static, which is on every signed frame that buddy sends. The
+second was never consent. Anyone who had ever heard from a node could name it
+and spend a replica, a twenty-node fan-out and a `callback_clients` slot.
+
+It is gone from both sides, because under wire v4 it could not help anyone.
+The endorsement shipped in `d87ae41a`, wire v4 in `68fce6ab` three days later,
+so every peer that can complete a frame exchange with us also speaks
+endorsements — and a current-build searcher refuses to dial an unendorsed
+buddy regardless (`DiscoveredSource::takes_callback` requires
+`has_identity()`). Publishing one produced a record every finder parked, and
+accepting one did that work on somebody else's say-so.
+
+`trailer_names_us` now always requires an endorsement we signed. The publish
+side no longer emits the compatibility trailer, which also retired
+`ember_unendorsed_source_buddy`, the `ember_source_published_unendorsed`
+latch, `ember_endorsement_supersedes_unendorsed_sources`, and the
+`ember_dht_buddy_unendorsed_publish` diagnostic. A firewalled publisher with
+no endorsement yet publishes nothing for that file and retries the next tick;
+nothing is stamped for a skipped file, so it stays due, and
+`ember_dht_waiting_buddy` is what surfaces the wait. Pairing costs one tick:
+`BUDDY_ENDORSE_REQ` is answered in a round trip and is not gated on the proxy
+budget.
 
 ### 4. Firewalled sources are discoverable but not dialable — done
 

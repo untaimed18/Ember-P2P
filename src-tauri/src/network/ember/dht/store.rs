@@ -891,11 +891,23 @@ impl DhtStore {
         // skipped the check would hand an attacker the choice of what to
         // displace. Deriving it here makes the claim true wherever it is read.
         //
-        // Only the key. `publisher_key` is already pinned by
-        // `verify_record_signature` below — a body naming someone else cannot
-        // produce a signature this key verifies — and `created_at` is
-        // deliberately the caller's, because the zero-digest republish path
-        // passes a timestamp that is legitimately not the resident body's.
+        // Only the key, and the other two are *not* pinned the way this once
+        // claimed. `verify_record_signature` verifies under the `publisher_key`
+        // the caller passed, not the one at `data[73..105]`, so a body naming a
+        // different author still verifies — it simply fails for every reader,
+        // since they all re-parse through `SignedRecord::from_wire` and check
+        // the embedded key. `created_at` is unchecked against `data[105..113]`
+        // for the same reason. Neither is reachable from the wire: every
+        // production caller derives both from the body it passes
+        // (`accept_record` via `from_wire`, `restore` via
+        // `signed_identity_from_record_data`, the proxy replica from its own
+        // `SignedRecord`), which is why this has never been exploitable.
+        //
+        // It is still the wrong shape — `restore` binds all three and this binds
+        // one — and closing it means requiring the caller's values to match the
+        // body, which every synthetic test fixture here would then have to carry.
+        // Left as an invariant the callers keep rather than one the store
+        // enforces; see the audit note in `docs/ember-dht.md`.
         let Some((signed_key, _, _)) = signed_identity_from_record_data(&data) else {
             self.unparseable_rejections = self.unparseable_rejections.saturating_add(1);
             return false;
