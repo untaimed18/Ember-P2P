@@ -227,7 +227,17 @@ pub enum ChannelMemberWrite {
     Unchanged,
     /// A new roster row. XOR-neighbors may have changed.
     Inserted,
-    /// `last_seen` advanced and/or the nickname changed.
+    /// Only `last_seen` advanced — the same member, seen again.
+    ///
+    /// Split from [`ChannelMemberWrite::Updated`] because it is by far the
+    /// commonest write and the cheapest to report: nothing about the row has
+    /// changed except when it was last heard from, which is one number the UI
+    /// can be handed directly. Reporting it as a general update made every
+    /// presence walk that found a routine republish rebuild the whole member
+    /// list, which in a full room is 256 rows serialised to answer "one of
+    /// these is still here".
+    Touched,
+    /// The nickname changed, so anything displaying the row has to re-read it.
     Updated,
 }
 const CHAT_KEY_FILE: &str = "chat-history.key";
@@ -5469,8 +5479,10 @@ impl Database {
             None => ChannelMemberWrite::Inserted,
             Some((old_nick, old_seen)) => {
                 let nick_changed = !nickname.is_empty() && nickname != old_nick;
-                if last_seen > old_seen || nick_changed {
+                if nick_changed {
                     ChannelMemberWrite::Updated
+                } else if last_seen > old_seen {
+                    ChannelMemberWrite::Touched
                 } else {
                     ChannelMemberWrite::Unchanged
                 }
@@ -5480,6 +5492,14 @@ impl Database {
 
     /// Refresh `last_seen` for a pubkey that already has a row. No INSERT:
     /// public-room chat must not admit strangers onto the gossip roster.
+    ///
+    /// Returns whether the row actually moved forward, which is a different
+    /// question from whether one was found. Callers that push presence to the
+    /// UI need the former: a member talking in a busy room is touched many
+    /// times a second with a stamp the row already has, and reporting each of
+    /// those as a change turned a quiet roster into a stream of no-op updates.
+    /// The monotonic guarantee now lives in the `WHERE` rather than in `MAX`,
+    /// so a late frame still cannot walk a row backwards.
     pub fn touch_channel_member_last_seen(
         &self,
         channel_id: &str,
@@ -5490,8 +5510,8 @@ impl Database {
         let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE channel_members
-             SET last_seen = MAX(channel_members.last_seen, ?3)
-             WHERE channel_id = ?1 AND member_pubkey = ?2",
+             SET last_seen = ?3
+             WHERE channel_id = ?1 AND member_pubkey = ?2 AND last_seen < ?3",
             params![channel_id, member_pubkey, last_seen],
         )?;
         Ok(n > 0)
@@ -5551,6 +5571,27 @@ impl Database {
             )
             .optional()?;
         Ok(banned.unwrap_or(0) != 0)
+    }
+
+    /// Whether a pubkey has a roster row at all, and whether it is banned.
+    ///
+    /// `None` for no row, `Some(banned)` otherwise. One query rather than two,
+    /// because presence ingest asks both questions about every beacon in every
+    /// digest and rooms beat on a timer.
+    pub fn channel_member_status(
+        &self,
+        channel_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        let banned: Option<i64> = conn
+            .query_row(
+                "SELECT banned FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(banned.map(|flag| flag != 0))
     }
 
     pub fn channel_member_is_moderator(
@@ -8441,6 +8482,22 @@ mod tests {
                 .unwrap(),
             ChannelMemberWrite::Unchanged
         );
+        // The same member, seen again. Reported apart from a nickname change
+        // because it is the commonest write there is — every presence walk of
+        // a settled room is a table of these — and the only thing a reader has
+        // to be told is the new number.
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "Ada2", 300, None)
+                .unwrap(),
+            ChannelMemberWrite::Touched
+        );
+        assert_eq!(
+            db.upsert_channel_member(&channel_id, &pk, "", 350, None)
+                .unwrap(),
+            ChannelMemberWrite::Touched,
+            "a presence record carrying no nickname still moves last_seen"
+        );
+        assert_eq!(db.list_channel_members(&channel_id).unwrap()[0].last_seen, 350);
         db.rename_self_channel_member(&pk, "AdaRenamed").unwrap();
         assert_eq!(
             db.list_channel_members(&channel_id).unwrap()[0].nickname,

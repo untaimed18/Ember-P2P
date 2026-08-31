@@ -1849,6 +1849,8 @@ pub fn run() {
             commands::channels::delete_owned_channel,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
+            commands::channels::channel_presence_config,
+            commands::channels::set_channel_focus,
             commands::channels::get_channel_messages,
             commands::channels::search_channel_messages,
             commands::channels::delete_channel_message,

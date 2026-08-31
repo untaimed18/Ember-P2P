@@ -846,6 +846,12 @@ pub async fn create_channel(
         .try_send(NetworkCommand::RefreshChannelMembers {
             channel_id: ident.channel_id,
         });
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::AnnounceChannelPresence {
+            channel_id: ident.channel_id,
+            departed: false,
+        });
 
     let invite = ChannelInvite {
         channel_id: ident.channel_id,
@@ -1154,6 +1160,16 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         .try_send(NetworkCommand::RefreshChannelMembers {
             channel_id: invite.channel_id,
         });
+    // The DHT record above is the durable copy and the slow one: it has to be
+    // stored, then found by a walk somebody else runs on their own timer, so on
+    // its own it can be minutes before the room knows anyone arrived. This is
+    // the same signed fact taking the path chat takes.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::AnnounceChannelPresence {
+            channel_id: invite.channel_id,
+            departed: false,
+        });
 }
 
 #[tauri::command]
@@ -1182,6 +1198,16 @@ pub async fn leave_channel(
                 .try_send(NetworkCommand::DropChannelTransfers {
                     channel_id: id,
                     member: None,
+                });
+            // Tell the room now, on the mesh, rather than leaving everyone to
+            // notice we stopped beating. The DHT tombstone below is the copy
+            // that reaches members who are offline at this moment; this is the
+            // one that reaches the people currently looking at the roster.
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::AnnounceChannelPresence {
+                    channel_id: id,
+                    departed: true,
                 });
         }
     }
@@ -1409,6 +1435,55 @@ pub async fn list_channel_members(
             ChannelMemberInfo::from_stored(row, is_self)
         })
         .collect())
+}
+
+/// The presence windows the roster is drawn with.
+///
+/// Served from the backend rather than mirrored in the UI. These numbers decide
+/// which members a device gossips to as well as which ones it draws a dot
+/// beside, and a copy in the frontend is a copy that can drift from the one the
+/// protocol actually runs on — the roster would then disagree with the mesh
+/// about who is in the room, which is the class of bug this whole change is
+/// about.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelPresenceConfig {
+    /// Seen within this many seconds on the live mesh: online.
+    pub mesh_fresh_secs: i64,
+    /// Seen within this many seconds by any means: recently here, not online.
+    pub dht_fresh_secs: i64,
+    /// How often a member announces itself, so the UI can pick a sane redraw.
+    pub beat_secs: i64,
+}
+
+#[tauri::command]
+pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> {
+    Ok(ChannelPresenceConfig {
+        mesh_fresh_secs: channel::PRESENCE_MESH_FRESH_SECS,
+        dht_fresh_secs: channel::PRESENCE_FRESH_SECS,
+        beat_secs: channel::PRESENCE_BEAT_SECS,
+    })
+}
+
+/// Tell the network loop which room is on screen, or `None` when none is.
+///
+/// Presence costs are per room and a user who has joined thirty is reading one.
+/// Naming it is what lets that one be walked at the rate somebody watching it
+/// would expect without paying the same for the other twenty-nine.
+#[tauri::command]
+pub async fn set_channel_focus(
+    state: tauri::State<'_, AppState>,
+    channel_id: Option<String>,
+) -> Result<(), String> {
+    let parsed = match channel_id {
+        Some(id) => Some(channel_id_bytes(&parse_channel_id(&id)?)?),
+        None => None,
+    };
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::SetChannelFocus {
+            channel_id: parsed,
+        });
+    Ok(())
 }
 
 #[tauri::command]

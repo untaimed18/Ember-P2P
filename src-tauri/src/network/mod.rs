@@ -8333,8 +8333,8 @@ mod tests {
     /// recently, which is the empty-room poll case.
     #[test]
     fn an_empty_room_asks_for_its_roster_far_sooner_than_a_settled_one() {
-        let empty = channel_presence_interval(1);
-        let settled = channel_presence_interval(4);
+        let empty = channel_presence_interval(1, false);
+        let settled = channel_presence_interval(4, false);
 
         assert_eq!(empty, ember::channel::PRESENCE_FETCH_EMPTY_SECS);
         assert_eq!(settled, ember::channel::PRESENCE_FETCH_SECS);
@@ -8344,10 +8344,28 @@ mod tests {
         );
         // Zero should not be reachable — we write our own member row on join —
         // but it is the same "nobody else" situation if it ever is.
-        assert_eq!(channel_presence_interval(0), empty);
+        assert_eq!(channel_presence_interval(0, false), empty);
         assert!(
             empty < ember::channel::PRESENCE_REPUBLISH_SECS,
             "asking less often than members announce would miss arrivals"
+        );
+    }
+
+    /// The room on screen is walked at the watched rate however settled it is.
+    ///
+    /// A busy room takes the five-minute interval from its member count, which
+    /// is right for the twenty-nine rooms nobody is reading and wrong for the
+    /// one that is open: five minutes is simply how long a new arrival stays
+    /// invisible to the person looking straight at the member list.
+    #[test]
+    fn the_room_on_screen_is_walked_at_the_watched_rate() {
+        assert_eq!(
+            channel_presence_interval(40, true),
+            ember::channel::PRESENCE_FETCH_FOCUSED_SECS
+        );
+        assert!(
+            channel_presence_interval(40, true) < channel_presence_interval(40, false),
+            "focus has to beat the settled interval or naming the open room buys nothing"
         );
     }
 
@@ -10635,6 +10653,22 @@ pub enum NetworkCommand {
     RefreshChannelMembers {
         channel_id: [u8; 16],
     },
+    /// Announce our arrival or departure on the live mesh right now.
+    ///
+    /// The DHT record this pairs with takes a republish interval to be written
+    /// and a fetch interval to be read, so on its own it makes joining a room
+    /// something the rest of the room learns about minutes later. This is the
+    /// same fact, signed the same way, taking the path the room's own chat
+    /// takes.
+    AnnounceChannelPresence {
+        channel_id: [u8; 16],
+        departed: bool,
+    },
+    /// Which room the user is looking at, if any. Raises that room's presence
+    /// cadence and lowers the previous one back to the resting rate.
+    SetChannelFocus {
+        channel_id: Option<[u8; 16]>,
+    },
     /// Ember Transfer: offer one file to one channel member. The file is
     /// already hashed by the caller, so the network task never blocks on a
     /// 100 MB read.
@@ -12583,6 +12617,33 @@ struct NetworkState {
     ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
     /// Last presence FIND_VALUE start per channel.
     channel_presence_fetch_at: HashMap<[u8; 16], i64>,
+    /// The one room the user currently has open, if any.
+    ///
+    /// Presence costs are paid per room, and a user who has joined thirty of
+    /// them is reading one. Walking and beating that one harder is the whole
+    /// difference between a roster that is right when somebody looks at it and
+    /// one that is right five minutes later.
+    channel_focused: Option<[u8; 16]>,
+    /// Last mesh presence beat per channel.
+    channel_beacon_beat_at: HashMap<[u8; 16], i64>,
+    /// Freshest beacon held per room, keyed by the member that signed it.
+    ///
+    /// Bounded by the roster, because a beacon is only kept for a member the
+    /// roster already admits — the cap and eviction rules in
+    /// `upsert_channel_member` are what stop a flood of invented identities
+    /// becoming gossip neighbors, and this map must not be a way around them.
+    channel_beacons: HashMap<[u8; 16], HashMap<[u8; 32], ember::channel::PresenceBeacon>>,
+    /// Last time a member's beacon was passed on as a flood, per (room, member).
+    channel_beacon_flood_at: HashMap<([u8; 16], [u8; 32]), i64>,
+    /// Rolling `(window start, count)` of members a room's roster has gained
+    /// from beacons, which is the one thing this layer must not make cheap.
+    channel_beacon_inserts: HashMap<[u8; 16], (i64, usize)>,
+    /// Roster rows whose `last_seen` moved since the last presence emit.
+    ///
+    /// Coalesced rather than emitted as they land: a busy room touches the same
+    /// handful of rows many times a second, and the UI only needs to know where
+    /// they ended up.
+    channel_presence_dirty: HashMap<[u8; 16], HashMap<[u8; 32], i64>>,
     /// In-flight FIND_VALUE of channel moderation keys (`search_id` → channel).
     ember_channel_moderation_searches: HashMap<u32, [u8; 16]>,
     /// Moderation blobs waiting for DB apply + UI emit (async drain), with how
@@ -13238,6 +13299,516 @@ fn channel_member_pubkeys(
         .collect()
 }
 
+/// Queue a roster row for the next presence emit.
+///
+/// Bounded by the same roster cap as the table it mirrors, so a peer spraying
+/// beacons for identities we refuse to admit cannot grow this instead.
+fn mark_channel_presence_dirty(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+    at: i64,
+) {
+    let room = state.channel_presence_dirty.entry(channel_id).or_default();
+    if room.len() >= ember::channel::CHANNEL_MEMBERS_MAX && !room.contains_key(member) {
+        return;
+    }
+    let slot = room.entry(*member).or_insert(at);
+    *slot = (*slot).max(at);
+}
+
+/// Record that a member was demonstrably alive a moment ago.
+///
+/// Every caller has already established the author cryptographically — a
+/// signature over the frame, or the pairwise transfer key that only that member
+/// and this device can derive — so this is first-hand evidence rather than one
+/// peer's claim about another. It is also free: these frames were already
+/// crossing the mesh between exactly these members, and the one thing they
+/// proved was the one thing the roster never learned from them. A member who
+/// was relaying gossip and moving a file could still be shown offline.
+///
+/// Deliberately a touch and never an insert. Whether a stranger may *join* a
+/// roster is a separate question that public and private rooms answer
+/// differently — see [`ember::channel::chat_author_joins_gossip_roster`] — and
+/// answering it here would quietly route around it.
+fn note_channel_member_alive(
+    state: &mut NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+    channel_id_hex: &str,
+    member: &[u8; 32],
+    at: i64,
+) {
+    if *member == state.local_ed25519_pubkey {
+        return;
+    }
+    if at <= 0 {
+        return;
+    }
+    if db
+        .touch_channel_member_last_seen(channel_id_hex, &hex::encode(member), at)
+        .unwrap_or(false)
+    {
+        mark_channel_presence_dirty(state, channel_id, member, at);
+    }
+}
+
+/// Push the roster rows whose `last_seen` moved since the last pass.
+///
+/// A delta rather than a nudge to re-read the whole list. `ember:channel-members`
+/// means "the roster changed shape" and costs the UI a round trip through
+/// `list_channel_members` for every member of the room; presence moves far more
+/// often than membership does, and firing that event every time somebody was
+/// heard from turned a quiet room into a steady stream of full refetches. What
+/// changed here is one number on one row, so that is what goes across.
+fn emit_channel_presence_deltas(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+    if state.channel_presence_dirty.is_empty() {
+        return;
+    }
+    for (channel_id, rows) in std::mem::take(&mut state.channel_presence_dirty) {
+        if rows.is_empty() {
+            continue;
+        }
+        let members: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(member, last_seen)| {
+                serde_json::json!({
+                    "member_pubkey": hex::encode(member),
+                    "last_seen": last_seen,
+                })
+            })
+            .collect();
+        let _ = app_handle.emit(
+            "ember:channel-presence",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "members": members,
+            }),
+        );
+    }
+}
+
+/// Rooms beaten per one-second tick.
+///
+/// One, because a beat is [`ember::channel::CHANNEL_NEIGHBOR_COUNT`] unicasts
+/// and those are charged to the same relay allowance as the mesh's own
+/// forwarding — `channel_gossip_rate_ok`. Beating several rooms in one tick
+/// would spend the whole second's budget on presence and have the rest of it
+/// silently shed, including part of the digest that prompted it. At a
+/// [`ember::channel::PRESENCE_BEAT_SECS`] interval this still covers far more
+/// rooms than anyone joins, and `a_beat_fits_the_relay_allowance_for_a_second`
+/// pins the relationship.
+const CHANNEL_BEACON_BEAT_PER_TICK: usize = 1;
+
+/// Keep a beacon for later relay, but only for somebody the roster admits.
+///
+/// The roster cap and its eviction rules are what stop a flood of invented
+/// identities being chosen as gossip neighbors. A separate beacon map that
+/// accepted anyone would be a way around that, so membership is checked against
+/// the table rather than assumed from the fact that a beacon verified.
+fn remember_channel_beacon(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    beacon: ember::channel::PresenceBeacon,
+) {
+    let room = state.channel_beacons.entry(channel_id).or_default();
+    if room.len() >= ember::channel::CHANNEL_MEMBERS_MAX && !room.contains_key(&beacon.member) {
+        return;
+    }
+    ember::channel::keep_latest_beacon(room, beacon);
+}
+
+/// The beacons worth putting in one digest frame, freshest first.
+///
+/// Newest-first is what makes the layer converge on the case people notice.
+/// A member who just arrived is by definition the freshest beacon in the room,
+/// so they ride out to every neighbor on the next round and reach the far side
+/// in a few hops, while a member who has been sitting there for an hour is
+/// already known to everyone and can afford to wait.
+fn channel_presence_digest(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    ours: ember::channel::PresenceBeacon,
+    now: i64,
+) -> Vec<ember::channel::PresenceBeacon> {
+    let mut out = vec![ours];
+    let Some(room) = state.channel_beacons.get_mut(&channel_id) else {
+        return out;
+    };
+    // A beacon past the freshness window says nothing anyone can act on: its
+    // subject is offline by every rule that reads it. Dropped rather than
+    // merely sorted last, because in a room with fewer members than a digest
+    // holds nothing ever sorts it out — a member who left months ago would ride
+    // every digest this device sent for as long as it stayed in the room.
+    let cutoff = now.saturating_sub(ember::channel::PRESENCE_FRESH_SECS);
+    room.retain(|_, beacon| beacon.timestamp >= cutoff);
+    if room.is_empty() {
+        state.channel_beacons.remove(&channel_id);
+        return out;
+    }
+    let mut others: Vec<ember::channel::PresenceBeacon> = room
+        .values()
+        .filter(|b| b.member != ours.member)
+        .copied()
+        .collect();
+    others.sort_unstable_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.member.cmp(&b.member))
+    });
+    out.extend(
+        others
+            .into_iter()
+            .take(ember::channel::PRESENCE_BEACON_BATCH_MAX - 1),
+    );
+    out
+}
+
+/// Seal a beacon batch for one room.
+fn seal_channel_beacons(
+    channel_id: [u8; 16],
+    key: &[u8; 32],
+    beacons: &[ember::channel::PresenceBeacon],
+    ttl: u8,
+    now: i64,
+) -> Vec<u8> {
+    let plain = ember::channel::encode_channel_presence_beacons(beacons);
+    let mut envelope_id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
+    ember::channel::ChannelGossip::sealed(
+        channel_id,
+        envelope_id,
+        key,
+        now.max(0) as u64,
+        &plain,
+        ttl,
+        now,
+    )
+    .encode()
+}
+
+/// Announce ourselves on the live mesh and pass along the freshest beacons we
+/// hold while we are at it.
+///
+/// Sent at `ttl = 1`, which is what separates the two ways a beacon travels.
+/// A digest is anti-entropy: one hop to our own neighbors, repeated on a timer,
+/// so its cost is one small frame per neighbor per beat no matter how large the
+/// room. Flooding it instead would multiply by the roster — in a full room that
+/// is a quarter of a million frames a minute for something nobody is waiting
+/// on. Joins and leaves are the frames people *are* waiting on, and those flood
+/// (see [`flood_channel_presence_beacon`]); they are rare enough to afford it.
+async fn maybe_beat_channel_presence(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(channels) = db.list_channels_lite() else {
+        return;
+    };
+    let mut beaten = 0usize;
+    for ch in channels {
+        if beaten >= CHANNEL_BEACON_BEAT_PER_TICK {
+            break;
+        }
+        if !ch.in_room_now() {
+            continue;
+        }
+        let Ok(id_bytes) = hex::decode(&ch.channel_id) else {
+            continue;
+        };
+        let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
+            continue;
+        };
+        let last = state
+            .channel_beacon_beat_at
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0);
+        if !ember::channel::schedule_due(last, now, ember::channel::PRESENCE_BEAT_SECS) {
+            continue;
+        }
+        // Stamped before the work rather than after it. A room that cannot beat
+        // — no content key on this device, nobody on the roster to beat at —
+        // has to back off like any other, or every tick re-reads its key and
+        // its whole member list to reach the same conclusion a second later.
+        state.channel_beacon_beat_at.insert(channel_id, now);
+        let Some(key) = channel_content_key(db, &ch) else {
+            continue;
+        };
+        let neighbors = ember::channel::gossip_neighbors(
+            &state.local_ed25519_pubkey,
+            &channel_member_pubkeys(db, &ch.channel_id),
+            ember::channel::CHANNEL_NEIGHBOR_COUNT,
+        );
+        if neighbors.is_empty() {
+            continue;
+        }
+        let ours = ember::channel::sign_presence_beacon(
+            &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
+            &state.local_ed25519_pubkey,
+            &channel_id,
+            ch.key_epoch,
+            now,
+            false,
+        );
+        remember_channel_beacon(state, channel_id, ours);
+        let digest = channel_presence_digest(state, channel_id, ours, now);
+        let body = seal_channel_beacons(channel_id, &key, &digest, 1, now);
+        for peer in neighbors {
+            send_channel_gossip_unicast(socket, state, db, channel_id, peer, body.clone()).await;
+        }
+        beaten += 1;
+    }
+}
+
+/// Flood a single beacon to the room, for the moments presence actually
+/// changes: arriving, and leaving.
+///
+/// These are the events a person is watching for, and the only ones worth
+/// `members × degree` sends. Everything else rides the periodic digest.
+async fn flood_channel_presence_beacon(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    departed: bool,
+    now: i64,
+) {
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
+        return;
+    };
+    let Some(key) = channel_content_key(db, &ch) else {
+        return;
+    };
+    let ours = ember::channel::sign_presence_beacon(
+        &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
+        &state.local_ed25519_pubkey,
+        &channel_id,
+        ch.key_epoch,
+        now,
+        departed,
+    );
+    let body = seal_channel_beacons(
+        channel_id,
+        &key,
+        &[ours],
+        ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+        now,
+    );
+    if departed {
+        // Nothing local to keep: the room is being left, so its schedules and
+        // caches go with it rather than sitting there holding a tombstone we
+        // would go on republishing to ourselves.
+        state.channel_beacons.remove(&channel_id);
+        state.channel_beacon_beat_at.remove(&channel_id);
+        state.channel_beacon_inserts.remove(&channel_id);
+        state.channel_presence_dirty.remove(&channel_id);
+        state
+            .channel_beacon_flood_at
+            .retain(|(room, _), _| *room != channel_id);
+        // Only when it is the room we were watching. Leaving one room while
+        // reading another must not drop the other back to the resting walk.
+        if state.channel_focused == Some(channel_id) {
+            state.channel_focused = None;
+        }
+    } else {
+        remember_channel_beacon(state, channel_id, ours);
+        state.channel_beacon_beat_at.insert(channel_id, now);
+    }
+    // Handed to our neighbors directly rather than through
+    // `fanout_channel_gossip_body`, which refuses to send for a room this
+    // device is not in — and a leave is by definition sent from outside it,
+    // since `leave_channel` clears `in_room` before the network loop ever sees
+    // the command. The frame still carries a full TTL, so the neighbors that
+    // take it are the ones that flood it onward.
+    let neighbors = ember::channel::gossip_neighbors(
+        &state.local_ed25519_pubkey,
+        &channel_member_pubkeys(db, &channel_id_hex),
+        ember::channel::CHANNEL_NEIGHBOR_COUNT,
+    );
+    for peer in neighbors {
+        send_channel_gossip_unicast(socket, state, db, channel_id, peer, body.clone()).await;
+    }
+}
+
+fn channel_beacon_flood_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+    now: i64,
+) -> bool {
+    let key = (channel_id, *member);
+    let last = state.channel_beacon_flood_at.get(&key).copied().unwrap_or(0);
+    if !ember::channel::beacon_flood_allow(last, now) {
+        return false;
+    }
+    if state.channel_beacon_flood_at.len() >= ember::channel::CHANNEL_MEMBERS_MAX * 4 {
+        state
+            .channel_beacon_flood_at
+            .retain(|_, at| now.saturating_sub(*at) < ember::channel::PRESENCE_FRESH_SECS);
+    }
+    state.channel_beacon_flood_at.insert(key, now);
+    true
+}
+
+fn channel_beacon_insert_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    now: i64,
+) -> bool {
+    let slot = state
+        .channel_beacon_inserts
+        .entry(channel_id)
+        .or_insert((now, 0));
+    ember::channel::beacon_insert_allow(slot, now)
+}
+
+/// Apply presence beacons that arrived on the mesh.
+///
+/// Each entry was verified against its own signature before it got here, so a
+/// peer relaying the room's presence is a courier and not a witness — it cannot
+/// invent a member, re-date one, or drop one without the gap simply being
+/// filled by the next digest from somebody else. There is deliberately no frame
+/// that says "X is gone": absence of a fresh beacon is how a member goes
+/// offline, and a leave is a member's own signed departure record. Accepting a
+/// third party's word for either would let any member evict anyone.
+async fn apply_channel_presence_beacons(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    beacons: Vec<ember::channel::PresenceBeacon>,
+    from_id: ember::dht::EmberNodeId,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let channel_id = gossip.channel_id;
+    // A single beacon is somebody announcing an arrival or a departure and is
+    // worth passing on; a batch is one peer's digest of the room, which is
+    // already reaching its own neighbors on their own timers. Without this a
+    // member could wrap ten beacons in a flooded envelope and have the room
+    // amplify all of them at once.
+    let announcement = beacons.len() == 1;
+    let mut roster_changed = false;
+    let mut relay = false;
+    for beacon in beacons {
+        if beacon.member == state.local_ed25519_pubkey {
+            continue;
+        }
+        let Some(at) = beacon.last_seen_at(now) else {
+            continue;
+        };
+        let member_hex = hex::encode(beacon.member);
+        let status = db
+            .channel_member_status(&ch.channel_id, &member_hex)
+            .unwrap_or(None);
+        if status == Some(true) {
+            continue;
+        }
+        // Anything we already hold that outranks this one settles it. Without
+        // this, a member's leave is undone by the next digest from any peer
+        // still carrying their last ordinary beacon, and they flicker back into
+        // the roster looking online.
+        if ember::channel::beacon_superseded(
+            state
+                .channel_beacons
+                .get(&channel_id)
+                .and_then(|room| room.get(&beacon.member)),
+            &beacon,
+        ) {
+            continue;
+        }
+        if beacon.departed {
+            // Signed by the member themselves — the loop skipped our own key
+            // above, so this can never be a replayed tombstone of ours removing
+            // us from a room we are sitting in. `remove_channel_member` is
+            // timestamped, so a leave cannot delete a row a newer rejoin wrote.
+            if status.is_some()
+                && db
+                    .remove_channel_member(&ch.channel_id, &member_hex, at)
+                    .unwrap_or(false)
+            {
+                roster_changed = true;
+                state.rendezvous_last_register = None;
+            }
+            // Kept rather than dropped, and passed on in digests like any other
+            // beacon. It is signed, so relaying it needs no trust, and holding
+            // it is what makes the check above work — the roster row is gone,
+            // so this map is the only thing left that remembers the member
+            // left rather than simply never having been here.
+            remember_channel_beacon(state, channel_id, beacon);
+            if announcement && channel_beacon_flood_ok(state, channel_id, &beacon.member, now) {
+                relay = true;
+            }
+            continue;
+        }
+        if status.is_some() {
+            if db
+                .touch_channel_member_last_seen(&ch.channel_id, &member_hex, at)
+                .unwrap_or(false)
+            {
+                mark_channel_presence_dirty(state, channel_id, &beacon.member, at);
+            }
+        } else {
+            if !channel_beacon_insert_ok(state, channel_id, now) {
+                continue;
+            }
+            // Nickname is left empty on purpose: a beacon carries no display
+            // name, and nothing outside the member's own signed presence record
+            // should be able to set one. The presence walk fills it in.
+            match db.upsert_channel_member(
+                &ch.channel_id,
+                &member_hex,
+                "",
+                at,
+                Some(&hex::encode(state.local_ed25519_pubkey)),
+            ) {
+                Ok(ChannelMemberWrite::Inserted) => {
+                    roster_changed = true;
+                    // A new member changes who our XOR-neighbors are, so the
+                    // pairwise capability they will look us up under has to be
+                    // re-registered rather than waiting out the heartbeat.
+                    state.rendezvous_last_register = None;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(
+                        "Ember channel presence: roster write failed for {}: {e}",
+                        ch.channel_id
+                    );
+                    continue;
+                }
+            }
+        }
+        remember_channel_beacon(state, channel_id, beacon);
+        if announcement && channel_beacon_flood_ok(state, channel_id, &beacon.member, now) {
+            relay = true;
+        }
+    }
+    if roster_changed {
+        // The roster gained or lost somebody. A beacon cannot say who a new
+        // member is, only that they are here, and the full list is what carries
+        // the nickname and the badges — so ask for it rather than inventing a
+        // row. A `last_seen` that merely moved goes out as a delta instead.
+        let _ = app_handle.emit(
+            "ember:channel-members",
+            serde_json::json!({ "channel_id": ch.channel_id }),
+        );
+    }
+    if relay {
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+    }
+}
+
 fn collect_channel_neighbor_caps(
     db: &Database,
     our_pubkey: &[u8; 32],
@@ -13297,8 +13868,15 @@ const CHANNEL_PRESENCE_FETCH_PER_TICK: usize = 2;
 /// in and somebody else is arriving. Until presence names a second member there
 /// is nobody to gossip to either, so chat cannot move until this resolves.
 ///
-/// `member_count` includes us, so 1 means nobody else yet.
-fn channel_presence_interval(member_count: i64) -> i64 {
+/// `member_count` includes us, so 1 means nobody else yet. `focused` is the
+/// room the user has open, which is walked at the same rate as an empty one for
+/// the same reason: it is the roster somebody is actually reading, so five
+/// minutes of staleness in it is five minutes of a member being in the room and
+/// not shown there.
+fn channel_presence_interval(member_count: i64, focused: bool) -> i64 {
+    if focused {
+        return ember::channel::PRESENCE_FETCH_FOCUSED_SECS;
+    }
     if member_count > 1 {
         ember::channel::PRESENCE_FETCH_SECS
     } else {
@@ -13409,6 +13987,7 @@ async fn maybe_refresh_channel_members(
         if !ember::channel::schedule_due(last, now, ember::channel::PRESENCE_FETCH_EMPTY_SECS) {
             continue;
         }
+        let focused = state.channel_focused == Some(channel_id);
         let fresh = db
             .count_fresh_channel_members(
                 &ch.channel_id,
@@ -13416,7 +13995,7 @@ async fn maybe_refresh_channel_members(
                 ember::channel::PRESENCE_FRESH_SECS,
             )
             .unwrap_or(0);
-        if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh)) {
+        if !ember::channel::schedule_due(last, now, channel_presence_interval(fresh, focused)) {
             continue;
         }
         if start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await {
@@ -14446,8 +15025,23 @@ fn ingest_channel_presence_records(
                     }
                     outcome.roster_changed = true;
                 }
+                // The nickname moved, so the row has to be re-read to be drawn.
                 ChannelMemberWrite::Updated => {
                     outcome.roster_changed = true;
+                }
+                // A routine republish from somebody already on the list. One
+                // number changed, and it goes out as that rather than as a
+                // reason to rebuild the room's whole roster. `member.timestamp`
+                // was clamped when the batch was merged.
+                ChannelMemberWrite::Touched => {
+                    if member.publisher_key != *our_pubkey {
+                        mark_channel_presence_dirty(
+                            state,
+                            channel_id,
+                            &member.publisher_key,
+                            member.timestamp,
+                        );
+                    }
                 }
                 ChannelMemberWrite::Unchanged => {}
             }
@@ -15389,6 +15983,19 @@ async fn handle_inbound_channel_gossip(
             );
             return;
         };
+        // The pairwise key that just authenticated this frame can be derived
+        // only by us and the member it names, so a transfer in flight is proof
+        // of presence every bit as good as a beacon — and it was already on the
+        // wire. A member moving a file through the room could still be shown
+        // offline while doing it.
+        note_channel_member_alive(
+            state,
+            db,
+            gossip.channel_id,
+            &channel_id_hex,
+            &sender,
+            chrono::Utc::now().timestamp(),
+        );
         if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(&key, body) {
             apply_xfer_block_data(
                 socket, state, db, app_handle, xfer_id, sender, offset, &data,
@@ -15407,6 +16014,21 @@ async fn handle_inbound_channel_gossip(
         } else if ember::channel::decode_xfer_done(body).is_some() {
             apply_xfer_done(state, app_handle, xfer_id, sender);
         }
+        return;
+    }
+    // Ahead of the rest because it is the frame this room sends most often once
+    // nobody is talking, and every decoder below it would otherwise be tried
+    // against each one first.
+    if let Some(beacons) = ember::channel::decode_channel_presence_beacons(
+        &plain,
+        &gossip.channel_id,
+        ch.key_epoch,
+        chrono::Utc::now().timestamp(),
+    ) {
+        apply_channel_presence_beacons(
+            socket, state, db, app_handle, &ch, &gossip, beacons, from_id,
+        )
+        .await;
         return;
     }
     let channel_pk = hex::decode(&ch.pubkey)
@@ -15461,6 +16083,18 @@ async fn handle_inbound_channel_gossip(
         {
             return;
         }
+        // Signature-verified above, so asking for catch-up is itself evidence
+        // the asker is here — and a member who has just come back online and is
+        // filling in what they missed is exactly the one a roster should not be
+        // calling offline.
+        note_channel_member_alive(
+            state,
+            db,
+            gossip.channel_id,
+            &channel_id_hex,
+            &sender_pk,
+            chrono::Utc::now().timestamp(),
+        );
         // Its own budget, and the tightest one here. Every other branch costs
         // the sender roughly what it costs us; this one answers a single small
         // request with up to `CHANNEL_HISTORY_SYNC_MAX` separately sealed
@@ -15504,6 +16138,14 @@ async fn handle_inbound_channel_gossip(
         {
             return;
         }
+        note_channel_member_alive(
+            state,
+            db,
+            gossip.channel_id,
+            &channel_id_hex,
+            &sender_pk,
+            chrono::Utc::now().timestamp(),
+        );
         // Same author budget as chat: a moderator spraying ban/unban actions
         // rewrites every peer's member list as fast as they can send.
         if !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
@@ -15676,24 +16318,46 @@ async fn handle_inbound_channel_gossip(
                 // First line from someone this device did not already hold: the
                 // roster has to grow, and XOR-neighbors may have changed, so do
                 // not wait for the next presence walk or the friend heartbeat.
-                if let Ok(ChannelMemberWrite::Inserted) = db.upsert_channel_member(
+                match db.upsert_channel_member(
                     &channel_id_hex,
                     &sender_hex,
                     "",
                     now,
                     Some(&hex::encode(state.local_ed25519_pubkey)),
                 ) {
-                    state.rendezvous_last_register = None;
-                    let _ = app_handle.emit(
-                        "ember:channel-members",
-                        serde_json::json!({ "channel_id": channel_id_hex }),
-                    );
+                    Ok(ChannelMemberWrite::Inserted) => {
+                        state.rendezvous_last_register = None;
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id_hex }),
+                        );
+                    }
+                    // Chat carries no nickname, so `Updated` is unreachable
+                    // here; both are folded in anyway so a future caller that
+                    // does pass one cannot silently stop refreshing the row.
+                    Ok(ChannelMemberWrite::Touched) => {
+                        mark_channel_presence_dirty(state, gossip.channel_id, &sender_pk, now);
+                    }
+                    Ok(ChannelMemberWrite::Updated) => {
+                        let _ = app_handle.emit(
+                            "ember:channel-members",
+                            serde_json::json!({ "channel_id": channel_id_hex }),
+                        );
+                    }
+                    _ => {}
                 }
             } else {
                 // Public rooms do not INSERT strangers from chat (anti-eclipse).
                 // A line from someone already on the roster still refreshes
                 // last_seen so they do not age out while visibly talking.
-                let _ = db.touch_channel_member_last_seen(&channel_id_hex, &sender_hex, now);
+                note_channel_member_alive(
+                    state,
+                    db,
+                    gossip.channel_id,
+                    &channel_id_hex,
+                    &sender_pk,
+                    now,
+                );
             }
             let _ = app_handle.emit(
                 "ember:channel-message",
@@ -21729,6 +22393,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_presence_buffer.clear();
     state.ember_pending_channel_presence.clear();
     state.channel_presence_fetch_at.clear();
+    state.channel_focused = None;
+    state.channel_beacon_beat_at.clear();
+    state.channel_beacons.clear();
+    state.channel_beacon_flood_at.clear();
+    state.channel_beacon_inserts.clear();
+    state.channel_presence_dirty.clear();
     state.ember_channel_moderation_searches.clear();
     state.ember_pending_channel_moderation.clear();
     state.channel_moderation_fetch_at.clear();
@@ -22748,6 +23418,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         channel_presence_fetch_at: HashMap::new(),
+        channel_focused: None,
+        channel_beacon_beat_at: HashMap::new(),
+        channel_beacons: HashMap::new(),
+        channel_beacon_flood_at: HashMap::new(),
+        channel_beacon_inserts: HashMap::new(),
+        channel_presence_dirty: HashMap::new(),
         ember_channel_moderation_searches: HashMap::new(),
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
@@ -39774,6 +40450,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     // seconds, which a sixty-second caller rounds up to sixty
                     // whatever the constant says.
                     maybe_refresh_channel_members(&udp_socket, &mut state, &db, &settings).await;
+                    // On the same tick and for the same reason: the beat is
+                    // tens of seconds, which a minute-granularity caller cannot
+                    // express. Its own per-room gate decides when one is due.
+                    maybe_beat_channel_presence(&udp_socket, &mut state, &db, &settings).await;
+                    emit_channel_presence_deltas(&mut state, &app_handle);
                     maybe_sync_channel_history(&udp_socket, &mut state, &db, &settings).await;
                     drain_channel_origin_retry(&udp_socket, &mut state, &db).await;
                 }
@@ -41227,6 +41908,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         );
                         if ingest.new_neighbors {
                             any_new = true;
+                            // Members we did not know a moment ago, who
+                            // therefore do not know us either. Clearing the
+                            // stamp beats at them on the next tick instead of
+                            // leaving both sides to wait out the interval —
+                            // which is the whole of the join case, since a
+                            // joiner has nobody to announce to until this walk
+                            // tells them who is there.
+                            state.channel_beacon_beat_at.remove(&channel_id);
                         }
                         if ingest.roster_changed {
                             updated_ids.insert(hex::encode(channel_id));

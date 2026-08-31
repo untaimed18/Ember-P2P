@@ -2835,6 +2835,39 @@ async fn handle_command_inner(
             start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
         }
 
+        NetworkCommand::AnnounceChannelPresence {
+            channel_id,
+            departed,
+        } => {
+            if !settings.ember_native_enabled || db.chat_locked() {
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            flood_channel_presence_beacon(socket, state, db, channel_id, departed, now).await;
+        }
+
+        NetworkCommand::SetChannelFocus { channel_id } => {
+            if state.channel_focused == channel_id {
+                return;
+            }
+            state.channel_focused = channel_id;
+            // Walk it now rather than at the next gate. Opening a room is the
+            // moment its roster is most likely to be wrong and the only moment
+            // anyone is looking, so making them wait even the focused interval
+            // for the first refresh would waste the part that matters.
+            let Some(channel_id) = channel_id else {
+                return;
+            };
+            if !settings.ember_native_enabled || db.chat_locked() {
+                return;
+            }
+            let Ok(Some(ch)) = db.get_channel(&hex::encode(channel_id)) else {
+                return;
+            };
+            let now = chrono::Utc::now().timestamp();
+            start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
+        }
+
         NetworkCommand::OfferChannelTransfer {
             channel_id,
             peer,

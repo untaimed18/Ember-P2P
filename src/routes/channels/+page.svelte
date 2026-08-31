@@ -30,6 +30,8 @@
     joinChannel,
     leaveChannel,
     listChannelMembers,
+    channelPresenceConfig,
+    setChannelFocus,
     offerChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
@@ -48,6 +50,8 @@
     type ChannelInfo,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
+    type ChannelPresenceConfig,
+    type ChannelPresenceDelta,
     type ChannelTransferInfo,
     type GatheredChannelInfo,
     type GatheredChannelBatch,
@@ -398,18 +402,18 @@
   }
 
   /**
-   * Whether a member has been heard from recently enough to call them present.
+   * The windows presence is judged against, read from the backend.
    *
-   * `last_seen` advances on their presence record (republished every
-   * `PRESENCE_REPUBLISH_SECS`, ten minutes). In a public room a chat line
-   * from someone already on the roster also refreshes it, so they do not
-   * age out while talking; it does not insert strangers. Private rooms
-   * still upsert from chat. Two intervals of slack means one missed
-   * republish does not blink somebody offline; the DHT drops the record
-   * entirely at 45 minutes, so anything beyond that would be claiming
-   * more than we know.
+   * The same numbers decide which members this device will gossip to, so a
+   * second copy here is one that can drift from the one the protocol runs on.
+   * Seeded with the shipped values so the first paint has something sane before
+   * the config lands.
    */
-  const PRESENCE_FRESH_SECS = 20 * 60;
+  let presenceConfig = $state<ChannelPresenceConfig>({
+    mesh_fresh_secs: 150,
+    dht_fresh_secs: 20 * 60,
+    beat_secs: 45,
+  });
 
   /** Ticks the clock the presence check reads. Freshness is measured against
    *  wall-clock, which no amount of roster reactivity refreshes on its own, so
@@ -417,29 +421,79 @@
    *  fetched — potentially long past the window. */
   let presenceNow = $state(Math.floor(Date.now() / 1000));
 
-  function isPresent(mem: ChannelMemberInfo, nowSecs: number): boolean {
-    if (mem.last_seen <= 0) return false;
-    return nowSecs - mem.last_seen <= PRESENCE_FRESH_SECS;
+  type Presence = 'online' | 'away' | 'offline';
+
+  /**
+   * Which of three states to draw a member in.
+   *
+   * `online` is mesh-confirmed: they announced themselves on the live mesh, or
+   * we verified a frame they signed, within a few beats. `away` is the DHT
+   * backstop — seen this quarter hour, which is the strongest claim a
+   * ten-minute republish read by a lossy walk can support.
+   *
+   * Collapsing the two, which is what this did when the DHT was the only
+   * signal, is what made the roster wrong in both directions at once: a member
+   * sitting quietly in the room had no dot, because their record had not been
+   * re-walked, and a member who had left kept a green one for twenty minutes,
+   * because nothing said otherwise until their record aged out.
+   */
+  function presenceOf(mem: ChannelMemberInfo, nowSecs: number): Presence {
+    if (mem.is_self) return 'online';
+    if (mem.last_seen <= 0) return 'offline';
+    const age = nowSecs - mem.last_seen;
+    if (age <= presenceConfig.mesh_fresh_secs) return 'online';
+    if (age <= presenceConfig.dht_fresh_secs) return 'away';
+    return 'offline';
   }
 
-  /** Advance one roster row's last_seen from a live chat line without waiting
-   *  for the next presence walk. Presence ingest still owns joins and leaves. */
-  function noteMemberHeard(pubkey: string, at: number) {
-    if (!pubkey || at <= 0) return;
+  /** How many of a roster are actually in the room.
+   *
+   *  Matches what `list_channels` counts on the backend — not banned, and seen
+   *  inside the DHT window — so the sidebar does not jump when a room is opened
+   *  and then snap back on the next refresh. The whole roster is the wrong
+   *  number to show: it includes everyone who has ever been counted present,
+   *  which in a public room is every visitor it has had. */
+  function presentCount(mems: ChannelMemberInfo[], nowSecs: number): number {
+    return mems.filter((mem) => !mem.banned && presenceOf(mem, nowSecs) !== 'offline').length;
+  }
+
+  /** Fold rows whose `last_seen` moved into the roster in place.
+   *
+   *  A delta, so a room where somebody is talking does not re-read the whole
+   *  member list to learn that one number changed. Only ever forward: a late
+   *  batch must not walk a row back to an older stamp than it already holds.
+   *
+   *  Clamped to wall-clock because not every caller's stamp is already bounded.
+   *  The backend clamps what it emits, but a live chat line carries the gossip
+   *  envelope's own timestamp, which a member may legitimately set up to
+   *  `CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS` ahead — and a future stamp keeps the
+   *  presence dot lit until wall-clock catches up *plus* the freshness
+   *  window. */
+  function applyPresenceDelta(rows: { member_pubkey: string; last_seen: number }[]) {
+    if (rows.length === 0) return;
     const wall = Math.floor(Date.now() / 1000);
-    // Gossip may claim up to five minutes ahead of us. The database clamps
-    // that; without the same cap a future stamp keeps the presence dot on
-    // until wall-clock catches up *plus* the freshness window.
-    const heard = Math.min(at, wall);
-    const key = pubkey.toLowerCase();
+    const byKey = new Map(rows.map((row) => [row.member_pubkey.toLowerCase(), row.last_seen]));
     let changed = false;
     members = members.map((mem) => {
-      if (mem.member_pubkey.toLowerCase() !== key) return mem;
+      const at = byKey.get(mem.member_pubkey.toLowerCase());
+      if (at === undefined) return mem;
+      const heard = Math.min(at, wall);
       if (heard <= mem.last_seen) return mem;
       changed = true;
       return { ...mem, last_seen: heard };
     });
     if (changed) presenceNow = wall;
+  }
+
+  /** Advance one roster row's last_seen from a live chat line.
+   *
+   *  The backend sends the same fact as a presence delta a moment later, so
+   *  this only buys the tick in between — but that tick is while the line is
+   *  appearing on screen, which is exactly when a reader looks across at the
+   *  member who sent it. Joins and leaves stay with presence ingest. */
+  function noteMemberHeard(pubkey: string, at: number) {
+    if (!pubkey || at <= 0) return;
+    applyPresenceDelta([{ member_pubkey: pubkey, last_seen: at }]);
   }
 
   function newGatherWalk(): string {
@@ -468,6 +522,11 @@
       void refreshDirectory(false);
     }, 60_000);
     let cancelled = false;
+    channelPresenceConfig()
+      .then((config) => {
+        if (!cancelled) presenceConfig = config;
+      })
+      .catch(() => {});
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
@@ -476,6 +535,17 @@
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenMembers = fn;
+    });
+    // The roster changing shape costs a full re-read; a member being heard from
+    // does not, and happens far more often. Only the open room is applied —
+    // rows for a room that is not on screen are re-read when it is opened.
+    let unlistenPresence: UnlistenFn | undefined;
+    listen<ChannelPresenceDelta>('ember:channel-presence', (event) => {
+      if (event.payload.channel_id !== selectedId) return;
+      applyPresenceDelta(event.payload.members ?? []);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenPresence = fn;
     });
     let unlistenChat: UnlistenFn | undefined;
     listen<{
@@ -551,24 +621,43 @@
     void mergeChannelTransfers();
     document.addEventListener('pointerdown', onCardMenuPointerDown);
     document.addEventListener('keydown', onPageKeydown);
-    // Half the presence-republish interval, so a member crossing the freshness
-    // line is reflected within a minute or so without polling the backend.
+    // Local arithmetic against a clock, not a poll: nothing is fetched here.
+    // A second is the resolution the mesh now works at, so anything coarser
+    // would be the UI reintroducing a delay the protocol no longer has.
     const presenceTimer = setInterval(() => {
       presenceNow = Math.floor(Date.now() / 1000);
-    }, 30_000);
+    }, 1_000);
     return () => {
       cancelled = true;
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
       unlistenMembers?.();
+      unlistenPresence?.();
       unlistenChat?.();
       unlistenModeration?.();
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
       document.removeEventListener('keydown', onPageKeydown);
+      // Leaving the page is not leaving the room, but it does mean nobody is
+      // reading this roster, so it goes back to the resting walk rate.
+      void setChannelFocus(null).catch(() => {});
       stashActiveChannelOnLeave();
     };
+  });
+
+  /** Mirror the open room to the backend, which walks that room's presence at
+   *  the rate somebody watching it would expect and drops the one it replaces
+   *  back to resting.
+   *
+   *  An effect rather than a line in `selectChannel`, because the selection is
+   *  also set and cleared by leaving a room, deleting one, following a deep
+   *  link, and being restored on the way back to this page — each of which
+   *  would otherwise have to remember, and one of them already had forgotten.
+   *  Repeats of the room the backend already holds are ignored there. */
+  $effect(() => {
+    const id = selectedId;
+    void setChannelFocus(id).catch(() => {});
   });
 
   $effect(() => {
@@ -679,7 +768,7 @@
       // Written even when empty: gating on a non-empty roster meant a room
       // that had emptied kept whatever count it last reported. Not generation
       // gated — it names the room it counted, so a late reply is still true.
-      setChannelMemberCount(id, mems.length);
+      setChannelMemberCount(id, presentCount(mems, Math.floor(Date.now() / 1000)));
     } catch (e) {
       if (gen === membersGen && id === selectedId) {
         membersLoading = false;
@@ -693,7 +782,7 @@
    *  answer, which must not look like an empty room. */
   function directoryMemberCount(ch: ChannelInfo): number | null {
     if (ch.in_room && ch.channel_id === selectedId && members.length > 0) {
-      return members.length;
+      return presentCount(members, presenceNow);
     }
     if (!ch.in_room) {
       const gathered = discovered.find((item) => item.channel_id === ch.channel_id);
@@ -2273,18 +2362,24 @@
             {:else}
               <ul class="member-list">
                 {#each sortedMembers as mem (mem.member_pubkey)}
-                  {@const present = mem.is_self || isPresent(mem, presenceNow)}
+                  {@const presence = presenceOf(mem, presenceNow)}
+                  {@const presenceLabel =
+                    presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
                   <li
                     class:banned={mem.banned}
                     oncontextmenu={memberHasMenu(mem) ? openMemberMenu : undefined}
                   >
-                    <div class="member-avatar" class:present>
+                    <div
+                      class="member-avatar"
+                      class:present={presence === 'online'}
+                      class:away={presence === 'away'}
+                    >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <circle cx="12" cy="8" r="4"/>
                         <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
                       </svg>
-                      {#if present}
-                        <span class="present-dot" role="img" title={m.channels_member_online()} aria-label={m.channels_member_online()}></span>
+                      {#if presence !== 'offline'}
+                        <span class="present-dot" class:away={presence === 'away'} role="img" title={presenceLabel} aria-label={presenceLabel}></span>
                       {/if}
                     </div>
                     <div class="member-identity">
@@ -2303,7 +2398,7 @@
                         {#if $ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())}
                           <span class="badge">{m.channels_ignored_badge()}</span>
                         {/if}
-                        {#if !present && mem.last_seen > 0}
+                        {#if presence !== 'online' && mem.last_seen > 0}
                           <span class="member-seen">
                             {m.channels_member_last_seen({
                               when: formatRelativeTime(mem.last_seen, presenceNow),
@@ -3644,6 +3739,14 @@
     background: color-mix(in srgb, var(--success) 16%, transparent);
   }
 
+  /* Seen this quarter hour, but not confirmed on the live mesh. Muted rather
+     than a second saturated colour: the distinction is worth showing and is not
+     worth competing with the online dot for attention. */
+  .member-avatar.away {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  }
+
   .present-dot {
     position: absolute;
     right: -1px;
@@ -3653,6 +3756,13 @@
     border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
+  }
+
+  /* Hollow, so the two states stay apart for anyone who cannot separate them
+     by colour. */
+  .present-dot.away {
+    background: var(--bg-secondary);
+    border: 2px solid var(--text-muted);
   }
 
   .member-seen {
