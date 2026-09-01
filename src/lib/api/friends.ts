@@ -59,6 +59,8 @@ export interface ChatMessage {
   timestamp: number;
   read: boolean;
   delivery: ChatDelivery;
+  /** The friend has opened this outbound message. Incoming rows are false. */
+  seen?: boolean;
 }
 
 export interface ChatSendResult {
@@ -128,6 +130,11 @@ export async function getChatMessages(friendHash: string, limit?: number, before
 
 export async function markMessagesRead(friendHash: string): Promise<void> {
   return invoke('mark_messages_read', { friendHash });
+}
+
+/** Live composing signal. Resolves even if the friend is offline — the packet is dropped. */
+export async function sendChatTyping(userHashHex: string, typing: boolean): Promise<void> {
+  return invoke('send_chat_typing', { userHashHex, typing });
 }
 
 export async function getUnreadMessageCounts(): Promise<[string, number][]> {

@@ -5580,6 +5580,7 @@ async fn handle_command_inner(
                                                 "ember:chat-message",
                                                 serde_json::json!({
                                                     "user_hash": hex::encode(friend_eh),
+                                                    "id": pending_id,
                                                     "message": message,
                                                     "direction": "sent",
                                                     "timestamp": chrono::Utc::now().timestamp(),
@@ -5884,6 +5885,45 @@ async fn handle_command_inner(
                     }
                 }
             }
+        }
+
+        NetworkCommand::SendChatTyping {
+            ember_hash: friend_eh,
+            typing,
+        } => {
+            if settings.friend_chat_disabled
+                || !friend_hashes.read().await.contains(&friend_eh)
+            {
+                return;
+            }
+            let _ = send_encrypted_chat_ext(
+                &state.ember_sessions,
+                &ed25519_secret_key,
+                friend_eh,
+                ed2k::messages::EMBER_EXT_CHAT_TYPING,
+                &[u8::from(typing)],
+            )
+            .await;
+        }
+
+        NetworkCommand::SendChatReadReceipt {
+            ember_hash: friend_eh,
+            body_hash,
+        } => {
+            if settings.friend_chat_disabled
+                || !settings.friend_chat_read_receipts
+                || !friend_hashes.read().await.contains(&friend_eh)
+            {
+                return;
+            }
+            let _ = send_encrypted_chat_ext(
+                &state.ember_sessions,
+                &ed25519_secret_key,
+                friend_eh,
+                ed2k::messages::EMBER_EXT_CHAT_READ,
+                &body_hash,
+            )
+            .await;
         }
 
         NetworkCommand::CancelBrowseFriend {

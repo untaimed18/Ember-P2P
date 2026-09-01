@@ -1249,6 +1249,11 @@ pub struct AppSettings {
     /// Disable incoming chat messages from friends
     #[serde(default)]
     pub friend_chat_disabled: bool,
+    /// Send and display friend-chat read receipts. Off both ways: we neither
+    /// tell friends we have read their messages nor show when they have read
+    /// ours.
+    #[serde(default = "default_true")]
+    pub friend_chat_read_receipts: bool,
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
@@ -1764,6 +1769,7 @@ impl Default for AppSettings {
             settings_revision: 0,
             friend_require_approval: true,
             friend_chat_disabled: false,
+            friend_chat_read_receipts: true,
             friend_browse_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),

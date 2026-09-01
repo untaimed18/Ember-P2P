@@ -624,6 +624,8 @@ pub struct ChatMessageInfo {
     /// `"delivered"`, `"queued"`, or `"failed"`. Received messages are always
     /// delivered; only outbound ones can sit in another state.
     pub delivery: String,
+    /// The friend has opened this outbound message. Received rows are false.
+    pub seen: bool,
 }
 
 /// Map the stored `chat_messages.delivery` integer to the string the UI uses.
@@ -808,16 +810,15 @@ pub async fn get_chat_messages(
             .map_err(|e| coded_ctx("peers_failed_load_messages", "Failed to load messages", e))?;
     Ok(rows
         .into_iter()
-        .map(
-            |(id, direction, message, timestamp, read, delivery)| ChatMessageInfo {
-                id,
-                direction,
-                message,
-                timestamp,
-                read,
-                delivery: delivery_label(delivery),
-            },
-        )
+        .map(|row| ChatMessageInfo {
+            id: row.id,
+            direction: row.direction,
+            message: row.message,
+            timestamp: row.timestamp,
+            read: row.read,
+            delivery: delivery_label(row.delivery),
+            seen: row.seen,
+        })
         .collect())
 }
 
@@ -882,7 +883,8 @@ pub async fn mark_messages_read(
         return Err(coded("peers_not_friend", "Can only mark chat for friends"));
     }
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.mark_messages_read(&friend_hash))
+    let marked_hash = friend_hash.clone();
+    tokio::task::spawn_blocking(move || db.mark_messages_read(&marked_hash))
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| {
@@ -892,7 +894,55 @@ pub async fn mark_messages_read(
                 e,
             )
         })?;
+    let send_receipt = {
+        let cfg = state.config.read().await;
+        !cfg.settings.friend_chat_disabled && cfg.settings.friend_chat_read_receipts
+    };
+    if send_receipt {
+        let db_hash = state.db.clone();
+        let hash_for_receipt = friend_hash;
+        if let Ok(Ok(Some(body_hex))) =
+            tokio::task::spawn_blocking(move || db_hash.latest_read_received_hash(&hash_for_receipt))
+                .await
+        {
+            if let Ok(bytes) = hex::decode(&body_hex) {
+                if let Ok(body_hash) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                    let _ = bounded_send(
+                        &state.network_tx,
+                        NetworkCommand::SendChatReadReceipt {
+                            ember_hash: eh,
+                            body_hash,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Tell a friend we are (or have stopped) composing. Live only; ignored if
+/// they are not currently reachable.
+#[tauri::command]
+pub async fn send_chat_typing(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    typing: bool,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    let hash = parse_user_hash(&canonical)?;
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded("peers_not_friend", "Can only chat with friends"));
+    }
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::SendChatTyping {
+            ember_hash: hash,
+            typing,
+        },
+    )
+    .await
 }
 
 #[tauri::command]

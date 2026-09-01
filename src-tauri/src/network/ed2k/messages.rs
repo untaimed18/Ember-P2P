@@ -168,6 +168,17 @@ pub const EMBER_EXT_RELAY_OFFER: u8 = 0x01;
 /// Acting on it may only ever delete a queued request, never a friendship.
 pub const EMBER_EXT_FRIEND_RETRACT: u8 = 0x02;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is (or has just stopped) composing a
+/// friend-chat message. Live only — never queued — and the body is the same
+/// chat AEAD envelope as [`OP_EMBER_CHAT_MSG`], wrapping a single status byte.
+/// A peer that predates this sub-type ignores it.
+pub const EMBER_EXT_CHAT_TYPING: u8 = 0x03;
+
+/// [`OP_EMBER_EXT`] sub-type: the sender has read friend-chat up through the
+/// message whose body hash is in the encrypted payload. Same AEAD envelope
+/// as chat; ignored by older builds.
+pub const EMBER_EXT_CHAT_READ: u8 = 0x04;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -181,6 +192,18 @@ pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
 pub fn parse_ember_ext(payload: &[u8]) -> Option<(u8, &[u8])> {
     let (ext_type, body) = payload.split_first()?;
     Some((*ext_type, body))
+}
+
+/// Full `OP_EMULEPROT` frame for an [`OP_EMBER_EXT`] sub-type, ready to hand
+/// to a friend-session writer.
+pub fn build_ember_ext_frame(ext_type: u8, body: &[u8]) -> Vec<u8> {
+    let payload = build_ember_ext(ext_type, body);
+    let mut packet = Vec::with_capacity(6 + payload.len());
+    packet.push(OP_EMULEPROT);
+    packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+    packet.push(OP_EMBER_EXT);
+    packet.extend_from_slice(&payload);
+    packet
 }
 
 // Constants
@@ -2881,11 +2904,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ember_ext_frame_carries_the_sub_type() {
+        let frame = build_ember_ext_frame(EMBER_EXT_CHAT_TYPING, b"env");
+        assert_eq!(frame[0], OP_EMULEPROT);
+        assert_eq!(frame[5], OP_EMBER_EXT);
+        assert_eq!(
+            parse_ember_ext(&frame[6..]),
+            Some((EMBER_EXT_CHAT_TYPING, &b"env"[..]))
+        );
+    }
+
     /// Sub-types dispatch off one byte with no length or type tag around it, so
     /// a duplicate would silently route one message into the other's handler.
     #[test]
     fn ember_ext_sub_types_are_distinct() {
-        let sub_types = [EMBER_EXT_RELAY_OFFER, EMBER_EXT_FRIEND_RETRACT];
+        let sub_types = [
+            EMBER_EXT_RELAY_OFFER,
+            EMBER_EXT_FRIEND_RETRACT,
+            EMBER_EXT_CHAT_TYPING,
+            EMBER_EXT_CHAT_READ,
+        ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {
             assert!(

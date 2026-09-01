@@ -1807,6 +1807,7 @@ pub fn run() {
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,
+            commands::peers::send_chat_typing,
             commands::peers::get_unread_message_counts,
             commands::peers::get_pending_chat_counts,
             commands::peers::offer_file_to_friend,

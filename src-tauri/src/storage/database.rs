@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::network::ember::channel::{CHANNEL_MEMBERS_MAX, PRESENCE_FRESH_SECS};
+use crate::network::ember::crypto::chat_body_hash;
 use crate::storage::paths;
 use crate::types::*;
 
@@ -26,7 +27,20 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 44;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 45;
+
+/// One friend-chat row as the UI needs it.
+#[derive(Debug, Clone)]
+pub struct FriendChatRow {
+    pub id: i64,
+    pub direction: String,
+    pub message: String,
+    pub timestamp: i64,
+    pub read: bool,
+    pub delivery: i64,
+    /// The friend has opened our sent message. Received rows stay false.
+    pub seen: bool,
+}
 
 /// One row of a room's history as the UI needs it.
 ///
@@ -661,6 +675,46 @@ impl Database {
             })?;
         String::from_utf8(plaintext)
             .map_err(|_| anyhow::anyhow!("Chat history row {id} decrypted to invalid UTF-8"))
+    }
+
+    fn friend_chat_body_hash_hex(message: &str) -> String {
+        hex::encode(chat_body_hash(message))
+    }
+
+    /// Fill `body_hash` on rows written before schema v45, so a later receipt
+    /// can still name them. Failures leave the hash empty rather than aborting
+    /// the migration: those lines simply never show as seen.
+    fn backfill_chat_body_hashes(tx: &Connection, key: &[u8; 32]) -> anyhow::Result<u32> {
+        let rows: Vec<(i64, String, String, i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, friend_hash, direction, timestamp, message \
+                 FROM chat_messages WHERE body_hash = ''",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut filled = 0u32;
+        for (id, friend_hash, direction, timestamp, stored) in rows {
+            let Ok(plain) =
+                Self::decrypt_chat_body(key, id, &friend_hash, &direction, timestamp, &stored)
+            else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE chat_messages SET body_hash = ?1 WHERE id = ?2",
+                params![Self::friend_chat_body_hash_hex(&plain), id],
+            )?;
+            filled += 1;
+        }
+        Ok(filled)
     }
 
     fn channel_secret_aad(channel_id: &str, label: &str) -> Vec<u8> {
@@ -2111,6 +2165,30 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 45 {
+            // Friend-chat read receipts: `seen` is "they opened this sent
+            // line", and `body_hash` is the truncated BLAKE3 of the plaintext
+            // so a receipt can name a line without a shared row id or clock.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "chat_messages",
+                "seen",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                &tx,
+                "chat_messages",
+                "body_hash",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            if let Some(key) = self.chat_key.as_deref() {
+                Self::backfill_chat_body_hashes(&tx, key)?;
+            }
+            set_version(&tx, 45)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -2129,13 +2207,20 @@ impl Database {
             if has_chat_table {
                 let tx = conn.unchecked_transaction()?;
                 let encrypted = self.encrypt_chat_history_rows(&tx, false)?;
-                if encrypted > 0 {
+                let hashed = if let Some(key) = self.chat_key.as_deref() {
+                    Self::backfill_chat_body_hashes(&tx, key)?
+                } else {
+                    0
+                };
+                if encrypted > 0 || hashed > 0 {
                     tx.commit()?;
-                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-                    info!(
-                        "Encrypted {encrypted} chat history row(s) left in plaintext by a \
-                         migration that ran while the chat key was unavailable"
-                    );
+                    if encrypted > 0 {
+                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+                        info!(
+                            "Encrypted {encrypted} chat history row(s) left in plaintext by a \
+                             migration that ran while the chat key was unavailable"
+                        );
+                    }
                 }
             }
         }
@@ -4186,9 +4271,11 @@ impl Database {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().timestamp();
+        let body_hash = Self::friend_chat_body_hash_hex(message);
         tx.execute(
-            "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read, delivery) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery],
+            "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read, delivery, seen, body_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery, body_hash],
         )?;
         let new_id = tx.last_insert_rowid();
         let encrypted = Self::encrypt_chat_body(
@@ -4371,11 +4458,12 @@ impl Database {
         friend_hash: &str,
         limit: i64,
         before_id: Option<i64>,
-    ) -> anyhow::Result<Vec<(i64, String, String, i64, bool, i64)>> {
+    ) -> anyhow::Result<Vec<FriendChatRow>> {
         let conn = self.conn.lock();
-        let rows: Vec<(i64, String, String, i64, bool, i64)> = if let Some(bid) = before_id {
+        let rows: Vec<(i64, String, String, i64, bool, i64, bool)> = if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
+                "SELECT id, direction, message, timestamp, read, delivery, seen \
+                 FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
             )?;
             let mapped = stmt.query_map(params![friend_hash, bid, limit], |row| {
                 Ok((
@@ -4385,12 +4473,14 @@ impl Database {
                     row.get(3)?,
                     row.get::<_, i64>(4)? != 0,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)? != 0,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
+                "SELECT id, direction, message, timestamp, read, delivery, seen \
+                 FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
             )?;
             let mapped = stmt.query_map(params![friend_hash, limit], |row| {
                 Ok((
@@ -4400,9 +4490,19 @@ impl Database {
                     row.get(3)?,
                     row.get::<_, i64>(4)? != 0,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)? != 0,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let to_row = |id, direction, message, timestamp, read, delivery, seen| FriendChatRow {
+            id,
+            direction,
+            message,
+            timestamp,
+            read,
+            delivery,
+            seen,
         };
         // Locked: every row is sealed, so report them all as unavailable in one
         // go rather than warning once per row for a condition that is a property
@@ -4410,34 +4510,38 @@ impl Database {
         let Some(chat_key) = self.chat_key.as_deref() else {
             return Ok(rows
                 .into_iter()
-                .map(|(id, direction, _stored, timestamp, read, delivery)| {
-                    (
+                .map(|(id, direction, _stored, timestamp, read, delivery, seen)| {
+                    to_row(
                         id,
                         direction,
                         CHAT_UNAVAILABLE_TEXT.to_string(),
                         timestamp,
                         read,
                         delivery,
+                        seen,
                     )
                 })
                 .collect());
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, direction, stored, timestamp, read, delivery) in rows {
+        for (id, direction, stored, timestamp, read, delivery, seen) in rows {
             match Self::decrypt_chat_body(chat_key, id, friend_hash, &direction, timestamp, &stored)
             {
-                Ok(message) => messages.push((id, direction, message, timestamp, read, delivery)),
+                Ok(message) => {
+                    messages.push(to_row(id, direction, message, timestamp, read, delivery, seen))
+                }
                 Err(error) => {
                     tracing::warn!(
                         "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
                     );
-                    messages.push((
+                    messages.push(to_row(
                         id,
                         direction,
                         CHAT_UNAVAILABLE_TEXT.to_string(),
                         timestamp,
                         read,
                         delivery,
+                        seen,
                     ));
                 }
             }
@@ -4452,6 +4556,53 @@ impl Database {
             params![friend_hash],
         )?;
         Ok(())
+    }
+
+    /// Body hash of the newest received message this device has already read,
+    /// for a read-receipt watermark. `None` if there is nothing to acknowledge.
+    pub fn latest_read_received_hash(&self, friend_hash: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT body_hash FROM chat_messages \
+                 WHERE friend_hash = ?1 AND direction = 'received' AND read = 1 AND body_hash != '' \
+                 ORDER BY id DESC LIMIT 1",
+                params![friend_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hash.filter(|h| !h.is_empty()))
+    }
+
+    /// Mark our sent messages up through the one named by `body_hash` as seen.
+    /// Returns that row's id so the UI can apply the watermark without a reload.
+    pub fn mark_sent_seen_by_hash(
+        &self,
+        friend_hash: &str,
+        body_hash: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        if body_hash.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM chat_messages \
+                 WHERE friend_hash = ?1 AND direction = 'sent' AND body_hash = ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                params![friend_hash, body_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE chat_messages SET seen = 1 \
+             WHERE friend_hash = ?1 AND direction = 'sent' AND id <= ?2 AND seen = 0",
+            params![friend_hash, id],
+        )?;
+        Ok(Some(id))
     }
 
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
@@ -7112,7 +7263,9 @@ mod tests {
                 message TEXT NOT NULL,
                 timestamp INTEGER NOT NULL DEFAULT 0,
                 read INTEGER NOT NULL DEFAULT 0,
-                delivery INTEGER NOT NULL DEFAULT 0
+                delivery INTEGER NOT NULL DEFAULT 0,
+                seen INTEGER NOT NULL DEFAULT 0,
+                body_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE friend_blocks (
                 user_hash TEXT PRIMARY KEY,
@@ -7255,7 +7408,9 @@ mod tests {
                 message TEXT NOT NULL,
                 timestamp INTEGER NOT NULL DEFAULT 0,
                 read INTEGER NOT NULL DEFAULT 0,
-                delivery INTEGER NOT NULL DEFAULT 0
+                delivery INTEGER NOT NULL DEFAULT 0,
+                seen INTEGER NOT NULL DEFAULT 0,
+                body_hash TEXT NOT NULL DEFAULT ''
             );",
         )
         .expect("create schema");
@@ -7281,7 +7436,7 @@ mod tests {
         // Reads succeed, reporting the row as unavailable rather than erroring.
         let messages = locked.get_chat_messages("aa", 50, None).expect("read");
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].2, CHAT_UNAVAILABLE_TEXT);
+        assert_eq!(messages[0].message, CHAT_UNAVAILABLE_TEXT);
 
         // Writes are refused, so nothing is stored under a key we do not have.
         assert!(locked.insert_chat_message("aa", "sent", "hello").is_err());
@@ -10076,7 +10231,7 @@ mod tests {
         // History still shows both, and the flushed one now reads as delivered.
         let history = db.get_chat_messages(&friend, 50, None).expect("history");
         assert_eq!(history.len(), 2);
-        assert!(history.iter().all(|row| row.5 == CHAT_DELIVERED));
+        assert!(history.iter().all(|row| row.delivery == CHAT_DELIVERED));
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -10191,19 +10346,19 @@ mod tests {
             assert!(!raw.contains(canary));
 
             let newest = db.get_chat_messages(&"11".repeat(16), 1, None).unwrap();
-            assert_eq!(newest[0].0, second);
-            assert_eq!(newest[0].2, "second");
+            assert_eq!(newest[0].id, second);
+            assert_eq!(newest[0].message, "second");
             let older = db
                 .get_chat_messages(&"11".repeat(16), 5, Some(second))
                 .unwrap();
-            assert_eq!(older[0].0, first);
-            assert_eq!(older[0].2, canary);
+            assert_eq!(older[0].id, first);
+            assert_eq!(older[0].message, canary);
         }
         {
             let db = Database::open_at(&path).expect("restart");
             let rows = db.get_chat_messages(&"11".repeat(16), 5, None).unwrap();
             assert_eq!(rows.len(), 2);
-            assert_eq!(rows[1].2, canary);
+            assert_eq!(rows[1].message, canary);
         }
         let raw_db = std::fs::read(&path).unwrap();
         assert!(
@@ -10287,7 +10442,7 @@ mod tests {
         }
         let db = Database::open_at(&path).expect("migrate");
         let rows = db.get_chat_messages(&"33".repeat(16), 10, None).unwrap();
-        assert_eq!(rows[0].2, canary);
+        assert_eq!(rows[0].message, canary);
         let stored: String = db
             .conn
             .lock()
@@ -10361,7 +10516,7 @@ mod tests {
         assert_eq!(stored, canary, "the row must be left exactly as it was");
         let sealed = locked.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(sealed.len(), 1);
-        assert_eq!(sealed[0].2, CHAT_UNAVAILABLE_TEXT);
+        assert_eq!(sealed[0].message, CHAT_UNAVAILABLE_TEXT);
         drop(locked);
 
         // With the key recoverable again the deferred pass finishes the job.
@@ -10376,7 +10531,7 @@ mod tests {
         assert!(stored.starts_with(CHAT_CIPHERTEXT_PREFIX));
         let messages = recovered.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].2, canary);
+        assert_eq!(messages[0].message, canary);
         drop(recovered);
 
         remove_test_database(&path);
@@ -10417,8 +10572,8 @@ mod tests {
         };
         let unavailable = wrong_key_db.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(unavailable.len(), 1);
-        assert_eq!(unavailable[0].2, CHAT_UNAVAILABLE_TEXT);
-        assert!(!unavailable[0].2.contains(&stored_before));
+        assert_eq!(unavailable[0].message, CHAT_UNAVAILABLE_TEXT);
+        assert!(!unavailable[0].message.contains(&stored_before));
         let stored_after: String = wrong_key_db
             .conn
             .lock()
@@ -10438,9 +10593,42 @@ mod tests {
         };
         let recovered = recovered_db.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].2, "keep-me");
+        assert_eq!(recovered[0].message, "keep-me");
         drop(recovered_db);
 
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_receipt_marks_sent_messages_up_through_the_named_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-seen-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let friend = "aa".repeat(16);
+        let db = Database::open_at(&path).unwrap();
+        let first = db.insert_chat_message(&friend, "sent", "one").unwrap();
+        let second = db.insert_chat_message(&friend, "sent", "two").unwrap();
+        let third = db.insert_chat_message(&friend, "sent", "three").unwrap();
+        db.insert_chat_message(&friend, "received", "two").unwrap();
+        db.mark_messages_read(&friend).unwrap();
+        let hash = db.latest_read_received_hash(&friend).unwrap().expect("hash");
+        let until = db
+            .mark_sent_seen_by_hash(&friend, &hash)
+            .unwrap()
+            .expect("matched our sent copy of the same body");
+        assert_eq!(until, second);
+        let rows = db.get_chat_messages(&friend, 10, None).unwrap();
+        let by_id: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|row| (row.id, row.seen)).collect();
+        assert!(by_id[&first], "earlier sent lines are covered by the watermark");
+        assert!(by_id[&second]);
+        assert!(!by_id[&third], "later unsent-to-them lines stay unseen");
+        drop(db);
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);
     }

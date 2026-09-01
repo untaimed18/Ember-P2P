@@ -15,7 +15,9 @@ use super::messages::*;
 use super::secure_stream;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
-use crate::network::ember::crypto::{decrypt_chat_payload, MAX_CHAT_WIRE_LEN};
+use crate::network::ember::crypto::{
+    decrypt_chat_payload, decrypt_chat_read, decrypt_chat_typing, MAX_CHAT_WIRE_LEN,
+};
 
 /// True when `existing` is safe to reuse as the canonical outbound router for
 /// a newly authenticated dial to the same friend identity.
@@ -762,6 +764,36 @@ pub async fn run_friend_session_over_transport(
                                                     ember_hash: peer_ember_hash,
                                                 },
                                             }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_CHAT_TYPING, body)) => {
+                                            if let Some(typing) = decrypt_chat_typing(
+                                                &session_our_ed25519_secret,
+                                                &session_peer_ember_pubkey,
+                                                body,
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberChatTyping {
+                                                        ember_hash: peer_ember_hash,
+                                                        typing,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
+                                        Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
+                                            if let Some(body_hash) = decrypt_chat_read(
+                                                &session_our_ed25519_secret,
+                                                &session_peer_ember_pubkey,
+                                                body,
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberChatRead {
+                                                        ember_hash: peer_ember_hash,
+                                                        body_hash,
+                                                    },
+                                                }).await;
+                                            }
                                         }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.

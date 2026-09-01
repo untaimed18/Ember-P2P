@@ -447,6 +447,76 @@ pub fn decrypt_chat_from_peer(
 /// get silently dropped as "too large".
 pub const MAX_CHAT_WIRE_LEN: usize = 4096 + CHAT_ENVELOPE_OVERHEAD;
 
+/// Truncated BLAKE3 of a friend-chat body, used as the read-receipt watermark
+/// so receipts do not depend on clocks that the two sides never share.
+pub const CHAT_BODY_HASH_LEN: usize = 16;
+
+/// Largest encrypted typing/read-receipt body we will decrypt. The plaintext
+/// is one byte (typing) or [`CHAT_BODY_HASH_LEN`] (read); anything larger is
+/// not a signal this build produces.
+pub const MAX_CHAT_SIGNAL_WIRE_LEN: usize = CHAT_ENVELOPE_OVERHEAD + CHAT_BODY_HASH_LEN;
+
+/// BLAKE3-16 of the UTF-8 chat body. Stored on the row and sent in a read
+/// receipt so the original sender can mark that line (and everything before
+/// it) seen without a shared message id.
+pub fn chat_body_hash(message: &str) -> [u8; CHAT_BODY_HASH_LEN] {
+    let full = blake3::hash(message.as_bytes());
+    let mut out = [0u8; CHAT_BODY_HASH_LEN];
+    out.copy_from_slice(&full.as_bytes()[..CHAT_BODY_HASH_LEN]);
+    out
+}
+
+/// Encrypt a composing / stopped-composing signal for a live friend session.
+pub fn encrypt_chat_typing(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    typing: bool,
+) -> Option<Vec<u8>> {
+    encrypt_chat_for_peer(our_ed25519_seed, peer_ed25519_pubkey, &[u8::from(typing)])
+}
+
+/// Decrypt a typing signal. `None` if the envelope is not ours or the
+/// plaintext is not a 0/1 status byte.
+pub fn decrypt_chat_typing(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<bool> {
+    if envelope.len() > MAX_CHAT_SIGNAL_WIRE_LEN {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, envelope)?;
+    match plain.as_slice() {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
+/// Encrypt a read-receipt watermark (body hash of the latest read inbound
+/// message) for a live friend session.
+pub fn encrypt_chat_read(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    body_hash: &[u8; CHAT_BODY_HASH_LEN],
+) -> Option<Vec<u8>> {
+    encrypt_chat_for_peer(our_ed25519_seed, peer_ed25519_pubkey, body_hash)
+}
+
+/// Decrypt a read-receipt watermark. `None` if the envelope is not ours or
+/// the plaintext is not exactly [`CHAT_BODY_HASH_LEN`] bytes.
+pub fn decrypt_chat_read(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<[u8; CHAT_BODY_HASH_LEN]> {
+    if envelope.len() > MAX_CHAT_SIGNAL_WIRE_LEN {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, envelope)?;
+    plain.try_into().ok()
+}
+
 /// Decode an inbound `OP_EMBER_CHAT_MSG` payload for display.
 ///
 /// Returns `None` if the payload fails to decrypt or the plaintext isn't
@@ -893,5 +963,35 @@ mod tests {
         let envelope = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"ping").unwrap();
         let decrypted = decrypt_chat_from_peer(&bob_seed, &alice_pub, &envelope).unwrap();
         assert_eq!(decrypted, b"ping");
+    }
+
+    #[test]
+    fn chat_typing_round_trip_and_rejects_forged() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+
+        let on = encrypt_chat_typing(&alice_seed, &bob_pub, true).unwrap();
+        assert_eq!(decrypt_chat_typing(&bob_seed, &alice_pub, &on), Some(true));
+        let off = encrypt_chat_typing(&alice_seed, &bob_pub, false).unwrap();
+        assert_eq!(decrypt_chat_typing(&bob_seed, &alice_pub, &off), Some(false));
+        assert!(decrypt_chat_typing(&bob_seed, &alice_pub, b"not-an-envelope").is_none());
+    }
+
+    #[test]
+    fn chat_read_receipt_round_trip() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+        let hash = chat_body_hash("hello there");
+        let envelope = encrypt_chat_read(&alice_seed, &bob_pub, &hash).unwrap();
+        assert_eq!(decrypt_chat_read(&bob_seed, &alice_pub, &envelope), Some(hash));
+        assert_ne!(chat_body_hash("hello there"), chat_body_hash("hello there!"));
     }
 }

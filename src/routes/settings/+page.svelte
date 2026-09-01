@@ -797,6 +797,7 @@
         ...cached,
         friend_require_approval: settings.friend_require_approval,
         friend_chat_disabled: settings.friend_chat_disabled,
+        friend_chat_read_receipts: settings.friend_chat_read_receipts,
         friend_browse_disabled: settings.friend_browse_disabled,
         friend_session_encryption: true,
         channel_file_offers: settings.channel_file_offers,
@@ -818,6 +819,7 @@
             ...latest,
             friend_require_approval: settings.friend_require_approval,
             friend_chat_disabled: settings.friend_chat_disabled,
+            friend_chat_read_receipts: settings.friend_chat_read_receipts,
             friend_browse_disabled: settings.friend_browse_disabled,
             friend_session_encryption: true,
             channel_file_offers: settings.channel_file_offers,
@@ -830,6 +832,7 @@
               const baseline = JSON.parse(originalSettings) as AppSettings;
               baseline.friend_require_approval = result.settings.friend_require_approval;
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
+              baseline.friend_chat_read_receipts = result.settings.friend_chat_read_receipts;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
               baseline.friend_session_encryption = true;
               baseline.channel_file_offers = result.settings.channel_file_offers;
@@ -859,6 +862,7 @@
         if (settings) {
           settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
+          settings.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
           settings.channel_file_offers = persisted.channel_file_offers;
           settings.settings_revision = persisted.settings_revision;
@@ -871,6 +875,7 @@
           const baseline = JSON.parse(originalSettings) as AppSettings;
           baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
+          baseline.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
           baseline.channel_file_offers = persisted.channel_file_offers;
           baseline.settings_revision = persisted.settings_revision;
@@ -2514,6 +2519,14 @@
               <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} onchange={() => void applyFriendTogglesLive()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
+              <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_chat_read_receipts} ariaLabel={m.settings_friend_chat_read_receipts()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
           <div class="field toggle-row">

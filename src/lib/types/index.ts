@@ -801,6 +801,8 @@ export interface AppSettings {
   friend_require_approval: boolean;
   /** Disable incoming chat messages from friends */
   friend_chat_disabled: boolean;
+  /** Send and display friend-chat read receipts. Off both ways. */
+  friend_chat_read_receipts: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */

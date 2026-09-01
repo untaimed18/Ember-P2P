@@ -1562,6 +1562,16 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         message: String,
     },
+    /// Friend is composing (or just stopped) in our 1:1 chat. Live only.
+    EmberChatTyping {
+        ember_hash: [u8; 16],
+        typing: bool,
+    },
+    /// Friend has read our chat up through the message with this body hash.
+    EmberChatRead {
+        ember_hash: [u8; 16],
+        body_hash: [u8; 16],
+    },
     /// Incoming Ember browse request from a friend.
     EmberBrowseRequest {
         ember_hash: [u8; 16],
@@ -10672,6 +10682,50 @@ impl UploadHandler {
                                             },
                                         })
                                         .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_TYPING, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(typing) =
+                                        crate::network::ember::crypto::decrypt_chat_typing(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatTyping {
+                                                    ember_hash: eh,
+                                                    typing,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(body_hash) =
+                                        crate::network::ember::crypto::decrypt_chat_read(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatRead {
+                                                    ember_hash: eh,
+                                                    body_hash,
+                                                },
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
                             // A sub-type this build predates. Ignoring it is

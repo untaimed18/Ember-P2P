@@ -3327,8 +3327,6 @@ fn emit_chat_delivery_failed(app_handle: &tauri::AppHandle, expired: &[(i64, Str
     }
 }
 
-/// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
-/// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
 /// Replay outbound chat that was queued while a friend was unreachable.
 ///
 /// Called whenever a session to `friend` becomes live. Messages go out oldest
@@ -3469,6 +3467,87 @@ async fn flush_pending_chat(
     }
 }
 
+/// Hand a typing or read-receipt signal to a live friend session. Returns
+/// false when there is no fresh session or the writer queue is full — the
+/// caller decides whether to retry (receipts) or drop (typing).
+async fn send_encrypted_chat_ext(
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+    ext_type: u8,
+    plaintext: &[u8],
+) -> bool {
+    let Some((session_tx, envelope)) = ({
+        let sessions = ember_sessions.read().await;
+        sessions
+            .get(&friend)
+            .filter(|h| h.is_fresh() && h.is_secure_v2())
+            .and_then(|sender| {
+                let peer_pubkey = sender.peer_ember_pubkey();
+                let envelope = match ext_type {
+                    ed2k::messages::EMBER_EXT_CHAT_TYPING => {
+                        crate::network::ember::crypto::encrypt_chat_typing(
+                            ed25519_secret_key,
+                            &peer_pubkey,
+                            plaintext.first().copied().unwrap_or(0) != 0,
+                        )
+                    }
+                    ed2k::messages::EMBER_EXT_CHAT_READ => plaintext.try_into().ok().and_then(
+                        |body_hash: [u8; crate::network::ember::crypto::CHAT_BODY_HASH_LEN]| {
+                            crate::network::ember::crypto::encrypt_chat_read(
+                                ed25519_secret_key,
+                                &peer_pubkey,
+                                &body_hash,
+                            )
+                        },
+                    ),
+                    _ => crate::network::ember::crypto::encrypt_chat_for_peer(
+                        ed25519_secret_key,
+                        &peer_pubkey,
+                        plaintext,
+                    ),
+                };
+                envelope.map(|envelope| (sender.tx.clone(), envelope))
+            })
+    }) else {
+        return false;
+    };
+    session_tx
+        .try_send(ed2k::messages::build_ember_ext_frame(ext_type, &envelope))
+        .is_ok()
+}
+
+async fn flush_pending_read_receipt(
+    db: &Arc<Database>,
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+) {
+    let hash_hex = hex::encode(friend);
+    let db_read = db.clone();
+    let Ok(Ok(Some(hash_hex_str))) =
+        tokio::task::spawn_blocking(move || db_read.latest_read_received_hash(&hash_hex)).await
+    else {
+        return;
+    };
+    let Ok(bytes) = hex::decode(&hash_hex_str) else {
+        return;
+    };
+    let Ok(body_hash) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return;
+    };
+    let _ = send_encrypted_chat_ext(
+        ember_sessions,
+        ed25519_secret_key,
+        friend,
+        ed2k::messages::EMBER_EXT_CHAT_READ,
+        &body_hash,
+    )
+    .await;
+}
+
+/// Decide how to answer a friend's `OP_EMBER_XFER_REQ`, returning the
+/// `XFER_STATUS_*` code to ack with. Accepting commits us to dialing them.
 async fn friend_transfer_request_status(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
@@ -5738,11 +5817,10 @@ async fn persist_chat_history_message(
     user_hash: String,
     direction: &'static str,
     message: String,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     tokio::task::spawn_blocking(move || db.insert_chat_message(&user_hash, direction, &message))
         .await
         .map_err(|error| format!("Chat history persistence task failed: {error}"))?
-        .map(|_| ())
         .map_err(|error| format!("Failed to persist chat history: {error}"))
 }
 
@@ -10472,6 +10550,18 @@ pub enum NetworkCommand {
         ember_hash: [u8; 16],
         message: String,
         tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Live composing signal. Never queued: if the friend is not on a fresh
+    /// session the packet is dropped and the next keystroke retries.
+    SendChatTyping {
+        ember_hash: [u8; 16],
+        typing: bool,
+    },
+    /// Read-receipt watermark (BLAKE3-16 of the latest inbound line we have
+    /// opened). Offline sends are retried the next time a session comes up.
+    SendChatReadReceipt {
+        ember_hash: [u8; 16],
+        body_hash: [u8; 16],
     },
     BrowseFriend {
         ember_hash: [u8; 16],
@@ -27802,6 +27892,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 {
                     let activity_eh = match &event.kind {
                         UploadEventKind::EmberChatMessage { ember_hash, .. }
+                        | UploadEventKind::EmberChatTyping { ember_hash, .. }
+                        | UploadEventKind::EmberChatRead { ember_hash, .. }
                         | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
                         | UploadEventKind::EmberBrowseResponse { ember_hash, .. }
                         | UploadEventKind::EmberFriendRequest { ember_hash, .. } => Some(*ember_hash),
@@ -27857,6 +27949,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 *ember_hash,
                             )
                             .await;
+                            if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
+                            {
+                                flush_pending_read_receipt(
+                                    &db,
+                                    &state.ember_sessions,
+                                    &ed25519_secret_key,
+                                    *ember_hash,
+                                )
+                                .await;
+                            }
                         }
                         if still_friend && !ip.is_unspecified() && *port > 0 {
                             let hash_hex = hex::encode(ember_hash);
@@ -27981,6 +28083,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 *ember_hash,
                             )
                             .await;
+                            if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
+                            {
+                                flush_pending_read_receipt(
+                                    &db,
+                                    &state.ember_sessions,
+                                    &ed25519_secret_key,
+                                    *ember_hash,
+                                )
+                                .await;
+                            }
                         }
                     _ => {}
                 }
@@ -28081,12 +28193,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             )
                             .await
                             {
-                                Ok(()) => {
+                                Ok(id) => {
                                     state
                                         .recent_ember_chat
                                         .insert(chat_eh, (cleaned.clone(), now));
                                     let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                                         "user_hash": hash_hex,
+                                        "id": id,
                                         "message": cleaned,
                                         "direction": "received",
                                         "timestamp": now,
@@ -28099,6 +28212,56 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+
+                if let UploadEventKind::EmberChatTyping { ember_hash: typing_eh, typing } = event.kind {
+                    if !settings.friend_chat_disabled
+                        && friend_hashes.read().await.contains(&typing_eh)
+                    {
+                        let _ = app_handle.emit(
+                            "ember:chat-typing",
+                            serde_json::json!({
+                                "user_hash": hex::encode(typing_eh),
+                                "typing": typing,
+                            }),
+                        );
+                    }
+                }
+
+                if let UploadEventKind::EmberChatRead { ember_hash: read_eh, body_hash } = event.kind
+                {
+                    // Same gate as outbound send/flush: off means we neither
+                    // tell friends we have read nor record that they have read
+                    // us. Persisting while the setting is off would still paint
+                    // "Seen" the moment it is turned back on.
+                    if settings.friend_chat_disabled
+                        || !settings.friend_chat_read_receipts
+                        || !friend_hashes.read().await.contains(&read_eh)
+                    {
+                        continue;
+                    }
+                    let hash_hex = hex::encode(read_eh);
+                    let body_hex = hex::encode(body_hash);
+                    let db_seen = db.clone();
+                    let hash_for_db = hash_hex.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_seen.mark_sent_seen_by_hash(&hash_for_db, &body_hex)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some(until_id))) => {
+                            let _ = app_handle.emit(
+                                "ember:chat-read",
+                                serde_json::json!({
+                                    "user_hash": hash_hex,
+                                    "until_id": until_id,
+                                }),
+                            );
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => warn!("Failed to apply chat read receipt from {hash_hex}: {e}"),
+                        Err(e) => warn!("Chat read-receipt task failed for {hash_hex}: {e}"),
                     }
                 }
 
@@ -52951,6 +53114,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberPeerDiscovered { .. }
         | UploadEventKind::FriendSeen { .. }
         | UploadEventKind::EmberChatMessage { .. }
+        | UploadEventKind::EmberChatTyping { .. }
+        | UploadEventKind::EmberChatRead { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberBrowseSessionReady { .. }
