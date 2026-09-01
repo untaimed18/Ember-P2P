@@ -137,6 +137,39 @@ small and updates are quick. A future *additive* change can lower
 `EMBER_DHT_MIN_VERSION` rather than raising both, which is the cheap half; the
 expensive half is that neither of the last two changes could take that path.
 
+### 2a. Bootstrapping from a friend is fragile
+
+A friend is the strongest bootstrap signal the app has — explicitly trusted, a
+live authenticated session, and a routing table that is exactly what a cold node
+is missing. The route from that to a DHT contact is thinner than it looks:
+the eD2K/friend hello has to carry a non-zero UDP port, `EmberPeerDiscovered`
+has to pass its address guards, and then a single bridge `PING` has to be
+answered. Nothing about the live friend session itself is used.
+
+**Improved:** the retry backoff no longer grows while the table is starved. It
+was designed for a healthy node deciding how much to keep spending on an address
+that will not answer — sensible there, wrong below
+`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`, where those addresses *are* the join. One
+dropped datagram put the next attempt five minutes out, which is longer than
+many sessions, so a friend who blinked got no second chance inside a visit.
+While starved the interval is pinned to `EMBER_BRIDGE_RETRY_FIRST`, which equals
+the maintenance tick, so the flattened rate is one datagram per candidate per
+minute; it is capped by `EMBER_KAD_BRIDGE_MAX_PINGS` and stops on its own once
+the table fills.
+
+**Still open.** A friend whose hello carried no UDP port, or whose address the
+`EmberPeerDiscovered` guards reject, is never a bridge candidate at all — no
+retry policy helps, because nothing is ever attempted. Closing that means
+driving the introduction from the friend session rather than from the eD2K
+hello, and if the endpoint genuinely is not dialable, asking for contacts over
+the friend connection that already works. Neither is done.
+
+Field evidence for why this matters: a node with three contacts sat beside a
+friend holding fourteen, over a working friend session, with `Known peers` at 0
+— so the friend had never been registered as an Ember peer and was never asked.
+The gossip machinery itself was fine, and said so: 190 gossip contacts seen, 0
+refused, 0 new, which is three peers describing each other in a loop.
+
 ### 3. Cold join when eMule is not available
 
 Every path in the list above except `nodes_ember.dat` presupposes either a

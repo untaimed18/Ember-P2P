@@ -1222,7 +1222,27 @@ const EMBER_BRIDGE_RETRY_MAX: std::time::Duration = std::time::Duration::from_se
 /// How long to leave a bridge peer alone after `failed_attempts` unanswered
 /// pings. Doubles from [`EMBER_BRIDGE_RETRY_FIRST`] up to
 /// [`EMBER_BRIDGE_RETRY_MAX`].
-fn bridge_retry_after(failed_attempts: u32) -> std::time::Duration {
+///
+/// `starved` flattens the curve to its first step. The backoff exists so a
+/// genuinely dead address stops costing a datagram a minute forever, which is
+/// the right trade once the table is healthy and the peer is one candidate
+/// among many — but below [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts
+/// those same candidates *are* the join, and backing off to five minutes prices
+/// a lost datagram at the whole session. A friend is the sharpest case: you
+/// have explicitly trusted them, there is a live authenticated session to them,
+/// and their routing table is exactly what you are missing — yet one dropped
+/// bridge PING put the next attempt five minutes out, and a shorter visit than
+/// that never got a second chance.
+///
+/// Costing nothing is what makes this safe rather than merely helpful. The
+/// bridge only runs while starved, it is capped at
+/// [`EMBER_KAD_BRIDGE_MAX_PINGS`] per cycle, and the maintenance tick driving it
+/// is 60 seconds — so the flattened rate is one datagram per candidate per
+/// minute, and it stops of its own accord the moment the table fills.
+fn bridge_retry_after(failed_attempts: u32, starved: bool) -> std::time::Duration {
+    if starved {
+        return EMBER_BRIDGE_RETRY_FIRST;
+    }
     let doublings = failed_attempts.saturating_sub(1).min(8);
     let secs = EMBER_BRIDGE_RETRY_FIRST
         .as_secs()
@@ -1237,11 +1257,12 @@ fn bridge_retry_due(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     key: &(Ipv4Addr, u16),
     now: std::time::Instant,
+    starved: bool,
 ) -> bool {
     match attempted.get(key) {
         None => true,
         Some((at, failed_attempts)) => {
-            now.duration_since(*at) >= bridge_retry_after(*failed_attempts)
+            now.duration_since(*at) >= bridge_retry_after(*failed_attempts, starved)
         }
     }
 }
@@ -1250,8 +1271,15 @@ fn kad_bridge_candidates(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
-    kad_bridge_candidates_at(noise_keys, attempted, max, std::time::Instant::now())
+    kad_bridge_candidates_at(
+        noise_keys,
+        attempted,
+        max,
+        std::time::Instant::now(),
+        starved,
+    )
 }
 
 /// `kad_bridge_candidates` with an explicit "now", so the retry window is
@@ -1261,6 +1289,7 @@ fn kad_bridge_candidates_at(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
     if max == 0 {
         return Vec::new();
@@ -1268,7 +1297,7 @@ fn kad_bridge_candidates_at(
     let mut candidates: Vec<(Ipv4Addr, u16, [u8; 32], std::time::Instant)> = noise_keys
         .iter()
         .filter(|(key, _)| {
-            !crate::security::is_bogus_v4(key.0) && bridge_retry_due(attempted, key, now)
+            !crate::security::is_bogus_v4(key.0) && bridge_retry_due(attempted, key, now, starved)
         })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
@@ -1377,6 +1406,7 @@ fn xx_bridge_candidates(
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16)> {
     xx_bridge_candidates_at(
         keyless,
@@ -1384,6 +1414,7 @@ fn xx_bridge_candidates(
         attempted,
         max,
         std::time::Instant::now(),
+        starved,
     )
 }
 
@@ -1394,6 +1425,7 @@ fn xx_bridge_candidates_at(
     attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
     max: usize,
     now: std::time::Instant,
+    starved: bool,
 ) -> Vec<(Ipv4Addr, u16)> {
     if max == 0 {
         return Vec::new();
@@ -1402,7 +1434,7 @@ fn xx_bridge_candidates_at(
         .iter()
         .filter(|(key, _)| {
             !crate::security::is_bogus_v4(key.0)
-                && bridge_retry_due(attempted, key, now)
+                && bridge_retry_due(attempted, key, now, starved)
                 && !noise_keys.contains_key(*key)
         })
         .map(|(key, seen)| (key.0, key.1, *seen))
@@ -9244,7 +9276,7 @@ mod tests {
 
         // Nothing attempted yet → freshest-first, capped at `max`.
         let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
-        let picked = kad_bridge_candidates(&map, &empty, 2);
+        let picked = kad_bridge_candidates(&map, &empty, 2, false);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), c); // freshest first
         assert_eq!(picked[0].2, [0xCC; 32]);
@@ -9253,13 +9285,13 @@ mod tests {
         // Mark C attempted → it drops out, leaving B then A.
         let mut attempted = HashMap::new();
         attempted.insert(c, (std::time::Instant::now(), 1u32));
-        let picked = kad_bridge_candidates(&map, &attempted, 8);
+        let picked = kad_bridge_candidates(&map, &attempted, 8, false);
         assert_eq!(picked.len(), 2);
         assert_eq!((picked[0].0, picked[0].1), b);
         assert_eq!((picked[1].0, picked[1].1), a);
 
         // max == 0 → no work.
-        assert!(kad_bridge_candidates(&map, &empty, 0).is_empty());
+        assert!(kad_bridge_candidates(&map, &empty, 0, false).is_empty());
     }
 
     #[test]
@@ -9270,7 +9302,7 @@ mod tests {
         record_ember_noise_key(&mut map, docs, 4672, [0xAA; 32]);
         record_ember_noise_key(&mut map, ok, 4672, [0xBB; 32]);
         let empty: HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)> = HashMap::new();
-        let picked = kad_bridge_candidates(&map, &empty, 8);
+        let picked = kad_bridge_candidates(&map, &empty, 8, false);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].0, ok);
     }
@@ -9289,7 +9321,7 @@ mod tests {
         assert!(record_ember_keyless_peer(&mut keyless, bare.0, bare.1));
         record_ember_noise_key(&mut keys, keyed.0, keyed.1, [0xAA; 32]);
 
-        let picked = xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 8);
+        let picked = xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 8, false);
         assert_eq!(picked, vec![bare]);
     }
 
@@ -9309,19 +9341,19 @@ mod tests {
 
         // Freshest first, and the budget caps the batch.
         assert_eq!(
-            xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1),
+            xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 1, false),
             vec![b]
         );
 
         let mut attempted = HashMap::new();
         attempted.insert(b, (std::time::Instant::now(), 1u32));
         assert_eq!(
-            xx_bridge_candidates(&keyless, &keys, &attempted, 8),
+            xx_bridge_candidates(&keyless, &keys, &attempted, 8, false),
             vec![a]
         );
 
         // A spent budget means no work, which is how the IK pass reserves it.
-        assert!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 0).is_empty());
+        assert!(xx_bridge_candidates(&keyless, &keys, &HashMap::new(), 0, false).is_empty());
     }
 
     /// One lost ping must not be final. The discovery caches refresh a peer's
@@ -9342,19 +9374,21 @@ mod tests {
 
         // Just after the attempt the bridge moves on to other peers.
         let soon = attempt_at + std::time::Duration::from_secs(30);
-        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, soon).is_empty());
+        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, soon, false).is_empty());
 
         // Past the window it is eligible again.
         let later = attempt_at + EMBER_BRIDGE_RETRY_FIRST;
-        let picked = kad_bridge_candidates_at(&keys, &attempted, 8, later);
+        let picked = kad_bridge_candidates_at(&keys, &attempted, 8, later, false);
         assert_eq!(picked.len(), 1);
         assert_eq!((picked[0].0, picked[0].1), peer);
 
         // The XX pass honours the same window (with no Noise key known).
         let no_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
-        assert!(xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, soon).is_empty());
+        assert!(
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, soon, false).is_empty()
+        );
         assert_eq!(
-            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, later),
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, later, false),
             vec![peer]
         );
     }
@@ -9365,15 +9399,56 @@ mod tests {
     /// rate rather than being probed forever.
     #[test]
     fn bridge_retry_backs_off_from_one_maintenance_tick_to_the_old_ceiling() {
-        assert_eq!(bridge_retry_after(1), EMBER_BRIDGE_RETRY_FIRST);
-        assert_eq!(bridge_retry_after(2), EMBER_BRIDGE_RETRY_FIRST * 2);
-        assert_eq!(bridge_retry_after(3), EMBER_BRIDGE_RETRY_FIRST * 4);
-        assert_eq!(bridge_retry_after(4), EMBER_BRIDGE_RETRY_MAX);
-        assert_eq!(bridge_retry_after(50), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(1, false), EMBER_BRIDGE_RETRY_FIRST);
+        assert_eq!(bridge_retry_after(2, false), EMBER_BRIDGE_RETRY_FIRST * 2);
+        assert_eq!(bridge_retry_after(3, false), EMBER_BRIDGE_RETRY_FIRST * 4);
+        assert_eq!(bridge_retry_after(4, false), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(50, false), EMBER_BRIDGE_RETRY_MAX);
         // Saturating rather than shifting past the width of the counter.
-        assert_eq!(bridge_retry_after(u32::MAX), EMBER_BRIDGE_RETRY_MAX);
+        assert_eq!(bridge_retry_after(u32::MAX, false), EMBER_BRIDGE_RETRY_MAX);
         // A peer with no recorded attempt is due immediately.
-        assert_eq!(bridge_retry_after(0), EMBER_BRIDGE_RETRY_FIRST);
+        assert_eq!(bridge_retry_after(0, false), EMBER_BRIDGE_RETRY_FIRST);
+    }
+
+    /// While the table is too thin to run a lookup on, the backoff flattens to
+    /// its first step. The curve is right for a healthy node deciding how much
+    /// to keep spending on an address that will not answer; it is wrong when
+    /// those addresses are the entire join, because five minutes is longer than
+    /// many sessions and a friend who dropped one datagram gets no second
+    /// chance inside a visit.
+    #[test]
+    fn a_starved_table_does_not_let_the_bridge_back_off() {
+        for attempts in [0u32, 1, 2, 3, 4, 50, u32::MAX] {
+            assert_eq!(
+                bridge_retry_after(attempts, true),
+                EMBER_BRIDGE_RETRY_FIRST,
+                "a starved node retries every tick, whatever the attempt count"
+            );
+        }
+
+        // And it is the maintenance tick, not something faster: the bridge is
+        // driven by that timer, so this cannot become a busy loop.
+        assert_eq!(EMBER_BRIDGE_RETRY_FIRST, EMBER_MAINT_INTERVAL);
+
+        // The same peer, same history, is due while starved and not otherwise.
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let peer = (Ipv4Addr::new(8, 8, 8, 8), 4672u16);
+        record_ember_noise_key(&mut keys, peer.0, peer.1, [0x11; 32]);
+        let at = std::time::Instant::now();
+        let mut attempted = HashMap::new();
+        // Four misses: settled at the five-minute ceiling on a healthy table.
+        attempted.insert(peer, (at, 4u32));
+        let one_tick = at + EMBER_BRIDGE_RETRY_FIRST;
+
+        assert!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, false).is_empty(),
+            "a healthy table still lets a dead address rest"
+        );
+        assert_eq!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, true).len(),
+            1,
+            "a starved one tries again on the next tick"
+        );
     }
 
     /// Each unanswered ping must lengthen the next wait. Overwriting the entry
@@ -9390,10 +9465,19 @@ mod tests {
         attempted.insert(peer, (at, 3u32));
 
         // Two doublings in: one tick is no longer enough.
-        assert!(kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST)
-            .is_empty());
+        assert!(
+            kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST, false)
+                .is_empty()
+        );
         assert_eq!(
-            kad_bridge_candidates_at(&keys, &attempted, 8, at + EMBER_BRIDGE_RETRY_FIRST * 4).len(),
+            kad_bridge_candidates_at(
+                &keys,
+                &attempted,
+                8,
+                at + EMBER_BRIDGE_RETRY_FIRST * 4,
+                false
+            )
+            .len(),
             1
         );
     }
@@ -17936,10 +18020,12 @@ async fn note_connected_ember_peer(
         return;
     }
     let key = (ip, udp_port);
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
     if !bridge_retry_due(
         &state.ember_kad_bridge_attempted,
         &key,
         std::time::Instant::now(),
+        starved,
     ) {
         return;
     }
@@ -47585,6 +47671,7 @@ async fn run_ember_kad_bridge(
             &state.ember_noise_keys,
             &state.ember_kad_bridge_attempted,
             max_pings,
+            bridging,
         );
         for (ip, port, noise_pub) in candidates {
             dialled += 1;
@@ -47603,6 +47690,7 @@ async fn run_ember_kad_bridge(
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
         xx_budget,
+        bridging,
     );
     let mut xx_sent = 0usize;
     for (ip, port) in xx_candidates {
