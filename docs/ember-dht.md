@@ -602,31 +602,45 @@ settled.
   many publishers' records from one address — the author/relayer split is
   load-bearing.
 
-  **What did close is the aiming, which is the half that hurt.** Both eviction
-  rankers order victims by XOR distance from our own node ID, so a publisher
-  choosing keys next to us made every honest key look further out and therefore
-  evictable — and for keyword records the key *was* free, because the word is
-  not on the wire and only `key == keyword_hash` could be checked. The name is
-  on the wire, though, signed beside the key, and publish derives its keywords
-  from that name with one tokenizer, so `accept_record` now recomputes
-  `extract_keywords(file_name)` and requires the key to be one of those hashes
-  (`keyword_key_matches_its_name`). A flood can still push volume; it can no
-  longer choose what that volume displaces. Two things to know about it: a name
-  within a UTF-8 character of the record budget may have been clamped by
-  `SignedRecord::build`, so those are admitted unchecked (four bytes out of
-  roughly a kilobyte), and the tokenizer is now part of the validation contract,
-  so changing `extract_keywords` needs a version bump. It last changed in
-  `d0f204e9`, eight days before `EMBER_DHT_MIN_VERSION` reached 4.
+  **The aiming is the half that would hurt, and binding it was tried and
+  rejected.** Both eviction rankers order victims by XOR distance from our own
+  node ID, so a publisher choosing keys next to us makes every honest key look
+  further out and therefore evictable. For keyword records that choice is free:
+  the word is not on the wire, so `key == keyword_hash` is the only check
+  available and the publisher writes both sides of it.
 
-  What remains is volume, and that genuinely needs something scarcer than a
+  It *is* closable. The file name is on the wire, signed beside the key, and the
+  publish loop derives its keywords from that name with `extract_keywords`, so a
+  storer can recompute the set and require the key to be one of its hashes. That
+  was implemented, tested and then backed out; it is in `git stash` if the threat
+  ever becomes real. Two reasons it is not worth shipping now:
+
+  - The benefit does not reach the user. The store is what a node *serves to
+    others* — a user's own searches walk outward, and their own records enter
+    through `store_own_record`, which never touches this path. Poisoning costs
+    the network aggregate index quality, not the operator anything they would
+    notice, and the magnitude is already bounded by `MAX_STORE_BYTES` and
+    `MAX_STORE_IDENTITIES_PER_ADDR` (8).
+  - The cost lands on planned work. It makes record *validity* depend on the
+    tokenizer, so the "richer keyword indexing (stemming, more than space-split
+    tokens)" item under Search and publish stops being a drop-in change: new
+    publishers' records would be refused by every storer still on the old
+    tokenizer. Today that improvement needs no version bump. Binding the key
+    turns it into a wire break of the same class that forced v3 and v4.
+
+  If it is ever wanted, the cheap precursor is measurement rather than
+  enforcement: count inbound keyword records whose key no word in their own name
+  hashes to. That is zero-risk, answers whether anyone is actually aiming, and
+  doubles as a tripwire for tokenizer drift.
+
+  Volume is the other half, and that genuinely needs something scarcer than a
   keypair: a proof-of-work constraint on `BLAKE3(ed25519_pub)` is the only
   measure that prices identity directly, and being a one-time cost it prices
   mass Sybils rather than a hundred-identity one. The honest alternative is to
-  accept the bound and rely on `MAX_STORE_BYTES` plus
-  `MAX_STORE_IDENTITIES_PER_ADDR` (8) to keep the damage to bandwidth and
-  memory rather than correctness. Nothing here is a correctness break today:
-  a flood cannot forge a record, displace a validly signed one, or make a
-  search return something unsigned.
+  accept the bound and rely on the byte ceiling and the per-address STORE cap to
+  keep the damage to bandwidth and memory rather than correctness. Nothing here
+  is a correctness break today: a flood cannot forge a record, displace a validly
+  signed one, or make a search return something unsigned.
 
 ### Product / UX
 
