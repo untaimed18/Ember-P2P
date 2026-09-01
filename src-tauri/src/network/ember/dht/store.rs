@@ -1510,6 +1510,28 @@ impl DhtStore {
             else {
                 continue;
             };
+            // Drop what lapsed while we were closed, here rather than four checks
+            // later in `store_attributed`.
+            //
+            // It would be refused there anyway, but on the wrong terms and at the
+            // wrong price. `ember_dht_store_reject_timestamp` says "STORE frames
+            // refused because the signed creation time was too far in the future
+            // or already past TTL" — it exists to show a peer sending nonsense
+            // times — and a file full of records that simply aged out overnight
+            // was inflating it, so a node closed for a day came back reporting
+            // dozens of refusals that meant nothing was wrong. The price is that
+            // `store_attributed` verifies the Ed25519 signature *before* it looks
+            // at the clock, so every expired record cost a verification on the
+            // synchronous startup path the persisted-record ceiling was sized
+            // against, purely to be thrown away.
+            let ttl_secs = record_ttl(&record.data).as_secs() as i64;
+            if chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(created_at)
+                >= ttl_secs
+            {
+                continue;
+            }
             // Channel records get the shard-key check the wire path applies at
             // `engine.rs`'s `accept_record`. The two waivers above — the
             // proximity gate and the source-address bind — are deliberate and
@@ -3171,6 +3193,63 @@ mod tests {
     /// A restart used to drop every record held for other publishers. On a young
     /// network with few replicas each — or when an update restarts many nodes at
     /// once — that content is missing until replication refills it.
+    /// A record that lapsed while the app was closed is the TTL working, not a
+    /// peer sending a bad clock — but `restore` used to hand it to
+    /// `store_attributed`, which counted it under the timestamp refusal that the
+    /// diagnostics label "STORE frames". A node closed overnight came back
+    /// reporting dozens of refusals with nothing wrong, and paid an Ed25519
+    /// verification for each one first, because the signature check runs before
+    /// the clock check.
+    #[test]
+    fn restoring_an_expired_record_is_not_counted_as_a_bad_timestamp() {
+        use super::super::publish::SignedRecord;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+
+        let live = SignedRecord::keyword("ubuntu", [1u8; 16], [0u8; 32], 100, "ubuntu.iso", &sk);
+        let stale = SignedRecord::keyword("debian", [2u8; 16], [0u8; 32], 100, "debian.iso", &sk);
+
+        // The stale one has to be old in its *signed body*, since that is the
+        // only timestamp `restore` reads — the file's own column is ignored
+        // precisely because nothing signs it. `SignedRecord::keyword` stamps
+        // "now", so age the body at `data[105..113]` and re-sign it, which is
+        // exactly what a record written before an overnight shutdown looks like.
+        let expired_at = now_ts() - KEYWORD_RECORD_TTL.as_secs() as i64 - 60;
+        let mut stale_data = stale.data.clone();
+        stale_data[105..113].copy_from_slice(&expired_at.to_le_bytes());
+        let stale_sig = sign(&sk, &stale_data);
+
+        let saved = vec![
+            PersistedRecord {
+                key: live.keyword_hash,
+                data: live.data.clone(),
+                signature: live.signature,
+                publisher_key: live.publisher_key,
+                created_at: live.timestamp,
+                attributed_ip: None,
+            },
+            PersistedRecord {
+                key: stale.keyword_hash,
+                data: stale_data,
+                signature: stale_sig,
+                publisher_key: stale.publisher_key,
+                created_at: expired_at,
+                attributed_ip: None,
+            },
+        ];
+
+        let before = store.reject_stats().timestamp;
+        assert_eq!(store.restore(saved), 1, "only the live record comes back");
+        assert_eq!(store.total_records(), 1);
+        assert_eq!(
+            store.reject_stats().timestamp,
+            before,
+            "an aged-out file entry is not a peer with a bad clock"
+        );
+    }
+
     #[test]
     fn the_store_survives_a_restart_without_trusting_the_file() {
         use super::super::publish::SignedRecord;
