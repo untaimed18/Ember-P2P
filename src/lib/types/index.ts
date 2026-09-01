@@ -394,6 +394,16 @@ export interface EmberDiagnostics {
   ember_dht_contacts_evicted: number;
   /** Contacts moved to a replacement cache because the diversity limits tightened. */
   ember_dht_contacts_demoted?: number;
+  /** PEER_LIST replies received. Zero while we are sending ANNOUNCE_PEER means
+   *  the announces are going unanswered, which is a different failure from
+   *  replies that arrive carrying nobody. */
+  ember_dht_peer_lists_received?: number;
+  /** Contacts carried in inbound gossip, counted before admission. */
+  ember_dht_gossip_contacts?: number;
+  /** Of those, ones we did not already hold and the table accepted. */
+  ember_dht_gossip_new?: number;
+  /** Of those, ones the table turned away on IP policy or diversity caps. */
+  ember_dht_gossip_refused?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
