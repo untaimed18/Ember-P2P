@@ -117,10 +117,25 @@ version byte has to move with it.
 
 **This is the breaking change the section used to warn about**, and it has now
 landed on an overlay that ships **on**. Two peers on incompatible versions fail
-cleanly, but neither is told why and there is no upgrade prompt — they simply
-never fold each other into a routing table. A v2 node therefore sees the network
-shrink as peers update, with nothing in the UI to explain it, until it updates
-too. Worth a release note; the negotiation gap itself is still open.
+cleanly and never fold each other into a routing table.
+
+The local half of that is no longer silent, and this section used to say it was.
+A refused frame is counted as `ember_dht_version_mismatch`, split into
+`ember_dht_version_peer_older` and `ember_dht_version_peer_newer`, and `/ember`
+raises a banner while older peers are being turned away — so a node on this
+build can tell a thin table from packet loss. What cannot be fixed from here is
+the other half: the peer that needs to update is by definition the one that
+cannot decode anything we send, and it is running a build from before those
+counters existed. It sees the network shrink with nothing to explain it. That is
+a release-note problem, not a code one.
+
+The negotiation gap itself is still open, and it is the part worth keeping on
+this list. Nothing on the wire advertises the range a peer speaks, so there is
+no graceful downgrade: a shape change partitions the network on the day it
+ships, and the only reason that has been survivable is that the overlay is
+small and updates are quick. A future *additive* change can lower
+`EMBER_DHT_MIN_VERSION` rather than raising both, which is the cheap half; the
+expensive half is that neither of the last two changes could take that path.
 
 ### 3. Cold join when eMule is not available
 
@@ -135,7 +150,25 @@ eMule's bootstrap, or add a path that does not.
 Search → download over a live network is confirmed working. Still
 unexercised end to end:
 
-- LowID / firewalled publishing through buddy `PROXY_STORE`.
+- LowID / firewalled publishing through buddy `PROXY_STORE`. **The priority of
+  the three**, because three parts of it changed in `df849818` and none has been
+  seen on a live network: the buddy now requires an endorsement before it will
+  proxy at all, the publish side no longer emits the compatibility trailer, and
+  the buddy's own replica is attributed to the sender. Each has unit coverage,
+  which says nothing about whether the chain completes.
+
+  The chain to walk, with the counter that shows each hop:
+  `BUDDY_ENDORSE_REQ` → endorsement absorbed → `PROXY_STORE` accepted
+  (`ember_dht_buddy_publishes`) → `PROXY_STORE_ACK` → overlay `STORE` → searcher
+  finds the record → `CALLBACK_REQ` (`ember_dht_callback_sent`) → buddy bounces
+  `CALLBACK` (`ember_dht_callback_forwards`) → publisher connects back
+  (`ember_dht_callback_connects`).
+
+  One behaviour to confirm specifically: with the compatibility trailer gone, a
+  publisher that never obtains an endorsement publishes *nothing* for that file
+  rather than a record no searcher would dial, and `ember_dht_waiting_buddy` is
+  the only evidence that state exists. Check it lights, and then clears once an
+  endorsement lands.
 - A cold join from an empty contact file with no KAD.
 - Republish behaviour across a full record TTL on a large library.
 
@@ -348,33 +381,6 @@ the emit step, and it removes the search from `ember_keyword_searches`. That
 ordering is what stops a reaped search from being streamed after its
 `search-complete`, and it is not obvious from either site alone.
 
-### 4a. The pre-endorsement buddy trailer — retired
-
-Naming a buddy used to be possible two ways: with the buddy's signed
-endorsement, or — for publishers whose build predated it — by naming the
-buddy's Noise static, which is on every signed frame that buddy sends. The
-second was never consent. Anyone who had ever heard from a node could name it
-and spend a replica, a twenty-node fan-out and a `callback_clients` slot.
-
-It is gone from both sides, because under wire v4 it could not help anyone.
-The endorsement shipped in `d87ae41a`, wire v4 in `68fce6ab` three days later,
-so every peer that can complete a frame exchange with us also speaks
-endorsements — and a current-build searcher refuses to dial an unendorsed
-buddy regardless (`DiscoveredSource::takes_callback` requires
-`has_identity()`). Publishing one produced a record every finder parked, and
-accepting one did that work on somebody else's say-so.
-
-`trailer_names_us` now always requires an endorsement we signed. The publish
-side no longer emits the compatibility trailer, which also retired
-`ember_unendorsed_source_buddy`, the `ember_source_published_unendorsed`
-latch, `ember_endorsement_supersedes_unendorsed_sources`, and the
-`ember_dht_buddy_unendorsed_publish` diagnostic. A firewalled publisher with
-no endorsement yet publishes nothing for that file and retries the next tick;
-nothing is stamped for a skipped file, so it stays due, and
-`ember_dht_waiting_buddy` is what surfaces the wait. Pairing costs one tick:
-`BUDDY_ENDORSE_REQ` is answered in a round trip and is not gated on the proxy
-budget.
-
 ### 4. Firewalled sources are discoverable but not dialable — done
 
 Publish was already complete: a firewalled node sets `SOURCE_FLAG_FIREWALLED`,
@@ -409,6 +415,33 @@ downloads — rather than dropping the source. The broker still needs admitted
 ERAT candidates; it does not invent a relay.
 
 Diagnostics: `ember_dht_callback_sent / forwards / connects` on the Ember page.
+
+### 4a. The pre-endorsement buddy trailer — retired
+
+Naming a buddy used to be possible two ways: with the buddy's signed
+endorsement, or — for publishers whose build predated it — by naming the
+buddy's Noise static, which is on every signed frame that buddy sends. The
+second was never consent. Anyone who had ever heard from a node could name it
+and spend a replica, a twenty-node fan-out and a `callback_clients` slot.
+
+It is gone from both sides, because under wire v4 it could not help anyone.
+The endorsement shipped in `d87ae41a`, wire v4 in `68fce6ab` three days later,
+so every peer that can complete a frame exchange with us also speaks
+endorsements — and a current-build searcher refuses to dial an unendorsed
+buddy regardless (`DiscoveredSource::takes_callback` requires
+`has_identity()`). Publishing one produced a record every finder parked, and
+accepting one did that work on somebody else's say-so.
+
+`trailer_names_us` now always requires an endorsement we signed. The publish
+side no longer emits the compatibility trailer, which also retired
+`ember_unendorsed_source_buddy`, the `ember_source_published_unendorsed`
+latch, `ember_endorsement_supersedes_unendorsed_sources`, and the
+`ember_dht_buddy_unendorsed_publish` diagnostic. A firewalled publisher with
+no endorsement yet publishes nothing for that file and retries the next tick;
+nothing is stamped for a skipped file, so it stays due, and
+`ember_dht_waiting_buddy` is what surfaces the wait. Pairing costs one tick:
+`BUDDY_ENDORSE_REQ` is answered in a round trip and is not gated on the proxy
+budget.
 
 ### 5. Persist the Ember source publish schedule — done
 
@@ -545,8 +578,55 @@ settled.
 ### Hardening and ops
 
 - Longer fuzz / property tests in CI; overnight soak jobs.
-- Score gossip to limit table poisoning under Sybil pressure, beyond the
-  per-IP and per-subnet admission caps.
+- **Sybil pressure: what is bounded and what is not.** Worth stating plainly,
+  because the two halves of the overlay are in very different shape.
+
+  The *routing table* is anchored on something scarce. Its caps are keyed on
+  address and /24, not on identity, so a keypair buys nothing on its own — and
+  `enforce_scale_quotas` closed the last hole, where a share admitted under the
+  cold-start tier was kept for the life of the process. What remains there is
+  that gossip is unscored: a peer can name contacts that never answer, forever,
+  at no cost beyond the frame. Weighting a contact by whether the leads it gave
+  us turned out to be reachable is the cheap next step and needs no wire change.
+
+  The *store* is not, and its caps cannot be fixed the same way. They —
+  `MAX_RECORDS_PER_PUBLISHER_PER_KEY` (150), `MAX_KEYS_PER_PUBLISHER` (6,250),
+  `MAX_BYTES_PER_PUBLISHER` (6 MiB) — are all keyed on `publisher_key`, so a
+  Sybil spending one identity per record is never over its share and the rule
+  never engages. The comments on those constants explain why the obvious fix is
+  worse than the gap: a per-publisher rule that *moves* capacity rather than
+  withholding it is an eviction primitive, since an arrival holding nothing
+  always outranks an incumbent. Attributing keyword records to the sender's
+  address instead is what closed the equivalent hole for *source* records, but
+  it cannot be extended, because storer-side replication legitimately relays
+  many publishers' records from one address — the author/relayer split is
+  load-bearing.
+
+  **What did close is the aiming, which is the half that hurt.** Both eviction
+  rankers order victims by XOR distance from our own node ID, so a publisher
+  choosing keys next to us made every honest key look further out and therefore
+  evictable — and for keyword records the key *was* free, because the word is
+  not on the wire and only `key == keyword_hash` could be checked. The name is
+  on the wire, though, signed beside the key, and publish derives its keywords
+  from that name with one tokenizer, so `accept_record` now recomputes
+  `extract_keywords(file_name)` and requires the key to be one of those hashes
+  (`keyword_key_matches_its_name`). A flood can still push volume; it can no
+  longer choose what that volume displaces. Two things to know about it: a name
+  within a UTF-8 character of the record budget may have been clamped by
+  `SignedRecord::build`, so those are admitted unchecked (four bytes out of
+  roughly a kilobyte), and the tokenizer is now part of the validation contract,
+  so changing `extract_keywords` needs a version bump. It last changed in
+  `d0f204e9`, eight days before `EMBER_DHT_MIN_VERSION` reached 4.
+
+  What remains is volume, and that genuinely needs something scarcer than a
+  keypair: a proof-of-work constraint on `BLAKE3(ed25519_pub)` is the only
+  measure that prices identity directly, and being a one-time cost it prices
+  mass Sybils rather than a hundred-identity one. The honest alternative is to
+  accept the bound and rely on `MAX_STORE_BYTES` plus
+  `MAX_STORE_IDENTITIES_PER_ADDR` (8) to keep the damage to bandwidth and
+  memory rather than correctness. Nothing here is a correctness break today:
+  a flood cannot forge a record, displace a validly signed one, or make a
+  search return something unsigned.
 
 ### Product / UX
 
