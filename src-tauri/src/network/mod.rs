@@ -18013,6 +18013,16 @@ async fn note_connected_ember_peer(
         state.ember_payload_dirty = true;
     }
     if udp_port == 0 {
+        // The peer is now a known Ember host and will never be a DHT contact:
+        // the overlay rides the shared UDP socket, so with no port there is
+        // nothing to bridge to, and every later step keys on `(ip, udp_port)`.
+        // Silence here is what makes that indistinguishable from a bridge ping
+        // that was sent and ignored, which is a very different fault — one is
+        // the peer's hello, the other is the network in between.
+        debug!(
+            "Ember bridge: {ip} advertised no UDP port, so it can be a known peer \
+             but never a DHT contact"
+        );
         return;
     }
     record_ember_keyless_peer(&mut state.ember_keyless_peers, ip, udp_port);

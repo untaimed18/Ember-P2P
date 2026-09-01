@@ -393,6 +393,12 @@ export interface EmberDiagnostics {
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
   /** Contacts moved to a replacement cache because the diversity limits tightened. */
+  /** Of ember_dht_contacts, ones parked in a replacement cache. These are never
+   *  liveness-pinged, so they cannot verify themselves — only promotion into a
+   *  bucket can, and that needs the IP policy to admit them. */
+  ember_dht_cached_contacts?: number;
+  /** Of ember_dht_contacts, firsthand session peers the public table refused. */
+  ember_dht_session_contacts?: number;
   ember_dht_contacts_demoted?: number;
   /** PEER_LIST replies received. Zero while we are sending ANNOUNCE_PEER means
    *  the announces are going unanswered, which is a different failure from

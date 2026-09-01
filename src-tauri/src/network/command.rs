@@ -2054,6 +2054,12 @@ async fn handle_command_inner(
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             diag.ember_dht_contacts = ember_contacts;
             diag.ember_dht_verified_contacts = ember_verified;
+            // The headline count is buckets + cache + session extras, and those
+            // three behave nothing alike — only the first is liveness-pinged.
+            // Splitting them is what tells "we hold twelve peers" apart from
+            // "we hold three and nine are parked where nothing will probe them".
+            diag.ember_dht_cached_contacts = state.ember_dht.routing().cached_len() as u32;
+            diag.ember_dht_session_contacts = ember_session_overlay_extras(state, false) as u32;
             if note_ember_verified_contacts(
                 &mut state.ember_verified_highwater,
                 diag.ember_dht_verified_contacts,

@@ -734,6 +734,24 @@ pub struct EmberDiagnostics {
     /// Maintenance liveness `PING`s sent to stale contacts this session.
     #[serde(default)]
     pub ember_dht_liveness_pings_sent: u32,
+    /// Of [`Self::ember_dht_contacts`], the ones parked in a bucket's
+    /// replacement cache rather than holding a slot.
+    ///
+    /// Worth its own row because a parked contact is invisible to the thing
+    /// that would promote it: `contacts_due_for_ping` reads `all_contacts`,
+    /// which is buckets only, so a cache entry is never liveness-pinged and can
+    /// never verify itself. It depends entirely on `promote_cached_contacts`
+    /// moving it into a bucket first, and that requires the IP policy to admit
+    /// it — so a peer parked while `ipfilter.dat` was loading, or a LAN address
+    /// under `block_private_ips`, can sit here indefinitely while the headline
+    /// contact count says the overlay is healthier than it is.
+    #[serde(default)]
+    pub ember_dht_cached_contacts: u32,
+    /// Of [`Self::ember_dht_contacts`], firsthand session peers the public
+    /// table refused outright — typically LAN or CGNAT while
+    /// `block_private_ips` is on. Counted, reachable, but not routing entries.
+    #[serde(default)]
+    pub ember_dht_session_contacts: u32,
     /// Contacts dropped from the routing table this session because they
     /// stopped answering — repeated liveness-ping failures and the staleness
     /// purge. Genuinely gone: nothing remembers them but the bootstrap cache.
