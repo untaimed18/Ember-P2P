@@ -32,7 +32,7 @@
     listChannelMembers,
     channelPresenceConfig,
     setChannelFocus,
-    offerChannelTransfer,
+    pickAndOfferChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
     rotateChannelRoomKey,
@@ -532,10 +532,12 @@
       const id = event.payload.channel_id;
       refreshChannels().catch(() => {});
       if (id === selectedId) void refreshMembers(id);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenMembers = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenMembers = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-members listener:', e));
     // The roster changing shape costs a full re-read; a member being heard from
     // does not, and happens far more often. Only the open room is applied —
     // rows for a room that is not on screen are re-read when it is opened.
@@ -543,10 +545,12 @@
     listen<ChannelPresenceDelta>('ember:channel-presence', (event) => {
       if (event.payload.channel_id !== selectedId) return;
       applyPresenceDelta(event.payload.members ?? []);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenPresence = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenPresence = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-presence listener:', e));
     let unlistenChat: UnlistenFn | undefined;
     listen<{
       channel_id: string;
@@ -555,10 +559,12 @@
     }>('ember:channel-message', (event) => {
       if (event.payload.channel_id !== selectedId) return;
       noteMemberHeard(event.payload.sender_pubkey ?? '', event.payload.timestamp ?? 0);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenChat = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenChat = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-message listener:', e));
     let unlistenModeration: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
       const id = event.payload.channel_id;
@@ -572,10 +578,12 @@
         })
         .catch(() => {});
       if (id === selectedId) void refreshMembers(id);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenModeration = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenModeration = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-moderation listener:', e));
     let unlistenHandoff: UnlistenFn | undefined;
     listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', (event) => {
       // Only the room that actually moved: wiping the map cleared the pending
@@ -591,10 +599,12 @@
           if (selectedId) void refreshMembers(selectedId);
         })
         .catch(() => {});
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenHandoff = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenHandoff = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-handoff listener:', e));
     // One index shard answered. Sixteen of these arrive per browse, in whatever
     // order the DHT returns them, so the list grows as the walk proceeds instead
     // of appearing all at once when the slowest shard gives up.
@@ -611,10 +621,12 @@
         byId.set(item.channel_id, withKnownMemberCount(item, byId.get(item.channel_id)));
       }
       discovered = [...byId.values()];
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlistenFound = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenFound = fn;
+      })
+      .catch((e) => console.error('Failed to register channels-found listener:', e));
     // In-flight transfers live in the shell store so offers toast even when
     // this page is not mounted. Merge a snapshot here in case one started
     // between store init and this visit.
@@ -1439,10 +1451,10 @@
     // second click while the dialog was up used to start a second offer.
     sendingTo = [...sendingTo, pk];
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const picked = await open({ multiple: false, title: m.channels_send_file() });
-      if (!picked || Array.isArray(picked)) return;
-      await offerChannelTransfer(id, pk, picked);
+      // The picker lives in the backend: it is what authorizes reading the
+      // file, so the path must never originate here. `null` means dismissed.
+      const xferId = await pickAndOfferChannelTransfer(id, pk);
+      if (xferId === null) return;
       toastSuccess(m.channels_xfer_offer_sent({ name: roomMemberLabel(mem) }));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));

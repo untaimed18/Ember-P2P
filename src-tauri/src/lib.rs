@@ -1871,7 +1871,7 @@ pub fn run() {
             commands::channels::set_channel_successor_nominee,
             commands::channels::claim_channel_ownership,
             commands::channels::channel_member_friend_code,
-            commands::channels::offer_channel_transfer,
+            commands::channels::pick_and_offer_channel_transfer,
             commands::channels::respond_channel_transfer,
             commands::channels::cancel_channel_transfer,
             commands::channels::list_channel_transfers,

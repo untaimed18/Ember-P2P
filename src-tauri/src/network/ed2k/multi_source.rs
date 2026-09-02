@@ -2955,9 +2955,14 @@ impl MultiSourceDownload {
             // callbacks (it's `None` here only if the channel already closed).
             post_phase_new_established_rx = new_established_rx;
         } else {
+            // Settled, not merely byte-complete: a source whose part just
+            // failed MD4 still leaves no gap while its AICH round-trip is in
+            // flight, and aborting it there throws away a ~180 KiB repair in
+            // favour of a failed whole-file verification. Falling through to
+            // the `else` branch simply awaits it instead.
             let all_parts_done = {
                 let t = tracker.read().await;
-                t.all_complete()
+                t.all_complete_and_settled()
             };
             if all_parts_done {
                 for handle in handles {
@@ -3901,9 +3906,11 @@ impl MultiSourceDownload {
             }
 
             drop(retry_tx);
+            // See the initial-phase abort above: a part still claimed by a
+            // source is one that source may yet repair.
             let retry_all_done = {
                 let t = tracker.read().await;
-                t.all_complete()
+                t.all_complete_and_settled()
             };
             if retry_all_done {
                 for h in retry_handles {
@@ -3938,9 +3945,10 @@ impl MultiSourceDownload {
             drop(es);
         }
         drop(adopt_progress_tx);
+        // See the initial-phase abort above.
         let adopted_all_done = {
             let t = tracker.read().await;
-            t.all_complete()
+            t.all_complete_and_settled()
         };
         if adopted_all_done {
             for h in &adopted_handles {

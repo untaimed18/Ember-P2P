@@ -20,12 +20,13 @@
 //! eMule wire-protocol compatibility is unaffected — this only changes how
 //! we move bytes into the on-disk `.part` file.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 /// Bounded operation queue per writer. Generous so byte-arrival bursts from
 /// multiple sources don't backpressure the network loop, but bounded so a
@@ -38,6 +39,48 @@ const MAX_WRITER_IO_BYTES: usize = 16 * 1024 * 1024;
 /// is deliberately coarse: this is one tokio timer per active download, not a
 /// thread, and an idle writer must not wake up on a fast tick.
 const DISCARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One live writer per `.part` path, across download generations.
+///
+/// Every start path aborts the previous worker before spawning a new one, but
+/// `abort()` only unwinds the *task*: the worker thread it owns keeps the file
+/// handle until it has drained its queue and run its trailing fsync, and most
+/// of those start paths do not wait for that at all (the KAD-disconnect path
+/// drains `download_handles` entirely, so the next start does not even see a
+/// handle to wait on). Two writer threads on one `.part` interleave seeks and
+/// writes, so a block the old generation still had queued can land on top of
+/// one the new generation just wrote — a torn part that only surfaces later as
+/// an MD4/AICH mismatch and a re-download.
+///
+/// The permit is taken before the file is opened and released by the worker
+/// thread itself, after it has closed its handle. That makes the hand-off
+/// ordered no matter which start path spawned the new generation, so callers
+/// do not each have to re-implement the wait.
+static PART_WRITER_GATES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<Semaphore>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// How long a new writer waits for the previous one to release the path.
+/// Generous enough for a multi-GB trailing fsync on a slow disk, bounded so a
+/// genuinely stuck writer fails the new download instead of hanging it
+/// forever. Failing is the safe direction: the transfer is re-queued and
+/// retried, whereas opening anyway is the corruption this gate exists to stop.
+const WRITER_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The gate for `path`, creating it if this is the first writer.
+///
+/// Entries are held by `Weak`, and an `OwnedSemaphorePermit` keeps its
+/// `Arc<Semaphore>` alive, so a path with no writer and no waiter drops out on
+/// the next sweep rather than accumulating one entry per completed download.
+fn writer_gate(path: &Path) -> Arc<Semaphore> {
+    let mut gates = PART_WRITER_GATES.lock();
+    if let Some(existing) = gates.get(path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    gates.retain(|_, weak| weak.strong_count() > 0);
+    let gate = Arc::new(Semaphore::new(1));
+    gates.insert(path.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
 
 fn validate_range(offset: u64, len: usize) -> io::Result<()> {
     if len > MAX_WRITER_IO_BYTES {
@@ -159,6 +202,27 @@ impl PartFileWriter {
         allowed_roots: Vec<String>,
         discard: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
+        // Claim the path before touching the file: `CreateOrOpen` can set (or
+        // truncate) the length, which must not happen while a previous
+        // generation's worker still holds the handle. See `PART_WRITER_GATES`.
+        let gate = writer_gate(&path);
+        let permit = match tokio::time::timeout(WRITER_HANDOFF_TIMEOUT, gate.acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(io::Error::other("part writer gate closed"));
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for the previous writer on {} to close",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+
         // Open on a blocking thread because creating + sizing the file can
         // be slow on cold disks. After this returns the worker thread takes
         // ownership of the handle.
@@ -180,7 +244,13 @@ impl PartFileWriter {
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
             ))
-            .spawn(move || writer_loop(file, &mut rx, discard_for_loop))
+            .spawn(move || {
+                // Declared first so it drops last: the path stays claimed
+                // until `writer_loop` has returned, which is after it has
+                // fsynced and dropped the file handle.
+                let _permit = permit;
+                writer_loop(file, &mut rx, discard_for_loop)
+            })
             .map_err(|e| {
                 io::Error::other(format!("spawn writer thread: {e}"))
             })?;
@@ -555,6 +625,59 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("discarded writer did not release {}", path.display());
+    }
+
+    /// Aborting a download task does not stop the writer thread it owns: the
+    /// thread still drains its queue and fsyncs while holding the handle, and
+    /// most start paths spawn the replacement worker immediately (the
+    /// KAD-disconnect path drains `download_handles`, so the next start has no
+    /// handle to wait on at all). Opening a second writer in that window is
+    /// what lets a stale queued block overwrite a fresh one.
+    #[tokio::test]
+    async fn a_second_writer_waits_for_the_previous_one_to_close() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("handoff");
+        let first = PartFileWriter::open(
+            path.clone(),
+            OpenMode::CreateOrOpen {
+                set_len_to: Some(4096),
+                truncate_existing: true,
+            },
+            allowed.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second_path = path.clone();
+        let second_allowed = allowed.clone();
+        let mut second = tokio::spawn(async move {
+            PartFileWriter::open(
+                second_path,
+                OpenMode::OpenExisting,
+                second_allowed,
+                None,
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a second writer opened {} while the first still held it",
+            path.display()
+        );
+
+        drop(first);
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+            .await
+            .expect("the second writer must open once the first has closed")
+            .expect("second writer task panicked")
+            .expect("second writer failed to open");
+        drop(second);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// Pause and Stop cancel the transfer control but keep the `.part` and its

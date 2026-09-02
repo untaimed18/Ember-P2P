@@ -3988,15 +3988,20 @@ pub async fn resolve_media_asset_path(
     };
 
     tokio::task::spawn_blocking(move || {
+        // Containment first, and one error code for every way it can fail.
+        // Unlike `open_shared_file`, nothing here requires the path to be in
+        // the index, so the earlier `exists()` / `is_file()` pre-checks
+        // answered "does this path exist?" about *any* path a compromised
+        // renderer cared to name — the distinct codes were the oracle. Mirrors
+        // `get_file_media_metadata`, which already checks containment first.
         let path = std::path::Path::new(&file_path);
-        if !path.exists() {
-            return Err(coded("sharing_file_not_exist", "File does not exist"));
-        }
-        if !path.is_file() {
-            return Err(coded("sharing_not_a_file", "Path is not a file"));
-        }
         let canonical = crate::security::filesystem::verify_existing_path(path, &allowed_dirs)
             .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        // Safe to distinguish now: the path is already known to live inside an
+        // approved root, so this tells the caller nothing it could not see.
+        if !canonical.is_file() {
+            return Err(coded("sharing_not_a_file", "Path is not a file"));
+        }
         if !crate::security::filesystem::passive_type_agrees(&file_path, &canonical) {
             return Err(coded(
                 "sharing_dangerous_file",
@@ -4029,9 +4034,10 @@ pub async fn open_shared_folder(
     tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path);
         let folder = path.parent().unwrap_or(path);
-        if !folder.exists() {
-            return Err(coded("sharing_folder_not_exist", "Folder does not exist"));
-        }
+        // Containment first, one code for every failure — see
+        // `resolve_media_asset_path`. The `exists()` pre-check here reported
+        // whether the *parent* of any renderer-supplied path existed, under a
+        // different code than the containment failure.
         let canonical = crate::security::filesystem::verify_existing_path(folder, &allowed_dirs)
             .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
         crate::security::filesystem::reveal_in_file_manager(&canonical)

@@ -246,7 +246,14 @@ async fn handle_command_inner(
 
             // --- TCP server search ---
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
-            let run_udp = matches!(method, SearchMethod::Global);
+            // Global's UDP leg does not need a server *session*, so it kept
+            // spraying `OP_GLOBSEARCH` at the whole server list after the user
+            // had gone offline. Ember still answers a Global query, which is
+            // the documented offline fallback; talking to eD2K servers is not.
+            let run_udp = matches!(method, SearchMethod::Global)
+                && !state
+                    .user_offline
+                    .load(std::sync::atomic::Ordering::Relaxed);
             let run_kad =
                 !keywords.is_empty() && matches!(method, SearchMethod::Global | SearchMethod::Kad);
             let run_ember = matches!(method, SearchMethod::Global | SearchMethod::Ember);
@@ -3779,6 +3786,11 @@ async fn handle_command_inner(
             state
                 .upload_disconnected
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Lift the outbound stop too: downloads, friend dials and server
+            // search are suspended for exactly as long as the user is offline.
+            state
+                .user_offline
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
@@ -4006,6 +4018,22 @@ async fn handle_command_inner(
             state.online_friends.clear();
             state.outbound_session_tasks.clear();
 
+            // Retire the live friend streams too, not just the UI's view of
+            // them. `online_friends` is what the Friends page renders, but
+            // chat, file offers and browse all route through `ember_sessions`
+            // — so clearing only the former left every friend shown as offline
+            // while messages still sent successfully on the surviving socket.
+            // It also blocked recovery: `FindFriendAndConnect` skips a peer
+            // that still has a fresh session, so the reconnect the user would
+            // reach for never dialled.
+            {
+                let mut sessions = state.ember_sessions.write().await;
+                for handle in sessions.values() {
+                    handle.close();
+                }
+                sessions.clear();
+            }
+
             // Abort all active download tasks — they hold open TCP connections
             // to peers and will keep transferring data even though the network
             // is logically disconnected.  Re-queue each as a pending download
@@ -4141,6 +4169,12 @@ async fn handle_command_inner(
             state
                 .upload_disconnected
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // And stop the outbound half, which the upload gate cannot speak
+            // for: no new download workers, no friend dials, no server search
+            // until the user comes back online.
+            state
+                .user_offline
+                .store(true, std::sync::atomic::Ordering::Relaxed);
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -4167,7 +4201,12 @@ async fn handle_command_inner(
                 .await;
             }
 
-            info!("KAD fully disconnected — all activity stopped");
+            // Deliberately not "all activity stopped": the Ember overlay has no
+            // off switch and keeps its DHT, channel transfers and publishing
+            // republish cycle running by design. What this tears down is KAD,
+            // the eD2K server session, uploads, friend sessions and the active
+            // download workers.
+            info!("KAD disconnected — KAD, eD2K server, uploads and friend sessions stopped");
         }
 
         NetworkCommand::KadBootstrapIp { ip, port, tx } => {
@@ -4214,9 +4253,13 @@ async fn handle_command_inner(
                                     // Same rule as `KadConnect`: this is the
                                     // one path that actually moves us off
                                     // Disconnected, so the upload listener
-                                    // must be told at the same moment.
+                                    // and the outbound stop must be told at
+                                    // the same moment.
                                     state
                                         .upload_disconnected
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    state
+                                        .user_offline
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Ok(format!(
@@ -4294,7 +4337,15 @@ async fn handle_command_inner(
                                                         "Parsed {} bytes but file is not a valid nodes.dat: {e}",
                                                         bytes.len()
                                                     )),
-                                                    Ok(contacts) => {
+                                                    Ok(mut contacts) => {
+                                                        // K3: a URL-supplied file is an unproven
+                                                        // seed list whatever its verified bytes
+                                                        // claim. Honouring them would let one
+                                                        // pasted link put contacts straight into
+                                                        // lookup and publish target selection.
+                                                        bootstrap::mark_contacts_unproven(
+                                                            &mut contacts,
+                                                        );
                                                         let count = contacts.len();
                                                         if count == 0 {
                                                             Err("Downloaded nodes.dat contained no contacts".into())
@@ -4386,10 +4437,13 @@ async fn handle_command_inner(
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
             if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
                 state.stats.status = NetworkStatus::Connecting;
-                // See `KadBootstrapIp`: keep the upload gate in sync with
-                // every path off Disconnected.
+                // See `KadBootstrapIp`: keep the upload gate and the outbound
+                // stop in sync with every path off Disconnected.
                 state
                     .upload_disconnected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .user_offline
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let _ = tx.send(if actually_sent > 0 {
@@ -5460,6 +5514,13 @@ async fn handle_command_inner(
                         // a full-length file whose middle was silence, and read
                         // its duration off that. A short prefix is what
                         // `can_preview` actually promises.
+                        //
+                        // Bounded by `PREVIEW_MAX_BYTES`: on a nearly complete
+                        // download that run *is* the whole file, and copying
+                        // all of it duplicated gigabytes into the preview temp
+                        // directory.
+                        let preview_limit =
+                            ed2k::preview::PREVIEW_MAX_BYTES.min(file_size);
                         let verified_ranges: Vec<ed2k::preview::FilledRange> =
                             verified_complete_parts
                                 .iter()
@@ -5471,6 +5532,11 @@ async fn handle_command_inner(
                                         start,
                                         end: (start + part_size).min(file_size),
                                     }
+                                })
+                                .take_while(|range| range.start < preview_limit)
+                                .map(|range| ed2k::preview::FilledRange {
+                                    start: range.start,
+                                    end: range.end.min(preview_limit),
                                 })
                                 .collect();
 
@@ -5658,6 +5724,7 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
+                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let db3 = db.clone();
@@ -5684,6 +5751,7 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
+                                        offline_clone,
                                         ul_tx,
                                         fh.clone(),
                                         Some(ed25519_pubkey),
@@ -5784,6 +5852,7 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
+                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let ultx2 = ul_event_tx.clone();
@@ -5818,6 +5887,7 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
+                                            offline,
                                             ultx,
                                             fh.clone(),
                                             Some(ed25519_pubkey),
@@ -6047,6 +6117,7 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
+                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let browse_event_tx = ul_event_tx.clone();
@@ -6071,6 +6142,7 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
+                                        offline_clone,
                                         ul_tx,
                                         fh,
                                         Some(ed25519_pubkey),
@@ -6162,6 +6234,7 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
+                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
@@ -6198,6 +6271,7 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
+                                            offline,
                                             ultx,
                                             fh,
                                             Some(ed25519_pubkey),

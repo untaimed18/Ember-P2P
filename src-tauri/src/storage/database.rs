@@ -2955,6 +2955,81 @@ impl Database {
         Ok(())
     }
 
+    /// Progress update that refuses to reopen a row that has already reached a
+    /// terminal state.
+    ///
+    /// The periodic progress flush is fire-and-forget on the blocking pool and
+    /// carries no sequence number, so it can be executed *after* the
+    /// completion write it was queued before. Without the predicate that
+    /// persists `completed` at 95%, which is what the UI and a restart then
+    /// show — and the `.part.met` is gone by then, so nothing can repair it.
+    /// Terminal states are only left via a deliberate re-queue, which writes
+    /// its own progress.
+    pub fn update_transfer_progress_if_active(
+        &self,
+        transfer_id: &str,
+        transferred: u64,
+        progress: f64,
+        speed: u64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE transfers
+             SET transferred = ?1, progress = ?2, speed = ?3
+             WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
+            params![
+                i64::try_from(transferred).unwrap_or(i64::MAX),
+                progress,
+                i64::try_from(speed).unwrap_or(i64::MAX),
+                transfer_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a finished download's terminal state in one transaction.
+    ///
+    /// Final progress, status, history and the optional row delete used to be
+    /// four independent statements, so a crash between them could persist
+    /// `completed` at 95%, or a history row for a transfer that was still
+    /// listed. Writing the final progress together with the status also closes
+    /// the window where a late periodic tick landed between the two and left a
+    /// completed row showing a short bar.
+    pub fn complete_transfer(
+        &self,
+        transfer_id: &str,
+        final_total: Option<u64>,
+        history: Option<(&str, &str, u64)>,
+        remove_row: bool,
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        match final_total {
+            Some(total) => {
+                tx.execute(
+                    "UPDATE transfers
+                     SET transferred = ?1, progress = 100.0, speed = 0, status = 'completed'
+                     WHERE id = ?2",
+                    params![i64::try_from(total).unwrap_or(i64::MAX), transfer_id],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE transfers SET speed = 0, status = 'completed' WHERE id = ?1",
+                    params![transfer_id],
+                )?;
+            }
+        }
+        if let Some((file_hash, file_name, file_size)) = history {
+            Self::record_download_history_in(&tx, file_hash, file_name, file_size, "completed")?;
+        }
+        if remove_row {
+            tx.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn update_transfer_priority(
         &self,
         transfer_id: &str,
@@ -7076,6 +7151,23 @@ impl Database {
         file_size: u64,
         status: &str,
     ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        Self::record_download_history_in(&tx, file_hash, file_name, file_size, status)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The history insert itself, so a caller that is already inside a
+    /// transaction (see [`Database::complete_transfer`]) can include it rather
+    /// than opening a second one.
+    fn record_download_history_in(
+        conn: &rusqlite::Connection,
+        file_hash: &str,
+        file_name: &str,
+        file_size: u64,
+        status: &str,
+    ) -> anyhow::Result<()> {
         // Bound the stored file name (on a char boundary). Names originate
         // from peer-supplied metadata, so a hostile source could otherwise
         // persist an oversized string. eD2K names don't exceed ~255 bytes in
@@ -7090,10 +7182,8 @@ impl Database {
         } else {
             file_name
         };
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
-        tx.execute(
+        conn.execute(
             "INSERT INTO download_history (file_hash, file_name, file_size, status, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(file_hash) DO UPDATE SET
@@ -7109,7 +7199,7 @@ impl Database {
                 now
             ],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM download_history WHERE file_hash IN (
                 SELECT file_hash FROM download_history
                 ORDER BY timestamp DESC
@@ -7117,7 +7207,6 @@ impl Database {
             )",
             params![MAX_DOWNLOAD_HISTORY_ROWS],
         )?;
-        tx.commit()?;
         Ok(())
     }
 

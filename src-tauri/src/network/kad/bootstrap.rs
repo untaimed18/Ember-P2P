@@ -275,6 +275,24 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
     load_nodes_dat_with_format(path).map(|(c, _)| c)
 }
 
+/// Strip the on-wire `verified` bit from contacts that did not come from this
+/// client's own `nodes.dat`.
+///
+/// `read_contact_v2` honours the byte the file carries, and
+/// `RoutingTable::insert` promotes a verified contact straight to
+/// `CONTACT_TYPE_OPEN` (K1), which makes it eligible for lookup and publish
+/// target selection before it has ever answered us. That is correct for a file
+/// we wrote ourselves after proving those contacts, and a routing-poisoning
+/// vector for one fetched from a user-supplied URL: the same reasoning that
+/// keeps `BootstrapHints` unverified on load (K3). Such contacts still get in
+/// as unproven seeds and are promoted normally once they answer a Hello.
+pub fn mark_contacts_unproven(contacts: &mut [KadContact]) {
+    for contact in contacts {
+        contact.verified = false;
+        contact.contact_type = CONTACT_TYPE_NEW;
+    }
+}
+
 fn read_contact_v0(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
     let id = KadId::read_from(cursor)?;
     let ip_raw = cursor.read_u32::<LittleEndian>()?;
@@ -424,5 +442,31 @@ mod tests {
         }
         assert!(!is_default_bootstrap_ip(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_default_bootstrap_ip(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    /// A v2/v3 `nodes.dat` carries a `verified` byte per contact, and
+    /// `RoutingTable::insert` promotes a verified contact out of
+    /// `CONTACT_TYPE_NEW` immediately. A file fetched from a user-supplied
+    /// bootstrap URL must not be able to set that byte for itself.
+    #[test]
+    fn contacts_from_an_untrusted_file_are_downgraded_to_unproven() {
+        let mut contacts: Vec<KadContact> = default_bootstrap_contacts();
+        for contact in &mut contacts {
+            contact.verified = true;
+            contact.contact_type = CONTACT_TYPE_VERIFIED;
+        }
+
+        mark_contacts_unproven(&mut contacts);
+
+        assert!(!contacts.is_empty());
+        for contact in &contacts {
+            assert!(!contact.verified, "{} stayed verified", contact.ip);
+            assert_eq!(
+                contact.contact_type,
+                CONTACT_TYPE_NEW,
+                "{} kept a promoted contact type",
+                contact.ip
+            );
+        }
     }
 }

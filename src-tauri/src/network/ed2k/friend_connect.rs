@@ -70,6 +70,7 @@ pub async fn open_and_run_friend_session(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -94,6 +95,7 @@ pub async fn open_and_run_friend_session(
         udp_port,
         obfuscate,
         ember_sessions,
+        user_offline,
         ul_event_tx,
         friend_hashes,
         ed25519_pubkey,
@@ -278,6 +280,7 @@ pub async fn run_friend_session_over_transport(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -403,6 +406,24 @@ pub async fn run_friend_session_over_transport(
         EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
     {
         let mut sessions = ember_sessions.write().await;
+        // The user may have gone offline while this dial was in flight.
+        // `KadDisconnect` closes and clears every session and reports every
+        // friend offline, so inserting here afterwards would put a live one
+        // back into a map the UI has already emptied: chat would send
+        // successfully to a friend shown as offline, and `FindFriendAndConnect`
+        // would then skip the reconnect because a fresh session exists. Read
+        // under the same lock as the insert, so a disconnect cannot land
+        // between the check and the claim.
+        if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
+            ember_session_handle.close();
+            drop(sessions);
+            drop(reader);
+            drop(writer);
+            anyhow::bail!(
+                "went offline while dialling {}",
+                crate::security::short_hash(&peer_ember_hash)
+            );
+        }
         match sessions.get(&peer_ember_hash) {
             Some(existing) if reusable_secure_friend_session(existing, &peer_pk) => {
                 info!(
@@ -994,6 +1015,7 @@ pub async fn connect_friend_with_fallback(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -1012,6 +1034,7 @@ pub async fn connect_friend_with_fallback(
         udp_port,
         obfuscate,
         ember_sessions.clone(),
+        user_offline.clone(),
         ul_event_tx.clone(),
         friend_hashes.clone(),
         ed25519_pubkey,
@@ -1024,6 +1047,13 @@ pub async fn connect_friend_with_fallback(
     };
 
     if rendezvous_url.is_empty() {
+        return Err(tcp_err);
+    }
+
+    // The insert site refuses an offline dial on its own, but the NAT
+    // fallback below is a punch registration plus a relay ticket — minutes of
+    // rendezvous round-trips whose only possible outcome is that same refusal.
+    if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(tcp_err);
     }
     info!(
@@ -1088,6 +1118,7 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
+                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -1114,6 +1145,7 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
+                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -2300,6 +2332,7 @@ mod tests {
                 4672,
                 false,
                 ember_sessions,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ul_tx,
                 friend_hashes,
                 None,
@@ -2727,6 +2760,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -2871,6 +2905,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -2952,6 +2987,125 @@ mod tests {
         );
     }
 
+    /// A dial that was already in flight when the user hit Disconnect must not
+    /// hand back a live session afterwards. `KadDisconnect` closes and clears
+    /// every entry and reports every friend offline, so a late insert would
+    /// leave chat working against a friend the UI shows as offline — and would
+    /// block the reconnect, because `FindFriendAndConnect` skips a peer that
+    /// still has a fresh session.
+    #[tokio::test]
+    async fn a_dial_that_completes_after_going_offline_claims_no_session() {
+        let our_sk = SigningKey::generate(&mut OsRng);
+        let our_pk_bytes = our_sk.verifying_key().to_bytes();
+        let our_sk_bytes = our_sk.to_bytes();
+        let our_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
+
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
+        let peer_ember_hash =
+            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (mut server_r, server_w) = tokio::io::split(server);
+
+        let ember_sessions: EmberSessionMap =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (ul_tx, _ul_rx) = tokio::sync::mpsc::channel(16);
+        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
+            peer_ember_hash,
+        ])));
+        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+
+        // Already offline by the time the handshake completes — the same state
+        // the dial would observe had Disconnect landed mid-flight.
+        let user_offline = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let session_task = tokio::spawn(run_friend_session_over_transport(
+            Box::new(client_r),
+            Box::new(client_w),
+            addr,
+            peer_ember_hash,
+            [0x11; 16],
+            our_ember_hash,
+            "tester".to_string(),
+            0,
+            4662,
+            4672,
+            false,
+            ember_sessions.clone(),
+            user_offline,
+            ul_tx,
+            friend_hashes,
+            Some(our_pk_bytes),
+            Some(our_sk_bytes),
+        ));
+
+        // The peer plays the handshake through to the point where the dial
+        // would claim its slot, so the refusal is proven to happen at the
+        // claim and not earlier by accident.
+        let mock_peer = async {
+            let first = server_r.read_u8().await.unwrap();
+            let secure = super::secure_stream::accept_after_first(
+                Box::new(server_r),
+                Box::new(server_w),
+                first,
+                peer_ember_hash,
+                peer_pk_bytes,
+                peer_sk.to_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut server_r = secure.reader;
+            let mut server_w = secure.writer;
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
+            let hello_answer = build_hello_answer_with_buddy_opts(
+                &[0x99; 16],
+                0,
+                4662,
+                "peer",
+                None,
+                &HelloOptions::default_for_udp_port(4672),
+            );
+            write_packet(
+                &mut server_w,
+                OP_EDONKEYHEADER,
+                OP_HELLOANSWER,
+                &hello_answer,
+            )
+            .await
+            .unwrap();
+
+            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+            let info_answer = build_emule_info(4672, false, None, None);
+            write_packet(
+                &mut server_w,
+                OP_EMULEPROT,
+                OP_EMULEINFOANSWER,
+                &info_answer,
+            )
+            .await
+            .unwrap();
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
+            .await
+            .expect("session task must not hang")
+            .expect("session task must not panic");
+        assert!(
+            result.is_err(),
+            "a dial completing while offline must not report a live session"
+        );
+        assert!(
+            ember_sessions.read().await.is_empty(),
+            "an offline dial must leave the session map as Disconnect left it"
+        );
+    }
+
     #[test]
     fn reusable_secure_session_requires_fresh_secure_matching_pubkey() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -3020,6 +3174,7 @@ mod tests {
             4672,
             false,
             ember_sessions,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),

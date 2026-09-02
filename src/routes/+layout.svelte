@@ -133,9 +133,12 @@
 
   $effect(() => {
     if (!policyResetReason) return;
-    requestAnimationFrame(() => {
+    // Cancelled on cleanup: without it, a reason that clears before the frame
+    // runs still focuses a button that is on its way out of the tree.
+    const frame = requestAnimationFrame(() => {
       policyResetAckBtn?.focus();
     });
+    return () => cancelAnimationFrame(frame);
   });
 
   async function onWizardComplete(updated: AppSettings) {

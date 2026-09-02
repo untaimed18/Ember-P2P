@@ -6230,6 +6230,7 @@ fn spawn_rendezvous_friend_lookup(
     let app_fc = app_handle.clone();
     let fh_fc = friend_hashes.clone();
     let sess_fc = state.ember_sessions.clone();
+    let offline_fc = state.user_offline.clone();
     let ultx_fc = ul_event_tx.clone();
     // Ember NAT-fallback context for `connect_friend_with_fallback`: a
     // plain `TcpStream::connect` alone can't reach a friend whose NAT
@@ -6348,6 +6349,7 @@ fn spawn_rendezvous_friend_lookup(
                         udp,
                         obfuscate,
                         sess_fc,
+                        offline_fc,
                         ultx_fc.clone(),
                         fh_fc,
                         Some(ed25519_pubkey),
@@ -11436,6 +11438,37 @@ pub(crate) fn apply_transfer_status_write(
     }
 }
 
+/// The completion counterpart of [`apply_transfer_status_write`].
+///
+/// Ordered against the same clock — a completion that lost a race to a newer
+/// status must not resurrect the row — but commits the final progress, the
+/// status, the history row and the optional delete in one transaction instead
+/// of four independent statements.
+pub(crate) fn apply_transfer_completion_write(
+    clock: &TransferStatusWriteClock,
+    db: &Database,
+    transfer_id: &str,
+    final_total: Option<u64>,
+    history: Option<(String, String, u64)>,
+    remove_row: bool,
+    seq: u64,
+) {
+    let mut last = match clock.last.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if transfer_status_write_is_stale(last.get(transfer_id).copied(), seq) {
+        return;
+    }
+    last.insert(transfer_id.to_string(), seq);
+    let history = history
+        .as_ref()
+        .map(|(hash, name, size)| (hash.as_str(), name.as_str(), *size));
+    if let Err(e) = db.complete_transfer(transfer_id, final_total, history, remove_row) {
+        warn!("DB complete_transfer failed for {transfer_id}: {e}");
+    }
+}
+
 fn spawn_transfer_status_write(
     clock: &Arc<TransferStatusWriteClock>,
     db: Arc<Database>,
@@ -12543,6 +12576,23 @@ struct NetworkState {
     /// with auto-connect off) serves uploads to anyone who already knows
     /// our IP:port while the UI still reads "Disconnected".
     upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// The user asked activity to stop: set by an explicit `KadDisconnect`,
+    /// cleared by every path back off `Disconnected`.
+    ///
+    /// Deliberately not `upload_disconnected`, which answers a different
+    /// question — "are we accepting inbound connections?" — and is *also* true
+    /// on a first run with both auto-connects off, a state in which the
+    /// always-on Ember overlay is expected to keep working. Gating outbound
+    /// activity on that flag would have broken Ember-only operation before the
+    /// user ever connects anything. This one starts `false` and only an
+    /// explicit Disconnect sets it, so it can gate the outbound side: starting
+    /// download workers, dialling friends, and UDP server search.
+    ///
+    /// Shared rather than a plain `bool` because friend dials outlive the
+    /// network task's borrow — one spawned before the click can still be
+    /// mid-handshake after it, and the session-insert path has to be able to
+    /// see that the answer changed underneath it.
+    user_offline: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
     /// Last successful `/register` had intro *and* every pairwise presence
@@ -21175,6 +21225,11 @@ async fn initiate_server_connect(
     state
         .upload_disconnected
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Joining a server is a deliberate "come back online" too, so it lifts the
+    // outbound stop the same way `KadConnect` does.
+    state
+        .user_offline
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // Explicit Connect should be allowed to retry a server that recently
     // failed auto-reconnect — keep fail counts for sort preference.
     state.server_list.clear_connect_cooldowns();
@@ -21639,6 +21694,20 @@ async fn try_start_pending_download_from_known_sources(
     file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
     epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
+    // The user asked activity to stop. Disconnect re-queues every active
+    // download as pending so it resumes on reconnect, but the Ember overlay
+    // keeps running and its source lookups call straight back into here — so
+    // without this gate a transfer the user just stopped could restart itself
+    // from an Ember source while the UI still read Disconnected. Checked here
+    // rather than at the five call sites so no future one can miss it.
+    if state
+        .user_offline
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        debug!("Not starting {transfer_id}: the user is offline");
+        return false;
+    }
+
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
             return false;
@@ -22070,26 +22139,60 @@ fn apply_persistent_ip_ban(
     }
 }
 
+/// Ceiling on the enforced ban set, above which it is rebuilt from durable
+/// sources rather than allowed to grow.
+const MAX_BANNED_IPS: usize = 10_000;
+
+/// The durable half of the ban-set rebuild: `(peers, auto-banned IPs)`.
+///
+/// Read on the blocking pool and delivered back to the loop, because
+/// `get_peers` and `get_banned_ips` are synchronous SQLite calls behind one
+/// process-wide connection mutex. Running them inline on the 60s reputation
+/// tick blocked the tokio worker driving the whole `select!` — UDP receive,
+/// KAD timers and IPC included — and every other `Database` user with it.
+type BannedIpsSyncInputs = (Vec<crate::types::PeerInfo>, Vec<Ipv4Addr>);
+
+/// Kick off the durable half of the ban-set rebuild on the blocking pool.
+///
+/// One outstanding read at a time, so a slow disk cannot queue a backlog of
+/// identical queries. A failed read is reported as `None` so the receiver
+/// keeps the current set instead of wiping bans.
+fn request_banned_ips_sync(
+    in_flight: &mut bool,
+    db: &Arc<Database>,
+    tx: &mpsc::UnboundedSender<Option<BannedIpsSyncInputs>>,
+) {
+    if *in_flight {
+        return;
+    }
+    *in_flight = true;
+    let db = db.clone();
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || match (db.get_peers(), db.get_banned_ips()) {
+        (Ok(peers), Ok(auto_bans)) => {
+            let _ = tx.send(Some((peers, auto_bans)));
+        }
+        _ => {
+            warn!("banned_ips sync skipped: DB read failed; keeping in-memory set");
+            let _ = tx.send(None);
+        }
+    });
+}
+
 /// Rebuild the in-memory enforced ban set from durable sources plus
 /// still-active reputation bans. This is what makes:
 /// - DB auto-ban TTLs actually expire in a long-running session (H2)
 /// - reputation 24h bans leave `banned_ips` after `lift_expired_bans` (H1)
 ///
-/// Fail-closed on DB errors: keep the current set rather than wiping bans.
-fn sync_enforced_banned_ips(
+/// Fail-closed on DB errors: the caller keeps the current set rather than
+/// wiping bans when the read half failed.
+fn apply_enforced_banned_ips(
     state: &mut NetworkState,
     shared_banned_ips: &ed2k::upload::SharedBannedIps,
-    db: &Arc<Database>,
+    peers: Vec<crate::types::PeerInfo>,
+    auto_bans: Vec<Ipv4Addr>,
     source_manager: &SourceManager,
 ) {
-    let (peers, auto_bans) = match (db.get_peers(), db.get_banned_ips()) {
-        (Ok(peers), Ok(auto_bans)) => (peers, auto_bans),
-        _ => {
-            warn!("banned_ips sync skipped: DB read failed; keeping in-memory set");
-            return;
-        }
-    };
-
     let mut rebuilt: HashSet<Ipv4Addr> = peers
         .iter()
         .filter(|p| p.banned)
@@ -23573,6 +23676,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(
             !settings.auto_connect_kad && !settings.auto_connect_server,
         )),
+        // Starts false on purpose — see the field comment. "Has not connected
+        // yet" is not "was asked to go offline".
+        user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
@@ -24562,6 +24668,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // `(ed2k hash, digest)`.
     let (ember_digest_result_tx, mut ember_digest_result_rx) =
         mpsc::unbounded_channel::<([u8; 16], [u8; 32])>();
+    // Completed-download ed2k part hashsets, recomputed off the event loop for
+    // the same reason as the digests above. `(ed2k hash, part hashes)`.
+    let (part_hashset_result_tx, mut part_hashset_result_rx) =
+        mpsc::unbounded_channel::<([u8; 16], Vec<[u8; 16]>)>();
+    // Durable inputs for the enforced-ban rebuild, read off the event loop.
+    // `None` means the read failed and the current set must be kept.
+    let (banned_ips_sync_tx, mut banned_ips_sync_rx) =
+        mpsc::unbounded_channel::<Option<BannedIpsSyncInputs>>();
+    let mut banned_ips_sync_in_flight = false;
     let mut nat_probe_packet_tx: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> = None;
     let (udp_map_ka_result_tx, mut udp_map_ka_result_rx) =
         mpsc::unbounded_channel::<UdpMappingKeepaliveResult>();
@@ -26384,13 +26499,27 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                         .map(|record| record.part_hashes.clone())
                                         .unwrap_or_default()
                                 } else {
+                                    // Recompute off the loop and fold it in
+                                    // when it lands, exactly as the BLAKE3
+                                    // digest below does. Awaiting a sequential
+                                    // end-to-end read of a multi-GB file here
+                                    // suspended the whole `select!` — no UDP
+                                    // receive, no timers, no command handling —
+                                    // on every completion that arrives without
+                                    // a hashset (callback and single-source
+                                    // downloads, and restore re-verification).
                                     let hash_path = completed_path.clone();
+                                    let hashset_tx = part_hashset_result_tx.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                                            .unwrap_or_default()
-                                    })
-                                    .await
-                                    .unwrap_or_default()
+                                        if let Ok(hashes) =
+                                            ed2k::hash::ed2k_part_hashes_file(&hash_path)
+                                        {
+                                            if !hashes.is_empty() {
+                                                let _ = hashset_tx.send((fh, hashes));
+                                            }
+                                        }
+                                    });
+                                    Vec::new()
                                 };
                                 let record = KnownFileRecord {
                                     file_hash: fh,
@@ -27159,6 +27288,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             let udp = advertised_udp_port(&state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
+                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let friend_addr = SocketAddr::new(v4.into(), port);
@@ -27171,7 +27301,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             tokio::spawn(async move {
                                 if let Err(e) = ed2k::friend_connect::connect_friend_with_fallback(
                                     friend_addr, friend_eh, our_uh, our_eh, nick,
-                                    cid, tcp, udp, obfs, sess, ultx, fh,
+                                    cid, tcp, udp, obfs, sess, offline, ultx, fh,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
                                     rv_url, nat_ctx,
                                 ).await {
@@ -34729,19 +34859,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
                 // Cap banned_ips to prevent unbounded growth: rebuild from
                 // durable sources + active reputation bans (same path as the
-                // periodic reputation-timer sync).
-                const MAX_BANNED_IPS: usize = 10_000;
+                // periodic reputation-timer sync). The rebuild is asynchronous
+                // now, so the over-cap check moved to where the result is
+                // applied.
                 if state.banned_ips.len() > MAX_BANNED_IPS {
-                    let sm = source_manager.read().await;
-                    let before = state.banned_ips.len();
-                    sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
-                    if state.banned_ips.len() > MAX_BANNED_IPS {
-                        warn!(
-                            "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
-                            before,
-                            state.banned_ips.len()
-                        );
-                    }
+                    request_banned_ips_sync(
+                        &mut banned_ips_sync_in_flight,
+                        &db,
+                        &banned_ips_sync_tx,
+                    );
                 }
 
                 // Sweep orphaned Ember ping waiters. Each entry is created
@@ -40706,6 +40832,49 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         debug!("Ember digest for {hash_hex} computed after completion");
                     }
                 }
+                // Apply any enforced-ban rebuild whose DB reads finished on the
+                // blocking pool. A failed read arrives as `None` and keeps the
+                // current set (fail-closed) rather than wiping bans.
+                while let Ok(inputs) = banned_ips_sync_rx.try_recv() {
+                    banned_ips_sync_in_flight = false;
+                    if let Some((peers, auto_bans)) = inputs {
+                        let before = state.banned_ips.len();
+                        {
+                            let sm = source_manager.read().await;
+                            apply_enforced_banned_ips(
+                                &mut state,
+                                &shared_banned_ips,
+                                peers,
+                                auto_bans,
+                                &sm,
+                            );
+                        }
+                        if state.banned_ips.len() > MAX_BANNED_IPS {
+                            warn!(
+                                "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",
+                                before,
+                                state.banned_ips.len()
+                            );
+                        }
+                    }
+                }
+                // Same deal for ed2k part hashsets recomputed after a
+                // completion that arrived without one: the record is written
+                // immediately with an empty hashset and patched here, so
+                // `known.met` gains the parts needed to serve the file without
+                // the completion path having blocked on the read.
+                while let Ok((hashset_hash, part_hashes)) = part_hashset_result_rx.try_recv() {
+                    if let Some(record) = known_files.find_by_hash_mut(&hashset_hash) {
+                        if record.part_hashes != part_hashes {
+                            record.part_hashes = part_hashes;
+                            known_files.mark_dirty();
+                            debug!(
+                                "ed2k hashset for {} computed after completion",
+                                hex::encode(hashset_hash)
+                            );
+                        }
+                    }
+                }
                 while let Ok(lookup) = channel_neighbor_lookup_rx.try_recv() {
                     apply_channel_neighbor_lookup(
                         &udp_socket,
@@ -40937,8 +41106,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
                 state.reputation.lift_expired_bans();
                 state.reputation.maybe_decay();
-                let sm = source_manager.read().await;
-                sync_enforced_banned_ips(&mut state, &shared_banned_ips, &db, &sm);
+                // The durable half of the rebuild is read off the loop and
+                // applied when it lands (see `BannedIpsSyncInputs`).
+                request_banned_ips_sync(
+                    &mut banned_ips_sync_in_flight,
+                    &db,
+                    &banned_ips_sync_tx,
+                );
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'reputation_timer' panicked: {}", describe_panic(&*__p));
@@ -47244,6 +47418,24 @@ async fn maybe_publish_ember_sources(
     // those files as published for the rest of the session.
     prune_expired_ember_published_sources(state);
 
+    // Not serving: the upload listener is refusing every inbound connection,
+    // so a source record placed now names a node that will not hand the file
+    // over — and it outlives the decision by a full source TTL, which is DHT
+    // pollution rather than a local UX quirk.
+    //
+    // `upload_disconnected` is the right signal and `ember_tcp_firewalled` is
+    // not: `KadDisconnect` clears LowID and rebuilds the firewall checker, so
+    // the TCP verdict reads `Unknown` immediately afterwards and the node
+    // publishes itself as a *reachable* HighID source while rejecting every
+    // connect. The same flag also covers a first run with both auto-connects
+    // off, where the listener has never been opened.
+    if state
+        .upload_disconnected
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+
     if !settings.ember_native_enabled || tcp_port == 0 || ember_publishable_peer_count(state) == 0 {
         return;
     }
@@ -52499,7 +52691,11 @@ async fn handle_download_event(
                 let db_for_progress = db.clone();
                 let transfer_id_for_progress = transfer_id.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Err(e) = db_for_progress.update_transfer_progress(
+                    // Guarded: this write is unsequenced and can be executed
+                    // after the completion write it was queued before, which
+                    // would leave a `completed` row showing the last
+                    // rate-limited percentage instead of 100%.
+                    if let Err(e) = db_for_progress.update_transfer_progress_if_active(
                         &transfer_id_for_progress,
                         capped_downloaded,
                         progress,
@@ -52824,40 +53020,15 @@ async fn handle_download_event(
             let completed_seq = status_writes.next_seq();
             let completed_clock = Arc::clone(status_writes);
             tokio::task::spawn_blocking(move || {
-                if let Some(total_size) = final_total {
-                    if let Err(e) = db_for_completion.update_transfer_progress(
-                        &completion_transfer_id,
-                        total_size,
-                        100.0,
-                        0,
-                    ) {
-                        warn!(
-                            "DB update_transfer_progress (final) failed for {completion_transfer_id}: {e}"
-                        );
-                    }
-                }
-                apply_transfer_status_write(
+                apply_transfer_completion_write(
                     &completed_clock,
                     &db_for_completion,
                     &completion_transfer_id,
-                    "completed",
+                    final_total,
+                    history_row,
+                    remove_finished,
                     completed_seq,
                 );
-                if let Some((file_hash, file_name, total_size)) = history_row {
-                    if let Err(e) = db_for_completion.record_download_history(
-                        &file_hash,
-                        &file_name,
-                        total_size,
-                        "completed",
-                    ) {
-                        tracing::warn!("Failed to record download history: {e}");
-                    }
-                }
-                if remove_finished {
-                    if let Err(e) = db_for_completion.remove_transfer(&completion_transfer_id) {
-                        warn!("DB remove_transfer failed for {completion_transfer_id}: {e}");
-                    }
-                }
             });
 
             let _ = app_handle.emit(

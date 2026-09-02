@@ -399,14 +399,17 @@ export interface ChannelTransferInfo {
   status: ChannelTransferStatus;
 }
 
-/** Offer one file to one member. Returns the transfer id. Nothing is sent
- *  until they accept. */
-export async function offerChannelTransfer(
+/** Offer one file to one member. Returns the transfer id, or `null` if the
+ *  user dismissed the picker. Nothing is sent until they accept.
+ *
+ *  The file dialog is opened by the backend rather than here: choosing a file
+ *  in the OS dialog is the authorization for reading it, and a path sent over
+ *  IPC is not. */
+export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
-  path: string,
-): Promise<string> {
-  return invoke('offer_channel_transfer', { channelId, memberPubkey, path });
+): Promise<string | null> {
+  return invoke('pick_and_offer_channel_transfer', { channelId, memberPubkey });
 }
 
 export async function respondChannelTransfer(xferId: string, accept: boolean): Promise<void> {

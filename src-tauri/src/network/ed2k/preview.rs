@@ -6,6 +6,16 @@ use tracing::info;
 
 const MIN_PREVIEW_SIZE: u64 = 16 * 1024;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Ceiling on how much of a `.part` is copied into the preview temp file.
+///
+/// The contiguous MD4-verified run reaches the end of the file on a nearly
+/// complete download, and copying all of it duplicated multiple gigabytes into
+/// the temp directory — and blocked the command for as long as that took — to
+/// answer a question ("is this the file it claims to be?") that a few minutes
+/// of playable media settles. Well above the first-256 KB window
+/// [`can_preview`] gates on, so the preview stays genuinely watchable.
+pub const PREVIEW_MAX_BYTES: u64 = 64 * 1024 * 1024;
 static PREVIEW_TEMP: OnceLock<
     parking_lot::Mutex<Option<crate::security::filesystem::PinnedTempDir>>,
 > = OnceLock::new();

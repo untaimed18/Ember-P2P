@@ -147,8 +147,14 @@
         .then((locked) => {
           if (!cancelled) chatLocked = locked;
         })
-        .catch(() => {
-          if (!cancelled) chatLocked = false;
+        .catch((e) => {
+          // Fail closed. This asks the backend whether chat history is sealed
+          // because its key could not be recovered; treating an unanswered
+          // question as "not sealed" unlocked the composer in exactly the
+          // situation where every send fails, and suppressed the warning that
+          // explains why.
+          console.error('Chat: could not determine chat-lock state', e);
+          if (!cancelled) chatLocked = true;
         });
     });
     return () => {
@@ -599,6 +605,17 @@
       fn = await listen<{ user_hash: string; id?: number; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
+        // Narrow the direction rather than asserting it (as `stores/friends.ts`
+        // does): an unrecognised value would otherwise be cast straight into a
+        // bubble while skipping the dedup and unread paths, both of which
+        // branch on it being exactly 'sent' or 'received'.
+        const direction: 'sent' | 'received' | null =
+          event.payload.direction === 'sent'
+            ? 'sent'
+            : event.payload.direction === 'received'
+              ? 'received'
+              : null;
+        if (direction === null) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
           // message. Compare the content tuple against the recent tail (a
@@ -610,31 +627,31 @@
           // genuinely distinct messages that share a whole-second timestamp.
           // `handleSend` deliberately renders nothing for a delivered message
           // and relies on this echo, so a collapsed one is lost until reload.
-          const sig = `${event.payload.timestamp}|${event.payload.direction}|${event.payload.message}`;
+          const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
           const isDuplicate =
-            event.payload.direction === 'received' &&
+            direction === 'received' &&
             messages
               .slice(-5)
               .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
           if (isDuplicate) return;
-          if (event.payload.direction === 'received') setFriendTyping(false);
+          if (direction === 'received') setFriendTyping(false);
           const wasPinned = isPinnedToBottom();
           const durableId = event.payload.id;
           const next = [...messages, {
             id: typeof durableId === 'number' && durableId > 0 ? durableId : --msgIdCounter,
-            direction: event.payload.direction as 'sent' | 'received',
+            direction,
             message: event.payload.message,
             timestamp: event.payload.timestamp,
             read: true,
             delivery: 'delivered' as const,
             seen: false,
           }];
-          commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
-          noteMissedMessage(wasPinned, event.payload.direction);
+          commitLiveMessages(next, direction === 'sent' || wasPinned);
+          noteMissedMessage(wasPinned, direction);
           // Only acknowledge what the user can actually see. A mounted
           // conversation in a minimized window would otherwise mark the
           // message read and suppress its badge, losing it entirely.
-          if (event.payload.direction === 'received' && isAppVisible()) {
+          if (direction === 'received' && isAppVisible()) {
             markAsRead();
           }
       });
