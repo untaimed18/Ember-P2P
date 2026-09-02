@@ -1277,6 +1277,19 @@ impl SearchManager {
         self.searches.len()
     }
 
+    /// Every search id currently held, so a caller can re-evaluate completion
+    /// without waiting for a wire event.
+    ///
+    /// [`Self::alloc_id`] refuses a new search once this map reaches
+    /// [`MAX_ACTIVE_SEARCHES`], and it counts entries rather than walks still
+    /// in flight — a search that has converged holds its slot until something
+    /// removes it. The only removal that did not need a response or an expired
+    /// query was [`Self::cleanup_expired`], at twice `SEARCH_TIMEOUT_SECS`, so
+    /// a finished walk could occupy one of the 64 slots for two minutes.
+    pub fn active_ids(&self) -> Vec<u32> {
+        self.searches.keys().copied().collect()
+    }
+
     /// Diagnostic snapshot of every in-flight iterative search (slice 16).
     pub fn snapshot(&self) -> Vec<SearchSnapshot> {
         self.searches
@@ -1650,6 +1663,41 @@ mod tests {
             answered, K_BUCKET_SIZE,
             "every peer on the shortlist must still be asked for records"
         );
+    }
+
+    /// The active-search cap counts searches the manager still *holds*, not
+    /// walks still running, and until the sweep in the network loop's search
+    /// timer nothing removed a converged search without a wire event to notice
+    /// it — leaving the 120 s `cleanup_expired` backstop as the only reaper.
+    /// A node with several background walkers (channel presence alone starts
+    /// one a second, plus download source lookups and bucket refreshes) then
+    /// refuses the user's own search while most of the 64 slots are held by
+    /// searches that have already finished.
+    #[test]
+    fn a_converged_search_holds_its_slot_until_it_is_removed() {
+        let rt = RoutingTable::new(make_id(0x00), false);
+        let mut sm = SearchManager::new();
+
+        // Nobody to ask, so the walk is over the moment it is polled.
+        let sid = sm.start_find_node(make_id(0x7F), &rt).expect("slot");
+        assert!(
+            sm.get_mut(sid).expect("held").poll_complete(),
+            "a search with an empty shortlist has already converged"
+        );
+
+        assert_eq!(
+            sm.active_count(),
+            1,
+            "converging does not free the slot — something has to remove it"
+        );
+        assert_eq!(
+            sm.active_ids(),
+            vec![sid],
+            "so the sweep has to be able to enumerate it"
+        );
+
+        assert!(sm.remove(sid).is_some());
+        assert_eq!(sm.active_count(), 0);
     }
 
     /// Two peers holding the same record is the normal case for anything

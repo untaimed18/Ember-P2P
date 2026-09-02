@@ -145,6 +145,27 @@ impl RoutingTable {
         scale::NetworkScale::from_contacts(self.verified_len())
     }
 
+    /// The tier that governs *admission*: the stricter of what the table looks
+    /// like now and what [`Self::enforce_scale_quotas`] has already pruned to.
+    ///
+    /// [`Self::scale`] counts verified contacts holding a bucket slot, and
+    /// demotion moves them to a replacement cache — so pruning the table to a
+    /// tier lowers the very reading that chose it. Prune 100 verified contacts
+    /// down past 80 and the live tier falls back from `Established` to `Small`,
+    /// whose per-IP allowance is twice as generous; `promote_cached_contacts`
+    /// then runs in the same maintenance tick and re-admits exactly the
+    /// contacts just demoted. The ratchet on [`Self::enforced_scale`] stops
+    /// `enforce_scale_quotas` from re-running, but on its own it did nothing to
+    /// stop the promotion pass undoing its work, which left the cold-start
+    /// grandfathering hole open in the case that matters most — a table crowded
+    /// enough for pruning to move it across a boundary.
+    ///
+    /// Only ever stricter than `scale()`, so this cannot admit something the
+    /// live tier would refuse.
+    pub fn admission_scale(&self) -> scale::NetworkScale {
+        self.scale().max(self.enforced_scale)
+    }
+
     /// Prune residents the current tier would no longer admit, moving them to
     /// their bucket's replacement cache.
     ///
@@ -430,7 +451,12 @@ impl RoutingTable {
             // The tier can only tighten as verified contacts are promoted, and
             // only refuses admissions, so at worst one bucket's batch is
             // admitted a tier late — bounded, and re-evaluated on the next call.
-            let scale = self.scale();
+            //
+            // `admission_scale`, not `scale`: this runs immediately after
+            // `enforce_scale_quotas` in the same maintenance tick, and the
+            // demotion it just performed is what would otherwise loosen the
+            // live tier enough to re-admit the demoted contacts here.
+            let scale = self.admission_scale();
             let mut filled = false;
             while !self.buckets[idx].is_full() {
                 let Some(i) = self.best_promotable_cached(idx, None, scale) else {
@@ -506,7 +532,11 @@ impl RoutingTable {
         // buckets, and `merge_gossip_contacts` runs this whole path once per
         // contact in a FOUND_NODE — most of which land in the cache on a warm
         // table, so recomputing doubled the walks for a frame.
-        let scale = self.scale();
+        //
+        // The enforced tier floors this so a pruned table cannot re-admit
+        // through the front door what `enforce_scale_quotas` just demoted —
+        // see [`Self::admission_scale`].
+        let scale = self.admission_scale();
         let max_per_ip = scale.max_contacts_per_ip();
         let max_subnet_global = scale.max_contacts_per_subnet_global();
         let max_subnet_bucket = scale.max_contacts_per_subnet_per_bucket();
@@ -924,7 +954,7 @@ impl RoutingTable {
         // behaviour) let a bucket fill up with contacts from one subnet via the
         // cache, defeating the eclipse-resistance the `add_contact` checks
         // provide — and treated gossip as equal to a proven contact.
-        let chosen = self.best_promotable_cached(bucket_idx, Some(dead_id), self.scale());
+        let chosen = self.best_promotable_cached(bucket_idx, Some(dead_id), self.admission_scale());
 
         match chosen {
             Some(i) => {
@@ -1687,6 +1717,76 @@ mod tests {
             rt.enforce_scale_quotas(),
             0,
             "a tier already enforced does not re-run"
+        );
+    }
+
+    /// The maintenance tick prunes and then promotes, in that order, and
+    /// promotion reads the tier from the table it is promoting into. Demotion
+    /// moves contacts to replacement caches, which the tier is not derived
+    /// from — so pruning a table that sits just above a boundary drops the live
+    /// reading back below it, and the promotion pass then re-admitted under the
+    /// looser tier exactly what the prune had removed. The ratchet stops
+    /// `enforce_scale_quotas` re-running; on its own it did nothing to stop the
+    /// same tick undoing it.
+    #[test]
+    fn promotion_does_not_re_admit_what_the_quota_pass_just_demoted() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // Eight peers behind one address: exactly what the cold-start tier
+        // allows. Spread across buckets so this is the per-IP cap under test
+        // and not the per-bucket subnet one.
+        let shared_ip = Ipv4Addr::new(80, 7, 7, 7);
+        for b in 0..8u8 {
+            let mut id = [0u8; 16];
+            id[0] = 1 << b;
+            id[1] = 0x11;
+            assert!(matches!(
+                rt.add_contact(contact_with(id, shared_ip)),
+                AddResult::Added
+            ));
+        }
+
+        // Five unrelated peers take the table to thirteen verified contacts —
+        // the point at which the quota pass prunes to `Small`, since it reads
+        // the tier from four-fifths of the count.
+        for i in 0..5u8 {
+            let mut id = [0u8; 16];
+            id[0] = 1 << i;
+            id[1] = 0xA5;
+            id[2] = i;
+            assert!(matches!(
+                rt.add_contact(contact_with(id, Ipv4Addr::new(20 + i, 1, 1, 1))),
+                AddResult::Added
+            ));
+        }
+        assert_eq!(rt.verified_len(), 13);
+
+        let demoted = rt.enforce_scale_quotas();
+        assert_eq!(
+            demoted,
+            8 - scale::NetworkScale::Small.max_contacts_per_ip(),
+            "the cold-start per-IP share is cut to what `Small` would admit"
+        );
+
+        // The trap: the contacts it just demoted are no longer counted, so the
+        // live tier has fallen back to the very one whose allowance was pruned
+        // away. Admission has to keep using the enforced tier here.
+        assert_eq!(rt.scale(), scale::NetworkScale::Bootstrap);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Small);
+
+        rt.promote_cached_contacts();
+
+        let resident_on_shared_ip = rt
+            .buckets
+            .iter()
+            .flat_map(|b| b.contacts.iter())
+            .filter(|c| c.addr.ip() == IpAddr::V4(shared_ip))
+            .count();
+        assert_eq!(
+            resident_on_shared_ip,
+            scale::NetworkScale::Small.max_contacts_per_ip(),
+            "promotion re-admitted the share the quota pass had just reclaimed"
         );
     }
 

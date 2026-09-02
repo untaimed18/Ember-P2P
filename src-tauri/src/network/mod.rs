@@ -41730,6 +41730,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     drive_ember_search(&udp_socket, &mut state, search_id).await;
                 }
 
+                // 2b) Retire searches that have converged or run past
+                //     `SEARCH_TIMEOUT_SECS` without a wire event to notice it.
+                //     Completion was only ever re-evaluated on a response, an
+                //     expired query, or a dispatched batch, so a walk with
+                //     nothing outstanding — every send in its first batch
+                //     failed, or its last answer completed it — kept its search
+                //     slot until the 120 s backstop below, twice the timeout it
+                //     is backstopping. The slot is the scarce part: the cap
+                //     counts held searches, not active ones, and background
+                //     walkers alone (channel presence starts one a second, plus
+                //     source lookups and bucket refreshes) can hold all 64 while
+                //     most are already done, which then refuses the user's own
+                //     search. Placed before the backstop so a reaped search is
+                //     still streamed and emitted by steps 7 and 8 in this tick.
+                for search_id in state.ember_search.active_ids() {
+                    maybe_finish_ember_search(&mut state, search_id);
+                }
+
                 // 3) Backstop: reap searches the SearchManager considers
                 //    long-expired and fail their still-waiting callers so
                 //    no Tauri command hangs past the overall timeout. A
@@ -48335,6 +48353,16 @@ async fn run_ember_maintenance(
     //      for the life of the process however crowded its /24 turned out to
     //      be. Runs before the promotion below so the slots it frees are
     //      available to the cache in the same tick.
+    // The STORE budget's tier, refreshed here rather than per datagram. It was
+    // recomputed on every inbound STORE, and `scale()` walks all 128 buckets —
+    // pure waste, since the tier only moves when the verified count crosses 10
+    // or 80 and this tick is where that changes. A minute of staleness on a
+    // limit that only ever tightens by a third is not worth a table scan per
+    // frame.
+    state
+        .ember_dht_protection
+        .set_scale(state.ember_dht.routing().scale());
+
     let demoted = state.ember_dht.enforce_scale_quotas();
     if demoted > 0 {
         // Not `ember_dht_contacts_evicted`: these peers answered us and are
@@ -48828,10 +48856,19 @@ async fn handle_ember_dht_message(
             | ember::dht::messages::MSG_STORE_BATCH
     );
 
-    // Only STORE traffic needs the identity lookup and the scale refresh, and
-    // both walk the whole routing table. Doing them for every packet put a
-    // full table scan in front of the gate that exists to make junk cheap to
-    // reject, so an attacker could buy a scan per datagram.
+    // The flat per-address frame gate first, before anything expensive. Only
+    // STORE traffic needs the identity lookup below, and that walks the whole
+    // routing table: leaving it in front of the gate meant a peer already over
+    // its frame rate still bought a table scan per datagram, which is the
+    // opposite of what a gate that exists to make junk cheap to reject is for.
+    if !state.ember_dht_protection.allow_frame(from.ip()) {
+        state.ember_diagnostics.ember_dht_rate_limited = state
+            .ember_diagnostics
+            .ember_dht_rate_limited
+            .saturating_add(1);
+        return;
+    }
+
     let (known_sender, store_records) = if is_store {
         // Prefer the peer's cryptographic identity for the STORE budget when
         // we already know it, so several genuine peers behind one NAT do not
@@ -48853,9 +48890,6 @@ async fn handle_ember_dht_message(
             .contact_at(from)
             .filter(|c| c.is_verified() && c.noise_pub == remote_noise_pub)
             .map(|c| c.node_id.0);
-        state
-            .ember_dht_protection
-            .set_scale(state.ember_dht.routing().scale());
         // A batch's record count is its first payload byte. Reading it here
         // is what lets the budget be charged for the work the frame implies
         // rather than for the frame itself; the decoder re-validates it.
@@ -48871,7 +48905,7 @@ async fn handle_ember_dht_message(
 
     if !state
         .ember_dht_protection
-        .allow_message(from.ip(), msg_type, known_sender, store_records)
+        .allow_typed(from.ip(), msg_type, known_sender, store_records)
     {
         state.ember_diagnostics.ember_dht_rate_limited = state
             .ember_diagnostics

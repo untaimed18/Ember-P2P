@@ -262,6 +262,18 @@ churn, not the change itself, is what has kept it open.
   tier are what stop a table on a boundary demoting and re-admitting the same
   contacts. Demotion is not eviction: the cache is where a contact the caps
   turn away already waits, and promotion brings it back if a slot frees up.
+
+  Those two were not sufficient on their own, and the gap is worth recording
+  because it made the whole pass a no-op in the case it was written for.
+  Demotion moves contacts out of the buckets, and `scale()` counts bucket
+  residents — so pruning a crowded table drops the very reading that chose the
+  tier, and `promote_cached_contacts`, which runs immediately afterwards in
+  the same tick, read the loosened tier and re-admitted what had just been
+  demoted. The ratchet stopped `enforce_scale_quotas` re-running; it did
+  nothing about the promotion pass. Admission and promotion now read
+  `RoutingTable::admission_scale` — the stricter of the live tier and the
+  enforced one — and `promotion_does_not_re_admit_what_the_quota_pass_just_demoted`
+  pins it.
 - Download content transfer is still eD2K c2c (see item 1 above).
 - BLAKE3 verify runs when an expected digest is available (search hit, DHT
   source record, known.met / library). Deep links without a digest still
@@ -534,6 +546,38 @@ Note this is the *wire* format only. `nodes_ember.dat` still persists a node ID
 per contact (advisory; `to_contact` re-derives the authoritative one), because
 changing the file format would cost every user their bootstrap set for no
 bandwidth saving.
+
+### 7a. Search slots were held by searches that had finished
+
+`MAX_ACTIVE_SEARCHES` is 64 and global, shared by every `FIND_NODE` and
+`FIND_VALUE` walk. `alloc_id` counts the entries the manager *holds*, not the
+walks still running, and completion alone never removed one: a search was only
+reaped by `maybe_finish_ember_search` — reached from a response, an expired
+query, or a dispatched batch — or by the `cleanup_expired` backstop at twice
+`SEARCH_TIMEOUT_SECS`. A walk that converged with nothing outstanding, or whose
+first batch failed to send at all, therefore sat in the map for two minutes
+holding a slot it was not using.
+
+That is enough to saturate the cap without anything leaking, because the
+creators are mostly background: channel presence starts one a second, source
+lookups up to five a minute, bucket refresh and publish-target lookups six
+more. Field evidence: a node with 14 contacts logged eleven consecutive
+`Too many active Ember searches (64)` inside two milliseconds — several
+subsystems each hitting a full pool in one turn of the event loop.
+
+The 1 s search timer now re-polls every held search and retires the ones that
+have converged or passed `SEARCH_TIMEOUT_SECS`, which also makes the 60 s
+timeout real rather than something only noticed if a wire event happened to
+land. It runs before the backstop so a reaped search is still streamed and
+emitted in the same tick — the ordering [item 3](#3-stream-search-results-as-they-arrive--done-in-153)
+describes. `a_converged_search_holds_its_slot_until_it_is_removed` pins the
+contract the sweep depends on.
+
+Still open: the cap is one pool for user and background searches, so a
+saturated pool refuses the user's keyword search with no visible signal (the
+Ember leg is silently skipped and `ember_pending` stays false). Reserving slots
+for user-initiated walks, or giving background walks a shorter timeout, is the
+next step if it recurs.
 
 ### 8. Observability gaps
 
