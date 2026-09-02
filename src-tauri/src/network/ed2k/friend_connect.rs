@@ -35,6 +35,9 @@ pub struct FriendSessionHandle {
 /// these attempts run in bursts when several requests are cancelled at once.
 const RETRACTION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const RETRACTION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the courier holds the socket open after its last frame, waiting for
+/// the peer to hang up first. See the tail of [`send_friend_request_retraction`].
+const RETRACTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Establishes a persistent outbound friend session. Performs the full
 /// Hello/EmuleInfo handshake, sends a friend request, then runs a
@@ -107,8 +110,8 @@ pub async fn open_and_run_friend_session(
 /// membership guard below — and loosening that guard to let a withdrawal
 /// through would open the friend-session path to non-friends for the sake of a
 /// single packet. Instead this completes the same Noise IK handshake, writes one
-/// packet and hangs up: no `ember_sessions` entry, no read loop, no keepalive,
-/// so the peer is granted nothing by having answered.
+/// packet and waits for the peer to hang up: no `ember_sessions` entry, no read
+/// loop, no keepalive, so the peer is granted nothing by having answered.
 ///
 /// The handshake is still what makes it safe in the other direction: the
 /// recipient only acts on a withdrawal whose sender proved possession of the
@@ -210,9 +213,38 @@ pub async fn send_friend_request_retraction(
     .await
     .context("failed to send friend-request withdrawal")?;
 
-    // Leave no half-open socket behind: this connection has said everything it
-    // was opened to say.
+    // This connection has said everything it was opened to say, but it is the
+    // peer that has to hang up first. TCP delivers in order, so the peer
+    // reaching end-of-stream means it has consumed everything ahead of it, the
+    // withdrawal included. Closing from this side was a race: the peer's own
+    // EmuleInfoAnswer, which this courier never reads, would land on our closed
+    // socket and be answered with a RST — and a RST makes the peer's kernel
+    // discard whatever it had received but not yet handed to the application.
+    // The withdrawal was the last frame we sent, so it was the one most likely
+    // to still be sitting there, and `Ok` here clears the retry queue, so a
+    // withdrawal lost that way was lost for good.
     let _ = writer.shutdown().await;
+    match tokio::time::timeout(
+        RETRACTION_DRAIN_TIMEOUT,
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        // A reset before end-of-stream is the peer closing with our frames
+        // still unread, which is exactly the loss this waits to rule out.
+        // Leave the row queued so the next sweep tries again.
+        Ok(Err(e)) => {
+            anyhow::bail!("peer dropped the connection before reading the withdrawal: {e}")
+        }
+        // The peer answered the greeting, so it is reading; seconds of silence
+        // after our FIN means it consumed the frames ahead of it long ago and
+        // is merely slow to hang up. Failing here would re-dial a peer that
+        // has already acted on the withdrawal.
+        Err(_) => {
+            debug!("Peer at {addr} did not close after the withdrawal; treating it as delivered")
+        }
+    }
     info!(
         "Withdrew friend request at {} ({})",
         addr,

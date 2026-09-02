@@ -253,6 +253,14 @@ pub enum ChannelMemberWrite {
     Touched,
     /// The nickname changed, so anything displaying the row has to re-read it.
     Updated,
+    /// A newcomer the roster cap turned away: the room is full of members who
+    /// are neither stale nor exempt, so nothing was evicted and no row was kept.
+    ///
+    /// Distinct from [`ChannelMemberWrite::Unchanged`] because callers hold
+    /// state beside the table — relay caches, key caches — that is meant to be
+    /// bounded by the roster. Reporting a refusal as a no-op let those admit
+    /// exactly the identities the roster had just refused.
+    Refused,
 }
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
@@ -4576,6 +4584,11 @@ impl Database {
 
     /// Mark our sent messages up through the one named by `body_hash` as seen.
     /// Returns that row's id so the UI can apply the watermark without a reload.
+    ///
+    /// Only delivered rows can match or be covered. A receipt names a line by
+    /// its body alone, and short replies repeat — "ok" sent twice, the second
+    /// still queued, would otherwise resolve to the queued copy and flag it and
+    /// everything before it as read by someone who has not received it yet.
     pub fn mark_sent_seen_by_hash(
         &self,
         friend_hash: &str,
@@ -4589,8 +4602,9 @@ impl Database {
             .query_row(
                 "SELECT id FROM chat_messages \
                  WHERE friend_hash = ?1 AND direction = 'sent' AND body_hash = ?2 \
+                   AND delivery = ?3 \
                  ORDER BY id DESC LIMIT 1",
-                params![friend_hash, body_hash],
+                params![friend_hash, body_hash, CHAT_DELIVERED],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4599,8 +4613,9 @@ impl Database {
         };
         conn.execute(
             "UPDATE chat_messages SET seen = 1 \
-             WHERE friend_hash = ?1 AND direction = 'sent' AND id <= ?2 AND seen = 0",
-            params![friend_hash, id],
+             WHERE friend_hash = ?1 AND direction = 'sent' AND id <= ?2 AND seen = 0 \
+               AND delivery = ?3",
+            params![friend_hash, id, CHAT_DELIVERED],
         )?;
         Ok(Some(id))
     }
@@ -5622,7 +5637,7 @@ impl Database {
                     params![channel_id, member_pubkey],
                 )?;
                 tx.commit()?;
-                return Ok(ChannelMemberWrite::Unchanged);
+                return Ok(ChannelMemberWrite::Refused);
             }
         }
         tx.commit()?;
@@ -8818,8 +8833,13 @@ mod tests {
         );
         for i in 0..16 {
             let pk = format!("{:064x}", 10_000 + i);
-            db.upsert_channel_member(&channel_id, &pk, "New", now, Some(&local))
-                .unwrap();
+            assert_eq!(
+                db.upsert_channel_member(&channel_id, &pk, "New", now, Some(&local))
+                    .unwrap(),
+                ChannelMemberWrite::Refused,
+                "a newcomer the cap turns away is reported as refused, not as a no-op, \
+                 so caches sized to the roster do not admit what the roster would not"
+            );
         }
         let members = db.list_channel_members(&channel_id).unwrap();
         let live: Vec<_> = members.iter().filter(|m| !m.banned).collect();
@@ -10628,6 +10648,56 @@ mod tests {
         assert!(by_id[&first], "earlier sent lines are covered by the watermark");
         assert!(by_id[&second]);
         assert!(!by_id[&third], "later unsent-to-them lines stay unseen");
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A receipt names a body, and bodies repeat. When the newest copy of that
+    /// body is still in the outbox, the receipt is for the delivered copy before
+    /// it — the friend cannot have read a line that never reached them — and a
+    /// queued or failed row between the two must not be swept up either.
+    #[test]
+    fn read_receipt_resolves_to_the_delivered_copy_of_a_repeated_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-seen-repeat-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let friend = "ab".repeat(16);
+        let db = Database::open_at(&path).unwrap();
+        let delivered_ok = db.insert_chat_message(&friend, "sent", "ok").unwrap();
+        let failed = db
+            .insert_pending_chat_message(&friend, "did you get that?")
+            .unwrap();
+        db.set_chat_delivery(failed, CHAT_FAILED).unwrap();
+        let queued_ok = db.insert_pending_chat_message(&friend, "ok").unwrap();
+        let hash = Database::friend_chat_body_hash_hex("ok");
+
+        let until = db
+            .mark_sent_seen_by_hash(&friend, &hash)
+            .unwrap()
+            .expect("the delivered copy matches");
+        assert_eq!(until, delivered_ok, "the queued copy is not a candidate");
+
+        let rows = db.get_chat_messages(&friend, 10, None).unwrap();
+        let by_id: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|row| (row.id, row.seen)).collect();
+        assert!(by_id[&delivered_ok]);
+        assert!(!by_id[&failed], "an abandoned line was never read");
+        assert!(
+            !by_id[&queued_ok],
+            "a line still in the outbox was never read"
+        );
+
+        // Nothing but outbox copies of a body: no watermark at all.
+        let only_queued = Database::friend_chat_body_hash_hex("did you get that?");
+        assert_eq!(
+            db.mark_sent_seen_by_hash(&friend, &only_queued).unwrap(),
+            None
+        );
         drop(db);
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);

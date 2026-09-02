@@ -1282,6 +1282,27 @@ fn kad_bridge_candidates(
     )
 }
 
+/// Order in which due bridge candidates are dialled: fewest unanswered pings
+/// first, then most recently observed.
+///
+/// Freshness alone used to be the key. That was fine while a miss earned a
+/// longer wait, because a dead address dropped out of the due set and the
+/// next-freshest got its turn. A starved table flattens the wait to one tick
+/// ([`bridge_retry_after`]), so every address is due on every tick, and the
+/// freshest few — re-observed by every KAD lookup whether or not they ever
+/// answer — were dialled again and again while candidates further down the
+/// list, which had never been tried at all, waited behind them indefinitely.
+/// An answered ping clears the entry (see the PONG path), so the count here is
+/// exactly the number of times the address has ignored us.
+fn bridge_candidate_rank(
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
+    key: &(Ipv4Addr, u16),
+    seen: std::time::Instant,
+) -> (u32, std::cmp::Reverse<std::time::Instant>) {
+    let misses = attempted.get(key).map(|(_, n)| *n).unwrap_or(0);
+    (misses, std::cmp::Reverse(seen))
+}
+
 /// `kad_bridge_candidates` with an explicit "now", so the retry window is
 /// testable without sleeping.
 fn kad_bridge_candidates_at(
@@ -1301,7 +1322,7 @@ fn kad_bridge_candidates_at(
         })
         .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
         .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
+    candidates.sort_by_key(|c| bridge_candidate_rank(attempted, &(c.0, c.1), c.3));
     candidates
         .into_iter()
         .take(max)
@@ -1400,7 +1421,7 @@ fn record_ember_keyless_peer(
 /// client-to-client sessions rather than KAD source tags. Anything we already
 /// hold a Noise key for is skipped so the cheaper 1-RTT IK path wins; the rest
 /// pay one extra round trip, which is the price of joining without KAD.
-/// Freshest first, same as the IK side.
+/// Ranked by [`bridge_candidate_rank`], same as the IK side.
 fn xx_bridge_candidates(
     keyless: &HashMap<(Ipv4Addr, u16), std::time::Instant>,
     noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
@@ -1439,12 +1460,37 @@ fn xx_bridge_candidates_at(
         })
         .map(|(key, seen)| (key.0, key.1, *seen))
         .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
+    candidates.sort_by_key(|c| bridge_candidate_rank(attempted, &(c.0, c.1), c.2));
     candidates
         .into_iter()
         .take(max)
         .map(|(ip, port, _)| (ip, port))
         .collect()
+}
+
+/// Share of one bridge pass held back for the Noise_XX candidates.
+///
+/// The IK pass used to run first and hand the XX pass only what it left, which
+/// on a healthy table was fine: dead IK addresses backed off, the due set
+/// thinned, and the budget reached the keyless peers within a few ticks. A
+/// starved table flattens that backoff, so with more due IK addresses than the
+/// budget — a KAD-fed key cache holds up to `MAX_KNOWN_EMBER_NOISE_KEYS`, most
+/// of them stale source records — the IK pass spent the whole budget every
+/// tick and the XX pass never ran. The keyless peers are the live eD2K sessions
+/// that advertised Ember without a key: LAN friends under `block_private_ips`,
+/// LowID peers — the ones most likely to actually answer.
+///
+/// A quarter, with a floor of one so the 1 Hz fast pass (four pings) still
+/// reaches them. Only held back while there are keyless peers to spend it on,
+/// and anything the reserve does not use goes to the IK pass, so a node with
+/// nothing on the XX side loses no throughput.
+const EMBER_BRIDGE_XX_RESERVE_DIVISOR: usize = 4;
+
+fn xx_bridge_reserve(max_pings: usize, keyless_known: bool) -> usize {
+    if !keyless_known || max_pings == 0 {
+        return 0;
+    }
+    (max_pings / EMBER_BRIDGE_XX_RESERVE_DIVISOR).clamp(1, max_pings)
 }
 
 /// Hard cap on firsthand DHT contacts learned from live eD2K Ember sessions.
@@ -9529,6 +9575,77 @@ mod tests {
         );
     }
 
+    /// Flattening the backoff made every address due on every tick, and with
+    /// freshness as the only key the same freshest few — re-observed by each
+    /// KAD lookup whether or not they ever answered — took the whole budget
+    /// every time. An address that has never been asked has to come ahead of
+    /// one that has ignored us, however recently the latter was seen.
+    #[test]
+    fn a_starved_bridge_tries_untested_addresses_before_ones_that_kept_ignoring_it() {
+        let mut keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        let mut keyless: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+        let ignored_fresh = (Ipv4Addr::new(8, 8, 8, 1), 4672u16);
+        let untried_old = (Ipv4Addr::new(8, 8, 8, 2), 4672u16);
+        let untried_fresh = (Ipv4Addr::new(8, 8, 8, 3), 4672u16);
+        let once_missed = (Ipv4Addr::new(8, 8, 8, 4), 4672u16);
+        // Oldest observation first so the timestamps strictly increase.
+        for peer in [untried_old, once_missed, untried_fresh, ignored_fresh] {
+            record_ember_noise_key(&mut keys, peer.0, peer.1, [0x22; 32]);
+            record_ember_keyless_peer(&mut keyless, peer.0, peer.1);
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let at = std::time::Instant::now();
+        let mut attempted = HashMap::new();
+        attempted.insert(ignored_fresh, (at, 3u32));
+        attempted.insert(once_missed, (at, 1u32));
+        let one_tick = at + EMBER_BRIDGE_RETRY_FIRST;
+
+        let picked: Vec<_> = kad_bridge_candidates_at(&keys, &attempted, 8, one_tick, true)
+            .into_iter()
+            .map(|(ip, port, _)| (ip, port))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![untried_fresh, untried_old, once_missed, ignored_fresh],
+            "never-asked first (freshest of those ahead), then by how often each has ignored us"
+        );
+        // A budget of two therefore reaches both untried addresses, where the
+        // old order spent one of them re-dialling the address with three misses.
+        let two: Vec<_> = kad_bridge_candidates_at(&keys, &attempted, 2, one_tick, true)
+            .into_iter()
+            .map(|(ip, port, _)| (ip, port))
+            .collect();
+        assert_eq!(two, vec![untried_fresh, untried_old]);
+
+        // The XX side ranks the same way.
+        let no_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        assert_eq!(
+            xx_bridge_candidates_at(&keyless, &no_keys, &attempted, 8, one_tick, true),
+            vec![untried_fresh, untried_old, once_missed, ignored_fresh]
+        );
+    }
+
+    /// The IK pass ran first and left the XX pass its remainder. While starved,
+    /// a key cache with more due addresses than the budget — the usual state of
+    /// a KAD-fed cache, most of it stale source records — left nothing over, so
+    /// the keyless peers, which are live sessions and the likeliest to answer,
+    /// were never dialled at all.
+    #[test]
+    fn the_xx_bridge_pass_keeps_a_share_of_the_budget_while_there_is_anyone_to_spend_it_on() {
+        // A quarter, floored at one so the four-ping fast pass still reaches it.
+        assert_eq!(
+            xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, true),
+            EMBER_KAD_BRIDGE_MAX_PINGS / 4
+        );
+        assert_eq!(xx_bridge_reserve(EMBER_BRIDGE_FAST_MAX_PINGS, true), 1);
+        assert_eq!(xx_bridge_reserve(1, true), 1);
+        // Never more than the pass itself, and nothing at all when the pass is
+        // empty or there is no keyless peer to spend it on.
+        assert_eq!(xx_bridge_reserve(0, true), 0);
+        assert_eq!(xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, false), 0);
+        assert!(xx_bridge_reserve(EMBER_KAD_BRIDGE_MAX_PINGS, true) < EMBER_KAD_BRIDGE_MAX_PINGS);
+    }
+
     /// Each unanswered ping must lengthen the next wait. Overwriting the entry
     /// instead of incrementing would pin every peer at the first interval and
     /// re-probe a dead one every maintenance tick forever.
@@ -13488,12 +13605,14 @@ fn emit_channel_presence_deltas(state: &mut NetworkState, app_handle: &tauri::Ap
 /// pins the relationship.
 const CHANNEL_BEACON_BEAT_PER_TICK: usize = 1;
 
-/// Keep a beacon for later relay, but only for somebody the roster admits.
+/// Keep a beacon for later relay.
 ///
 /// The roster cap and its eviction rules are what stop a flood of invented
 /// identities being chosen as gossip neighbors. A separate beacon map that
-/// accepted anyone would be a way around that, so membership is checked against
-/// the table rather than assumed from the fact that a beacon verified.
+/// accepted anyone would be a way around that, so callers hand in only beacons
+/// the table admitted — `apply_channel_presence_beacons` skips a
+/// [`ChannelMemberWrite::Refused`] — and the size cap here is a backstop for
+/// the tombstones, which are kept for identities the roster no longer holds.
 fn remember_channel_beacon(
     state: &mut NetworkState,
     channel_id: [u8; 16],
@@ -13865,6 +13984,12 @@ async fn apply_channel_presence_beacons(
                     // re-registered rather than waiting out the heartbeat.
                     state.rendezvous_last_register = None;
                 }
+                // The room is full of members who are neither stale nor exempt.
+                // Not cached and not relayed: the beacon map is meant to be
+                // bounded by the roster, and a digest is freshest-first, so a
+                // burst of invented identities admitted here would ride out in
+                // place of the members who are actually present.
+                Ok(ChannelMemberWrite::Refused) => continue,
                 Ok(_) => {}
                 Err(e) => {
                     debug!(
@@ -15103,6 +15228,11 @@ fn ingest_channel_presence_records(
             member.timestamp,
             Some(&our_hex),
         ) {
+            // A refused newcomer holds no row, so it gets no key cached
+            // either: that map is sized to the rosters it serves.
+            if write == ChannelMemberWrite::Refused {
+                continue;
+            }
             state
                 .ember_channel_noise_keys
                 .insert(member.publisher_key, member.noise_pub);
@@ -15131,7 +15261,7 @@ fn ingest_channel_presence_records(
                         );
                     }
                 }
-                ChannelMemberWrite::Unchanged => {}
+                ChannelMemberWrite::Unchanged | ChannelMemberWrite::Refused => {}
             }
         }
     }
@@ -47830,43 +47960,70 @@ async fn run_ember_kad_bridge(
     force: bool,
     max_pings: usize,
 ) -> usize {
+    // `starved` is what flattens the retry backoff, and it has to be the real
+    // table state: a forced run against a healthy table is still a healthy
+    // table, and letting `force` stand in for it re-dialled every address the
+    // backoff was resting.
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    if !(force || starved) {
+        return 0;
+    }
     let mut sent = 0usize;
+    let mut xx_sent = 0usize;
     // The budget has to be charged against peers *dialled*, not datagrams that
     // left. `send_ember_bridge_ping` returns false for a local send error too,
     // and a run of those would otherwise leave `max_pings` untouched and hand
-    // the XX pass a full second budget — up to twice the documented cap in one
-    // call, spent on the slower 2-RTT handshake.
+    // the next pass a full second budget — up to twice the documented cap in
+    // one call, spent on the slower 2-RTT handshake.
     let mut dialled = 0usize;
-    let bridging =
-        force || state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
-    if bridging {
-        let candidates = kad_bridge_candidates(
-            &state.ember_noise_keys,
-            &state.ember_kad_bridge_attempted,
-            max_pings,
-            bridging,
-        );
-        for (ip, port, noise_pub) in candidates {
-            dialled += 1;
-            if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
-                sent += 1;
-            }
+
+    // XX first, up to its reserve, so the IK pass cannot crowd it out; see
+    // `EMBER_BRIDGE_XX_RESERVE_DIVISOR`. Whatever the reserve does not find a
+    // candidate for is still on the table for the IK pass below.
+    let reserve = xx_bridge_reserve(max_pings, !state.ember_keyless_peers.is_empty());
+    let reserved_xx = xx_bridge_candidates(
+        &state.ember_keyless_peers,
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        reserve,
+        starved,
+    );
+    for (ip, port) in &reserved_xx {
+        dialled += 1;
+        if send_ember_bridge_ping(socket, state, *ip, *port, None).await {
+            xx_sent += 1;
+            sent += 1;
         }
     }
-    let xx_budget = if bridging {
-        max_pings.saturating_sub(dialled)
-    } else {
-        0
-    };
+
+    let candidates = kad_bridge_candidates(
+        &state.ember_noise_keys,
+        &state.ember_kad_bridge_attempted,
+        max_pings.saturating_sub(dialled),
+        starved,
+    );
+    for (ip, port, noise_pub) in candidates {
+        dialled += 1;
+        if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
+            sent += 1;
+        }
+    }
+
+    // Whatever the IK pass left over goes to the XX side as before. A peer the
+    // reserve already dialled is excluded explicitly rather than trusting the
+    // attempted set alone: a transport error there records no attempt, and the
+    // same address must not be charged twice in one pass.
     let xx_candidates = xx_bridge_candidates(
         &state.ember_keyless_peers,
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
-        xx_budget,
-        bridging,
+        max_pings.saturating_sub(dialled),
+        starved,
     );
-    let mut xx_sent = 0usize;
     for (ip, port) in xx_candidates {
+        if reserved_xx.contains(&(ip, port)) {
+            continue;
+        }
         if send_ember_bridge_ping(socket, state, ip, port, None).await {
             xx_sent += 1;
             sent += 1;
