@@ -67,10 +67,24 @@ fn backup_before_overwrite(path: &Path) {
 ///   for each contact:
 ///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
 ///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE) + misses(1)
+/// What this session knows about the on-disk nodes file, which is what decides
+/// whether overwriting it is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodesFileState {
+    /// Never read this session. The file may hold peers this run knows nothing
+    /// about, so it must not be overwritten.
+    Unread,
+    /// Read, and everything its header declared came back.
+    Loaded,
+    /// Read, but the header declared more contacts than parsed — a truncated
+    /// or corrupted file. `recovered` is how many did parse.
+    Truncated { recovered: usize },
+}
+
 pub fn save_nodes(
     path: &Path,
     contacts: &[CachedContact],
-    nodes_were_loaded: bool,
+    file_state: NodesFileState,
 ) -> anyhow::Result<()> {
     // Never trade a usable bootstrap file for an empty one. A table can be
     // momentarily empty (startup, the transport toggled off, a network drop),
@@ -91,13 +105,32 @@ pub fn save_nodes(
     // empty, nothing re-reads the file, and the next save would overwrite two
     // hundred remembered peers with whatever this one session managed to find.
     // `save_store` has taken the same flag for the same reason all along.
-    if !nodes_were_loaded && path.exists() {
+    if matches!(file_state, NodesFileState::Unread) && path.exists() {
         info!(
             "Skipping Ember nodes save: this session never loaded {}, so what it \
              holds cannot be compared with what is there",
             path.display()
         );
         return Ok(());
+    }
+
+    // A partial read is not authority to shrink the file. The parse recovered
+    // some of a header that claimed more, and the timestamped backup keeps the
+    // original bytes — but nothing ever reads that backup, so writing back
+    // fewer contacts than were recovered is the step that makes the loss
+    // permanent, one launch at a time. Growing past the recovered count is
+    // allowed, which is how a node that has since met more peers replaces the
+    // damaged file with a whole one.
+    if let NodesFileState::Truncated { recovered } = file_state {
+        if contacts.len() < recovered && path.exists() {
+            info!(
+                "Skipping Ember nodes save: {} was truncated on load ({recovered} contact(s) \
+                 recovered) and this session holds only {}, which would make the loss permanent",
+                path.display(),
+                contacts.len(),
+            );
+            return Ok(());
+        }
     }
 
     // Build the full file in memory first, then commit via
@@ -148,7 +181,16 @@ pub fn save_nodes(
 /// unproven — [`super::peer_cache::BootstrapCache::seed_batch`] is what
 /// enforces that, and is the only supported way to get contacts from here into
 /// a table.
+/// Test-only: production reads through [`load_nodes_with_state`], because the
+/// save path has to know whether the file came back whole.
+#[cfg(test)]
 pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<CachedContact>> {
+    load_nodes_with_state(path).map(|(contacts, _)| contacts)
+}
+
+/// [`load_nodes`], plus whether the file was whole. The save path needs the
+/// second half — see [`NodesFileState`].
+pub fn load_nodes_with_state(path: &Path) -> anyhow::Result<(Vec<CachedContact>, NodesFileState)> {
     crate::security::recover_interrupted_replace(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_NODES_EMBER_BYTES {
@@ -291,7 +333,7 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<CachedContact>> {
     // Mirrors `kad::bootstrap::backup_if_short_load`. `dropped` entries were
     // parsed successfully but discarded for an invalid key, so they don't count
     // as truncation.
-    if contacts.len() + dropped < count {
+    let file_state = if contacts.len() + dropped < count {
         warn!(
             "Ember DHT nodes file declared {count} contacts but only {} loaded; \
              likely a corrupted or truncated file. Backing up before next save.",
@@ -310,14 +352,19 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<CachedContact>> {
         } else {
             info!("Backed up partial nodes_ember.dat to {}", bak.display());
         }
-    }
+        NodesFileState::Truncated {
+            recovered: contacts.len(),
+        }
+    } else {
+        NodesFileState::Loaded
+    };
 
     info!(
         "Loaded {} Ember DHT contacts from {}",
         contacts.len(),
         path.display()
     );
-    Ok(contacts)
+    Ok((contacts, file_state))
 }
 
 const STORE_EMBER_MAGIC: u32 = 0x454D_5331; // "EMS1" in LE
@@ -568,7 +615,7 @@ mod tests {
         let path = dir.join("nodes_ember.dat");
 
         let contacts = vec![make_contact(1), make_contact(2), make_contact(3)];
-        save_nodes(&path, &contacts, true).unwrap();
+        save_nodes(&path, &contacts, NodesFileState::Loaded).unwrap();
         let loaded = load_nodes(&path).unwrap();
 
         assert_eq!(loaded.len(), 3);
@@ -605,11 +652,11 @@ mod tests {
         let path = dir.join("nodes_ember.dat");
 
         let book: Vec<CachedContact> = (1..=8).map(make_contact).collect();
-        save_nodes(&path, &book, true).unwrap();
+        save_nodes(&path, &book, NodesFileState::Loaded).unwrap();
         let before = std::fs::read(&path).unwrap();
 
         // This session never loaded it and found one peer of its own.
-        save_nodes(&path, &[make_contact(9)], false).unwrap();
+        save_nodes(&path, &[make_contact(9)], NodesFileState::Unread).unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -618,8 +665,56 @@ mod tests {
         assert_eq!(load_nodes(&path).unwrap().len(), 8);
 
         // A session that did read it is free to rewrite it.
-        save_nodes(&path, &[make_contact(9)], true).unwrap();
+        save_nodes(&path, &[make_contact(9)], NodesFileState::Loaded).unwrap();
         assert_eq!(load_nodes(&path).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file that lost half its contacts to truncation must not then lose the
+    /// rest to the session that recovered them. The timestamped backup keeps
+    /// the bytes, but nothing ever reads it back, so writing a smaller set over
+    /// the live file is what makes the loss permanent — one launch at a time,
+    /// which is the ratchet the whole bootstrap cache exists to break.
+    #[test]
+    fn a_truncated_load_is_not_licence_to_shrink_the_file() {
+        let dir = std::env::temp_dir().join("ember_test_nodes_truncated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        let book: Vec<CachedContact> = (1..=8).map(make_contact).collect();
+        save_nodes(&path, &book, NodesFileState::Loaded).unwrap();
+
+        // Lop off the tail so the header still claims eight.
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() * 2 / 3]).unwrap();
+
+        let (recovered, file_state) = load_nodes_with_state(&path).unwrap();
+        assert!(
+            recovered.len() < 8,
+            "the point of the fixture is that some contacts are gone"
+        );
+        assert_eq!(
+            file_state,
+            NodesFileState::Truncated {
+                recovered: recovered.len()
+            }
+        );
+
+        // A session holding fewer than were recovered must leave the file be.
+        let damaged = std::fs::read(&path).unwrap();
+        save_nodes(&path, &[make_contact(9)], file_state).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "one contact must not overwrite the several the parse rescued"
+        );
+
+        // Growing past what was recovered is how the damaged file gets
+        // replaced, so that has to still work.
+        let grown: Vec<CachedContact> = (1..=12).map(make_contact).collect();
+        save_nodes(&path, &grown, file_state).unwrap();
+        assert_eq!(load_nodes(&path).unwrap().len(), 12);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -633,7 +728,7 @@ mod tests {
         let path = dir.join("nodes_ember.dat");
         let _ = std::fs::remove_file(&path);
 
-        save_nodes(&path, &[make_contact(3)], false).unwrap();
+        save_nodes(&path, &[make_contact(3)], NodesFileState::Unread).unwrap();
         assert_eq!(load_nodes(&path).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -653,7 +748,7 @@ mod tests {
         let mut ahead = make_contact(5);
         let far_future = chrono::Utc::now().timestamp() + 86_400;
         ahead.contact.last_seen = far_future;
-        save_nodes(&path, &[ahead], true).unwrap();
+        save_nodes(&path, &[ahead], NodesFileState::Loaded).unwrap();
 
         let loaded = load_nodes(&path).unwrap();
         assert_eq!(loaded.len(), 1);
@@ -728,7 +823,7 @@ mod tests {
                 })
             })
             .collect();
-        save_nodes(&path, &overlong, true).unwrap();
+        save_nodes(&path, &overlong, NodesFileState::Loaded).unwrap();
 
         let loaded = load_nodes(&path).unwrap();
         assert_eq!(
@@ -759,7 +854,7 @@ mod tests {
             last_seen: 42,
             failed_queries: 0,
         })];
-        save_nodes(&path, &contacts, true).unwrap();
+        save_nodes(&path, &contacts, NodesFileState::Loaded).unwrap();
         let loaded = load_nodes(&path).unwrap();
 
         assert_eq!(loaded.len(), 1);

@@ -12365,11 +12365,12 @@ struct NetworkState {
     /// its peers on every restart and could only ever shrink the file. See
     /// [`ember::dht::peer_cache`].
     ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache,
-    /// Whether this session actually read `nodes_ember.dat`. Lets the save path
-    /// tell "the book is genuinely empty" from "we never got to look at it" —
-    /// see [`ember::dht::bootstrap::save_nodes`]. `true` when the file is simply
-    /// absent, which is a new profile rather than a failure.
-    ember_nodes_loaded: bool,
+    /// What this session knows about `nodes_ember.dat`. Lets the save path tell
+    /// "the book is genuinely empty" from "we never got to look at it", and
+    /// from "we read a truncated file and must not write our subset back over
+    /// it" — see [`ember::dht::bootstrap::save_nodes`]. `Loaded` when the file
+    /// is simply absent, which is a new profile rather than a failure.
+    ember_nodes_file: ember::dht::bootstrap::NodesFileState,
     /// Unix time of our last self-publish to the Ember rendezvous key, so it
     /// republishes on the same cadence as any other source record. 0 = never.
     ember_rendezvous_published_at: i64,
@@ -14190,7 +14191,7 @@ async fn start_channel_presence_fetch(
     }
     let mut any = false;
     for key in keys {
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14315,7 +14316,7 @@ async fn maybe_refresh_channel_moderation(
             continue;
         }
         let key = ember::channel::moderation_key(&channel_id);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14826,7 +14827,7 @@ async fn maybe_refresh_channel_key_epoch(
             continue;
         }
         let key = ember::channel::epoch_key(&channel_id, &our_pk, target);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14954,7 +14955,7 @@ async fn maybe_refresh_channel_handoff(
             continue;
         }
         let key = ember::channel::handoff_key(&channel_id);
-        let Some(search_id) = state.ember_search.start_find_value(
+        let Some(search_id) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(key),
             Vec::new(),
             state.ember_dht.routing(),
@@ -14988,7 +14989,7 @@ async fn maybe_refresh_channel_handoff(
             continue;
         }
         let claim = ember::channel::claim_key(&channel_id);
-        let Some(claim_search) = state.ember_search.start_find_value(
+        let Some(claim_search) = state.ember_search.start_background_find_value(
             ember::dht::EmberNodeId(claim),
             Vec::new(),
             state.ember_dht.routing(),
@@ -15408,7 +15409,7 @@ async fn maybe_dial_channel_neighbors(
         if find_nodes < CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK {
             if let Some(search_id) = state
                 .ember_search
-                .start_find_node(node_id, state.ember_dht.routing())
+                .start_background_find_node(node_id, state.ember_dht.routing())
             {
                 find_nodes += 1;
                 pending_find.push(search_id);
@@ -18393,6 +18394,21 @@ fn start_ember_find_node(
     let search_id = state
         .ember_search
         .start_find_node(target, state.ember_dht.routing())?;
+    seed_ember_session_search_contacts(state, search_id);
+    Some(search_id)
+}
+
+/// [`start_ember_find_node`] for the maintenance tick's own walks — the
+/// self-lookup, bucket refresh and publish-target resolution. Each is re-queued
+/// and retried on the next tick, so they yield the reserve that keeps a slot
+/// available for whatever the user asked for. See `MAX_BACKGROUND_SEARCHES`.
+fn start_ember_background_find_node(
+    state: &mut NetworkState,
+    target: ember::dht::EmberNodeId,
+) -> Option<u32> {
+    let search_id = state
+        .ember_search
+        .start_background_find_node(target, state.ember_dht.routing())?;
     seed_ember_session_search_contacts(state, search_id);
     Some(search_id)
 }
@@ -23473,7 +23489,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
         ember_bootstrap_cache: ember::dht::peer_cache::BootstrapCache::new(),
-        ember_nodes_loaded: false,
+        ember_nodes_file: ember::dht::bootstrap::NodesFileState::Unread,
         external_ip: None,
         external_udp_port: None,
         external_tcp_port: None,
@@ -23802,13 +23818,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // `std::fs` read inside an async fn that shares its runtime with the UI.
         let load_path = nodes_ember_path.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_nodes(&load_path)
+            ember::dht::bootstrap::load_nodes_with_state(&load_path)
         })
         .await;
         match loaded {
-            Ok(Ok(entries)) => {
+            Ok(Ok((entries, file_state))) => {
                 let n = entries.len();
-                state.ember_nodes_loaded = true;
+                state.ember_nodes_file = file_state;
                 state.ember_bootstrap_cache.load(entries);
                 // Through `seed_batch`, never straight from the file: the table
                 // has to receive every remembered peer as unproven, while the
@@ -23859,7 +23875,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let quarantine = nodes_ember_path.with_extension(format!("dat.unreadable.{ts}"));
                 match std::fs::rename(&nodes_ember_path, &quarantine) {
                     Ok(()) => {
-                        state.ember_nodes_loaded = true;
+                        state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
                         warn!(
                             "Moved the unreadable nodes_ember.dat aside to {} so this node can \
                              remember peers again",
@@ -23879,7 +23895,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     } else {
         // Absent is not unreadable: there is nothing to preserve, so the save
         // path is free to write whatever this session learns.
-        state.ember_nodes_loaded = true;
+        state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
     state
@@ -40316,13 +40332,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     let Ok(ownership) = state.ember_nodes_save_lock.clone().try_lock_owned() else {
                         return;
                     };
-                    let nodes_were_loaded = state.ember_nodes_loaded;
+                    let nodes_file_state = state.ember_nodes_file;
                     tokio::task::spawn_blocking(move || {
                         let _ownership = ownership;
                         if let Err(e) = ember::dht::bootstrap::save_nodes(
                             &ember_path,
                             &ember_contacts,
-                            nodes_were_loaded,
+                            nodes_file_state,
                         ) {
                             error!("Failed periodic nodes_ember.dat save: {e}");
                         }
@@ -43656,7 +43672,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(e) = ember::dht::bootstrap::save_nodes(
                     &ember_nodes_path,
                     &ember_contacts,
-                    state.ember_nodes_loaded,
+                    state.ember_nodes_file,
                 ) {
                     error!("Failed to save nodes_ember.dat on shutdown: {e}");
                 }
@@ -48040,7 +48056,7 @@ async fn start_ember_source_search(
     let Some(search_id) =
         state
             .ember_search
-            .start_find_value(target, Vec::new(), state.ember_dht.routing())
+            .start_background_find_value(target, Vec::new(), state.ember_dht.routing())
     else {
         return false;
     };
@@ -48500,7 +48516,7 @@ async fn run_ember_maintenance(
         && now_secs.saturating_sub(state.ember_last_self_lookup) >= EMBER_SELF_LOOKUP_REPEAT_SECS;
     if ember_overlay_contact_count(state) > 0 && (force || first_due || repeat_due) {
         let self_target = state.ember_dht.local_id();
-        if let Some(search_id) = start_ember_find_node(state, self_target) {
+        if let Some(search_id) = start_ember_background_find_node(state, self_target) {
             state.ember_self_lookup_done = true;
             state.ember_last_self_lookup = now_secs;
             result.buckets_refreshed += 1;
@@ -48520,7 +48536,7 @@ async fn run_ember_maintenance(
     );
     for bucket_idx in buckets {
         let target = state.ember_dht.random_target_in_bucket(bucket_idx);
-        if let Some(search_id) = start_ember_find_node(state, target) {
+        if let Some(search_id) = start_ember_background_find_node(state, target) {
             result.buckets_refreshed += 1;
             state.ember_diagnostics.ember_dht_refreshes = state
                 .ember_diagnostics
@@ -48549,7 +48565,7 @@ async fn run_ember_maintenance(
                 break;
             };
             let target = ember::dht::EmberNodeId(key);
-            match start_ember_find_node(state, target) {
+            match start_ember_background_find_node(state, target) {
                 Some(search_id) => {
                     state.ember_publish_target_lookups.insert(search_id, key);
                     drive_ember_search(socket, state, search_id).await;

@@ -573,11 +573,62 @@ emitted in the same tick — the ordering [item 3](#3-stream-search-results-as-t
 describes. `a_converged_search_holds_its_slot_until_it_is_removed` pins the
 contract the sweep depends on.
 
-Still open: the cap is one pool for user and background searches, so a
-saturated pool refuses the user's keyword search with no visible signal (the
-Ember leg is silently skipped and `ember_pending` stays false). Reserving slots
-for user-initiated walks, or giving background walks a shorter timeout, is the
-next step if it recurs.
+**Also done: background work now yields a reserve.** The pool was shared by
+everything, and almost every creator is automatic — so a saturated pool refused
+the user's keyword search, which has no second chance: `start_find_value`
+returning `None` drops the Ember leg for that query, `ember_pending` stays
+false, and the results arrive KAD-only with nothing said. Background callers go
+through `start_background_find_node` / `start_background_find_value` and stop at
+`MAX_BACKGROUND_SEARCHES` (three quarters of the pool); each of them re-queues
+and retries on its own tick, so a refusal costs them nothing. A refused
+background walk logs at debug, a refused user search still warns.
+`background_work_cannot_take_the_slots_held_for_the_user` pins the split.
+
+### 7b. A truncated `nodes_ember.dat` could still shrink itself away
+
+The loader already detected a header that declared more contacts than parsed,
+warned, and copied the damaged file to `nodes_ember.dat.bak.{ts}`. Nothing read
+that backup, and nothing stopped the session from writing its own smaller set
+straight back over the live file — so a truncation cost the difference
+permanently, and a second one cost the difference again. That is the same
+one-way ratchet [`peer_cache`](../src-tauri/src/network/ember/dht/peer_cache.rs)
+was written to break, arriving through the file format instead of through
+eviction.
+
+`load_nodes_with_state` now returns a `NodesFileState`, and `save_nodes` refuses
+to write fewer contacts than a truncated load recovered. Growing past that
+count is still allowed, which is how a node that has since met more peers
+replaces the damaged file with a whole one rather than being stuck behind the
+guard forever. `a_truncated_load_is_not_licence_to_shrink_the_file` covers both
+halves.
+
+### 7c. Transport hardening — one done, two decided against
+
+Long-lived transport secrets are wiped on drop: the static Noise private key
+and both XX cookie secrets, via `impl Drop for EmberTransport`. Defence in
+depth against a later heap disclosure (core dump, swapped page, reused
+allocation), not against an attacker who can read the process live. Out of
+reach are the per-session traffic keys inside snow's `StatelessTransportState`,
+which owns them and offers no way to clear them.
+
+Two related items were considered and deliberately **not** changed:
+
+- **The on-path XX msg3 stall.** A corrupted msg3 replaying the real `s` block
+  lets `Dh(se)` re-key before the payload fails, snow's rollback does not
+  restore the CipherState, and the genuine msg3 can then no longer decrypt —
+  the handshake waits out the 30 s pending sweep. Closing it means snapshotting
+  the responder handshake state around every inbound msg3. That cost lands on
+  the packet path for every peer, to deny an attacker who is *already on the
+  path* an outcome strictly weaker than the one they get for free by dropping
+  msg3 instead. Not worth it unless the snapshot becomes cheap.
+- **A replay window on friend chat.** `decrypt_chat_message` will decrypt the
+  same `(nonce, ciphertext)` twice, unlike the UDP transport, which has a
+  64-wide sliding window. It is not reachable: chat rides an authenticated
+  secure-v2 Noise stream over TCP, so an off-path attacker cannot inject the
+  bytes at all, and the only party who can resend them is the friend whose
+  session it is. `recent_ember_chat` already suppresses an accidental
+  same-text repeat inside five seconds. Adding a nonce ledger would cost
+  per-conversation state for a vector that has no path to the decrypt.
 
 ### 8. Observability gaps
 

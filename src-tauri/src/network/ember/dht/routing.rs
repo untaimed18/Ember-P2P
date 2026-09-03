@@ -2539,7 +2539,7 @@ mod tests {
                 })
             })
             .collect();
-        bootstrap::save_nodes(&path, &saved, true).unwrap();
+        bootstrap::save_nodes(&path, &saved, bootstrap::NodesFileState::Loaded).unwrap();
 
         // Through the cache, which is how the network loop restores a table:
         // the file keeps the previous session's timestamps and `seed_batch` is

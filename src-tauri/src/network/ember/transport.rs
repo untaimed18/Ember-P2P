@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tracing::{debug, trace, warn};
+use zeroize::Zeroize;
 
 /// Magic bytes that distinguish Ember-encrypted UDP from KAD/ED2K traffic.
 pub const EMBER_MAGIC: [u8; 2] = [0xEB, 0x3E];
@@ -729,6 +730,25 @@ struct RecentHandshake {
 enum HandshakeReplay {
     Fresh { digest: [u8; 32] },
     Seen { response: Option<Vec<u8>> },
+}
+
+/// Wipe the long-lived secrets rather than leaving them in freed heap.
+///
+/// `local_noise_key` is the node's static X25519 private key and lives for the
+/// whole process; the two cookie secrets are what make an XX retry cookie
+/// unforgeable. This is defence in depth against a later heap disclosure — a
+/// core dump, a swapped page, an allocator reusing the block — not against an
+/// attacker who can already read this process's memory live.
+///
+/// What it cannot reach is the per-session traffic keys inside snow's
+/// `StatelessTransportState`, which owns them and exposes no way to clear
+/// them. Those go when a session is evicted, uncleared.
+impl Drop for EmberTransport {
+    fn drop(&mut self) {
+        self.local_noise_key.zeroize();
+        self.cookie_secret.zeroize();
+        self.prev_cookie_secret.zeroize();
+    }
 }
 
 impl EmberTransport {

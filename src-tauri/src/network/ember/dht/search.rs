@@ -10,6 +10,18 @@ use super::{EmberContact, EmberNodeId, ALPHA, K_BUCKET_SIZE};
 /// Maximum concurrent searches.
 const MAX_ACTIVE_SEARCHES: usize = 64;
 
+/// How much of that pool automatic work may occupy.
+///
+/// The cap is one pool shared by everything, and almost every creator is
+/// background: channel presence starts a walk a second, download source
+/// lookups five a minute, bucket refresh and publish-target lookups six more.
+/// Each of those retries on its own tick, so a refusal costs them nothing. The
+/// user's keyword search has no second chance — `start_find_value` returning
+/// `None` drops the Ember leg for that query, the results arrive KAD-only, and
+/// nothing says so. Holding a quarter of the pool back means the one search
+/// somebody is actually waiting on is never the one turned away.
+const MAX_BACKGROUND_SEARCHES: usize = MAX_ACTIVE_SEARCHES * 3 / 4;
+
 /// How long a search can run before being considered timed out.
 const SEARCH_TIMEOUT_SECS: u64 = 60;
 
@@ -1140,8 +1152,27 @@ impl SearchManager {
         target: EmberNodeId,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
+        self.start_find_node_within(target, routing_table, MAX_ACTIVE_SEARCHES)
+    }
+
+    /// [`Self::start_find_node`] for automatic work, which yields the reserve.
+    /// See [`MAX_BACKGROUND_SEARCHES`].
+    pub fn start_background_find_node(
+        &mut self,
+        target: EmberNodeId,
+        routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        self.start_find_node_within(target, routing_table, MAX_BACKGROUND_SEARCHES)
+    }
+
+    fn start_find_node_within(
+        &mut self,
+        target: EmberNodeId,
+        routing_table: &RoutingTable,
+        cap: usize,
+    ) -> Option<u32> {
         let initial = routing_table.find_closest_prefer_verified(&target, K_BUCKET_SIZE);
-        let id = self.alloc_id()?;
+        let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(id, SearchType::FindNode, target, vec![], initial);
         trace!("Starting FIND_NODE search {} for target {}", id, target);
         self.searches.insert(id, search);
@@ -1156,8 +1187,39 @@ impl SearchManager {
         keyword_hashes: Vec<[u8; 16]>,
         routing_table: &RoutingTable,
     ) -> Option<u32> {
+        self.start_find_value_within(
+            primary_key,
+            keyword_hashes,
+            routing_table,
+            MAX_ACTIVE_SEARCHES,
+        )
+    }
+
+    /// [`Self::start_find_value`] for automatic work, which yields the reserve.
+    /// See [`MAX_BACKGROUND_SEARCHES`].
+    pub fn start_background_find_value(
+        &mut self,
+        primary_key: EmberNodeId,
+        keyword_hashes: Vec<[u8; 16]>,
+        routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        self.start_find_value_within(
+            primary_key,
+            keyword_hashes,
+            routing_table,
+            MAX_BACKGROUND_SEARCHES,
+        )
+    }
+
+    fn start_find_value_within(
+        &mut self,
+        primary_key: EmberNodeId,
+        keyword_hashes: Vec<[u8; 16]>,
+        routing_table: &RoutingTable,
+        cap: usize,
+    ) -> Option<u32> {
         let initial = routing_table.find_closest_prefer_verified(&primary_key, K_BUCKET_SIZE);
-        let id = self.alloc_id()?;
+        let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(
             id,
             SearchType::FindValue,
@@ -1347,12 +1409,22 @@ impl SearchManager {
             .collect()
     }
 
-    fn alloc_id(&mut self) -> Option<u32> {
-        if self.searches.len() >= MAX_ACTIVE_SEARCHES {
-            warn!(
-                "Too many active Ember searches ({}), rejecting new search",
-                self.searches.len()
-            );
+    fn alloc_id(&mut self, cap: usize) -> Option<u32> {
+        if self.searches.len() >= cap {
+            if cap < MAX_ACTIVE_SEARCHES {
+                // Routine and self-correcting: the caller re-queues whatever it
+                // was walking for and tries again next tick. Logging it as a
+                // warning would bury the one that is worth seeing.
+                debug!(
+                    "Ember search pool at its background ceiling ({}/{cap}); deferring",
+                    self.searches.len()
+                );
+            } else {
+                warn!(
+                    "Too many active Ember searches ({}), rejecting new search",
+                    self.searches.len()
+                );
+            }
             return None;
         }
         // Skip IDs that are already in use (defends against the
@@ -1698,6 +1770,46 @@ mod tests {
 
         assert!(sm.remove(sid).is_some());
         assert_eq!(sm.active_count(), 0);
+    }
+
+    /// Almost every search this node starts is automatic — channel presence
+    /// alone starts one a second — and all of them retry on their own tick. The
+    /// user's keyword search does not: a refusal drops the Ember leg for that
+    /// query with nothing said. Background work therefore yields a reserve it
+    /// cannot take.
+    #[test]
+    fn background_work_cannot_take_the_slots_held_for_the_user() {
+        let rt = RoutingTable::new(make_id(0x00), false);
+        let mut sm = SearchManager::new();
+
+        for i in 0..MAX_BACKGROUND_SEARCHES {
+            assert!(
+                sm.start_background_find_node(make_id(i as u8), &rt).is_some(),
+                "background walk {i} is within its ceiling"
+            );
+        }
+
+        assert!(
+            sm.start_background_find_node(make_id(0xAA), &rt).is_none(),
+            "background work must stop at its ceiling, not at the hard cap"
+        );
+        assert!(
+            sm.active_count() < MAX_ACTIVE_SEARCHES,
+            "which leaves the pool short of full"
+        );
+
+        // The reserve is what the person waiting on a search gets to use.
+        for i in MAX_BACKGROUND_SEARCHES..MAX_ACTIVE_SEARCHES {
+            assert!(
+                sm.start_find_node(make_id(i as u8), &rt).is_some(),
+                "user search {i} must still find a slot"
+            );
+        }
+        assert_eq!(sm.active_count(), MAX_ACTIVE_SEARCHES);
+        assert!(
+            sm.start_find_node(make_id(0xBB), &rt).is_none(),
+            "and the hard cap still binds once even the reserve is spent"
+        );
     }
 
     /// Two peers holding the same record is the normal case for anything
