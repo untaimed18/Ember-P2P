@@ -179,6 +179,33 @@ pub const EMBER_EXT_CHAT_TYPING: u8 = 0x03;
 /// as chat; ignored by older builds.
 pub const EMBER_EXT_CHAT_READ: u8 = 0x04;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is asking for Ember DHT contacts.
+///
+/// A friend is the strongest bootstrap signal the app has — explicitly
+/// trusted, on a live authenticated session, and holding exactly the routing
+/// table a cold node is missing. The only route from that to a DHT contact was
+/// the eD2K hello carrying a non-zero UDP port plus one bridge `PING` being
+/// answered, so a friend whose hello named no port, or whose address the
+/// discovery guards reject, was never even attempted. The overlay rides UDP,
+/// so such a friend can never *be* a contact — but it can still hand over the
+/// contacts it already has, and this asks over the session that demonstrably
+/// works.
+///
+/// Body is the asker's own 16-byte DHT node ID, so the answer can be the
+/// contacts closest to it; an absent or short body means "anything you have".
+pub const EMBER_EXT_DHT_CONTACT_REQ: u8 = 0x05;
+
+/// [`OP_EMBER_EXT`] sub-type: the answer to [`EMBER_EXT_DHT_CONTACT_REQ`].
+///
+/// Body is a DHT wire contact list
+/// ([`crate::network::ember::dht::messages::encode_contact_list`]), reused
+/// rather than reinvented so the identity binding travels with it: no node ID
+/// is carried, every ID is re-derived from the Ed25519 key beside it, and a
+/// contact whose key is not a valid point is dropped. A friend therefore
+/// cannot name a contact under an ID it does not control, which is the same
+/// guarantee gossip over the DHT wire gets.
+pub const EMBER_EXT_DHT_CONTACTS: u8 = 0x06;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -2924,6 +2951,8 @@ mod tests {
             EMBER_EXT_FRIEND_RETRACT,
             EMBER_EXT_CHAT_TYPING,
             EMBER_EXT_CHAT_READ,
+            EMBER_EXT_DHT_CONTACT_REQ,
+            EMBER_EXT_DHT_CONTACTS,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

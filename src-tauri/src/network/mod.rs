@@ -9869,6 +9869,160 @@ mod tests {
         );
     }
 
+    /// A friend asks for contacts because its own table is thin, so answering
+    /// with addresses we have never heard from would hand it our guesses and
+    /// call them introductions. `find_closest` falls back to leads exactly
+    /// when we hold nothing verified, which is the case that must answer
+    /// empty instead.
+    #[test]
+    fn a_friend_is_only_ever_told_about_contacts_that_answered_us() {
+        let target = ember::dht::EmberNodeId([0x11; 16]);
+        let mut table =
+            ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0xFF; 16]), false);
+
+        let mut lead = test_ember_contact(2, [10, 2, 0, 20], 4672);
+        lead.last_seen = 0;
+        table.add_contact(lead.clone());
+        assert!(!lead.is_verified());
+        assert!(
+            ember_friend_contact_answer(&table, &target).is_empty(),
+            "a node holding only leads has nothing to introduce"
+        );
+
+        let proven = test_ember_contact(1, [10, 1, 0, 10], 4672);
+        assert!(proven.is_verified());
+        table.add_contact(proven.clone());
+        let answer = ember_friend_contact_answer(&table, &target);
+        assert_eq!(answer.len(), 1);
+        assert_eq!(answer[0].node_id, proven.node_id);
+    }
+
+    /// Every friend has to get a turn. The ask interval equals the maintenance
+    /// tick, so a friend asked last cycle is due again this cycle, and the
+    /// per-tick budget is smaller than a friends list — so ordering by
+    /// least-recently-asked is the only thing stopping the first few from
+    /// holding the budget while the rest are never asked at all.
+    #[test]
+    fn the_friend_ask_rotates_instead_of_pinning_the_first_few() {
+        let friends: Vec<[u8; 16]> = (1..=9u8).map(|i| [i; 16]).collect();
+        assert!(
+            friends.len() > EMBER_FRIEND_CONTACT_ASKS_PER_TICK,
+            "the fixture only means anything with more friends than one tick can ask"
+        );
+        let mut asked: HashMap<[u8; 16], std::time::Instant> = HashMap::new();
+        let mut ever_asked: HashSet<[u8; 16]> = HashSet::new();
+        let start = std::time::Instant::now();
+
+        for tick in 0..3u32 {
+            let now = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL * tick;
+            let live: Vec<([u8; 16], ())> = friends.iter().map(|f| (*f, ())).collect();
+            let due = ember_friend_ask_order(live, &asked, now);
+            for (eh, _) in due.into_iter().take(EMBER_FRIEND_CONTACT_ASKS_PER_TICK) {
+                asked.insert(eh, now);
+                ever_asked.insert(eh);
+            }
+        }
+
+        assert_eq!(
+            ever_asked.len(),
+            friends.len(),
+            "every friend must get a turn within a few ticks"
+        );
+    }
+
+    /// A friend asked this tick must not be asked again on the next one, or
+    /// the throttle would be doing nothing.
+    #[test]
+    fn a_friend_just_asked_is_not_due_again_immediately() {
+        let friend = [7u8; 16];
+        let start = std::time::Instant::now();
+        let mut asked = HashMap::new();
+        asked.insert(friend, start);
+
+        let soon = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL / 2;
+        assert!(ember_friend_ask_order(vec![(friend, ())], &asked, soon).is_empty());
+
+        let later = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL;
+        assert_eq!(
+            ember_friend_ask_order(vec![(friend, ())], &asked, later).len(),
+            1
+        );
+    }
+
+    /// A contact with a real key, since the friend answer is decoded on the
+    /// far side and `decode_contact_list` drops anything whose Ed25519 key is
+    /// not a valid point.
+    fn keyed_ember_contact(seed: u8, ip: [u8; 4]) -> ember::dht::EmberContact {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId(
+                crate::network::ember::crypto::node_id_from_public_key(&vk),
+            ),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), 4672),
+            noise_pub: [seed; 32],
+            ed25519_pub: vk.to_bytes(),
+            last_seen: 1,
+            failed_queries: 0,
+        }
+    }
+
+    /// What we hand a friend has to survive the round trip the friend session
+    /// puts it through, and arrive on the far side as *leads* — with every
+    /// node ID re-derived from the key beside it, so a friend cannot name a
+    /// contact under an ID it does not control.
+    #[test]
+    fn a_friend_answer_survives_the_round_trip_as_unverified_leads() {
+        let target = ember::dht::EmberNodeId([0x11; 16]);
+        let mut table =
+            ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0xFF; 16]), false);
+        // Distinct /24s, or the diversity caps refuse most of them.
+        for i in 1..=ember::dht::MAX_CONTACTS_PER_RESPONSE as u8 {
+            table.add_contact(keyed_ember_contact(i, [10, 0, i, 10]));
+        }
+        let answer = ember_friend_contact_answer(&table, &target);
+        assert!(!answer.is_empty(), "the fixture must produce an answer");
+
+        let body = ember::dht::messages::encode_contact_list(&answer);
+        let frame =
+            ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACTS, &body);
+        let (ext_type, wire_body) =
+            ed2k::messages::parse_ember_ext(&frame[6..]).expect("a framed answer parses");
+        assert_eq!(ext_type, ed2k::messages::EMBER_EXT_DHT_CONTACTS);
+        assert!(
+            wire_body.len() <= ember::dht::messages::MAX_CONTACT_LIST_BYTES,
+            "the receiver refuses a body over the cap before decoding it, so an \
+             honest answer must fit: {} contacts encoded to {} bytes",
+            answer.len(),
+            wire_body.len()
+        );
+
+        // The encoder trims to its own datagram budget, which over TCP only
+        // caps the answer at 17 — see `encode_contact_list`. What must hold is
+        // that nothing it did carry is lost on the far side.
+        let carried = wire_body[0] as usize;
+        assert!(carried > 0 && carried <= answer.len());
+        let decoded = ember::dht::messages::decode_contact_list(wire_body)
+            .expect("our own answer must decode");
+        assert_eq!(
+            decoded.len(),
+            carried,
+            "no carried contact may be dropped for an unusable key"
+        );
+        for contact in &decoded {
+            assert_eq!(
+                contact.node_id.0,
+                crate::network::ember::crypto::node_id_from_ed25519_bytes(&contact.ed25519_pub)
+                    .expect("the fixture keys are valid points"),
+                "the ID must come from the key, never from the wire"
+            );
+            assert!(
+                !contact.is_verified(),
+                "a contact learned from a friend is a lead until it answers us"
+            );
+        }
+    }
+
     #[test]
     fn record_ember_noise_key_evicts_oldest_at_capacity() {
         let mut map = HashMap::new();
@@ -11023,6 +11177,9 @@ pub struct EmberMaintenanceResult {
     /// KAD-bridge bootstrap `PING`s sent to KAD-learned Ember peers (slice
     /// 13). Non-zero only while the table is still sparse.
     pub kad_bridge_pings_sent: usize,
+    /// Friend sessions asked for their Ember DHT contacts. Like the bridge,
+    /// non-zero only while the table is short of a working set.
+    pub friend_contact_asks: usize,
 }
 
 /// Persisted peak of verified Ember DHT contacts, so a restart does not
@@ -12500,6 +12657,19 @@ struct NetworkState {
     /// it has spent, so a per-tick budget cannot be re-granted to every inbound
     /// frame. See `probe_ember_gossip_leads`.
     ember_gossip_probe_window: (std::time::Instant, usize),
+
+    /// Which peers' introductions have been worth probing. Decides how much of
+    /// the gossip-probe budget one introducer may spend; see
+    /// [`ember::dht::gossip`] for why it never refuses a contact outright and
+    /// is not consulted while the table is starved.
+    ember_gossip_reputation: ember::dht::gossip::GossipReputation,
+
+    /// When we last asked each friend for its Ember DHT contacts, and when we
+    /// last answered that question for them. Kept apart so the two directions
+    /// cannot throttle each other: a friend asking us on its own schedule says
+    /// nothing about when we should next ask them.
+    ember_friend_contacts_asked: HashMap<[u8; 16], std::time::Instant>,
+    ember_friend_contacts_served: HashMap<[u8; 16], std::time::Instant>,
 
     /// Session store-ack/fail totals as of the previous Ember publish
     /// heartbeat, so that line can report a per-cycle delta next to the total
@@ -18374,6 +18544,238 @@ async fn send_ember_bridge_ping(
     sent
 }
 
+/// Ask live friend sessions for the Ember DHT contacts they hold.
+///
+/// A friend is the strongest bootstrap signal the app has, and almost none of
+/// it was used: the route from a friend to a DHT contact ran entirely through
+/// the eD2K hello's UDP port and a single bridge `PING`, so a friend whose
+/// hello named no port — or whose address `EmberPeerDiscovered`'s guards
+/// reject, which is the normal case for a relayed or NAT-traversed session —
+/// was never a candidate at all, and no retry policy helps something that is
+/// never attempted. Field evidence: a node holding three contacts sat beside a
+/// friend holding fourteen, over a working friend session, with `Known peers`
+/// at 0.
+///
+/// The overlay rides UDP, so a friend we cannot ping can never *be* a contact.
+/// It can still hand over the contacts it already has, and those enter as
+/// unverified leads through the same admission and probe path as any other
+/// gossip — nothing here is trusted further than a `FOUND_NODE` would be.
+///
+/// Only while the table is short of a working set, so a healthy node never
+/// spends a byte on this. Returns how many friends were asked.
+async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> usize {
+    if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        return 0;
+    }
+    let now = std::time::Instant::now();
+    let live: Vec<([u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+        let sessions = state.ember_sessions.read().await;
+        sessions
+            .iter()
+            .filter(|(_, h)| h.is_fresh() && h.is_secure_v2())
+            .map(|(eh, h)| (*eh, h.tx.clone()))
+            .collect()
+    };
+    let target = state.ember_dht.local_id();
+    let frame =
+        ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACT_REQ, &target.0);
+
+    let due = ember_friend_ask_order(live, &state.ember_friend_contacts_asked, now);
+    let mut asked = 0usize;
+    for (eh, tx) in due {
+        if asked >= EMBER_FRIEND_CONTACT_ASKS_PER_TICK {
+            break;
+        }
+        // A full queue means the session is already backed up; the next tick
+        // asks again, so nothing is lost by not waiting for room here.
+        if tx.try_send(frame.clone()).is_err() {
+            continue;
+        }
+        state.ember_friend_contacts_asked.insert(eh, now);
+        asked += 1;
+        state.ember_diagnostics.ember_dht_friend_contact_asks = state
+            .ember_diagnostics
+            .ember_dht_friend_contact_asks
+            .saturating_add(1);
+    }
+    if asked > 0 {
+        debug!("Ember DHT: asked {asked} friend session(s) for contacts while the table is thin");
+    }
+    asked
+}
+
+/// Friends due to be asked for contacts, least recently asked first.
+///
+/// The ordering is not cosmetic. [`EMBER_FRIEND_CONTACT_ASK_INTERVAL`] equals
+/// the maintenance tick, so every friend asked last cycle is due again this
+/// cycle — and taking the first [`EMBER_FRIEND_CONTACT_ASKS_PER_TICK`] in
+/// session-map order would then ask the same few for the life of the process
+/// while a fifth friend was never asked at all. `ember_dht_announce_targets`
+/// had the same failure for the same reason, and this is the same fix.
+///
+/// Never-asked friends come first, which `Option`'s own ordering gives for
+/// free (`None` before `Some`).
+fn ember_friend_ask_order<T>(
+    live: Vec<([u8; 16], T)>,
+    asked: &HashMap<[u8; 16], std::time::Instant>,
+    now: std::time::Instant,
+) -> Vec<([u8; 16], T)> {
+    let mut due: Vec<([u8; 16], T)> = live
+        .into_iter()
+        .filter(|(eh, _)| match asked.get(eh) {
+            Some(last) => now.saturating_duration_since(*last) >= EMBER_FRIEND_CONTACT_ASK_INTERVAL,
+            None => true,
+        })
+        .collect();
+    due.sort_by_key(|(eh, _)| asked.get(eh).copied());
+    due
+}
+
+/// The contacts to hand a friend that asked: closest to `target`, and only
+/// ones that have answered us.
+///
+/// `find_closest` already prefers verified contacts, but falls back to leads
+/// when it holds no verified ones at all — which is exactly the node whose
+/// leads are least worth passing on. Filtering after it is what makes a
+/// starved node answer with an empty list rather than with its own guesses,
+/// and an empty answer still tells the asker the difference between a friend
+/// that has nothing and a friend whose build predates the question.
+fn ember_friend_contact_answer(
+    routing: &ember::dht::routing::RoutingTable,
+    target: &ember::dht::EmberNodeId,
+) -> Vec<ember::dht::EmberContact> {
+    let mut contacts = routing.find_closest(target, ember::dht::MAX_CONTACTS_PER_RESPONSE);
+    contacts.retain(|c| c.is_verified());
+    contacts
+}
+
+/// Answer a friend's request for our Ember DHT contacts.
+///
+/// Passing on our own unverified leads would spread exactly the noise
+/// [`ember::dht::gossip`] exists to price, so only proven contacts travel —
+/// see [`ember_friend_contact_answer`].
+///
+/// `target` decides only *which* of our contacts are closest, so taking the
+/// asker's word for it grants nothing.
+async fn answer_friend_ember_contact_request(
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    target: Option<[u8; 16]>,
+    reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let now = std::time::Instant::now();
+    if let Some(last) = state.ember_friend_contacts_served.get(&friend) {
+        if now.saturating_duration_since(*last) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL {
+            return;
+        }
+    }
+    // Stamped before the work, not after a successful send. What this throttle
+    // protects is the table walk and the kilobyte it produces, and a friend
+    // whose writer queue is full would otherwise buy an unthrottled walk per
+    // request by never accepting the answer.
+    state.ember_friend_contacts_served.insert(friend, now);
+
+    let target = ember::dht::EmberNodeId(target.unwrap_or(state.ember_dht.local_id().0));
+    let contacts = ember_friend_contact_answer(state.ember_dht.routing(), &target);
+    let body = ember::dht::messages::encode_contact_list(&contacts);
+    let frame =
+        ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACTS, &body);
+    if reply_tx.try_send(frame).is_ok() {
+        debug!(
+            "Ember DHT: answered friend {} with {} verified contact(s)",
+            crate::security::short_hash(&friend),
+            contacts.len()
+        );
+    }
+}
+
+/// Fold a friend's answer into the routing table and probe what it named.
+///
+/// The contacts arrive unverified (the wire list carries no `last_seen`), so
+/// they go through `offer_contact` — the full IP policy and diversity gate —
+/// and then through the ordinary gossip probe.
+///
+/// Only ever an answer to a question we asked, inside
+/// [`EMBER_FRIEND_CONTACT_ANSWER_WINDOW`]. Acting on an unsolicited list would
+/// hand a friend the whole gossip probe budget on demand — the one thing
+/// [`ember::dht::gossip`] rations a DHT peer for. Requiring the ask is what
+/// lets a friend go unscored, and it also drops a list that arrives long after
+/// the table it was meant to fill.
+///
+/// No reputation record is kept for the friend, even though it could be: an
+/// Ember hash *is* a DHT node ID (`BLAKE3(ed25519_pub)[..16]` — see
+/// [`ember::dht::engine::EmberDht::new`]), so the two are the same namespace.
+/// Scoring is for a peer whose introductions we did not solicit; here the ask
+/// and its window are the bound, and rationing a friend we deliberately
+/// queried would only starve the path we opened it for.
+async fn ingest_friend_ember_contacts(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    body: &[u8],
+) {
+    let asked_recently = state
+        .ember_friend_contacts_asked
+        .get(&friend)
+        .is_some_and(|at| {
+            std::time::Instant::now().saturating_duration_since(*at)
+                < EMBER_FRIEND_CONTACT_ANSWER_WINDOW
+        });
+    if !asked_recently {
+        debug!(
+            "Ember DHT: ignoring a contact list from friend {} that answers no recent ask",
+            crate::security::short_hash(&friend)
+        );
+        return;
+    }
+    let contacts = match ember::dht::messages::decode_contact_list(body) {
+        Ok(contacts) => contacts,
+        Err(e) => {
+            debug!(
+                "Ember DHT: friend {} sent an undecodable contact list: {e}",
+                crate::security::short_hash(&friend)
+            );
+            return;
+        }
+    };
+    if contacts.is_empty() {
+        debug!(
+            "Ember DHT: friend {} has no verified contacts to share",
+            crate::security::short_hash(&friend)
+        );
+        return;
+    }
+    let local_id = state.ember_dht.local_id();
+    let mut learned = 0usize;
+    for contact in &contacts {
+        if contact.node_id == local_id {
+            continue;
+        }
+        let known = state.ember_dht.contact_for(&contact.node_id).is_some();
+        if matches!(
+            state.ember_dht.offer_contact(contact.clone()),
+            ember::dht::routing::AddResult::Added
+        ) && !known
+        {
+            learned += 1;
+        }
+    }
+    if learned > 0 {
+        state.ember_diagnostics.ember_dht_friend_contacts_learned = state
+            .ember_diagnostics
+            .ember_dht_friend_contacts_learned
+            .saturating_add(learned as u32);
+    }
+    info!(
+        "Ember DHT: friend {} shared {} contact(s), {learned} new",
+        crate::security::short_hash(&friend),
+        contacts.len()
+    );
+    // No introducer: see the note above. The probe budget and its one-second
+    // window still apply, so this cannot outspend ordinary gossip.
+    probe_ember_gossip_leads(socket, state, &contacts, None).await;
+}
+
 /// Pin connected eD2K Ember peers onto a FIND_VALUE walk. Their records live
 /// on that node; XOR-closest public contacts will not have them.
 fn seed_ember_session_search_contacts(state: &mut NetworkState, search_id: u32) {
@@ -18463,17 +18865,22 @@ async fn send_ember_announce_peer(
 
 /// Ping unverified gossip as soon as we hear it, so a PEER_LIST of the
 /// friend's other contacts does not sit idle until the next 60s tick.
+///
+/// `introducer` is the peer whose frame carried these leads: it is skipped if it
+/// named itself, and it is who the outcome of each probe is charged to. See
+/// [`ember::dht::gossip`].
 async fn probe_ember_gossip_leads(
     socket: &UdpSocket,
     state: &mut NetworkState,
     leads: &[ember::dht::EmberContact],
-    exclude: Option<ember::dht::EmberNodeId>,
+    introducer: Option<ember::dht::EmberNodeId>,
 ) {
     if leads.is_empty() {
         return;
     }
     let local_id = state.ember_dht.local_id();
-    let budget = if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    let budget = if starved {
         EMBER_MAINT_MAX_PINGS_STARVED
     } else {
         EMBER_MAINT_MAX_PINGS
@@ -18497,7 +18904,7 @@ async fn probe_ember_gossip_leads(
         if sent >= budget {
             break;
         }
-        if contact.node_id == local_id || Some(contact.node_id) == exclude {
+        if contact.node_id == local_id || Some(contact.node_id) == introducer {
             continue;
         }
         if contact.noise_pub == [0u8; 32] || contact.addr.port() == 0 {
@@ -18528,6 +18935,22 @@ async fn probe_ember_gossip_leads(
         };
         if crate::security::is_bogus_v4(ip) {
             continue;
+        }
+        // Whose word this is on, and whether that word has been worth a probe.
+        // Not asked while starved: a node with nothing has to try everything,
+        // because probing junk costs bandwidth and failing to join costs the
+        // overlay. Asked last, so a lead skipped for any of the reasons above
+        // does not read as an introducer being rationed.
+        if !starved {
+            if let Some(intro) = introducer {
+                if !state.ember_gossip_reputation.should_probe(&intro) {
+                    state.ember_diagnostics.ember_dht_gossip_leads_rationed = state
+                        .ember_diagnostics
+                        .ember_dht_gossip_leads_rationed
+                        .saturating_add(1);
+                    continue;
+                }
+            }
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
@@ -18585,6 +19008,16 @@ async fn probe_ember_gossip_leads(
             sent += 1;
             state.ember_gossip_probe_window.1 =
                 state.ember_gossip_probe_window.1.saturating_add(1);
+            // Attribution starts here rather than at the naming, so an
+            // introducer is never charged for a lead our own budget never
+            // reached.
+            if let Some(intro) = introducer {
+                state.ember_gossip_reputation.note_probe(
+                    intro,
+                    contact.node_id,
+                    std::time::Instant::now(),
+                );
+            }
         }
     }
 }
@@ -19518,6 +19951,51 @@ const EMBER_MAINT_MAX_ANNOUNCE_STARVED: usize = 16;
 /// in the wrong direction: one usable contact is too thin a frontier for a
 /// lookup to discover anyone new.
 const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
+
+/// Minimum spacing between asking one friend for its Ember DHT contacts.
+///
+/// Matches the maintenance tick, because the ask only happens below
+/// [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts and a starved node
+/// wants its next chance now rather than in five minutes — the same reasoning
+/// that flattened the bridge backoff while starved. One small packet per friend
+/// per minute, which stops entirely once the table is usable.
+const EMBER_FRIEND_CONTACT_ASK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How long after asking a friend we will act on its answer.
+///
+/// Held apart from the interval above because the two want different lengths:
+/// the ask stamp has to outlive its own interval for
+/// `ask_friends_for_ember_contacts` to rank by least-recently-asked, while the
+/// window in which an answer is still wanted is one round trip. Tying the
+/// acceptance window to however long the stamp happens to be kept is how a
+/// four-minute window would appear by accident.
+const EMBER_FRIEND_CONTACT_ANSWER_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How long an ask stamp is kept at all.
+///
+/// Longer than the interval on purpose. The stamp is the rotation key, and
+/// dropping it the moment it stops throttling would reset every friend to
+/// "never asked" each cycle — which is precisely how the four friends the
+/// per-tick budget reaches first keep reaching it first. Past this the map is
+/// bounded by forgetting, since a friend not asked in four minutes is not in a
+/// rotation that matters.
+const EMBER_FRIEND_CONTACT_STAMP_TTL: std::time::Duration =
+    std::time::Duration::from_secs(240);
+
+/// Minimum spacing between *answering* one friend's contact request.
+///
+/// Longer than the ask interval on purpose: answering costs a table walk and a
+/// kilobyte on the wire, and the asker's own schedule is not ours to trust. A
+/// friend that asks more often than this simply gets its extra asks dropped.
+const EMBER_FRIEND_CONTACT_SERVE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Friends asked per maintenance tick. A user with a large friends list should
+/// not turn a starved table into a burst of traffic; the ask walks through them
+/// over successive ticks instead, and one answer is enough to bootstrap.
+const EMBER_FRIEND_CONTACT_ASKS_PER_TICK: usize = 4;
 
 /// How often we re-advertise ourselves under the Ember rendezvous key.
 /// Deliberately the same 5 hours KAD itself uses for source records, so the
@@ -23658,6 +24136,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
             ember_kad_bridge_attempted: HashMap::new(),
+        ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
+        ember_friend_contacts_asked: HashMap::new(),
+        ember_friend_contacts_served: HashMap::new(),
             ember_bridge_fast_at: None,
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
@@ -27256,6 +27737,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if !friend_hashes.read().await.contains(&friend_eh) {
                         continue;
                     }
+                    // The inbound counterpart to the ask on `EmberFriendConnected`:
+                    // a friend that dialled us never raises that event, and a
+                    // starved node should not wait out a 60s tick for the one
+                    // bootstrap path that does not need their UDP port.
+                    if settings.ember_native_enabled {
+                        ask_friends_for_ember_contacts(&mut state).await;
+                    }
                     let hash_hex = hex::encode(friend_eh);
                     let now = chrono::Utc::now().timestamp();
                     state.online_friends.insert(friend_eh, now);
@@ -28163,6 +28651,33 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     .await;
                 }
 
+                // The friend contact exchange. Gated on the overlay being on,
+                // because with it off there is neither a table to share nor one
+                // to fill.
+                if let UploadEventKind::EmberDhtContactRequest { ember_hash, target, ref reply_tx } = event.kind {
+                    if settings.ember_native_enabled {
+                        answer_friend_ember_contact_request(
+                            &mut state,
+                            ember_hash,
+                            target,
+                            reply_tx,
+                        )
+                        .await;
+                    }
+                }
+
+                if let UploadEventKind::EmberDhtContacts { ember_hash, ref contacts } = event.kind {
+                    if settings.ember_native_enabled {
+                        ingest_friend_ember_contacts(
+                            &udp_socket,
+                            &mut state,
+                            ember_hash,
+                            contacts,
+                        )
+                        .await;
+                    }
+                }
+
                 // Any inbound friend activity implies they're online — update
                 // status if we haven't already so the UI card flips immediately.
                 {
@@ -28259,6 +28774,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                                 port,
                             )
                             .await;
+                        }
+                        // A friend session coming up is the moment a starved
+                        // table has something to ask, and waiting for the 60s
+                        // maintenance tick is most of a short visit. The ask
+                        // rate-limits per friend, so a session that flaps
+                        // cannot turn this into a burst.
+                        if still_friend && settings.ember_native_enabled {
+                            ask_friends_for_ember_contacts(&mut state).await;
                         }
                     }
                     UploadEventKind::FriendEndpointDiscovered {
@@ -41875,6 +42398,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     if !ember_ping_timeout_is_a_fault(last_seen, sent_unix) {
                         continue;
                     }
+                    // Silence is also the answer to "was this lead real?", so
+                    // it is charged to whoever named it. Only reached when the
+                    // peer has said nothing since we asked — a lead that spoke
+                    // was already credited where its frame arrived.
+                    state.ember_gossip_reputation.note_silent(&node_id);
                     fault_ember_contact(&mut state, &node_id, "unresponsive");
                 }
 
@@ -42537,12 +43065,26 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Ember peers learned from KAD source tags (dialed over Noise_IK)
                 // or from eD2K sessions (dialed over Noise_XX). An idle node with
                 // nothing to work with stays quiet.
-                if settings.ember_native_enabled
-                    && (state.ember_dht.contact_count() > 0
-                        || !state.ember_session_dht_contacts.is_empty()
-                        || !state.ember_noise_keys.is_empty()
-                        || !state.ember_keyless_peers.is_empty())
-                {
+                let mut ember_has_work = state.ember_dht.contact_count() > 0
+                    || !state.ember_session_dht_contacts.is_empty()
+                    || !state.ember_noise_keys.is_empty()
+                    || !state.ember_keyless_peers.is_empty();
+                // A live friend session counts on its own. It is the one
+                // bootstrap path that needs no dialable address for the peer
+                // introducing us, so the node it matters most to — a cold join
+                // whose only peer is a friend behind a relayed session — has
+                // every condition above empty. Without this the friend ask
+                // could never fire in the case it exists for. Read last, so the
+                // lock is only taken when the cheap checks all missed.
+                if settings.ember_native_enabled && !ember_has_work {
+                    ember_has_work = state
+                        .ember_sessions
+                        .read()
+                        .await
+                        .values()
+                        .any(|h| h.is_fresh() && h.is_secure_v2());
+                }
+                if settings.ember_native_enabled && ember_has_work {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
                     maybe_publish_channel_presence(
                         &udp_socket,
@@ -48346,6 +48888,13 @@ async fn run_ember_maintenance(
     result.kad_bridge_pings_sent =
         run_ember_kad_bridge(socket, state, force, EMBER_KAD_BRIDGE_MAX_PINGS).await;
 
+    // 0a1) Ask friends for contacts, for the friends the bridge above can never
+    //      reach: the bridge dials an address from the eD2K hello, and a friend
+    //      that named no UDP port or sits behind a relayed session has no such
+    //      address. See `ask_friends_for_ember_contacts`. Self-limiting — it
+    //      stops entirely once the table holds a working set.
+    result.friend_contact_asks = ask_friends_for_ember_contacts(state).await;
+
     // 0b) Staleness purge. Liveness pings alone need three consecutive
     //     misses to evict, and the ping budget is small, so a contact that
     //     quietly disappeared could hold its slot for hours — blocking the
@@ -48809,6 +49358,28 @@ async fn run_ember_maintenance(
         state.ember_verified_highwater_dirty = false;
     }
 
+    // Introducer records only change on a probe outcome, and pruning them is
+    // per-cycle work, so the gauge is refreshed here rather than per frame.
+    let prune_now = std::time::Instant::now();
+    state.ember_gossip_reputation.prune(prune_now);
+    let introducers_rationed = state.ember_gossip_reputation.rationed_len() as u32;
+    state
+        .ember_diagnostics
+        .ember_dht_gossip_introducers_rationed = introducers_rationed;
+
+    // The friend contact-exchange throttles, by age rather than by which
+    // sessions are still live, so neither needs a session lock to bound. The
+    // ask side outlives its own interval because it doubles as the rotation
+    // key — see `EMBER_FRIEND_CONTACT_STAMP_TTL`. Runs outside the starved gate
+    // above, or a node that recovered would keep whatever it had asked for the
+    // life of the process.
+    state
+        .ember_friend_contacts_asked
+        .retain(|_, at| prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_STAMP_TTL);
+    state.ember_friend_contacts_served.retain(|_, at| {
+        prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL
+    });
+
     // Everything the overlay's health depends on, in one line. A node that is
     // not growing is the hard case to diagnose from the outside: "1 contact"
     // alone cannot distinguish "nobody is telling us about anyone" from "we
@@ -48817,7 +49388,8 @@ async fn run_ember_maintenance(
     let verified_now_len = state.ember_dht.routing().verified_len();
     info!(
         "Ember DHT cycle: contacts={} ({verified_now_len} verified, {} leads, {} session), \
-         announced={}, peer_lists={}, gossip={} (new {}, refused {}), pings={}, bridge={}, \
+         announced={}, peer_lists={}, gossip={} (new {}, refused {}, rationed {} from {} \
+         introducer(s)), pings={}, bridge={}, friend_asks={}, \
          noise_keys={}, keyless={}, records due={} selected={} queued={} re-armed={} \
          backlog={}",
         state.ember_dht.contact_count(),
@@ -48831,8 +49403,11 @@ async fn run_ember_maintenance(
         state.ember_diagnostics.ember_dht_gossip_contacts,
         state.ember_diagnostics.ember_dht_gossip_new,
         state.ember_diagnostics.ember_dht_gossip_refused,
+        state.ember_diagnostics.ember_dht_gossip_leads_rationed,
+        introducers_rationed,
         result.liveness_pings_sent,
         result.kad_bridge_pings_sent,
+        result.friend_contact_asks,
         state.ember_noise_keys.len(),
         state.ember_keyless_peers.len(),
         result.republish_due,
@@ -48966,6 +49541,12 @@ async fn handle_ember_dht_message(
         // way back.
         if let std::net::IpAddr::V4(v4) = from.ip() {
             state.ember_kad_bridge_attempted.remove(&(v4, from.port()));
+        }
+        // And if this peer was a lead somebody named, that name has just been
+        // shown to be worth something. Any signed frame counts, not only the
+        // `PONG`: what the probe was asking is whether the address is real.
+        if let Some(id) = inbound.sender_id {
+            state.ember_gossip_reputation.note_answered(&id);
         }
     }
     if let Some(contact) = inbound.sender_contact.clone() {
@@ -53507,6 +54088,8 @@ async fn handle_upload_event(
         | UploadEventKind::EmberTransferAck { .. }
         | UploadEventKind::EmberFileOffer { .. }
         | UploadEventKind::EmberRelayOffer { .. }
+        | UploadEventKind::EmberDhtContactRequest { .. }
+        | UploadEventKind::EmberDhtContacts { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
         | UploadEventKind::EmberFriendRequest { .. }
         | UploadEventKind::EmberFriendRetract { .. } => {

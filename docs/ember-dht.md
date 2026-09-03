@@ -46,7 +46,12 @@ gets in through, in rough order of who arrives first:
    capability bit over a normal eD2K transfer are cached with their UDP
    port and bridged too, via Noise_XX when no static key is known. This is
    the path for a client running with no KAD at all.
-4. **DHT gossip** (`FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`) and
+4. **A friend's routing table, over the friend session.** While below one
+   k-bucket of verified contacts, live friend sessions are asked for the
+   contacts they hold (`EMBER_EXT_DHT_CONTACT_REQ`). This is the only path that
+   needs no dialable UDP address for the peer introducing us — see
+   [item 2a](#2a-bootstrapping-from-a-friend).
+5. **DHT gossip** (`FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`) and
    **`nodes_ember.dat`** (up to `EMBER_PERSIST_MAX_CONTACTS` = 200) once
    the node has been online before.
 
@@ -137,14 +142,16 @@ small and updates are quick. A future *additive* change can lower
 `EMBER_DHT_MIN_VERSION` rather than raising both, which is the cheap half; the
 expensive half is that neither of the last two changes could take that path.
 
-### 2a. Bootstrapping from a friend is fragile
+### 2a. Bootstrapping from a friend
 
 A friend is the strongest bootstrap signal the app has — explicitly trusted, a
 live authenticated session, and a routing table that is exactly what a cold node
-is missing. The route from that to a DHT contact is thinner than it looks:
-the eD2K/friend hello has to carry a non-zero UDP port, `EmberPeerDiscovered`
-has to pass its address guards, and then a single bridge `PING` has to be
-answered. Nothing about the live friend session itself is used.
+is missing. For a long time the route from that to a DHT contact ran entirely
+around the session rather than through it: the eD2K/friend hello had to carry a
+non-zero UDP port, `EmberPeerDiscovered` had to pass its address guards, and
+then a single bridge `PING` had to be answered. Both halves below are now
+closed — the retry rate while starved, and the case where there is no address to
+retry at all.
 
 **Improved:** the retry backoff no longer grows while the table is starved. It
 was designed for a healthy node deciding how much to keep spending on an address
@@ -157,26 +164,106 @@ the maintenance tick, so the flattened rate is one datagram per candidate per
 minute; it is capped by `EMBER_KAD_BRIDGE_MAX_PINGS` and stops on its own once
 the table fills.
 
-**Still open.** A friend whose hello carried no UDP port, or whose address the
-`EmberPeerDiscovered` guards reject, is never a bridge candidate at all — no
-retry policy helps, because nothing is ever attempted. Closing that means
-driving the introduction from the friend session rather than from the eD2K
-hello, and if the endpoint genuinely is not dialable, asking for contacts over
-the friend connection that already works. Neither is done.
+**Also done: we now ask over the session instead of waiting for the address.**
+A friend whose hello carried no UDP port, or whose address the
+`EmberPeerDiscovered` guards reject — the normal case for a relayed or
+NAT-traversed session — was never a bridge candidate at all, and no retry
+policy helps something that is never attempted. `note_connected_ember_peer`
+returns at `udp_port == 0`, so that friend became a known peer and could never
+be a DHT contact.
 
-Field evidence for why this matters: a node with three contacts sat beside a
+The overlay rides UDP, so a friend we cannot ping can never *be* a contact.
+It can still hand over the contacts it already has. `EMBER_EXT_DHT_CONTACT_REQ`
+(0x05) carries our own node ID; `EMBER_EXT_DHT_CONTACTS` (0x06) answers with a
+DHT wire contact list, reusing `encode_contact_list` so the identity binding
+travels with it — no node ID on the wire, every ID re-derived from the Ed25519
+key beside it, so a friend cannot name a contact under an ID it does not
+control. Older builds ignore both sub-types, as the envelope intends.
+
+Four things the shape of this is load-bearing on:
+
+- **Only verified contacts are shared.** `find_closest` prefers verified but
+  falls back to leads when it holds none — which is exactly the node whose
+  leads are least worth passing on, so `ember_friend_contact_answer` filters
+  after it. A starved node answers with an empty list, which still separates
+  "my friend has nothing" from "my friend predates the question".
+- **What arrives is a lead, not a contact.** The wire list carries no
+  `last_seen`, so every entry enters through `offer_contact` — the full IP
+  policy and diversity gate — and then through the ordinary gossip probe. A
+  friend is trusted to *introduce*, not to vouch.
+- **Strictly an answer to a question we asked**, inside
+  `EMBER_FRIEND_CONTACT_ANSWER_WINDOW`. An unsolicited list is dropped. A
+  friend is not scored by the gossip reputation below — it is asked rather than
+  believed — so without this it could claim the whole probe budget on demand,
+  which is the one thing that machinery rations a DHT peer for. Note this is a
+  policy choice, not a namespace one: an Ember hash *is* a DHT node ID
+  (`BLAKE3(ed25519_pub)[..16]`), so a friend could be scored; rationing one we
+  deliberately queried would just starve the path we opened.
+- **It stops on its own.** The ask only runs below
+  `EMBER_KAD_BRIDGE_UNTIL_CONTACTS` verified contacts, at four friends per
+  maintenance tick, once per friend per minute, plus an opportunistic ask when
+  a session comes up in either direction (`EmberFriendConnected` outbound,
+  `FriendSeen` inbound), because waiting out a 60 s tick is most of a short
+  visit. Those two are best-effort rather than the guarantee: either can fire
+  before the session is registered in `ember_sessions`, in which case it finds
+  nothing and the tick is what actually asks. Answering is
+  capped at one per friend per 30 s, stamped before the table walk rather than
+  after a successful send, so a friend whose writer queue is full cannot buy an
+  unthrottled walk per request.
+
+  Friends are taken least-recently-asked first, never-asked ahead of all of
+  them. That ordering is load-bearing rather than tidy: the ask interval equals
+  the maintenance tick, so every friend asked last cycle is due again this
+  cycle, and taking the first four in session-map order asks the same four for
+  the life of the process while a fifth is never asked at all — the identical
+  failure `ember_dht_announce_targets` was written to avoid. The ask stamp
+  therefore has to outlive its own interval, since it doubles as the rotation
+  key; `EMBER_FRIEND_CONTACT_STAMP_TTL` keeps it four minutes and the
+  acceptance window above is named separately so it cannot inherit that length
+  by accident. `the_friend_ask_rotates_instead_of_pinning_the_first_few` pins
+  it.
+
+One gate had to move for any of this to fire: the maintenance tick ran only
+when the table held contacts or the bridge held candidates, and a cold node
+whose only peer is a friend behind a relayed session has every one of those
+empty — so the ask would have been unreachable in precisely its own case. A
+live friend session now counts as work on its own.
+
+`a_friend_is_only_ever_told_about_contacts_that_answered_us` and
+`a_friend_answer_survives_the_round_trip_as_unverified_leads` pin the two
+halves; `the_contact_list_size_cap_cannot_refuse_an_honest_list` pins the
+receiver's length guard against what the encoder can emit, because a cap set
+too low would drop honest answers and look exactly like a friend on an older
+build. Diagnostics: `ember_dht_friend_contact_asks` against
+`ember_dht_friend_contacts_learned` — asks climbing with the second flat is
+friends on older builds or with nothing verified to give.
+
+Field evidence for why this mattered: a node with three contacts sat beside a
 friend holding fourteen, over a working friend session, with `Known peers` at 0
 — so the friend had never been registered as an Ember peer and was never asked.
 The gossip machinery itself was fine, and said so: 190 gossip contacts seen, 0
 refused, 0 new, which is three peers describing each other in a loop.
 
+Still open on this path: nothing uses the friend session to carry a *live*
+introduction the other way, so two friends who can each reach a third party but
+not each other still do not meet over the overlay. That needs relay, not
+another ask.
+
 ### 3. Cold join when eMule is not available
 
-Every path in the list above except `nodes_ember.dat` presupposes either a
-live KAD connection or an eD2K transfer with an Ember-capable peer. A
-first-run user with KAD off and no servers has no way in, and seed lists
-are deliberately not planned. Either accept and document that Ember rides
-eMule's bootstrap, or add a path that does not.
+Every path in the list above except `nodes_ember.dat` used to presuppose either
+a live KAD connection or an eD2K transfer with an Ember-capable peer, so a
+first-run user with KAD off and no servers had no way in. Seed lists are
+deliberately not planned.
+
+**Narrowed, not closed.** The friend contact exchange in
+[item 2a](#2a-bootstrapping-from-a-friend) needs neither: a friend session is
+reached by stored address or through the rendezvous server, so a user who has
+added one friend can now join with KAD off and no servers. What is still
+uncovered is the user who has *nobody* — no friend, no KAD, no server — and for
+them the answer remains that Ember rides eMule's bootstrap. That is now a
+documentation matter rather than a gap for most first runs, but the shape of the
+hole has not changed.
 
 ### 4. Validation past the happy path
 
@@ -672,6 +759,8 @@ settled.
 - ~~Monitoring for rendezvous-key health: how many nodes are listed, how
   often a cold lookup returns nothing.~~ Surfaced as `ember_dht_rendezvous_*`
   on the Ember page (listed / lookups / empty).
+- ~~Weight a gossip contact by whether the leads its introducer gave us turned
+  out to be reachable.~~ Done — see the Sybil note under Hardening and ops.
 - Stronger observed-IP / STUN interplay under awkward NATs (needs soak
   data).
 - Shard the rendezvous key space. The derivation is already versioned for
@@ -712,10 +801,47 @@ settled.
   The *routing table* is anchored on something scarce. Its caps are keyed on
   address and /24, not on identity, so a keypair buys nothing on its own — and
   `enforce_scale_quotas` closed the last hole, where a share admitted under the
-  cold-start tier was kept for the life of the process. What remains there is
-  that gossip is unscored: a peer can name contacts that never answer, forever,
-  at no cost beyond the frame. Weighting a contact by whether the leads it gave
-  us turned out to be reachable is the cheap next step and needs no wire change.
+  cold-start tier was kept for the life of the process.
+
+  **Gossip is now scored, which was the remaining gap here.** Naming a contact
+  was free and unpriced: a peer could hand out addresses that never answer,
+  forever, for the cost of one frame, and each name cost us a probe — a
+  datagram, usually a Noise handshake behind it, and a slot in the in-flight
+  ping map a real lead then could not have. One `FOUND_NODE` carries up to 17 of
+  them, and eleven consecutive `Too many active Ember searches` in two
+  milliseconds is what that looks like from inside.
+  [`dht/gossip.rs`](../src-tauri/src/network/ember/dht/gossip.rs) tracks, per
+  introducer, how many of the leads we *probed* went on to answer, and trickles
+  the probes for one whose leads almost never do.
+
+  Four properties are deliberate, because each is a way this could cost more
+  than the problem:
+
+  - **An introducer with no record is funded.** The first contacts a node ever
+    hears about arrive by gossip, so a scheme that must earn trust before
+    granting any closes the only door in.
+  - **It never refuses a contact.** Only probing is rationed; the table's own
+    caps still decide what may hold a slot, and a lead that answers is worth
+    having however it arrived.
+  - **It is not consulted while the table is starved.** A node with nothing has
+    to try everything: probing junk costs bandwidth, failing to join costs the
+    overlay.
+  - **A rationed introducer is still sampled**, one lead in eight, and tallies
+    halve past 64 outcomes — so a peer whose contacts went dark in a netsplit
+    recovers instead of being written off for the life of the process.
+
+  Attribution starts at the probe, not at the naming, or an introducer would be
+  charged for our own budget running out. An answer is credited on any signed
+  frame rather than only a `PONG`, because the question a probe asks is whether
+  the address is real. Diagnostics: `ember_dht_gossip_leads_rationed` and the
+  introducer gauge beside it separate "nobody is naming anyone reachable" from
+  "a few peers are naming a great many unreachable ones".
+
+  What this does *not* price is identity rotation: a Sybil can spend a fresh
+  keypair per round to reset its record. That costs it a keypair per round of
+  leads and buys it no more than it had before, so it is a rate limit rather
+  than a defence — the volume half still needs something scarcer, which is the
+  proof-of-work note below.
 
   The *store* is not, and its caps cannot be fixed the same way. They —
   `MAX_RECORDS_PER_PUBLISHER_PER_KEY` (150), `MAX_KEYS_PER_PUBLISHER` (6,250),

@@ -1634,6 +1634,27 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         attestations: Vec<crate::network::ember::RelayAttestation>,
     },
+    /// A friend is asking for our Ember DHT contacts, so it can join the
+    /// overlay through a session that already works rather than through a
+    /// bridge `PING` its address may never allow. `target` is the asker's own
+    /// node ID when it sent one, which only decides *which* of our contacts
+    /// are closest and is therefore safe to take on its word.
+    EmberDhtContactRequest {
+        ember_hash: [u8; 16],
+        target: Option<[u8; 16]>,
+        /// The friend session this arrived on, so the answer goes back down the
+        /// same socket rather than to whatever holds that hash's slot by the
+        /// time the network loop gets here.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    /// A friend answered with its contacts. Carried as the raw wire list and
+    /// decoded in the network loop, which owns the routing table that has to
+    /// judge them — they are unverified leads, exactly like DHT gossip, and go
+    /// through the same admission and probe path.
+    EmberDhtContacts {
+        ember_hash: [u8; 16],
+        contacts: Vec<u8>,
+    },
     /// A friend is offering to send us a file. Surfaced to the UI for an
     /// explicit accept — we never start a download because a peer asked us to.
     EmberFileOffer {
@@ -10726,6 +10747,51 @@ impl UploadHandler {
                                             })
                                             .await;
                                     }
+                                }
+                            }
+                            Some((
+                                super::messages::EMBER_EXT_DHT_CONTACT_REQ,
+                                body,
+                            )) => {
+                                if let Some(reply_tx) =
+                                    ember_session_handle.as_ref().map(|h| h.tx.clone())
+                                {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtContactRequest {
+                                                ember_hash: eh,
+                                                target: body.try_into().ok(),
+                                                reply_tx,
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_DHT_CONTACTS, body)) => {
+                                // Refused by length before it is carried any
+                                // further: no contact list can be this large,
+                                // whatever it would decode to.
+                                if body.len()
+                                    > crate::network::ember::dht::messages::MAX_CONTACT_LIST_BYTES
+                                {
+                                    debug!(
+                                        "Friend {} sent an oversized Ember contact list ({} bytes)",
+                                        hex::encode(eh),
+                                        body.len()
+                                    );
+                                } else {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtContacts {
+                                                ember_hash: eh,
+                                                contacts: body.to_vec(),
+                                            },
+                                        })
+                                        .await;
                                 }
                             }
                             // A sub-type this build predates. Ignoring it is

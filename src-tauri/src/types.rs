@@ -696,6 +696,32 @@ pub struct EmberDiagnostics {
     /// Of those, ones the table turned away on IP policy or diversity caps.
     #[serde(default)]
     pub ember_dht_gossip_refused: u32,
+    /// Gossip leads we declined to probe because the peer that named them has
+    /// a record of naming addresses that never answer.
+    ///
+    /// Separates the two reasons a table with plenty of inbound gossip still
+    /// will not grow: nobody is naming anyone reachable, or a few peers are
+    /// naming a great many unreachable ones. Never non-zero while the table is
+    /// starved — see `network::ember::dht::gossip`.
+    #[serde(default)]
+    pub ember_dht_gossip_leads_rationed: u32,
+    /// Introducers currently rationed (gauge). A handful here alongside a
+    /// large `ember_dht_gossip_contacts` is the signature of gossip volume
+    /// that is not worth what it costs to check.
+    #[serde(default)]
+    pub ember_dht_gossip_introducers_rationed: u32,
+    /// Times we asked a friend for its Ember DHT contacts over the
+    /// authenticated friend session, which only happens while our own table is
+    /// short of a working set.
+    #[serde(default)]
+    pub ember_dht_friend_contact_asks: u32,
+    /// Contacts a friend answered with that our routing table accepted.
+    ///
+    /// Paired with the asks, this is what says whether the friend route is
+    /// carrying a cold join: asks climbing with this flat means friends are on
+    /// builds that predate the sub-type, or have nothing verified to share.
+    #[serde(default)]
+    pub ember_dht_friend_contacts_learned: u32,
     /// Iterative Ember DHT lookups currently running (gauge, not a
     /// counter).
     #[serde(default)]

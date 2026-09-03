@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod engine;
+pub mod gossip;
 pub mod messages;
 pub mod observed;
 pub mod peer_cache;

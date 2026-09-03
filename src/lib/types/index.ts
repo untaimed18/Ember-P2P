@@ -410,6 +410,17 @@ export interface EmberDiagnostics {
   ember_dht_gossip_new?: number;
   /** Of those, ones the table turned away on IP policy or diversity caps. */
   ember_dht_gossip_refused?: number;
+  /** Leads we declined to probe because the peer naming them has a record of
+   *  naming addresses that never answer. Always 0 while our table is starved. */
+  ember_dht_gossip_leads_rationed?: number;
+  /** Introducers currently rationed (gauge). */
+  ember_dht_gossip_introducers_rationed?: number;
+  /** Times we asked a friend for its DHT contacts over the friend session.
+   *  Only while our own table is short of a working set. */
+  ember_dht_friend_contact_asks?: number;
+  /** Contacts a friend answered with that the routing table accepted. Asks
+   *  climbing with this flat means friends have nothing verified to share. */
+  ember_dht_friend_contacts_learned?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed

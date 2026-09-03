@@ -848,6 +848,37 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_DHT_CONTACT_REQ, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberDhtContactRequest {
+                                                    ember_hash: peer_ember_hash,
+                                                    target: body.try_into().ok(),
+                                                    reply_tx: session_ember_session_handle.tx.clone(),
+                                                },
+                                            }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_DHT_CONTACTS, body)) => {
+                                            // Refused by length before it is
+                                            // carried any further: no contact
+                                            // list can be this large, whatever
+                                            // it would decode to.
+                                            if body.len() > crate::network::ember::dht::messages::MAX_CONTACT_LIST_BYTES {
+                                                debug!(
+                                                    "Friend {} sent an oversized Ember contact list ({} bytes)",
+                                                    crate::security::short_hash(&peer_ember_hash),
+                                                    body.len()
+                                                );
+                                            } else {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberDhtContacts {
+                                                        ember_hash: peer_ember_hash,
+                                                        contacts: body.to_vec(),
+                                                    },
+                                                }).await;
+                                            }
+                                        }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(
