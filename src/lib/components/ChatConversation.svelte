@@ -178,11 +178,21 @@
   const MAX_LIVE_MESSAGES = MAX_LOADED_MESSAGES;
 
   let messages: ConvMessage[] = $state([]);
-  // One "Seen" on the newest opened outbound line, not a label on every
-  // earlier bubble the watermark covers.
+  // One read-receipt eye on the newest opened outbound line, not a mark on
+  // every earlier bubble the watermark covers.
   let lastSeenSentId = $derived(
     messages.reduce((best, message) => {
       if (message.direction === 'sent' && message.seen && message.id > best) return message.id;
+      return best;
+    }, 0),
+  );
+  // One "Sent" on the newest delivered outbound line. Queued/failed keep
+  // their own per-bubble captions so a later send does not hide them.
+  let lastDeliveredSentId = $derived(
+    messages.reduce((best, message) => {
+      if (message.direction === 'sent' && message.delivery === 'delivered' && message.id > best) {
+        return message.id;
+      }
       return best;
     }, 0),
   );
@@ -910,6 +920,7 @@
   }
 
   function setFriendTyping(on: boolean) {
+    const was = friendTyping;
     friendTyping = on;
     if (typingHoldTimer) {
       clearTimeout(typingHoldTimer);
@@ -920,6 +931,7 @@
         friendTyping = false;
         typingHoldTimer = null;
       }, TYPING_HOLD_MS);
+      if (!was && isPinnedToBottom()) scrollToBottom();
     }
   }
 
@@ -930,9 +942,12 @@
     void sendChatTyping(friendHash, on).catch(() => {});
   }
 
-  function notifyOutgoingTyping() {
-    if (isChannel || chatDisabled || chatLocked || !isOnline) return;
-    const on = inputText.trim().length > 0;
+  function notifyOutgoingTyping(text = inputText) {
+    // The backend drops this when there is no live session. Gating on the
+    // UI online set used to swallow composing entirely: that store can lag
+    // the session (or miss a friend-online event), while chat still delivers.
+    if (isChannel || chatDisabled || chatLocked) return;
+    const on = text.trim().length > 0;
     if (!on) {
       if (lastTypingSentOn) sendOutgoingTyping(false);
       return;
@@ -948,13 +963,18 @@
   }
 
   $effect(() => {
-    if (!isOnline) {
+    if (isOnline) return;
+    // A typing packet is itself proof they are composing. Do not subscribe
+    // to the hold timer here: writing it from `setFriendTyping` would
+    // re-run this effect and immediately clear the indicator whenever the
+    // UI still thought they were offline.
+    untrack(() => {
       friendTyping = false;
       if (typingHoldTimer) {
         clearTimeout(typingHoldTimer);
         typingHoldTimer = null;
       }
-    }
+    });
   });
 
   // Messages that arrived while the window was hidden were deliberately left
@@ -1606,32 +1626,13 @@
   });
 </script>
 
-{#snippet messageTimestamp(msg: ConvMessage, pending: boolean, failed: boolean)}
+{#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
     {formatTime(msg.timestamp)}
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}
       </span>
-    {/if}
-    {#if pending}
-      <span class="bubble-delivery" title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
-    {:else if failed}
-      <span class="bubble-delivery failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
-      {#if !isChannel}
-        <button
-          class="bubble-resend"
-          type="button"
-          disabled={resendingId !== null || sending || chatDisabled || chatLocked}
-          onclick={() => resendMessage(msg)}
-          title={m.chat_resend()}
-          aria-label={m.chat_resend()}
-        >
-          {resendingId === msg.id ? m.chat_loading_short() : m.chat_resend()}
-        </button>
-      {/if}
-    {:else if msg.direction === 'sent' && msg.seen && showReadReceipts && msg.id === lastSeenSentId}
-      <span class="bubble-delivery seen" title={m.chat_seen_title()}>{m.chat_seen()}</span>
     {/if}
   </div>
 {/snippet}
@@ -1725,6 +1726,8 @@
         {/if}
         {@const pending = row.msg.direction === 'sent' && row.msg.delivery === 'queued'}
         {@const failed = row.msg.direction === 'sent' && row.msg.delivery === 'failed'}
+        {@const showSeen = row.msg.direction === 'sent' && row.msg.seen && showReadReceipts && row.msg.id === lastSeenSentId}
+        {@const showSent = row.msg.direction === 'sent' && row.msg.delivery === 'delivered' && row.msg.id === lastDeliveredSentId && !showSeen}
         <div
           class="conv-msg"
           class:sent={row.msg.direction === 'sent'}
@@ -1801,7 +1804,7 @@
                 >{seg.text}</button>{:else}{seg.text}{/if}{/each}</bdi></div>
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
-            {@render messageTimestamp(row.msg, pending, failed)}
+            {@render messageTimestamp(row.msg)}
           {/if}
           <!-- Channels only, and only for rows the DB can actually address:
                live bubbles carry negative synthetic ids. -->
@@ -1902,12 +1905,48 @@
                 </div>
                 {/if}
               {/if}
-              {@render messageTimestamp(row.msg, pending, failed)}
+              {@render messageTimestamp(row.msg)}
             </div>
           {/if}
         </div>
+        {#if !isChannel && (pending || failed || showSeen || showSent)}
+          <div class="bubble-status">
+            {#if pending}
+              <span title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+            {:else if failed}
+              <span class="failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+              <button
+                class="bubble-resend"
+                type="button"
+                disabled={resendingId !== null || sending || chatDisabled || chatLocked}
+                onclick={() => resendMessage(row.msg)}
+                title={m.chat_resend()}
+                aria-label={m.chat_resend()}
+              >
+                {resendingId === row.msg.id ? m.chat_loading_short() : m.chat_resend()}
+              </button>
+            {:else if showSeen}
+              <span class="bubble-seen" title={m.chat_seen_title()} aria-label={m.chat_seen()} role="img">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                  <path d="M1.5 8s2.6-4.5 6.5-4.5S14.5 8 14.5 8s-2.6 4.5-6.5 4.5S1.5 8 1.5 8z"/>
+                  <circle class="bubble-seen-pupil" cx="8" cy="8" r="1.85"/>
+                </svg>
+              </span>
+            {:else}
+              <span title={m.chat_delivery_sent_title()}>{m.chat_delivery_sent()}</span>
+            {/if}
+          </div>
+        {/if}
         </div>
       {/each}
+    {/if}
+    {#if friendTyping && !isChannel && !loading && !loadError}
+      <div class="conv-msg received conv-typing-row">
+        <div class="conv-typing" role="status" aria-live="polite">
+          {m.chat_typing({ name: friendName || friendHash.slice(0, 8) })}
+          <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+        </div>
+      </div>
     {/if}
     <div bind:this={messagesEnd}></div>
   </div>
@@ -1941,12 +1980,6 @@
   {:else if chatDisabled}
     <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
   {:else}
-    {#if friendTyping && !isChannel}
-      <div class="conv-typing" role="status" aria-live="polite">
-        {m.chat_typing({ name: friendName || friendHash.slice(0, 8) })}
-        <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-      </div>
-    {/if}
     <div class="conv-input-area">
       {#if mentionOpen}
         <!-- A listbox the textarea owns rather than a focusable menu: focus has
@@ -1977,9 +2010,9 @@
         bind:value={inputText}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
-        oninput={() => {
+        oninput={(e) => {
           refreshMentionToken();
-          notifyOutgoingTyping();
+          notifyOutgoingTyping(e.currentTarget.value);
         }}
         onclick={refreshMentionToken}
         onkeyup={refreshMentionToken}
@@ -2142,6 +2175,7 @@
 
   .conv-messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 16px;
     display: flex;
@@ -2588,25 +2622,36 @@
     margin-inline-start: auto;
   }
 
-  /* Sits inside the timestamp line so a queued message reads as "sent at X,
-     not yet delivered" rather than as a separate error state. */
-  .bubble-delivery {
-    margin-left: 6px;
+  /* Delivery captions (queued / sent / seen) share one slot under the
+     trailing corner of a friend bubble, on the transcript surface. */
+  .bubble-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+    font-size: 10px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
+    line-height: 1.2;
+    color: var(--text-muted);
   }
 
-  .bubble-delivery.failed {
+  .bubble-status .failed {
     color: var(--danger);
-    opacity: 1;
   }
 
-  .bubble-delivery.seen {
-    letter-spacing: 0.2px;
-    text-transform: none;
-    font-weight: 600;
-    opacity: 0.92;
+  .bubble-seen {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .bubble-seen svg {
+    display: block;
+  }
+
+  .bubble-seen-pupil {
+    fill: var(--text-primary);
+    stroke: none;
   }
 
   /* Edit and remove share one hover-revealed cluster so they cannot overlap each
@@ -2991,12 +3036,12 @@
     color: color-mix(in srgb, var(--reaction-gold) 65%, var(--text-primary));
   }
 
-  /* Resend sits inside the timestamp line of its own bubble, so it reads as
-     part of the failure notice rather than a general-purpose action. Always
-     visible (unlike `.bubble-remove`, which is hover-revealed): a message that
-     did not arrive is exactly the case where the remedy should not be hidden. */
+  /* Resend sits beside the failure caption under its own bubble, so it
+     reads as part of the failure notice rather than a general-purpose
+     action. Always visible (unlike `.bubble-remove`, which is hover-revealed):
+     a message that did not arrive is exactly the case where the remedy
+     should not be hidden. */
   .bubble-resend {
-    margin-inline-start: 6px;
     padding: 0 5px;
     border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
     border-radius: 4px;
@@ -3074,10 +3119,15 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 14px 0;
+    padding: 4px 2px;
     color: var(--text-muted);
     font-size: 12px;
     flex-shrink: 0;
+  }
+
+  .conv-typing-row {
+    align-self: flex-start;
+    max-width: 80%;
   }
 
   .conv-typing-dots {

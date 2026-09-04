@@ -256,6 +256,8 @@
   "chat_delivery_queued_title": "Pas encore envoyé. Ember le remettra dès que votre ami sera joignable.",
   "chat_delivery_failed": "Non envoyé",
   "chat_delivery_failed_title": "Ember a renoncé à remettre ce message.",
+  "chat_delivery_sent": "Envoyé",
+  "chat_delivery_sent_title": "Ce message a été remis à votre ami.",
   "chat_seen": "Vu",
   "chat_seen_title": "Votre ami a lu ce message.",
   "chat_typing": "{name} est en train d’écrire…",

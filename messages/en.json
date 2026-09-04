@@ -256,6 +256,8 @@
   "chat_delivery_queued_title": "Not sent yet. Ember will deliver this the next time your friend is reachable.",
   "chat_delivery_failed": "Not sent",
   "chat_delivery_failed_title": "Ember gave up trying to deliver this message.",
+  "chat_delivery_sent": "Sent",
+  "chat_delivery_sent_title": "This message was delivered to your friend.",
   "chat_seen": "Seen",
   "chat_seen_title": "Your friend has read this message.",
   "chat_typing": "{name} is typing…",

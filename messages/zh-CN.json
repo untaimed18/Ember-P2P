@@ -256,6 +256,8 @@
   "chat_delivery_queued_title": "尚未发送。好友下次可连接时，Ember 会自动送达。",
   "chat_delivery_failed": "未发送",
   "chat_delivery_failed_title": "Ember 已放弃投递这条消息。",
+  "chat_delivery_sent": "已发送",
+  "chat_delivery_sent_title": "这条消息已送达好友。",
   "chat_seen": "已读",
   "chat_seen_title": "好友已阅读这条消息。",
   "chat_typing": "{name} 正在输入…",

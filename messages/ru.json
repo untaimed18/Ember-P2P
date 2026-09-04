@@ -256,6 +256,8 @@
   "chat_delivery_queued_title": "Ещё не отправлено. Ember доставит это сообщение, когда ваш друг снова будет доступен.",
   "chat_delivery_failed": "Не отправлено",
   "chat_delivery_failed_title": "Ember прекратил попытки доставить это сообщение.",
+  "chat_delivery_sent": "Отправлено",
+  "chat_delivery_sent_title": "Сообщение доставлено другу.",
   "chat_seen": "Прочитано",
   "chat_seen_title": "Друг прочитал это сообщение.",
   "chat_typing": "{name} печатает…",
