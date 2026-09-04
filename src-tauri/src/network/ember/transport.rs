@@ -283,6 +283,17 @@ struct NoiseSession {
     transport: snow::StatelessTransportState,
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
+    /// The last time this peer proved it was still there: a frame of theirs we
+    /// decrypted, or — until one arrives — the handshake that built the session.
+    ///
+    /// Separate from `last_activity`, which our own sends refresh and which is
+    /// therefore useless as an expiry clock. A peer that restarts or forgets
+    /// its half leaves us sealing to keys nobody can read, and every such send
+    /// pushed `last_activity` forward, so [`SESSION_TIMEOUT`] never fired and
+    /// the dead slot outlived the process. `has_live_session` reported it as
+    /// live throughout, which is what channel fan-out consults before choosing
+    /// direct delivery over the relay. Only the peer can advance this.
+    last_inbound: Instant,
     /// When this session's handshake completed, and unlike `last_activity` never
     /// touched again. Being able to order sessions by *arrival* rather than by use
     /// is what makes [`EmberTransport::trim_sessions_at`] correct — see there.
@@ -327,6 +338,7 @@ impl NoiseSession {
             transport,
             remote_noise_pub,
             last_activity: now,
+            last_inbound: now,
             established: now,
             ik_authenticated,
             addr_validated: false,
@@ -407,12 +419,65 @@ impl NoiseSession {
     }
 }
 
+/// An application payload parked behind an in-progress handshake, together
+/// with the peer identity the caller addressed it to.
+///
+/// `pending` holds one slot per address while `sessions` are keyed by
+/// `(address, static key)`, so a queued payload is only safe to seal once the
+/// handshake has proven *which* identity answered. Carrying `to` is what lets
+/// the flush sites tell a payload meant for this peer from one meant for a
+/// different peer that happens to share the address.
+struct QueuedPayload {
+    /// The static key the caller named, or `None` if it named none.
+    ///
+    /// `None` is not a wildcard by accident: an unkeyed `prepare_outgoing` is
+    /// precisely how an XX handshake gets started (the KAD bridge and the
+    /// channel-neighbour probe both dial addresses whose Noise key we have not
+    /// learned yet), and such a caller has already accepted whoever answers.
+    to: Option<[u8; 32]>,
+    bytes: Vec<u8>,
+}
+
+impl QueuedPayload {
+    /// Whether this payload may be sealed to a session with `remote_noise_pub`.
+    fn addressed_to(&self, remote_noise_pub: &[u8; 32]) -> bool {
+        self.to.is_none_or(|want| &want == remote_noise_pub)
+    }
+}
+
+/// Drop the payloads a completed handshake must not deliver, keeping only the
+/// ones addressed to the identity that actually answered.
+///
+/// An XX handshake learns the peer's static key only at the end, so anything
+/// queued behind one was queued before the recipient was known. Delivering the
+/// remainder anyway would seal a caller's bytes to a peer it never named — the
+/// same mistake [`EmberTransport::prepare_outgoing`] refuses outright for IK,
+/// where the target *is* known up front. Dropping is safe in the way that
+/// matters: every caller here is sending a best-effort datagram that a lost
+/// packet would have cost anyway, and the DHT re-drives it on the next tick
+/// against a session for the right identity.
+fn retain_addressed_to(queued: Vec<QueuedPayload>, remote_noise_pub: &[u8; 32]) -> Vec<Vec<u8>> {
+    let total = queued.len();
+    let kept: Vec<Vec<u8>> = queued
+        .into_iter()
+        .filter(|q| q.addressed_to(remote_noise_pub))
+        .map(|q| q.bytes)
+        .collect();
+    if kept.len() != total {
+        debug!(
+            "Dropped {} queued payload(s) addressed to another identity",
+            total - kept.len()
+        );
+    }
+    kept
+}
+
 /// In-progress handshake awaiting a response.
 enum PendingHandshake {
     /// Noise_IK: we sent message 1, waiting for message 2.
     IkInitiator {
         state: snow::HandshakeState,
-        queued: Vec<Vec<u8>>,
+        queued: Vec<QueuedPayload>,
         created: Instant,
         /// Static key this handshake was started for. `pending` is keyed by
         /// address alone while `sessions` is keyed by `(address, static key)`,
@@ -424,7 +489,7 @@ enum PendingHandshake {
     /// Noise_XX: we sent message 1, waiting for message 2.
     XxInitiatorMsg1 {
         state: snow::HandshakeState,
-        queued: Vec<Vec<u8>>,
+        queued: Vec<QueuedPayload>,
         created: Instant,
         /// Retry cookies this attempt has already acted on. Nothing is keyed yet
         /// at msg1, so a cookie packet is unauthenticated: without a hard limit,
@@ -449,7 +514,7 @@ enum PendingHandshake {
     /// window would silently drop the payload.
     XxResponderMsg2 {
         state: snow::HandshakeState,
-        queued: Vec<Vec<u8>>,
+        queued: Vec<QueuedPayload>,
         created: Instant,
     },
 }
@@ -1181,7 +1246,7 @@ impl EmberTransport {
         // restamps `created`: an XX exchange that takes longer than the grace
         // window is superseded here, and a single lost msg2 plus a retransmit
         // is enough to reach it.
-        let mut carried_from_stalled: Vec<Vec<u8>> = Vec::new();
+        let mut carried_from_stalled: Vec<QueuedPayload> = Vec::new();
         if stalled_inbound_handshake {
             debug!(
                 "Inbound XX handshake for {peer} has not completed in {:?}; dialling \
@@ -1235,7 +1300,16 @@ impl EmberTransport {
                     if queued.len() >= MAX_QUEUED_PER_HANDSHAKE {
                         queued.remove(0);
                     }
-                    queued.push(message.to_vec());
+                    // Tagged with the identity the caller named. An IK
+                    // handshake is already known to be reaching for that
+                    // identity (refused just above otherwise), but an XX one
+                    // does not learn who answered until it completes, so the
+                    // flush sites need this to avoid sealing these bytes to a
+                    // peer the caller never asked for.
+                    queued.push(QueuedPayload {
+                        to: remote_noise_pub.copied(),
+                        bytes: message.to_vec(),
+                    });
                     return OutgoingResult::Queued;
                 }
             }
@@ -1403,25 +1477,30 @@ impl EmberTransport {
     /// Remove expired sessions and pending handshakes.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
-        self.sessions.retain(|_, s| {
-            if now.duration_since(s.last_activity) >= SESSION_TIMEOUT {
-                return false;
-            }
-            // A session that has never decrypted anything is aged from when it
-            // was established, not from when we last used it.
-            //
-            // `last_activity` is refreshed by our own sends, so a session that
-            // can only ever fail never timed out as long as we kept
-            // transmitting. An on-path attacker replaying a captured `IK_INIT`
-            // past `HANDSHAKE_REPLAY_TTL` installs exactly that: keys the real
-            // peer cannot read, at their address, held forever. Every later
-            // send sealed to a peer who sees nothing, self-healing only if they
-            // happened to dial us. `addr_validated` flips on the first
-            // successful decrypt, so "unvalidated" is precisely "has never
-            // heard anything", and `established` is never touched — which makes
-            // it the honest clock for one.
-            s.addr_validated || now.duration_since(s.established) < SESSION_TIMEOUT
-        });
+        // Age every session from the last time the *peer* proved it was there,
+        // never from when we last used it.
+        //
+        // `last_activity` is refreshed by our own sends, so any session that can
+        // only ever fail survived as long as we kept transmitting — and the DHT
+        // keeps transmitting, because a contact stays in the table until its
+        // pings time out. Two ways in: an on-path attacker replaying a captured
+        // `IK_INIT` past `HANDSHAKE_REPLAY_TTL` (keys the real peer cannot read,
+        // held at their address), and the ordinary case of a peer restarting or
+        // forgetting its half. `fault_ember_contact` drops the session for a
+        // routing-table contact on its first missed ping, but a peer we hold no
+        // contact for — a channel member reached over its own session — is never
+        // liveness-pinged, so nothing faulted it and the dead slot outlived the
+        // process while `has_live_session` kept calling it live.
+        //
+        // `last_inbound` starts at the handshake and only the peer can advance
+        // it, so this subsumes the old rule rather than loosening it: our sends
+        // push `last_activity` forward but never this, so `last_activity` is
+        // always at or ahead of it. The cost is that a strictly one-way flow
+        // re-handshakes every `SESSION_TIMEOUT` — one 1-RTT IK exchange against
+        // a peer whose static key we already hold, which is the trade this
+        // constant's own documentation already accepts.
+        self.sessions
+            .retain(|_, s| now.duration_since(s.last_inbound) < SESSION_TIMEOUT);
         // A staged session that never decrypted anything is a handshake the
         // peer never followed up on — or a replay that never could. Drop it on
         // the pending-handshake timescale rather than the session one: the
@@ -1444,15 +1523,37 @@ impl EmberTransport {
             .retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
     }
 
-    /// Remove an existing session for a peer (e.g., on disconnect).
-    #[allow(dead_code)]
-    pub fn remove_session(&mut self, addr: &SocketAddr) {
-        self.sessions
-            .retain(|(session_addr, _), _| session_addr != addr);
-        self.staged_sessions
-            .retain(|(session_addr, _), _| session_addr != addr);
-        self.pending.remove(addr);
-        self.deferred_ik.retain(|(deferred, _), _| deferred != addr);
+    /// Drop the session, staged re-handshake and deferred payload held for one
+    /// peer *identity* (e.g. when the DHT concludes that peer is unreachable).
+    ///
+    /// Keyed by `(addr, static key)` rather than by address alone. Sessions
+    /// coexist per identity precisely so that distinct peers behind one NAT or
+    /// CGNAT do not compete for a slot, and [`Self::trim_sessions_at`] goes to
+    /// real trouble never to shed a validated session to admit an unproven one.
+    /// An address-wide sweep discarded all of that: one unresponsive peer's
+    /// ping timeout tore down a co-located peer's working session, its
+    /// in-flight handshake, and the first-contact payload deferred behind its
+    /// return-routability probe — none of which that peer did anything to earn.
+    ///
+    /// A pending handshake is dropped only when it is one of ours aimed at this
+    /// identity. `pending` holds a single slot per address, and an XX leg
+    /// carries no target key at all, so anything else in it belongs to a
+    /// different peer or a different question; it ages out on the 30-second
+    /// sweep in [`Self::cleanup`].
+    pub fn remove_session_for(&mut self, addr: &SocketAddr, remote_noise_pub: &[u8; 32]) {
+        let slot = (*addr, *remote_noise_pub);
+        self.sessions.remove(&slot);
+        self.staged_sessions.remove(&slot);
+        self.deferred_ik.remove(&slot);
+        if matches!(
+            self.pending.get(addr),
+            Some(PendingHandshake::IkInitiator {
+                remote_noise_pub: target,
+                ..
+            }) if target == remote_noise_pub
+        ) {
+            self.pending.remove(addr);
+        }
     }
 
     /// Drop every session and pending handshake. Used when the
@@ -1646,7 +1747,7 @@ impl EmberTransport {
         peer: SocketAddr,
         remote_pub: &[u8; 32],
         first_message: &[u8],
-        carried: Vec<Vec<u8>>,
+        carried: Vec<QueuedPayload>,
     ) -> OutgoingResult {
         let params = match NOISE_PATTERN_IK.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
@@ -2056,10 +2157,14 @@ impl EmberTransport {
         // address is proven.
         let mut session = NoiseSession::new(transport, remote_noise_pub, true).validated();
 
-        // Send queued messages
+        // Send queued messages. `prepare_outgoing` already refuses to park a
+        // payload behind an IK handshake aimed elsewhere, so this filter is
+        // expected to keep everything; it earns its place on the payloads
+        // *carried in* from a superseded XX handshake, which were queued
+        // before any identity was known.
         let mut packets = Vec::new();
-        for msg in &queued {
-            if let Some(pkt) = session.seal(msg) {
+        for msg in retain_addressed_to(queued, &remote_noise_pub) {
+            if let Some(pkt) = session.seal(&msg) {
                 packets.push(pkt);
             }
         }
@@ -2077,8 +2182,15 @@ impl EmberTransport {
 
     // ── Noise_XX handshake (2-RTT, we don't know the peer's static key) ──
 
+    /// Only reached when the caller named no static key — that is what makes
+    /// XX the right pattern — so the queued first message is addressed to
+    /// whoever answers.
     fn start_xx_handshake(&mut self, peer: SocketAddr, first_message: &[u8]) -> OutgoingResult {
-        match self.write_xx_msg1(peer, vec![first_message.to_vec()], &[], 0) {
+        let first = QueuedPayload {
+            to: None,
+            bytes: first_message.to_vec(),
+        };
+        match self.write_xx_msg1(peer, vec![first], &[], 0) {
             Ok(packet) => {
                 trace!("Started XX handshake with {peer}");
                 OutgoingResult::HandshakeStarted { packet }
@@ -2098,7 +2210,7 @@ impl EmberTransport {
     fn write_xx_msg1(
         &mut self,
         peer: SocketAddr,
-        queued: Vec<Vec<u8>>,
+        queued: Vec<QueuedPayload>,
         cookie: &[u8],
         cookie_retries: u8,
     ) -> Result<Vec<u8>, String> {
@@ -2444,8 +2556,26 @@ impl EmberTransport {
             return IncomingResult::Rejected;
         };
 
-        // Write message 3 (includes initiator's static key + first queued message as payload)
-        let payload = queued.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        // Read out who answered before deciding what to send them. Message 2
+        // carried the responder's static key, so the identity is known here —
+        // and it has to be, because the msg3 payload below is the first thing
+        // we would seal to it. Choosing that payload from the queue without
+        // checking would hand a caller's bytes to whatever identity happens to
+        // sit at this address: an XX handshake is only ever started by an
+        // unkeyed `prepare_outgoing`, so the peer here was never named by the
+        // caller whose payload is at the head of the queue.
+        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
+            Some(k) => k,
+            None => {
+                debug!("XX initiator: handshake completed without remote static key from {from}");
+                return IncomingResult::Rejected;
+            }
+        };
+        let deliverable = retain_addressed_to(queued, &remote_noise_pub);
+
+        // Write message 3 (includes initiator's static key + first deliverable
+        // queued message as payload)
+        let payload = deliverable.first().map(|v| v.as_slice()).unwrap_or(&[]);
         let mut resp_buf = vec![0u8; HEADER_LEN + payload.len() + 256];
         resp_buf[0] = EMBER_MAGIC[0];
         resp_buf[1] = EMBER_MAGIC[1];
@@ -2458,14 +2588,6 @@ impl EmberTransport {
             }
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
-
-        let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
-            Some(k) => k,
-            None => {
-                debug!("XX initiator: handshake completed without remote static key from {from}");
-                return IncomingResult::Rejected;
-            }
-        };
 
         // Sessions coexist per static key, so completing this handshake cannot
         // displace a different identity already at `from`.
@@ -2483,7 +2605,7 @@ impl EmberTransport {
 
         // Send remaining queued messages (skip first, it was in msg3 payload)
         let mut packets = vec![resp_buf];
-        for msg in queued.iter().skip(1) {
+        for msg in deliverable.iter().skip(1) {
             if let Some(pkt) = session.seal(msg) {
                 packets.push(pkt);
             }
@@ -2575,8 +2697,16 @@ impl EmberTransport {
         // becomes a transport-mode packet that the caller will emit on
         // the wire; without this loop those payloads were silently
         // dropped by `prepare_outgoing`'s queue case.
-        let mut packets_to_send: Vec<Vec<u8>> = Vec::with_capacity(queued.len());
-        for msg in &queued {
+        //
+        // Only the ones addressed to the peer that actually completed the
+        // handshake. This is the window the grace period in
+        // `XX_RESPONDER_QUEUE_GRACE` deliberately keeps open, and in the
+        // honest race the caller named exactly this peer — but a second
+        // identity at the same address would otherwise have been handed
+        // whatever was parked here for the first.
+        let deliverable = retain_addressed_to(queued, &remote_noise_pub);
+        let mut packets_to_send: Vec<Vec<u8>> = Vec::with_capacity(deliverable.len());
+        for msg in &deliverable {
             if let Some(pkt) = session.seal(msg) {
                 packets_to_send.push(pkt);
             } else {
@@ -2587,7 +2717,7 @@ impl EmberTransport {
         self.install_session(from, session);
         trace!(
             "XX handshake completed (responder) with {from}; flushed {} queued message(s)",
-            queued.len()
+            deliverable.len()
         );
 
         let decrypted = if payload_len > 0 {
@@ -2647,7 +2777,9 @@ impl EmberTransport {
             {
                 Ok(len) => {
                     session.replay_commit(nonce);
-                    session.last_activity = Instant::now();
+                    let now = Instant::now();
+                    session.last_activity = now;
+                    session.last_inbound = now;
                     session.addr_validated = true;
                     return IncomingResult::Message {
                         from,
@@ -2682,7 +2814,9 @@ impl EmberTransport {
                         continue;
                     };
                     promoted.replay_commit(nonce);
-                    promoted.last_activity = Instant::now();
+                    let now = Instant::now();
+                    promoted.last_activity = now;
+                    promoted.last_inbound = now;
                     promoted.addr_validated = true;
                     let remote_noise_pub = promoted.remote_noise_pub;
                     debug!(
@@ -4336,7 +4470,7 @@ mod tests {
 
         // A later initiation from Mallory installs (or refreshes) her own slot
         // rather than being rejected by a takeover guard, and cannot evict Alice.
-        mallory.remove_session(&bob_addr);
+        mallory.remove_session_for(&bob_addr, &bob_pub);
         let squat_again = match mallory.prepare_outgoing(bob_addr, Some(&bob_pub), b"squat again") {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
@@ -4565,7 +4699,7 @@ mod tests {
         // `Instant` subtraction panics on a machine that has been up for less
         // than the timeout.
         if let Some(session) = bob.sessions.get_mut(&slot) {
-            session.established = Instant::now()
+            session.last_inbound = Instant::now()
                 .checked_sub(SESSION_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or_else(Instant::now);
         }
@@ -4574,6 +4708,105 @@ mod tests {
         assert!(
             !bob.sessions.contains_key(&slot),
             "our own traffic must not keep an unproven session alive forever"
+        );
+    }
+
+    /// The same rule has to hold for a session that *was* proven and then went
+    /// dead, which is the ordinary case: the peer restarts or forgets its half,
+    /// every frame we seal is unreadable, and our own sends kept the idle timer
+    /// fresh. `fault_ember_contact` clears this for a routing-table contact on
+    /// its first missed liveness ping, but a peer we hold no contact for is
+    /// never pinged, so nothing else would ever reap it — and `has_live_session`
+    /// reports it live meanwhile, which is what channel fan-out consults before
+    /// choosing direct delivery over the relay.
+    #[test]
+    fn a_proven_session_that_goes_silent_is_aged_out_despite_our_own_sends() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // A full exchange, so Alice's session is proven rather than merely
+        // installed: she started it and read Bob's reply.
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let resp = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("expected HandshakeComplete"),
+        };
+        for packet in &resp {
+            let _ = alice.dispatch_incoming(packet, bob_addr);
+        }
+        assert!(
+            alice.has_live_session(&bob_addr, &bob_pub),
+            "the session must be established before it can go stale"
+        );
+
+        // Bob vanishes. Alice keeps sending, as the DHT and channel fan-out do.
+        for _ in 0..5 {
+            let _ = alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"still here?");
+        }
+        // Age past the timeout. Only `last_inbound` is backdated, because that
+        // is the whole point: `last_activity` is whatever our last send set.
+        if let Some(session) = alice.sessions.get_mut(&(bob_addr, bob_pub)) {
+            session.last_inbound = Instant::now()
+                .checked_sub(SESSION_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        alice.cleanup();
+
+        assert!(
+            !alice.has_live_session(&bob_addr, &bob_pub),
+            "a peer we have not heard from in longer than SESSION_TIMEOUT must \
+             not keep reporting as live just because we kept talking at it"
+        );
+    }
+
+    /// Sessions are keyed per identity so peers sharing a NAT coexist. Tearing
+    /// one down on its own ping timeout must not take the neighbours with it —
+    /// the address-wide sweep this replaced dropped a working session, an
+    /// in-flight handshake and a deferred first-contact payload belonging to a
+    /// peer that had done nothing wrong.
+    #[test]
+    fn dropping_one_identity_spares_a_co_located_peer() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let (alice_priv, alice_pub) = make_keypair();
+        let (carol_priv, carol_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut carol = EmberTransport::new(carol_priv, carol_pub);
+        // One address, two identities — a CGNAT or a shared host.
+        let shared: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        for peer in [&mut alice, &mut carol] {
+            let init = match peer.prepare_outgoing(bob_addr, Some(&bob_pub), b"hi") {
+                OutgoingResult::HandshakeStarted { packet } => packet,
+                other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+            };
+            assert!(matches!(
+                bob.process_incoming(&init, shared),
+                IncomingResult::HandshakeComplete { .. }
+            ));
+        }
+        assert!(bob.sessions.contains_key(&(shared, alice_pub)));
+        assert!(bob.sessions.contains_key(&(shared, carol_pub)));
+
+        bob.remove_session_for(&shared, &alice_pub);
+
+        assert!(
+            !bob.sessions.contains_key(&(shared, alice_pub)),
+            "the identity we gave up on must be gone"
+        );
+        assert!(
+            bob.sessions.contains_key(&(shared, carol_pub)),
+            "the peer that merely shares an address must keep its session"
         );
     }
 
@@ -4909,6 +5142,153 @@ mod tests {
             }
             other => panic!(
                 "expected decrypted Message, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// An XX handshake does not learn who answered until it completes, so
+    /// anything queued behind one was queued before its recipient was known.
+    /// Those payloads used to be sealed to whoever turned up — starting with
+    /// the msg3 payload, the very first thing written to the new session.
+    ///
+    /// `prepare_outgoing` refuses this outright for IK, where the target is
+    /// known up front (see
+    /// `a_payload_is_not_queued_onto_a_handshake_for_another_identity`). XX had
+    /// no equivalent, and XX is exactly what an unkeyed `prepare_outgoing`
+    /// starts — which is how the KAD bridge and the channel-neighbour probe
+    /// dial every address whose Noise key we have not learned yet. A keyed
+    /// caller reaching the same address in that window (a liveness ping to a
+    /// contact we do have keys for) parked its frame behind the XX attempt.
+    #[test]
+    fn an_xx_handshake_does_not_deliver_a_payload_meant_for_another_identity() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let (_other_priv, other_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let for_whoever = vec![0xC3u8; 96];
+        let for_other = vec![0xD4u8; 96];
+
+        // No key for the address, so this is an XX dial and the caller has
+        // accepted whoever answers.
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, &for_whoever) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        // A second caller does name an identity, and it is not the one that is
+        // about to answer. Queuing is still the right answer to give it — the
+        // honest case is that the address holds the peer it named — but the
+        // handshake has to be the one that decides.
+        assert!(
+            matches!(
+                alice.prepare_outgoing(bob_addr, Some(&other_pub), &for_other),
+                OutgoingResult::Queued
+            ),
+            "a keyed caller behind an XX dial still queues"
+        );
+
+        let msg2 = match bob.process_incoming(&msg1, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets,
+            other => panic!("expected msg2, got {:?}", std::mem::discriminant(&other)),
+        };
+        let msg3 = match alice.process_incoming(&msg2[0], bob_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send,
+                remote_noise_pub,
+                ..
+            } => {
+                assert_eq!(remote_noise_pub, bob_pub, "Bob is who answered");
+                packets_to_send
+            }
+            other => panic!(
+                "expected HandshakeComplete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        assert_eq!(
+            msg3.len(),
+            1,
+            "only msg3 goes out: the payload for another identity is not Bob's to receive"
+        );
+
+        match bob.process_incoming(&msg3[0], alice_addr) {
+            IncomingResult::HandshakeComplete {
+                decrypted_payload, ..
+            } => {
+                assert_eq!(
+                    decrypted_payload,
+                    Some(for_whoever),
+                    "the unkeyed caller's payload is the one addressed to whoever answered"
+                );
+            }
+            other => panic!(
+                "expected HandshakeComplete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// The responder half of the same rule. The msg2→msg3 window is held open
+    /// deliberately by `XX_RESPONDER_QUEUE_GRACE` so the honest race delivers
+    /// both sides' first message, and in that race the queued payload really is
+    /// for the peer completing the handshake. It is only when it is not that
+    /// the queue must hold it back.
+    #[test]
+    fn an_xx_responder_does_not_flush_a_payload_meant_for_another_identity() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let (_other_priv, other_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let msg2 = match bob.process_incoming(&msg1, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets,
+            other => panic!("expected msg2, got {:?}", std::mem::discriminant(&other)),
+        };
+
+        // Bob has an inbound XX in flight and no session yet, so this queues —
+        // but it names a third identity, not the Alice who is completing.
+        let for_other = b"not for the peer completing this handshake";
+        assert!(
+            matches!(
+                bob.prepare_outgoing(alice_addr, Some(&other_pub), for_other),
+                OutgoingResult::Queued
+            ),
+            "the msg2 window queues, as the grace period intends"
+        );
+        assert_ne!(other_pub, alice_pub);
+
+        let msg3 = match alice.process_incoming(&msg2[0], bob_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            other => panic!(
+                "expected HandshakeComplete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        match bob.process_incoming(&msg3[0], alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => {
+                assert!(
+                    packets_to_send.is_empty(),
+                    "nothing queued here was addressed to Alice, so nothing is flushed to her"
+                );
+            }
+            other => panic!(
+                "expected HandshakeComplete, got {:?}",
                 std::mem::discriminant(&other)
             ),
         }

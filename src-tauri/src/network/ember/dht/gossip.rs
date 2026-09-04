@@ -175,8 +175,22 @@ impl GossipReputation {
             .entry(introducer)
             .or_insert_with(|| Introducer::new(now))
             .seen = now;
+        // A full map used to mean the newest probe went unattributed, which is
+        // the wrong end to shed: attribution is only ever settled by
+        // `note_answered` or `note_silent`, so an entry that has been waiting
+        // longest is the one closest to being swept out unresolved anyway,
+        // while the probe we are recording now is the one whose answer is
+        // still to come. Dropping the newest also handed a free pass to
+        // whoever filled the map — its later leads escaped being charged.
         if self.pending.len() >= MAX_PENDING_LEADS && !self.pending.contains_key(&lead) {
-            return;
+            if let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.probed_at)
+                .map(|(id, _)| *id)
+            {
+                self.pending.remove(&oldest);
+            }
         }
         self.pending.insert(
             lead,
@@ -410,6 +424,40 @@ mod tests {
             rep.note_probe(id(1), EmberNodeId(raw), now);
         }
         assert!(rep.pending_len() <= MAX_PENDING_LEADS);
+    }
+
+    /// Which probe gets shed when the map is full decides whether a flood pays
+    /// for itself. Refusing the *newest* meant a peer that filled the map
+    /// bought anonymity for every lead it named afterwards: the probe went out,
+    /// no claim was recorded, and the silence it produced was charged to
+    /// nobody.
+    #[test]
+    fn a_full_pending_map_still_charges_the_newest_probe() {
+        let mut rep = GossipReputation::new();
+        let start = Instant::now();
+
+        // A flood from one peer takes the map to its cap.
+        for i in 0..MAX_PENDING_LEADS {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            rep.note_probe(id(1), EmberNodeId(raw), start);
+        }
+        assert_eq!(rep.pending_len(), MAX_PENDING_LEADS);
+
+        // The next lead it names is probed a moment later and goes silent.
+        let later = start + Duration::from_secs(1);
+        rep.note_probe(id(1), id(99), later);
+        rep.note_silent(&id(99));
+
+        let record = rep.introducers[&id(1)];
+        assert_eq!(
+            record.silent, 1,
+            "the lead we probed most recently must still be attributable"
+        );
+        assert!(
+            rep.pending_len() <= MAX_PENDING_LEADS,
+            "and taking the newest in must not raise the cap"
+        );
     }
 
     /// A probe that never reaches the ping sweep is forgotten rather than

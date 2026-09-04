@@ -635,6 +635,7 @@ impl EmberDht {
         ip: Ipv4Addr,
         udp_port: u16,
         noise_pub: [u8; 32],
+        session_noise_pub: [u8; 32],
         expires_at: i64,
         signature: [u8; 64],
         now: i64,
@@ -650,6 +651,18 @@ impl EmberDht {
         // The signing key must be the one the frame was attributed to, or the
         // trailer would name a node ID whose key cannot verify the signature.
         if crypto::node_id_from_ed25519_bytes(&ed25519_pub) != Some(buddy.0) {
+            return false;
+        }
+        // The Noise key the endorsement advertises must be the one this session
+        // is actually encrypted to. `sign_buddy_endorsement` always signs
+        // `local_noise_pub`, so an honest buddy cannot produce a mismatch —
+        // only a peer naming a key it does not hold can, and we would publish
+        // that key in every source record for the endorsement's whole six-hour
+        // life. Searchers do corroborate the endpoint against a verified
+        // contact before dialling it, so this is not the only guard; it is the
+        // cheap one, and it fails at the point where we can still choose a
+        // different buddy instead of at every searcher.
+        if noise_pub != session_noise_pub {
             return false;
         }
         if !endorsement
@@ -1101,9 +1114,18 @@ impl EmberDht {
     /// Store a local replica, then charge proxy budget and remember the
     /// publisher for `CALLBACK_REQ`.
     ///
-    /// Store runs first so a full/expired replica cannot burn a publish slot
-    /// and a callback grant. Call only after [`PublishManager::start_publish_to`]
-    /// granted a slot; the caller must drop that slot if this returns false.
+    /// Store runs before the *charge* so a full/expired replica cannot burn a
+    /// publish slot and a callback grant — but after the budget *check*, which
+    /// is the order the two halves need. Storage is the first half of the
+    /// favour the budget bounds, so a refusal that came after it left us
+    /// holding the replica while telling the publisher no: no ack, no callback
+    /// grant, and a record no searcher could ever be bounced to. The only
+    /// caller peeks the same budget before it reserves a publish slot, so this
+    /// was masked; keeping the invariant here rather than in the caller is what
+    /// makes it safe for a second one to exist.
+    ///
+    /// Call only after [`PublishManager::start_publish_to`] granted a slot; the
+    /// caller must drop that slot if this returns false.
     pub fn commit_proxy_store(
         &mut self,
         publisher: EmberNodeId,
@@ -1112,9 +1134,14 @@ impl EmberDht {
         record: &SignedRecord,
         now: Instant,
     ) -> bool {
+        if !self.can_accept_proxy_forward(publisher, now) {
+            return false;
+        }
         if !self.store_proxy_replica(record, from) {
             return false;
         }
+        // Cannot fail: nothing between here and the check above touches the
+        // proxy budget, and `now` has not moved.
         if !self.accept_proxy_forward(publisher, now) {
             return false;
         }
@@ -1895,8 +1922,12 @@ impl EmberDht {
     /// Bulk-load persisted contacts (from `nodes_ember.dat`) into the
     /// routing table at startup. Detaches the range filter for the pass so a
     /// still-loading `ipfilter.dat` cannot refuse the whole bootstrap set.
-    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
-        self.routing.load_contacts(contacts);
+    ///
+    /// Returns the ids that took a bucket slot — see
+    /// [`RoutingTable::load_contacts`] for why the caller must not infer that
+    /// from [`Self::contact_for`].
+    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) -> Vec<EmberNodeId> {
+        self.routing.load_contacts(contacts)
     }
 
     // ── Maintenance (slice 6) ──
@@ -2443,6 +2474,7 @@ impl EmberDht {
                         ip,
                         udp_port,
                         noise_pub,
+                        remote_noise_pub,
                         expires_at,
                         signature,
                         now,
@@ -4831,6 +4863,48 @@ mod tests {
             .expect("fresh candidate");
         let on_homeless = homeless.handle_message(&req, addr(1, 4672), [0x01; 32], now);
         assert!(on_homeless.responses.is_empty());
+    }
+
+    /// The Noise key an endorsement advertises is the key every searcher will
+    /// dial, and we publish it in a source record for the endorsement's whole
+    /// life. So it has to be the key the session it arrived on is actually
+    /// encrypted to: `sign_buddy_endorsement` always signs `local_noise_pub`,
+    /// which means an honest buddy cannot produce a mismatch and only a peer
+    /// naming a key it does not hold can.
+    #[test]
+    fn an_endorsement_naming_a_key_the_session_does_not_use_is_refused() {
+        let mut publisher = dht(120);
+        let mut buddy = dht(121);
+        let now = 5_000i64;
+
+        let (_rid, req) = publisher
+            .build_buddy_endorse_req(buddy.local_id(), Instant::now())
+            .expect("fresh candidate");
+        let publisher_noise = publisher.local_noise_pub;
+        let on_buddy = buddy.handle_message(&req, addr(1, 4672), publisher_noise, now);
+        let reply = on_buddy.responses.first().expect("the buddy signs it");
+
+        // Same frame, same signature, delivered over a session belonging to a
+        // different static key than the one the endorsement names.
+        let absorbed = publisher.handle_message(reply, addr(2, 4672), [0xEEu8; 32], now);
+        assert!(
+            !absorbed.buddy_endorsed,
+            "the advertised key must match the session's"
+        );
+        assert!(
+            publisher
+                .buddy_endorsement(&buddy.local_id(), now)
+                .is_none(),
+            "and nothing is cached, so nothing reaches a source record"
+        );
+
+        // Over the session it belongs to, the very same frame is accepted.
+        let buddy_noise = buddy.local_noise_pub;
+        assert!(
+            publisher
+                .handle_message(reply, addr(2, 4672), buddy_noise, now)
+                .buddy_endorsed
+        );
     }
 
     /// A re-ask on every publish tick would be a frame per tick at a peer too

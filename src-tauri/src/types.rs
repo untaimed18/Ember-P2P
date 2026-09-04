@@ -660,7 +660,12 @@ pub struct EmberDiagnostics {
     /// from "stuck", none of which the other counters distinguish.
     #[serde(default)]
     pub ember_dht_seconds_since_inbound: u32,
-    /// Ember DHT `PING` frames we sent this session.
+    /// Ember DHT `PING` frames the dev panel sent this session.
+    ///
+    /// Only the debug harness increments this, not the three automatic probe
+    /// paths — those land in [`Self::ember_dht_liveness_pings_sent`]. Named as
+    /// though it counted every `PING` frame, which is what it is for: to show
+    /// that a hand-driven probe left the machine at all.
     #[serde(default)]
     pub ember_dht_pings_sent: u32,
     /// Ember DHT `PING` frames we received and answered this session.
@@ -757,7 +762,18 @@ pub struct EmberDiagnostics {
     /// session (slice 6).
     #[serde(default)]
     pub ember_dht_refreshes: u32,
-    /// Maintenance liveness `PING`s sent to stale contacts this session.
+    /// Automatic verification `PING`s sent this session.
+    ///
+    /// Three paths feed this, not just the maintenance sweep it was originally
+    /// documented as: the 60-second liveness pass over stale contacts,
+    /// `probe_ember_gossip_leads` (a lead someone named, which has to answer
+    /// before it counts as verified) and `probe_bucket_oldest` (a full bucket's
+    /// incumbent, whose silence promotes the newcomer waiting in the
+    /// replacement cache). One number because all three register in
+    /// `ember_dht_maint_pings` and share its fault, evict and promote
+    /// semantics — a probe from any of them verifies a contact or costs it a
+    /// strike. Reading it as the maintenance budget alone overstates that
+    /// budget during a join, when the other two dominate.
     #[serde(default)]
     pub ember_dht_liveness_pings_sent: u32,
     /// Of [`Self::ember_dht_contacts`], the ones parked in a bucket's

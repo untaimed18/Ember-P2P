@@ -104,8 +104,10 @@ pub struct RoutingTable {
     /// The strictest tier whose diversity quotas the *resident* set has been
     /// pruned down to. See [`Self::enforce_scale_quotas`].
     ///
-    /// Only ever ratchets tighter, which is what keeps a table hovering near a
-    /// tier boundary from demoting and re-admitting the same contacts forever.
+    /// Tightens as soon as the table crosses a boundary and relaxes only once
+    /// it has fallen a clear margin back below one, which is what keeps a table
+    /// hovering near a boundary from demoting and re-admitting the same
+    /// contacts forever.
     enforced_scale: scale::NetworkScale,
 }
 
@@ -193,13 +195,36 @@ impl RoutingTable {
     /// `Established` at 80 against 100. Between those the caps still refuse
     /// newcomers, so the margin costs nothing and buys the property that a table
     /// sitting on a boundary cannot demote a contact one tick and re-admit it
-    /// the next. [`Self::enforced_scale`] only ratchets tighter, which is the
-    /// other half: a network that later shrinks loosens admission again without
-    /// this re-running.
+    /// the next.
+    ///
+    /// The relaxation below is the other half of that, and it has to be
+    /// explicit. [`Self::admission_scale`] is `scale().max(enforced_scale)`, so
+    /// a tier this pass ratchets to governs admission until something lowers it
+    /// — and nothing did. A node that reached 100 verified contacts and then
+    /// lost them (a suspended laptop, a changed network, an upstream outage,
+    /// a wave of evictions) sat on an almost empty table while still enforcing
+    /// the caps meant for a full one: two contacts per address and ten per /24,
+    /// applied at exactly the moment the `Bootstrap` allowances exist to get a
+    /// node reconnected. It held for the life of the process, because nothing
+    /// short of a restart rebuilt the table.
+    ///
+    /// Relaxing is measured from five-fourths of the verified count, mirroring
+    /// the four-fifths above: acting later than the live tier in both
+    /// directions leaves a dead band around every boundary, so the flapping
+    /// this field exists to prevent still cannot happen. Nothing is demoted by
+    /// relaxing, and the pass below cannot fire in the same call — a count low
+    /// enough to widen the band has a `target` at or under the tier it widens
+    /// to.
     ///
     /// Returns how many contacts were demoted.
     pub fn enforce_scale_quotas(&mut self) -> usize {
-        let target = scale::NetworkScale::from_contacts(self.verified_len() * 4 / 5);
+        let verified = self.verified_len();
+        let floor = scale::NetworkScale::from_contacts(verified.saturating_mul(5) / 4);
+        if floor < self.enforced_scale {
+            self.enforced_scale = floor;
+        }
+
+        let target = scale::NetworkScale::from_contacts(verified * 4 / 5);
         if target <= self.enforced_scale {
             return 0;
         }
@@ -1452,17 +1477,30 @@ impl RoutingTable {
     /// non-v4, and the table's private/bogus rules still apply. Blocked ranges
     /// are dropped later by [`Self::evict_filtered_contacts`] once the list is
     /// ready.
-    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) {
+    ///
+    /// Returns the ids that took a bucket slot. Callers need that to be the
+    /// *admitted* set and nothing wider: a contact refused by the IP policy or
+    /// a diversity cap is parked in a replacement cache, and a parked contact
+    /// is never dialled — [`Self::all_contacts`] does not return the cache, so
+    /// it is not a liveness-ping target. Asking [`Self::get_contact`]
+    /// afterwards cannot answer this, because it deliberately searches the
+    /// cache too, so a parked seed reads back as if it had been tried.
+    pub fn load_contacts(&mut self, contacts: Vec<EmberContact>) -> Vec<EmberNodeId> {
         let held = self.ip_gate.take_range_filter();
         let count = contacts.len();
-        let mut added = 0;
+        let mut admitted = Vec::with_capacity(contacts.len());
         for contact in contacts {
+            let node_id = contact.node_id;
             if matches!(self.add_contact(contact), AddResult::Added) {
-                added += 1;
+                admitted.push(node_id);
             }
         }
         self.ip_gate.restore_range_filter(held);
-        debug!("Loaded {added}/{count} contacts into Ember routing table");
+        debug!(
+            "Loaded {}/{count} contacts into Ember routing table",
+            admitted.len()
+        );
+        admitted
     }
 
     // ── Internal helpers ──
@@ -1835,6 +1873,71 @@ mod tests {
         );
     }
 
+    /// The other direction of the same margin. `admission_scale` is the
+    /// stricter of the live tier and the enforced one, so a tier that ratcheted
+    /// tight while the table was full went on governing admission after the
+    /// table emptied — for the life of the process, since nothing rebuilds it.
+    /// A node that loses its peers is in the situation the `Bootstrap`
+    /// allowances exist for, not the one `Established` was chosen for.
+    #[test]
+    fn a_table_that_loses_its_peers_stops_enforcing_the_tier_it_outgrew() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        // 105 verified contacts, none of them sharing an address or a /24, so
+        // the tier moves without any cap binding on the way.
+        grow_verified(&mut rt, 15);
+        assert_eq!(rt.verified_len(), 105);
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "nothing shares an address, so tightening demotes nobody"
+        );
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Established);
+
+        // Keep enough to stay inside `Established`'s own band. Relaxing is read
+        // from five-fourths of the count, mirroring the four-fifths that
+        // tightening uses, so the tier does not drop the moment the count does.
+        let resident: Vec<EmberNodeId> = rt.all_contacts().iter().map(|c| c.node_id).collect();
+        for id in resident.iter().take(105 - 70) {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 70);
+        assert_eq!(
+            rt.admission_scale(),
+            scale::NetworkScale::Established,
+            "70 verified is 87 with the margin, still an established table"
+        );
+        assert_eq!(rt.enforce_scale_quotas(), 0);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Established);
+
+        // Far enough below and the caps have to loosen with the table.
+        for id in resident.iter().skip(105 - 70).take(70 - 12) {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 12);
+        assert_eq!(
+            rt.enforce_scale_quotas(),
+            0,
+            "relaxing demotes nobody — it only widens what may be admitted"
+        );
+        assert_eq!(
+            rt.admission_scale(),
+            scale::NetworkScale::Small,
+            "a nearly empty table must not be admitting under a full table's caps"
+        );
+
+        // And all the way down, so a node rejoining from nothing gets the
+        // allowances a cold start is supposed to have.
+        let left: Vec<EmberNodeId> = rt.all_contacts().iter().map(|c| c.node_id).collect();
+        for id in &left {
+            assert!(rt.remove_contact(id));
+        }
+        assert_eq!(rt.verified_len(), 0);
+        assert_eq!(rt.enforce_scale_quotas(), 0);
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Bootstrap);
+    }
+
     #[test]
     fn distance_is_xor() {
         let a = EmberNodeId([0xFF; 16]);
@@ -1983,6 +2086,37 @@ mod tests {
         }
         assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
         rt
+    }
+
+    /// The bulk loader must report only the seeds that took a slot.
+    ///
+    /// Startup used to infer that by asking `get_contact` afterwards, which
+    /// deliberately searches the replacement caches too — so a seed parked
+    /// behind a full bucket read back as admitted, and the bootstrap cache
+    /// charged it a missed session at shutdown for silence it was never given a
+    /// chance to break. A parked contact is not a ping target either, which is
+    /// what makes the charge simply untrue rather than merely early.
+    #[test]
+    fn load_contacts_reports_only_the_seeds_that_took_a_slot() {
+        let mut rt = table_with_one_full_bucket();
+        let parked = contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1);
+
+        let admitted = rt.load_contacts(vec![parked.clone()]);
+
+        assert!(
+            admitted.is_empty(),
+            "the bucket was full, so nothing was dialled"
+        );
+        assert!(
+            rt.get_contact(&parked.node_id).is_some(),
+            "it is still held — this is exactly what misled the caller"
+        );
+        assert!(
+            !rt.all_contacts()
+                .iter()
+                .any(|c| c.node_id == parked.node_id),
+            "and it is not a liveness-ping target, so it can never answer"
+        );
     }
 
     /// Promotion was the one selection point in the table that ranked hearsay

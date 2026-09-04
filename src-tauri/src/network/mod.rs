@@ -1498,6 +1498,23 @@ fn xx_bridge_reserve(max_pings: usize, keyless_known: bool) -> usize {
 /// being gossiped onto the public overlay.
 const MAX_EMBER_SESSION_DHT_CONTACTS: usize = 64;
 
+/// Whether a firsthand session contact still earns the place it holds beside
+/// the routing table.
+///
+/// A contact here is exempt from everything that disciplines a routing
+/// contact — no liveness ping reaches it, so `failed_queries` never rises and
+/// the table's own staleness purge never sees it. That left the map with no
+/// expiry at all, only the LRU in [`record_ember_session_dht_contact`], and 64
+/// slots take a long time to turn over on a LAN.
+///
+/// `last_seen == 0` is kept: that is a peer we learned from a LAN `PEER_LIST`
+/// and have not asked yet, not one that went quiet. The LRU already ranks
+/// those first for eviction, which is the right order — an unproven lead
+/// should lose its slot to a proven peer, not to the clock.
+fn ember_session_contact_is_live(contact: &ember::dht::EmberContact, now_secs: i64) -> bool {
+    contact.last_seen == 0 || now_secs.saturating_sub(contact.last_seen) < EMBER_CONTACT_STALE_SECS
+}
+
 fn record_ember_session_dht_contact(
     map: &mut HashMap<(Ipv4Addr, u16), ember::dht::EmberContact>,
     contact: ember::dht::EmberContact,
@@ -6505,6 +6522,72 @@ fn hardcoded_bootstrap_backoff_interval(shift: u32) -> i64 {
 mod tests {
     use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
     use super::*;
+
+    /// Firsthand session contacts sit beside the routing table and are exempt
+    /// from everything that disciplines a resident: no liveness ping reaches
+    /// them, so they never accrue a failed query, and the table's staleness
+    /// purge never sees them. Nothing aged them out at all — a LAN peer that
+    /// went away stayed in the UI's overlay count, on every search shortlist,
+    /// in the publish target set, and holding known-peer UDP treatment, until
+    /// 64 better contacts pushed it out.
+    #[test]
+    fn a_session_contact_that_goes_quiet_stops_being_counted() {
+        let now = 1_800_000_000i64;
+        let contact = |last_seen: i64, last: u8| ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([last; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last)), 4672),
+            noise_pub: [last; 32],
+            ed25519_pub: [last; 32],
+            last_seen,
+            failed_queries: 0,
+        };
+
+        let answering = contact(now - 60, 1);
+        let quiet = contact(now - EMBER_CONTACT_STALE_SECS - 1, 2);
+        let never_asked = contact(0, 3);
+
+        assert!(ember_session_contact_is_live(&answering, now));
+        assert!(
+            !ember_session_contact_is_live(&quiet, now),
+            "two hours unheard is the same verdict the routing table reaches"
+        );
+        assert!(
+            ember_session_contact_is_live(&never_asked, now),
+            "a LAN lead we have not probed yet is not a peer that went silent"
+        );
+
+        // And as the sweep applies it.
+        let mut map: HashMap<(Ipv4Addr, u16), ember::dht::EmberContact> = HashMap::new();
+        for c in [&answering, &quiet, &never_asked] {
+            record_ember_session_dht_contact(&mut map, c.clone());
+        }
+        assert_eq!(map.len(), 3);
+        map.retain(|_, c| ember_session_contact_is_live(c, now));
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&(Ipv4Addr::new(192, 168, 1, 2), 4672)));
+
+        // The unproven lead is not immortal either: it is the first thing the
+        // LRU gives up, which is the order that matters — a proven peer should
+        // take its slot, not the clock.
+        for i in 0..MAX_EMBER_SESSION_DHT_CONTACTS as u8 {
+            record_ember_session_dht_contact(
+                &mut map,
+                ember::dht::EmberContact {
+                    node_id: ember::dht::EmberNodeId([0x80 | i; 16]),
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, i, 1)), 4672),
+                    noise_pub: [0x80 | i; 32],
+                    ed25519_pub: [0x80 | i; 32],
+                    last_seen: now - 10,
+                    failed_queries: 0,
+                },
+            );
+        }
+        assert!(map.len() <= MAX_EMBER_SESSION_DHT_CONTACTS);
+        assert!(
+            !map.contains_key(&(Ipv4Addr::new(192, 168, 1, 3), 4672)),
+            "the never-probed lead loses its slot to peers that answer"
+        );
+    }
 
     /// A succession claim hands a room to someone new, so the checks that gate
     /// it are the most consequential in the feature. "The owner is silent" and
@@ -12572,7 +12655,17 @@ struct NetworkState {
     ember_last_self_lookup: i64,
     /// Unix time we last received any Ember DHT frame. `None` until the first
     /// one arrives. Drives disconnect detection.
+    ///
+    /// Only ever written when a frame actually arrives. The disconnect re-arm
+    /// used to stamp it too, to keep itself from firing every tick, which made
+    /// `ember_dht_seconds_since_inbound` read a couple of seconds on a node
+    /// that had heard nothing for an hour — "joined and quiet" and "stuck
+    /// rejoining" looked identical in diagnostics, and the second is the one
+    /// worth seeing. The debounce lives in `ember_rearmed_at` instead.
     ember_last_inbound: Option<i64>,
+    /// Unix time the disconnect re-arm last fired, so it fires once per silent
+    /// stretch rather than on every maintenance tick within one.
+    ember_rearmed_at: Option<i64>,
     /// Overlay contact count as of the previous maintenance tick, so emptying
     /// can re-arm bootstrap on the *transition* to zero rather than every tick
     /// spent there.
@@ -19619,12 +19712,19 @@ fn fault_ember_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNode
     // Drop any Noise session with this peer. Sessions are one-sided state:
     // if the peer forgot its half (restart, eviction under session pressure,
     // the transport being toggled off) every frame we send is rejected as
-    // "no session", while each send refreshes our own idle timer so the
-    // session never expires on its own. Clearing it here means the next
-    // attempt re-handshakes instead of talking into a black hole.
+    // "no session". Clearing it here means the next attempt re-handshakes
+    // instead of talking into a black hole. `cleanup` would get there on its
+    // own — it ages a session from the last frame the *peer* sent — but only
+    // after `SESSION_TIMEOUT`, and a missed ping is the earlier, sharper
+    // signal for a peer we hold a contact for.
+    //
+    // Keyed by this contact's identity, not just its address: sessions are
+    // per `(addr, static key)` so peers sharing a NAT coexist, and an
+    // address-wide drop punished every one of them for this peer's silence.
     if let Some(contact) = state.ember_dht.contact_for(node_id) {
         let addr = contact.addr;
-        state.ember_transport.remove_session(&addr);
+        let noise_pub = contact.noise_pub;
+        state.ember_transport.remove_session_for(&addr, &noise_pub);
     }
     evict_ember_contact_if_dead(state, node_id, why);
 }
@@ -23304,6 +23404,7 @@ fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_self_lookup_done = false;
     state.ember_last_self_lookup = 0;
     state.ember_last_inbound = None;
+    state.ember_rearmed_at = None;
     state.ember_last_overlay_contacts = 0;
     state.ember_empty_rearmed_at = 0;
     state.ember_publish_targets.clear();
@@ -24127,6 +24228,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_self_lookup_done: false,
         ember_last_self_lookup: 0,
         ember_last_inbound: None,
+        ember_rearmed_at: None,
         ember_last_overlay_contacts: 0,
         ember_empty_rearmed_at: 0,
         ember_publish_targets: HashMap::new(),
@@ -24321,16 +24423,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &HashSet::new(),
                     EMBER_SEED_BATCH,
                 );
-                let seeded: Vec<ember::dht::EmberNodeId> =
-                    seed.iter().map(|c| c.node_id).collect();
-                state.ember_dht.load_contacts(seed);
-                // Whatever the table took is genuinely being tried this session,
-                // so its silence counts at shutdown. The bulk loader reports no
-                // per-contact result, hence asking the table afterwards.
-                let admitted: Vec<ember::dht::EmberNodeId> = seeded
-                    .into_iter()
-                    .filter(|id| state.ember_dht.contact_for(id).is_some())
-                    .collect();
+                // Only what took a bucket slot counts as tried, exactly as the
+                // maintenance top-up requires. This used to ask
+                // `contact_for` afterwards, which searches the replacement
+                // caches too — so a seed the IP policy or a diversity cap
+                // parked read back as admitted, and `charge_silent_session`
+                // charged a miss at shutdown to an address no packet was ever
+                // sent to. A miss also sinks an address in `seed_batch`
+                // ranking, so the error compounded: an untried peer became
+                // less likely to be tried on the next launch.
+                let admitted = state.ember_dht.load_contacts(seed);
                 state
                     .ember_bootstrap_cache
                     .note_offered(admitted.into_iter());
@@ -35441,6 +35543,35 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             MAX_PING_AGE.as_secs(),
                         );
                     }
+
+                    // The dev-panel DHT harness has the same two maps and had
+                    // no sweep at all: `ember_dht_pending_pings` and
+                    // `ember_dht_pending_finds` were only ever drained by a
+                    // matching wire reply. Every probe that timed out — a peer
+                    // that never answered, or a send that only reached
+                    // `OutgoingResult::Queued` because the handshake never
+                    // completed, so nothing went on the wire to be answered —
+                    // left its entry behind. A thousand of those and
+                    // `MAX_EMBER_PENDING_PINGS` refuses every further DHT ping
+                    // and find for the rest of the run, which reads as the
+                    // dev panel being broken.
+                    let before = state.ember_dht_pending_pings.len()
+                        + state.ember_dht_pending_finds.len();
+                    state
+                        .ember_dht_pending_pings
+                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
+                    state
+                        .ember_dht_pending_finds
+                        .retain(|_, (sent_at, _, _)| now.duration_since(*sent_at) < MAX_PING_AGE);
+                    let swept = before
+                        - (state.ember_dht_pending_pings.len()
+                            + state.ember_dht_pending_finds.len());
+                    if swept > 0 {
+                        debug!(
+                            "Ember: swept {swept} orphaned DHT harness waiter(s) older than {}s",
+                            MAX_PING_AGE.as_secs(),
+                        );
+                    }
                 }
 
                 // Reap idle Noise sessions and pending handshakes. The
@@ -43065,10 +43196,26 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Ember peers learned from KAD source tags (dialed over Noise_IK)
                 // or from eD2K sessions (dialed over Noise_XX). An idle node with
                 // nothing to work with stays quiet.
+                //
+                // The remembered address book counts as work on its own. Every
+                // other condition here is live state, and all of it is
+                // perishable: contacts fault out after three missed pings,
+                // `ember_noise_keys` expires on `KNOWN_EMBER_PEER_TTL`, keyless
+                // peers and friend sessions go with their eD2K sessions. A
+                // suspend/resume, an interface or VPN change, an `ipfilter.dat`
+                // reload or simply a long stretch offline can empty all of them
+                // together — and then the one thing that could still get us
+                // back, the book on disk, was unreachable, because the top-up
+                // that offers it and the `rearm_offers` that makes a spent book
+                // offerable again both run *inside* this cycle. Nothing outside
+                // it can add a contact when no peer knows us and the eD2K side
+                // is quiet too, so the node stayed dark until it was restarted.
+                // That is the restart-only ratchet `peer_cache` exists to break.
                 let mut ember_has_work = state.ember_dht.contact_count() > 0
                     || !state.ember_session_dht_contacts.is_empty()
                     || !state.ember_noise_keys.is_empty()
-                    || !state.ember_keyless_peers.is_empty();
+                    || !state.ember_keyless_peers.is_empty()
+                    || state.ember_bootstrap_cache.remembered_len() > 0;
                 // A live friend session counts on its own. It is the one
                 // bootstrap path that needs no dialable address for the peer
                 // introducing us, so the node it matters most to — a cold join
@@ -48832,7 +48979,16 @@ async fn run_ember_maintenance(
         // from anyone is exactly the one that most needs the kick, and gating
         // on "we heard something once" skipped it entirely.
         let last_inbound = state.ember_last_inbound.unwrap_or(state.ember_started_at);
-        if now_secs.saturating_sub(last_inbound) > EMBER_DISCONNECT_SECS {
+        // Debounced against the last re-arm rather than against the inbound
+        // clock. Stamping `ember_last_inbound` here was what kept this from
+        // firing every tick, at the cost of telling the diagnostics we had just
+        // heard from someone when the whole reason we were here is that we had
+        // not. A separate stamp buys the same once-per-stretch behaviour and
+        // leaves the observation alone.
+        let last_rearm = state.ember_rearmed_at.unwrap_or(state.ember_started_at);
+        if now_secs.saturating_sub(last_inbound) > EMBER_DISCONNECT_SECS
+            && now_secs.saturating_sub(last_rearm) > EMBER_DISCONNECT_SECS
+        {
             info!(
                 "Ember DHT: no traffic for {}s, re-bootstrapping",
                 now_secs.saturating_sub(last_inbound)
@@ -48845,7 +49001,7 @@ async fn run_ember_maintenance(
             // lookups says nothing about the network we are rejoining.
             state.ember_rendezvous_empty_streak = 0;
             // Only re-arm once per silent stretch, not on every tick.
-            state.ember_last_inbound = Some(now_secs);
+            state.ember_rearmed_at = Some(now_secs);
         }
 
         let contacts = ember_overlay_contact_count(state);
@@ -48909,6 +49065,39 @@ async fn run_ember_maintenance(
             .ember_diagnostics
             .ember_dht_contacts_evicted
             .saturating_add(purged as u32);
+    }
+
+    // 0b0) The same purge for the firsthand session contacts that sit beside
+    //      the table. Nothing removed one, ever: `record_ember_session_dht_contact`
+    //      bounds the map by an LRU at `MAX_EMBER_SESSION_DHT_CONTACTS` and two
+    //      ports per host, and the only wholesale clear is on the disable path
+    //      that settings can no longer reach. So a LAN peer that went away kept
+    //      being counted in the overlay figure the UI shows, kept being pinned
+    //      onto every search shortlist — `SearchManager` exempts these from the
+    //      k-trim on purpose — kept being offered as a publish target by
+    //      `ember_top_up_session_targets`, and kept its known-peer UDP handling,
+    //      because `ember_session_introduced` treats presence in this map as its
+    //      own justification. A quiet LAN host is the common case here, and 64
+    //      slots is few enough that the LRU would not reclaim them for a long
+    //      time.
+    //
+    //      Only contacts that have answered us are aged out. A copy learned from
+    //      a LAN `PEER_LIST` arrives with `last_seen == 0`, and that is not
+    //      silence — it is a peer we have not asked yet, which the LRU already
+    //      ranks first for eviction. Nothing here consults
+    //      `SearchManager::nodes_in_use`: a search pins its own copies of these
+    //      contacts onto its shortlist when it starts, so a walk in flight
+    //      cannot lose a branch to this sweep the way it could to the table's.
+    let session_extras_before = state.ember_session_dht_contacts.len();
+    state
+        .ember_session_dht_contacts
+        .retain(|_, c| ember_session_contact_is_live(c, now_secs));
+    let session_extras_purged = session_extras_before - state.ember_session_dht_contacts.len();
+    if session_extras_purged > 0 {
+        debug!(
+            "Ember DHT: purged {session_extras_purged} session contact(s) unheard for {}s",
+            EMBER_CONTACT_STALE_SECS
+        );
     }
 
     // 0b1) The other direction: residents a tier we have since grown into
