@@ -134,11 +134,42 @@
   let transferOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
   let membersOpen = $state(true);
-  /** Walking into a room hands the whole workspace to the conversation; the
-   *  header toggle brings the directory back without leaving the room. */
+  /** The directory stays up alongside an open room; the header toggle hands the
+   *  whole workspace to the conversation for anyone who wants it that way.
+   *
+   *  Open by default and remembered, because collapsing used to be automatic on
+   *  entering a room: the one pane that shows what is happening in every other
+   *  room vanished exactly when the page started being used, and re-opening it
+   *  never took — clicking the next room closed it again. */
   let listCollapsed = $state(false);
+  const LIST_COLLAPSED_KEY = 'channels-list-collapsed';
+  let listCollapsedLoaded = $state(false);
   let roomInfoOpen = $state(false);
   let listQuery = $state('');
+
+  function loadListCollapsed() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(LIST_COLLAPSED_KEY);
+      // Only the two values we write count. A missing, stale, or hand-edited
+      // entry leaves the default open rather than being coerced into a
+      // collapse nobody asked for.
+      if (raw === 'true' || raw === 'false') listCollapsed = raw === 'true';
+    } catch {
+      // Corrupt or blocked — drop it so we don't keep failing every load.
+      try { localStorage.removeItem(LIST_COLLAPSED_KEY); } catch { /* ignore */ }
+    }
+  }
+
+  // Guarded by `listCollapsedLoaded` so the default isn't written back over a
+  // saved choice before `loadListCollapsed()` has had a chance to apply it.
+  $effect(() => {
+    void listCollapsed;
+    if (!listCollapsedLoaded || typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(LIST_COLLAPSED_KEY, String(listCollapsed));
+    } catch { /* quota — non-fatal */ }
+  });
   /** Separate in-flight flags per operation. One shared "form busy" gate meant
    *  creating a room, pasting an invite, and joining from Discover all blocked
    *  each other despite touching nothing in common. */
@@ -516,6 +547,10 @@
     if (typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
       membersOpen = false;
     }
+    // Before the first paint, so a room restored just above opens against the
+    // directory the user left up rather than flashing it in or out.
+    loadListCollapsed();
+    listCollapsedLoaded = true;
     loadChannels();
     void refreshDirectory(false);
     const gatherTimer = setInterval(() => {
@@ -676,16 +711,6 @@
     if (emberOff) {
       goto('/ember').catch(() => {});
     }
-  });
-
-  /** Walking into a room gives it the whole workspace; stepping back out
-   *  returns the directory. Driven off the selection rather than set inside
-   *  `selectChannel`, so a room restored on mount collapses the list too. */
-  $effect(() => {
-    const open = !!selectedId;
-    untrack(() => {
-      listCollapsed = open;
-    });
   });
 
   $effect(() => {
@@ -3225,11 +3250,11 @@
     color: var(--text-secondary);
   }
 
-  /* Walking into a room hands it the whole workspace: the list collapses to
-     nothing and the conversation takes its place. Without this the room lands
-     in a single frame while the columns are still sliding, which reads as a
-     flash rather than a move. Timed to the column transition so the two
-     settle together.
+  /* A room arrives as a movement rather than in a single frame. That matters
+     most with the list collapsed, where walking into a room slides the columns
+     as well: without this the room lands instantly while they are still moving,
+     which reads as a flash. Timed to the column transition so the two settle
+     together.
 
      On the children, not the pane: the pane itself never unmounts, so an
      animation there would only ever run once. Everything a room draws mounts
