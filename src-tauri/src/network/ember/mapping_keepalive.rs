@@ -253,6 +253,32 @@ async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpS
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
+    // Abortive close, so a cycle does not deny the next one the tuple it just
+    // used. The local port is pinned to the listener's, `lookup_ipv4` takes the
+    // first A record in resolver order, and dropping the stream at the end of
+    // `tcp_mapping_cycle` makes this side the active closer — so the same
+    // (listen port -> target:80) 4-tuple recurred every 20s against a 120s
+    // TIME_WAIT. Windows fails `connect` on a tuple in TIME_WAIT with
+    // WSAEADDRINUSE whatever `SO_REUSEADDR` says, because that waives the bind
+    // and not the connect. The hold worked its way down the target list one
+    // cycle at a time and then failed on every target for two minutes until the
+    // oldest entry aged out, and it left a TIME_WAIT entry on the listen port
+    // each cycle besides.
+    //
+    // `set_zero_linger` rather than `set_linger(Some(ZERO))`: the general form
+    // is deprecated because a non-zero linger blocks the thread on drop, which
+    // is the one case this is not. RST is safe on this connection in
+    // particular, because it carries no data in either direction — no request
+    // is ever written — so there is nothing to truncate, and it closes only
+    // after the STUN measurement the hold exists to protect. Between cycles the
+    // port mapping is held open by the real listener's inbound traffic, not by
+    // this.
+    //
+    // Non-fatal: a platform that refuses the option falls back to the graceful
+    // close, which is a hold that occasionally skips a cycle rather than none.
+    if let Err(e) = stream.set_zero_linger() {
+        debug!("TCP mapping hold: zero-linger unavailable ({e}); closing gracefully");
+    }
     Ok(stream)
 }
 
