@@ -573,6 +573,14 @@ async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_
 /// Files whose basename isn't a valid UUID are ignored — only Ember-
 /// created part files use UUID basenames, so user-managed files in the
 /// same folder are never touched.
+///
+/// Must stay on the caller's task rather than being spawned off it, even
+/// though it walks a directory and deletes files. `known_ids` is a snapshot
+/// taken just before the call, and it is the only thing standing between this
+/// sweep and a live download's `.part`. Detached, the sweep would still be
+/// walking Temp while the loop accepted a download whose id postdates that
+/// snapshot — and it would delete that file out from under the worker writing
+/// it. The startup gate this runs behind exists to keep the two ordered.
 pub async fn sweep_orphan_part_files(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,

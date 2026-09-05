@@ -13207,6 +13207,11 @@ struct NetworkState {
     /// loop. Held here rather than threaded through the four frames between
     /// the loop and the block handler that completes a transfer.
     xfer_finish_tx: mpsc::UnboundedSender<XferFinishResult>,
+    /// Verifications handed to the blocking pool that the loop has not yet
+    /// applied. Shutdown drains exactly this many results before it tears the
+    /// socket down, so a transfer that finished hashing as the user quit still
+    /// gets its completion frame instead of being timed out by the sender.
+    xfer_finish_in_flight: usize,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
     /// holding the newest timestamp seen. Drained once a second by
     /// [`flush_channel_member_touches`].
@@ -17690,6 +17695,7 @@ fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
         return;
     };
     let tx = state.xfer_finish_tx.clone();
+    state.xfer_finish_in_flight += 1;
     tokio::task::spawn_blocking(move || {
         let outcome = (|| -> std::io::Result<bool> {
             recv.finish()?;
@@ -17746,6 +17752,7 @@ async fn apply_xfer_finish(
     app_handle: &tauri::AppHandle,
     result: XferFinishResult,
 ) {
+    state.xfer_finish_in_flight = state.xfer_finish_in_flight.saturating_sub(1);
     let complete = result.status == "complete";
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its
@@ -24501,6 +24508,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_send: HashMap::new(),
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
+        xfer_finish_in_flight: 0,
         channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_block_times: VecDeque::new(),
@@ -44329,6 +44337,40 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             "Network loop exited without a shutdown command; running the save sequence on a fresh {}s budget",
             UNREQUESTED_SHUTDOWN_BUDGET.as_secs()
         );
+    }
+
+    // Apply any transfer verification the blocking pool is still working on,
+    // before anything below tears down the paths its completion frame needs.
+    // `finish_xfer_recv` renames the file into place on that pool, so the
+    // download itself survives a quit either way — what is lost by exiting
+    // early is the `XFER_DONE` frame, and the sender has no other way to learn
+    // the transfer succeeded: it answers block requests and then waits, so its
+    // own stall timer reports a file we actually received as failed.
+    //
+    // Runs before the QUIC endpoint closes because `send_xfer_frame` falls
+    // back to the relay for a peer we have no direct path to. Bounded, and
+    // deliberately tighter than the save phases below: this is a courtesy to
+    // the sender, and a 100 MB hash on a spinning disk is not worth delaying
+    // the writes that protect our own state.
+    let xfer_drain_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3));
+    while state.xfer_finish_in_flight > 0 {
+        match tokio::time::timeout_at(xfer_drain_deadline, xfer_finish_rx.recv()).await {
+            Ok(Some(finished)) => {
+                apply_xfer_finish(&udp_socket, &mut state, &db, &app_handle, finished).await;
+            }
+            // Only `state` holds a sender, so this cannot happen while the
+            // loop owns it — treat it as "nothing more is coming" regardless.
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    "{} Ember transfer verification(s) still hashing 3s into shutdown; \
+                     the file is already saved but the sender will time it out",
+                    state.xfer_finish_in_flight
+                );
+                break;
+            }
+        }
     }
 
     // Abort pending server connection if any
